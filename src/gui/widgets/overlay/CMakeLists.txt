@@ -2,6 +2,8 @@ add_library(
     playeroverlay STATIC
     "$<$<BOOL:${OCR_SUPPORT}>:ocroverlay.cpp>"
     "$<$<BOOL:${OCR_SUPPORT}>:ocroverlay.h>"
+    "$<$<BOOL:${ASR_SUPPORT}>:asroverlay.cpp>"
+    "$<$<BOOL:${ASR_SUPPORT}>:asroverlay.h>"
     playercontrols.cpp
     playercontrols.h
     playercontrols.ui
@@ -21,7 +23,7 @@ target_include_directories(playeroverlay PRIVATE ${MEMENTO_INCLUDE_DIRS})
 target_link_libraries(
     playeroverlay
     PRIVATE "$<$<BOOL:${OCR_SUPPORT}>:ocrmodel>"
-    PRIVATE constants
+    PRIVATE "$<$<BOOL:${ASR_SUPPORT}>:asrmodel>"
     PRIVATE definitionwidget
     PRIVATE dictionary_db
     PRIVATE hittestwidget

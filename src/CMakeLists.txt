@@ -10,6 +10,7 @@ target_include_directories(version PUBLIC "${PROJECT_BINARY_DIR}/src")
 
 # Add subdirectories
 add_subdirectory(anki)
+add_subdirectory(asr)
 add_subdirectory(audio)
 add_subdirectory(dict)
 add_subdirectory(gui)

@@ -26,7 +26,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DOCR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
+        cmake .. -DOCR_SUPPORT=ON -DASR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
         cmake --build . -j $(nproc)
 
   windows:
@@ -59,7 +59,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DOCR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
+        cmake .. -DOCR_SUPPORT=ON -DASR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
         cmake --build . -j $(nproc)
 
   macos:
@@ -77,5 +77,5 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DOCR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
+        cmake .. -DOCR_SUPPORT=ON -DASR_SUPPORT=ON -DMEMENTO_COMPILER_FLAGS=-Werror
         cmake --build . -j $(nproc)

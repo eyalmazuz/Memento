@@ -3,6 +3,9 @@ add_library(
     "$<$<BOOL:${OCR_SUPPORT}>:ocrsettings.cpp>"
     "$<$<BOOL:${OCR_SUPPORT}>:ocrsettings.h>"
     "$<$<BOOL:${OCR_SUPPORT}>:ocrsettings.ui>"
+    "$<$<BOOL:${ASR_SUPPORT}>:asrsettings.cpp>"
+    "$<$<BOOL:${ASR_SUPPORT}>:asrsettings.h>"
+    "$<$<BOOL:${ASR_SUPPORT}>:asrsettings.ui>"
     ankisettings.cpp
     ankisettings.h
     ankisettings.ui

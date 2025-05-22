@@ -29,3 +29,14 @@ if(OCR_SUPPORT)
     )
     FetchContent_MakeAvailable(libmocr)
 endif()
+
+
+if(ASR_SUPPORT)
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        libwhisper
+        GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
+        GIT_TAG 51c6961c7b64b406833f4b6a4a20e67142f69225 # v1.7.5
+    )
+    FetchContent_MakeAvailable(libwhisper)
+endif()

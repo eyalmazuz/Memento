@@ -237,6 +237,15 @@ export CMAKE_ARGS='-DOCR_SUPPORT=ON'
 ```
 From here follow normal build instructions for your platform.
 
+
+### Adding ASR Support
+
+To build with ASR support add `-DASR_SUPPORT=ON` to the `CMAKE_ARGS` environment variable:
+```
+export CMAKE_ARGS='-DASR_SUPPORT=ON'
+```
+From here follow normal build instructions for your platform.
+
 **Note**:
 Theoretically OCR is supported on Windows.
 Assuming Memento was built against msys2's version of Python, you will have to

@@ -61,7 +61,7 @@ These will expand to larger expressions in the final card.</string>
        <item>
         <widget class="QTabWidget" name="tabWidget">
          <property name="currentIndex">
-          <number>0</number>
+          <number>2</number>
          </property>
          <widget class="QWidget" name="tabTermMarkers">
           <attribute name="title">
@@ -1601,8 +1601,18 @@ These will expand to larger expressions in the final card.</string>
           <attribute name="title">
            <string>Extended Syntax</string>
           </attribute>
-          <layout class="QGridLayout" name="layoutExtendedSyntax" columnstretch="0,1" columnminimumwidth="0,0">
-           <item row="2" column="0" alignment="Qt::AlignmentFlag::AlignHCenter|Qt::AlignmentFlag::AlignVCenter">
+          <layout class="QFormLayout" name="formLayout">
+           <item row="0" column="0" colspan="2">
+            <widget class="QLabel" name="labelExtendedSyntaxEx">
+             <property name="text">
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Extended marker syntax uses additional arguments to modify the behavior of markers.&lt;/p&gt;&lt;ul style=&quot;margin-top: 0px; margin-bottom: 0px; margin-left: 0px; margin-right: 0px; -qt-list-indent: 1;&quot;&gt;&lt;li style=&quot; margin-top:12px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Arguments are specified after the : character.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Multiple arguments are separated by the , character.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;An argument is specified in the form 'name = value'.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Whitespace is ignored.&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;An example of extended marker syntax is {glossary : dict = 1}.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="0">
             <widget class="QLabel" name="labelExtendedDicId">
              <property name="font">
               <font>
@@ -1617,7 +1627,17 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="3" column="0" alignment="Qt::AlignmentFlag::AlignHCenter|Qt::AlignmentFlag::AlignVCenter">
+           <item row="1" column="1">
+            <widget class="QLabel" name="labelExtendedDicIdEx">
+             <property name="text">
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Filter to only use entries from a particular dictionary. Identifies dictionaries using dictionary IDs. IDs can be found in &lt;span style=&quot; font-weight:700;&quot;&gt;Options&lt;/span&gt; under &lt;span style=&quot; font-weight:700;&quot;&gt;Dictionaries&lt;/span&gt; at the end of dictionary names. Applies to term markers &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary}&lt;/span&gt;, &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary-brief}&lt;/span&gt;, and &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary-compact}&lt;/span&gt;.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item row="2" column="0">
             <widget class="QLabel" name="labelExtendedScreenshotWidth">
              <property name="font">
               <font>
@@ -1632,17 +1652,17 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="4" column="1">
-            <widget class="QLabel" name="labelExtendedScreenshotHeightEx">
+           <item row="2" column="1">
+            <widget class="QLabel" name="labelExtendedScreenshotWidthEx">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine the maximum height of a saved screenshot. A value of -1 leaves this unbounded. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: -1.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine the maximum width of a saved screenshot. A value of -1 leaves this unbounded. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: -1.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>
              </property>
             </widget>
            </item>
-           <item row="4" column="0" alignment="Qt::AlignmentFlag::AlignHCenter|Qt::AlignmentFlag::AlignVCenter">
+           <item row="3" column="0">
             <widget class="QLabel" name="labelExtendedScreenshotHeight">
              <property name="font">
               <font>
@@ -1657,17 +1677,17 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="5" column="1">
-            <widget class="QLabel" name="labelExtendedScreenshotKeepAspect">
+           <item row="3" column="1">
+            <widget class="QLabel" name="labelExtendedScreenshotHeightEx">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;If true, maintains the aspect ratio of the image during resize. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: true.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine the maximum height of a saved screenshot. A value of -1 leaves this unbounded. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: -1.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>
              </property>
             </widget>
            </item>
-           <item row="5" column="0" alignment="Qt::AlignmentFlag::AlignHCenter|Qt::AlignmentFlag::AlignVCenter">
+           <item row="4" column="0">
             <widget class="QLabel" name="labelExtendedScreenshotKeepAspectEx">
              <property name="font">
               <font>
@@ -1682,50 +1702,17 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="8" column="0">
-            <spacer name="spacerExtendedSyntax">
-             <property name="orientation">
-              <enum>Qt::Orientation::Vertical</enum>
-             </property>
-             <property name="sizeHint" stdset="0">
-              <size>
-               <width>20</width>
-               <height>40</height>
-              </size>
-             </property>
-            </spacer>
-           </item>
-           <item row="2" column="1">
-            <widget class="QLabel" name="labelExtendedDicIdEx">
+           <item row="4" column="1">
+            <widget class="QLabel" name="labelExtendedScreenshotKeepAspect">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Filter to only use entries from a particular dictionary. Identifies dictionaries using dictionary IDs. IDs can be found in &lt;span style=&quot; font-weight:700;&quot;&gt;Options&lt;/span&gt; under &lt;span style=&quot; font-weight:700;&quot;&gt;Dictionaries&lt;/span&gt; at the end of dictionary names. Applies to term markers &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary}&lt;/span&gt;, &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary-brief}&lt;/span&gt;, and &lt;span style=&quot; font-weight:700;&quot;&gt;{glossary-compact}&lt;/span&gt;.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;If true, maintains the aspect ratio of the image during resize. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: true.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>
              </property>
             </widget>
            </item>
-           <item row="3" column="1">
-            <widget class="QLabel" name="labelExtendedScreenshotWidthEx">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine the maximum width of a saved screenshot. A value of -1 leaves this unbounded. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot}&lt;/span&gt; and &lt;span style=&quot; font-weight:700;&quot;&gt;{screenshot-video}&lt;/span&gt;. Default value: -1.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-             <property name="wordWrap">
-              <bool>true</bool>
-             </property>
-            </widget>
-           </item>
-           <item row="1" column="0" colspan="2">
-            <widget class="QLabel" name="labelExtendedSyntaxEx">
-             <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Extended marker syntax uses additional arguments to modify the behavior of markers.&lt;/p&gt;&lt;ul style=&quot;margin-top: 0px; margin-bottom: 0px; margin-left: 0px; margin-right: 0px; -qt-list-indent: 1;&quot;&gt;&lt;li style=&quot; margin-top:12px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Arguments are specified after the : character.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Multiple arguments are separated by the , character.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;An argument is specified in the form 'name = value'.&lt;/li&gt;&lt;li style=&quot; margin-top:0px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;Whitespace is ignored.&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;An example of extended marker syntax is {glossary : dict = 1}.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-             <property name="wordWrap">
-              <bool>true</bool>
-             </property>
-            </widget>
-           </item>
-           <item row="6" column="0" alignment="Qt::AlignmentFlag::AlignHCenter">
+           <item row="5" column="0">
             <widget class="QLabel" name="labelExtendedFrequencyMinValue">
              <property name="font">
               <font>
@@ -1740,14 +1727,17 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="6" column="1">
+           <item row="5" column="1">
             <widget class="QLabel" name="labelExtendedFrequencyMinValueEx">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Only export the lowest value frequency. Applies to marker &lt;span style=&quot; font-weight:700;&quot;&gt;{frequencies}&lt;/span&gt;. Default value: false.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine if to only export the lowest value frequency. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{frequencies}&lt;/span&gt;. Default value: false.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
              </property>
             </widget>
            </item>
-           <item row="7" column="0" alignment="Qt::AlignmentFlag::AlignHCenter">
+           <item row="6" column="0">
             <widget class="QLabel" name="labelExtendedFrequencyValueOnly">
              <property name="font">
               <font>
@@ -1762,12 +1752,28 @@ These will expand to larger expressions in the final card.</string>
              </property>
             </widget>
            </item>
-           <item row="7" column="1">
+           <item row="6" column="1">
             <widget class="QLabel" name="labelExtendedFrequencyValueOnlyEx">
              <property name="text">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Export frequency values without the dictionary names. Applies to marker &lt;span style=&quot; font-weight:700;&quot;&gt;{frequencies}&lt;/span&gt;. Default value: false.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Used to determine if to only export frequency value without the dictionary name. Applies to markers &lt;span style=&quot; font-weight:700;&quot;&gt;{frequencies}&lt;/span&gt;. Default value: false.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
              </property>
             </widget>
+           </item>
+           <item row="7" column="0">
+            <spacer name="spacerExtendedSyntax">
+             <property name="orientation">
+              <enum>Qt::Orientation::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>40</height>
+              </size>
+             </property>
+            </spacer>
            </item>
           </layout>
          </widget>

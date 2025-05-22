@@ -9,4 +9,5 @@ option(MAC_CROSSCOMPILE_X86 "Enables ARM machines to cross compile for x86" OFF)
 option(RELEASE_BUILD "Toggle to build with release settings" OFF)
 
 option(OCR_SUPPORT "Support for OCR through MangaOCR" OFF)
+option(ASR_SUPPORT "Support for ASR through whisper.cpp" OFF)
 option(MECAB_SUPPORT "Support for deconjugation with MeCab" OFF)
