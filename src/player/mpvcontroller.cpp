@@ -21,6 +21,7 @@
 #include "player/mpvcontroller.h"
 
 #include <cinttypes>
+#include <vector>
 
 #include <QTemporaryFile>
 
@@ -357,6 +358,60 @@ void MpvController::showText(const QString &text)
     if (::mpv_command_async(handle(), 0, command))
     {
         qWarning("Could not show text '%s'", qUtf8Printable(text));
+    }
+}
+
+QString MpvController::clientName() const
+{
+    if (handle())
+    {
+        const char *name = ::mpv_client_name(handle());
+        if (name)
+        {
+            return QString::fromUtf8(name);
+        }
+    }
+    return QString();
+}
+
+void MpvController::scriptMessageTo(
+    const QString &target,
+    const QVariantList &args)
+{
+    if (target.isEmpty())
+    {
+        return;
+    }
+    if (args.isEmpty())
+    {
+        return;
+    }
+
+    std::vector<QByteArray> byteArrays;
+    byteArrays.reserve(args.size() + 2);
+    std::vector<const char *> cmdArgs;
+    cmdArgs.reserve(args.size() + 3);
+
+    byteArrays.push_back("script-message-to");
+    cmdArgs.push_back(byteArrays.back().constData());
+    byteArrays.push_back(target.toUtf8());
+    cmdArgs.push_back(byteArrays.back().constData());
+    for (const QVariant &arg : args)
+    {
+        byteArrays.push_back(arg.toString().toUtf8());
+        cmdArgs.push_back(byteArrays.back().constData());
+    }
+    cmdArgs.push_back(nullptr);
+
+    int ret = ::mpv_command_async(handle(), 0, cmdArgs.data());
+    if (ret < 0)
+    {
+        qWarning()
+            << "Failed to send script message to mpv:"
+            << target
+            << args
+            << "Error:"
+            << ::mpv_error_string(ret);
     }
 }
 

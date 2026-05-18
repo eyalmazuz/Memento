@@ -25,6 +25,7 @@
 #else
 #include <QQuickFramebufferObject>
 #endif // Q_OS_MACOS
+#include <QVariant>
 
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
@@ -134,6 +135,13 @@ public:
     void setController(MpvController *controller);
 
 signals:
+    /**
+     * @brief Emitted when a client message is received from an mpv script.
+     *
+     * @param args The arguments of the client message.
+     */
+    void clientMessage(const QVariantList &args);
+
     /**
      * @brief Emitted when the render context is created.
      */

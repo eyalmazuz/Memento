@@ -24,6 +24,7 @@
 
 #include <QPoint>
 #include <QSet>
+#include <QVariant>
 
 class MpvPlayer;
 struct mpv_handle;
@@ -274,7 +275,24 @@ public:
     Q_INVOKABLE void showText(const QString &text);
 
     /**
-     * @brief Sends a keypress to the player.
+     * @brief Gets the client name of the mpv instance.
+     *
+     * @return The client name.
+     */
+    Q_INVOKABLE QString clientName() const;
+
+    /**
+     * @brief Sends a script message to an mpv script.
+     *
+     * @param target The target script name.
+     * @param args The script message and its arguments.
+     */
+    Q_INVOKABLE void scriptMessageTo(
+        const QString &target,
+        const QVariantList &args);
+
+    /**
+     * @brief Sends a key press event to the player.
      *
      * @param key The Qt key pressed.
      * @param modifiers The modifiers held.

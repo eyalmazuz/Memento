@@ -774,6 +774,19 @@ void MpvPlayer::handleMpvEvent(mpv_event *event)
         break;
     }
 
+    case MPV_EVENT_CLIENT_MESSAGE:
+    {
+        mpv_event_client_message *msg =
+            reinterpret_cast<mpv_event_client_message *>(event->data);
+        QVariantList args;
+        for (int i = 0; i < msg->num_args; i++)
+        {
+            args.append(QString::fromUtf8(msg->args[i]));
+        }
+        emit clientMessage(args);
+        break;
+    }
+
     default:
         break;
     }

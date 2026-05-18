@@ -43,6 +43,20 @@ target_link_libraries(
 
 
 add_library(
+    thumbnailprovider
+    thumbnailprovider.cpp
+    thumbnailprovider.h
+)
+target_compile_features(thumbnailprovider PRIVATE cxx_std_20)
+target_include_directories(thumbnailprovider PRIVATE ${MEMENTO_INCLUDE_DIRS})
+target_compile_options(thumbnailprovider PRIVATE ${MEMENTO_COMPILER_FLAGS})
+target_link_libraries(
+    thumbnailprovider
+    PRIVATE Qt6::Gui
+    PUBLIC Qt6::Quick
+)
+
+add_library(
     quickpaths
     paths.cpp
     paths.h

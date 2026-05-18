@@ -82,6 +82,68 @@ Slider {
         }
     }
 
+    onCursorValueChanged: {
+        if (!root.enabled || root.cursorValue === -1)
+        {
+            if (player.thumbShow)
+            {
+                player.thumbShow = false;
+                player.controller.scriptMessageTo(
+                    "thumbfast",
+                    [
+                        "clear"
+                    ]
+                );
+            }
+        }
+        else if (player.thumbAvailable)
+        {
+            player.controller.scriptMessageTo(
+                "thumbfast",
+                [
+                    "thumb",
+                    root.cursorValue.toString(),
+                    "",
+                    "",
+                    player.controller.clientName()
+                ]
+            );
+        }
+    }
+
+    Rectangle {
+        id: thumbFrame
+
+        readonly property int imageMargin: 2
+
+        visible:
+            player.thumbShow &&
+            root.enabled &&
+            (root.hovered || root.pressed)
+        width: player.thumbWidth + imageMargin * 2
+        height: player.thumbHeight + imageMargin * 2
+        color: MementoPalette.window
+        border.color: MementoPalette.border
+        border.width: 1
+        radius: 4
+        anchors.bottom: parent.top
+        anchors.bottomMargin: 10
+        x: {
+            const max_x = root.width - width;
+            return Math.max(0, Math.min(max_x, root.xPosition - width / 2));
+        }
+
+        Image {
+            id: thumbImage
+
+            anchors.fill: parent
+            anchors.margins: thumbFrame.imageMargin
+            source: player.thumbFile
+            asynchronous: true
+            cache: false
+        }
+    }
+
     StrokeLabel {
         anchors.verticalCenter: parent.verticalCenter
         x: {

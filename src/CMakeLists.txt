@@ -140,6 +140,7 @@ target_link_libraries(
     PRIVATE screensaver
     PRIVATE settings
     PRIVATE subtitle
+    PRIVATE thumbnailprovider
     PRIVATE utils
 )
 

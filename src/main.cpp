@@ -55,6 +55,7 @@
 #include "quick/coloredsvgprovider.h"
 #include "quick/keytracker.h"
 #include "quick/paths.h"
+#include "quick/thumbnailprovider.h"
 #include "setting/settings.h"
 #include "state/context.h"
 #include "subtitle/subtitlelistmodel.h"
@@ -250,6 +251,7 @@ static void registerQmlTypes(Context &context)
 static void registerImageProviders(QQmlApplicationEngine &engine)
 {
     engine.addImageProvider("svgicon", new ColoredSvgProvider);
+    engine.addImageProvider("thumbnail", new ThumbnailProvider);
 }
 
 int main(int argc, char *argv[])
