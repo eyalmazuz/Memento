@@ -134,6 +134,9 @@ namespace Keys
         constexpr const char *OSC_MPV_CURSOR = "osc-mpv-cursor";
         constexpr bool OSC_MPV_CURSOR_DEFAULT = false;
 
+        constexpr const char *TIMELINE_PREVIEWS = "timeline-previews";
+        constexpr bool TIMELINE_PREVIEWS_DEFAULT = true;
+
         constexpr const char *OSC_DURATION = "osc-duration";
         constexpr int OSC_DURATION_DEFAULT = 700;
 

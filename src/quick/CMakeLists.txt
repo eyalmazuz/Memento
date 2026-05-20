@@ -46,6 +46,8 @@ add_library(
     thumbnailprovider
     thumbnailprovider.cpp
     thumbnailprovider.h
+    thumbnailmanager.cpp
+    thumbnailmanager.h
 )
 target_compile_features(thumbnailprovider PRIVATE cxx_std_20)
 target_include_directories(thumbnailprovider PRIVATE ${MEMENTO_INCLUDE_DIRS})
@@ -54,6 +56,7 @@ target_link_libraries(
     thumbnailprovider
     PRIVATE Qt6::Gui
     PUBLIC Qt6::Quick
+    PUBLIC mpv::mpv
 )
 
 add_library(

@@ -276,6 +276,12 @@ void Settings::loadBehaviorSettings()
             Keys::Behavior::OSC_MPV_CURSOR_DEFAULT
         ).toBool()
     );
+    setBehaviorTimelinePreviews(
+        s.value(
+            Keys::Behavior::TIMELINE_PREVIEWS,
+            Keys::Behavior::TIMELINE_PREVIEWS_DEFAULT
+        ).toBool()
+    );
     setBehaviorOscDuration(
         s.value(
             Keys::Behavior::OSC_DURATION,
@@ -346,6 +352,10 @@ void Settings::writeBehaviorSettings()
         behaviorOscMpvCursor()
     );
     s.setValue(
+        Keys::Behavior::TIMELINE_PREVIEWS,
+        behaviorTimelinePreviews()
+    );
+    s.setValue(
         Keys::Behavior::OSC_DURATION,
         behaviorOscDuration()
     );
@@ -386,6 +396,7 @@ void Settings::defaultBehaviorSettings()
     setBehaviorAutoFit();
     setBehaviorAutoFitPercent();
     setBehaviorOscMpvCursor();
+    setBehaviorTimelinePreviews();
     setBehaviorOscDuration();
     setBehaviorOscFadeDuration();
     setBehaviorOscMinMove();
@@ -1452,6 +1463,21 @@ void Settings::setBehaviorOscMpvCursor(bool value)
     }
     m_behavior.oscMpvCursor = value;
     emit behaviorOscMpvCursorChanged(m_behavior.oscMpvCursor);
+}
+
+bool Settings::behaviorTimelinePreviews() const noexcept
+{
+    return m_behavior.timelinePreviews;
+}
+
+void Settings::setBehaviorTimelinePreviews(bool value)
+{
+    if (m_behavior.timelinePreviews == value)
+    {
+        return;
+    }
+    m_behavior.timelinePreviews = value;
+    emit behaviorTimelinePreviewsChanged(m_behavior.timelinePreviews);
 }
 
 int Settings::behaviorOscDuration() const noexcept

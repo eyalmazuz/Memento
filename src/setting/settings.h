@@ -111,6 +111,13 @@ class Settings : public QObject
     )
 
     Q_PROPERTY(
+        bool behaviorTimelinePreviews
+        READ behaviorTimelinePreviews
+        WRITE setBehaviorTimelinePreviews
+        NOTIFY behaviorTimelinePreviewsChanged
+    )
+
+    Q_PROPERTY(
         int behaviorOscDuration
         READ behaviorOscDuration
         WRITE setBehaviorOscDuration
@@ -830,6 +837,24 @@ public:
      */
     void setBehaviorOscMpvCursor(
         bool value = Keys::Behavior::OSC_MPV_CURSOR_DEFAULT);
+
+    /**
+     * @brief Gets the timeline preview setting.
+     *
+     * @return true if native timeline preview thumbnails should be shown,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool behaviorTimelinePreviews() const noexcept;
+
+    /**
+     * @brief Sets the timeline preview setting.
+     *
+     * @param value true to enable native timeline preview thumbnails,
+     * false otherwise.
+     */
+    void setBehaviorTimelinePreviews(
+        bool value = Keys::Behavior::TIMELINE_PREVIEWS_DEFAULT);
 
     /**
      * @brief Gets the show OSC duration in milliseconds.
@@ -1824,6 +1849,13 @@ signals:
     void behaviorOscMpvCursorChanged(bool value);
 
     /**
+     * @brief Emitted when the timeline preview setting is changed.
+     *
+     * @param value The new value.
+     */
+    void behaviorTimelinePreviewsChanged(bool value);
+
+    /**
      * @brief Emitted when the OSC duration is changed.
      *
      * @param value The new value.
@@ -2321,6 +2353,9 @@ private:
 
         /* Custom location for Setting::Directory::DirectoryCustom */
         QString fileOpenCustom{Keys::Behavior::FILE_OPEN_CUSTOM_DEFAULT};
+
+        /* true to enable native timeline preview thumbnails */
+        bool timelinePreviews{Keys::Behavior::TIMELINE_PREVIEWS_DEFAULT};
     };
     BehaviorSettings m_behavior{};
 

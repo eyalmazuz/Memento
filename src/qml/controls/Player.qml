@@ -17,56 +17,18 @@ MpvPlayer {
 
     property point cursorPosition: Qt.point(0, 0)
 
-    property bool thumbAvailable: false
+    readonly property bool thumbAvailable: root.state.path !== "" && MementoSettings.behaviorTimelinePreviews
     property string thumbFile: ""
-    property int thumbWidth: 0
-    property int thumbHeight: 0
+    readonly property int thumbWidth: 240
+    readonly property int thumbHeight: root.state.videoWidth > 0 ?
+        Math.round(240 * root.state.videoHeight / root.state.videoWidth) : 135
     property bool thumbShow: false
     property int thumbUpdateCounter: 0
 
-    onClientMessage: function(args) {
-        if (args.length < 2)
-        {
-            return;
-        }
-
-        if (args[0] === "thumbfast-info")
-        {
-            try
-            {
-                const data = JSON.parse(args[1]);
-                root.thumbAvailable = data.available && !data.disabled;
-                if (!root.thumbAvailable)
-                {
-                    root.thumbShow = false;
-                }
-            }
-            catch (e)
-            {
-                console.error("Failed to parse thumbfast-info JSON", e);
-            }
-        }
-        else if (args[0] === "thumbfast-render")
-        {
-            try
-            {
-                const data = JSON.parse(args[1]);
-                const scale = data.scale_factor || 1;
-                const thumbnail = data.thumbnail.endsWith(".bgra") ?
-                    data.thumbnail : data.thumbnail + ".bgra";
-                root.thumbWidth = data.width * scale;
-                root.thumbHeight = data.height * scale;
-                root.thumbUpdateCounter++;
-                root.thumbFile = "image://thumbnail/" +
-                    root.thumbUpdateCounter + "/" +
-                    data.width + "/" + data.height + "/" + thumbnail;
-                root.thumbShow = true;
-            }
-            catch (e)
-            {
-                console.error("Failed to parse thumbfast-render JSON", e);
-            }
-        }
+    Binding {
+        target: ThumbnailManager
+        property: "source"
+        value: root.thumbAvailable ? root.state.path : ""
     }
 
     enum OscVisibility

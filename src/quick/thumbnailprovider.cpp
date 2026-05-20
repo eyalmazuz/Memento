@@ -19,146 +19,39 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "thumbnailprovider.h"
+#include "thumbnailmanager.h"
 
-#include <QFile>
-#include <QImage>
-#include <QStringList>
-#include <QThread>
-
-namespace
-{
-
-constexpr qsizetype THUMBNAIL_WIDTH_INDEX = 1;
-constexpr qsizetype THUMBNAIL_HEIGHT_INDEX = 2;
-constexpr qsizetype THUMBNAIL_PATH_INDEX = 3;
-static constexpr int THUMBNAIL_RETRY_COUNT = 3;
-static constexpr unsigned long THUMBNAIL_RETRY_DELAY_MS = 5;
-
-/* Begin Static Functions */
-
-/**
- * @brief Parses a thumbnail provider image id.
- *
- * @param id The image id passed by QML.
- * @param[out] width The parsed raw thumbnail width.
- * @param[out] height The parsed raw thumbnail height.
- * @param[out] path The parsed raw thumbnail file path.
- * @return true if the id is valid,
- * @return false otherwise.
- */
-[[nodiscard]]
-bool parseThumbnailId(
-    const QString &id,
-    int &width,
-    int &height,
-    QString &path)
-{
-    QStringList parts = id.split('/', Qt::KeepEmptyParts);
-    if (parts.size() <= THUMBNAIL_PATH_INDEX)
-    {
-        return false;
-    }
-
-    bool widthOkay = false;
-    bool heightOkay = false;
-    width = parts[THUMBNAIL_WIDTH_INDEX].toInt(&widthOkay);
-    height = parts[THUMBNAIL_HEIGHT_INDEX].toInt(&heightOkay);
-    path = parts.mid(THUMBNAIL_PATH_INDEX).join('/');
-    return widthOkay && heightOkay && width > 0 && height > 0 &&
-        !path.isEmpty();
-}
-
-/**
- * @brief Reads thumbnail bytes from a path, retrying short write races.
- *
- * @param path The raw thumbnail path to read.
- * @param expectedSize The minimum number of bytes expected.
- * @return The thumbnail bytes. Empty if the file could not be read.
- */
-[[nodiscard]]
-QByteArray readThumbnailData(const QString &path, qint64 expectedSize)
-{
-    QStringList paths{path};
-    if (!path.endsWith(".bgra"))
-    {
-        paths.append(path + ".bgra");
-    }
-
-    for (int retry = 0; retry < THUMBNAIL_RETRY_COUNT; ++retry)
-    {
-        for (const QString &candidate : paths)
-        {
-            QFile file(candidate);
-            if (!file.open(QIODevice::ReadOnly))
-            {
-                continue;
-            }
-
-            QByteArray data = file.readAll();
-            if (data.size() >= expectedSize)
-            {
-                return data;
-            }
-        }
-
-        QThread::msleep(THUMBNAIL_RETRY_DELAY_MS);
-    }
-
-    return {};
-}
-
-}
-
-/* End Static Functions */
-
-/* Begin Constructor */
-
-ThumbnailProvider::ThumbnailProvider()
+ThumbnailProvider::ThumbnailProvider(ThumbnailManager *manager)
     : QQuickImageProvider(QQuickImageProvider::Image)
+    , m_manager(manager)
 {
 }
-
-/* End Constructor */
-
-/* Begin Public Functions */
 
 QImage ThumbnailProvider::requestImage(
     const QString &id,
     QSize *size,
     const QSize &requestedSize)
 {
-    Q_UNUSED(requestedSize);
+    // The id contains the timestamp, e.g. "123.45" or "123.45?u=1"
+    QString timeStr = id;
+    int queryIndex = id.indexOf('?');
+    if (queryIndex != -1)
+    {
+        timeStr = id.left(queryIndex);
+    }
 
-    int width = 0;
-    int height = 0;
-    QString path;
-    if (!parseThumbnailId(id, width, height, path))
+    bool ok = false;
+    double time = timeStr.toDouble(&ok);
+    if (!ok || !m_manager)
     {
         return QImage();
     }
 
-    qint64 expectedSize = static_cast<qint64>(width) * height * 4;
-    QByteArray data = readThumbnailData(path, expectedSize);
-    if (data.isEmpty())
-    {
-        return QImage();
-    }
-
-    /* Format_ARGB32 matches little-endian BGRA memory layout natively */
-    QImage image(
-        reinterpret_cast<const uchar *>(data.constData()),
-        width,
-        height,
-        QImage::Format_ARGB32
-    );
-
+    QImage image = m_manager->renderThumbnail(time, requestedSize);
     if (size)
     {
         *size = image.size();
     }
 
-    /* Copy the image because it points to the temporary QByteArray data. */
-    return image.copy();
+    return image;
 }
-
-/* End Public Functions */

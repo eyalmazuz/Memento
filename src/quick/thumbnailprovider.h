@@ -22,19 +22,21 @@
 
 #include <QQuickImageProvider>
 
+class ThumbnailManager;
+
 /**
- * @brief Provides thumbfast BGRA thumbnails to QML.
+ * @brief Provides thumbnails to QML by forwarding requests to ThumbnailManager.
  */
 class ThumbnailProvider : public QQuickImageProvider
 {
 public:
-    ThumbnailProvider();
+    explicit ThumbnailProvider(ThumbnailManager *manager);
     virtual ~ThumbnailProvider() = default;
 
     /**
      * @brief Requests an image from the provider.
      *
-     * @param id The id containing the revision, dimensions, and path.
+     * @param id The id containing the requested timestamp.
      * @param size The requested size of the image.
      * @param requestedSize The requested size of the image.
      * @return The requested image.
@@ -44,4 +46,7 @@ public:
         const QString &id,
         QSize *size,
         const QSize &requestedSize) override;
+
+private:
+    ThumbnailManager *m_manager{nullptr};
 };

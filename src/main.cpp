@@ -56,6 +56,7 @@
 #include "quick/keytracker.h"
 #include "quick/paths.h"
 #include "quick/thumbnailprovider.h"
+#include "quick/thumbnailmanager.h"
 #include "setting/settings.h"
 #include "state/context.h"
 #include "subtitle/subtitlelistmodel.h"
@@ -104,7 +105,7 @@ static bool makeConfigDirectory()
  *
  * @param context The application context.
  */
-static void registerQmlTypes(Context &context)
+static void registerQmlTypes(Context &context, ThumbnailManager *thumbnailManager)
 {
     /* QCoro Types */
 
@@ -172,6 +173,9 @@ static void registerQmlTypes(Context &context)
     /* Player Types */
 
     qmlRegisterType<MpvPlayer>(MEMENTO_URI, 1, 0, "MpvPlayer");
+    qmlRegisterSingletonInstance<ThumbnailManager>(
+        MEMENTO_URI, 1, 0, "ThumbnailManager", thumbnailManager
+    );
     qmlRegisterUncreatableType<MpvState>(
         MEMENTO_URI, 1, 0, "MpvState",
         "MpvState cannot be created directly from QML. "
@@ -248,10 +252,10 @@ static void registerQmlTypes(Context &context)
  *
  * @param engine The QML application engine.
  */
-static void registerImageProviders(QQmlApplicationEngine &engine)
+static void registerImageProviders(QQmlApplicationEngine &engine, ThumbnailManager *thumbnailManager)
 {
     engine.addImageProvider("svgicon", new ColoredSvgProvider);
-    engine.addImageProvider("thumbnail", new ThumbnailProvider);
+    engine.addImageProvider("thumbnail", new ThumbnailProvider(thumbnailManager));
 }
 
 int main(int argc, char *argv[])
@@ -327,8 +331,10 @@ int main(int argc, char *argv[])
         &context, QQmlEngine::CppOwnership
     );
 
-    registerQmlTypes(context);
-    registerImageProviders(engine);
+    auto *thumbnailManager = new ThumbnailManager(&app);
+
+    registerQmlTypes(context, thumbnailManager);
+    registerImageProviders(engine, thumbnailManager);
 
     MainManager mainManager(&engine, &context, &engine);
 

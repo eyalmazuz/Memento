@@ -88,26 +88,13 @@ Slider {
             if (player.thumbShow)
             {
                 player.thumbShow = false;
-                player.controller.scriptMessageTo(
-                    "thumbfast",
-                    [
-                        "clear"
-                    ]
-                );
             }
         }
         else if (player.thumbAvailable)
         {
-            player.controller.scriptMessageTo(
-                "thumbfast",
-                [
-                    "thumb",
-                    root.cursorValue.toString(),
-                    "",
-                    "",
-                    player.controller.clientName()
-                ]
-            );
+            player.thumbUpdateCounter++;
+            player.thumbFile = "image://thumbnail/" + root.cursorValue + "?u=" + player.thumbUpdateCounter;
+            player.thumbShow = true;
         }
     }
 
@@ -139,6 +126,8 @@ Slider {
             anchors.fill: parent
             anchors.margins: thumbFrame.imageMargin
             source: player.thumbFile
+            sourceSize.width: player.thumbWidth
+            sourceSize.height: player.thumbHeight
             asynchronous: true
             cache: false
         }
