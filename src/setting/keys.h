@@ -91,6 +91,7 @@ namespace Keys
         constexpr const char *GROUP = "internal";
 
         constexpr const char *AUTO_UPDATE_OPT_IN_SHOWN = "auto-update-opt-in-shown";
+        constexpr const char *WHISPER_NO_MODEL_PROMPT_DISMISSED = "whisper-no-model-prompt-dismissed";
     }
 
     namespace Recent
@@ -434,5 +435,43 @@ namespace Keys
 
         constexpr const char *MODEL = "model";
         constexpr const char *MODEL_DEFAULT = "kha-white/manga-ocr-base";
+    }
+
+    namespace Whisper
+    {
+        constexpr const char *GROUP = "whisper";
+
+        constexpr const char *ENABLED = "enable";
+        constexpr bool ENABLED_DEFAULT = true;
+
+        constexpr const char *MODEL = "model";
+        constexpr const char *MODEL_DEFAULT = "base";
+
+        constexpr const char *CUSTOM_MODEL = "custom-model";
+        constexpr const char *CUSTOM_MODEL_DEFAULT = "";
+
+        constexpr const char *VAD_ENABLED = "vad-enable";
+        constexpr bool VAD_ENABLED_DEFAULT = false;
+
+        constexpr const char *VAD_MODEL = "vad-model";
+        constexpr const char *VAD_MODEL_DEFAULT = "ggml-silero-v6.2.0.bin";
+
+        constexpr const char *USE_GPU = "use-gpu";
+        constexpr bool USE_GPU_DEFAULT = true;
+
+        constexpr const char *GPU_DEVICE = "gpu-device";
+        constexpr int GPU_DEVICE_DEFAULT = 0;
+
+        constexpr const char *THREADS = "threads";
+        constexpr int THREADS_DEFAULT = 0;
+
+        constexpr const char *BEST_OF = "best-of";
+        constexpr int BEST_OF_DEFAULT = 5;
+
+        constexpr const char *BEAM_SIZE = "beam-size";
+        constexpr int BEAM_SIZE_DEFAULT = 5;
+
+        constexpr const char *FLASH_ATTN = "flash-attn";
+        constexpr bool FLASH_ATTN_DEFAULT = true;
     }
 }
