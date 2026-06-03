@@ -64,6 +64,13 @@ class Settings : public QObject
         NOTIFY internalAutoUpdateOptInShownChanged
     )
 
+    Q_PROPERTY(
+        bool internalWhisperNoModelPromptDismissed
+        READ internalWhisperNoModelPromptDismissed
+        WRITE setInternalWhisperNoModelPromptDismissed
+        NOTIFY internalWhisperNoModelPromptDismissedChanged
+    )
+
     /* Recent Settings */
 
     Q_PROPERTY(
@@ -536,6 +543,91 @@ class Settings : public QObject
         NOTIFY ocrModelChanged
     )
 
+    /* Whisper Settings */
+
+    Q_PROPERTY(
+        bool whisperEnabled
+        READ whisperEnabled
+        WRITE setWhisperEnabled
+        NOTIFY whisperEnabledChanged
+    )
+
+    Q_PROPERTY(
+        QString whisperModel
+        READ whisperModel
+        WRITE setWhisperModel
+        NOTIFY whisperModelChanged
+    )
+
+    Q_PROPERTY(
+        QString whisperCustomModel
+        READ whisperCustomModel
+        WRITE setWhisperCustomModel
+        NOTIFY whisperCustomModelChanged
+    )
+
+    Q_PROPERTY(
+        bool whisperVadEnabled
+        READ whisperVadEnabled
+        WRITE setWhisperVadEnabled
+        NOTIFY whisperVadEnabledChanged
+    )
+
+    Q_PROPERTY(
+        QString whisperVadModel
+        READ whisperVadModel
+        WRITE setWhisperVadModel
+        NOTIFY whisperVadModelChanged
+    )
+
+    Q_PROPERTY(
+        bool whisperUseGpu
+        READ whisperUseGpu
+        WRITE setWhisperUseGpu
+        NOTIFY whisperUseGpuChanged
+    )
+
+    Q_PROPERTY(
+        int whisperGpuDevice
+        READ whisperGpuDevice
+        WRITE setWhisperGpuDevice
+        NOTIFY whisperGpuDeviceChanged
+    )
+
+    Q_PROPERTY(
+        int whisperThreads
+        READ whisperThreads
+        WRITE setWhisperThreads
+        NOTIFY whisperThreadsChanged
+    )
+
+    Q_PROPERTY(
+        int whisperMaxThreads
+        READ whisperMaxThreads
+        CONSTANT
+    )
+
+    Q_PROPERTY(
+        int whisperBestOf
+        READ whisperBestOf
+        WRITE setWhisperBestOf
+        NOTIFY whisperBestOfChanged
+    )
+
+    Q_PROPERTY(
+        int whisperBeamSize
+        READ whisperBeamSize
+        WRITE setWhisperBeamSize
+        NOTIFY whisperBeamSizeChanged
+    )
+
+    Q_PROPERTY(
+        bool whisperFlashAttention
+        READ whisperFlashAttention
+        WRITE setWhisperFlashAttention
+        NOTIFY whisperFlashAttentionChanged
+    )
+
 public:
     Settings(QObject *parent = nullptr);
     virtual ~Settings();
@@ -721,6 +813,21 @@ public:
     Q_INVOKABLE void defaultOcrSettings();
 
     /**
+     * @brief Load Whisper settings from disc.
+     */
+    Q_INVOKABLE void loadWhisperSettings();
+
+    /**
+     * @brief Write Whisper settings to disc.
+     */
+    Q_INVOKABLE void writeWhisperSettings();
+
+    /**
+     * @brief Load Whisper settings defaults.
+     */
+    Q_INVOKABLE void defaultWhisperSettings();
+
+    /**
      * @brief The version of the settings file.
      *
      * @return The version number of the setting file.
@@ -786,6 +893,22 @@ public:
      * @param value true if the message has been shown, false otherwise.
      */
     void setInternalAutoUpdateOptInShown(bool value);
+
+    /**
+     * @brief Get if the no Whisper model prompt was dismissed.
+     *
+     * @return true if the prompt should not be shown,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool internalWhisperNoModelPromptDismissed() const noexcept;
+
+    /**
+     * @brief Set if the no Whisper model prompt was dismissed.
+     *
+     * @param value true if the prompt should not be shown, false otherwise.
+     */
+    void setInternalWhisperNoModelPromptDismissed(bool value);
 
     /* Recent Settings */
 
@@ -1881,6 +2004,193 @@ public:
     void setOcrModel(
         const QString &value = Keys::Ocr::MODEL_DEFAULT);
 
+    /* Whisper Settings */
+
+    /**
+     * @brief Gets if Whisper subtitle generation is enabled.
+     *
+     * @return true if Whisper subtitle generation is enabled,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool whisperEnabled() const noexcept;
+
+    /**
+     * @brief Sets if Whisper subtitle generation is enabled.
+     *
+     * @param value true to enable Whisper, false otherwise.
+     */
+    void setWhisperEnabled(
+        bool value = Keys::Whisper::ENABLED_DEFAULT);
+
+    /**
+     * @brief Gets the selected Whisper model preset.
+     *
+     * @return The selected model preset.
+     */
+    [[nodiscard]]
+    QString whisperModel() const noexcept;
+
+    /**
+     * @brief Sets the selected Whisper model preset.
+     *
+     * @param value The selected model preset.
+     */
+    void setWhisperModel(
+        const QString &value = Keys::Whisper::MODEL_DEFAULT);
+
+    /**
+     * @brief Gets the custom Whisper model path.
+     *
+     * @return The custom model path.
+     */
+    [[nodiscard]]
+    QString whisperCustomModel() const noexcept;
+
+    /**
+     * @brief Sets the custom Whisper model path.
+     *
+     * @param value The custom model path.
+     */
+    void setWhisperCustomModel(
+        const QString &value = Keys::Whisper::CUSTOM_MODEL_DEFAULT);
+
+    /**
+     * @brief Gets if VAD is enabled for Whisper.
+     *
+     * @return true if VAD is enabled,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool whisperVadEnabled() const noexcept;
+
+    /**
+     * @brief Sets if VAD is enabled for Whisper.
+     *
+     * @param value true to enable VAD, false otherwise.
+     */
+    void setWhisperVadEnabled(
+        bool value = Keys::Whisper::VAD_ENABLED_DEFAULT);
+
+    /**
+     * @brief Gets the VAD model path.
+     *
+     * @return The VAD model path.
+     */
+    [[nodiscard]]
+    QString whisperVadModel() const noexcept;
+
+    /**
+     * @brief Sets the VAD model path.
+     *
+     * @param value The VAD model path.
+     */
+    void setWhisperVadModel(
+        const QString &value = Keys::Whisper::VAD_MODEL_DEFAULT);
+
+    /**
+     * @brief Gets if Whisper should try GPU acceleration.
+     *
+     * @return true to try GPU acceleration,
+     * @return false to force CPU execution.
+     */
+    [[nodiscard]]
+    bool whisperUseGpu() const noexcept;
+
+    /**
+     * @brief Sets if Whisper should try GPU acceleration.
+     *
+     * @param value true to try GPU acceleration, false to force CPU.
+     */
+    void setWhisperUseGpu(
+        bool value = Keys::Whisper::USE_GPU_DEFAULT);
+
+    /**
+     * @brief Gets the Whisper GPU device index.
+     *
+     * @return The GPU device index.
+     */
+    [[nodiscard]]
+    int whisperGpuDevice() const noexcept;
+
+    /**
+     * @brief Sets the Whisper GPU device index.
+     *
+     * @param value The GPU device index.
+     */
+    void setWhisperGpuDevice(
+        int value = Keys::Whisper::GPU_DEVICE_DEFAULT);
+
+    /**
+     * @brief Gets the number of Whisper inference threads.
+     *
+     * @return The number of inference threads.
+     */
+    [[nodiscard]]
+    int whisperThreads() const noexcept;
+
+    /**
+     * @brief Sets the number of Whisper inference threads.
+     *
+     * @param value The number of inference threads.
+     */
+    void setWhisperThreads(int value = Keys::Whisper::THREADS_DEFAULT);
+
+    /**
+     * @brief Gets the maximum selectable Whisper thread count.
+     *
+     * @return The maximum selectable thread count.
+     */
+    [[nodiscard]]
+    int whisperMaxThreads() const noexcept;
+
+    /**
+     * @brief Gets the Whisper best-of parameter.
+     *
+     * @return The best-of parameter.
+     */
+    [[nodiscard]]
+    int whisperBestOf() const noexcept;
+
+    /**
+     * @brief Sets the Whisper best-of parameter.
+     *
+     * @param value The best-of parameter.
+     */
+    void setWhisperBestOf(int value = Keys::Whisper::BEST_OF_DEFAULT);
+
+    /**
+     * @brief Gets the Whisper beam search size parameter.
+     *
+     * @return The beam search size parameter.
+     */
+    [[nodiscard]]
+    int whisperBeamSize() const noexcept;
+
+    /**
+     * @brief Sets the Whisper beam search size parameter.
+     *
+     * @param value The beam search size parameter.
+     */
+    void setWhisperBeamSize(int value = Keys::Whisper::BEAM_SIZE_DEFAULT);
+
+    /**
+     * @brief Gets if flash attention is enabled for Whisper.
+     *
+     * @return true if flash attention is enabled,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool whisperFlashAttention() const noexcept;
+
+    /**
+     * @brief Sets if flash attention is enabled for Whisper.
+     *
+     * @param value true to enable flash attention, false otherwise.
+     */
+    void setWhisperFlashAttention(
+        bool value = Keys::Whisper::FLASH_ATTN_DEFAULT);
+
 signals:
     /**
      * @brief Emitted when the version is changed.
@@ -1913,6 +2223,13 @@ signals:
      * @param value The new value.
      */
     void internalAutoUpdateOptInShownChanged(bool value);
+
+    /**
+     * @brief Emitted when the no Whisper model prompt dismissed state changes.
+     *
+     * @param value The new value.
+     */
+    void internalWhisperNoModelPromptDismissedChanged(bool value);
 
     /* Recent Settings */
 
@@ -2375,6 +2692,83 @@ signals:
      */
     void ocrModelChanged(const QString &value);
 
+    /**
+     * @brief Emitted when the Whisper enabled setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperEnabledChanged(bool value);
+
+    /**
+     * @brief Emitted when the Whisper model setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperModelChanged(const QString &value);
+
+    /**
+     * @brief Emitted when the custom Whisper model path is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperCustomModelChanged(const QString &value);
+
+    /**
+     * @brief Emitted when the Whisper VAD enabled setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperVadEnabledChanged(bool value);
+
+    /**
+     * @brief Emitted when the Whisper VAD model path is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperVadModelChanged(const QString &value);
+
+    /**
+     * @brief Emitted when the Whisper GPU setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperUseGpuChanged(bool value);
+
+    /**
+     * @brief Emitted when the Whisper GPU device index is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperGpuDeviceChanged(int value);
+
+    /**
+     * @brief Emitted when the Whisper thread count is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperThreadsChanged(int value);
+
+    /**
+     * @brief Emitted when the Whisper best-of setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperBestOfChanged(int value);
+
+    /**
+     * @brief Emitted when the Whisper beam size setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperBeamSizeChanged(int value);
+
+    /**
+     * @brief Emitted when the Whisper flash attention setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperFlashAttentionChanged(bool value);
+
 private:
     /**
      * @brief Loads the version from disc.
@@ -2414,6 +2808,9 @@ private:
     {
         /* true if the auto update opt in has been shown, false otherwise */
         bool autoUpdateOptInShown{false};
+
+        /* true if the no Whisper model prompt should not be shown */
+        bool whisperNoModelPromptDismissed{false};
     };
     InternalSettings m_internal{};
 
@@ -2720,4 +3117,44 @@ private:
         QString model{Keys::Ocr::MODEL_DEFAULT};
     };
     OcrSettings m_ocr{};
+
+    /**
+     * @brief Whisper settings.
+     */
+    struct WhisperSettings
+    {
+        /* true if Whisper subtitle generation is enabled */
+        bool enabled{Keys::Whisper::ENABLED_DEFAULT};
+
+        /* The selected Whisper model preset */
+        QString model{Keys::Whisper::MODEL_DEFAULT};
+
+        /* Custom Whisper model path */
+        QString customModel{Keys::Whisper::CUSTOM_MODEL_DEFAULT};
+
+        /* true if VAD is enabled */
+        bool vadEnabled{Keys::Whisper::VAD_ENABLED_DEFAULT};
+
+        /* VAD model path */
+        QString vadModel{Keys::Whisper::VAD_MODEL_DEFAULT};
+
+        /* true to try GPU acceleration */
+        bool useGpu{Keys::Whisper::USE_GPU_DEFAULT};
+
+        /* GPU device index */
+        int gpuDevice{Keys::Whisper::GPU_DEVICE_DEFAULT};
+
+        /* Inference thread count */
+        int threads{Keys::Whisper::THREADS_DEFAULT};
+
+        /* Number of best candidates */
+        int bestOf{Keys::Whisper::BEST_OF_DEFAULT};
+
+        /* Beam search size */
+        int beamSize{Keys::Whisper::BEAM_SIZE_DEFAULT};
+
+        /* true to use flash attention */
+        bool flashAttention{Keys::Whisper::FLASH_ATTN_DEFAULT};
+    };
+    WhisperSettings m_whisper{};
 };

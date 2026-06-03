@@ -20,8 +20,12 @@
 
 #include "setting/settings.h"
 
+#include <utility>
+
 #include <QDir>
 #include <QSettings>
+#include <QStringList>
+#include <QThread>
 
 #if defined(Q_OS_WIN)
 #include "util/utils.h"
@@ -56,6 +60,7 @@ void Settings::load()
     loadInterfaceSettings();
     loadKeybindSettings();
     loadOcrSettings();
+    loadWhisperSettings();
 }
 
 void Settings::write()
@@ -73,6 +78,7 @@ void Settings::write()
     writeInterfaceSettings();
     writeKeybindSettings();
     writeOcrSettings();
+    writeWhisperSettings();
 }
 
 void Settings::defaults()
@@ -86,6 +92,7 @@ void Settings::defaults()
     defaultInterfaceSettings();
     defaultKeybindSettings();
     defaultOcrSettings();
+    defaultWhisperSettings();
 }
 
 void Settings::loadVersion()
@@ -149,6 +156,12 @@ void Settings::loadInternalSettings()
             false
         ).toBool()
     );
+    setInternalWhisperNoModelPromptDismissed(
+        s.value(
+            Keys::Internal::WHISPER_NO_MODEL_PROMPT_DISMISSED,
+            false
+        ).toBool()
+    );
 
     s.endGroup();
 }
@@ -161,6 +174,10 @@ void Settings::writeInternalSettings()
     s.setValue(
         Keys::Internal::AUTO_UPDATE_OPT_IN_SHOWN,
         internalAutoUpdateOptInShown()
+    );
+    s.setValue(
+        Keys::Internal::WHISPER_NO_MODEL_PROMPT_DISMISSED,
+        internalWhisperNoModelPromptDismissed()
     );
 
     s.endGroup();
@@ -1413,6 +1430,149 @@ void Settings::defaultOcrSettings()
     setOcrModel();
 }
 
+void Settings::loadWhisperSettings()
+{
+    QSettings s;
+    s.beginGroup(Keys::Whisper::GROUP);
+
+    setWhisperEnabled(
+        s.value(
+            Keys::Whisper::ENABLED,
+            Keys::Whisper::ENABLED_DEFAULT
+        ).toBool()
+    );
+    setWhisperModel(
+        s.value(
+            Keys::Whisper::MODEL,
+            Keys::Whisper::MODEL_DEFAULT
+        ).toString()
+    );
+    setWhisperCustomModel(
+        s.value(
+            Keys::Whisper::CUSTOM_MODEL,
+            Keys::Whisper::CUSTOM_MODEL_DEFAULT
+        ).toString()
+    );
+    setWhisperVadEnabled(
+        s.value(
+            Keys::Whisper::VAD_ENABLED,
+            Keys::Whisper::VAD_ENABLED_DEFAULT
+        ).toBool()
+    );
+    setWhisperVadModel(
+        s.value(
+            Keys::Whisper::VAD_MODEL,
+            Keys::Whisper::VAD_MODEL_DEFAULT
+        ).toString()
+    );
+    setWhisperUseGpu(
+        s.value(
+            Keys::Whisper::USE_GPU,
+            Keys::Whisper::USE_GPU_DEFAULT
+        ).toBool()
+    );
+    setWhisperGpuDevice(
+        s.value(
+            Keys::Whisper::GPU_DEVICE,
+            Keys::Whisper::GPU_DEVICE_DEFAULT
+        ).toInt()
+    );
+    setWhisperThreads(
+        s.value(
+            Keys::Whisper::THREADS,
+            Keys::Whisper::THREADS_DEFAULT
+        ).toInt()
+    );
+    setWhisperBestOf(
+        s.value(
+            Keys::Whisper::BEST_OF,
+            Keys::Whisper::BEST_OF_DEFAULT
+        ).toInt()
+    );
+    setWhisperBeamSize(
+        s.value(
+            Keys::Whisper::BEAM_SIZE,
+            Keys::Whisper::BEAM_SIZE_DEFAULT
+        ).toInt()
+    );
+    setWhisperFlashAttention(
+        s.value(
+            Keys::Whisper::FLASH_ATTN,
+            Keys::Whisper::FLASH_ATTN_DEFAULT
+        ).toBool()
+    );
+
+    s.endGroup();
+}
+
+void Settings::writeWhisperSettings()
+{
+    QSettings s;
+    s.beginGroup(Keys::Whisper::GROUP);
+
+    s.setValue(
+        Keys::Whisper::ENABLED,
+        whisperEnabled()
+    );
+    s.setValue(
+        Keys::Whisper::MODEL,
+        whisperModel()
+    );
+    s.setValue(
+        Keys::Whisper::CUSTOM_MODEL,
+        whisperCustomModel()
+    );
+    s.setValue(
+        Keys::Whisper::VAD_ENABLED,
+        whisperVadEnabled()
+    );
+    s.setValue(
+        Keys::Whisper::VAD_MODEL,
+        whisperVadModel()
+    );
+    s.setValue(
+        Keys::Whisper::USE_GPU,
+        whisperUseGpu()
+    );
+    s.setValue(
+        Keys::Whisper::GPU_DEVICE,
+        whisperGpuDevice()
+    );
+    s.setValue(
+        Keys::Whisper::THREADS,
+        whisperThreads()
+    );
+    s.setValue(
+        Keys::Whisper::BEST_OF,
+        whisperBestOf()
+    );
+    s.setValue(
+        Keys::Whisper::BEAM_SIZE,
+        whisperBeamSize()
+    );
+    s.setValue(
+        Keys::Whisper::FLASH_ATTN,
+        whisperFlashAttention()
+    );
+
+    s.endGroup();
+}
+
+void Settings::defaultWhisperSettings()
+{
+    setWhisperEnabled();
+    setWhisperModel();
+    setWhisperCustomModel();
+    setWhisperVadEnabled();
+    setWhisperVadModel();
+    setWhisperUseGpu();
+    setWhisperGpuDevice();
+    setWhisperThreads();
+    setWhisperBestOf();
+    setWhisperBeamSize();
+    setWhisperFlashAttention();
+}
+
 /* Version Settings */
 
 unsigned int Settings::version() const noexcept
@@ -1477,6 +1637,23 @@ void Settings::setInternalAutoUpdateOptInShown(bool value)
     }
     m_internal.autoUpdateOptInShown = value;
     emit internalAutoUpdateOptInShownChanged(m_internal.autoUpdateOptInShown);
+}
+
+bool Settings::internalWhisperNoModelPromptDismissed() const noexcept
+{
+    return m_internal.whisperNoModelPromptDismissed;
+}
+
+void Settings::setInternalWhisperNoModelPromptDismissed(bool value)
+{
+    if (m_internal.whisperNoModelPromptDismissed == value)
+    {
+        return;
+    }
+    m_internal.whisperNoModelPromptDismissed = value;
+    emit internalWhisperNoModelPromptDismissedChanged(
+        m_internal.whisperNoModelPromptDismissed
+    );
 }
 
 /* Recent Settings */
@@ -2481,6 +2658,196 @@ void Settings::setOcrModel(const QString &value)
     }
     m_ocr.model = value;
     emit ocrModelChanged(m_ocr.model);
+}
+
+/* Whisper Settings */
+
+bool Settings::whisperEnabled() const noexcept
+{
+    return m_whisper.enabled;
+}
+
+void Settings::setWhisperEnabled(bool value)
+{
+    if (m_whisper.enabled == value)
+    {
+        return;
+    }
+    m_whisper.enabled = value;
+    emit whisperEnabledChanged(m_whisper.enabled);
+}
+
+QString Settings::whisperModel() const noexcept
+{
+    return m_whisper.model;
+}
+
+void Settings::setWhisperModel(const QString &value)
+{
+    static const QStringList MODELS{
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large-v3",
+        "large-v3-turbo",
+        "custom",
+    };
+
+    QString model = MODELS.contains(value) ?
+        value : QString(Keys::Whisper::MODEL_DEFAULT);
+    if (m_whisper.model == model)
+    {
+        return;
+    }
+    m_whisper.model = std::move(model);
+    emit whisperModelChanged(m_whisper.model);
+}
+
+QString Settings::whisperCustomModel() const noexcept
+{
+    return m_whisper.customModel;
+}
+
+void Settings::setWhisperCustomModel(const QString &value)
+{
+    if (m_whisper.customModel == value)
+    {
+        return;
+    }
+    m_whisper.customModel = value;
+    emit whisperCustomModelChanged(m_whisper.customModel);
+}
+
+bool Settings::whisperVadEnabled() const noexcept
+{
+    return m_whisper.vadEnabled;
+}
+
+void Settings::setWhisperVadEnabled(bool value)
+{
+    if (m_whisper.vadEnabled == value)
+    {
+        return;
+    }
+    m_whisper.vadEnabled = value;
+    emit whisperVadEnabledChanged(m_whisper.vadEnabled);
+}
+
+QString Settings::whisperVadModel() const noexcept
+{
+    return m_whisper.vadModel;
+}
+
+void Settings::setWhisperVadModel(const QString &value)
+{
+    if (m_whisper.vadModel == value)
+    {
+        return;
+    }
+    m_whisper.vadModel = value;
+    emit whisperVadModelChanged(m_whisper.vadModel);
+}
+
+bool Settings::whisperUseGpu() const noexcept
+{
+    return m_whisper.useGpu;
+}
+
+void Settings::setWhisperUseGpu(bool value)
+{
+    if (m_whisper.useGpu == value)
+    {
+        return;
+    }
+    m_whisper.useGpu = value;
+    emit whisperUseGpuChanged(m_whisper.useGpu);
+}
+
+int Settings::whisperGpuDevice() const noexcept
+{
+    return m_whisper.gpuDevice;
+}
+
+void Settings::setWhisperGpuDevice(int value)
+{
+    const int gpuDevice = qBound(0, value, 15);
+    if (m_whisper.gpuDevice == gpuDevice)
+    {
+        return;
+    }
+    m_whisper.gpuDevice = gpuDevice;
+    emit whisperGpuDeviceChanged(m_whisper.gpuDevice);
+}
+
+int Settings::whisperThreads() const noexcept
+{
+    return m_whisper.threads;
+}
+
+void Settings::setWhisperThreads(int value)
+{
+    const int threads = value <= 0 ?
+        qMin(4, whisperMaxThreads()) :
+        qBound(1, value, whisperMaxThreads());
+    if (m_whisper.threads == threads)
+    {
+        return;
+    }
+    m_whisper.threads = threads;
+    emit whisperThreadsChanged(m_whisper.threads);
+}
+
+int Settings::whisperMaxThreads() const noexcept
+{
+    return qMax(1, QThread::idealThreadCount());
+}
+
+int Settings::whisperBestOf() const noexcept
+{
+    return m_whisper.bestOf;
+}
+
+void Settings::setWhisperBestOf(int value)
+{
+    const int bestOf = qBound(1, value, 10);
+    if (m_whisper.bestOf == bestOf)
+    {
+        return;
+    }
+    m_whisper.bestOf = bestOf;
+    emit whisperBestOfChanged(m_whisper.bestOf);
+}
+
+int Settings::whisperBeamSize() const noexcept
+{
+    return m_whisper.beamSize;
+}
+
+void Settings::setWhisperBeamSize(int value)
+{
+    const int beamSize = qBound(1, value, 10);
+    if (m_whisper.beamSize == beamSize)
+    {
+        return;
+    }
+    m_whisper.beamSize = beamSize;
+    emit whisperBeamSizeChanged(m_whisper.beamSize);
+}
+
+bool Settings::whisperFlashAttention() const noexcept
+{
+    return m_whisper.flashAttention;
+}
+
+void Settings::setWhisperFlashAttention(bool value)
+{
+    if (m_whisper.flashAttention == value)
+    {
+        return;
+    }
+    m_whisper.flashAttention = value;
+    emit whisperFlashAttentionChanged(m_whisper.flashAttention);
 }
 
 /* Update Version */
