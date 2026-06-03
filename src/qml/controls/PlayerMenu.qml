@@ -365,25 +365,115 @@ MenuBar {
             }
 
             checkable: true
-            checked: root.player.state.sid === 0
+            checked: root.player.state.sid === 0 && !WhisperController.active
             ActionGroup.group: subtitleTrackGroup
             text: qsTr("None")
-            onTriggered: root.player.controller.setSid(0)
+            onTriggered: {
+                WhisperController.stop();
+                root.player.controller.setSid(0);
+            }
+        }
+
+        Instantiator {
+            id: whisperSubtitleInstantiator
+
+            model: Features.whisper && MementoSettings.whisperEnabled ? 1 : 0
+
+            delegate: Action {
+                readonly property bool selected:
+                    WhisperController.active && root.player.state.sid === 0
+
+                function syncChecked() {
+                    if (checked !== selected)
+                    {
+                        checked = selected;
+                    }
+                }
+
+                checkable: true
+                checked: selected
+                enabled: !WhisperController.running || WhisperController.active
+                text: WhisperController.running ?
+                    qsTr("Whisper subtitles...") :
+                    qsTr("Whisper subtitles")
+                onSelectedChanged: syncChecked()
+                onCheckedChanged: Qt.callLater(syncChecked)
+                Component.onCompleted: syncChecked()
+
+                onTriggered: {
+                    if (selected)
+                    {
+                        WhisperController.stop();
+                        syncChecked();
+                        return;
+                    }
+
+                    const previousSid = root.player.state.sid;
+                    if (!WhisperController.selectedModelAvailable())
+                    {
+                        WhisperController.stop();
+                        root.player.controller.setSid(previousSid);
+                        syncChecked();
+                        return;
+                    }
+
+                    root.player.controller.setSid(0);
+                    WhisperController.select(root.player.controller)
+                        .then(function(result) {
+                            if (result.error)
+                            {
+                                if (result.fatal !== false)
+                                {
+                                    WhisperController.stop();
+                                    root.player.controller.setSid(previousSid);
+                                }
+                                root.player.controller.showText(result.error);
+                            }
+                            syncChecked();
+                        });
+                    syncChecked();
+                }
+            }
+
+            onObjectAdded: function(index, object) {
+                subtitleMenu.insertAction(subtitleNoneAction.index + index + 1, object);
+
+                /* This is a hack to force a refresh after adding the item.
+                 * For some reason the items are all added with blank text,
+                 * until something causes a visual update. */
+                if (Features.macos)
+                {
+                    object.checkable = !object.checkable;
+                    object.checkable = !object.checkable;
+                }
+            }
+            onObjectRemoved: function(index, object) {
+                subtitleMenu.removeAction(object);
+            }
         }
 
         Instantiator {
             model: root.player.state.subtitleTracks
             delegate: Action {
                 checkable: true
-                checked: root.player.state.sid === modelData.id
+                checked: root.player.state.sid === modelData.id &&
+                         !WhisperController.active
                 enabled: root.player.state.secondarySid !== modelData.id
                 ActionGroup.group: subtitleTrackGroup
                 text: root.makeTrackName(modelData)
-                onTriggered: root.player.controller.setSid(modelData.id)
+                onTriggered: {
+                    WhisperController.stop();
+                    root.player.controller.setSid(modelData.id);
+                }
             }
 
             onObjectAdded: function(index, object) {
-                subtitleMenu.insertAction(subtitleNoneAction.index + index + 1, object);
+                subtitleMenu.insertAction(
+                    subtitleNoneAction.index +
+                    (Features.whisper && MementoSettings.whisperEnabled ? 1 : 0) +
+                    index + 1,
+                    object
+                );
 
                 /* This is a hack to force a refresh after adding the item.
                  * For some reason the items are all added with blank text,

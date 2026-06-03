@@ -558,7 +558,10 @@ MpvPlayer {
 
         text: {
             /* Implements regex filtering */
-            let text = root.state.subtitle.text.replace(subtitleText.regexFilter, "");
+            let text = WhisperController.active ?
+                WhisperController.currentText :
+                root.state.subtitle.text;
+            text = text.replace(subtitleText.regexFilter, "");
             /* Implements replace new lines */
             if (MementoSettings.searchReplaceNewlines)
             {

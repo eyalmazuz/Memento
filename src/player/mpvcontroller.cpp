@@ -707,6 +707,10 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
         .arg(args.end, 0, 'f', 3)
         .arg(aid)
         .toUtf8();
+    if (args.extension == ".wav")
+    {
+        argString += ",oac=pcm_s16le";
+    }
 
     QList<QPair<QByteArray, QByteArray>> options = {
         {"vid", "no"},

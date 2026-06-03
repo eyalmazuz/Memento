@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Dialogs
+import QtQuick.Layouts
 import QtQuick.Window
 import Ripose.Memento
 
@@ -344,6 +345,78 @@ ApplicationWindow {
         }
 
         Component.onCompleted: active = DictionaryController.dictionaries.rowCount() === 0
+        onLoaded: item.open()
+    }
+
+    Loader {
+        id: whisperStartupDownloadDialog
+        active: false
+        sourceComponent: Component {
+            WhisperDownloadDialog { }
+        }
+
+        function start(model) {
+            active = true;
+            item.start(model);
+        }
+    }
+
+    Loader {
+        id: whisperNoModelLoader
+        active: false
+        sourceComponent: Component {
+            Dialog {
+                id: whisperNoModelDialog
+                parent: Overlay.overlay
+                anchors.centerIn: parent
+                modal: true
+                standardButtons: Dialog.Yes | Dialog.No
+                title: qsTr("Whisper Model Missing")
+
+                onAccepted: {
+                    MementoSettings.whisperModel = "tiny";
+                    MementoSettings.writeWhisperSettings();
+                    whisperStartupDownloadDialog.start("tiny");
+                }
+                onRejected: {
+                    if (whisperNoModelCheckBox.checked)
+                    {
+                        MementoSettings.internalWhisperNoModelPromptDismissed = true;
+                        MementoSettings.writeInternalSettings();
+                    }
+                }
+                onClosed: whisperNoModelLoader.active = false
+
+                ColumnLayout {
+                    width: 460
+                    spacing: 10
+
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: qsTr(
+                            "Memento was compiled with Whisper support, " +
+                            "but no Whisper model was found in %1.\n\n" +
+                            "Do you want to download the tiny model now?"
+                        ).arg(WhisperController.modelsDirectory())
+                    }
+
+                    CheckBox {
+                        id: whisperNoModelCheckBox
+                        text: qsTr("Don't show this again")
+                    }
+                }
+            }
+        }
+
+        Component.onCompleted: {
+            Qt.callLater(function() {
+                whisperNoModelLoader.active =
+                    Features.whisper &&
+                    !MementoSettings.internalWhisperNoModelPromptDismissed &&
+                    !WhisperController.hasAnyModel();
+            });
+        }
         onLoaded: item.open()
     }
 
