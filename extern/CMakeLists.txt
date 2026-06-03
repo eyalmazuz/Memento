@@ -33,3 +33,55 @@ if(MEMENTO_OCR_SUPPORT AND NOT MEMENTO_SYSTEM_MOCR)
     )
     FetchContent_MakeAvailable(libmocr)
 endif()
+
+if(MEMENTO_WHISPER_SUPPORT)
+    set(MEMENTO_BUILD_SHARED_LIBS_WAS_SET FALSE)
+    if(DEFINED BUILD_SHARED_LIBS)
+        set(MEMENTO_BUILD_SHARED_LIBS_WAS_SET TRUE)
+        set(MEMENTO_BUILD_SHARED_LIBS_VALUE "${BUILD_SHARED_LIBS}")
+    endif()
+
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(WHISPER_CURL OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA ${MEMENTO_WHISPER_CUDA} CACHE BOOL "" FORCE)
+    set(
+        GGML_CUDA_FORCE_MMQ
+        ${MEMENTO_WHISPER_CUDA_FORCE_MMQ}
+        CACHE BOOL "" FORCE
+    )
+    set(GGML_VULKAN ${MEMENTO_WHISPER_VULKAN} CACHE BOOL "" FORCE)
+    set(GGML_BLAS ${MEMENTO_WHISPER_BLAS} CACHE BOOL "" FORCE)
+    set(
+        GGML_BLAS_VENDOR
+        "${MEMENTO_WHISPER_BLAS_VENDOR}"
+        CACHE STRING "" FORCE
+    )
+    if(MEMENTO_WHISPER_CUDA)
+        if(MEMENTO_WHISPER_CUDA_ARCHITECTURES)
+            set(
+                CMAKE_CUDA_ARCHITECTURES
+                "${MEMENTO_WHISPER_CUDA_ARCHITECTURES}"
+                CACHE STRING "" FORCE
+            )
+        endif()
+    endif()
+    FetchContent_Declare(
+        whispercpp
+        GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
+        GIT_TAG v1.8.6
+    )
+    FetchContent_MakeAvailable(whispercpp)
+
+    if(MEMENTO_BUILD_SHARED_LIBS_WAS_SET)
+        set(
+            BUILD_SHARED_LIBS "${MEMENTO_BUILD_SHARED_LIBS_VALUE}"
+            CACHE BOOL "" FORCE
+        )
+    else()
+        unset(BUILD_SHARED_LIBS CACHE)
+        unset(BUILD_SHARED_LIBS)
+    endif()
+endif()
