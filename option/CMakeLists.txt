@@ -16,6 +16,13 @@ option(MEMENTO_SYSTEM_QCORO "Use the local installation of QCoro instead of Fetc
 # Features
 option(MEMENTO_OCR_SUPPORT "Support for OCR through MangaOCR" OFF)
 option(MEMENTO_MECAB_SUPPORT "Support for deconjugation with MeCab" OFF)
+option(MEMENTO_WHISPER_SUPPORT "Support for transcription through whisper.cpp" OFF)
+option(MEMENTO_WHISPER_CUDA "Build whisper.cpp with the ggml CUDA backend" OFF)
+option(MEMENTO_WHISPER_VULKAN "Build whisper.cpp with the ggml Vulkan backend" OFF)
+option(MEMENTO_WHISPER_BLAS "Build whisper.cpp with the ggml BLAS backend" OFF)
+option(MEMENTO_WHISPER_CUDA_FORCE_MMQ "Force ggml CUDA MMQ kernels instead of cuBLAS" OFF)
+set(MEMENTO_WHISPER_BLAS_VENDOR "Generic" CACHE STRING "BLAS vendor used by ggml when MEMENTO_WHISPER_BLAS is ON")
+set(MEMENTO_WHISPER_CUDA_ARCHITECTURES "" CACHE STRING "CUDA architectures for whisper.cpp, for example 75 for GTX 1650; leave empty for CMake default")
 
 # Modifications
 option(MEMENTO_QAPPLICATION "Builds Memento with a QApplication instead of QGuiApplication" OFF)
