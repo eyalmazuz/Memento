@@ -22,6 +22,12 @@
 
 #include <QObject>
 
+/* Some Unix toolchains define unix as a legacy platform macro. If it remains
+ * defined here, moc turns Q_PROPERTY(bool unix ...) into a property named "1". */
+#ifdef unix
+#undef unix
+#endif
+
 /**
  * @brief QML object containing all information about compiled features.
  */
@@ -92,6 +98,12 @@ class Features : public QObject
     Q_PROPERTY(
         bool ocr
         READ ocr
+        CONSTANT
+    )
+
+    Q_PROPERTY(
+        bool whisper
+        READ whisper
         CONSTANT
     )
 
@@ -210,6 +222,15 @@ public:
      */
     [[nodiscard]]
     bool ocr() const noexcept;
+
+    /**
+     * @brief Get if Memento was compiled with whisper.cpp support.
+     *
+     * @return true if compiled with whisper.cpp support,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool whisper() const noexcept;
 
     /**
      * @brief Get if Memento was compiled as a QApplication instead of

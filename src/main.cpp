@@ -64,6 +64,7 @@
 #include "subtitle/subtitlelistmodel.h"
 #include "subtitle/subtitlelists.h"
 #include "util/utils.h"
+#include "whisper/whispercontroller.h"
 
 static constexpr const char *MEMENTO_URI{"Ripose.Memento"};
 
@@ -178,6 +179,13 @@ static void registerQmlTypes(Context &context)
     qmlRegisterSingletonInstance<OcrController>(
         MEMENTO_URI, 1, 0, "OcrController",
         new OcrController(context.settings(), &context)
+    );
+
+    /* Whisper Types */
+
+    qmlRegisterSingletonInstance<WhisperController>(
+        MEMENTO_URI, 1, 0, "WhisperController",
+        new WhisperController(&context, &context)
     );
 
     /* Player Types */

@@ -59,17 +59,27 @@ Window {
                 ListElement {
                     text: qsTr("Search")
                     icon: "search"
-                    pageIndex: 8
+                    pageIndex: 9
                 }
             }
 
             Component.onCompleted: {
+                let insertIndex = 7;
                 if (Features.ocr)
                 {
-                    model.insert(7, {
+                    model.insert(insertIndex, {
                         text: qsTr("OCR"),
                         icon: "eye",
                         pageIndex: 7,
+                    });
+                    ++insertIndex;
+                }
+                if (Features.whisper)
+                {
+                    model.insert(insertIndex, {
+                        text: qsTr("Whisper"),
+                        icon: "volume-on",
+                        pageIndex: 8,
                     });
                 }
             }
@@ -110,6 +120,10 @@ Window {
 
             OcrPage {
                 enabled: Features.ocr
+            }
+
+            WhisperPage {
+                enabled: Features.whisper
             }
 
             SearchPage { }
