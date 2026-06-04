@@ -23,7 +23,6 @@
 #include "whisper/whispermodel.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -39,7 +38,8 @@ static constexpr int WAV_HEADER_SIZE = 12;
 static constexpr int WAV_CHUNK_HEADER_SIZE = 8;
 static constexpr int WHISPER_TIME_SCALE = 100;
 static constexpr quint16 WAV_FORMAT_PCM = 1;
-static constexpr quint16 WAV_FORMAT_FLOAT = 3;
+static constexpr quint16 WAV_BITS_PER_SAMPLE = 16;
+static constexpr quint16 WAV_CHANNELS = 1;
 
 /**
  * @brief Transcription callback context.
@@ -48,21 +48,6 @@ struct SegmentCallbackContext
 {
     /* Called when a segment is generated */
     std::function<void(const SubtitleEntry &)> callback;
-};
-
-/**
- * @brief Decoded WAV audio data.
- */
-struct WavAudio
-{
-    /* Audio sample rate */
-    int sampleRate{0};
-
-    /* Audio channel count */
-    int channels{0};
-
-    /* Audio samples as interleaved 32-bit floats */
-    std::vector<float> samples;
 };
 
 /**
@@ -96,134 +81,12 @@ static quint32 read_u32(const char *data)
 }
 
 /**
- * @brief Convert one WAV sample to a float.
- *
- * @param data The sample data.
- * @param format The WAV format code.
- * @param bitsPerSample Bits per sample.
- * @return The sample value.
- */
-static float read_sample(
-    const char *data, quint16 format, quint16 bitsPerSample)
-{
-    if (format == WAV_FORMAT_FLOAT && bitsPerSample == 32)
-    {
-        const quint32 bits = read_u32(data);
-        float value = 0.0f;
-        std::memcpy(&value, &bits, sizeof(value));
-        return value;
-    }
-
-    if (format != WAV_FORMAT_PCM)
-    {
-        return 0.0f;
-    }
-
-    switch (bitsPerSample)
-    {
-        case 16:
-        {
-            const qint16 value = static_cast<qint16>(read_u16(data));
-            return static_cast<float>(value) / 32768.0f;
-        }
-
-        case 24:
-        {
-            qint32 value =
-                static_cast<quint8>(data[0]) |
-                (static_cast<quint8>(data[1]) << 8) |
-                (static_cast<quint8>(data[2]) << 16);
-            if (value & 0x00800000)
-            {
-                value |= 0xFF000000;
-            }
-            return static_cast<float>(value) / 8388608.0f;
-        }
-
-        case 32:
-        {
-            const qint32 value = static_cast<qint32>(read_u32(data));
-            return static_cast<float>(value) / 2147483648.0f;
-        }
-
-        default:
-            return 0.0f;
-    }
-}
-
-/**
- * @brief Downmix interleaved samples to mono.
- *
- * @param audio The decoded WAV audio.
- * @return Mono samples.
- */
-static std::vector<float> downmix_to_mono(const WavAudio &audio)
-{
-    if (audio.channels <= 0)
-    {
-        return {};
-    }
-
-    const size_t frames = audio.samples.size() / audio.channels;
-    std::vector<float> mono(frames);
-    for (size_t frame = 0; frame < frames; ++frame)
-    {
-        float sum = 0.0f;
-        for (int channel = 0; channel < audio.channels; ++channel)
-        {
-            sum += audio.samples[frame * audio.channels + channel];
-        }
-        mono[frame] = sum / audio.channels;
-    }
-    return mono;
-}
-
-/**
- * @brief Resample mono audio to the whisper.cpp sample rate.
- *
- * @param samples The input samples.
- * @param sampleRate The input sample rate.
- * @return Samples at WHISPER_SAMPLE_RATE.
- */
-static std::vector<float> resample_for_whisper(
-    const std::vector<float> &samples, int sampleRate)
-{
-    if (samples.empty() || sampleRate <= 0)
-    {
-        return {};
-    }
-    if (sampleRate == WHISPER_SAMPLE_RATE)
-    {
-        return samples;
-    }
-
-    const double outputSize =
-        static_cast<double>(samples.size()) *
-        WHISPER_SAMPLE_RATE /
-        sampleRate;
-    std::vector<float> resampled(
-        std::max<size_t>(1, static_cast<size_t>(std::llround(outputSize)))
-    );
-    const double scale = static_cast<double>(sampleRate) / WHISPER_SAMPLE_RATE;
-    for (size_t i = 0; i < resampled.size(); ++i)
-    {
-        const double src = i * scale;
-        const size_t index = static_cast<size_t>(src);
-        const size_t next = std::min(index + 1, samples.size() - 1);
-        const float fraction = static_cast<float>(src - index);
-        resampled[i] = samples[index] * (1.0f - fraction) +
-            samples[next] * fraction;
-    }
-    return resampled;
-}
-
-/**
- * @brief Decode a WAV file to interleaved float samples.
+ * @brief Read Whisper-ready WAV samples.
  *
  * @param path The WAV file path.
- * @return Decoded audio.
+ * @return 16 kHz mono float samples.
  */
-static WavAudio read_wav(const QString &path)
+static std::vector<float> read_whisper_wav(const QString &path)
 {
     QFile file(path);
     if (!file.open(QFile::ReadOnly))
@@ -244,6 +107,7 @@ static WavAudio read_wav(const QString &path)
     quint16 format = 0;
     quint16 channels = 0;
     quint32 sampleRate = 0;
+    quint16 blockAlign = 0;
     quint16 bitsPerSample = 0;
     QByteArray pcmData;
 
@@ -267,6 +131,7 @@ static WavAudio read_wav(const QString &path)
             format = read_u16(fmt);
             channels = read_u16(fmt + 2);
             sampleRate = read_u32(fmt + 4);
+            blockAlign = read_u16(fmt + 12);
             bitsPerSample = read_u16(fmt + 14);
         }
         else if (id == "data")
@@ -277,57 +142,37 @@ static WavAudio read_wav(const QString &path)
         offset += size + (size % 2);
     }
 
-    const int bytesPerSample = bitsPerSample / 8;
-    if ((format != WAV_FORMAT_PCM && format != WAV_FORMAT_FLOAT) ||
-        channels == 0 ||
-        sampleRate == 0 ||
-        bytesPerSample <= 0 ||
+    constexpr int BYTES_PER_SAMPLE = WAV_BITS_PER_SAMPLE / 8;
+    if (format != WAV_FORMAT_PCM ||
+        channels != WAV_CHANNELS ||
+        sampleRate != WHISPER_SAMPLE_RATE ||
+        blockAlign != WAV_CHANNELS * BYTES_PER_SAMPLE ||
+        bitsPerSample != WAV_BITS_PER_SAMPLE ||
         pcmData.isEmpty())
     {
-        qWarning("Whisper audio WAV format is unsupported.");
+        qWarning(
+            "Whisper audio WAV format is unsupported. Expected 16 kHz mono "
+            "PCM16."
+        );
         return {};
     }
 
-    const int bytesPerFrame = bytesPerSample * channels;
-    if (bytesPerFrame <= 0 || pcmData.size() < bytesPerFrame)
+    if (pcmData.size() < BYTES_PER_SAMPLE)
     {
         return {};
     }
 
-    WavAudio audio{
-        .sampleRate = static_cast<int>(sampleRate),
-        .channels = static_cast<int>(channels),
-        .samples = {},
-    };
-    const qsizetype frames = pcmData.size() / bytesPerFrame;
-    audio.samples.reserve(frames * channels);
-    for (qsizetype frame = 0; frame < frames; ++frame)
+    const qsizetype samples = pcmData.size() / BYTES_PER_SAMPLE;
+    std::vector<float> output;
+    output.reserve(samples);
+    for (qsizetype i = 0; i < samples; ++i)
     {
-        const char *frameData = pcmData.constData() + frame * bytesPerFrame;
-        for (int channel = 0; channel < channels; ++channel)
-        {
-            audio.samples.emplace_back(
-                read_sample(
-                    frameData + channel * bytesPerSample,
-                    format,
-                    bitsPerSample
-                )
-            );
-        }
+        const qint16 value = static_cast<qint16>(
+            read_u16(pcmData.constData() + i * BYTES_PER_SAMPLE)
+        );
+        output.emplace_back(static_cast<float>(value) / 32768.0f);
     }
-    return audio;
-}
-
-/**
- * @brief Load audio samples from a WAV file in whisper.cpp format.
- *
- * @param path The WAV file path.
- * @return 16 kHz mono float samples.
- */
-static std::vector<float> read_audio_for_whisper(const QString &path)
-{
-    const WavAudio audio = read_wav(path);
-    return resample_for_whisper(downmix_to_mono(audio), audio.sampleRate);
+    return output;
 }
 
 /**
@@ -431,7 +276,7 @@ QFuture<WhisperModel::TranscriptionResult> WhisperModel::transcribe(
         [this, audioPath, options = std::move(options)] ()
             -> TranscriptionResult
         {
-            std::vector<float> samples = read_audio_for_whisper(audioPath);
+            std::vector<float> samples = read_whisper_wav(audioPath);
             if (samples.empty())
             {
                 qWarning("No audio samples available for Whisper.");

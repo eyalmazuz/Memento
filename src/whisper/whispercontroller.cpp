@@ -86,61 +86,61 @@ WhisperController::WhisperController(Context *context, QObject *parent) :
                 settings,
                 &Settings::whisperEnabledChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperModelChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperCustomModelChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperVadEnabledChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperVadModelChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperUseGpuChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperThreadsChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperBestOfChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperBeamSizeChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperFlashAttentionChanged,
                 this,
-                [this] { requestReconfigure(); }
+                &WhisperController::requestReconfigure
             );
         }
     }
@@ -537,7 +537,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         args.start = start;
         args.end = end;
         args.normalize = false;
-        args.extension = ".wav";
+        args.preset = MpvAudioClipArgs::WhisperPcm16Wav;
 
         const QString audioPath = m_controller->tempAudioClip(args);
         if (audioPath.isEmpty())
@@ -1056,12 +1056,30 @@ void WhisperController::updateCurrentText()
     }
 
     const double position = m_context->player()->state()->timePosition();
-    for (const SubtitleEntry &subtitle : m_subtitles->items())
+    const std::vector<SubtitleEntry> &subtitles = m_subtitles->items();
+    for (size_t i = 0; i < subtitles.size(); ++i)
     {
+        const SubtitleEntry &subtitle = subtitles[i];
         if (subtitle.start <= position && position < subtitle.end)
         {
+            QItemSelectionModel *selection = m_subtitles->selectionModel();
+            if (selection == nullptr ||
+                !selection->isRowSelected(
+                    static_cast<int>(i),
+                    QModelIndex()
+                ))
+            {
+                m_subtitles->selectPosition(position);
+            }
             setCurrentText(subtitle.text);
             return;
+        }
+    }
+    if (QItemSelectionModel *selection = m_subtitles->selectionModel())
+    {
+        if (selection->hasSelection())
+        {
+            selection->clear();
         }
     }
     setCurrentText({});

@@ -702,15 +702,12 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
         return {};
     }
 
+    QString extension = args.extension;
     QByteArray argString = QString("start=%1,end=%2,aid=%3")
         .arg(args.start, 0, 'f', 3)
         .arg(args.end, 0, 'f', 3)
         .arg(aid)
         .toUtf8();
-    if (args.extension == ".wav")
-    {
-        argString += ",oac=pcm_s16le";
-    }
 
     QList<QPair<QByteArray, QByteArray>> options = {
         {"vid", "no"},
@@ -718,6 +715,20 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
         {"sid", "no"},
         {"secondary-sid", "no"},
     };
+
+    switch (args.preset)
+    {
+        case MpvAudioClipArgs::WhisperPcm16Wav:
+            extension = ".wav";
+            options.emplaceBack("oac", "pcm_s16le");
+            options.emplaceBack("audio-samplerate", "16000");
+            options.emplaceBack("audio-channels", "mono");
+            break;
+
+        case MpvAudioClipArgs::Default:
+            break;
+    }
+
     if (args.normalize)
     {
         QByteArray audioFilter;
@@ -726,7 +737,7 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
         options.emplaceBack("af", std::move(audioFilter));
     }
 
-    return encodeFile(argString, options, args.extension);
+    return encodeFile(argString, options, extension);
 }
 
 QString MpvController::tempVideoClip(const MpvVideoClipArgs &args)
