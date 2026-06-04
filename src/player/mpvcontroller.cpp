@@ -27,6 +27,7 @@
 
 #include <QScopeGuard>
 #include <QTemporaryFile>
+#include <QVector>
 
 #include "player/mpvplayer.h"
 #include "util/directoryutils.h"
@@ -166,7 +167,11 @@ void MpvController::loadFile(const QStringList &files, bool append)
     }
 }
 
-bool MpvController::loadSubtitle(const QString &file)
+bool MpvController::loadSubtitle(
+    const QString &file,
+    bool select,
+    const QString &title,
+    const QString &language)
 {
     if (file.isEmpty())
     {
@@ -174,12 +179,29 @@ bool MpvController::loadSubtitle(const QString &file)
     }
 
     QByteArray path = file.toUtf8();
-    const char *args[]{
+    QByteArray flags = select ? "select" : "auto";
+    QByteArray titleBytes = title.toUtf8();
+    QByteArray languageBytes = language.toUtf8();
+
+    QVector<const char *> args{
         "sub-add",
-        path,
-        nullptr
+        path.constData(),
     };
-    int ret = ::mpv_command_async(handle(), 0, args);
+    if (select || !title.isEmpty() || !language.isEmpty())
+    {
+        args.emplaceBack(flags.constData());
+    }
+    if (!title.isEmpty() || !language.isEmpty())
+    {
+        args.emplaceBack(titleBytes.constData());
+    }
+    if (!language.isEmpty())
+    {
+        args.emplaceBack(languageBytes.constData());
+    }
+    args.emplaceBack(nullptr);
+
+    int ret = ::mpv_command_async(handle(), 0, args.data());
     if (ret < 0)
     {
         qWarning(
@@ -187,6 +209,53 @@ bool MpvController::loadSubtitle(const QString &file)
             qUtf8Printable(file),
             ::mpv_error_string(ret)
         );
+        return false;
+    }
+    return true;
+}
+
+bool MpvController::reloadSubtitle(int64_t id)
+{
+    QByteArray idStr = QByteArray::number(id);
+    const char *argsWithId[]{
+        "sub-reload",
+        idStr.constData(),
+        nullptr
+    };
+    const char *argsAll[]{
+        "sub-reload",
+        nullptr
+    };
+    int ret = ::mpv_command_async(
+        handle(),
+        0,
+        id > 0 ? argsWithId : argsAll
+    );
+    if (ret < 0)
+    {
+        qWarning("Could not reload subtitle: %s", ::mpv_error_string(ret));
+        return false;
+    }
+    return true;
+}
+
+bool MpvController::removeSubtitle(int64_t id)
+{
+    if (id <= 0)
+    {
+        return false;
+    }
+
+    QByteArray idStr = QByteArray::number(id);
+    const char *args[]{
+        "sub-remove",
+        idStr.constData(),
+        nullptr
+    };
+    int ret = ::mpv_command_async(handle(), 0, args);
+    if (ret < 0)
+    {
+        qWarning("Could not remove subtitle: %s", ::mpv_error_string(ret));
         return false;
     }
     return true;

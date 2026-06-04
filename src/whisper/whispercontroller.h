@@ -28,6 +28,7 @@
 #include <QNetworkAccessManager>
 #include <QPointer>
 #include <QString>
+#include <QTimer>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -45,7 +46,9 @@
 
 class Context;
 class MpvController;
+class MpvTrack;
 class SubtitleListModel;
+class QTemporaryDir;
 class WhisperModel;
 
 /**
@@ -71,6 +74,12 @@ class WhisperController : public QObject
         QString currentText
         READ currentText
         NOTIFY currentTextChanged
+    )
+
+    Q_PROPERTY(
+        qint64 subtitleTrackId
+        READ subtitleTrackId
+        NOTIFY subtitleTrackIdChanged
     )
 
     Q_PROPERTY(
@@ -144,6 +153,14 @@ public:
      */
     [[nodiscard]]
     QString currentText() const;
+
+    /**
+     * @brief Get the mpv subtitle track ID used for Whisper subtitles.
+     *
+     * @return The mpv subtitle track ID, or 0 if no track is loaded.
+     */
+    [[nodiscard]]
+    qint64 subtitleTrackId() const noexcept;
 
     /**
      * @brief Get if a managed Whisper model is currently downloading.
@@ -255,6 +272,15 @@ public:
     Q_INVOKABLE QString selectedModelPath() const;
 
     /**
+     * @brief Get if a subtitle track belongs to the active Whisper mirror.
+     *
+     * @param id The mpv subtitle track ID.
+     * @return true if the track is the active Whisper subtitle track,
+     * @return false otherwise.
+     */
+    Q_INVOKABLE bool isSubtitleTrack(qint64 id) const noexcept;
+
+    /**
      * @brief Download a managed Whisper model preset.
      *
      * @param model The model preset to download.
@@ -284,6 +310,13 @@ signals:
      * @param value The generated subtitle text.
      */
     void currentTextChanged(const QString &value);
+
+    /**
+     * @brief Emitted when the mpv Whisper subtitle track ID changes.
+     *
+     * @param value The mpv subtitle track ID, or 0 if unloaded.
+     */
+    void subtitleTrackIdChanged(qint64 value);
 
     /**
      * @brief Emitted when a managed model download starts or stops.
@@ -347,6 +380,13 @@ private:
      * @param value The current subtitle text.
      */
     void setCurrentText(QString value);
+
+    /**
+     * @brief Set the active mpv Whisper subtitle track ID.
+     *
+     * @param value The track ID, or 0 if unloaded.
+     */
+    void setSubtitleTrackId(qint64 value);
 
     /**
      * @brief Set if a managed model download is running.
@@ -427,6 +467,69 @@ private:
      * @brief Update currentText from the current player position.
      */
     void updateCurrentText();
+
+    /**
+     * @brief Create the temporary SRT mirror if needed.
+     *
+     * @return true if the SRT path is available,
+     * @return false otherwise.
+     */
+    bool ensureSubtitleMirror();
+
+    /**
+     * @brief Remove the temporary SRT mirror and optionally unload its mpv track.
+     *
+     * @param removeTrack true to unload the mpv track.
+     */
+    void resetSubtitleMirror(bool removeTrack);
+
+    /**
+     * @brief Schedule a generated subtitle SRT write and mpv reload.
+     *
+     * @param immediate true to flush immediately, false to debounce.
+     */
+    void scheduleSubtitleMirrorSync(bool immediate);
+
+    /**
+     * @brief Flush generated subtitles to SRT and update the mpv track.
+     */
+    void flushSubtitleMirror();
+
+    /**
+     * @brief Write generated subtitles to the temporary SRT mirror.
+     *
+     * @return true on success,
+     * @return false otherwise.
+     */
+    bool writeSubtitleMirror() const;
+
+    /**
+     * @brief Refresh the active mpv track ID from mpv's subtitle tracks.
+     */
+    void updateSubtitleTrackId();
+
+    /**
+     * @brief Get if an mpv track belongs to Whisper's SRT mirror.
+     *
+     * @param track The track to check.
+     * @return true if this is a Whisper mirror track,
+     * @return false otherwise.
+     */
+    bool isSubtitleMirrorTrack(const MpvTrack *track) const;
+
+    /**
+     * @brief Remove Whisper mirror tracks except an optional track to keep.
+     *
+     * @param keepId The mpv subtitle track ID to keep, or 0 to remove all.
+     */
+    void removeSubtitleMirrorTracks(qint64 keepId = 0);
+
+    /**
+     * @brief Keep the generated subtitle list selected when mpv selects it.
+     *
+     * @param sid The selected primary subtitle track ID.
+     */
+    void handleSidChanged(qint64 sid);
 
     /**
      * @brief Resolve a user or preset model path.
@@ -512,8 +615,32 @@ private:
     /* Connection for tracking player position */
     QMetaObject::Connection m_positionConnection;
 
+    /* Connection for tracking mpv subtitle track changes */
+    QMetaObject::Connection m_trackConnection;
+
+    /* Connection for tracking primary subtitle track changes */
+    QMetaObject::Connection m_sidConnection;
+
     /* Player controller used for the active Whisper subtitle track */
     QPointer<MpvController> m_controller;
+
+    /* Temporary directory that owns the generated SRT mirror */
+    std::unique_ptr<QTemporaryDir> m_subtitleTempDir;
+
+    /* Path to the generated SRT mirror */
+    QString m_subtitleFilePath;
+
+    /* mpv subtitle track ID for the generated SRT mirror */
+    qint64 m_subtitleTrackId{0};
+
+    /* true while waiting for mpv to expose the generated subtitle track */
+    bool m_subtitleTrackPending{false};
+
+    /* true when the SRT mirror has changed since the last mpv reload */
+    bool m_subtitleMirrorDirty{false};
+
+    /* Debounces mpv sub-reload while Whisper emits subtitle segments */
+    QTimer m_subtitleReloadTimer;
 
     /* true if Whisper subtitles are selected */
     bool m_active{false};

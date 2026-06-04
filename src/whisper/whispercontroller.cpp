@@ -32,6 +32,9 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
+#include <QSaveFile>
+#include <QTemporaryDir>
+#include <QTextStream>
 #include <QThread>
 #include <QUrl>
 #include <QVariantMap>
@@ -45,6 +48,7 @@
 #include "player/mpvcontroller.h"
 #include "player/mpvplayer.h"
 #include "player/mpvstate.h"
+#include "player/mpvtrack.h"
 #include "setting/settings.h"
 #include "state/context.h"
 #include "subtitle/subtitlelistmodel.h"
@@ -71,11 +75,67 @@ static constexpr double SEEK_RESTART_THRESHOLD_SECONDS = 5.0;
 static constexpr double SUBTITLE_TIME_DELTA = 0.0001;
 static constexpr int WHISPER_GPU_DEVICE = 0;
 static constexpr int MAX_TRANSCRIPTION_FAILURES = 3;
+static constexpr int SUBTITLE_RELOAD_DEBOUNCE_MS = 750;
+static constexpr const char *WHISPER_SUBTITLE_FILENAME = "whisper.srt";
+
+static QString format_srt_time(double seconds)
+{
+    const qint64 ms = qMax<qint64>(
+        0,
+        static_cast<qint64>(std::llround(seconds * 1000.0))
+    );
+    const qint64 hours = ms / 3600000;
+    const qint64 minutes = (ms / 60000) % 60;
+    const qint64 wholeSeconds = (ms / 1000) % 60;
+    const qint64 milliseconds = ms % 1000;
+    return QString("%1:%2:%3,%4")
+        .arg(hours, 2, 10, QLatin1Char('0'))
+        .arg(minutes, 2, 10, QLatin1Char('0'))
+        .arg(wholeSeconds, 2, 10, QLatin1Char('0'))
+        .arg(milliseconds, 3, 10, QLatin1Char('0'));
+}
+
+static double round_srt_seconds(double seconds)
+{
+    return static_cast<double>(qMax<qint64>(
+        0,
+        static_cast<qint64>(std::llround(seconds * 1000.0))
+    )) / 1000.0;
+}
+
+static QString normalize_srt_text(QString text)
+{
+    text.replace("\r\n", "\n");
+    text.replace('\r', '\n');
+    while (text.contains("\n\n"))
+    {
+        text.replace("\n\n", "\n");
+    }
+    return text.trimmed();
+}
+
+static QString comparable_path(const QString &path)
+{
+    if (path.isEmpty())
+    {
+        return {};
+    }
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+}
 
 WhisperController::WhisperController(Context *context, QObject *parent) :
     QObject(parent),
     m_context(context)
 {
+    m_subtitleReloadTimer.setSingleShot(true);
+    m_subtitleReloadTimer.setInterval(SUBTITLE_RELOAD_DEBOUNCE_MS);
+    connect(
+        &m_subtitleReloadTimer,
+        &QTimer::timeout,
+        this,
+        &WhisperController::flushSubtitleMirror
+    );
+
     if (m_context != nullptr)
     {
         m_subtitles = new SubtitleListModel(m_context, this);
@@ -166,6 +226,11 @@ QString WhisperController::currentText() const
     return m_currentText;
 }
 
+qint64 WhisperController::subtitleTrackId() const noexcept
+{
+    return m_subtitleTrackId;
+}
+
 bool WhisperController::downloadRunning() const noexcept
 {
     return m_downloadRunning;
@@ -226,6 +291,7 @@ void WhisperController::stop()
     {
         m_context->subtitleLists()->setPrimary(nullptr);
     }
+    resetSubtitleMirror(true);
     setActive(false);
     setCurrentText({});
     m_controller = nullptr;
@@ -274,6 +340,36 @@ bool WhisperController::selectedModelDownloadable() const
     return m_context != nullptr &&
         m_context->settings() != nullptr &&
         isManagedModel(m_context->settings()->whisperModel());
+}
+
+bool WhisperController::isSubtitleTrack(qint64 id) const noexcept
+{
+    if (id <= 0)
+    {
+        return false;
+    }
+    if (m_subtitleTrackId > 0 && id == m_subtitleTrackId)
+    {
+        return true;
+    }
+    if (m_context == nullptr ||
+        m_context->player() == nullptr ||
+        m_context->player()->state() == nullptr)
+    {
+        return false;
+    }
+
+    for (const MpvTrack *track :
+         m_context->player()->state()->subtitleTracks())
+    {
+        if (track != nullptr &&
+            track->id() == id &&
+            isSubtitleMirrorTrack(track))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 QCoro::QmlTask WhisperController::downloadModel(const QString &model)
@@ -458,6 +554,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         m_cacheSettingsKey != cacheSettingsKey)
     {
         m_subtitles->clear();
+        resetSubtitleMirror(true);
         m_cacheMediaPath = mediaPath;
         m_cacheModelPath = modelPath;
         m_cacheSettingsKey = cacheSettingsKey;
@@ -480,12 +577,36 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         this,
         [this] (double position) { handlePositionChanged(position); }
     );
+    if (m_trackConnection)
+    {
+        disconnect(m_trackConnection);
+    }
+    m_trackConnection = connect(
+        state,
+        &MpvState::subtitleTracksChanged,
+        this,
+        &WhisperController::updateSubtitleTrackId
+    );
+    if (m_sidConnection)
+    {
+        disconnect(m_sidConnection);
+    }
+    m_sidConnection = connect(
+        state,
+        &MpvState::sidChanged,
+        this,
+        &WhisperController::handleSidChanged
+    );
 
     setActive(true);
     setCurrentText({});
     m_context->subtitleLists()->setPrimary(m_subtitles);
 
     const int initialRows = m_subtitles->rowCount();
+    if (initialRows > 0)
+    {
+        scheduleSubtitleMirrorSync(true);
+    }
     double start = skipCoveredPosition(
         qBound(0.0, state->timePosition(), state->duration())
     );
@@ -789,6 +910,16 @@ void WhisperController::setCurrentText(QString value)
     emit currentTextChanged(m_currentText);
 }
 
+void WhisperController::setSubtitleTrackId(qint64 value)
+{
+    if (m_subtitleTrackId == value)
+    {
+        return;
+    }
+    m_subtitleTrackId = value;
+    emit subtitleTrackIdChanged(m_subtitleTrackId);
+}
+
 void WhisperController::setDownloadRunning(bool value)
 {
     if (m_downloadRunning == value)
@@ -841,9 +972,13 @@ void WhisperController::addSubtitle(
         return;
     }
 
-    const QString text = subtitle.text.trimmed();
+    SubtitleEntry srtSubtitle = subtitle;
+    srtSubtitle.start = round_srt_seconds(srtSubtitle.start);
+    srtSubtitle.end = round_srt_seconds(srtSubtitle.end);
+
+    const QString text = srtSubtitle.text.trimmed();
     if (text.isEmpty() ||
-        subtitle.end <= subtitle.start + SUBTITLE_TIME_DELTA)
+        srtSubtitle.end <= srtSubtitle.start + SUBTITLE_TIME_DELTA)
     {
         return;
     }
@@ -855,8 +990,8 @@ void WhisperController::addSubtitle(
         m_context->subtitleLists()->setPrimary(m_subtitles);
     }
 
-    m_subtitles->removeOverlapping(subtitle.start, subtitle.end);
-    m_subtitles->addSubtitle(text, subtitle.start, subtitle.end);
+    m_subtitles->removeOverlapping(srtSubtitle.start, srtSubtitle.end);
+    m_subtitles->addSubtitle(text, srtSubtitle.start, srtSubtitle.end);
     if (m_context != nullptr &&
         m_context->player() != nullptr &&
         m_context->player()->state() != nullptr)
@@ -866,6 +1001,7 @@ void WhisperController::addSubtitle(
         );
     }
     updateCurrentText();
+    scheduleSubtitleMirrorSync(m_subtitleTrackId <= 0 && !m_subtitleTrackPending);
 }
 
 void WhisperController::handlePositionChanged(double position)
@@ -1083,6 +1219,289 @@ void WhisperController::updateCurrentText()
         }
     }
     setCurrentText({});
+}
+
+bool WhisperController::ensureSubtitleMirror()
+{
+    if (!m_subtitleFilePath.isEmpty())
+    {
+        return true;
+    }
+
+    m_subtitleTempDir = std::make_unique<QTemporaryDir>();
+    if (!m_subtitleTempDir->isValid())
+    {
+        qWarning("Could not create temporary directory for Whisper subtitles.");
+        m_subtitleTempDir.reset();
+        return false;
+    }
+
+    m_subtitleFilePath =
+        m_subtitleTempDir->filePath(WHISPER_SUBTITLE_FILENAME);
+    return true;
+}
+
+void WhisperController::resetSubtitleMirror(bool removeTrack)
+{
+    m_subtitleReloadTimer.stop();
+    if (removeTrack && m_controller != nullptr)
+    {
+        removeSubtitleMirrorTracks();
+    }
+    m_subtitleTrackPending = false;
+    m_subtitleMirrorDirty = false;
+    setSubtitleTrackId(0);
+    if (m_trackConnection)
+    {
+        disconnect(m_trackConnection);
+        m_trackConnection = {};
+    }
+    if (m_sidConnection)
+    {
+        disconnect(m_sidConnection);
+        m_sidConnection = {};
+    }
+    m_subtitleFilePath.clear();
+    m_subtitleTempDir.reset();
+}
+
+void WhisperController::scheduleSubtitleMirrorSync(bool immediate)
+{
+    if (immediate)
+    {
+        flushSubtitleMirror();
+        return;
+    }
+    if (!m_subtitleReloadTimer.isActive())
+    {
+        m_subtitleReloadTimer.start();
+    }
+}
+
+void WhisperController::flushSubtitleMirror()
+{
+    if (!m_active ||
+        m_controller == nullptr ||
+        m_subtitles == nullptr ||
+        m_subtitles->rowCount() <= 0)
+    {
+        return;
+    }
+
+    if (!ensureSubtitleMirror() || !writeSubtitleMirror())
+    {
+        return;
+    }
+    m_subtitleMirrorDirty = true;
+
+    updateSubtitleTrackId();
+    if (m_subtitleTrackId > 0)
+    {
+        if (m_subtitleMirrorDirty &&
+            m_controller->reloadSubtitle(m_subtitleTrackId))
+        {
+            m_subtitleMirrorDirty = false;
+        }
+        return;
+    }
+
+    if (!m_subtitleTrackPending)
+    {
+        m_subtitleTrackPending = m_controller->loadSubtitle(
+            m_subtitleFilePath,
+            true,
+            tr("Whisper subtitles"),
+            "ja"
+        );
+    }
+}
+
+bool WhisperController::writeSubtitleMirror() const
+{
+    if (m_subtitleFilePath.isEmpty() || m_subtitles == nullptr)
+    {
+        return false;
+    }
+
+    QSaveFile file(m_subtitleFilePath);
+    if (!file.open(QFile::WriteOnly | QFile::Text))
+    {
+        qWarning(
+            "Could not open Whisper subtitle mirror '%s' for writing.",
+            qUtf8Printable(m_subtitleFilePath)
+        );
+        return false;
+    }
+
+    QTextStream stream(&file);
+    stream.setEncoding(QStringConverter::Utf8);
+    qsizetype index = 1;
+    for (const SubtitleEntry &subtitle : m_subtitles->items())
+    {
+        const QString text = normalize_srt_text(subtitle.text);
+        if (text.isEmpty() ||
+            subtitle.end <= subtitle.start + SUBTITLE_TIME_DELTA)
+        {
+            continue;
+        }
+
+        stream << index++ << '\n';
+        stream << format_srt_time(subtitle.start) << " --> "
+               << format_srt_time(subtitle.end) << '\n';
+        stream << text << "\n\n";
+    }
+
+    if (!file.commit())
+    {
+        qWarning(
+            "Could not commit Whisper subtitle mirror '%s'.",
+            qUtf8Printable(m_subtitleFilePath)
+        );
+        return false;
+    }
+    return true;
+}
+
+void WhisperController::updateSubtitleTrackId()
+{
+    if (m_context == nullptr ||
+        m_context->player() == nullptr ||
+        m_context->player()->state() == nullptr ||
+        m_subtitleFilePath.isEmpty())
+    {
+        setSubtitleTrackId(0);
+        return;
+    }
+
+    const QString path = comparable_path(m_subtitleFilePath);
+    QList<qint64> ids;
+    for (const MpvTrack *track :
+         m_context->player()->state()->subtitleTracks())
+    {
+        if (!isSubtitleMirrorTrack(track))
+        {
+            continue;
+        }
+
+        if (comparable_path(track->externalFilename()) != path)
+        {
+            if (m_controller != nullptr)
+            {
+                m_controller->removeSubtitle(track->id());
+            }
+            continue;
+        }
+
+        ids.append(track->id());
+    }
+
+    if (ids.isEmpty())
+    {
+        if (!m_subtitleTrackPending)
+        {
+            setSubtitleTrackId(0);
+        }
+        return;
+    }
+
+    qint64 keepId = ids.front();
+    if (ids.contains(m_subtitleTrackId))
+    {
+        keepId = m_subtitleTrackId;
+    }
+    else if (ids.contains(m_context->player()->state()->sid()))
+    {
+        keepId = m_context->player()->state()->sid();
+    }
+
+    removeSubtitleMirrorTracks(keepId);
+
+    const bool wasPending = m_subtitleTrackPending;
+    m_subtitleTrackPending = false;
+    setSubtitleTrackId(keepId);
+    if (m_active &&
+        m_controller != nullptr &&
+        m_context->player()->state()->sid() != keepId)
+    {
+        m_controller->setSid(keepId);
+    }
+    if (m_context->subtitleLists() != nullptr &&
+        m_context->subtitleLists()->primary() != m_subtitles)
+    {
+        m_context->subtitleLists()->setPrimary(m_subtitles);
+    }
+    if (wasPending &&
+        m_subtitleMirrorDirty &&
+        m_controller != nullptr &&
+        m_controller->reloadSubtitle(keepId))
+    {
+        m_subtitleMirrorDirty = false;
+    }
+}
+
+bool WhisperController::isSubtitleMirrorTrack(const MpvTrack *track) const
+{
+    if (track == nullptr || !track->external())
+    {
+        return false;
+    }
+
+    const QString external = track->externalFilename();
+    if (external.isEmpty())
+    {
+        return false;
+    }
+
+    if (!m_subtitleFilePath.isEmpty() &&
+        comparable_path(external) == comparable_path(m_subtitleFilePath))
+    {
+        return true;
+    }
+
+    const QFileInfo info(external);
+    return info.fileName() == WHISPER_SUBTITLE_FILENAME &&
+        (!info.exists() || track->title() == tr("Whisper subtitles"));
+}
+
+void WhisperController::removeSubtitleMirrorTracks(qint64 keepId)
+{
+    if (m_controller == nullptr ||
+        m_context == nullptr ||
+        m_context->player() == nullptr ||
+        m_context->player()->state() == nullptr)
+    {
+        return;
+    }
+
+    for (const MpvTrack *track :
+         m_context->player()->state()->subtitleTracks())
+    {
+        if (track == nullptr ||
+            track->id() == keepId ||
+            !isSubtitleMirrorTrack(track))
+        {
+            continue;
+        }
+        m_controller->removeSubtitle(track->id());
+    }
+}
+
+void WhisperController::handleSidChanged(qint64 sid)
+{
+    if (!m_active ||
+        m_subtitleTrackId <= 0 ||
+        sid != m_subtitleTrackId ||
+        m_context == nullptr ||
+        m_context->subtitleLists() == nullptr ||
+        m_subtitles == nullptr)
+    {
+        return;
+    }
+
+    if (m_context->subtitleLists()->primary() != m_subtitles)
+    {
+        m_context->subtitleLists()->setPrimary(m_subtitles);
+    }
 }
 
 QString WhisperController::resolveModelPath(const QString &path) const

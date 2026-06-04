@@ -170,10 +170,36 @@ public:
      * @brief Loads a subtitle file for the currently playing media.
      *
      * @param file The path to the subtitle file.
-     * @param true if the subtitle was loaded,
-     * @param false otherwise.
+     * @param select true to select the subtitle after loading.
+     * @param title The optional subtitle track title.
+     * @param language The optional subtitle language.
+     * @return true if the subtitle was loaded,
+     * @return false otherwise.
      */
-    Q_INVOKABLE bool loadSubtitle(const QString &file);
+    Q_INVOKABLE bool loadSubtitle(
+        const QString &file,
+        bool select = false,
+        const QString &title = {},
+        const QString &language = {}
+    );
+
+    /**
+     * @brief Reloads a subtitle track from disk.
+     *
+     * @param id The subtitle track ID, or 0 to reload all subtitles.
+     * @return true if the command was sent,
+     * @return false otherwise.
+     */
+    Q_INVOKABLE bool reloadSubtitle(int64_t id = 0);
+
+    /**
+     * @brief Removes a subtitle track.
+     *
+     * @param id The subtitle track ID.
+     * @return true if the command was sent,
+     * @return false otherwise.
+     */
+    Q_INVOKABLE bool removeSubtitle(int64_t id);
 
     /**
      * @brief Seeks to the specified time.

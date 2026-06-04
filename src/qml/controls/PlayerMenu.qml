@@ -52,6 +52,17 @@ MenuBar {
         return name;
     }
 
+    function refreshAction(action) {
+        /* This is a hack to force a refresh after adding the item.
+         * For some reason the items are all added with blank text,
+         * until something causes a visual update. */
+        if (Features.macos)
+        {
+            action.checkable = !action.checkable;
+            action.checkable = !action.checkable;
+        }
+    }
+
     Component.onCompleted: {
         if (Features.windows)
         {
@@ -317,28 +328,55 @@ MenuBar {
             Instantiator {
                 model: root.player.state.subtitleTracks
                 delegate: Action {
+                    readonly property bool whisperTrack:
+                        WhisperController.isSubtitleTrack(modelData.id)
+                    property bool insertedInMenu: false
+
+                    function insertIntoMenu() {
+                        if (insertedInMenu || whisperTrack)
+                        {
+                            return;
+                        }
+                        secondarySubtitleMenu.insertAction(index + 1, this);
+                        insertedInMenu = true;
+                        root.refreshAction(this);
+                    }
+
+                    function removeFromMenu() {
+                        if (!insertedInMenu)
+                        {
+                            return;
+                        }
+                        secondarySubtitleMenu.removeAction(this);
+                        insertedInMenu = false;
+                    }
+
                     checkable: true
-                    checked: root.player.state.secondarySid === modelData.id
-                    enabled: root.player.state.sid !== modelData.id
+                    checked: root.player.state.secondarySid === modelData.id &&
+                             !whisperTrack
+                    enabled: root.player.state.sid !== modelData.id &&
+                             !whisperTrack
                     ActionGroup.group: secondarySubtitleTrackGroup
                     text: root.makeTrackName(modelData)
                     onTriggered: root.player.controller.setSecondarySid(modelData.id)
+                    onWhisperTrackChanged: {
+                        if (whisperTrack)
+                        {
+                            removeFromMenu();
+                        }
+                        else
+                        {
+                            insertIntoMenu();
+                        }
+                    }
+                    Component.onDestruction: removeFromMenu()
                 }
 
                 onObjectAdded: function(index, object) {
-                    secondarySubtitleMenu.insertAction(index + 1, object);
-
-                    /* This is a hack to force a refresh after adding the item.
-                     * For some reason the items are all added with blank text,
-                     * until something causes a visual update. */
-                    if (Features.macos)
-                    {
-                        object.checkable = !object.checkable;
-                        object.checkable = !object.checkable;
-                    }
+                    object.insertIntoMenu();
                 }
                 onObjectRemoved: function(index, object) {
-                    secondarySubtitleMenu.removeAction(object);
+                    object.removeFromMenu();
                 }
             }
         }
@@ -381,7 +419,7 @@ MenuBar {
 
             delegate: Action {
                 readonly property bool selected:
-                    WhisperController.active && root.player.state.sid === 0
+                    WhisperController.active
 
                 function syncChecked() {
                     if (checked !== selected)
@@ -455,37 +493,63 @@ MenuBar {
         Instantiator {
             model: root.player.state.subtitleTracks
             delegate: Action {
+                readonly property bool whisperTrack:
+                    WhisperController.isSubtitleTrack(modelData.id)
+                property bool insertedInMenu: false
+
+                function insertIntoMenu() {
+                    if (insertedInMenu || whisperTrack)
+                    {
+                        return;
+                    }
+                    subtitleMenu.insertAction(
+                        subtitleNoneAction.index +
+                        (Features.whisper && MementoSettings.whisperEnabled ? 1 : 0) +
+                        index + 1,
+                        this
+                    );
+                    insertedInMenu = true;
+                    root.refreshAction(this);
+                }
+
+                function removeFromMenu() {
+                    if (!insertedInMenu)
+                    {
+                        return;
+                    }
+                    subtitleMenu.removeAction(this);
+                    insertedInMenu = false;
+                }
+
                 checkable: true
                 checked: root.player.state.sid === modelData.id &&
-                         !WhisperController.active
-                enabled: root.player.state.secondarySid !== modelData.id
+                         !whisperTrack
+                enabled: root.player.state.secondarySid !== modelData.id &&
+                         !whisperTrack
                 ActionGroup.group: subtitleTrackGroup
                 text: root.makeTrackName(modelData)
                 onTriggered: {
                     WhisperController.stop();
                     root.player.controller.setSid(modelData.id);
                 }
+                onWhisperTrackChanged: {
+                    if (whisperTrack)
+                    {
+                        removeFromMenu();
+                    }
+                    else
+                    {
+                        insertIntoMenu();
+                    }
+                }
+                Component.onDestruction: removeFromMenu()
             }
 
             onObjectAdded: function(index, object) {
-                subtitleMenu.insertAction(
-                    subtitleNoneAction.index +
-                    (Features.whisper && MementoSettings.whisperEnabled ? 1 : 0) +
-                    index + 1,
-                    object
-                );
-
-                /* This is a hack to force a refresh after adding the item.
-                 * For some reason the items are all added with blank text,
-                 * until something causes a visual update. */
-                if (Features.macos)
-                {
-                    object.checkable = !object.checkable;
-                    object.checkable = !object.checkable;
-                }
+                object.insertIntoMenu();
             }
             onObjectRemoved: function(index, object) {
-                subtitleMenu.removeAction(object);
+                object.removeFromMenu();
             }
         }
     }
