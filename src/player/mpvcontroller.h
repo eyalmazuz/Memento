@@ -38,13 +38,22 @@ class MpvPlayer;
 struct MpvAudioClipArgs
 {
     Q_GADGET
+
+public:
+    enum Preset
+    {
+        Default,
+        WhisperPcm16Wav,
+    };
+    Q_ENUM(Preset)
+
     Q_PROPERTY(double start MEMBER start)
     Q_PROPERTY(double end MEMBER end)
     Q_PROPERTY(bool normalize MEMBER normalize)
     Q_PROPERTY(double db MEMBER db)
     Q_PROPERTY(QString extension MEMBER extension)
+    Q_PROPERTY(Preset preset MEMBER preset)
 
-public:
     /* The start time of the clip */
     double start = 0.0;
 
@@ -57,8 +66,11 @@ public:
     /* The decibels to normalize to */
     double db = -20.0;
 
-    /* The file extension to write to */
+    /* The file extension to write to when using the default preset */
     QString extension = ".aac";
+
+    /* The output preset. Non-default presets can override extension/encoding. */
+    Preset preset = Default;
 };
 
 /**

@@ -94,9 +94,9 @@ public:
     virtual ~WhisperModel();
 
     /**
-     * @brief Transcribe an audio file.
+     * @brief Transcribe a Whisper-ready audio file.
      *
-     * @param audioPath The path to a WAV audio file.
+     * @param audioPath The path to a 16 kHz mono PCM16 WAV audio file.
      * @param options Runtime transcription options.
      * @return A future containing the transcription result.
      */

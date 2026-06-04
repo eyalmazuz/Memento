@@ -304,6 +304,12 @@ signals:
      */
     void downloadNameChanged(const QString &value);
 
+private slots:
+    /**
+     * @brief Ask the active transcription loop to reload settings and restart.
+     */
+    void requestReconfigure();
+
 private:
     /**
      * @brief Async implementation for select.
@@ -391,11 +397,6 @@ private:
      * @param position The requested restart position.
      */
     void requestRestart(double position);
-
-    /**
-     * @brief Ask the active transcription loop to reload settings and restart.
-     */
-    void requestReconfigure();
 
     /**
      * @brief Consume a pending restart request.
