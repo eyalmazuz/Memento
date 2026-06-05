@@ -22,6 +22,7 @@
 
 #include "player/mpvplayer.h"
 #include "state/context.h"
+#include "subtitle/subtitlestate.h"
 
 PlayerManager::PlayerManager(Context *context, QObject *parent) :
     QObject(parent),
@@ -38,17 +39,25 @@ PlayerManager::PlayerManager(Context *context, QObject *parent) :
         Qt::QueuedConnection
     );
     connect(
-        m_context->player()->state()->subtitle(), &MpvSubtitle::delayChanged,
-        this, &PlayerManager::resetAutoPause,
-        Qt::QueuedConnection
-    );
-    connect(
         m_context->player()->state(), &MpvState::timePositionChanged,
         this, &PlayerManager::handleAutoPausePosition,
         Qt::QueuedConnection
     );
     connect(
-        m_context->player()->state()->subtitle(), &MpvSubtitle::textChanged,
+        m_context->subtitleLists(), &SubtitleLists::primarySourceChanged,
+        this, &PlayerManager::resetAutoPause,
+        Qt::QueuedConnection
+    );
+    connect(
+        m_context->subtitleLists()->primaryState(),
+        &SubtitleState::delayChanged,
+        this,
+        &PlayerManager::resetAutoPause,
+        Qt::QueuedConnection
+    );
+    connect(
+        m_context->subtitleLists()->primaryState(),
+        &SubtitleState::changed,
         this, &PlayerManager::handleAutoPause,
         Qt::QueuedConnection
     );
@@ -97,8 +106,9 @@ void PlayerManager::handleAutoPause()
         m_autoPauseData = {};
     }
 
-    double startTime{m_context->player()->state()->subtitle()->startTime()};
-    double endTime{m_context->player()->state()->subtitle()->endTime()};
+    SubtitleState *subtitle = m_context->subtitleLists()->primaryState();
+    double startTime{subtitle->startTime()};
+    double endTime{subtitle->endTime()};
 
     if (m_autoPauseData.lastEndTime == endTime)
     {
@@ -141,7 +151,7 @@ void PlayerManager::handleAutoPause()
     m_context->player()->controller()->pause();
     double idealSeekTime = std::clamp(
         m_autoPauseData.endTime +
-            m_context->player()->state()->subtitle()->delay() -
+            subtitle->delay() -
             0.1,
         0.0,
         m_context->player()->state()->duration()

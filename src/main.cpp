@@ -63,6 +63,7 @@
 #include "state/context.h"
 #include "subtitle/subtitlelistmodel.h"
 #include "subtitle/subtitlelists.h"
+#include "subtitle/subtitlestate.h"
 #include "util/utils.h"
 #include "whisper/whispercontroller.h"
 
@@ -263,6 +264,10 @@ static void registerQmlTypes(Context &context)
     qmlRegisterUncreatableType<SubtitleListModel>(
         MEMENTO_URI, 1, 0, "SubtitleListModel",
         "SubtitleListModel should only be created by SubtitleLists"
+    );
+    qmlRegisterUncreatableType<SubtitleState>(
+        MEMENTO_URI, 1, 0, "SubtitleState",
+        "SubtitleState should only be created by SubtitleLists"
     );
     qmlRegisterSingletonInstance<SubtitleLists>(
         MEMENTO_URI, 1, 0, "SubtitleLists", context.subtitleLists()

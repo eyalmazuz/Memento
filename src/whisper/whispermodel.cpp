@@ -283,7 +283,7 @@ QFuture<WhisperModel::TranscriptionResult> WhisperModel::transcribe(
                 return TranscriptionResult::Failed;
             }
 
-            QReadLocker locker(&m_modelLock);
+            QWriteLocker locker(&m_modelLock);
             whisper_context *ctx = getModel();
             if (ctx == nullptr)
             {

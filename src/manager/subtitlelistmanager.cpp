@@ -32,6 +32,7 @@
 #include "player/mpvplayer.h"
 #include "state/context.h"
 #include "subtitle/subtitleparser.h"
+#include "subtitle/subtitlestate.h"
 
 SubtitleListManager::SubtitleListManager(Context *context, QObject *parent) :
     QObject(parent),
@@ -69,8 +70,16 @@ SubtitleListManager::~SubtitleListManager()
 
 void SubtitleListManager::clearLists()
 {
-    m_context->subtitleLists()->setPrimary(nullptr);
-    m_context->subtitleLists()->setSecondary(nullptr);
+    if (m_context->subtitleLists()->primarySource() !=
+        SubtitleLists::Internal)
+    {
+        m_context->subtitleLists()->setPrimary(nullptr);
+    }
+    if (m_context->subtitleLists()->secondarySource() !=
+        SubtitleLists::Internal)
+    {
+        m_context->subtitleLists()->setSecondary(nullptr);
+    }
     qDeleteAll(m_models);
     m_models.clear();
 }
@@ -95,6 +104,12 @@ void SubtitleListManager::handleSubtitleTracksChanged()
 
 void SubtitleListManager::handleSidChanged(int64_t sid)
 {
+    if (m_context->subtitleLists()->primarySource() ==
+        SubtitleLists::Internal)
+    {
+        return;
+    }
+
     if (sid > m_models.size())
     {
         return;
@@ -106,6 +121,12 @@ void SubtitleListManager::handleSidChanged(int64_t sid)
 
 void SubtitleListManager::handleSecondarySidChanged(int64_t sid)
 {
+    if (m_context->subtitleLists()->secondarySource() ==
+        SubtitleLists::Internal)
+    {
+        return;
+    }
+
     if (sid > m_models.size())
     {
         return;
@@ -117,8 +138,15 @@ void SubtitleListManager::handleSecondarySidChanged(int64_t sid)
 
 void SubtitleListManager::handlePrimarySubtitleChanged()
 {
+    if (m_context->subtitleLists()->primarySource() ==
+        SubtitleLists::Internal)
+    {
+        return;
+    }
+
     addSubtitle(
         m_context->subtitleLists()->primary(),
+        m_context->subtitleLists()->primaryState(),
         m_context->player()->state()->subtitle(),
         m_context->player()->state()->timePosition()
     );
@@ -126,30 +154,53 @@ void SubtitleListManager::handlePrimarySubtitleChanged()
 
 void SubtitleListManager::handleSecondarySubtitleChanged()
 {
+    if (m_context->subtitleLists()->secondarySource() ==
+        SubtitleLists::Internal)
+    {
+        return;
+    }
+
     addSubtitle(
         m_context->subtitleLists()->secondary(),
+        m_context->subtitleLists()->secondaryState(),
         m_context->player()->state()->secondarySubtitle(),
         m_context->player()->state()->timePosition()
     );
 }
 
 void SubtitleListManager::addSubtitle(
-    SubtitleListModel *model, MpvSubtitle *subtitle, double position)
+    SubtitleListModel *model,
+    SubtitleState *state,
+    MpvSubtitle *subtitle,
+    double position)
 {
-    if (model == nullptr)
+    if (state == nullptr || subtitle == nullptr)
     {
         return;
     }
 
     if (!subtitle->text().isEmpty())
     {
-        model->addSubtitle(
-            subtitle->text(), subtitle->startTime(), subtitle->endTime());
-        model->selectPosition(position - subtitle->delay());
+        if (model != nullptr)
+        {
+            model->addSubtitle(
+                subtitle->text(), subtitle->startTime(), subtitle->endTime());
+            model->selectPosition(position - subtitle->delay());
+        }
+        state->setSubtitle(
+            subtitle->text(),
+            subtitle->startTime(),
+            subtitle->endTime(),
+            subtitle->delay()
+        );
     }
     else
     {
-        model->selectionModel()->clear();
+        if (model != nullptr)
+        {
+            model->selectionModel()->clear();
+        }
+        state->clear();
     }
 }
 

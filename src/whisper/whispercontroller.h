@@ -25,6 +25,7 @@
 #include <atomic>
 #include <memory>
 
+#include <QElapsedTimer>
 #include <QNetworkAccessManager>
 #include <QPointer>
 #include <QString>
@@ -545,11 +546,17 @@ private:
     /* Incremented to invalidate stale callbacks */
     int m_generation{0};
 
+    /* Incremented to reject stale select requests */
+    int m_selectGeneration{0};
+
     /* Incremented to invalidate stale segment callbacks */
     int m_segmentGeneration{0};
 
     /* Last observed player position */
     double m_lastPosition{-1.0};
+
+    /* Wall-clock time for the last observed player position */
+    QElapsedTimer m_lastPositionTimer;
 
     /* true if a transcription restart was requested */
     bool m_restartRequested{false};

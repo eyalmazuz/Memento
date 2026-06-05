@@ -36,6 +36,7 @@
 
 #include "anki/ankiconnect.h"
 #include "state/context.h"
+#include "subtitle/subtitlestate.h"
 
 /* The minimum AnkiConnect version required */
 static constexpr int MIN_ANKICONNECT_VERSION = 6;
@@ -936,16 +937,20 @@ QJsonObject AnkiClient::processReply(QNetworkReply &reply, QString &error)
 void AnkiClient::populate(Expression *expression) const
 {
     MpvState *state = m_context->player()->state();
+    SubtitleState *primaryState = m_context->subtitleLists()->primaryState();
+    SubtitleState *secondaryState =
+        m_context->subtitleLists()->secondaryState();
+
     expression->setTitle(state->title());
-    QString subtitleText = state->subtitle()->text();
+    QString subtitleText = primaryState->text();
     expression->setSubtitle(subtitleText.remove(m_subtitleFilterRegex));
     expression->setStartTime(
-        state->subtitle()->startTime() + state->subtitle()->delay()
+        primaryState->startTime() + primaryState->delay()
     );
     expression->setEndTime(
-        state->subtitle()->endTime() + state->subtitle()->delay()
+        primaryState->endTime() + primaryState->delay()
     );
-    expression->setSubtitle2(state->secondarySubtitle()->text());
+    expression->setSubtitle2(secondaryState->text());
 
     /* Set {context} fields */
     const SubtitleListModel *primaryList =
@@ -982,10 +987,10 @@ void AnkiClient::populate(Expression *expression) const
         {
             expression->setContextStartTime(
                 primaryListItems[primarySelection.front().row()].start +
-                    state->subtitle()->delay()
+                    primaryState->delay()
             );
             expression->setContextEndTime(
-                contextEndTime + state->subtitle()->delay()
+                contextEndTime + primaryState->delay()
             );
             expression->setContext(contextList.join('\n'));
         }

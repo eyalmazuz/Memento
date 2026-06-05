@@ -7,6 +7,8 @@ add_library(
     subtitlelists.h
     subtitleparser.cpp
     subtitleparser.h
+    subtitlestate.cpp
+    subtitlestate.h
 )
 target_compile_features(subtitle PUBLIC cxx_std_20)
 target_compile_options(subtitle PRIVATE ${MEMENTO_COMPILER_FLAGS})

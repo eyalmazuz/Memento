@@ -32,7 +32,6 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QPointer>
-#include <QThread>
 #include <QUrl>
 #include <QVariantMap>
 
@@ -68,6 +67,7 @@ static constexpr const char *VAD_SILERO_6 = "ggml-silero-v6.2.0.bin";
 static constexpr double WORK_WINDOW_SECONDS = 30.0;
 static constexpr double MIN_WORK_WINDOW_SECONDS = 0.25;
 static constexpr double SEEK_RESTART_THRESHOLD_SECONDS = 5.0;
+static constexpr double SEEK_RESTART_CLOCK_SLOP_SECONDS = 2.0;
 static constexpr double SUBTITLE_TIME_DELTA = 0.0001;
 static constexpr int WHISPER_GPU_DEVICE = 0;
 static constexpr int MAX_TRANSCRIPTION_FAILURES = 3;
@@ -208,6 +208,7 @@ QCoro::QmlTask WhisperController::select(MpvController *controller)
 
 void WhisperController::stop()
 {
+    ++m_selectGeneration;
     ++m_generation;
     ++m_segmentGeneration;
     m_restartRequested = false;
@@ -222,11 +223,13 @@ void WhisperController::stop()
 
     if (m_context != nullptr &&
         m_context->subtitleLists() != nullptr &&
-        m_context->subtitleLists()->primary() == m_subtitles)
+        m_context->subtitleLists()->primary() == m_subtitles &&
+        m_context->subtitleLists()->primarySource() == SubtitleLists::Internal)
     {
-        m_context->subtitleLists()->setPrimary(nullptr);
+        m_context->subtitleLists()->setPrimary(nullptr, SubtitleLists::None);
     }
     setActive(false);
+    setRunning(false);
     setCurrentText({});
     m_controller = nullptr;
 }
@@ -389,6 +392,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
     }
 
     Settings *settings = m_context->settings();
+    const int selectGeneration = ++m_selectGeneration;
     setRunning(true);
     const QString modelPath = selectedModelPath();
     if (modelPath.isEmpty() || !QFileInfo::exists(modelPath))
@@ -416,6 +420,10 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                 ).arg(vadModelPath);
                 co_return result;
             }
+        }
+        if (selectGeneration != m_selectGeneration)
+        {
+            co_return result;
         }
         if (vadModelPath.isEmpty() || !QFileInfo::exists(vadModelPath))
         {
@@ -469,6 +477,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
     m_reconfigureRequested = false;
     m_controller = controller;
     m_lastPosition = state->timePosition();
+    m_lastPositionTimer.restart();
 
     if (m_positionConnection)
     {
@@ -483,7 +492,10 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
 
     setActive(true);
     setCurrentText({});
-    m_context->subtitleLists()->setPrimary(m_subtitles);
+    m_context->subtitleLists()->setPrimary(
+        m_subtitles,
+        SubtitleLists::Internal
+    );
 
     const int initialRows = m_subtitles->rowCount();
     double start = skipCoveredPosition(
@@ -583,11 +595,6 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                 SubtitleEntry adjusted = subtitle;
                 adjusted.start = qBound(start, adjusted.start + start, end);
                 adjusted.end = qBound(start, adjusted.end + start, end);
-                const Qt::ConnectionType connectionType =
-                    QThread::currentThread() == self->thread() ?
-                        Qt::DirectConnection :
-                        Qt::BlockingQueuedConnection;
-
                 QMetaObject::invokeMethod(
                     self,
                     [self, generation, segmentGeneration, adjusted]
@@ -601,7 +608,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                             );
                         }
                     },
-                    connectionType
+                    Qt::QueuedConnection
                 );
             };
 
@@ -850,9 +857,14 @@ void WhisperController::addSubtitle(
 
     if (m_context != nullptr &&
         m_context->subtitleLists() != nullptr &&
-        m_context->subtitleLists()->primary() != m_subtitles)
+        (m_context->subtitleLists()->primary() != m_subtitles ||
+         m_context->subtitleLists()->primarySource() !=
+            SubtitleLists::Internal))
     {
-        m_context->subtitleLists()->setPrimary(m_subtitles);
+        m_context->subtitleLists()->setPrimary(
+            m_subtitles,
+            SubtitleLists::Internal
+        );
     }
 
     m_subtitles->removeOverlapping(subtitle.start, subtitle.end);
@@ -872,14 +884,41 @@ void WhisperController::handlePositionChanged(double position)
 {
     updateCurrentText();
 
+    double elapsedSeconds = 0.0;
+    if (m_lastPositionTimer.isValid())
+    {
+        elapsedSeconds =
+            static_cast<double>(m_lastPositionTimer.elapsed()) / 1000.0;
+    }
+    m_lastPositionTimer.restart();
+
     if (!m_active)
     {
         m_lastPosition = position;
         return;
     }
 
-    const bool seeked = m_lastPosition >= 0.0 &&
-        std::abs(position - m_lastPosition) > SEEK_RESTART_THRESHOLD_SECONDS;
+    bool seeked = false;
+    if (m_lastPosition >= 0.0)
+    {
+        const double positionDelta = position - m_lastPosition;
+        const double absoluteDelta = std::abs(positionDelta);
+        if (absoluteDelta > SEEK_RESTART_THRESHOLD_SECONDS)
+        {
+            MpvState *state = nullptr;
+            if (m_context != nullptr &&
+                m_context->player() != nullptr)
+            {
+                state = m_context->player()->state();
+            }
+
+            seeked = positionDelta < 0.0 ||
+                state == nullptr ||
+                state->pause() ||
+                positionDelta >
+                    elapsedSeconds + SEEK_RESTART_CLOCK_SLOP_SECONDS;
+        }
+    }
     m_lastPosition = position;
 
     if (seeked)
@@ -1042,9 +1081,14 @@ void WhisperController::updateCurrentText()
 
     if (m_subtitles != nullptr &&
         m_context->subtitleLists() != nullptr &&
-        m_context->subtitleLists()->primary() != m_subtitles)
+        (m_context->subtitleLists()->primary() != m_subtitles ||
+         m_context->subtitleLists()->primarySource() !=
+            SubtitleLists::Internal))
     {
-        m_context->subtitleLists()->setPrimary(m_subtitles);
+        m_context->subtitleLists()->setPrimary(
+            m_subtitles,
+            SubtitleLists::Internal
+        );
     }
 
     if (m_context->player() == nullptr ||
@@ -1071,6 +1115,11 @@ void WhisperController::updateCurrentText()
             {
                 m_subtitles->selectPosition(position);
             }
+            m_context->subtitleLists()->setPrimarySubtitle(
+                subtitle.text,
+                subtitle.start,
+                subtitle.end
+            );
             setCurrentText(subtitle.text);
             return;
         }
@@ -1082,6 +1131,7 @@ void WhisperController::updateCurrentText()
             selection->clear();
         }
     }
+    m_context->subtitleLists()->clearPrimarySubtitle();
     setCurrentText({});
 }
 

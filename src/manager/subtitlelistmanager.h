@@ -33,6 +33,7 @@
 class Context;
 class MpvSubtitle;
 class SubtitleListModel;
+class SubtitleState;
 class SubtitleParser;
 
 /**
@@ -97,6 +98,7 @@ private slots:
      */
     void addSubtitle(
         SubtitleListModel *model,
+        SubtitleState *state,
         MpvSubtitle *subtitle,
         double position);
 

@@ -20,16 +20,22 @@
 
 #include "anki/notebuilder.h"
 
+#include <cmath>
 #include <optional>
 
 #include <QDir>
+#include <QFile>
+#include <QFontMetrics>
 #include <QHash>
+#include <QImage>
+#include <QPainter>
 #include <QSet>
 
 #include "anki/ankiconnect.h"
 #include "anki/marker.h"
 #include "anki/markertokenizer.h"
 #include "state/context.h"
+#include "subtitle/subtitlestate.h"
 #include "util/utils.h"
 
 /**
@@ -2305,6 +2311,137 @@ static bool createAudioMedia(
 }
 
 /**
+ * @brief Draw Memento subtitle text onto a screenshot image.
+ *
+ * @param image The image to draw on.
+ * @param appCtx The application context.
+ * @param text The subtitle text to draw.
+ */
+static void drawInternalSubtitle(
+    QImage &image,
+    const ::Context &appCtx,
+    const QString &text)
+{
+    if (image.isNull() || text.trimmed().isEmpty())
+    {
+        return;
+    }
+
+    Settings *settings = appCtx.settings();
+    QFont font = settings->interfaceSubtitleFont();
+    font.setPixelSize(qMax(
+        1,
+        static_cast<int>(image.height() * settings->interfaceSubtitleScale())
+    ));
+
+    QFontMetrics metrics(font);
+    constexpr double MAX_TEXT_WIDTH = 0.95;
+    const int flags = Qt::AlignCenter | Qt::TextWordWrap;
+    const int maxWidth = qMax(
+        1,
+        static_cast<int>(image.width() * MAX_TEXT_WIDTH)
+    );
+    QRect textRect = metrics.boundingRect(
+        QRect(0, 0, maxWidth, image.height()),
+        flags,
+        text
+    );
+    textRect.setWidth(textRect.width() + 4);
+    textRect.setHeight(textRect.height() + 4);
+
+    const int bottomMax = qMax(0, image.height() - textRect.height());
+    const int bottomMargin = qBound(
+        0,
+        static_cast<int>(image.height() * settings->interfaceSubtitleOffset()),
+        bottomMax
+    );
+    textRect.moveLeft((image.width() - textRect.width()) / 2);
+    textRect.moveTop(image.height() - bottomMargin - textRect.height());
+
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+    painter.setFont(font);
+
+    const int padding = qMax(0, font.pixelSize() / 8);
+    const QColor background = settings->interfaceSubtitleBackground();
+    if (background.alpha() > 0)
+    {
+        painter.fillRect(
+            textRect.adjusted(-padding, -padding, padding, padding),
+            background
+        );
+    }
+
+    const int stroke = qMax(
+        0,
+        static_cast<int>(std::round(settings->interfaceSubtitleStroke()))
+    );
+    const QColor strokeColor = settings->interfaceSubtitleStrokeColor();
+    if (stroke > 0 && strokeColor.alpha() > 0)
+    {
+        painter.setPen(strokeColor);
+        for (int dx = -stroke; dx <= stroke; ++dx)
+        {
+            for (int dy = -stroke; dy <= stroke; ++dy)
+            {
+                if (dx == 0 && dy == 0)
+                {
+                    continue;
+                }
+                if (dx * dx + dy * dy > stroke * stroke)
+                {
+                    continue;
+                }
+                painter.drawText(textRect.translated(dx, dy), flags, text);
+            }
+        }
+    }
+
+    painter.setPen(settings->interfaceSubtitleColor());
+    painter.drawText(textRect, flags, text);
+}
+
+/**
+ * @brief Create a screenshot with internally rendered subtitles.
+ *
+ * @param appCtx The application context.
+ * @param imageExt The screenshot file extension.
+ * @return The screenshot path, or empty on failure.
+ */
+static QString createInternalSubtitleScreenshot(
+    const ::Context &appCtx,
+    const QString &imageExt)
+{
+    QString path =
+        appCtx.player()->controller()->tempScreenshot(false, imageExt);
+    if (path.isEmpty())
+    {
+        return {};
+    }
+
+    const SubtitleState *state = appCtx.subtitleLists()->primaryState();
+    if (state == nullptr || state->text().trimmed().isEmpty())
+    {
+        return path;
+    }
+
+    QImage image(path);
+    if (image.isNull())
+    {
+        qWarning("Could not load screenshot for subtitle overlay");
+        return path;
+    }
+
+    drawInternalSubtitle(image, appCtx, state->text());
+    if (!image.save(path))
+    {
+        qWarning("Could not save screenshot with subtitle overlay");
+    }
+    return path;
+}
+
+/**
  * @brief Create the {screenshot} image and add it to the context.
  *
  * @param appCtx The context of the application.
@@ -2327,11 +2464,22 @@ static bool createScreenshot(
 
     const QString imageExt = getImageFileExtension(profile.screenshotType());
 
-    const bool visibility = appCtx.player()->state()->subtitle()->visible();
-    appCtx.player()->controller()->setSubtitleVisibility(true);
-    QString path =
-        appCtx.player()->controller()->tempScreenshot(true, imageExt);
-    appCtx.player()->controller()->setSubtitleVisibility(visibility);
+    QString path;
+    if (appCtx.subtitleLists()->primarySource() == SubtitleLists::Internal)
+    {
+        path = createInternalSubtitleScreenshot(appCtx, imageExt);
+    }
+    else if (appCtx.subtitleLists()->primarySource() == SubtitleLists::Mpv)
+    {
+        const bool visibility = appCtx.player()->state()->subtitle()->visible();
+        appCtx.player()->controller()->setSubtitleVisibility(true);
+        path = appCtx.player()->controller()->tempScreenshot(true, imageExt);
+        appCtx.player()->controller()->setSubtitleVisibility(visibility);
+    }
+    else
+    {
+        path = appCtx.player()->controller()->tempScreenshot(false, imageExt);
+    }
 
     for (const auto &[params, fields] :
         fieldCtx.fieldsWithScreenshot.asKeyValueRange())

@@ -84,7 +84,7 @@ Page {
         SubtitleList {
             id: primarySubtitleList
             subtitleListModel: SubtitleLists.primary
-            delay: root.player?.state.subtitle.delay ?? 0
+            delay: SubtitleLists.primaryState.delay
             textColor: root.textColor
             hoverColor: root.hoverColor
             selectedColor: root.selectedColor
@@ -96,7 +96,7 @@ Page {
         SubtitleList {
             id: secondarySubtitleList
             subtitleListModel: SubtitleLists.secondary
-            delay: root.player?.state.secondarySubtitle.delay ?? 0
+            delay: SubtitleLists.secondaryState.delay
             textColor: root.textColor
             hoverColor: root.hoverColor
             selectedColor: root.selectedColor
