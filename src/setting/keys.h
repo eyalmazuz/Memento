@@ -437,6 +437,18 @@ namespace Keys
         constexpr const char *MODEL_DEFAULT = "kha-white/manga-ocr-base";
     }
 
+    namespace Asr
+    {
+        constexpr const char *GROUP = "asr";
+
+        constexpr const char *ENABLED = "enable";
+        constexpr bool ENABLED_DEFAULT = true;
+
+        constexpr const char *BACKEND = "backend";
+        constexpr const char *BACKEND_WHISPER = "whisper";
+        constexpr const char *BACKEND_DEFAULT = BACKEND_WHISPER;
+    }
+
     namespace Whisper
     {
         constexpr const char *GROUP = "whisper";
@@ -474,4 +486,5 @@ namespace Keys
         constexpr const char *FLASH_ATTN = "flash-attn";
         constexpr bool FLASH_ATTN_DEFAULT = true;
     }
+
 }

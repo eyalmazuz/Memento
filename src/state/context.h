@@ -26,6 +26,7 @@
 #include "anki/ankiconfig.h"
 #include "audio/audioplayer.h"
 #include "dict/dictionarycontroller.h"
+#include "manager/downloadmanager.h"
 #include "player/mpvplayer.h"
 #include "quick/fileopenhandler.h"
 #include "setting/settings.h"
@@ -100,6 +101,14 @@ public:
     FileOpenHandler *fileOpenHandler() const noexcept;
 
     /**
+     * @brief Get the global download manager.
+     *
+     * @return The global download manager.
+     */
+    [[nodiscard]]
+    DownloadManager *downloadManager() const noexcept;
+
+    /**
      * @brief Get the application MpvPlayer instance.
      *
      * @return The MpvPlayer instance.
@@ -139,6 +148,9 @@ private:
 
     /* The application file open handler. Has ownership. */
     FileOpenHandler *m_fileOpenHandler{new FileOpenHandler(this)};
+
+    /* The application download manager. Has ownership. */
+    DownloadManager *m_downloadManager{new DownloadManager(this, this)};
 
     /* The main application MpvPlayer. Does not have ownership. */
     MpvPlayer *m_player{nullptr};

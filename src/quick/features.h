@@ -108,6 +108,18 @@ class Features : public QObject
     )
 
     Q_PROPERTY(
+        bool asr
+        READ asr
+        CONSTANT
+    )
+
+    Q_PROPERTY(
+        bool asrWhisper
+        READ asrWhisper
+        CONSTANT
+    )
+
+    Q_PROPERTY(
         bool qApplication
         READ qApplication
         CONSTANT
@@ -231,6 +243,24 @@ public:
      */
     [[nodiscard]]
     bool whisper() const noexcept;
+
+    /**
+     * @brief Get if Memento was compiled with any ASR backend.
+     *
+     * @return true if ASR is supported,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool asr() const noexcept;
+
+    /**
+     * @brief Get if Memento was compiled with the Whisper ASR backend.
+     *
+     * @return true if Whisper ASR is supported,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool asrWhisper() const noexcept;
 
     /**
      * @brief Get if Memento was compiled as a QApplication instead of

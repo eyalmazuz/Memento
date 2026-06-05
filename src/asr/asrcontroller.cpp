@@ -18,7 +18,11 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-#include "whisper/whispercontroller.h"
+#include "asr/asrcontroller.h"
+
+#ifdef MEMENTO_WHISPER_SUPPORT
+#define MEMENTO_ASR_BACKEND_SUPPORT
+#endif // MEMENTO_WHISPER_SUPPORT
 
 #include <cmath>
 #include <limits>
@@ -29,8 +33,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QPointer>
 #include <QUrl>
 #include <QVariantMap>
@@ -44,26 +46,17 @@
 #include "player/mpvcontroller.h"
 #include "player/mpvplayer.h"
 #include "player/mpvstate.h"
+#include "setting/keys.h"
 #include "setting/settings.h"
 #include "state/context.h"
 #include "subtitle/subtitlelistmodel.h"
-#include "util/directoryutils.h"
-
-#ifdef MEMENTO_WHISPER_SUPPORT
-#include "whisper/whispermodel.h"
-#endif // MEMENTO_WHISPER_SUPPORT
+#include "manager/downloadmanager.h"
+#include "asr/whisper/whispercontroller.h"
 
 static constexpr const char *KEY_ERROR = "error";
 static constexpr const char *MODEL_CUSTOM = "custom";
-static constexpr const char *MODEL_PREFIX = "ggml-";
 static constexpr const char *MODEL_SUFFIX = ".bin";
-static constexpr const char *WHISPER_MODEL_URL =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-static constexpr const char *WHISPER_VAD_URL =
-    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/";
-static constexpr const char *WHISPER_MODEL_DIR = "models";
-static constexpr const char *VAD_SILERO_5 = "ggml-silero-v5.1.2.bin";
-static constexpr const char *VAD_SILERO_6 = "ggml-silero-v6.2.0.bin";
+
 static constexpr double WORK_WINDOW_SECONDS = 30.0;
 static constexpr double MIN_WORK_WINDOW_SECONDS = 0.25;
 static constexpr double SEEK_RESTART_THRESHOLD_SECONDS = 5.0;
@@ -72,9 +65,11 @@ static constexpr double SUBTITLE_TIME_DELTA = 0.0001;
 static constexpr int WHISPER_GPU_DEVICE = 0;
 static constexpr int MAX_TRANSCRIPTION_FAILURES = 3;
 
-WhisperController::WhisperController(Context *context, QObject *parent) :
+AsrController::AsrController(Context *context, QObject *parent) :
     QObject(parent),
-    m_context(context)
+    m_context(context),
+    m_downloader(context != nullptr ? context->downloadManager() : nullptr),
+    m_whisperController(new WhisperController(context, this))
 {
     if (m_context != nullptr)
     {
@@ -84,129 +79,144 @@ WhisperController::WhisperController(Context *context, QObject *parent) :
         {
             connect(
                 settings,
+                &Settings::asrEnabledChanged,
+                this,
+                &AsrController::requestReconfigure
+            );
+            connect(
+                settings,
+                &Settings::asrBackendChanged,
+                this,
+                &AsrController::requestReconfigure
+            );
+            connect(
+                settings,
                 &Settings::whisperEnabledChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperModelChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperCustomModelChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperVadEnabledChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperVadModelChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperUseGpuChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperThreadsChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperBestOfChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperBeamSizeChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
             connect(
                 settings,
                 &Settings::whisperFlashAttentionChanged,
                 this,
-                &WhisperController::requestReconfigure
+                &AsrController::requestReconfigure
             );
+
         }
+    }
+
+    if (m_downloader != nullptr)
+    {
+        connect(m_downloader, &DownloadManager::downloadRunningChanged, this, &AsrController::downloadRunningChanged);
+        connect(m_downloader, &DownloadManager::downloadProgressChanged, this, &AsrController::downloadProgressChanged);
+        connect(m_downloader, &DownloadManager::downloadNameChanged, this, &AsrController::downloadNameChanged);
     }
 }
 
-WhisperController::~WhisperController()
+AsrController::~AsrController()
 {
     stop();
 }
 
-bool WhisperController::active() const noexcept
+bool AsrController::active() const noexcept
 {
     return m_active;
 }
 
-bool WhisperController::running() const noexcept
+bool AsrController::running() const noexcept
 {
     return m_running;
 }
 
-QString WhisperController::currentText() const
+QString AsrController::currentText() const
 {
     return m_currentText;
 }
 
-bool WhisperController::downloadRunning() const noexcept
+bool AsrController::downloadRunning() const noexcept
 {
-    return m_downloadRunning;
+    return m_downloader->downloadRunning();
 }
 
-qreal WhisperController::downloadProgress() const noexcept
+qreal AsrController::downloadProgress() const noexcept
 {
-    if (m_downloadTotal <= 0)
-    {
-        return m_downloadRunning ? 0.0 : 1.0;
-    }
-    return qBound(0.0, static_cast<qreal>(m_downloadReceived) /
-        static_cast<qreal>(m_downloadTotal), 1.0);
+    return m_downloader->downloadProgress();
 }
 
-qint64 WhisperController::downloadReceived() const noexcept
+qint64 AsrController::downloadReceived() const noexcept
 {
-    return m_downloadReceived;
+    return m_downloader->downloadReceived();
 }
 
-qint64 WhisperController::downloadTotal() const noexcept
+qint64 AsrController::downloadTotal() const noexcept
 {
-    return m_downloadTotal;
+    return m_downloader->downloadTotal();
 }
 
-qint64 WhisperController::downloadSpeed() const noexcept
+qint64 AsrController::downloadSpeed() const noexcept
 {
-    return m_downloadSpeed;
+    return m_downloader->downloadSpeed();
 }
 
-QString WhisperController::downloadName() const
+QString AsrController::downloadName() const
 {
-    return m_downloadName;
+    return m_downloader->downloadName();
 }
 
-QCoro::QmlTask WhisperController::select(MpvController *controller)
+QCoro::QmlTask AsrController::select(MpvController *controller)
 {
     return selectAsync(controller);
 }
 
-void WhisperController::stop()
+void AsrController::stop()
 {
     ++m_selectGeneration;
     ++m_generation;
@@ -214,12 +224,10 @@ void WhisperController::stop()
     m_restartRequested = false;
     m_reconfigureRequested = false;
 
-#ifdef MEMENTO_WHISPER_SUPPORT
     if (m_abort)
     {
         m_abort->store(true);
     }
-#endif // MEMENTO_WHISPER_SUPPORT
 
     if (m_context != nullptr &&
         m_context->subtitleLists() != nullptr &&
@@ -234,145 +242,173 @@ void WhisperController::stop()
     m_controller = nullptr;
 }
 
-QString WhisperController::modelsDirectory() const
+QString AsrController::modelsDirectory() const
 {
-    return QDir(DirectoryUtils::getConfigDir()).filePath(WHISPER_MODEL_DIR);
+    return m_whisperController->modelsDirectory();
 }
 
-bool WhisperController::hasAnyModel() const
+bool AsrController::hasAnyModel() const
 {
     QDir dir(modelsDirectory());
     const QFileInfoList entries = dir.entryInfoList(
-        QStringList{"*.bin"},
+        QStringList{"*"},
         QDir::Files | QDir::Readable
     );
     for (const QFileInfo &entry : entries)
     {
         const QString filename = entry.fileName();
-        if (filename != VAD_SILERO_5 && filename != VAD_SILERO_6)
+        if (!filename.endsWith(MODEL_SUFFIX) ||
+            filename == "ggml-silero-v5.1.2.bin" ||
+            filename == "ggml-silero-v6.2.0.bin")
         {
-            return true;
+            continue;
         }
+        return true;
     }
     return false;
 }
 
-bool WhisperController::modelAvailable(const QString &model) const
+bool AsrController::modelAvailable(const QString &model) const
 {
-    if (!isManagedModel(model))
-    {
-        return false;
-    }
-    return QFileInfo::exists(resolveModelPath(modelFilename(model)));
+    return m_whisperController->modelAvailable(model);
 }
 
-bool WhisperController::selectedModelAvailable() const
+bool AsrController::selectedModelAvailable() const
 {
     const QString path = selectedModelPath();
     return !path.isEmpty() && QFileInfo::exists(path);
 }
 
-bool WhisperController::selectedModelDownloadable() const
+bool AsrController::selectedModelDownloadable() const
 {
-    return m_context != nullptr &&
-        m_context->settings() != nullptr &&
-        isManagedModel(m_context->settings()->whisperModel());
+    if (m_context == nullptr || m_context->settings() == nullptr)
+    {
+        return false;
+    }
+
+    Settings *settings = m_context->settings();
+    if (settings->asrBackend() == Keys::Asr::BACKEND_WHISPER)
+    {
+        return m_whisperController->isManagedModel(settings->whisperModel());
+    }
+    return false;
 }
 
-QCoro::QmlTask WhisperController::downloadModel(const QString &model)
+QCoro::QmlTask AsrController::downloadModel(const QString &model)
 {
     return downloadModelAsync(model);
 }
 
-QCoro::Task<QVariantMap> WhisperController::downloadModelAsync(QString model)
+QCoro::Task<QVariantMap> AsrController::downloadModelAsync(QString model)
 {
     QVariantMap result;
 
-#ifndef MEMENTO_WHISPER_SUPPORT
+#ifndef MEMENTO_ASR_BACKEND_SUPPORT
     Q_UNUSED(model)
     result[KEY_ERROR] = tr(
-        "Whisper subtitle support is not available in this build.");
+        "ASR subtitle support is not available in this build.");
     co_return result;
 #else
-    if (m_downloadRunning)
+    if (m_downloader->downloadRunning())
     {
-        result[KEY_ERROR] = tr("A Whisper model is already downloading.");
+        result[KEY_ERROR] = tr("An ASR model is already downloading.");
         co_return result;
     }
 
-    if (!isManagedModel(model))
+    QString path;
+    QUrl url;
+    bool reconfigureWhenDone = false;
+    Settings *settings = m_context->settings();
+
+    if (m_whisperController->isManagedModel(model))
     {
-        result[KEY_ERROR] = tr("This Whisper model cannot be downloaded.");
+#ifndef MEMENTO_WHISPER_SUPPORT
+        result[KEY_ERROR] = tr(
+            "Whisper subtitle support is not available in this build.");
+        co_return result;
+#else
+        path = m_whisperController->resolveModelPath(
+            m_whisperController->modelFilename(model),
+            QStringList{MODEL_SUFFIX}
+        );
+        url = m_whisperController->whisperModelUrl(model);
+        reconfigureWhenDone =
+            m_context != nullptr &&
+            settings != nullptr &&
+            settings->asrBackend() ==
+                Keys::Asr::BACKEND_WHISPER &&
+            settings->whisperModel() == model;
+#endif // MEMENTO_WHISPER_SUPPORT
+    }
+
+    else
+    {
+        result[KEY_ERROR] = tr("This ASR model cannot be downloaded.");
         co_return result;
     }
 
-    const QString path = resolveModelPath(modelFilename(model));
     if (QFileInfo::exists(path))
     {
         const qint64 size = QFileInfo(path).size();
-        setDownloadName(model);
-        setDownloadProgress(size, size, 0);
+        m_downloader->setDownloadName(model);
+        m_downloader->setDownloadProgress(size, size, 0);
         result["path"] = path;
-        if (m_context != nullptr &&
-            m_context->settings() != nullptr &&
-            m_context->settings()->whisperModel() == model)
+        if (reconfigureWhenDone)
         {
             requestReconfigure();
         }
         co_return result;
     }
 
-    setDownloadName(model);
-    setDownloadProgress(0, 0, 0);
-    setDownloadRunning(true);
-    const bool ok = co_await ensureDownloaded(
-        whisperModelUrl(model),
+    m_downloader->setDownloadName(model);
+    m_downloader->setDownloadProgress(0, 0, 0);
+    m_downloader->setDownloadRunning(true);
+    const bool ok = co_await m_downloader->download(
+        url,
         path,
         model,
         true
     );
-    setDownloadRunning(false);
+    m_downloader->setDownloadRunning(false);
 
     if (!ok)
     {
-        result[KEY_ERROR] = tr("Could not download Whisper model: %1")
+        result[KEY_ERROR] = tr("Could not download ASR model: %1")
             .arg(model);
         co_return result;
     }
 
     result["path"] = path;
-    if (m_context != nullptr &&
-        m_context->settings() != nullptr &&
-        m_context->settings()->whisperModel() == model)
+    if (reconfigureWhenDone)
     {
         requestReconfigure();
     }
     co_return result;
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif // MEMENTO_ASR_BACKEND_SUPPORT
 }
 
-QCoro::Task<QVariantMap> WhisperController::selectAsync(
+QCoro::Task<QVariantMap> AsrController::selectAsync(
     MpvController *controller)
 {
     QVariantMap result;
 
-#ifndef MEMENTO_WHISPER_SUPPORT
+#ifndef MEMENTO_ASR_BACKEND_SUPPORT
     Q_UNUSED(controller)
     result[KEY_ERROR] = tr(
-        "Whisper subtitle support is not available in this build.");
+        "ASR subtitle support is not available in this build.");
     co_return result;
 #else
     if (m_running)
     {
-        result[KEY_ERROR] = tr("Whisper is already transcribing.");
+        result[KEY_ERROR] = tr("ASR is already transcribing.");
         co_return result;
     }
 
     if (m_context == nullptr ||
         m_context->settings() == nullptr ||
-        !m_context->settings()->whisperEnabled())
+        !m_context->settings()->asrEnabled())
     {
-        result[KEY_ERROR] = tr("Whisper subtitles are disabled.");
+        result[KEY_ERROR] = tr("ASR subtitles are disabled.");
         co_return result;
     }
 
@@ -392,6 +428,22 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
     }
 
     Settings *settings = m_context->settings();
+    const QString backendName = settings->asrBackend();
+    if (backendName == Keys::Asr::BACKEND_WHISPER)
+    {
+#ifndef MEMENTO_WHISPER_SUPPORT
+        result[KEY_ERROR] = tr(
+            "Whisper subtitle support is not available in this build.");
+        co_return result;
+#endif // MEMENTO_WHISPER_SUPPORT
+    }
+
+    else
+    {
+        result[KEY_ERROR] = tr("The selected ASR backend is not available.");
+        co_return result;
+    }
+
     const int selectGeneration = ++m_selectGeneration;
     setRunning(true);
     const QString modelPath = selectedModelPath();
@@ -400,19 +452,24 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         setRunning(false);
         result["missingModel"] = true;
         result["path"] = modelPath;
-        result[KEY_ERROR] = tr("Whisper model was not found: %1")
+        result[KEY_ERROR] = tr("ASR model was not found: %1")
             .arg(modelPath);
         co_return result;
     }
 
+    const bool whisperBackend = backendName == Keys::Asr::BACKEND_WHISPER;
+
     QString vadModelPath;
-    if (settings->whisperVadEnabled())
+    if (whisperBackend && settings->whisperVadEnabled())
     {
-        vadModelPath = resolveModelPath(settings->whisperVadModel());
-        const QUrl vadUrl = vadModelUrl(settings->whisperVadModel());
+        vadModelPath = m_whisperController->resolveModelPath(
+            settings->whisperVadModel(),
+            QStringList{MODEL_SUFFIX}
+        );
+        const QUrl vadUrl = m_whisperController->vadModelUrl(settings->whisperVadModel());
         if (!vadUrl.isEmpty() && !QFileInfo::exists(vadModelPath))
         {
-            if (!co_await ensureDownloaded(vadUrl, vadModelPath))
+            if (!co_await m_downloader->download(vadUrl, vadModelPath, settings->whisperVadModel()))
             {
                 setRunning(false);
                 result[KEY_ERROR] = tr(
@@ -449,10 +506,12 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
     }
 
     const QString mediaPath = state->path();
-    const bool useGpu = settings->whisperUseGpu();
+    const bool useGpu = whisperBackend && settings->whisperUseGpu();
     const int gpuDevice = WHISPER_GPU_DEVICE;
-    const bool flashAttention = settings->whisperFlashAttention();
+    const bool flashAttention =
+        whisperBackend && settings->whisperFlashAttention();
     const QString cacheSettingsKey =
+        backendName + "\n" +
         modelPath + "\n" +
         vadModelPath + "\n" +
         QString::number(useGpu) + "\n" +
@@ -460,7 +519,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         QString::number(settings->whisperBestOf()) + "\n" +
         QString::number(settings->whisperBeamSize()) + "\n" +
         QString::number(settings->whisperVadEnabled()) + "\n" +
-        QString::number(flashAttention);
+        QString::number(flashAttention) + "\n";
     if (m_cacheMediaPath != mediaPath ||
         m_cacheModelPath != modelPath ||
         m_cacheSettingsKey != cacheSettingsKey)
@@ -520,7 +579,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         if (state->path() != mediaPath || duration <= 0.0)
         {
             failed = true;
-            result[KEY_ERROR] = tr("Media changed while Whisper was running.");
+            result[KEY_ERROR] = tr("Media changed while ASR was running.");
             break;
         }
 
@@ -555,7 +614,7 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
         if (audioPath.isEmpty())
         {
             failed = true;
-            result[KEY_ERROR] = tr("Could not extract audio for Whisper.");
+            result[KEY_ERROR] = tr("Could not extract audio for ASR.");
             break;
         }
 
@@ -572,17 +631,18 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
             continue;
         }
 
-        WhisperModel::Options options{
+        AsrTranscriptionOptions options{
             .threads = settings->whisperThreads(),
             .bestOf = settings->whisperBestOf(),
             .beamSize = settings->whisperBeamSize(),
             .useVad = settings->whisperVadEnabled(),
             .vadModel = vadModelPath,
+            .language = QStringLiteral("ja"),
             .abort = m_abort,
             .segmentCallback = {},
         };
 
-        QPointer<WhisperController> self(this);
+        QPointer<AsrController> self(this);
         options.segmentCallback =
             [self, generation, segmentGeneration, start, end]
             (const SubtitleEntry &subtitle)
@@ -620,22 +680,34 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                 !m_restartRequested;
         };
 
-        WhisperModel::TranscriptionResult transcribeResult =
+        AsrBackend *currentBackend = backend(
+            backendName,
+            modelPath,
+            runtimeUseGpu,
+            gpuDevice,
+            runtimeFlashAttention
+        );
+
+        if (currentBackend == nullptr)
+        {
+            failed = true;
+            result[KEY_ERROR] = tr("Could not instantiate ASR backend.");
+            QFile::remove(audioPath);
+            break;
+        }
+
+        AsrTranscriptionResult transcribeResult =
             co_await qCoro(
-                model(
-                    modelPath,
-                    runtimeUseGpu,
-                    gpuDevice,
-                    runtimeFlashAttention
-                )->transcribe(
+                currentBackend->transcribe(
                     audioPath,
                     options
                 )
             ).takeResult();
 
         if (transcribeResult ==
-                WhisperModel::TranscriptionResult::Failed &&
+                AsrTranscriptionResult::Failed &&
             canRetry() &&
+            whisperBackend &&
             runtimeFlashAttention)
         {
             qWarning(
@@ -643,22 +715,28 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                 "retrying without flash attention."
             );
             runtimeFlashAttention = false;
-            transcribeResult = co_await qCoro(
-                model(
-                    modelPath,
-                    runtimeUseGpu,
-                    gpuDevice,
-                    runtimeFlashAttention
-                )->transcribe(
-                    audioPath,
-                    options
-                )
-            ).takeResult();
+            currentBackend = backend(
+                backendName,
+                modelPath,
+                runtimeUseGpu,
+                gpuDevice,
+                runtimeFlashAttention
+            );
+            if (currentBackend != nullptr)
+            {
+                transcribeResult = co_await qCoro(
+                    currentBackend->transcribe(
+                        audioPath,
+                        options
+                    )
+                ).takeResult();
+            }
         }
 
         if (transcribeResult ==
-                WhisperModel::TranscriptionResult::Failed &&
+                AsrTranscriptionResult::Failed &&
             canRetry() &&
+            whisperBackend &&
             runtimeUseGpu)
         {
             qWarning(
@@ -666,17 +744,22 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
             );
             runtimeUseGpu = false;
             runtimeFlashAttention = false;
-            transcribeResult = co_await qCoro(
-                model(
-                    modelPath,
-                    runtimeUseGpu,
-                    gpuDevice,
-                    runtimeFlashAttention
-                )->transcribe(
-                    audioPath,
-                    options
-                )
-            ).takeResult();
+            currentBackend = backend(
+                backendName,
+                modelPath,
+                runtimeUseGpu,
+                gpuDevice,
+                runtimeFlashAttention
+            );
+            if (currentBackend != nullptr)
+            {
+                transcribeResult = co_await qCoro(
+                    currentBackend->transcribe(
+                        audioPath,
+                        options
+                    )
+                ).takeResult();
+            }
         }
 
         QFile::remove(audioPath);
@@ -696,12 +779,12 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
             setRunning(false);
             co_return result;
         }
-        if (transcribeResult == WhisperModel::TranscriptionResult::Canceled)
+        if (transcribeResult == AsrTranscriptionResult::Canceled)
         {
             start = qBound(0.0, state->timePosition(), duration);
             continue;
         }
-        if (transcribeResult != WhisperModel::TranscriptionResult::Success)
+        if (transcribeResult != AsrTranscriptionResult::Success)
         {
             ++consecutiveFailures;
             if (consecutiveFailures >= MAX_TRANSCRIPTION_FAILURES)
@@ -710,14 +793,14 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
                 fatalFailure = false;
                 result["fatal"] = false;
                 result[KEY_ERROR] = tr(
-                    "Whisper transcription paused after repeated decode "
-                    "failures. Seek or change Whisper settings to retry."
+                    "ASR transcription paused after repeated decode "
+                    "failures. Seek or change ASR settings to retry."
                 );
                 break;
             }
 
             qWarning(
-                "Whisper transcription failed; retrying from the current "
+                "ASR transcription failed; retrying from the current "
                 "playback position."
             );
             start = qBound(0.0, state->timePosition(), duration);
@@ -763,80 +846,40 @@ QCoro::Task<QVariantMap> WhisperController::selectAsync(
     }
 
     co_return result;
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif // MEMENTO_ASR_BACKEND_SUPPORT
 }
 
-void WhisperController::setActive(bool value)
+void AsrController::setActive(bool value)
 {
     if (m_active == value)
     {
         return;
     }
     m_active = value;
-    emit activeChanged(m_active);
+    emit activeChanged();
 }
 
-void WhisperController::setRunning(bool value)
+void AsrController::setRunning(bool value)
 {
     if (m_running == value)
     {
         return;
     }
     m_running = value;
-    emit runningChanged(m_running);
+    emit runningChanged();
 }
 
-void WhisperController::setCurrentText(QString value)
+void AsrController::setCurrentText(QString value)
 {
     if (m_currentText == value)
     {
         return;
     }
     m_currentText = std::move(value);
-    emit currentTextChanged(m_currentText);
+    emit currentTextChanged();
 }
 
-void WhisperController::setDownloadRunning(bool value)
-{
-    if (m_downloadRunning == value)
-    {
-        return;
-    }
-    m_downloadRunning = value;
-    emit downloadRunningChanged(m_downloadRunning);
-}
-
-void WhisperController::setDownloadName(QString value)
-{
-    if (m_downloadName == value)
-    {
-        return;
-    }
-    m_downloadName = std::move(value);
-    emit downloadNameChanged(m_downloadName);
-}
-
-void WhisperController::setDownloadProgress(
-    qint64 received, qint64 total, qint64 speed)
-{
-    received = qMax<qint64>(0, received);
-    total = qMax<qint64>(0, total);
-    speed = qMax<qint64>(0, speed);
-
-    if (m_downloadReceived == received &&
-        m_downloadTotal == total &&
-        m_downloadSpeed == speed)
-    {
-        return;
-    }
-
-    m_downloadReceived = received;
-    m_downloadTotal = total;
-    m_downloadSpeed = speed;
-    emit downloadProgressChanged();
-}
-
-void WhisperController::addSubtitle(
+void AsrController::addSubtitle(
     int generation,
     int segmentGeneration,
     const SubtitleEntry &subtitle)
@@ -880,7 +923,77 @@ void WhisperController::addSubtitle(
     updateCurrentText();
 }
 
-void WhisperController::handlePositionChanged(double position)
+void AsrController::updateCurrentText()
+{
+    if (!m_active || m_context == nullptr)
+    {
+        setCurrentText({});
+        return;
+    }
+
+    if (m_subtitles != nullptr &&
+        m_context->subtitleLists() != nullptr &&
+        (m_context->subtitleLists()->primary() != m_subtitles ||
+         m_context->subtitleLists()->primarySource() !=
+            SubtitleLists::Internal))
+    {
+        m_context->subtitleLists()->setPrimary(
+            m_subtitles,
+            SubtitleLists::Internal
+        );
+    }
+
+    if (m_context->player() == nullptr ||
+        m_context->player()->state() == nullptr ||
+        m_subtitles == nullptr)
+    {
+        setCurrentText({});
+        return;
+    }
+
+    const double position = m_context->player()->state()->timePosition();
+    const std::vector<SubtitleEntry> &subtitles = m_subtitles->items();
+    bool found = false;
+    for (size_t i = 0; i < subtitles.size(); ++i)
+    {
+        const SubtitleEntry &subtitle = subtitles[i];
+        if (subtitle.start <= position && position < subtitle.end)
+        {
+            QItemSelectionModel *selection = m_subtitles->selectionModel();
+            if (selection == nullptr ||
+                !selection->isRowSelected(
+                    static_cast<int>(i),
+                    QModelIndex()
+                ))
+            {
+                m_subtitles->selectPosition(position);
+            }
+            m_context->subtitleLists()->setPrimarySubtitle(
+                subtitle.text,
+                subtitle.start,
+                subtitle.end
+            );
+            setCurrentText(subtitle.text);
+            found = true;
+            break;
+        }
+    }
+
+    if (!found)
+    {
+        if (QItemSelectionModel *selection = m_subtitles->selectionModel())
+        {
+            if (selection->hasSelection())
+            {
+                selection->clear();
+            }
+        }
+        m_context->subtitleLists()->clearPrimarySubtitle();
+        setCurrentText({});
+    }
+}
+
+void AsrController::handlePositionChanged(double position)
 {
     updateCurrentText();
 
@@ -891,12 +1004,6 @@ void WhisperController::handlePositionChanged(double position)
             static_cast<double>(m_lastPositionTimer.elapsed()) / 1000.0;
     }
     m_lastPositionTimer.restart();
-
-    if (!m_active)
-    {
-        m_lastPosition = position;
-        return;
-    }
 
     bool seeked = false;
     if (m_lastPosition >= 0.0)
@@ -949,85 +1056,36 @@ void WhisperController::handlePositionChanged(double position)
     }
 }
 
-void WhisperController::requestRestart(double position)
+void AsrController::requestRestart(double position)
 {
-    if (!m_active)
-    {
-        return;
-    }
-
-    if (m_context != nullptr &&
-        m_context->player() != nullptr &&
-        m_context->player()->state() != nullptr)
-    {
-        position = qBound(
-            0.0,
-            position,
-            m_context->player()->state()->duration()
-        );
-    }
-    else
-    {
-        position = qMax(0.0, position);
-    }
-
     m_restartPosition = position;
     m_restartRequested = true;
-    ++m_segmentGeneration;
-
-#ifdef MEMENTO_WHISPER_SUPPORT
     if (m_abort)
     {
         m_abort->store(true);
     }
-#endif // MEMENTO_WHISPER_SUPPORT
-
-    if (!m_running && m_controller != nullptr)
-    {
-        selectAsync(m_controller);
-    }
 }
 
-void WhisperController::requestReconfigure()
+void AsrController::requestReconfigure()
 {
-    if (!m_active)
-    {
-        return;
-    }
-
-    if (m_context != nullptr &&
-        m_context->settings() != nullptr &&
-        !m_context->settings()->whisperEnabled())
-    {
-        stop();
-        return;
-    }
-
     m_reconfigureRequested = true;
-
-    double position = 0.0;
-    if (m_context != nullptr &&
-        m_context->player() != nullptr &&
-        m_context->player()->state() != nullptr)
+    if (m_abort)
     {
-        position = m_context->player()->state()->timePosition();
+        m_abort->store(true);
     }
-    requestRestart(position);
 }
 
-bool WhisperController::consumeRestart(double &position)
+bool AsrController::consumeRestart(double &position)
 {
-    if (!m_restartRequested)
+    const bool requested = m_restartRequested.exchange(false);
+    if (requested)
     {
-        return false;
+        position = m_restartPosition;
     }
-
-    position = m_restartPosition;
-    m_restartRequested = false;
-    return true;
+    return requested;
 }
 
-double WhisperController::skipCoveredPosition(double position) const
+double AsrController::skipCoveredPosition(double position) const
 {
     if (m_subtitles == nullptr)
     {
@@ -1041,7 +1099,7 @@ double WhisperController::skipCoveredPosition(double position) const
         for (const SubtitleEntry &subtitle : m_subtitles->items())
         {
             if (subtitle.start <= position + SUBTITLE_TIME_DELTA &&
-                position < subtitle.end - SUBTITLE_TIME_DELTA)
+                position < subtitle.end)
             {
                 position = subtitle.end;
                 advanced = true;
@@ -1052,7 +1110,7 @@ double WhisperController::skipCoveredPosition(double position) const
     return position;
 }
 
-double WhisperController::nextSubtitleStart(double position) const
+double AsrController::nextSubtitleStart(double position) const
 {
     if (m_subtitles == nullptr)
     {
@@ -1071,296 +1129,51 @@ double WhisperController::nextSubtitleStart(double position) const
     return next;
 }
 
-void WhisperController::updateCurrentText()
-{
-    if (!m_active || m_context == nullptr)
-    {
-        setCurrentText({});
-        return;
-    }
-
-    if (m_subtitles != nullptr &&
-        m_context->subtitleLists() != nullptr &&
-        (m_context->subtitleLists()->primary() != m_subtitles ||
-         m_context->subtitleLists()->primarySource() !=
-            SubtitleLists::Internal))
-    {
-        m_context->subtitleLists()->setPrimary(
-            m_subtitles,
-            SubtitleLists::Internal
-        );
-    }
-
-    if (m_context->player() == nullptr ||
-        m_context->player()->state() == nullptr ||
-        m_subtitles == nullptr)
-    {
-        setCurrentText({});
-        return;
-    }
-
-    const double position = m_context->player()->state()->timePosition();
-    const std::vector<SubtitleEntry> &subtitles = m_subtitles->items();
-    for (size_t i = 0; i < subtitles.size(); ++i)
-    {
-        const SubtitleEntry &subtitle = subtitles[i];
-        if (subtitle.start <= position && position < subtitle.end)
-        {
-            QItemSelectionModel *selection = m_subtitles->selectionModel();
-            if (selection == nullptr ||
-                !selection->isRowSelected(
-                    static_cast<int>(i),
-                    QModelIndex()
-                ))
-            {
-                m_subtitles->selectPosition(position);
-            }
-            m_context->subtitleLists()->setPrimarySubtitle(
-                subtitle.text,
-                subtitle.start,
-                subtitle.end
-            );
-            setCurrentText(subtitle.text);
-            return;
-        }
-    }
-    if (QItemSelectionModel *selection = m_subtitles->selectionModel())
-    {
-        if (selection->hasSelection())
-        {
-            selection->clear();
-        }
-    }
-    m_context->subtitleLists()->clearPrimarySubtitle();
-    setCurrentText({});
-}
-
-QString WhisperController::resolveModelPath(const QString &path) const
-{
-    if (path.isEmpty())
-    {
-        return {};
-    }
-
-    const QFileInfo info(path);
-    if (info.isAbsolute())
-    {
-        return path;
-    }
-
-    const QDir modelDir(modelsDirectory());
-    QStringList filenames{path};
-    if (!path.endsWith(MODEL_SUFFIX))
-    {
-        filenames.append(path + MODEL_SUFFIX);
-    }
-
-    for (const QString &filename : filenames)
-    {
-        const QString candidate = modelDir.filePath(filename);
-        if (QFileInfo::exists(candidate))
-        {
-            return candidate;
-        }
-    }
-
-    const bool bareFilename = info.fileName() == path;
-    if (bareFilename)
-    {
-        return modelDir.filePath(filenames.last());
-    }
-
-    return info.absoluteFilePath();
-}
-
-QString WhisperController::selectedModelPath() const
+QString AsrController::selectedModelPath() const
 {
     if (m_context == nullptr || m_context->settings() == nullptr)
     {
         return {};
     }
 
-    const QString model = m_context->settings()->whisperModel();
-    if (model == MODEL_CUSTOM)
+    Settings *settings = m_context->settings();
+    if (settings->asrBackend() == Keys::Asr::BACKEND_WHISPER)
     {
-        return resolveModelPath(m_context->settings()->whisperCustomModel());
+        return m_whisperController->selectedModelPath();
     }
-
-    return resolveModelPath(modelFilename(model));
+    return {};
 }
 
-QCoro::Task<bool> WhisperController::ensureDownloaded(
-    const QUrl &url,
-    const QString &path,
-    const QString &name,
-    bool reportProgress)
-{
-    if (!url.isValid() || path.isEmpty())
-    {
-        co_return false;
-    }
-    if (QFileInfo::exists(path))
-    {
-        if (reportProgress)
-        {
-            const qint64 size = QFileInfo(path).size();
-            setDownloadName(name);
-            setDownloadProgress(size, size, 0);
-        }
-        co_return true;
-    }
-
-    const QFileInfo info(path);
-    if (!QDir().mkpath(info.absolutePath()))
-    {
-        qWarning("Could not create Whisper model directory.");
-        co_return false;
-    }
-
-    const QString partialPath = path + ".download";
-    QFile::remove(partialPath);
-    QFile file(partialPath);
-    if (!file.open(QFile::WriteOnly))
-    {
-        qWarning("Could not open Whisper model download target.");
-        co_return false;
-    }
-
-    QNetworkRequest req{url};
-    req.setAttribute(
-        QNetworkRequest::RedirectPolicyAttribute,
-        QNetworkRequest::UserVerifiedRedirectPolicy
-    );
-    std::unique_ptr<QNetworkReply> reply{m_manager.get(std::move(req))};
-    connect(
-        reply.get(), &QNetworkReply::redirected,
-        reply.get(), &QNetworkReply::redirectAllowed
-    );
-    QElapsedTimer timer;
-    timer.start();
-    if (reportProgress)
-    {
-        connect(
-            reply.get(),
-            &QNetworkReply::downloadProgress,
-            this,
-            [this, &timer] (qint64 received, qint64 total)
-            {
-                const qint64 elapsed = qMax<qint64>(1, timer.elapsed());
-                setDownloadProgress(
-                    received,
-                    total,
-                    (received * 1000) / elapsed
-                );
-            }
-        );
-    }
-    connect(
-        reply.get(), &QNetworkReply::readyRead,
-        reply.get(),
-        [&file, reply = reply.get()]
-        {
-            file.write(reply->readAll());
-        }
-    );
-    co_await reply.get();
-    file.write(reply->readAll());
-    file.close();
-
-    const QVariant statusCode = reply->attribute(
-        QNetworkRequest::HttpStatusCodeAttribute
-    );
-    if (reply->error() != QNetworkReply::NetworkError::NoError ||
-        (statusCode.isValid() && statusCode.toInt() >= 400))
-    {
-        qWarning(
-            "Whisper model download failed: %s",
-            qUtf8Printable(reply->errorString())
-        );
-        QFile::remove(partialPath);
-        co_return false;
-    }
-
-    QFile::remove(path);
-    if (!QFile::rename(partialPath, path))
-    {
-        qWarning("Could not finalize Whisper model download.");
-        QFile::remove(partialPath);
-        co_return false;
-    }
-
-    if (reportProgress)
-    {
-        const qint64 size = QFileInfo(path).size();
-        setDownloadProgress(size, size, 0);
-    }
-    co_return true;
-}
-
-QString WhisperController::modelFilename(const QString &model) const
-{
-    return QString("%1%2%3").arg(MODEL_PREFIX, model, MODEL_SUFFIX);
-}
-
-bool WhisperController::isManagedModel(const QString &model) const
-{
-    static const QStringList MODELS{
-        "tiny",
-        "base",
-        "small",
-        "medium",
-        "large-v3",
-        "large-v3-turbo",
-    };
-    return MODELS.contains(model);
-}
-
-QUrl WhisperController::whisperModelUrl(const QString &model) const
-{
-    return QUrl(QString("%1%2").arg(WHISPER_MODEL_URL, modelFilename(model)));
-}
-
-QUrl WhisperController::vadModelUrl(const QString &modelPath) const
-{
-    const QFileInfo info(modelPath);
-    if (info.isAbsolute())
-    {
-        return {};
-    }
-
-    const QString filename = info.fileName();
-    if (filename != VAD_SILERO_5 && filename != VAD_SILERO_6)
-    {
-        return {};
-    }
-
-    return QUrl(QString("%1%2").arg(WHISPER_VAD_URL, filename));
-}
-
-#ifdef MEMENTO_WHISPER_SUPPORT
-WhisperModel *WhisperController::model(
+AsrBackend *AsrController::backend(
+    const QString &backendName,
     const QString &modelPath,
     bool useGpu,
     int gpuDevice,
     bool flashAttention)
 {
-    if (!m_model ||
+    if (!m_backend ||
+        m_backendName != backendName ||
         m_modelPath != modelPath ||
         m_useGpu != useGpu ||
         m_gpuDevice != gpuDevice ||
         m_flashAttention != flashAttention)
     {
-        m_model = std::make_unique<WhisperModel>(
-            modelPath,
-            useGpu,
-            gpuDevice,
-            flashAttention
-        );
+        m_backend.reset();
+        if (backendName == Keys::Asr::BACKEND_WHISPER)
+        {
+            m_backend = m_whisperController->createBackend(
+                modelPath,
+                useGpu,
+                gpuDevice,
+                flashAttention
+            );
+        }
+
+        m_backendName = backendName;
         m_modelPath = modelPath;
         m_useGpu = useGpu;
         m_gpuDevice = gpuDevice;
         m_flashAttention = flashAttention;
     }
-    return m_model.get();
+    return m_backend.get();
 }
-#endif // MEMENTO_WHISPER_SUPPORT

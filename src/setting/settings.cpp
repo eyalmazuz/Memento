@@ -60,6 +60,7 @@ void Settings::load()
     loadInterfaceSettings();
     loadKeybindSettings();
     loadOcrSettings();
+    loadAsrSettings();
     loadWhisperSettings();
 }
 
@@ -78,6 +79,7 @@ void Settings::write()
     writeInterfaceSettings();
     writeKeybindSettings();
     writeOcrSettings();
+    writeAsrSettings();
     writeWhisperSettings();
 }
 
@@ -92,6 +94,7 @@ void Settings::defaults()
     defaultInterfaceSettings();
     defaultKeybindSettings();
     defaultOcrSettings();
+    defaultAsrSettings();
     defaultWhisperSettings();
 }
 
@@ -1430,6 +1433,58 @@ void Settings::defaultOcrSettings()
     setOcrModel();
 }
 
+void Settings::loadAsrSettings()
+{
+    QSettings s;
+    QSettings legacy;
+    legacy.beginGroup(Keys::Whisper::GROUP);
+    const bool legacyEnabled = legacy.value(
+        Keys::Whisper::ENABLED,
+        Keys::Asr::ENABLED_DEFAULT
+    ).toBool();
+    legacy.endGroup();
+
+    s.beginGroup(Keys::Asr::GROUP);
+
+    setAsrEnabled(
+        s.value(
+            Keys::Asr::ENABLED,
+            legacyEnabled
+        ).toBool()
+    );
+    setAsrBackend(
+        s.value(
+            Keys::Asr::BACKEND,
+            Keys::Asr::BACKEND_DEFAULT
+        ).toString()
+    );
+
+    s.endGroup();
+}
+
+void Settings::writeAsrSettings()
+{
+    QSettings s;
+    s.beginGroup(Keys::Asr::GROUP);
+
+    s.setValue(
+        Keys::Asr::ENABLED,
+        asrEnabled()
+    );
+    s.setValue(
+        Keys::Asr::BACKEND,
+        asrBackend()
+    );
+
+    s.endGroup();
+}
+
+void Settings::defaultAsrSettings()
+{
+    setAsrEnabled();
+    setAsrBackend();
+}
+
 void Settings::loadWhisperSettings()
 {
     QSettings s;
@@ -2658,6 +2713,52 @@ void Settings::setOcrModel(const QString &value)
     }
     m_ocr.model = value;
     emit ocrModelChanged(m_ocr.model);
+}
+
+/* ASR Settings */
+
+bool Settings::asrEnabled() const noexcept
+{
+    return m_asr.enabled;
+}
+
+void Settings::setAsrEnabled(bool value)
+{
+    if (m_asr.enabled == value)
+    {
+        return;
+    }
+    m_asr.enabled = value;
+    emit asrEnabledChanged(m_asr.enabled);
+}
+
+QString Settings::asrBackend() const noexcept
+{
+    return m_asr.backend;
+}
+
+void Settings::setAsrBackend(const QString &value)
+{
+    QStringList backends;
+#ifdef MEMENTO_WHISPER_SUPPORT
+    backends.append(Keys::Asr::BACKEND_WHISPER);
+#endif // MEMENTO_WHISPER_SUPPORT
+    if (backends.isEmpty())
+    {
+        backends.append(Keys::Asr::BACKEND_WHISPER);
+    }
+
+    const QString defaultBackend = backends.front();
+
+    QString backend = backends.contains(value) ?
+        value : defaultBackend;
+    if (m_asr.backend == backend)
+    {
+        return;
+    }
+
+    m_asr.backend = std::move(backend);
+    emit asrBackendChanged(m_asr.backend);
 }
 
 /* Whisper Settings */

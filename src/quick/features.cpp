@@ -124,6 +124,16 @@ bool Features::whisper() const noexcept
 #endif
 }
 
+bool Features::asr() const noexcept
+{
+    return asrWhisper();
+}
+
+bool Features::asrWhisper() const noexcept
+{
+    return whisper();
+}
+
 bool Features::qApplication() const noexcept
 {
 #ifdef MEMENTO_QAPPLICATION

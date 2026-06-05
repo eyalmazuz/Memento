@@ -74,10 +74,10 @@ Window {
                     });
                     ++insertIndex;
                 }
-                if (Features.whisper)
+                if (Features.asr)
                 {
                     model.insert(insertIndex, {
-                        text: qsTr("Whisper"),
+                        text: qsTr("ASR"),
                         icon: "volume-on",
                         pageIndex: 8,
                     });
@@ -122,8 +122,8 @@ Window {
                 enabled: Features.ocr
             }
 
-            WhisperPage {
-                enabled: Features.whisper
+            AsrPage {
+                enabled: Features.asr
             }
 
             SearchPage { }

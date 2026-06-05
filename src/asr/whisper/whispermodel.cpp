@@ -20,7 +20,7 @@
 
 #ifdef MEMENTO_WHISPER_SUPPORT
 
-#include "whisper/whispermodel.h"
+#include "asr/whisper/whispermodel.h"
 
 #include <algorithm>
 #include <cstring>
@@ -269,18 +269,18 @@ WhisperModel::~WhisperModel()
     whisper_free(getModel());
 }
 
-QFuture<WhisperModel::TranscriptionResult> WhisperModel::transcribe(
-    const QString &audioPath, Options options)
+QFuture<AsrTranscriptionResult> WhisperModel::transcribe(
+    const QString &audioPath, AsrTranscriptionOptions options)
 {
     return QtConcurrent::run(
         [this, audioPath, options = std::move(options)] ()
-            -> TranscriptionResult
+            -> AsrTranscriptionResult
         {
             std::vector<float> samples = read_whisper_wav(audioPath);
             if (samples.empty())
             {
                 qWarning("No audio samples available for Whisper.");
-                return TranscriptionResult::Failed;
+                return AsrTranscriptionResult::Failed;
             }
 
             QWriteLocker locker(&m_modelLock);
@@ -288,7 +288,7 @@ QFuture<WhisperModel::TranscriptionResult> WhisperModel::transcribe(
             if (ctx == nullptr)
             {
                 qWarning("Whisper model is invalid.");
-                return TranscriptionResult::Failed;
+                return AsrTranscriptionResult::Failed;
             }
 
             const whisper_sampling_strategy strategy =
@@ -332,17 +332,17 @@ QFuture<WhisperModel::TranscriptionResult> WhisperModel::transcribe(
             );
             if (ret == 0)
             {
-                return TranscriptionResult::Success;
+                return AsrTranscriptionResult::Success;
             }
             if (abort != nullptr && abort->load())
             {
-                return TranscriptionResult::Canceled;
+                return AsrTranscriptionResult::Canceled;
             }
             else
             {
                 qWarning("Whisper transcription failed with code %d.", ret);
             }
-            return TranscriptionResult::Failed;
+            return AsrTranscriptionResult::Failed;
         }
     );
 }

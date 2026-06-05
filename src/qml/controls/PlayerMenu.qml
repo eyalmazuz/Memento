@@ -365,23 +365,23 @@ MenuBar {
             }
 
             checkable: true
-            checked: root.player.state.sid === 0 && !WhisperController.active
+            checked: root.player.state.sid === 0 && !AsrController.active
             ActionGroup.group: subtitleTrackGroup
             text: qsTr("None")
             onTriggered: {
-                WhisperController.stop();
+                AsrController.stop();
                 root.player.controller.setSid(0);
             }
         }
 
         Instantiator {
-            id: whisperSubtitleInstantiator
+            id: asrSubtitleInstantiator
 
-            model: Features.whisper && MementoSettings.whisperEnabled ? 1 : 0
+            model: Features.asr && MementoSettings.asrEnabled ? 1 : 0
 
             delegate: Action {
                 readonly property bool selected:
-                    WhisperController.active && root.player.state.sid === 0
+                    AsrController.active && root.player.state.sid === 0
 
                 function syncChecked() {
                     if (checked !== selected)
@@ -392,10 +392,10 @@ MenuBar {
 
                 checkable: true
                 checked: selected
-                enabled: !WhisperController.running || WhisperController.active
-                text: WhisperController.running ?
-                    qsTr("Whisper subtitles...") :
-                    qsTr("Whisper subtitles")
+                enabled: !AsrController.running || AsrController.active
+                text: AsrController.running ?
+                    qsTr("ASR subtitles...") :
+                    qsTr("ASR subtitles")
                 onSelectedChanged: syncChecked()
                 onCheckedChanged: Qt.callLater(syncChecked)
                 Component.onCompleted: syncChecked()
@@ -403,28 +403,28 @@ MenuBar {
                 onTriggered: {
                     if (selected)
                     {
-                        WhisperController.stop();
+                        AsrController.stop();
                         syncChecked();
                         return;
                     }
 
                     const previousSid = root.player.state.sid;
-                    if (!WhisperController.selectedModelAvailable())
+                    if (!AsrController.selectedModelAvailable())
                     {
-                        WhisperController.stop();
+                        AsrController.stop();
                         root.player.controller.setSid(previousSid);
                         syncChecked();
                         return;
                     }
 
                     root.player.controller.setSid(0);
-                    WhisperController.select(root.player.controller)
+                    AsrController.select(root.player.controller)
                         .then(function(result) {
                             if (result.error)
                             {
                                 if (result.fatal !== false)
                                 {
-                                    WhisperController.stop();
+                                    AsrController.stop();
                                     root.player.controller.setSid(previousSid);
                                 }
                                 root.player.controller.showText(result.error);
@@ -457,12 +457,12 @@ MenuBar {
             delegate: Action {
                 checkable: true
                 checked: root.player.state.sid === modelData.id &&
-                         !WhisperController.active
+                         !AsrController.active
                 enabled: root.player.state.secondarySid !== modelData.id
                 ActionGroup.group: subtitleTrackGroup
                 text: root.makeTrackName(modelData)
                 onTriggered: {
-                    WhisperController.stop();
+                    AsrController.stop();
                     root.player.controller.setSid(modelData.id);
                 }
             }
@@ -470,7 +470,7 @@ MenuBar {
             onObjectAdded: function(index, object) {
                 subtitleMenu.insertAction(
                     subtitleNoneAction.index +
-                    (Features.whisper && MementoSettings.whisperEnabled ? 1 : 0) +
+                    (Features.asr && MementoSettings.asrEnabled ? 1 : 0) +
                     index + 1,
                     object
                 );

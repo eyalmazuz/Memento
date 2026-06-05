@@ -22,15 +22,11 @@
 
 #ifdef MEMENTO_WHISPER_SUPPORT
 
-#include <atomic>
-#include <functional>
-#include <memory>
-
 #include <QFuture>
 #include <QReadWriteLock>
 #include <QString>
 
-#include "subtitle/subtitleentry.h"
+#include "asr/asrbackend.h"
 
 struct whisper_context;
 
@@ -40,43 +36,6 @@ struct whisper_context;
 class WhisperModel
 {
 public:
-    /**
-     * @brief Result of a transcription request.
-     */
-    enum class TranscriptionResult
-    {
-        Success,
-        Failed,
-        Canceled,
-    };
-
-    /**
-     * @brief Runtime transcription options.
-     */
-    struct Options
-    {
-        /* Number of inference threads */
-        int threads{1};
-
-        /* Number of greedy candidates */
-        int bestOf{5};
-
-        /* Beam search size */
-        int beamSize{5};
-
-        /* true to use VAD */
-        bool useVad{false};
-
-        /* VAD model path */
-        QString vadModel;
-
-        /* Abort flag */
-        std::shared_ptr<std::atomic_bool> abort;
-
-        /* Called for each generated segment */
-        std::function<void(const SubtitleEntry &)> segmentCallback;
-    };
-
     /**
      * @brief Initializes a WhisperModel object.
      *
@@ -100,8 +59,8 @@ public:
      * @param options Runtime transcription options.
      * @return A future containing the transcription result.
      */
-    QFuture<TranscriptionResult> transcribe(
-        const QString &audioPath, Options options);
+    QFuture<AsrTranscriptionResult> transcribe(
+        const QString &audioPath, AsrTranscriptionOptions options);
 
 private:
     /**

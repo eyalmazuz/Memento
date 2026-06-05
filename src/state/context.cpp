@@ -65,6 +65,11 @@ FileOpenHandler *Context::fileOpenHandler() const noexcept
     return m_fileOpenHandler;
 }
 
+DownloadManager *Context::downloadManager() const noexcept
+{
+    return m_downloadManager;
+}
+
 MpvPlayer *Context::player() const noexcept
 {
     return m_player;

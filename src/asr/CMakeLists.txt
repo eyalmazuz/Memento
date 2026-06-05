@@ -1,20 +1,25 @@
 add_library(
-    whispertranscriber
-    whispercontroller.cpp
-    whispercontroller.h
+    asrtranscriber
+    asrbackend.h
+    asrcontroller.cpp
+    asrcontroller.h
+    whisper/whispercontroller.cpp
+    whisper/whispercontroller.h
 )
 if(MEMENTO_WHISPER_SUPPORT)
     target_sources(
-        whispertranscriber
-        PRIVATE whispermodel.cpp
-        PRIVATE whispermodel.h
+        asrtranscriber
+        PRIVATE whisper/whisperbackend.cpp
+        PRIVATE whisper/whisperbackend.h
+        PRIVATE whisper/whispermodel.cpp
+        PRIVATE whisper/whispermodel.h
     )
 endif()
-target_compile_features(whispertranscriber PUBLIC cxx_std_20)
-target_compile_options(whispertranscriber PRIVATE ${MEMENTO_COMPILER_FLAGS})
-target_include_directories(whispertranscriber PRIVATE ${MEMENTO_INCLUDE_DIRS})
+target_compile_features(asrtranscriber PUBLIC cxx_std_20)
+target_compile_options(asrtranscriber PRIVATE ${MEMENTO_COMPILER_FLAGS})
+target_include_directories(asrtranscriber PRIVATE ${MEMENTO_INCLUDE_DIRS})
 target_link_libraries(
-    whispertranscriber
+    asrtranscriber
     PRIVATE "$<$<BOOL:${MEMENTO_WHISPER_SUPPORT}>:whisper>"
     PRIVATE context
     PRIVATE mpvplayer

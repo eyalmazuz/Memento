@@ -13,7 +13,7 @@ add_subdirectory(setting)
 add_subdirectory(state)
 add_subdirectory(subtitle)
 add_subdirectory(util)
-add_subdirectory(whisper)
+add_subdirectory(asr)
 
 # Executable Targets
 qt_add_executable(
@@ -86,7 +86,7 @@ qt_add_qml_module(
         qml/definition/TermGlossary.qml
         qml/definition/TermPitch.qml
         qml/dialogs/UpdateDialog.qml
-        qml/dialogs/WhisperDownloadDialog.qml
+        qml/dialogs/AsrDownloadDialog.qml
         qml/Main.qml
         qml/objects/AudioFiles.qml
         qml/objects/AudioSourceResolver.qml
@@ -103,7 +103,7 @@ qt_add_qml_module(
         qml/options/OcrPage.qml
         qml/options/OptionsWindow.qml
         qml/options/SearchPage.qml
-        qml/options/WhisperPage.qml
+        qml/options/AsrPage.qml
         qml/util/AnkiMarkers.qml
         qml/util/MementoPalette.qml
         qml/util/Utils.qml
@@ -154,7 +154,7 @@ target_link_libraries(
     PRIVATE settings
     PRIVATE subtitle
     PRIVATE utils
-    PRIVATE whispertranscriber
+    PRIVATE asrtranscriber
 )
 
 include(GNUInstallDirs)

@@ -16,10 +16,10 @@ Dialog {
     anchors.centerIn: parent
     modal: true
     width: 460
-    closePolicy: WhisperController.downloadRunning ?
+    closePolicy: AsrController.downloadRunning ?
         Popup.NoAutoClose :
         Popup.CloseOnEscape
-    title: qsTr("Download Whisper Model")
+    title: qsTr("Download ASR Model")
 
     component DialogFooterButton: Rectangle {
         id: footerButton
@@ -54,7 +54,7 @@ Dialog {
     }
 
     footer: RowLayout {
-        visible: !WhisperController.downloadRunning
+        visible: !AsrController.downloadRunning
         width: parent.width
         spacing: 8
 
@@ -91,7 +91,7 @@ Dialog {
         root.success = false;
         root.open();
 
-        WhisperController.downloadModel(modelName)
+        AsrController.downloadModel(modelName)
             .then(function(result) {
                 root.error = result.error ?? "";
                 root.success = !root.error;
@@ -114,7 +114,7 @@ Dialog {
                     qsTr("Downloaded %1.").arg(root.model) :
                     qsTr("Downloading %1 to %2.")
                         .arg(root.model)
-                        .arg(WhisperController.modelsDirectory()))
+                        .arg(AsrController.modelsDirectory()))
         }
 
         Rectangle {
@@ -125,7 +125,7 @@ Dialog {
             clip: true
 
             Rectangle {
-                width: parent.width * WhisperController.downloadProgress
+                width: parent.width * AsrController.downloadProgress
                 height: parent.height
                 radius: parent.radius
                 color: MementoPalette.highlight
@@ -144,7 +144,7 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignRight
-                text: `${Math.round(WhisperController.downloadProgress * 100)}%`
+                text: `${Math.round(AsrController.downloadProgress * 100)}%`
             }
 
             Label {
@@ -154,8 +154,8 @@ Dialog {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignRight
                 text: qsTr("%1 of %2")
-                    .arg(root.formatBytes(WhisperController.downloadReceived))
-                    .arg(root.formatBytes(WhisperController.downloadTotal))
+                    .arg(root.formatBytes(AsrController.downloadReceived))
+                    .arg(root.formatBytes(AsrController.downloadTotal))
             }
 
             Label {
@@ -164,7 +164,7 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignRight
-                text: root.formatBytes(WhisperController.downloadTotal)
+                text: root.formatBytes(AsrController.downloadTotal)
             }
 
             Label {
@@ -174,7 +174,7 @@ Dialog {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignRight
                 text: qsTr("%1/s")
-                    .arg(root.formatBytes(WhisperController.downloadSpeed))
+                    .arg(root.formatBytes(AsrController.downloadSpeed))
             }
         }
     }

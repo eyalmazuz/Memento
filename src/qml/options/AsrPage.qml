@@ -9,7 +9,15 @@ Page {
     property int preferredWidth: 600
     property int groupSpacing: 10
 
-    readonly property var modelOptions: [
+    readonly property var backendOptions: {
+        let options = [];
+        if (Features.asrWhisper)
+        {
+            options.push({ label: qsTr("Whisper"), value: "whisper" });
+        }
+        return options;
+    }
+    readonly property var whisperModelOptions: [
         "tiny",
         "base",
         "small",
@@ -21,24 +29,36 @@ Page {
     readonly property var numericOptions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     readonly property var threadOptions: {
         let options = [];
-        for (let i = 1; i <= MementoSettings.whisperMaxThreads; ++i)
+        const maxThreads = MementoSettings.whisperMaxThreads;
+        for (let i = 1; i <= maxThreads; ++i)
         {
             options.push(i);
         }
         return options;
     }
 
+    function backendIndex(value) {
+        for (let i = 0; i < root.backendOptions.length; ++i)
+        {
+            if (root.backendOptions[i].value === value)
+            {
+                return i;
+            }
+        }
+        return 0;
+    }
+
     function maybePromptModelDownload(model) {
-        if (model === "custom" || WhisperController.modelAvailable(model))
+        if (model === "custom" || AsrController.modelAvailable(model))
         {
             return;
         }
 
-        whisperDownloadPrompt.openForModel(model);
+        asrDownloadPrompt.openForModel(model);
     }
 
     Loader {
-        id: whisperDownloadPrompt
+        id: asrDownloadPrompt
         active: false
 
         function openForModel(model) {
@@ -49,7 +69,7 @@ Page {
 
         sourceComponent: Component {
             Dialog {
-                id: whisperDownloadPromptItem
+                id: asrDownloadPromptItem
 
                 property string modelName: ""
 
@@ -57,28 +77,28 @@ Page {
                 anchors.centerIn: parent
                 modal: true
                 standardButtons: Dialog.Yes | Dialog.No
-                title: qsTr("Download Whisper Model")
+                title: qsTr("Download ASR Model")
 
-                onAccepted: whisperDownloadDialog.start(modelName)
+                onAccepted: asrDownloadDialog.start(modelName)
 
                 Label {
                     width: 420
                     wrapMode: Text.WordWrap
                     text: qsTr(
-                        "The selected Whisper model is not installed in %1.\n\n" +
+                        "The selected ASR model is not installed in %1.\n\n" +
                         "Do you want to download %2 now?"
-                    ).arg(WhisperController.modelsDirectory())
-                     .arg(whisperDownloadPromptItem.modelName)
+                    ).arg(AsrController.modelsDirectory())
+                     .arg(asrDownloadPromptItem.modelName)
                 }
             }
         }
     }
 
     Loader {
-        id: whisperDownloadDialog
+        id: asrDownloadDialog
         active: false
         sourceComponent: Component {
-            WhisperDownloadDialog { }
+            AsrDownloadDialog { }
         }
 
         function start(model) {
@@ -104,14 +124,19 @@ Page {
                              DialogButtonBox.RestoreDefaults |
                              DialogButtonBox.Reset
 
-            onApplied: MementoSettings.writeWhisperSettings()
+            onApplied: {
+                MementoSettings.writeAsrSettings();
+                MementoSettings.writeWhisperSettings();
+            }
             onClicked: function(button) {
                 if (button === standardButton(DialogButtonBox.Reset))
                 {
+                    MementoSettings.loadAsrSettings();
                     MementoSettings.loadWhisperSettings();
                 }
                 else if (button === standardButton(DialogButtonBox.RestoreDefaults))
                 {
+                    MementoSettings.defaultAsrSettings();
                     MementoSettings.defaultWhisperSettings();
                 }
             }
@@ -139,7 +164,7 @@ Page {
                 Layout.topMargin: root.groupSpacing
                 Layout.bottomMargin: root.groupSpacing
                 Layout.alignment: Qt.AlignHCenter
-                title: qsTr("Whisper")
+                title: qsTr("ASR")
 
                 ColumnLayout {
                     anchors.fill: parent
@@ -149,18 +174,48 @@ Page {
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
-                            text: qsTr("Enabled")
+                            text: qsTr("Backend")
                         }
-                        Switch {
+                        ComboBox {
                             Layout.alignment: Qt.AlignRight
-                            checked: MementoSettings.whisperEnabled
-                            onClicked: MementoSettings.whisperEnabled = checked
+                            Layout.preferredWidth: 250
+                            model: root.backendOptions
+                            textRole: "label"
+                            valueRole: "value"
+                            currentIndex: root.backendIndex(
+                                MementoSettings.asrBackend
+                            )
+                            onActivated: MementoSettings.asrBackend =
+                                currentValue
                         }
                     }
 
                     SettingsBoxSeparator { Layout.fillWidth: true }
 
                     RowLayout {
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Enabled")
+                        }
+                        Switch {
+                            Layout.alignment: Qt.AlignRight
+                            checked: MementoSettings.asrEnabled
+                            onClicked: MementoSettings.asrEnabled = checked
+                        }
+                    }
+
+                    SettingsBoxSeparator { Layout.fillWidth: true }
+
+                    Label {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                        text: qsTr("Whisper")
+                        font.bold: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -173,9 +228,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -184,10 +243,12 @@ Page {
                         ComboBox {
                             Layout.alignment: Qt.AlignRight
                             Layout.preferredWidth: 250
-                            model: root.modelOptions
+                            model: root.whisperModelOptions
                             currentIndex: Math.max(
                                 0,
-                                root.modelOptions.indexOf(MementoSettings.whisperModel)
+                                root.whisperModelOptions.indexOf(
+                                    MementoSettings.whisperModel
+                                )
                             )
                             onActivated: {
                                 MementoSettings.whisperModel = currentValue;
@@ -197,7 +258,8 @@ Page {
                     }
 
                     RowLayout {
-                        visible: MementoSettings.whisperModel === "custom"
+                        visible: MementoSettings.asrBackend === "whisper" &&
+                            MementoSettings.whisperModel === "custom"
                         Layout.fillWidth: true
 
                         Label {
@@ -216,9 +278,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -232,7 +298,8 @@ Page {
                     }
 
                     RowLayout {
-                        visible: MementoSettings.whisperVadEnabled
+                        visible: MementoSettings.asrBackend === "whisper" &&
+                            MementoSettings.whisperVadEnabled
                         Layout.fillWidth: true
 
                         Label {
@@ -249,9 +316,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -272,9 +343,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -290,9 +365,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -308,9 +387,13 @@ Page {
                         }
                     }
 
-                    SettingsBoxSeparator { Layout.fillWidth: true }
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
 
                     RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
                         Label {
                             Layout.fillWidth: true
                             Layout.alignment: Qt.AlignLeft
@@ -324,6 +407,7 @@ Page {
                             }
                         }
                     }
+
                 }
             }
         }

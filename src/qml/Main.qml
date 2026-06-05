@@ -349,10 +349,10 @@ ApplicationWindow {
     }
 
     Loader {
-        id: whisperStartupDownloadDialog
+        id: asrStartupDownloadDialog
         active: false
         sourceComponent: Component {
-            WhisperDownloadDialog { }
+            AsrDownloadDialog { }
         }
 
         function start(model) {
@@ -362,30 +362,35 @@ ApplicationWindow {
     }
 
     Loader {
-        id: whisperNoModelLoader
+        id: asrNoModelLoader
         active: false
         sourceComponent: Component {
             Dialog {
-                id: whisperNoModelDialog
+                id: asrNoModelDialog
+                readonly property string defaultModel: "tiny"
+                readonly property string defaultModelLabel: qsTr("Whisper tiny")
+
                 parent: Overlay.overlay
                 anchors.centerIn: parent
                 modal: true
                 standardButtons: Dialog.Yes | Dialog.No
-                title: qsTr("Whisper Model Missing")
+                title: qsTr("ASR Model Missing")
 
                 onAccepted: {
-                    MementoSettings.whisperModel = "tiny";
+                    MementoSettings.asrBackend = "whisper";
+                    MementoSettings.whisperModel = defaultModel;
+                    MementoSettings.writeAsrSettings();
                     MementoSettings.writeWhisperSettings();
-                    whisperStartupDownloadDialog.start("tiny");
+                    asrStartupDownloadDialog.start(defaultModel);
                 }
                 onRejected: {
-                    if (whisperNoModelCheckBox.checked)
+                    if (asrNoModelCheckBox.checked)
                     {
                         MementoSettings.internalWhisperNoModelPromptDismissed = true;
                         MementoSettings.writeInternalSettings();
                     }
                 }
-                onClosed: whisperNoModelLoader.active = false
+                onClosed: asrNoModelLoader.active = false
 
                 ColumnLayout {
                     width: 460
@@ -395,14 +400,16 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap
                         text: qsTr(
-                            "Memento was compiled with Whisper support, " +
-                            "but no Whisper model was found in %1.\n\n" +
-                            "Do you want to download the tiny model now?"
-                        ).arg(WhisperController.modelsDirectory())
+                            "Memento was compiled with ASR support, " +
+                            "but no ASR model was found in %1.\n\n" +
+                            "Do you want to download the default %2 " +
+                            "model now?"
+                        ).arg(AsrController.modelsDirectory())
+                         .arg(asrNoModelDialog.defaultModelLabel)
                     }
 
                     CheckBox {
-                        id: whisperNoModelCheckBox
+                        id: asrNoModelCheckBox
                         text: qsTr("Don't show this again")
                     }
                 }
@@ -411,10 +418,10 @@ ApplicationWindow {
 
         Component.onCompleted: {
             Qt.callLater(function() {
-                whisperNoModelLoader.active =
-                    Features.whisper &&
+                asrNoModelLoader.active =
+                    Features.asr &&
                     !MementoSettings.internalWhisperNoModelPromptDismissed &&
-                    !WhisperController.hasAnyModel();
+                    !AsrController.hasAnyModel();
             });
         }
         onLoaded: item.open()

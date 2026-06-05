@@ -543,6 +543,22 @@ class Settings : public QObject
         NOTIFY ocrModelChanged
     )
 
+    /* ASR Settings */
+
+    Q_PROPERTY(
+        bool asrEnabled
+        READ asrEnabled
+        WRITE setAsrEnabled
+        NOTIFY asrEnabledChanged
+    )
+
+    Q_PROPERTY(
+        QString asrBackend
+        READ asrBackend
+        WRITE setAsrBackend
+        NOTIFY asrBackendChanged
+    )
+
     /* Whisper Settings */
 
     Q_PROPERTY(
@@ -627,6 +643,8 @@ class Settings : public QObject
         WRITE setWhisperFlashAttention
         NOTIFY whisperFlashAttentionChanged
     )
+
+
 
 public:
     Settings(QObject *parent = nullptr);
@@ -813,6 +831,21 @@ public:
     Q_INVOKABLE void defaultOcrSettings();
 
     /**
+     * @brief Load ASR settings from disc.
+     */
+    Q_INVOKABLE void loadAsrSettings();
+
+    /**
+     * @brief Write ASR settings to disc.
+     */
+    Q_INVOKABLE void writeAsrSettings();
+
+    /**
+     * @brief Load ASR settings defaults.
+     */
+    Q_INVOKABLE void defaultAsrSettings();
+
+    /**
      * @brief Load Whisper settings from disc.
      */
     Q_INVOKABLE void loadWhisperSettings();
@@ -826,6 +859,8 @@ public:
      * @brief Load Whisper settings defaults.
      */
     Q_INVOKABLE void defaultWhisperSettings();
+
+
 
     /**
      * @brief The version of the settings file.
@@ -2004,6 +2039,39 @@ public:
     void setOcrModel(
         const QString &value = Keys::Ocr::MODEL_DEFAULT);
 
+    /* ASR Settings */
+
+    /**
+     * @brief Gets if ASR subtitle generation is enabled.
+     *
+     * @return true if ASR subtitle generation is enabled,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool asrEnabled() const noexcept;
+
+    /**
+     * @brief Sets if ASR subtitle generation is enabled.
+     *
+     * @param value true to enable ASR, false otherwise.
+     */
+    void setAsrEnabled(bool value = Keys::Asr::ENABLED_DEFAULT);
+
+    /**
+     * @brief Gets the selected ASR backend.
+     *
+     * @return The selected ASR backend.
+     */
+    [[nodiscard]]
+    QString asrBackend() const noexcept;
+
+    /**
+     * @brief Sets the selected ASR backend.
+     *
+     * @param value The selected ASR backend.
+     */
+    void setAsrBackend(const QString &value = Keys::Asr::BACKEND_DEFAULT);
+
     /* Whisper Settings */
 
     /**
@@ -2190,6 +2258,8 @@ public:
      */
     void setWhisperFlashAttention(
         bool value = Keys::Whisper::FLASH_ATTN_DEFAULT);
+
+
 
 signals:
     /**
@@ -2693,6 +2763,20 @@ signals:
     void ocrModelChanged(const QString &value);
 
     /**
+     * @brief Emitted when the ASR enabled setting is changed.
+     *
+     * @param value The new value.
+     */
+    void asrEnabledChanged(bool value);
+
+    /**
+     * @brief Emitted when the ASR backend setting is changed.
+     *
+     * @param value The new value.
+     */
+    void asrBackendChanged(const QString &value);
+
+    /**
      * @brief Emitted when the Whisper enabled setting is changed.
      *
      * @param value The new value.
@@ -3119,6 +3203,19 @@ private:
     OcrSettings m_ocr{};
 
     /**
+     * @brief ASR settings.
+     */
+    struct AsrSettings
+    {
+        /* true if ASR subtitle generation is enabled */
+        bool enabled{Keys::Asr::ENABLED_DEFAULT};
+
+        /* The selected ASR backend */
+        QString backend{Keys::Asr::BACKEND_DEFAULT};
+    };
+    AsrSettings m_asr{};
+
+    /**
      * @brief Whisper settings.
      */
     struct WhisperSettings
@@ -3157,4 +3254,6 @@ private:
         bool flashAttention{Keys::Whisper::FLASH_ATTN_DEFAULT};
     };
     WhisperSettings m_whisper{};
+
+
 };
