@@ -43,6 +43,12 @@ QFuture<AsrTranscriptionResult> WhisperBackend::transcribe(
 
     if (weak_from_this().expired())
     {
+        if (options.failureCallback)
+        {
+            options.failureCallback(QStringLiteral(
+                "Whisper backend is not owned by a shared pointer."
+            ));
+        }
         resultPromise->addResult(AsrTranscriptionResult::Failed);
         resultPromise->finish();
         return resultFuture;
@@ -65,6 +71,7 @@ void WhisperBackend::transcribeAttempt(
         .beamSize = self->m_options.beamSize,
         .useVad = self->m_options.useVad,
         .vadModel = self->m_options.vadModel,
+        .suppressRegex = self->m_options.suppressRegex,
     };
     self->m_model->transcribe(audioPath, std::move(whisperOptions)).then(
         [self = std::move(self),

@@ -22,8 +22,12 @@
 
 #include <QObject>
 
+#include <atomic>
+#include <memory>
 #include <optional>
 
+#include <QByteArray>
+#include <QFuture>
 #include <QHash>
 #include <QImage>
 #include <QPoint>
@@ -452,6 +456,17 @@ public:
     Q_INVOKABLE QString tempAudioClip(const MpvAudioClipArgs &args);
 
     /**
+     * @brief Create an audio clip without blocking the caller's thread.
+     *
+     * @param args The arguments to use to make the audio clip.
+     * @return A future containing the file path, or an empty path on failure.
+     */
+    [[nodiscard]]
+    QFuture<QString> tempAudioClipAsync(
+        const MpvAudioClipArgs &args,
+        std::shared_ptr<std::atomic_bool> abort = {});
+
+    /**
      * @brief Create an H264 video clip in the temporary directory.
      *
      * @param args The arguments that specify how the video should be cut.
@@ -466,7 +481,21 @@ signals:
      */
     void playerChanged();
 
+    /**
+     * @brief Emitted when Memento explicitly requests a playback seek.
+     *
+     * @param time The requested playback position in seconds.
+     */
+    void seekRequested(double time);
+
 private:
+    struct EncodeContext
+    {
+        QString path;
+        QByteArray scriptOptions;
+        int64_t audioId{-1};
+    };
+
     /**
      * @brief Get the current mpv_handle.
      *
@@ -579,10 +608,20 @@ private:
      * @return The path to the file, empty string on failure.
      */
     [[nodiscard]]
-    QString encodeFile(
+    EncodeContext captureEncodeContext() const;
+
+    static QString tempAudioClip(
+        const EncodeContext &context,
+        const MpvAudioClipArgs &args,
+        std::shared_ptr<std::atomic_bool> abort = {});
+
+    static QString encodeFile(
+        const QString &inputPath,
+        const QByteArray &scriptOptions,
         const QByteArray &argString,
         const QList<QPair<QByteArray, QByteArray>> &options,
-        const QString &fileExtension);
+        const QString &fileExtension,
+        std::shared_ptr<std::atomic_bool> abort = {});
 
     /**
      * @brief Get a node value from an mpv_node map.

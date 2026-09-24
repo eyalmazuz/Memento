@@ -665,6 +665,13 @@ class Settings : public QObject
         NOTIFY whisperFlashAttentionChanged
     )
 
+    Q_PROPERTY(
+        QString whisperSuppressRegex
+        READ whisperSuppressRegex
+        WRITE setWhisperSuppressRegex
+        NOTIFY whisperSuppressRegexChanged
+    )
+
 public:
     Settings(QObject *parent = nullptr);
     virtual ~Settings();
@@ -2323,6 +2330,22 @@ public:
     void setWhisperFlashAttention(
         bool value = Keys::Whisper::FLASH_ATTN_DEFAULT);
 
+    /**
+     * @brief Gets the regex pattern used to suppress tokens in Whisper decoding.
+     *
+     * @return The suppress regex pattern.
+     */
+    [[nodiscard]]
+    QString whisperSuppressRegex() const noexcept;
+
+    /**
+     * @brief Sets the regex pattern used to suppress tokens in Whisper decoding.
+     *
+     * @param value The suppress regex pattern.
+     */
+    void setWhisperSuppressRegex(
+        const QString &value = Keys::Whisper::SUPPRESS_REGEX_DEFAULT);
+
 signals:
     /**
      * @brief Emitted when the version is changed.
@@ -2937,6 +2960,13 @@ signals:
      */
     void whisperFlashAttentionChanged(bool value);
 
+    /**
+     * @brief Emitted when the Whisper suppress regex setting is changed.
+     *
+     * @param value The new value.
+     */
+    void whisperSuppressRegexChanged(const QString &value);
+
 private:
     /**
      * @brief Loads the version from disc.
@@ -3342,6 +3372,9 @@ private:
 
         /* true to use flash attention */
         bool flashAttention{Keys::Whisper::FLASH_ATTN_DEFAULT};
+
+        /* Suppress regex pattern */
+        QString suppressRegex{Keys::Whisper::SUPPRESS_REGEX_DEFAULT};
     };
     WhisperSettings m_whisper{};
 };

@@ -176,11 +176,17 @@ QCoro::Task<bool> DownloadManager::download(
         reply.get(),
         [&file, reply = reply.get()]
         {
-            file.write(reply->readAll());
+            if (reply->isOpen() && reply->isReadable())
+            {
+                file.write(reply->readAll());
+            }
         }
     );
     co_await reply.get();
-    file.write(reply->readAll());
+    if (reply->isOpen() && reply->isReadable() && reply->bytesAvailable() > 0)
+    {
+        file.write(reply->readAll());
+    }
     file.close();
 
     const QVariant statusCode = reply->attribute(

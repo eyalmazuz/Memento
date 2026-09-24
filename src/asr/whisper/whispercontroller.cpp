@@ -291,6 +291,7 @@ QCoro::Task<WhisperBackendCreationResult> WhisperController::createBackend(
     options.bestOf = settings->whisperBestOf();
     options.beamSize = settings->whisperBeamSize();
     options.useVad = settings->whisperVadEnabled();
+    options.suppressRegex = settings->whisperSuppressRegex();
 
     if (options.useVad)
     {
@@ -335,7 +336,7 @@ QCoro::Task<WhisperBackendCreationResult> WhisperController::createBackend(
         }
     }
 
-    result.backend = std::make_unique<WhisperBackend>(std::move(options));
+    result.backend = std::make_shared<WhisperBackend>(std::move(options));
     co_return std::move(result);
 #else
     Q_UNUSED(modelPath)

@@ -34,6 +34,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QPointer>
 #include <QUrl>
 #include <QVariantMap>
@@ -160,6 +162,8 @@ QString AsrController::downloadName() const
 
 QCoro::QmlTask AsrController::select(MpvController *controller)
 {
+    m_retryPaused = false;
+    m_retryAwaitingSeekPosition = false;
     return selectAsync(controller);
 }
 
@@ -171,6 +175,8 @@ void AsrController::stop()
     m_restartRequested = false;
     m_reconfigureRequested = false;
     m_isReconfiguring = false;
+    m_retryPaused = false;
+    m_retryAwaitingSeekPosition = false;
 
     if (m_abort)
     {
@@ -188,6 +194,10 @@ void AsrController::stop()
     if (m_sidConnection)
     {
         disconnect(m_sidConnection);
+    }
+    if (m_seekConnection)
+    {
+        disconnect(m_seekConnection);
     }
     if (m_subtitleTextConnection)
     {
@@ -616,7 +626,25 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
         args.normalize = false;
         args.preset = MpvAudioClipArgs::WhisperPcm16Wav;
 
-        const QString audioPath = m_controller->tempAudioClip(args);
+        QElapsedTimer extractionTimer;
+        extractionTimer.start();
+        const QString audioPath = co_await qCoro(
+            m_controller->tempAudioClipAsync(args, attemptAbort)
+        ).takeResult();
+        qInfo(
+            "ASR_STAGE_PERF extraction_await_ms=%lld",
+            static_cast<long long>(extractionTimer.elapsed())
+        );
+        if (self == nullptr)
+        {
+            QFile::remove(audioPath);
+            co_return result;
+        }
+        if (generation != m_generation || !m_active)
+        {
+            QFile::remove(audioPath);
+            co_return result;
+        }
         if (audioPath.isEmpty())
         {
             failed = true;
@@ -642,7 +670,16 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
             .language = QStringLiteral("ja"),
             .abort = m_abort,
             .segmentCallback = {},
+            .failureCallback = {},
         };
+        auto failureMessage = std::make_shared<QString>();
+        auto failureMutex = std::make_shared<QMutex>();
+        options.failureCallback = [failureMessage, failureMutex]
+            (const QString &message)
+            {
+                QMutexLocker lock(failureMutex.get());
+                *failureMessage = message;
+            };
 
         QPointer<AsrController> callbackSelf(this);
         options.segmentCallback =
@@ -674,6 +711,8 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
                 );
             };
 
+        QElapsedTimer inferenceTimer;
+        inferenceTimer.start();
         AsrTranscriptionResult transcribeResult =
             co_await qCoro(
                 currentBackend->transcribe(
@@ -681,6 +720,10 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
                     options
                 )
             ).takeResult();
+        qInfo(
+            "ASR_STAGE_PERF inference_ms=%lld",
+            static_cast<long long>(inferenceTimer.elapsed())
+        );
 
         if (self == nullptr)
         {
@@ -722,22 +765,43 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
         if (transcribeResult != AsrTranscriptionResult::Success)
         {
             ++consecutiveFailures;
+            QString failureDetail;
+            {
+                QMutexLocker lock(failureMutex.get());
+                failureDetail = *failureMessage;
+            }
             if (consecutiveFailures >= MAX_TRANSCRIPTION_FAILURES)
             {
                 failed = true;
                 fatalFailure = false;
+                m_retryPaused = true;
+                m_retryAwaitingSeekPosition = false;
                 result["fatal"] = false;
-                result[KEY_ERROR] = tr(
+                result[KEY_ERROR] = failureDetail.isEmpty() ? tr(
                     "ASR transcription paused after repeated decode "
                     "failures. Seek or change ASR settings to retry."
-                );
+                ) : tr(
+                    "ASR transcription paused after repeated decode "
+                    "failures: %1. Seek or change ASR settings to retry."
+                ).arg(failureDetail);
                 break;
             }
 
-            qWarning(
-                "ASR transcription failed; retrying from the current "
-                "playback position."
-            );
+            if (failureDetail.isEmpty())
+            {
+                qWarning(
+                    "ASR transcription failed; retrying from the current "
+                    "playback position."
+                );
+            }
+            else
+            {
+                qWarning(
+                    "ASR transcription failed (%s); retrying from the "
+                    "current playback position.",
+                    qUtf8Printable(failureDetail)
+                );
+            }
             start = qBound(0.0, state->timePosition(), duration);
             continue;
         }
@@ -926,6 +990,10 @@ void AsrController::watchMediaLifecycle(
         {
             disconnect(m_sidConnection);
         }
+        if (m_seekConnection)
+        {
+            disconnect(m_seekConnection);
+        }
         if (m_subtitleTextConnection)
         {
             disconnect(m_subtitleTextConnection);
@@ -941,6 +1009,10 @@ void AsrController::watchMediaLifecycle(
         if (m_sidConnection)
         {
             disconnect(m_sidConnection);
+        }
+        if (m_seekConnection)
+        {
+            disconnect(m_seekConnection);
         }
         if (m_subtitleTextConnection)
         {
@@ -959,6 +1031,10 @@ void AsrController::watchMediaLifecycle(
     if (m_fileEndedConnection)
     {
         disconnect(m_fileEndedConnection);
+    }
+    if (m_seekConnection)
+    {
+        disconnect(m_seekConnection);
     }
 
     m_controller = controller;
@@ -980,6 +1056,12 @@ void AsrController::watchMediaLifecycle(
         &MpvPlayer::fileEnded,
         this,
         &AsrController::handleFileLifecycleChange
+    );
+    m_seekConnection = connect(
+        controller,
+        &MpvController::seekRequested,
+        this,
+        &AsrController::handleSeeked
     );
 }
 
@@ -1197,6 +1279,22 @@ void AsrController::handlePositionChanged(double position)
     }
     m_lastPositionTimer.restart();
 
+    if (m_retryPaused)
+    {
+        m_lastPosition = position;
+        if (m_retryAwaitingSeekPosition)
+        {
+            m_retryPaused = false;
+            m_retryAwaitingSeekPosition = false;
+            requestRestart(position);
+            if (!m_running && m_active && m_controller != nullptr)
+            {
+                selectAsync(m_controller);
+            }
+        }
+        return;
+    }
+
     bool seeked = false;
     if (m_lastPosition >= 0.0)
     {
@@ -1222,7 +1320,7 @@ void AsrController::handlePositionChanged(double position)
         return;
     }
 
-    if (m_running)
+    if (m_running || m_retryPaused)
     {
         return;
     }
@@ -1236,6 +1334,14 @@ void AsrController::handlePositionChanged(double position)
     if (uncovered <= position + SUBTITLE_TIME_DELTA)
     {
         selectAsync(m_controller);
+    }
+}
+
+void AsrController::handleSeeked()
+{
+    if (m_retryPaused)
+    {
+        m_retryAwaitingSeekPosition = true;
     }
 }
 
@@ -1264,6 +1370,8 @@ void AsrController::requestReconfigure()
         return;
     }
 
+    m_retryPaused = false;
+    m_retryAwaitingSeekPosition = false;
     ++m_segmentGeneration;
     m_reconfigureRequested = true;
     if (m_abort)
@@ -1294,6 +1402,8 @@ void AsrController::restartAfterReconfigure()
     /* Consume before selection, including attempts that fail validation. */
     m_reconfigureRequested = false;
     m_isReconfiguring = true;
+    m_retryPaused = false;
+    m_retryAwaitingSeekPosition = false;
     m_backend.reset();
     selectAsync(m_controller);
 }

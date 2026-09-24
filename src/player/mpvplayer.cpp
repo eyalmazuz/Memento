@@ -883,6 +883,12 @@ void MpvPlayer::handleMpvEvent(mpv_event *event)
         break;
     }
 
+    case MPV_EVENT_SEEK:
+    {
+        emit seeked();
+        break;
+    }
+
     case MPV_EVENT_SHUTDOWN:
     {
         emit shutdown();

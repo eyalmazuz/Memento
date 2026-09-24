@@ -41,7 +41,7 @@ class Context;
  */
 struct WhisperBackendCreationResult
 {
-    std::unique_ptr<AsrBackend> backend;
+    std::shared_ptr<AsrBackend> backend;
     QString error;
 };
 

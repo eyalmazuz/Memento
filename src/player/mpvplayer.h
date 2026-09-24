@@ -183,6 +183,11 @@ signals:
     void fileEnded();
 
     /**
+     * @brief Emitted when mpv starts a user or script initiated seek.
+     */
+    void seeked();
+
+    /**
      * @brief Emitted with a copied snapshot of the selected primary sub-lines.
      *
      * Each list entry contains id, text, start, and end values.

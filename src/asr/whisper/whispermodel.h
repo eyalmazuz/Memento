@@ -52,6 +52,9 @@ struct WhisperTranscriptionOptions
 
     /* VAD model path */
     QString vadModel;
+
+    /* Suppress regex pattern */
+    QString suppressRegex;
 };
 
 /**

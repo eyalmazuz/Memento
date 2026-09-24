@@ -52,6 +52,9 @@ struct AsrTranscriptionOptions
 
     /* Called for each generated subtitle segment */
     std::function<void(const SubtitleEntry &)> segmentCallback;
+
+    /* Called with a backend-specific reason when transcription fails */
+    std::function<void(const QString &)> failureCallback;
 };
 
 /**

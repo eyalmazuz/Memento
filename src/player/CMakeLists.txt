@@ -40,6 +40,7 @@ target_link_libraries(
     PRIVATE utils
     PUBLIC mpv::mpv
     PUBLIC Qt6::Core
+    PRIVATE Qt6::Concurrent
     PUBLIC Qt6::Gui
     PUBLIC Qt6::OpenGL
     PUBLIC Qt6::Qml

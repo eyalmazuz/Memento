@@ -506,5 +506,8 @@ namespace Keys
 
         constexpr const char *FLASH_ATTN = "flash-attn";
         constexpr bool FLASH_ATTN_DEFAULT = true;
+
+        constexpr const char *SUPPRESS_REGEX = "suppress-regex";
+        constexpr const char *SUPPRESS_REGEX_DEFAULT = "^\\[_extra_token_[0-9]+\\]$";
     }
 }

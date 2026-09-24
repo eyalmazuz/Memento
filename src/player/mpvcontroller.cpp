@@ -31,8 +31,11 @@
 #include <QScopeGuard>
 #include <QThread>
 #include <QTemporaryFile>
+#include <QElapsedTimer>
+#include <QtConcurrent>
 
 #include "player/mpvplayer.h"
+#include "player/mpvstate.h"
 #include "util/directoryutils.h"
 
 namespace
@@ -592,7 +595,9 @@ void MpvController::seek(double time)
     if (::mpv_command_async(handle(), 0, args) < 0)
     {
         qWarning("Seeking failed");
+        return;
     }
+    emit seekRequested(time);
 }
 
 void MpvController::play()
@@ -1097,9 +1102,53 @@ QImage MpvController::screenshotRaw(bool subtitles)
 
 QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
 {
-    int64_t aid = player()->state()->aid();
-    if (aid == -1)
+    return tempAudioClip(captureEncodeContext(), args, {});
+}
+
+QFuture<QString> MpvController::tempAudioClipAsync(
+    const MpvAudioClipArgs &args,
+    std::shared_ptr<std::atomic_bool> abort)
+{
+    const EncodeContext context = invokeOnObjectThread<EncodeContext>(
+        this,
+        {},
+        [this] { return captureEncodeContext(); }
+    );
+    return QtConcurrent::run(
+        [context, args, abort = std::move(abort)]
+        {
+            QElapsedTimer timer;
+            timer.start();
+            const QString path = MpvController::tempAudioClip(
+                context, args, abort
+            );
+            qInfo(
+                "TEMP_AUDIO_PERF elapsed_ms=%lld duration_s=%.3f canceled=%d",
+                static_cast<long long>(timer.elapsed()),
+                args.end - args.start,
+                abort && abort->load()
+            );
+            return path;
+        }
+    );
+}
+
+QString MpvController::tempAudioClip(
+    const EncodeContext &context,
+    const MpvAudioClipArgs &args,
+    std::shared_ptr<std::atomic_bool> abort)
+{
+    if (context.path.isEmpty() || context.audioId < 0 ||
+        (abort && abort->load()))
     {
+        if (!abort || !abort->load())
+        {
+            qWarning(
+                "Could not extract audio: media path is %s and audio ID is %lld",
+                context.path.isEmpty() ? "empty" : "available",
+                static_cast<long long>(context.audioId)
+            );
+        }
         return {};
     }
 
@@ -1107,12 +1156,11 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
     QByteArray argString = QString("start=%1,end=%2,aid=%3")
         .arg(args.start, 0, 'f', 3)
         .arg(args.end, 0, 'f', 3)
-        .arg(aid)
+        .arg(context.audioId)
         .toUtf8();
 
     QList<QPair<QByteArray, QByteArray>> options = {
         {"vid", "no"},
-        {"aid", "yes"},
         {"sid", "no"},
         {"secondary-sid", "no"},
     };
@@ -1138,26 +1186,36 @@ QString MpvController::tempAudioClip(const MpvAudioClipArgs &args)
         options.emplaceBack("af", std::move(audioFilter));
     }
 
-    return encodeFile(argString, options, extension);
+    return encodeFile(
+        context.path,
+        context.scriptOptions,
+        argString,
+        options,
+        extension,
+        std::move(abort)
+    );
 }
 
 QString MpvController::tempVideoClip(const MpvVideoClipArgs &args)
 {
     constexpr const char *FILE_EXTENSION = ".mp4";
 
-    QByteArray input = player()->state()->path().toUtf8();
+    const EncodeContext context = captureEncodeContext();
+    if (context.path.isEmpty())
+    {
+        return {};
+    }
     QByteArray argString = QString("ovc=libx264,oac=aac,start=%1,end=%2")
         .arg(args.start, 0, 'f', 3)
         .arg(args.end, 0, 'f', 3)
         .toUtf8();
     if (args.audio)
     {
-        int64_t aid = player()->state()->aid();
-        if (aid == -1)
+        if (context.audioId < 0)
         {
             return {};
         }
-        argString += QString(",aid=%1").arg(aid).toUtf8();
+        argString += QString(",aid=%1").arg(context.audioId).toUtf8();
     }
     if (args.subtitles)
     {
@@ -1183,7 +1241,14 @@ QString MpvController::tempVideoClip(const MpvVideoClipArgs &args)
         );
     }
 
-    return encodeFile(argString, options, FILE_EXTENSION);
+    return encodeFile(
+        context.path,
+        context.scriptOptions,
+        argString,
+        options,
+        FILE_EXTENSION,
+        {}
+    );
 }
 
 /* End Public Functions */
@@ -1192,6 +1257,57 @@ QString MpvController::tempVideoClip(const MpvVideoClipArgs &args)
 mpv_handle *MpvController::handle() const noexcept
 {
     return player()->handle();
+}
+
+MpvController::EncodeContext MpvController::captureEncodeContext() const
+{
+    EncodeContext context;
+    MpvPlayer *mpvPlayer = m_player;
+    MpvState *state = mpvPlayer == nullptr ? nullptr : mpvPlayer->state();
+    if (state == nullptr || mpvPlayer->handle() == nullptr)
+    {
+        return context;
+    }
+
+    context.path = state->path();
+    context.audioId = state->aid();
+
+    char *scriptOptions = ::mpv_get_property_string(
+        mpvPlayer->handle(), "script-opts"
+    );
+    if (scriptOptions != nullptr)
+    {
+        const QByteArray currentOptions(scriptOptions);
+        if (currentOptions.contains("ytdl_hook-ytdl_path="))
+        {
+            context.scriptOptions = currentOptions;
+        }
+    }
+    ::mpv_free(scriptOptions);
+
+#if MEMENTO_BUNDLE
+    if (context.scriptOptions.isEmpty())
+    {
+        QByteArray ytdlPath = "ytdl_hook-ytdl_path=";
+        char *configDir = ::mpv_get_property_string(
+            mpvPlayer->handle(), "config-dir"
+        );
+        if (configDir != nullptr)
+        {
+            ytdlPath += configDir;
+            ytdlPath += '/';
+        }
+        else
+        {
+            ytdlPath += DirectoryUtils::getConfigDir().toUtf8();
+        }
+        ::mpv_free(configDir);
+        ytdlPath += "youtube-dl";
+        context.scriptOptions = std::move(ytdlPath);
+    }
+#endif // MEMENTO_BUNDLE
+
+    return context;
 }
 
 QString MpvController::quoteArg(QString arg)
@@ -1359,20 +1475,30 @@ bool MpvController::sendMouseKey(const QByteArray &key, bool pressed)
 }
 
 QString MpvController::encodeFile(
+    const QString &inputPath,
+    const QByteArray &scriptOptions,
     const QByteArray &argString,
     const QList<QPair<QByteArray, QByteArray>> &options,
-    const QString &fileExtension)
+    const QString &fileExtension,
+    std::shared_ptr<std::atomic_bool> abort)
 {
+    if (abort && abort->load())
+    {
+        return {};
+    }
+
     /* Create a valid temporary file name */
     QTemporaryFile file;
     if (!file.open())
     {
+        qWarning("Could not create a temporary audio output file");
         return {};
     }
     QByteArray filename = (file.fileName() + fileExtension).toUtf8();
+    const QString outputPath = QString::fromUtf8(filename);
     file.close();
 
-    QByteArray input = player()->state()->path().toUtf8();
+    QByteArray input = inputPath.toUtf8();
     const char *argOpts = argString.isEmpty() ? NULL : argString.data();
 
     bool isApi23 = mpv_client_api_version() >= MPV_MAKE_VERSION(2, 3);
@@ -1385,83 +1511,215 @@ QString MpvController::encodeFile(
         NULL
     };
 
-    char *script_opts = NULL;
-    mpv_event *event = NULL;
-    mpv_handle *enc_h = mpv_create();
+    mpv_event *event = nullptr;
+    mpv_handle *enc_h = nullptr;
+    bool initialized = false;
+    bool optionsSet = true;
+    int initializeStatus = 0;
+    int commandStatus = 0;
+    const auto setOption = [&enc_h]
+        (const QByteArray &name, const QByteArray &value)
+        {
+            const int status = ::mpv_set_option_string(
+                enc_h, name.constData(), value.constData()
+            );
+            if (status < 0)
+            {
+                qWarning(
+                    "Could not set mpv encoder option '%s': %s",
+                    name.constData(),
+                    ::mpv_error_string(status)
+                );
+            }
+            return status >= 0;
+        };
+
+    const bool isNetwork = inputPath.contains("://");
+    enc_h = mpv_create();
     if (enc_h == NULL)
     {
         qWarning("Error creating encoder handle");
         filename = "";
         goto cleanup;
     }
+    ::mpv_request_log_messages(enc_h, "warn");
 
     for (const auto &[k, v] : options)
     {
-        ::mpv_set_option_string(enc_h, k, v);
+        if (!setOption(k, v))
+        {
+            optionsSet = false;
+            break;
+        }
     }
-    ::mpv_set_option_string(enc_h, "cover-art-auto", "no");
-    ::mpv_set_option_string(enc_h, "keep-open", "no");
-    ::mpv_set_option_string(enc_h, "ytdl", "yes");
-    ::mpv_set_option_string(enc_h, "config", "no");
-    ::mpv_set_option_string(enc_h, "o", filename);
+    if (!optionsSet ||
+        !setOption("cover-art-auto", "no") ||
+        !setOption("keep-open", "no") ||
+        !setOption("ytdl", isNetwork ? "yes" : "no") ||
+        !setOption("config", "no") ||
+        !setOption("o", filename))
+    {
+        filename.clear();
+        goto cleanup;
+    }
 
     /* This guarantees the correct version of youtube-dl is used. */
-    script_opts = ::mpv_get_property_string(handle(), "script-opts");
-    if (script_opts && QByteArray(script_opts).contains("ytdl_hook-ytdl_path="))
+    if (!scriptOptions.isEmpty() &&
+        !setOption("script-opts", scriptOptions))
     {
-        ::mpv_set_option_string(enc_h, "script-opts", script_opts);
+        filename.clear();
+        goto cleanup;
     }
-#if MEMENTO_BUNDLE
-    else
-    {
-        QByteArray ytdlPath = "ytdl_hook-ytdl_path=";
-        char *config_dir = ::mpv_get_property_string(handle(), "config-dir");
-        if (config_dir)
-        {
-            ytdlPath += config_dir;
-            ytdlPath += '/';
-        }
-        else
-        {
-            ytdlPath += DirectoryUtils::getConfigDir().toUtf8();
-        }
-        ::mpv_free(config_dir);
-        ytdlPath += "youtube-dl";
-        ::mpv_set_option_string(enc_h, "script-opts", ytdlPath);
-    }
-#endif // MEMENTO_BUNDLE
-    ::mpv_free(script_opts);
 
-    if (::mpv_initialize(enc_h) < 0)
+    initializeStatus = ::mpv_initialize(enc_h);
+    if (initializeStatus < 0)
     {
-        qWarning("Could not initialize encoder");
+        qWarning(
+            "Could not initialize encoder: %s",
+            ::mpv_error_string(initializeStatus)
+        );
+        filename = "";
+        goto cleanup;
+    }
+    initialized = true;
+
+    if (abort && abort->load())
+    {
+        filename.clear();
+        ::mpv_request_log_messages(enc_h, "no");
+        ::mpv_terminate_destroy(enc_h);
+        enc_h = nullptr;
+        goto cleanup;
+    }
+
+    commandStatus = ::mpv_command(enc_h, args);
+    if (commandStatus < 0)
+    {
+        qWarning(
+            "Could not encode file: %s",
+            ::mpv_error_string(commandStatus)
+        );
         filename = "";
         goto cleanup;
     }
 
-    if (::mpv_command(enc_h, args) < 0)
+    while (true)
     {
-        qWarning("Could not encode file");
-        filename = "";
-        goto cleanup;
-    }
+        if (abort && abort->load())
+        {
+            filename.clear();
+            ::mpv_request_log_messages(enc_h, "no");
+            ::mpv_terminate_destroy(enc_h);
+            enc_h = nullptr;
+            goto cleanup;
+        }
 
-    do
-    {
         event = ::mpv_wait_event(enc_h, 100);
-        if (event->event_id == MPV_EVENT_NONE ||
-            event->event_id == MPV_EVENT_QUEUE_OVERFLOW)
+        if (event->event_id == MPV_EVENT_NONE)
         {
-            qWarning()
-                << QString("mpv returned a bad event: %1").arg(event->event_id);
+            continue;
+        }
+        if (event->event_id == MPV_EVENT_QUEUE_OVERFLOW)
+        {
+            qWarning("mpv encoder event queue overflowed");
             filename = "";
             goto cleanup;
         }
+        if (event->event_id == MPV_EVENT_END_FILE)
+        {
+            const auto *endFile =
+                static_cast<const mpv_event_end_file *>(event->data);
+            if (endFile == nullptr)
+            {
+                qWarning("mpv encoder ended without a completion status");
+                filename.clear();
+            }
+            else if (endFile->error < 0)
+            {
+                qWarning(
+                    "mpv encoder failed: %s",
+                    ::mpv_error_string(endFile->error)
+                );
+                filename.clear();
+            }
+            else if (endFile->reason == MPV_END_FILE_REASON_REDIRECT)
+            {
+                continue;
+            }
+            else if (endFile->reason != MPV_END_FILE_REASON_EOF)
+            {
+                qWarning(
+                    "mpv encoder ended before EOF (reason=%d)",
+                    endFile->reason
+                );
+                filename.clear();
+            }
+            ::mpv_terminate_destroy(enc_h);
+            enc_h = nullptr;
+            break;
+        }
+        if (event->event_id == MPV_EVENT_LOG_MESSAGE)
+        {
+            const auto *message =
+                static_cast<const mpv_event_log_message *>(event->data);
+            if (message != nullptr && !(abort && abort->load()))
+            {
+                const QString text = QString::fromUtf8(message->text).trimmed();
+                if (!text.contains("client removed during hook handling"))
+                {
+                    qWarning(
+                        "mpv encoder %s: %s",
+                        message->prefix,
+                        qUtf8Printable(text)
+                    );
+                }
+            }
+        }
+        if (event->event_id == MPV_EVENT_SHUTDOWN)
+        {
+            qWarning("mpv encoder shut down before encoding completed");
+            filename.clear();
+            ::mpv_destroy(enc_h);
+            enc_h = nullptr;
+            goto cleanup;
+        }
     }
-    while (event->event_id != MPV_EVENT_END_FILE);
 
 cleanup:
-    ::mpv_destroy(enc_h);
+    if (enc_h != nullptr)
+    {
+        if (initialized)
+        {
+            ::mpv_terminate_destroy(enc_h);
+        }
+        else
+        {
+            ::mpv_destroy(enc_h);
+        }
+    }
+
+    QFile output(outputPath);
+    if (abort && abort->load())
+    {
+        filename.clear();
+    }
+    if (filename.isEmpty() || !output.exists() || output.size() == 0)
+    {
+        if (!(abort && abort->load()))
+        {
+            qWarning(
+                "mpv encoder produced no output at '%s' (exists=%d, size=%lld)",
+                qUtf8Printable(outputPath),
+                output.exists(),
+                static_cast<long long>(output.size())
+            );
+        }
+        if (output.exists())
+        {
+            output.remove();
+        }
+        filename.clear();
+    }
 
     return filename;
 }

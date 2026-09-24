@@ -60,6 +60,9 @@ struct WhisperBackendOptions
 
     /* VAD model path */
     QString vadModel;
+
+    /* Suppress regex pattern */
+    QString suppressRegex;
 };
 
 /**

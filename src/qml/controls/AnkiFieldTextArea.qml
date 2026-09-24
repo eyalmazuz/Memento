@@ -1,9 +1,18 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Controls.Basic as Basic
 import Ripose.Memento
 
-TextArea {
+Basic.TextArea {
     id: root
+
+    background: Rectangle {
+        color: MementoPalette.base
+        radius: 3
+        border.color: root.activeFocus ? MementoPalette.accent :
+                                        MementoPalette.border
+        border.width: 1
+    }
 
     property var markers: []
     property var filteredSuggestions: []

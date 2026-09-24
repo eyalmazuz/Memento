@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <regex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -86,21 +88,34 @@ static quint32 read_u32(const char *data)
  * @param path The WAV file path.
  * @return 16 kHz mono float samples.
  */
-static std::vector<float> read_whisper_wav(const QString &path)
+static std::vector<float> read_whisper_wav(
+    const QString &path, QString &error)
 {
+    const auto fail = [&error](const QString &message)
+    {
+        error = message;
+        qWarning("%s", qUtf8Printable(message));
+    };
+
     QFile file(path);
     if (!file.open(QFile::ReadOnly))
     {
-        qWarning("Could not open Whisper audio file.");
+        fail(QStringLiteral("Could not open the extracted audio file."));
         return {};
     }
 
     const QByteArray bytes = file.readAll();
-    if (bytes.size() < WAV_HEADER_SIZE ||
-        std::memcmp(bytes.constData(), "RIFF", 4) != 0 ||
+    if (bytes.size() < WAV_HEADER_SIZE)
+    {
+        fail(QStringLiteral("The extracted WAV is truncated (%1 bytes).")
+            .arg(bytes.size()));
+        return {};
+    }
+    if (std::memcmp(bytes.constData(), "RIFF", 4) != 0 ||
         std::memcmp(bytes.constData() + 8, "WAVE", 4) != 0)
     {
-        qWarning("Whisper audio file was not a WAV file.");
+        fail(QStringLiteral("The extracted audio is not RIFF/WAVE (header %1).")
+            .arg(QString::fromLatin1(bytes.first(12).toHex(' '))));
         return {};
     }
 
@@ -121,7 +136,7 @@ static std::vector<float> read_whisper_wav(const QString &path)
 
         if (offset + size > static_cast<quint32>(bytes.size()))
         {
-            qWarning("Whisper audio WAV chunk was truncated.");
+            fail(QStringLiteral("The extracted WAV file is truncated."));
             return {};
         }
 
@@ -150,15 +165,15 @@ static std::vector<float> read_whisper_wav(const QString &path)
         bitsPerSample != WAV_BITS_PER_SAMPLE ||
         pcmData.isEmpty())
     {
-        qWarning(
-            "Whisper audio WAV format is unsupported. Expected 16 kHz mono "
-            "PCM16."
-        );
+        fail(QStringLiteral(
+            "The extracted WAV is not 16 kHz mono PCM16."
+        ));
         return {};
     }
 
     if (pcmData.size() < BYTES_PER_SAMPLE)
     {
+        fail(QStringLiteral("The extracted WAV contains no audio samples."));
         return {};
     }
 
@@ -276,10 +291,20 @@ QFuture<AsrTranscriptionResult> WhisperModel::transcribe(
         [this, audioPath, options = std::move(options)] ()
             -> AsrTranscriptionResult
         {
-            std::vector<float> samples = read_whisper_wav(audioPath);
+            QString failure;
+            std::vector<float> samples = read_whisper_wav(audioPath, failure);
             if (samples.empty())
             {
-                qWarning("No audio samples available for Whisper.");
+                if (failure.isEmpty())
+                {
+                    failure = QStringLiteral(
+                        "The extracted audio contains no samples."
+                    );
+                }
+                if (options.common.failureCallback)
+                {
+                    options.common.failureCallback(failure);
+                }
                 return AsrTranscriptionResult::Failed;
             }
 
@@ -287,7 +312,14 @@ QFuture<AsrTranscriptionResult> WhisperModel::transcribe(
             whisper_context *ctx = getModel();
             if (ctx == nullptr)
             {
-                qWarning("Whisper model is invalid.");
+                failure = QStringLiteral(
+                    "Whisper could not initialize the selected model."
+                );
+                qWarning("%s", qUtf8Printable(failure));
+                if (options.common.failureCallback)
+                {
+                    options.common.failureCallback(failure);
+                }
                 return AsrTranscriptionResult::Failed;
             }
 
@@ -327,6 +359,26 @@ QFuture<AsrTranscriptionResult> WhisperModel::transcribe(
                 params.vad_model_path = vadModel.constData();
             }
 
+            std::string suppressRegexStr;
+            if (!options.suppressRegex.trimmed().isEmpty())
+            {
+                const std::string pattern = options.suppressRegex.toStdString();
+                try
+                {
+                    std::regex re(pattern);
+                    suppressRegexStr = pattern;
+                    params.suppress_regex = suppressRegexStr.c_str();
+                }
+                catch (const std::regex_error &e)
+                {
+                    qWarning(
+                        "Invalid whisper suppress regex '%s': %s",
+                        pattern.c_str(),
+                        e.what()
+                    );
+                }
+            }
+
             const int ret = whisper_full(
                 ctx,
                 params,
@@ -343,7 +395,14 @@ QFuture<AsrTranscriptionResult> WhisperModel::transcribe(
             }
             else
             {
-                qWarning("Whisper transcription failed with code %d.", ret);
+                failure = QString(
+                    "whisper_full returned error code %1."
+                ).arg(ret);
+                qWarning("%s", qUtf8Printable(failure));
+                if (options.common.failureCallback)
+                {
+                    options.common.failureCallback(failure);
+                }
             }
             return AsrTranscriptionResult::Failed;
         }

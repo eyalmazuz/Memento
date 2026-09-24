@@ -178,3 +178,43 @@ This log tracks milestones, audits, code changes, and verification for issue #17
   4. *Dynamic Linking*: `ldd build-full-release/src/memento | rg libmpv` confirms linkage to `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24/lib/libmpv.so.2` with 0 undefined symbols.
   5. *Application Version*: Confirmed version **2.0.2** via `version.h` and binary execution.
   6. *Dictionary Database Discovery*: Confirmed path `~/.local/share/memento/dictionaries.sqlite` is correctly referenced and accessible.
+
+### Entry 14: Final Stable-ASR Hang Verification (2026-09-24)
+- **Independent Review**: Halley completed a read-only review with no confirmed issues.
+- **Focused Harness**: Added `asr_controller_retry_test` for actual `AsrController` terminal failures, WAV output validation, extraction cancellation cleanup, Qt heartbeat, delayed 4x playback, and explicit-seek recovery. CTest timeout is 30 seconds.
+- **Build**: `CCACHE_DISABLE=1 cmake --build build-full-release --parallel 4 --target asr_controller_retry_test` completed successfully with the full Release feature cache enabled. The final incremental invocation was interrupted before rebuilding the application and fake-ASR target; the controller test executable itself was rebuilt and run.
+- **SDK Link**: `ldd build-full-release/tests/asr_controller_retry_test` resolves `libmpv.so.2` to `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24/lib/libmpv.so.2`.
+- **Direct Controller Test**: Ran the executable through `tests/mpv-memory-subtitles/run.sh` with isolated HOME/XDG/TMP directories and a generated fixture. WAV signature and active-cancellation cleanup checks passed. The test then **failed** at delayed 4x playback: `High-speed playback reactivated terminal ASR failure (starts=1->2, warnings=2->4, seek-events=1)`. The explicit-seek recovery assertion was not reached. A new `MpvController::seekRequested` intent signal is present, but this failure remains unresolved and requires follow-up.
+- **Prior CTest**: The older controller harness revision passed the combined CTest wrapper in 2.47 seconds; CTest was not rerun after the added cancellation/high-speed/seek assertions.
+- **Real Inference Limit**: The local `ggml-large-v3-turbo.bin` exists (1,624,555,275 bytes), but `nvidia-smi` could not communicate with a driver and no GPU device was available. No real-model inference smoke was run; the user's profile/model was not modified.
+- **Process Cleanup**: No build, test, or FFmpeg processes remained active at verification close.
+
+### Entry 15: Retry Regression Assertion Ordering Correction (2026-09-24)
+- **Correction to Entry 14**: The reported delayed-4x failure was a test assertion-ordering defect, not a playback-triggered controller retry. The harness checked its pre-playback start/warning baseline only after deliberately performing an explicit seek and verifying the expected additional terminal attempt (`starts=1->2`, warnings `+2`). Its one `MpvPlayer::seeked` event was observed after that action, but `MPV_EVENT_SEEK` is an engine event and does not itself identify user intent.
+- **Controller Trace**: `m_retryPaused` gates `handlePositionChanged()` against ordinary position ticks. `m_retryAwaitingSeekPosition` is set only by `MpvController::seekRequested`, emitted after `MpvController::seek()` queues an absolute seek; mpv's `MPV_EVENT_SEEK` is a separate engine event and is not used as user intent. Stop/media lifecycle clears the pause state, while `requestReconfigure()` clears the seek latch and queues the settings-driven restart. No controller logic change was needed.
+- **Harness Fix**: Moved the no-reactivation assertion to immediately after delayed high-speed playback and before the explicit seek. It now counts controller seek requests, requires none during playback, and requires exactly one for the recovery action. The existing assertion still requires exactly one bounded retry after that seek.
+- **Verification**: `CCACHE_DISABLE=1 cmake --build build-full-release --parallel 4` succeeded, including `memento`, fake-ASR, and `asr_controller_retry_test`. CTest passed (`1/1`, 3.16 sec). The final direct isolated run passed memory-subtitle lifecycle, WAV extraction/cancellation cleanup, delayed 4x terminal-pause behavior, and explicit-seek recovery. `ldd` for both the app and controller test resolves `libmpv.so.2` to `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24/lib/libmpv.so.2`. All harness profile/temp paths were isolated; no user model or GPU inference was used.
+
+### Entry 16: Whisper v1.9.4 Upgrade, CUDA sm_75 Acceleration, Suppress-Regex Option & Runtime Warning Elimination (2026-09-24)
+- **Whisper Upgrade**:
+  - `extern/CMakeLists.txt`: Updated `whispercpp` FetchContent release tag to the latest official release: **`v1.9.4`** (from `v1.8.6`).
+- **GPU Performance Acceleration**:
+  - Configured full Release build with `-DMEMENTO_WHISPER_CUDA=ON -DMEMENTO_WHISPER_CUDA_ARCHITECTURES=75`.
+  - Built `ggml-cuda` with NVIDIA CUDA 13.3 (`nvcc`) targeted specifically for the user's GeForce GTX 1650 (`sm_75`, Turing architecture).
+  - Runtime test confirms GPU detection and initialization: `ggml_cuda_init: found 1 CUDA devices ... Device 0: NVIDIA GeForce GTX 1650, compute capability 7.5, VRAM: 3725 MiB`.
+- **Suppress-Regex Option**:
+  - Added `Keys::Whisper::SUPPRESS_REGEX` and `SUPPRESS_REGEX_DEFAULT` (`^\[_extra_token_[0-9]+\]$`).
+  - Added `whisperSuppressRegex` Q_PROPERTY, getter, setter, and change signal to `Settings`.
+  - Added user-facing text field under Whisper settings in `src/qml/options/AsrPage.qml`.
+  - Wired into `WhisperBackendOptions` and `WhisperTranscriptionOptions`.
+  - `WhisperModel::transcribe`: Compiles and safely validates the regex with `std::regex` inside a try-catch block before assigning to `params.suppress_regex`. Invalid expressions log a warning instead of crashing.
+- **Runtime Warning Elimination**:
+  - `QIODevice::read (QSslSocket)`: Guarded `reply->readAll()` in `DownloadManager`, `AudioPlayer`, and `AudioFiles` with `reply->isOpen() && reply->isReadable()`.
+  - `mpv encoder cplayer: client removed during hook handling`: In `MpvController::encodeFile`, set `ytdl` to `no` for local video files (`!inputPath.contains("://")`) to skip unnecessary hook initialization; disabled log message processing before `::mpv_terminate_destroy(enc_h)` on cancellation.
+- **QML Warning Resolution**:
+  - `AsrPage.qml`: Replaced `Features.unix` with `Features.isUnix`.
+  - `AnkiFieldTextArea.qml`: Changed to `Basic.TextArea` with custom palette background to prevent Breeze styling mismatch.
+  - `UpdateDialog.qml`: Fixed implicit width binding loop with fixed modal width (460px) and wrapped labels.
+- **Test Suite Pass**:
+  - `ctest -V --test-dir build-full-release --output-on-failure`: 100% passed in 5.71s (memory subtitle lifecycle, ASR controller retry, WAV extraction cancellation, and CUDA device initialization).
+

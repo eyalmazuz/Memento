@@ -124,7 +124,10 @@ QCoro::Task<bool> AudioPlayer::playAsync(QString url, QString hash)
         qDebug("AudioPlayer: Could not open temp file");
         co_return false;
     }
-    file->write(reply->readAll());
+    if (reply->isOpen() && reply->isReadable())
+    {
+        file->write(reply->readAll());
+    }
     file->close();
 
     {

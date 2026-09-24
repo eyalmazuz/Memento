@@ -21,6 +21,28 @@ target_link_libraries(
     PRIVATE Qt6::Concurrent
 )
 
+add_executable(
+    asr_controller_retry_test
+    mpv-memory-subtitles/asr_controller_retry_test.cpp
+)
+target_compile_features(asr_controller_retry_test PRIVATE cxx_std_20)
+target_include_directories(
+    asr_controller_retry_test
+    PRIVATE ${MEMENTO_INCLUDE_DIRS}
+)
+target_compile_options(
+    asr_controller_retry_test
+    PRIVATE ${MEMENTO_COMPILER_FLAGS}
+)
+target_link_libraries(
+    asr_controller_retry_test
+    PRIVATE asrtranscriber
+    PRIVATE context
+    PRIVATE managers
+    PRIVATE mpvplayer
+    PRIVATE Qt6::Concurrent
+)
+
 get_filename_component(MPV_SDK "${mpv_INCLUDE_DIR}" DIRECTORY)
 get_filename_component(MPV_LIBRARY_DIR "${mpv_LIBRARY}" DIRECTORY)
 set(
@@ -36,9 +58,11 @@ add_test(
         sh
         "${CMAKE_CURRENT_SOURCE_DIR}/mpv-memory-subtitles/run.sh"
         "$<TARGET_FILE:mpv_memory_subtitles_fake_asr>"
+        "$<TARGET_FILE:asr_controller_retry_test>"
 )
 set_tests_properties(
     mpv-memory-subtitles
     PROPERTIES
         ENVIRONMENT "${MPV_TEST_ENV}"
+        TIMEOUT 30
 )

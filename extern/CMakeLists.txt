@@ -71,7 +71,7 @@ if(MEMENTO_WHISPER_SUPPORT)
     FetchContent_Declare(
         whispercpp
         GIT_REPOSITORY https://github.com/ggml-org/whisper.cpp.git
-        GIT_TAG v1.8.6
+        GIT_TAG v1.9.4
     )
     FetchContent_MakeAvailable(whispercpp)
 

@@ -112,7 +112,7 @@ Page {
 
         Rectangle {
             Layout.fillWidth: true
-            visible: Features.unix && !scrollView.atBottom
+            visible: Features.isUnix && !scrollView.atBottom
             color: MementoPalette.border
             height: 1
         }
@@ -408,6 +408,30 @@ Page {
                         }
                     }
 
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "whisper"
+                        Layout.fillWidth: true
+
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Suppress regex")
+                        }
+                        TextField {
+                            Layout.alignment: Qt.AlignRight
+                            Layout.preferredWidth: 250
+                            placeholderText: "^\\\\[_extra_token_[0-9]+\\\\]$"
+                            text: MementoSettings.whisperSuppressRegex
+                            onEditingFinished: {
+                                MementoSettings.whisperSuppressRegex = text;
+                            }
+                        }
+                    }
                 }
             }
         }

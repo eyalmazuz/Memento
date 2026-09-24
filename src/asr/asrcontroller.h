@@ -223,6 +223,7 @@ private:
      */
     QCoro::Task<QVariantMap> selectImplAsync(MpvController *controller);
     void handlePositionChanged(double position);
+    void handleSeeked();
     void handleMediaPathChanged(const QString &path);
     void handleFileLifecycleChange();
     void handleSidChanged(int64_t sid);
@@ -281,6 +282,7 @@ private:
     QMetaObject::Connection m_positionConnection;
     QMetaObject::Connection m_pathConnection;
     QMetaObject::Connection m_sidConnection;
+    QMetaObject::Connection m_seekConnection;
     QMetaObject::Connection m_subtitleTextConnection;
     QMetaObject::Connection m_fileStartedConnection;
     QMetaObject::Connection m_fileEndedConnection;
@@ -292,6 +294,9 @@ private:
 
     bool m_active{false};
     bool m_running{false};
+    /* Pause automatic retries after repeated failures until explicit input. */
+    bool m_retryPaused{false};
+    bool m_retryAwaitingSeekPosition{false};
     /* Prevent backend reuse until the active selection coroutine completes. */
     bool m_selectInFlight{false};
     QString m_currentText;

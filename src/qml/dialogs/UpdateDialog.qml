@@ -8,10 +8,13 @@ Dialog {
     parent: Overlay.overlay
     anchors.centerIn: parent
     modal: true
+    implicitWidth: 460
     standardButtons: Dialog.Ok
 
     Label {
         id: messageLabel
+        width: root.availableWidth
+        wrapMode: Text.WordWrap
         textFormat: Text.RichText
         onLinkActivated: (link) => Qt.openUrlExternally(link)
     }

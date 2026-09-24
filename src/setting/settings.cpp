@@ -1703,6 +1703,12 @@ void Settings::loadWhisperSettings()
             Keys::Whisper::FLASH_ATTN_DEFAULT
         ).toBool()
     );
+    setWhisperSuppressRegex(
+        s.value(
+            Keys::Whisper::SUPPRESS_REGEX,
+            Keys::Whisper::SUPPRESS_REGEX_DEFAULT
+        ).toString()
+    );
 
     s.endGroup();
 }
@@ -1756,6 +1762,10 @@ void Settings::writeWhisperSettings()
         Keys::Whisper::FLASH_ATTN,
         whisperFlashAttention()
     );
+    s.setValue(
+        Keys::Whisper::SUPPRESS_REGEX,
+        whisperSuppressRegex()
+    );
 
     s.endGroup();
 }
@@ -1773,6 +1783,7 @@ void Settings::defaultWhisperSettings()
     setWhisperBestOf();
     setWhisperBeamSize();
     setWhisperFlashAttention();
+    setWhisperSuppressRegex();
 }
 
 /* Version Settings */
@@ -3146,3 +3157,19 @@ void Settings::setWhisperFlashAttention(bool value)
     m_whisper.flashAttention = value;
     emit whisperFlashAttentionChanged(m_whisper.flashAttention);
 }
+
+QString Settings::whisperSuppressRegex() const noexcept
+{
+    return m_whisper.suppressRegex;
+}
+
+void Settings::setWhisperSuppressRegex(const QString &value)
+{
+    if (m_whisper.suppressRegex == value)
+    {
+        return;
+    }
+    m_whisper.suppressRegex = value;
+    emit whisperSuppressRegexChanged(m_whisper.suppressRegex);
+}
+

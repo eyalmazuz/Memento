@@ -215,10 +215,15 @@ void AudioFiles::loadJsonAudioSource(quint64 generation)
                 return;
             }
 
+            QByteArray dataBytes;
+            if (reply->isOpen() && reply->isReadable())
+            {
+                dataBytes = reply->readAll();
+            }
+            reply->deleteLater();
             QJsonParseError jsonParseError{};
             QJsonDocument data =
-                QJsonDocument::fromJson(reply->readAll(), &jsonParseError);
-            reply->deleteLater();
+                QJsonDocument::fromJson(dataBytes, &jsonParseError);
             if (jsonParseError.error != QJsonParseError::NoError)
             {
                 loadCurrentSource(generation);
