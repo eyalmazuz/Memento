@@ -35,6 +35,7 @@
 #endif // MEMENTO_SYSTEM_QCORO
 
 #include "anki/ankiconnect.h"
+#include "player/mpvsubtitle.h"
 #include "state/context.h"
 
 /* The minimum AnkiConnect version required */
@@ -936,16 +937,19 @@ QJsonObject AnkiClient::processReply(QNetworkReply &reply, QString &error)
 void AnkiClient::populate(Expression *expression) const
 {
     MpvState *state = m_context->player()->state();
+    MpvSubtitle *primarySubtitle = state->subtitle();
+    MpvSubtitle *secondarySubtitle = state->secondarySubtitle();
+
     expression->setTitle(state->title());
-    QString subtitleText = state->subtitle()->text();
+    QString subtitleText = primarySubtitle->text();
     expression->setSubtitle(subtitleText.remove(m_subtitleFilterRegex));
     expression->setStartTime(
-        state->subtitle()->startTime() + state->subtitle()->delay()
+        primarySubtitle->playbackTime(primarySubtitle->startTime())
     );
     expression->setEndTime(
-        state->subtitle()->endTime() + state->subtitle()->delay()
+        primarySubtitle->playbackTime(primarySubtitle->endTime())
     );
-    expression->setSubtitle2(state->secondarySubtitle()->text());
+    expression->setSubtitle2(secondarySubtitle->text());
 
     /* Set {context} fields */
     const SubtitleListModel *primaryList =
@@ -981,11 +985,11 @@ void AnkiClient::populate(Expression *expression) const
         if (!contextList.isEmpty())
         {
             expression->setContextStartTime(
-                primaryListItems[primarySelection.front().row()].start +
-                    state->subtitle()->delay()
+                primarySubtitle->playbackTime(
+                    primaryListItems[primarySelection.front().row()].start)
             );
             expression->setContextEndTime(
-                contextEndTime + state->subtitle()->delay()
+                primarySubtitle->playbackTime(contextEndTime)
             );
             expression->setContext(contextList.join('\n'));
         }

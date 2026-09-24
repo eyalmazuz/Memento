@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Dialogs
+import QtQuick.Layouts
 import QtQuick.Window
 import Ripose.Memento
 
@@ -347,6 +348,85 @@ ApplicationWindow {
         }
 
         Component.onCompleted: active = DictionaryController.dictionaries.rowCount() === 0
+        onLoaded: item.open()
+    }
+
+    Loader {
+        id: asrStartupDownloadDialog
+        active: false
+        sourceComponent: Component {
+            AsrDownloadDialog { }
+        }
+
+        function start(model) {
+            active = true;
+            item.start(model);
+        }
+    }
+
+    Loader {
+        id: asrNoModelLoader
+        active: false
+        sourceComponent: Component {
+            Dialog {
+                id: asrNoModelDialog
+                readonly property string defaultModel: "tiny"
+                readonly property string defaultModelLabel: qsTr("Whisper tiny")
+
+                parent: Overlay.overlay
+                anchors.centerIn: parent
+                modal: true
+                standardButtons: Dialog.Yes | Dialog.No
+                title: qsTr("ASR Model Missing")
+
+                onAccepted: {
+                    MementoSettings.asrBackend = "whisper";
+                    MementoSettings.whisperModel = defaultModel;
+                    MementoSettings.writeAsrSettings();
+                    MementoSettings.writeWhisperSettings();
+                    asrStartupDownloadDialog.start(defaultModel);
+                }
+                onRejected: {
+                    if (asrNoModelCheckBox.checked)
+                    {
+                        MementoSettings.internalWhisperNoModelPromptDismissed = true;
+                        MementoSettings.writeInternalSettings();
+                    }
+                }
+                onClosed: asrNoModelLoader.active = false
+
+                ColumnLayout {
+                    width: 460
+                    spacing: 10
+
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: qsTr(
+                            "Memento was compiled with ASR support, " +
+                            "but no ASR model was found in %1.\n\n" +
+                            "Do you want to download the default %2 " +
+                            "model now?"
+                        ).arg(AsrController.modelsDirectory())
+                         .arg(asrNoModelDialog.defaultModelLabel)
+                    }
+
+                    CheckBox {
+                        id: asrNoModelCheckBox
+                        text: qsTr("Don't show this again")
+                    }
+                }
+            }
+        }
+
+        Component.onCompleted: {
+            Qt.callLater(function() {
+                asrNoModelLoader.active =
+                    Features.asr &&
+                    !MementoSettings.internalWhisperNoModelPromptDismissed &&
+                    !AsrController.hasAnyModel();
+            });
+        }
         onLoaded: item.open()
     }
 

@@ -20,6 +20,8 @@
 
 #include "player/mpvsubtitle.h"
 
+#include <cmath>
+
 MpvSubtitle::MpvSubtitle(QObject *parent) : QObject(parent)
 {
 
@@ -83,6 +85,31 @@ void MpvSubtitle::setDelay(double value)
     }
     m_delay = value;
     emit delayChanged(m_delay);
+}
+
+double MpvSubtitle::speed() const noexcept
+{
+    return m_speed;
+}
+
+void MpvSubtitle::setSpeed(double value)
+{
+    if (!std::isfinite(value) || value <= 0 || m_speed == value)
+    {
+        return;
+    }
+    m_speed = value;
+    emit speedChanged(m_speed);
+}
+
+double MpvSubtitle::playbackTime(double rawTime) const noexcept
+{
+    return rawTime * m_speed + m_delay;
+}
+
+double MpvSubtitle::rawTime(double playbackTime) const noexcept
+{
+    return (playbackTime - m_delay) / m_speed;
 }
 
 bool MpvSubtitle::visible() const noexcept

@@ -85,6 +85,7 @@ Page {
             id: primarySubtitleList
             subtitleListModel: SubtitleLists.primary
             delay: root.player?.state.subtitle.delay ?? 0
+            speed: root.player?.state.subtitle.speed ?? 1
             textColor: root.textColor
             hoverColor: root.hoverColor
             selectedColor: root.selectedColor
@@ -97,6 +98,7 @@ Page {
             id: secondarySubtitleList
             subtitleListModel: SubtitleLists.secondary
             delay: root.player?.state.secondarySubtitle.delay ?? 0
+            speed: root.player?.state.secondarySubtitle.speed ?? 1
             textColor: root.textColor
             hoverColor: root.hoverColor
             selectedColor: root.selectedColor
@@ -173,7 +175,7 @@ Page {
             if (MementoSettings.subtitleListAutoSeek)
             {
                 let position = subtitleList.subtitleListModel.data(modelIndex, SubtitleListModel.StartRole);
-                root.player.controller.seek(position + subtitleList.delay);
+                root.player.controller.seek(Math.max(0, position * subtitleList.speed + subtitleList.delay));
             }
         }
 

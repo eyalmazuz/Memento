@@ -10,7 +10,8 @@ ListView {
     readonly property ItemSelectionModel selectionModel: root.subtitleListModel?.selectionModel ?? null
     readonly property var regexFilter: Utils.safeRegex(MementoSettings.searchRemoveRegex, "g")
 
-    property int delay: 0
+    property real delay: 0
+    property real speed: 1
     property color textColor: "white"
     property color hoverColor: "#1A1A1A"
     property color selectedColor: "#333333"
@@ -114,7 +115,7 @@ ListView {
                     const SECONDS_IN_HOUR = 3600;
                     const SECONDS_IN_MINUTE = 60;
 
-                    let total = Math.floor(model.start + root.delay);
+                    let total = Math.floor(model.start * root.speed + root.delay);
                     total = Math.max(total, 0);
 
                     const hours = Math.floor(total / SECONDS_IN_HOUR);
@@ -183,7 +184,7 @@ ListView {
             }
             let modelIndex = root.subtitleListModel.index(index, 0);
             let position = root.subtitleListModel.data(modelIndex, SubtitleListModel.StartRole);
-            position += root.delay;
+            position = position * root.speed + root.delay;
             position = Math.max(position, 0);
             root.seekRequested(position);
         }

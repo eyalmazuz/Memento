@@ -1,0 +1,180 @@
+# Progress Log: Whisper Subtitle Provider Refactor & In-Memory libmpv Subtitles
+
+This log tracks milestones, audits, code changes, and verification for issue #176 and the backend refactor on branch `feature/whisper-subtitle-provider-refactor`.
+
+---
+
+## [Task Overview]
+- **Goal**: Integrate in-memory subtitle tracks into libmpv via the custom SDK (`/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24`), clean up backend abstraction (move Whisper-specific settings and fallback logic behind `WhisperBackend`), remove screenshot/rendering duplication, and fix session restart/lifecycle races.
+- **Role**: Orchestrator coordinating subagents for planning, auditing, implementation, review, and verification.
+- **Branch**: `feature/whisper-subtitle-provider-refactor`
+
+---
+
+## [Log Entries]
+
+### Entry 1: Initialization & Worktree Assessment
+- **Status**: Resumed from Codex's interrupted session.
+- **Findings from previous session**:
+  - Handoff guide reviewed (`/home/eyalm/Desktop/programming/mpv-in-memory-subtitles-handoff.md`).
+  - Worktree contains uncommitted changes across 31 files and untracked `tests/`.
+  - Prior session flagged remaining issue: settings change after transcription finishes can clear subtitles without restarting ASR; must distinguish active ASR session from explicit stop.
+  - Backend abstraction cleanup status needs verification.
+- **Next**: Deploy Auditor/Planner agent to audit worktree, backend abstraction cleanliness, and session lifecycle state.
+
+### Entry 2: Auditor/Planner Subagent Dispatched
+- **Agent ID**: `a60698f8-0d35-4cce-b7b7-4ff5bd5feaec`
+- **Scope**:
+  1. Audit `AsrBackend` vs `WhisperBackend` abstraction: check for remaining Whisper-specific settings (e.g., `bestOf`, `beamSize`, `vadModelPath`) or fallback logic in `AsrController`.
+  2. Audit in-memory subtitle commands in `MpvController`/`MpvPlayer` against handoff specification.
+  3. Audit `AsrController` session lifecycle for the setting-change restart bug (distinguishing completed/active session from explicit stop).
+  4. Inspect test harness in `tests/mpv-memory-subtitles/` and build requirements for custom libmpv SDK.
+- **Status**: Audit completed.
+
+### Entry 3: Audit Findings & Implementation Blueprint
+- **Audit Source**: `a60698f8-0d35-4cce-b7b7-4ff5bd5feaec`
+- **Key Findings**:
+  1. *Backend Abstraction*: `AsrBackend` is minimal. Remaining task: delegate `hasAnyModel()` from `AsrController` to `WhisperController` to remove hardcoded VAD model filenames.
+  2. *libmpv In-Memory Subtitles*: Full handoff compliance confirmed (`sub-create`, `add-subtitle`, `edit-subtitle`, `remove-subtitle`, `clear-subtitles`, `sub-remove`), `supportsMemorySubtitles()` verifies command availability, internal screenshot and subtitle state duplicates are cleanly removed.
+  3. *Lifecycle / Settings Restart Bug*:
+     - `requestReconfigure()` cleared cues before verifying model/backend readiness.
+     - Disabling ASR (`!asrEnabled`) did not call `stop()`.
+     - Changing settings when stopped (`!m_active`) dirty-flagged reconfigure.
+     - EOF playback clamp stopped ASR instead of re-transcribing from `0.0`.
+     - Seeking while idle did not restart/wake transcription.
+  4. *Test Suite*: `fake_asr_test.cpp` needed `std::setlocale(LC_NUMERIC, "C")` for mpv context creation.
+- **Action Plan**:
+  - Phase 1: Implementer agent applies fixes to `fake_asr_test.cpp`, `whispercontroller.*`, and `asrcontroller.*`.
+  - Phase 2: Reviewer agent audits lifecycle state transitions, error handling, and coding standards.
+  - Phase 3: Verifier agent builds via `ninja -C build-asr-memory` and runs CTest / script tests against custom libmpv SDK.
+
+### Entry 4: Implementer Subagent Dispatched
+- **Agent ID**: `d367ad61-970c-4e4a-a771-d96e755279e3`
+- **Assigned Tasks**:
+  1. Add `std::setlocale(LC_NUMERIC, "C");` in `tests/mpv-memory-subtitles/fake_asr_test.cpp`.
+  2. Move VAD filename filtering from `AsrController::hasAnyModel()` to `WhisperController::hasAnyModel()`.
+  3. Implement lifecycle fixes in `AsrController`:
+     - Fix `requestReconfigure()`: stop if `!asrEnabled`, no-op if `!m_active`, defer cue invalidation.
+     - Fix `restartAfterReconfigure()`: guard against inactive/disabled state, restart `selectAsync()`.
+     - Fix `selectImplAsync()`: validate model before cue invalidation, handle EOF restart position (`start = 0.0`), and support two-pass coverage.
+     - Fix `handlePositionChanged()`: wake idle transcription on seek.
+  4. Verify compilation with `ninja -C build-asr-memory`.
+- **Status**: Implementation completed successfully.
+
+### Entry 5: Implementation Complete
+- **Implemented By**: `d367ad61-970c-4e4a-a771-d96e755279e3`
+- **Delivered Changes**:
+  1. `tests/mpv-memory-subtitles/fake_asr_test.cpp`: Added `std::setlocale(LC_NUMERIC, "C");` for cross-locale libmpv compatibility.
+  2. `src/asr/whisper/whispercontroller.h` & `.cpp`: Implemented `hasAnyModel()` with Silero VAD model filtering encapsulated inside WhisperController.
+  3. `src/asr/asrcontroller.cpp`:
+     - Cleaned `AsrController::hasAnyModel()` by delegating to `m_whisperController->hasAnyModel()`.
+     - `requestReconfigure()`: explicit stop if disabled, no-op if inactive, deferred cue clearing if active.
+     - `restartAfterReconfigure()`: guards against inactive/disabled state, triggers clean reconfigure restart.
+     - `selectImplAsync()`: validates model and backend before invalidating cues; restarts from `0.0` if positioned near EOF; adds two-pass coverage sweep.
+     - `handlePositionChanged()`: wakes idle transcription on seek events.
+  4. Local build & test checks passed 100% (`ninja`, `ctest`, and `run.sh`).
+- **Next**: Dispatch independent Reviewer agent (`code_reviewer`) to audit the modifications for edge cases and Memento guidelines.
+
+### Entry 6: Independent Code Review (APPROVED)
+- **Reviewer ID**: `aee4c449-0156-4740-ad04-4a51f416b703`
+- **Audit Results**:
+  1. *Lifecycle Transitions*: Explicit stop invoked on `!asrEnabled`; inactive ASR (`!m_active`) remains strict no-op on settings changes.
+  2. *Subtitle Preservation*: Model existence verified before backend creation or cue clearing; missing models report errors without destroying visible subtitles.
+  3. *EOF & Two-Pass Coverage*: EOF clamp resets to `0.0`, eliminating spurious "No speech was detected" errors; two-pass sweep ensures full coverage of pre-start media segments.
+  4. *Concurrency & Safety*: Atomic flags, generational segment filtering, and `m_selectInFlight` prevent overlapping coroutines and race conditions. Idle seeking safely restarts transcription.
+  5. *Code Standards*: No Whisper leakage into `AsrBackend`, clean encapsulation in `WhisperController`, removal of duplicate screenshot/subtitle paths confirmed.
+- **Verdict**: **APPROVED** without reservation.
+- **Next**: Dispatch Verifier agent (`test_verifier`) to perform full verification run and final artifact check.
+
+### Entry 7: Full Multi-Feature Release Verification
+- **Configuration**:
+  - `CMAKE_BUILD_TYPE=Release`
+  - `MEMENTO_QAPPLICATION=ON`
+  - `MEMENTO_OCR_SUPPORT=ON`
+  - `MEMENTO_SYSTEM_MOCR=ON`
+  - `MEMENTO_MECAB_SUPPORT=ON`
+  - `MEMENTO_SYSTEM_QCORO=ON`
+  - `MEMENTO_WHISPER_SUPPORT=ON`
+  - Custom libmpv SDK: `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24`
+- **Build Directory**: `build-full-release/`
+- **Purpose**: Ensure no symbol conflicts or configuration collisions exist across OCR, MeCab, QCoro, QApplication, and in-memory ASR subtitles.
+- **Status**: Completed successfully.
+- **Build & Linking**: Clean compilation (`[100%] Built target memento`). `ldd` confirmed linked against `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24/lib/libmpv.so.2`. Zero undefined symbols.
+- **Test Result**: `100% tests passed out of 1` (`mpv-memory-subtitles` passed in 0.90 sec).
+
+### Entry 8: Final Summary & Architecture Wrap-Up
+- **Backend Clean-up**:
+  - `AsrBackend` / `AsrTranscriptionOptions` interface is strictly engine-agnostic (language, abort flag, segment callback).
+  - All Whisper-specific inference options (`threads`, `bestOf`, `beamSize`, `useVad`, `vadModel`) and fallback retry logic are contained inside `WhisperBackend`.
+  - Silero VAD model filename filtering was encapsulated inside `WhisperController::hasAnyModel()`.
+- **In-Memory Subtitle Integration**:
+  - Custom libmpv commands (`sub-create`, `add-subtitle`, `edit-subtitle`, `remove-subtitle`, `clear-subtitles`, `sub-remove`) implemented and tested.
+  - Subtitle track mutations update mpv directly; `sub-lines` events drive `SubtitleListManager`.
+  - Duplicate internal screenshot and subtitle state classes were removed.
+- **Session Lifecycle & Settings Restart**:
+  - Disabling ASR (`!asrEnabled`) calls `stop()` and unloads the track.
+  - Inactive ASR (`!m_active`) ignores settings changes without wiping cues.
+  - Missing/uninstalled model selections report errors without clearing visible subtitles.
+  - EOF playback clamp restarts transcription cleanly from `0.0` instead of failing with "No speech detected".
+  - Two-pass coverage sweeps ensure full file coverage.
+  - Seeking while idle wakes transcription without racing active workers.
+- **Multi-Feature Compatibility**:
+  - Tested with full Release build (`QAPPLICATION`, `OCR`, `SYSTEM_MOCR`, `MECAB`, `SYSTEM_QCORO`, `WHISPER`, `TESTING`) without symbol or configuration conflicts.
+
+### Entry 9: Pivot directly to Memento v2.0.2 base (commit e45a792)
+- **User Directive**: Discard merge conflict resolution against the legacy 1.7.2 history; build directly on top of Memento v2.0.2 (`master` @ `e45a792`).
+- **Rationale**: Memento 2.0.2 includes fundamental architecture changes (e.g., dictionary databases loaded from `~/.local/share/memento/dictionaries.sqlite`, refactored rich text, decoupled audio files). Rebasing against 56 historical 1.7.2 commits caused obsolete code and merge churn.
+- **Strategy**:
+  1. Base tree reset to clean `e45a792` (`master`).
+  2. Restore and integrate the verified ASR backend and in-memory libmpv subtitle subsystem directly onto 2.0.2.
+  3. Ensure all 2.0.2 core paths (especially `DirectoryUtils::getDictionaryDb()`, `AudioFile`, `StructuredRichText`) remain untouched and pristine.
+  4. Build and verify using the full multi-feature CMake release configuration.
+
+### Entry 10: Auditor Blueprint Approved & Implementer Dispatched
+- **Blueprint Location**: `/home/eyalm/.gemini/antigravity-cli/brain/a60698f8-0d35-4cce-b7b7-4ff5bd5feaec/v2_migration_blueprint.md`
+- **Key Checkpoints**:
+  1. 19 new files checked out directly from backup branch (`src/asr/`, `src/manager/downloadmanager.*`, `AsrPage.qml`, `AsrDownloadDialog.qml`, `tests/`).
+  2. Surgical integration into 2.0.2 target files (`CMakeLists.txt`, `keys.h`, `settings.*`, `mpvsubtitle.*`, `mpvplayer.*`, `mpvcontroller.*`, `subtitlelistmanager.*`, `context.*`, `main.cpp`, QML).
+  3. Strict zero-regression guarantees:
+     - `DirectoryUtils::getDictionaryDb()` intact (`getDataDir() + "dictionaries.sqlite"`).
+     - Native C++ `AudioFile` / `AudioFiles` untouched.
+     - `KeyTracker` in `Context` preserved.
+     - Translation engine untouched.
+  4. Pre-baked bug fixes: Silero VAD filename abstraction in `WhisperController`, lifecycle restart fixes in `AsrController`, and locale fix in `fake_asr_test.cpp`.
+- **Implementer ID**: `d367ad61-970c-4e4a-a771-d96e755279e3`
+- **Current Status**: Complete.
+
+### Entry 11: v2.0.2 Implementation Complete & Reviewer Dispatched
+- **Base**: Memento v2.0.2 (`master` @ `e45a792`).
+- **Implementer Report Summary**:
+  1. All 19 new files added (`src/asr/`, `src/manager/downloadmanager.*`, `AsrPage.qml`, `AsrDownloadDialog.qml`, `tests/`).
+  2. Surgical integration in build files, settings, player, manager, quick, main, and QML.
+  3. Strict zero-regression preserved on v2.0.2 features (dictionary loading, audio files, translations, key tracking).
+  4. Encapsulation of Silero VAD model filtering in `WhisperController::hasAnyModel()`.
+  5. Session lifecycle fixes applied to `AsrController.cpp` (explicit stop on disabled, no-op on inactive, cue preservation on model check, EOF clamp to 0.0, two-pass coverage sweep, seek wake).
+  6. Locale fix applied to `fake_asr_test.cpp`.
+  7. Verification in `build-asr-memory`: clean compile (`ninja`), test suite passed (100%).
+- **Reviewer ID**: `aee4c449-0156-4740-ad04-4a51f416b703`
+- **Current Status**: Complete. Verdict: APPROVED.
+
+### Entry 12: Independent Code Review APPROVED & Verifier Dispatched
+- **Reviewer ID**: `aee4c449-0156-4740-ad04-4a51f416b703`
+- **Audit Findings**:
+  1. *v2.0.2 Regression Audit*: Confirmed zero regressions across `DirectoryUtils::getDictionaryDb()`, `Settings::applicationLanguage()`, `KeyTracker` in `Context`, `AudioFile`/`AudioFiles` C++ objects, and rich text engines.
+  2. *In-Memory Subtitles*: Full compliance with custom libmpv commands (`sub-create`, `add-subtitle`, `edit-subtitle`, `remove-subtitle`, `clear-subtitles`, `sub-remove`) and `sub-lines` property observation.
+  3. *Engine Refinements*: Verified Silero VAD model filtering encapsulated in `WhisperController`, zero VAD leakage in `AsrController`, and all 5 lifecycle/EOF restart fixes operational.
+  4. *Locale & Standards*: `std::setlocale(LC_NUMERIC, "C")` verified; memory management, temporary file cleanup, and thread-safe QPointer callbacks confirmed.
+- **Verifier ID**: `1c706d2c-6cef-4a90-ae2c-e09992a820ab`
+- **Target Configuration**: Full multi-feature Release build (`QAPPLICATION`, `OCR`, `SYSTEM_MOCR`, `MECAB`, `SYSTEM_QCORO`, `WHISPER`, `TESTING`) against custom libmpv SDK `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24`.
+- **Status**: Complete. 100% Passed.
+
+### Entry 13: Full Multi-Feature Release Build & Verification PASSED
+- **Build Directory**: `build-full-release`
+- **Base Version**: **2.0.2** (`master` @ `e45a792`)
+- **Verification Results**:
+  1. *Build Success*: Built 100% cleanly with all flags (`MEMENTO_QAPPLICATION`, `MEMENTO_OCR_SUPPORT`, `MEMENTO_SYSTEM_MOCR`, `MEMENTO_MECAB_SUPPORT`, `MEMENTO_SYSTEM_QCORO`, `MEMENTO_WHISPER_SUPPORT`, `BUILD_TESTING`).
+  2. *CTest Suite*: 100% passed (`mpv-memory-subtitles` in 0.86s).
+  3. *Standalone Test*: Both memory subtitle lifecycle test and fake ASR pipeline test passed cleanly.
+  4. *Dynamic Linking*: `ldd build-full-release/src/memento | rg libmpv` confirms linkage to `/home/eyalm/.local/opt/mpv-in-memory-subtitles-15d25e0f24/lib/libmpv.so.2` with 0 undefined symbols.
+  5. *Application Version*: Confirmed version **2.0.2** via `version.h` and binary execution.
+  6. *Dictionary Database Discovery*: Confirmed path `~/.local/share/memento/dictionaries.sqlite` is correctly referenced and accessible.

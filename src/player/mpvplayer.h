@@ -26,6 +26,8 @@
 #include <QQuickFramebufferObject>
 #endif // Q_OS_MACOS
 
+#include <QVariant>
+
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
 
@@ -69,6 +71,14 @@ public:
      */
     [[nodiscard]]
     mpv_handle *handle() const noexcept;
+
+    /**
+     * @brief Checks whether a file has completed loading in mpv.
+     *
+     * @return true if a file is loaded, false otherwise.
+     */
+    [[nodiscard]]
+    bool isFileLoaded() const noexcept;
 
     /**
      * @brief The mpv OpenGL render context in use.
@@ -163,6 +173,25 @@ signals:
     void fileLoaded(int64_t width, int64_t height);
 
     /**
+     * @brief Emitted when mpv begins loading a file.
+     */
+    void fileStarted();
+
+    /**
+     * @brief Emitted when mpv finishes or aborts a file.
+     */
+    void fileEnded();
+
+    /**
+     * @brief Emitted with a copied snapshot of the selected primary sub-lines.
+     *
+     * Each list entry contains id, text, start, and end values.
+     *
+     * @param lines The copied primary subtitle cue list.
+     */
+    void primarySubtitleLinesChanged(const QVariantList &lines);
+
+    /**
      * @brief Emitted when the mpv instance has shutdown.
      */
     void shutdown();
@@ -216,6 +245,9 @@ private:
 
     /* The mpv context */
     mpv_handle *m_mpv{nullptr};
+
+    /* Whether mpv has completed loading the current file */
+    bool m_isFileLoaded{false};
 
     /* The mpv render context */
     mpv_render_context *m_mpv_gl{nullptr};

@@ -121,6 +121,14 @@ public:
         const QString &text, double start, double end);
 
     /**
+     * @brief Remove every subtitle that overlaps a time range.
+     *
+     * @param start Start of the range.
+     * @param end End of the range.
+     */
+    Q_INVOKABLE void removeOverlapping(double start, double end);
+
+    /**
      * @brief Select all items a time position overlaps with and deselects all
      * subtitles that don't overlap.
      *

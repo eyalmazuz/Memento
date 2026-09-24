@@ -20,6 +20,10 @@
 
 #include "player/mpvplayer.h"
 
+#include <cmath>
+#include <cstring>
+#include <utility>
+
 #include <QOpenGLContext>
 #include <QQuickWindow>
 
@@ -315,6 +319,16 @@ void MpvPlayer::initPropertyMap()
         }
     };
 
+    m_propertyMap["sub-speed"] = [this] (mpv_event_property *prop)
+    {
+        if (prop->format == MPV_FORMAT_DOUBLE)
+        {
+            const double speed = *reinterpret_cast<double *>(prop->data);
+            state()->subtitle()->setSpeed(speed);
+            state()->secondarySubtitle()->setSpeed(speed);
+        }
+    };
+
     m_propertyMap["sub-delay"] = [this] (mpv_event_property *prop)
     {
         if (prop->format == MPV_FORMAT_DOUBLE)
@@ -352,6 +366,85 @@ void MpvPlayer::initPropertyMap()
             state()->subtitle()->setEndTime(end);
             state()->subtitle()->setText(std::move(subtitle));
         }
+    };
+
+    m_propertyMap["sub-lines"] = [this] (mpv_event_property *prop)
+    {
+        QVariantList lines;
+        if (prop->format == MPV_FORMAT_NODE)
+        {
+            mpv_node *node = reinterpret_cast<mpv_node *>(prop->data);
+            if (node->format == MPV_FORMAT_NODE_ARRAY &&
+                node->u.list != nullptr)
+            {
+                mpv_node_list *array = node->u.list;
+                for (int i = 0; i < array->num; ++i)
+                {
+                    const mpv_node &entry = array->values[i];
+                    if (entry.format != MPV_FORMAT_NODE_MAP ||
+                        entry.u.list == nullptr)
+                    {
+                        continue;
+                    }
+
+                    bool hasId = false;
+                    bool hasText = false;
+                    bool hasStart = false;
+                    bool hasEnd = false;
+                    int64_t id = 0;
+                    QString text;
+                    double start = 0.0;
+                    double end = 0.0;
+                    mpv_node_list *map = entry.u.list;
+                    for (int j = 0; j < map->num; ++j)
+                    {
+                        const char *key = map->keys[j];
+                        const mpv_node &value = map->values[j];
+                        if (key == nullptr)
+                        {
+                            continue;
+                        }
+
+                        if (std::strcmp(key, "id") == 0 &&
+                            value.format == MPV_FORMAT_INT64)
+                        {
+                            id = value.u.int64;
+                            hasId = true;
+                        }
+                        else if (std::strcmp(key, "text") == 0 &&
+                            value.format == MPV_FORMAT_STRING &&
+                            value.u.string != nullptr)
+                        {
+                            text = QString::fromUtf8(value.u.string);
+                            hasText = true;
+                        }
+                        else if (std::strcmp(key, "start") == 0 &&
+                            value.format == MPV_FORMAT_DOUBLE)
+                        {
+                            start = value.u.double_;
+                            hasStart = std::isfinite(start);
+                        }
+                        else if (std::strcmp(key, "end") == 0 &&
+                            value.format == MPV_FORMAT_DOUBLE)
+                        {
+                            end = value.u.double_;
+                            hasEnd = std::isfinite(end);
+                        }
+                    }
+
+                    if (hasId && hasText && hasStart && hasEnd)
+                    {
+                        QVariantMap line;
+                        line.insert("id", QVariant::fromValue<qlonglong>(id));
+                        line.insert("text", text);
+                        line.insert("start", start);
+                        line.insert("end", end);
+                        lines.emplaceBack(std::move(line));
+                    }
+                }
+            }
+        }
+        emit primarySubtitleLinesChanged(lines);
     };
 
     m_propertyMap["secondary-sub-text"] = [this] (mpv_event_property *prop)
@@ -468,6 +561,8 @@ void MpvPlayer::initializeMpv()
     mpv_observe_property(m_mpv, 0, "secondary-sub-delay", MPV_FORMAT_DOUBLE);
     mpv_observe_property(m_mpv, 0, "secondary-sub-visibility", MPV_FORMAT_FLAG);
     mpv_observe_property(m_mpv, 0, "sub-delay",           MPV_FORMAT_DOUBLE);
+    mpv_observe_property(m_mpv, 0, "sub-speed",           MPV_FORMAT_DOUBLE);
+    mpv_observe_property(m_mpv, 0, "sub-lines",           MPV_FORMAT_NODE);
     mpv_observe_property(m_mpv, 0, "sub-text",            MPV_FORMAT_STRING);
     mpv_observe_property(m_mpv, 0, "sub-visibility",      MPV_FORMAT_FLAG);
 
@@ -556,6 +651,11 @@ void MpvPlayer::initOptions()
 mpv_handle *MpvPlayer::handle() const noexcept
 {
     return m_mpv;
+}
+
+bool MpvPlayer::isFileLoaded() const noexcept
+{
+    return m_isFileLoaded;
 }
 
 mpv_render_context *MpvPlayer::renderContext() const noexcept
@@ -756,13 +856,30 @@ void MpvPlayer::handleMpvEvent(mpv_event *event)
         break;
     }
 
+    case MPV_EVENT_START_FILE:
+    {
+        m_isFileLoaded = false;
+        emit fileStarted();
+        emit primarySubtitleLinesChanged(QVariantList{});
+        break;
+    }
+
     case MPV_EVENT_FILE_LOADED:
     {
+        m_isFileLoaded = true;
         int64_t w = 0;
         ::mpv_get_property(m_mpv, "video-params/w", MPV_FORMAT_INT64, &w);
         int64_t h = 0;
         ::mpv_get_property(m_mpv, "video-params/h", MPV_FORMAT_INT64, &h);
         emit fileLoaded(w, h);
+        break;
+    }
+
+    case MPV_EVENT_END_FILE:
+    {
+        m_isFileLoaded = false;
+        emit fileEnded();
+        emit primarySubtitleLinesChanged(QVariantList{});
         break;
     }
 

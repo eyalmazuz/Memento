@@ -47,6 +47,7 @@
 #include "audio/audiofiles.h"
 #include "audio/audioplayer.h"
 #include "definition/structuredrichtext.h"
+#include "asr/asrcontroller.h"
 #include "dict/dictionary.h"
 #include "dict/dictionarycontroller.h"
 #include "dict/dictionaryinfomodel.h"
@@ -187,6 +188,14 @@ static void registerQmlTypes(Context &context)
     qmlRegisterSingletonInstance<OcrController>(
         MEMENTO_URI, 1, 0, "OcrController",
         new OcrController(context.settings(), &context)
+    );
+
+    /* ASR Types */
+
+    auto *asrController = new AsrController(&context, &context);
+    qmlRegisterSingletonInstance<AsrController>(
+        MEMENTO_URI, 1, 0, "AsrController",
+        asrController
     );
 
     /* Player Types */

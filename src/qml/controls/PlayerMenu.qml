@@ -412,25 +412,125 @@ MenuBar {
             }
 
             checkable: true
-            checked: root.player.state.sid === 0
+            checked: root.player.state.sid === 0 && !AsrController.active
             ActionGroup.group: subtitleTrackGroup
             text: qsTr("None")
-            onTriggered: root.player.controller.setSid(0)
+            onTriggered: {
+                AsrController.stop();
+                root.player.controller.setSid(0);
+            }
+        }
+
+        Instantiator {
+            id: asrSubtitleInstantiator
+
+            model: Features.asr && MementoSettings.asrEnabled ? 1 : 0
+
+            delegate: Action {
+                readonly property bool selected:
+                    AsrController.active &&
+                    root.player.state.sid === AsrController.subtitleTrackId
+
+                function syncChecked() {
+                    if (checked !== selected)
+                    {
+                        checked = selected;
+                    }
+                }
+
+                checkable: true
+                checked: selected
+                enabled: !AsrController.running || AsrController.active
+                text: AsrController.running ?
+                    qsTr("ASR subtitles...") :
+                    qsTr("ASR subtitles")
+                onSelectedChanged: syncChecked()
+                onCheckedChanged: Qt.callLater(syncChecked)
+                Component.onCompleted: syncChecked()
+
+                onTriggered: {
+                    if (selected)
+                    {
+                        AsrController.stop();
+                        syncChecked();
+                        return;
+                    }
+
+                    if (AsrController.active &&
+                        AsrController.subtitleTrackId >= 0)
+                    {
+                        root.player.controller.setSid(
+                            AsrController.subtitleTrackId
+                        );
+                        syncChecked();
+                        return;
+                    }
+
+                    const previousSid = root.player.state.sid;
+                    if (!AsrController.selectedModelAvailable())
+                    {
+                        AsrController.stop();
+                        root.player.controller.setSid(previousSid);
+                        syncChecked();
+                        return;
+                    }
+
+                    AsrController.select(root.player.controller)
+                        .then(function(result) {
+                            if (result.error)
+                            {
+                                if (result.fatal !== false)
+                                {
+                                    AsrController.stop();
+                                    root.player.controller.setSid(previousSid);
+                                }
+                                root.player.controller.showText(result.error);
+                            }
+                            syncChecked();
+                        });
+                    syncChecked();
+                }
+            }
+
+            onObjectAdded: function(index, object) {
+                subtitleMenu.insertAction(subtitleNoneAction.index + index + 1, object);
+
+                /* This is a hack to force a refresh after adding the item.
+                 * For some reason the items are all added with blank text,
+                 * until something causes a visual update. */
+                if (Features.isMacos)
+                {
+                    object.checkable = !object.checkable;
+                    object.checkable = !object.checkable;
+                }
+            }
+            onObjectRemoved: function(index, object) {
+                subtitleMenu.removeAction(object);
+            }
         }
 
         Instantiator {
             model: root.player.state.subtitleTracks
             delegate: Action {
                 checkable: true
-                checked: root.player.state.sid === modelData.id
+                checked: root.player.state.sid === modelData.id &&
+                         !AsrController.active
                 enabled: root.player.state.secondarySid !== modelData.id
                 ActionGroup.group: subtitleTrackGroup
                 text: root.makeTrackName(modelData)
-                onTriggered: root.player.controller.setSid(modelData.id)
+                onTriggered: {
+                    AsrController.stop();
+                    root.player.controller.setSid(modelData.id);
+                }
             }
 
             onObjectAdded: function(index, object) {
-                subtitleMenu.insertAction(subtitleNoneAction.index + index + 1, object);
+                subtitleMenu.insertAction(
+                    subtitleNoneAction.index +
+                    (Features.asr && MementoSettings.asrEnabled ? 1 : 0) +
+                    index + 1,
+                    object
+                );
 
                 /* This is a hack to force a refresh after adding the item.
                  * For some reason the items are all added with blank text,

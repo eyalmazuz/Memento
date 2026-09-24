@@ -39,13 +39,22 @@ class MpvPlayer;
 struct MpvAudioClipArgs
 {
     Q_GADGET
+
+public:
+    enum Preset
+    {
+        Default,
+        WhisperPcm16Wav,
+    };
+    Q_ENUM(Preset)
+
     Q_PROPERTY(double start MEMBER start)
     Q_PROPERTY(double end MEMBER end)
     Q_PROPERTY(bool normalize MEMBER normalize)
     Q_PROPERTY(double db MEMBER db)
     Q_PROPERTY(QString extension MEMBER extension)
+    Q_PROPERTY(Preset preset MEMBER preset)
 
-public:
     /* The start time of the clip */
     double start = 0.0;
 
@@ -58,8 +67,11 @@ public:
     /* The decibels to normalize to */
     double db = -20.0;
 
-    /* The file extension to write to */
+    /* The file extension to write to when using the default preset */
     QString extension = ".aac";
+
+    /* The output preset. Non-default presets can override extension/encoding. */
+    Preset preset = Default;
 };
 
 /**
@@ -163,6 +175,84 @@ public:
      * @param false otherwise.
      */
     Q_INVOKABLE bool loadSubtitle(const QString &file);
+
+    /**
+     * @brief Checks whether this mpv instance supports in-memory subtitles.
+     *
+     * @return true if all required subtitle commands are available.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE bool supportsMemorySubtitles() const;
+
+    /**
+     * @brief Creates and selects an in-memory subtitle track.
+     *
+     * @param title The subtitle track title.
+     * @param language The subtitle track language code.
+     * @return The track ID, or -1 on failure.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE qint64 createSubtitleTrack(
+        const QString &title, const QString &language);
+
+    /**
+     * @brief Adds a cue to an in-memory subtitle track.
+     *
+     * @param trackId The in-memory subtitle track ID.
+     * @param start The cue start time in seconds.
+     * @param end The cue end time in seconds.
+     * @param text The cue text.
+     * @return The cue ID, or -1 on failure.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE qint64 addSubtitle(
+        qint64 trackId, double start, double end, const QString &text);
+
+    /**
+     * @brief Replaces a cue's text and timing.
+     *
+     * @param trackId The in-memory subtitle track ID.
+     * @param cueId The cue ID.
+     * @param start The cue start time in seconds.
+     * @param end The cue end time in seconds.
+     * @param text The cue text.
+     * @return true if the cue was edited, false otherwise.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE bool editSubtitle(
+        qint64 trackId,
+        qint64 cueId,
+        double start,
+        double end,
+        const QString &text);
+
+    /**
+     * @brief Removes a cue from an in-memory subtitle track.
+     *
+     * @param trackId The in-memory subtitle track ID.
+     * @param cueId The cue ID.
+     * @return true if the cue was removed, false otherwise.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE bool removeSubtitle(qint64 trackId, qint64 cueId);
+
+    /**
+     * @brief Removes all cues from an in-memory subtitle track.
+     *
+     * @param trackId The in-memory subtitle track ID.
+     * @return true if the cues were cleared, false otherwise.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE bool clearSubtitles(qint64 trackId);
+
+    /**
+     * @brief Removes an in-memory subtitle track.
+     *
+     * @param trackId The in-memory subtitle track ID.
+     * @return true if the track was removed, false otherwise.
+     */
+    [[nodiscard]]
+    Q_INVOKABLE bool removeSubtitleTrack(qint64 trackId);
 
     /**
      * @brief Seeks to the specified time.

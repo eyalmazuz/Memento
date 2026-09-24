@@ -70,6 +70,11 @@ KeyTracker *Context::keyTracker() const noexcept
     return m_keyTracker;
 }
 
+DownloadManager *Context::downloadManager() const noexcept
+{
+    return m_downloadManager;
+}
+
 MpvPlayer *Context::player() const noexcept
 {
     return m_player;

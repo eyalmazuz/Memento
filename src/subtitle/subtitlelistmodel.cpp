@@ -181,6 +181,50 @@ qsizetype SubtitleListModel::addSubtitle(
     return index;
 }
 
+void SubtitleListModel::removeOverlapping(double start, double end)
+{
+    constexpr double TIME_DELTA = 0.0001;
+
+    if (end <= start)
+    {
+        return;
+    }
+
+    qsizetype row = 0;
+    while (row < static_cast<qsizetype>(m_items.size()))
+    {
+        const SubtitleEntry &item = m_items[row];
+        const bool overlaps =
+            item.start < end - TIME_DELTA &&
+            start + TIME_DELTA < item.end;
+        if (!overlaps)
+        {
+            ++row;
+            continue;
+        }
+
+        const qsizetype first = row;
+        while (row < static_cast<qsizetype>(m_items.size()))
+        {
+            const SubtitleEntry &overlap = m_items[row];
+            if (!(overlap.start < end - TIME_DELTA &&
+                  start + TIME_DELTA < overlap.end))
+            {
+                break;
+            }
+            ++row;
+        }
+
+        beginRemoveRows(QModelIndex(), first, row - 1);
+        m_items.erase(
+            std::next(std::begin(m_items), first),
+            std::next(std::begin(m_items), row)
+        );
+        endRemoveRows();
+        row = first;
+    }
+}
+
 void SubtitleListModel::selectPosition(double position)
 {
     constexpr double TIME_DELTA = 0.0001;

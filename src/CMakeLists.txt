@@ -1,5 +1,6 @@
 # Add subdirectories
 add_subdirectory(anki)
+add_subdirectory(asr)
 add_subdirectory(audio)
 add_subdirectory(constant)
 add_subdirectory(definition)
@@ -84,6 +85,7 @@ qt_add_qml_module(
         qml/definition/TermEntry.qml
         qml/definition/TermGlossary.qml
         qml/definition/TermPitch.qml
+        qml/dialogs/AsrDownloadDialog.qml
         qml/dialogs/UpdateDialog.qml
         qml/Main.qml
         qml/objects/CursorTimer.qml
@@ -91,6 +93,7 @@ qt_add_qml_module(
         qml/options/AnkiIntegrationHelpWindow.qml
         qml/options/AnkiIntegrationPage.qml
         qml/options/ApplicationPage.qml
+        qml/options/AsrPage.qml
         qml/options/AudioSourcesPage.qml
         qml/options/BehaviorPage.qml
         qml/options/DictionaryPage.qml
@@ -136,6 +139,7 @@ target_link_libraries(
     PRIVATE "$<$<BOOL:${MEMENTO_SYSTEM_QCORO}>:QCoro::Qml>"
     PRIVATE "$<$<NOT:$<BOOL:${MEMENTO_SYSTEM_QCORO}>>:QCoro6Qml>"
     PRIVATE anki
+    PRIVATE asrtranscriber
     PRIVATE audiofiles
     PRIVATE audioplayer
     PRIVATE clipboard

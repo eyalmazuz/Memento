@@ -8,6 +8,8 @@ project(
     LANGUAGES C CXX
 )
 
+include(CTest)
+
 if(APPLE)
     enable_language(OBJCXX)
 endif()
@@ -69,6 +71,7 @@ list(
 	"$<$<BOOL:${MEMENTO_SYSTEM_QCORO}>:-DMEMENTO_SYSTEM_QCORO=1>"
 	"$<$<BOOL:${MEMENTO_WARN_UNSUPPORTED_CSS}>:-DMEMENTO_WARN_UNSUPPORTED_CSS=1>"
 	"$<$<BOOL:${MEMENTO_WERROR}>:-Werror>"
+	"$<$<BOOL:${MEMENTO_WHISPER_SUPPORT}>:-DMEMENTO_WHISPER_SUPPORT=1>"
 )
 if(MEMENTO_ASAN)
 	add_link_options(-fsanitize=address)
@@ -189,4 +192,5 @@ endif()
 
 add_subdirectory(extern)
 add_subdirectory(src)
+add_subdirectory(tests)
 add_subdirectory(res)

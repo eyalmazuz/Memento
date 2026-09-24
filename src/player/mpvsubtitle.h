@@ -64,6 +64,8 @@ class MpvSubtitle : public QObject
         NOTIFY visibleChanged
     )
 
+    Q_PROPERTY(double speed READ speed WRITE setSpeed NOTIFY speedChanged)
+
 public:
     MpvSubtitle(QObject *parent = nullptr);
     virtual ~MpvSubtitle() = default;
@@ -128,6 +130,18 @@ public:
      */
     void setDelay(double value);
 
+    /** @brief Gets the subtitle timeline speed multiplier. */
+    double speed() const noexcept;
+
+    /** @brief Sets a finite, positive subtitle speed multiplier. */
+    void setSpeed(double value);
+
+    /** @brief Converts a raw cue time to the media playback timeline. */
+    double playbackTime(double rawTime) const noexcept;
+
+    /** @brief Converts a media playback time to the raw cue timeline. */
+    double rawTime(double playbackTime) const noexcept;
+
     /**
      * @brief Gets if the subtitle is visible.
      *
@@ -173,6 +187,9 @@ signals:
      */
     void delayChanged(double value);
 
+    /** @brief Emitted when the subtitle speed multiplier changes. */
+    void speedChanged(double value);
+
     /**
      * @brief Emitted when the subtitle visibility changed.
      *
@@ -192,6 +209,9 @@ private:
 
     /* The delay of the subtitle in seconds */
     double m_delay{0};
+
+    /* The subtitle timeline speed multiplier */
+    double m_speed{1};
 
     /* The visibility of the subtitles */
     bool m_visible{false};

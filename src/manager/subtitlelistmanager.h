@@ -22,6 +22,10 @@
 
 #include <QObject>
 
+#include <QHash>
+#include <QSet>
+#include <QVariant>
+
 #include <memory>
 
 #ifdef MEMENTO_SYSTEM_QCORO
@@ -89,10 +93,17 @@ private slots:
     void handleSecondarySubtitleChanged();
 
     /**
+     * @brief Replace the selected in-memory subtitle list from an mpv snapshot.
+     *
+     * @param lines The copied cue maps from mpv's sub-lines property.
+     */
+    void handlePrimarySubtitleLinesChanged(const QVariantList &lines);
+
+    /**
      * @brief Add and select a subtitle.
      *
      * @param model The model to update.
-     * @param subtitle The subtitle to add.
+     * @param subtitle The mpv subtitle to add.
      * @param position The current player position without delay.
      */
     void addSubtitle(
@@ -117,6 +128,12 @@ private:
     /* The subtitle parser */
     std::unique_ptr<SubtitleParser> m_subtitleParser;
 
-    /* The subtitle list models */
-    QList<SubtitleListModel *> m_models;
+    /* Subtitle list models keyed by their mpv track IDs */
+    QHash<qint64, SubtitleListModel *> m_models;
+
+    /* External subtitle paths keyed by their mpv track IDs */
+    QHash<qint64, QString> m_externalPaths;
+
+    /* Track IDs confirmed to expose in-memory subtitle cues */
+    QSet<qint64> m_memoryTrackIds;
 };
