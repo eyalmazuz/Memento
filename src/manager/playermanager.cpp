@@ -122,6 +122,8 @@ void PlayerManager::handleAutoPause()
 
     if (m_autoPauseData.lastEndTime == endTime)
     {
+        m_autoPauseData.startTime = 0;
+        m_autoPauseData.endTime = 0;
         return;
     }
 
@@ -167,7 +169,7 @@ void PlayerManager::handleAutoPause()
     m_context->player()->controller()->seek(idealSeekTime);
 
     m_autoPauseData.lastEndTime = m_autoPauseData.endTime;
-    m_autoPauseData.startTime = startTime;
-    m_autoPauseData.endTime = endTime;
-    m_autoPauseData.alreadyPaused = true;
+    m_autoPauseData.startTime = 0;
+    m_autoPauseData.endTime = 0;
+    m_autoPauseData.alreadyPaused = false;
 }

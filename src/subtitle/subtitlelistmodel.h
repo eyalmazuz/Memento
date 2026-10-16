@@ -133,8 +133,12 @@ public:
      * subtitles that don't overlap.
      *
      * @param position The position to test.
+     * @param scrollToPosition true to emit positionSelected to scroll the view.
      */
-    Q_INVOKABLE void selectPosition(double position);
+    Q_INVOKABLE void selectPosition(
+        double position,
+        bool scrollToPosition = true
+    );
 
     /**
      * @brief Get a list of rows that contain a search string.

@@ -282,7 +282,8 @@ void SubtitleListManager::handlePrimarySubtitleLinesChanged(
 
     model->setItems(std::move(items));
     model->selectPosition(
-        state->subtitle()->rawTime(state->timePosition())
+        state->subtitle()->rawTime(state->timePosition()),
+        false
     );
 }
 

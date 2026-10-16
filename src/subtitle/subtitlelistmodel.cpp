@@ -225,7 +225,7 @@ void SubtitleListModel::removeOverlapping(double start, double end)
     }
 }
 
-void SubtitleListModel::selectPosition(double position)
+void SubtitleListModel::selectPosition(double position, bool scrollToPosition)
 {
     constexpr double TIME_DELTA = 0.0001;
 
@@ -251,9 +251,12 @@ void SubtitleListModel::selectPosition(double position)
         m_selectionModel->setCurrentIndex(
             selectedIndices.front(), QItemSelectionModel::NoUpdate
         );
-        emit positionSelected(
-            selectedIndices.front().row(), selectedIndices.back().row()
-        );
+        if (scrollToPosition)
+        {
+            emit positionSelected(
+                selectedIndices.front().row(), selectedIndices.back().row()
+            );
+        }
     }
 }
 
@@ -300,11 +303,72 @@ void SubtitleListModel::clear()
 
 void SubtitleListModel::setItems(std::vector<SubtitleEntry> &&items)
 {
-    m_selectionModel->clear();
+    constexpr double TIME_DELTA = 0.0001;
+    const auto sameEntry = [](const SubtitleEntry &lhs, const SubtitleEntry &rhs)
+    {
+        return std::abs(lhs.start - rhs.start) <= TIME_DELTA &&
+               std::abs(lhs.end - rhs.end) <= TIME_DELTA &&
+               lhs.text == rhs.text;
+    };
+
     m_blockAdds = true;
-    beginResetModel();
-    m_items = std::move(items);
-    endResetModel();
+
+    size_t prefix = 0;
+    const size_t minSize = std::min(m_items.size(), items.size());
+    while (prefix < minSize && sameEntry(m_items[prefix], items[prefix]))
+    {
+        ++prefix;
+    }
+
+    size_t suffix = 0;
+    while (suffix < (minSize - prefix) &&
+           sameEntry(
+               m_items[m_items.size() - 1 - suffix],
+               items[items.size() - 1 - suffix]
+           ))
+    {
+        ++suffix;
+    }
+
+    const size_t oldMidCount = m_items.size() - prefix - suffix;
+    const size_t newMidCount = items.size() - prefix - suffix;
+    if (oldMidCount == 0 && newMidCount == 0)
+    {
+        return;
+    }
+
+    if (oldMidCount > 0)
+    {
+        beginRemoveRows(
+            QModelIndex(),
+            static_cast<int>(prefix),
+            static_cast<int>(prefix + oldMidCount - 1)
+        );
+        m_items.erase(
+            m_items.begin() + static_cast<std::ptrdiff_t>(prefix),
+            m_items.begin() + static_cast<std::ptrdiff_t>(prefix + oldMidCount)
+        );
+        endRemoveRows();
+    }
+
+    if (newMidCount > 0)
+    {
+        beginInsertRows(
+            QModelIndex(),
+            static_cast<int>(prefix),
+            static_cast<int>(prefix + newMidCount - 1)
+        );
+        m_items.insert(
+            m_items.begin() + static_cast<std::ptrdiff_t>(prefix),
+            std::make_move_iterator(
+                items.begin() + static_cast<std::ptrdiff_t>(prefix)
+            ),
+            std::make_move_iterator(
+                items.begin() + static_cast<std::ptrdiff_t>(prefix + newMidCount)
+            )
+        );
+        endInsertRows();
+    }
 }
 
 const std::vector<SubtitleEntry> &SubtitleListModel::items() const noexcept

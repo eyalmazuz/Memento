@@ -72,7 +72,7 @@ private:
         bool reset{false};
 
         /* The end time of the previous subtitle to pause to */
-        double lastEndTime{0};
+        double lastEndTime{-1};
 
         /* The start time of the subtitle to pause to */
         double startTime{0};
