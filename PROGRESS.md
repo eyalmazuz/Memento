@@ -258,6 +258,9 @@ This log tracks milestones, audits, code changes, and verification for issue #17
 - **Auto-Pause & Subtitle List Fixes**:
   - `PlayerManager` (`playermanager.h/.cpp`): Initialized `AutoPauseData::lastEndTime` to `-1` and reset `startTime = 0; endTime = 0;` on pause and on matching `lastEndTime` so pause-on-subtitle-end never skips audio or prematurely seeks to subsequent subtitle ends.
   - `SubtitleListModel` & `SubtitleListManager` (`subtitlelistmodel.h/.cpp`, `subtitlelistmanager.cpp`): Converted `SubtitleListModel::setItems` from `beginResetModel()` to incremental `beginInsertRows()` / `beginRemoveRows()` row diffing and added `scrollToPosition = false` when ingesting background `sub-lines` updates so user scrolling in `SubtitleList.qml` is not interrupted or reset while ASR is actively transcribing.
+- **Prebuilt libmpv SDK via FetchContent**:
+  - Hosted Linux x86_64 SDK release asset (`v2.5.0-subtitles-15d25e0f`) on `eyalmazuz/mpv`.
+  - Updated `cmake/Findmpv.cmake` and `option/CMakeLists.txt` (`MEMENTO_SYSTEM_MPV` and `MPV_SDK`) so Memento automatically downloads, extracts, and links the patched `libmpv` with embedded rpath whenever an explicit SDK is not supplied, eliminating manual `PKG_CONFIG_PATH` / `LD_LIBRARY_PATH` requirements.
 - **Verification**:
   - Configured and built `build-full-release` with `-DASR_BACKENDS="whisper;onnx"`.
   - Added `onnx_asr_unit_test` verifying 128-mel and 80-mel `MelFrontend`, `OnnxTokenizer`, `OnnxModelConfig` for both `cohere_asr` and `parakeet_ctc`, and end-to-end `OnnxSession::transcribe` inference against `kitsune-transcribe-t0.6b-ja`.

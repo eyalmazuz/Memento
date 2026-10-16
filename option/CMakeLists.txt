@@ -14,6 +14,8 @@ option(MEMENTO_WARN_UNSUPPORTED_CSS "Enable log messages for unsupported CSS" OF
 # Use Local System Libraries
 option(MEMENTO_SYSTEM_MOCR "Use the local installation of libmocr instead of FetchContent" OFF)
 option(MEMENTO_SYSTEM_QCORO "Use the local installation of QCoro instead of FetchContent" OFF)
+option(MEMENTO_SYSTEM_MPV "Use the local installation of libmpv instead of FetchContent" OFF)
+set(MPV_SDK "" CACHE PATH "Optional path to a local libmpv SDK prefix")
 
 # Features
 option(MEMENTO_OCR_SUPPORT "Support for OCR through MangaOCR" OFF)
