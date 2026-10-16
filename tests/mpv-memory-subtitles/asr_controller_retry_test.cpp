@@ -46,6 +46,7 @@
 #include "util/directoryutils.h"
 
 static std::atomic_int retryWarningCount{0};
+static std::atomic_int flashAttentionFallbackCount{0};
 
 /**
  * @brief Initialize and release Memento's dictionary DB around Context.
@@ -85,6 +86,12 @@ static void count_retry_warnings(
     if (message.startsWith(QStringLiteral("ASR transcription failed")))
     {
         retryWarningCount.fetch_add(1);
+    }
+    if (message.startsWith(QStringLiteral(
+        "Whisper transcription failed with flash attention;"
+    )))
+    {
+        flashAttentionFallbackCount.fetch_add(1);
     }
     if (type >= QtWarningMsg)
     {
@@ -150,11 +157,11 @@ static bool wait_until(
 }
 
 /**
- * @brief Run the controller decode-failure and playback-reactivation check.
+ * @brief Run controller extraction-seek, failure, and settings checks.
  *
  * @param argc The argument count.
  * @param argv The generated media path is passed as the first argument.
- * @return EXIT_SUCCESS if terminal failure does not restart on position ticks.
+ * @return EXIT_SUCCESS if seek and settings changes recover as expected.
  */
 int main(int argc, char **argv)
 {
@@ -372,14 +379,40 @@ int main(int argc, char **argv)
         }
     );
 
+    const QStringList wavFilesBeforeAsr = tempDirectory.entryList(
+        QStringList{QStringLiteral("*.wav")},
+        QDir::Files,
+        QDir::Name
+    );
     QCoro::QmlTask selection = asr.select(mpvController);
     QCoro::QmlTaskListener *selectionResult = selection.await();
+    QStringList wavFilesDuringAsr;
+    if (selectionResult == nullptr || !wait_until([&]
+    {
+        wavFilesDuringAsr = tempDirectory.entryList(
+            QStringList{QStringLiteral("*.wav")},
+            QDir::Files,
+            QDir::Name
+        );
+        return asr.running() &&
+            wavFilesDuringAsr.size() > wavFilesBeforeAsr.size();
+    }, 10000))
+    {
+        asr.stop();
+        std::fprintf(
+            stderr,
+            "ASR audio extraction did not become observable\n"
+        );
+        return 1;
+    }
+    mpvController->seek(10.0);
     if (selectionResult == nullptr ||
         !wait_until([selectionResult]
         {
             return selectionResult->value().isValid();
-        }))
+        }, 10000))
     {
+        asr.stop();
         std::fprintf(stderr, "ASR selection did not complete\n");
         return 1;
     }
@@ -392,13 +425,16 @@ int main(int argc, char **argv)
     );
     if (result.value("fatal").toBool() ||
         !error.contains(QStringLiteral(
-            "paused after repeated decode failures"
+            "paused after repeated failures"
         )) ||
-        initialRetryWarnings != 2 || transcriptionStarts != 1 || asr.running())
+        error.contains(QStringLiteral("decode failures")) ||
+        initialRetryWarnings != 2 || transcriptionStarts != 1 ||
+        asr.running() || !asr.active())
     {
         std::fprintf(
             stderr,
-            "Expected one terminal controller failure; "
+            "Expected extraction seek recovery followed by one terminal "
+            "controller failure; "
             "starts=%d warnings=%d error=%s\n",
             transcriptionStarts,
             initialRetryWarnings,
@@ -530,7 +566,6 @@ int main(int argc, char **argv)
         );
         return 1;
     }
-    asr.stop();
     if (transcriptionStarts != startsBeforeSeek + 1 ||
         retryWarningCount.load() != warningsBeforeSeek + 2)
     {
@@ -545,6 +580,120 @@ int main(int argc, char **argv)
         );
         return 1;
     }
+
+    const int startsBeforeRegexChange = transcriptionStarts;
+    const int warningsBeforeRegexChange = retryWarningCount.load();
+    settings->setWhisperSuppressRegex(QStringLiteral("^active_change$"));
+    if (!wait_until([&]
+    {
+        return transcriptionStarts > startsBeforeRegexChange &&
+            !asr.running() &&
+            retryWarningCount.load() >= warningsBeforeRegexChange + 2;
+    }, 10000) ||
+        transcriptionStarts != startsBeforeRegexChange + 1 ||
+        retryWarningCount.load() != warningsBeforeRegexChange + 2 ||
+        !asr.active())
+    {
+        std::fprintf(
+            stderr,
+            "Active suppress-regex change did not reconfigure ASR "
+            "(starts=%d->%d, warnings=%d->%d, active=%d)\n",
+            startsBeforeRegexChange,
+            transcriptionStarts,
+            warningsBeforeRegexChange,
+            retryWarningCount.load(),
+            asr.active()
+        );
+        return 1;
+    }
+
+    asr.stop();
+    const qint64 retainedTrackId = mpvController->createSubtitleTrack(
+        QStringLiteral("retained test track"),
+        QStringLiteral("ja")
+    );
+    const qint64 retainedCueId = mpvController->addSubtitle(
+        retainedTrackId,
+        0.0,
+        player.state()->duration(),
+        QStringLiteral("retained visible cue")
+    );
+    if (retainedTrackId < 0 || retainedCueId < 0 ||
+        !wait_until([&]
+        {
+            return player.state()->sid() == retainedTrackId &&
+                player.state()->subtitle() != nullptr &&
+                player.state()->subtitle()->text() ==
+                    QStringLiteral("retained visible cue");
+        }))
+    {
+        std::fprintf(stderr, "Could not create retained subtitle cue\n");
+        return 1;
+    }
+
+    const int startsBeforeInactiveChange = transcriptionStarts;
+    const int warningsBeforeInactiveChange = retryWarningCount.load();
+    settings->setWhisperSuppressRegex(QStringLiteral("^inactive_change$"));
+    settings->setWhisperFlashAttention(true);
+    QElapsedTimer inactiveChangeTimer;
+    inactiveChangeTimer.start();
+    while (inactiveChangeTimer.elapsed() < 100)
+    {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(5);
+    }
+    if (asr.active() || asr.running() ||
+        transcriptionStarts != startsBeforeInactiveChange ||
+        retryWarningCount.load() != warningsBeforeInactiveChange ||
+        player.state()->sid() != retainedTrackId ||
+        player.state()->subtitle() == nullptr ||
+        player.state()->subtitle()->text() !=
+            QStringLiteral("retained visible cue"))
+    {
+        std::fprintf(
+            stderr,
+            "Inactive setting change restarted ASR or altered visible "
+            "subtitles\n"
+        );
+        return 1;
+    }
+
+    const int startsBeforeManualSelect = transcriptionStarts;
+    const int warningsBeforeManualSelect = retryWarningCount.load();
+    const int flashFallbacksBeforeManualSelect =
+        flashAttentionFallbackCount.load();
+    QCoro::QmlTask manualSelection = asr.select(mpvController);
+    QCoro::QmlTaskListener *manualSelectionResult = manualSelection.await();
+    if (manualSelectionResult == nullptr ||
+        !wait_until([manualSelectionResult]
+        {
+            return manualSelectionResult->value().isValid();
+        }, 10000) ||
+        transcriptionStarts != startsBeforeManualSelect + 1 ||
+        retryWarningCount.load() != warningsBeforeManualSelect + 2 ||
+        flashAttentionFallbackCount.load() !=
+            flashFallbacksBeforeManualSelect + 1)
+    {
+        std::fprintf(
+            stderr,
+            "Inactive settings were not used by the next selection "
+            "(starts=%d->%d, retries=%d->%d, flash-fallbacks=%d->%d)\n",
+            startsBeforeManualSelect,
+            transcriptionStarts,
+            warningsBeforeManualSelect,
+            retryWarningCount.load(),
+            flashFallbacksBeforeManualSelect,
+            flashAttentionFallbackCount.load()
+        );
+        return 1;
+    }
+    asr.stop();
+    if (!mpvController->removeSubtitleTrack(retainedTrackId))
+    {
+        std::fprintf(stderr, "Could not remove retained subtitle track\n");
+        return 1;
+    }
+
     if (heartbeatCount < 10)
     {
         std::fprintf(
@@ -570,15 +719,17 @@ int main(int argc, char **argv)
     {
         std::fprintf(
             stderr,
-            "Controller omitted the decode cause from its result: %s\n",
+            "Controller omitted the failure cause from its result: %s\n",
             qPrintable(error)
         );
         return 1;
     }
 
     std::puts(
-        "PASS: terminal failure ignores delayed high-speed playback and "
-        "retries only after explicit seek; WAV cancellation cleans up"
+        "PASS: extraction seeks recover, terminal failures ignore delayed "
+        "playback, active regex changes reconfigure, inactive settings are "
+        "cached without touching visible subtitles, and WAV cancellation "
+        "cleans up"
     );
     return 0;
 }

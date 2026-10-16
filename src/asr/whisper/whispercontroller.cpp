@@ -125,6 +125,12 @@ WhisperController::WhisperController(Context *context, QObject *parent) :
         this,
         notifyConfigurationChanged
     );
+    connect(
+        settings,
+        &Settings::whisperSuppressRegexChanged,
+        this,
+        notifyConfigurationChanged
+    );
 }
 
 WhisperController::~WhisperController() = default;
