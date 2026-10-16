@@ -13,7 +13,7 @@ set(_mpv_custom_hints
     $ENV{MPV_ROOT}
 )
 
-if(NOT MEMENTO_SYSTEM_MPV)
+if(MEMENTO_ASR_MPV OR MEMENTO_PATCHED_MPV OR _mpv_custom_hints)
     if(_mpv_custom_hints)
         find_library(
             mpv_LIBRARY

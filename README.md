@@ -116,6 +116,8 @@ your system.
     * With either ipadic or NAIST-jdic installed as a system dictionary on Linux and macOS.
 * [libmocr](https://github.com/ripose-jp/libmocr) (Optional)
     * Use `-DMEMENTO_OCR_SUPPORT=ON` and `-DMEMENTO_SYSTEM_MOCR=ON`
+* In-Memory Subtitle Patched libmpv / ASR (Optional)
+    * Use `-DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON`
 
 For the best experience, install [Noto Sans CJK JP](https://github.com/googlefonts/noto-cjk/raw/main/Sans/Variable/TTF/NotoSansCJKjp-VF.ttf)
 and the [Kanji Stroke Order](https://drive.google.com/uc?export=download&id=1oyQoTB531tbhlYaOW7ugvutXZ7HSlJfW) fonts.
@@ -235,6 +237,58 @@ If you want to use a venv, make sure to configure the build with these additiona
 ```
 
 **Note:** If using `-DMEMENTO_SYSTEM_MOCR=ON`, make sure that the installed libmocr binary links to your preferred venv by building libmocr using the same `-DPython_` options.
+
+Follow the normal build instructions from here.
+
+### Adding ASR Support
+
+Memento supports automatic speech recognition (ASR) to transcribe spoken dialogue in video media directly into subtitles.
+
+ASR generates subtitles in real time into an in-memory subtitle track, allowing speech-to-text subtitles to be interacted with, looked up with Yomitan, and timed with audio without creating temporary subtitle files on disk.
+
+#### Patched libmpv Requirement
+
+Because standard upstream mpv does not yet provide in-memory subtitle track manipulation commands (`sub-create`, `add-subtitle`, `edit-subtitle`, `remove-subtitle`, `clear-subtitles`, `sub-remove`), **ASR requires a patched build of `libmpv`**.
+
+When building with `-DMEMENTO_ASR_MPV=ON` on Linux x86_64, CMake automatically downloads and links a prebuilt patched `libmpv` SDK from GitHub releases:
+```
+cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON
+```
+
+If you compiled your own custom patched `libmpv` from the [mpv fork](https://github.com/eyalmazuz/mpv/tree/feat/in-memory-subtitles), you can point CMake directly to your installation prefix instead:
+```
+cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMPV_SDK=/path/to/mpv-sdk
+```
+
+> **Note:** Enabling `-DMEMENTO_ASR_SUPPORT=ON` without `-DMEMENTO_ASR_MPV=ON` (or `-DMPV_SDK=...`) will produce a configuration error. If you want to build standard Memento like upstream without ASR or patched mpv, omit `-DMEMENTO_ASR_SUPPORT` (it is disabled by default).
+
+#### ASR Backends
+
+Memento supports multiple inference engines configured via `-DASR_BACKENDS="..."`:
+
+1. **Whisper (whisper.cpp - default)**:
+   Enabled by default when ASR is enabled. Whisper.cpp is downloaded and built automatically via CMake `FetchContent`.
+   ```
+   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="whisper"
+   ```
+   - **Hardware Acceleration Options**:
+     - NVIDIA CUDA: `-DMEMENTO_WHISPER_CUDA=ON` (optionally set `-DMEMENTO_WHISPER_CUDA_ARCHITECTURES="75"` or your GPU compute capability)
+     - Vulkan: `-DMEMENTO_WHISPER_VULKAN=ON`
+     - BLAS: `-DMEMENTO_WHISPER_BLAS=ON`
+
+2. **ONNX Runtime (Kitsune / Cohere Transcribe / Parakeet CTC)**:
+   Supports HuggingFace ONNX-based speech models. On Linux x86_64, prebuilt ONNX Runtime binaries are fetched automatically.
+   ```
+   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="onnx"
+   ```
+   - For GPU acceleration with ONNX Runtime: `-DMEMENTO_ONNX_CUDA=ON`
+   - To link against an existing local ONNX Runtime installation: `-DONNXRUNTIME_ROOT=/path/to/onnxruntime`
+
+3. **Multi-Backend**:
+   Both Whisper and ONNX backends can be built into the same binary:
+   ```
+   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="whisper;onnx"
+   ```
 
 Follow the normal build instructions from here.
 

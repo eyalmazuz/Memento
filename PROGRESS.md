@@ -260,8 +260,22 @@ This log tracks milestones, audits, code changes, and verification for issue #17
   - `SubtitleListModel` & `SubtitleListManager` (`subtitlelistmodel.h/.cpp`, `subtitlelistmanager.cpp`): Converted `SubtitleListModel::setItems` from `beginResetModel()` to incremental `beginInsertRows()` / `beginRemoveRows()` row diffing and added `scrollToPosition = false` when ingesting background `sub-lines` updates so user scrolling in `SubtitleList.qml` is not interrupted or reset while ASR is actively transcribing.
 - **Prebuilt libmpv SDK via FetchContent**:
   - Hosted Linux x86_64 SDK release asset (`v2.5.0-subtitles-15d25e0f`) on `eyalmazuz/mpv`.
-  - Updated `cmake/Findmpv.cmake` and `option/CMakeLists.txt` (`MEMENTO_SYSTEM_MPV` and `MPV_SDK`) so Memento automatically downloads, extracts, and links the patched `libmpv` with embedded rpath whenever an explicit SDK is not supplied, eliminating manual `PKG_CONFIG_PATH` / `LD_LIBRARY_PATH` requirements.
 - **Verification**:
   - Configured and built `build-full-release` with `-DASR_BACKENDS="whisper;onnx"`.
   - Added `onnx_asr_unit_test` verifying 128-mel and 80-mel `MelFrontend`, `OnnxTokenizer`, `OnnxModelConfig` for both `cohere_asr` and `parakeet_ctc`, and end-to-end `OnnxSession::transcribe` inference against `kitsune-transcribe-t0.6b-ja`.
   - `ctest -V --test-dir build-full-release --output-on-failure`: `2/2` tests passed (`mpv-memory-subtitles` and `onnx-asr-unit-test`).
+
+### Entry 20: Opt-in Patched libmpv & CMake Guard for ASR Transcription (2026-10-16)
+- **Standard System `libmpv` by Default**:
+  - Replaced the opt-out `MEMENTO_SYSTEM_MPV` flag with an explicit opt-in model. Compiling Memento defaults to system `libmpv` (`find_package(mpv)`) with zero automatic downloads or SDK fetching, matching upstream Memento behavior.
+- **ASR & Patched libmpv Alignment**:
+  - Made `MEMENTO_ASR_SUPPORT` default to `OFF` (matching `MEMENTO_OCR_SUPPORT` and `MEMENTO_MECAB_SUPPORT`).
+  - Added `-DMEMENTO_ASR_MPV=ON` (with `-DMEMENTO_PATCHED_MPV=ON` as an alias) and `-DMPV_SDK=<path>`.
+  - Added CMake error check in `option/CMakeLists.txt`: enabling ASR (`-DMEMENTO_ASR_SUPPORT=ON`, `-DASR_BACKENDS=...`, or individual backend flags) without `-DMEMENTO_ASR_MPV=ON` or `-DMPV_SDK=...` immediately produces a `FATAL_ERROR` explaining that ASR requires the patched `libmpv` SDK.
+- **README Documentation**:
+  - Added optional patched `libmpv` / ASR entry under `Dependencies`.
+  - Added a comprehensive `Adding ASR Support` section to `README.md` modeled after `Adding OCR Support`, explaining the in-memory subtitle requirement, CMake configuration flags, backends (`whisper`, `onnx`, multi-backend), and GPU acceleration options (`CUDA`, `Vulkan`, `BLAS`).
+- **Verification**:
+  - Tested default build (`cmake -B build`): successfully configured and built with system `libmpv` (`/usr/lib/libmpv.so.2`) and ASR disabled.
+  - Tested invalid build (`-DMEMENTO_ASR_SUPPORT=ON` without `-DMEMENTO_ASR_MPV=ON`): aborted with expected `FATAL_ERROR`.
+  - Tested ASR opt-in build (`-DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON`): successfully fetched patched `libmpv` SDK, compiled Whisper backend, and linked `libmpv.so.2` with embedded rpath.
