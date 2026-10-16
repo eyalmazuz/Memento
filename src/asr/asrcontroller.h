@@ -47,6 +47,7 @@ class Context;
 class MpvController;
 class DownloadManager;
 class WhisperController;
+class OnnxController;
 
 /**
  * @brief QML interface coordinating multiple ASR backends and model downloading.
@@ -275,6 +276,7 @@ private:
     Context *m_context{nullptr};
     DownloadManager *m_downloader{nullptr};
     WhisperController *m_whisperController{nullptr};
+    OnnxController *m_onnxController{nullptr};
     /* Backend retained by in-flight transcription futures. */
     std::shared_ptr<AsrBackend> m_backend;
 
@@ -302,6 +304,7 @@ private:
     QString m_currentText;
 
     std::shared_ptr<std::atomic_bool> m_abort;
+    int m_flightGeneration{0};
     int m_generation{0};
     int m_segmentGeneration{0};
     int m_selectGeneration{0};

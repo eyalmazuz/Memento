@@ -467,7 +467,12 @@ namespace Keys
 
         constexpr const char *BACKEND = "backend";
         constexpr const char *BACKEND_WHISPER = "whisper";
+        constexpr const char *BACKEND_ONNX = "onnx";
+#if !defined(HAVE_ASR_BACKEND_WHISPER) && defined(HAVE_ASR_BACKEND_ONNX)
+        constexpr const char *BACKEND_DEFAULT = BACKEND_ONNX;
+#else
         constexpr const char *BACKEND_DEFAULT = BACKEND_WHISPER;
+#endif
     }
 
     namespace Whisper
@@ -509,5 +514,28 @@ namespace Keys
 
         constexpr const char *SUPPRESS_REGEX = "suppress-regex";
         constexpr const char *SUPPRESS_REGEX_DEFAULT = "^\\[_extra_token_[0-9]+\\]$";
+    }
+
+    namespace Onnx
+    {
+        constexpr const char *GROUP = "onnx";
+
+        constexpr const char *MODEL = "model";
+        constexpr const char *MODEL_DEFAULT = "kitsune-transcribe-t0.6b-ja";
+
+        constexpr const char *CUSTOM_MODEL = "custom-model";
+        constexpr const char *CUSTOM_MODEL_DEFAULT = "";
+
+        constexpr const char *USE_GPU = "use-gpu";
+        constexpr bool USE_GPU_DEFAULT = false;
+
+        constexpr const char *GPU_DEVICE = "gpu-device";
+        constexpr int GPU_DEVICE_DEFAULT = 0;
+
+        constexpr const char *THREADS = "threads";
+        constexpr int THREADS_DEFAULT = 0;
+
+        constexpr const char *PUNCTUATION = "punctuation";
+        constexpr bool PUNCTUATION_DEFAULT = true;
     }
 }

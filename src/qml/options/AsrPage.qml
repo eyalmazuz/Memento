@@ -15,6 +15,10 @@ Page {
         {
             options.push({ label: qsTr("Whisper"), value: "whisper" });
         }
+        if (Features.asrOnnx)
+        {
+            options.push({ label: qsTr("ONNX Runtime"), value: "onnx" });
+        }
         return options;
     }
     readonly property var whisperModelOptions: [
@@ -24,6 +28,11 @@ Page {
         "medium",
         "large-v3",
         "large-v3-turbo",
+        "custom",
+    ]
+    readonly property var onnxModelOptions: [
+        "kitsune-transcribe-t0.6b-ja",
+        "kitsune-transcribe-p0.3b-ja",
         "custom",
     ]
     readonly property var numericOptions: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
@@ -127,17 +136,20 @@ Page {
             onApplied: {
                 MementoSettings.writeAsrSettings();
                 MementoSettings.writeWhisperSettings();
+                MementoSettings.writeOnnxSettings();
             }
             onClicked: function(button) {
                 if (button === standardButton(DialogButtonBox.Reset))
                 {
                     MementoSettings.loadAsrSettings();
                     MementoSettings.loadWhisperSettings();
+                    MementoSettings.loadOnnxSettings();
                 }
                 else if (button === standardButton(DialogButtonBox.RestoreDefaults))
                 {
                     MementoSettings.defaultAsrSettings();
                     MementoSettings.defaultWhisperSettings();
+                    MementoSettings.defaultOnnxSettings();
                 }
             }
         }
@@ -185,8 +197,21 @@ Page {
                             currentIndex: root.backendIndex(
                                 MementoSettings.asrBackend
                             )
-                            onActivated: MementoSettings.asrBackend =
-                                currentValue
+                            onActivated: {
+                                MementoSettings.asrBackend = currentValue;
+                                if (currentValue === "onnx")
+                                {
+                                    root.maybePromptModelDownload(
+                                        MementoSettings.onnxModel
+                                    );
+                                }
+                                else if (currentValue === "whisper")
+                                {
+                                    root.maybePromptModelDownload(
+                                        MementoSettings.whisperModel
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -425,11 +450,128 @@ Page {
                         TextField {
                             Layout.alignment: Qt.AlignRight
                             Layout.preferredWidth: 250
-                            placeholderText: "^\\\\[_extra_token_[0-9]+\\\\]$"
+                            placeholderText: "^\\[_extra_token_[0-9]+\\]$"
                             text: MementoSettings.whisperSuppressRegex
                             onEditingFinished: {
                                 MementoSettings.whisperSuppressRegex = text;
                             }
+                        }
+                    }
+
+                    Label {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Layout.fillWidth: true
+                        text: qsTr("ONNX Runtime")
+                        font.bold: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Use GPU")
+                        }
+                        Switch {
+                            Layout.alignment: Qt.AlignRight
+                            checked: MementoSettings.onnxUseGpu
+                            onClicked: MementoSettings.onnxUseGpu = checked
+                        }
+                    }
+
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Layout.fillWidth: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Model")
+                        }
+                        ComboBox {
+                            Layout.alignment: Qt.AlignRight
+                            Layout.preferredWidth: 250
+                            model: root.onnxModelOptions
+                            currentIndex: Math.max(
+                                0,
+                                root.onnxModelOptions.indexOf(
+                                    MementoSettings.onnxModel
+                                )
+                            )
+                            onActivated: {
+                                MementoSettings.onnxModel = currentValue;
+                                root.maybePromptModelDownload(currentValue);
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "onnx" &&
+                            MementoSettings.onnxModel === "custom"
+                        Layout.fillWidth: true
+
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Custom model")
+                        }
+                        TextField {
+                            Layout.alignment: Qt.AlignRight
+                            Layout.preferredWidth: 250
+                            placeholderText: qsTr("Model directory path")
+                            text: MementoSettings.onnxCustomModel
+                            onEditingFinished: {
+                                MementoSettings.onnxCustomModel = text;
+                            }
+                        }
+                    }
+
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Layout.fillWidth: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Punctuation")
+                        }
+                        Switch {
+                            Layout.alignment: Qt.AlignRight
+                            checked: MementoSettings.onnxPunctuation
+                            onClicked: MementoSettings.onnxPunctuation = checked
+                        }
+                    }
+
+                    SettingsBoxSeparator {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Layout.fillWidth: true
+                    }
+
+                    RowLayout {
+                        visible: MementoSettings.asrBackend === "onnx"
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.alignment: Qt.AlignLeft
+                            text: qsTr("Threads")
+                        }
+                        ComboBox {
+                            Layout.alignment: Qt.AlignRight
+                            Layout.preferredWidth: 250
+                            model: root.threadOptions
+                            currentIndex: Math.max(
+                                0,
+                                root.threadOptions.indexOf(
+                                    MementoSettings.onnxThreads
+                                )
+                            )
+                            onActivated: MementoSettings.onnxThreads =
+                                currentValue
                         }
                     }
                 }

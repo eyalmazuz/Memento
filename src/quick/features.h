@@ -120,6 +120,12 @@ class Features : public QObject
     )
 
     Q_PROPERTY(
+        bool asrOnnx
+        READ asrOnnx
+        CONSTANT
+    )
+
+    Q_PROPERTY(
         bool qApplication
         READ qApplication
         CONSTANT
@@ -261,6 +267,15 @@ public:
      */
     [[nodiscard]]
     bool asrWhisper() const noexcept;
+
+    /**
+     * @brief Get if Memento was compiled with the ONNX Runtime ASR backend.
+     *
+     * @return true if ONNX ASR is supported,
+     * @return false otherwise.
+     */
+    [[nodiscard]]
+    bool asrOnnx() const noexcept;
 
     /**
      * @brief Get if Memento was compiled as a QApplication instead of

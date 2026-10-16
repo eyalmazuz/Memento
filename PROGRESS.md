@@ -218,3 +218,44 @@ This log tracks milestones, audits, code changes, and verification for issue #17
 - **Test Suite Pass**:
   - `ctest -V --test-dir build-full-release --output-on-failure`: 100% passed in 5.71s (memory subtitle lifecycle, ASR controller retry, WAV extraction cancellation, and CUDA device initialization).
 
+### Entry 17: Independent Verification Checkpoint for ASR Follow-Up Fixes (2026-09-25)
+- **Scope**: Read-only review of four follow-up source/test files. No product or test files were edited by the verifier.
+- **Changes Reviewed**:
+  1. `WhisperController` now observes `whisperSuppressRegexChanged` as a configuration change, so an active backend is refreshed when this option changes.
+  2. The QML suppress-regex placeholder now uses the intended escaping: `^\\[_extra_token_[0-9]+\\]$`.
+  3. Repeated transcription failures now use generic failure wording instead of describing every failure as a decode failure.
+  4. The empty audio-path failure check now follows pending reconfigure/restart handling, allowing a seek that aborts asynchronous audio extraction to take the restart path instead of terminating selection first.
+- **Controller Regression Coverage**: Extended `asr_controller_retry_test` to cover seek during extraction, active suppress-regex reconfiguration, and inactive settings changes preserving a visible cue. The later manual selection confirms the changed flash-attention setting through the fallback counter; it does not directly verify suppress-regex matching. Existing cancellation, terminal-failure pause, and explicit-seek retry checks remain in the harness.
+- **Build Configuration**: The writer reported a full Release rebuild after refreshing CMake metadata. The verifier confirmed the refreshed generated version is `2.0.2` with hash `4c7fc68`, the full feature flags remain enabled, CUDA remains enabled for architecture `75`, and the Whisper.cpp source is `v1.9.4`. Generated CUDA flags include `compute_75` and `sm_75`. `ldd` resolves both the application and controller test to the configured custom libmpv SDK.
+- **Independent Test Run**: Ran `ctest -V --test-dir build-full-release --output-on-failure` with isolated HOME/XDG/TMP paths. The combined `mpv-memory-subtitles` test passed (`1/1`, 3.87 sec), including the updated controller regression. No additional build was run by the verifier.
+- **Verification Limits**: The test uses a deliberately invalid temporary Whisper model to exercise failure/restart behavior; it does not exercise successful inference or suppress-regex matching/default semantics. No CUDA-capable device was detected, so no GPU inference was run. The test log also contained a non-failing `QFile::remove: Empty or null file name` warning on the extraction-abort path.
+- **Pending Review Finding**: A follow-up reviewer identified that the outer selection coroutine can retain the previous backend `shared_ptr` during reconfiguration, potentially keeping the old model allocated while its replacement initializes. The writer is addressing this backend-lifetime issue. This entry records an interim checkpoint only; final verification is pending that change and a stable source tree.
+
+### Entry 18: Final Independent Verification After Backend Lifetime Fix (2026-09-25)
+- **Backend Lifetime Follow-Up**: Reviewed the final `AsrController::selectImplAsync()` diff. Both recursive reconfigure paths now release the coroutine's old backend reference before awaiting the replacement selection. This addresses the prior review concern about retaining the previous model while the replacement initializes; the harness does not measure peak VRAM directly.
+- **Build**: The writer reported a successful full Release rebuild and CTest run after this change. The verifier did not rebuild.
+- **Independent Test**: Re-ran `ctest -V --test-dir build-full-release --output-on-failure` with isolated HOME/XDG/TMP directories. The combined `mpv-memory-subtitles` test passed (`1/1`, 3.82 sec) and included the controller extraction-seek, backend reconfigure, retry, and subtitle lifecycle checks.
+- **Limits and Observations**: The harness uses a deliberately invalid temporary Whisper model and logs `bad magic`; this is controller failure-path coverage, not successful inference. CUDA initialization reported no CUDA-capable device, so no GPU inference or transcription-quality claim is made. A non-failing `QFile::remove: Empty or null file name` warning remains visible on the extraction-abort path.
+- **Closeout**: The earlier interim checkpoint is superseded by this final CTest result. `git diff --check` passed, no build or test processes remained, and the user's HOME/XDG profile and model were not used or modified.
+
+### Entry 19: Multi-Backend `-DASR_BACKENDS` Build Flag & Generic ONNX Runtime ASR Integration (2026-10-16)
+- **Multi-Backend Build Flag (`-DASR_BACKENDS=...`)**:
+  - Updated `option/CMakeLists.txt`, `CMakeLists.txt`, `extern/CMakeLists.txt`, and `src/asr/CMakeLists.txt` to accept `-DASR_BACKENDS=...` (defaulting to `"whisper"`, supporting comma- or semicolon-separated backend lists such as `-DASR_BACKENDS="whisper;onnx"`).
+  - Backends are non-exclusive (`HAVE_ASR_BACKEND_WHISPER`, `HAVE_ASR_BACKEND_ONNX`, `MEMENTO_ASR_SUPPORT`, `MEMENTO_WHISPER_SUPPORT`, `MEMENTO_ONNX_SUPPORT`) and link cleanly into the same binary without `ggml` or runtime symbol collisions.
+  - Added automatic ONNX Runtime C++ discovery (`ONNXRUNTIME_ROOT` / system `onnxruntime`) with fallback to Microsoft's official prebuilt `onnxruntime-linux-x64-1.22.0.tgz` via `FetchContent`.
+- **Shared Audio Frontend (`src/asr/audio/`)**:
+  - Implemented `AsrAudio::readPcm16Wav` (`wavreader.h/.cpp`) and `AsrAudio::MelFrontend` (`melfrontend.h/.cpp`) matching Hugging Face `CohereAsrFeatureExtractor` (128-mel) and `ParakeetFeatureExtractor` (80-mel): `preemphasis = 0.97`, center-padded 512-point STFT (`hop_length = 160`, symmetric 400-sample Hann window `periodic=False`), Slaney-normalized Mel filterbank, $\ln(E + 2^{-24})$, per-feature mean/std normalization with Bessel's correction across valid frames (`num_samples / 160`), and energy-based utterance segmentation (`segmentSpeechUtterances`).
+- **Generic ONNX Runtime Backend (`src/asr/onnx/`)**:
+  - `OnnxModelConfig` (`onnxmodelconfig.h/.cpp`): Dynamically reads `config.json`, `processor_config.json`, and `generation_config.json` from any ONNX model directory and auto-detects `EncoderDecoder` (`cohere_asr`, `encoder_model*.onnx` + `decoder_model*.onnx`) vs `Ctc` (`parakeet_ctc`, `model*.onnx`).
+  - `OnnxTokenizer` (`onnxtokenizer.h/.cpp`): Parses `tokenizer.json` (BPE object and Unigram array vocabs, `added_tokens`, `<0xXX>` UTF-8 byte fallback, `▁` metaspace decoding) and constructs the 10-token `CohereAsr` decoder prompt dynamically (`language="ja"`, `punctuation=true/false`).
+  - `OnnxSession` & `OnnxBackend` (`onnxsession.h/.cpp`, `onnxbackend.h/.cpp`):
+    - Runs `Ort::Session` inference with dynamic input/output and KV-cache layer/head discovery for `cohere_asr` (`16 + 10 * s` max token cap and 24-token periodic repetition stop) and frame-aligned greedy CTC decoding (80 ms/frame) for `parakeet_ctc`.
+    - Uses a singleton `Ort::Env` (`getSharedOrtEnv()`) so ONNX Runtime registers its `DefaultLogger` before any CUDA Execution Provider probes.
+    - Keeps owning `Ort::TypeInfo` objects alive before calling `GetTensorTypeAndShapeInfo().GetShape()` to prevent dangling `Ort::ConstTensorTypeAndShapeInfo` references.
+    - Initializes `Ort::Session` asynchronously in `m_initFuture` on a background thread (matching `WhisperModel`) so `createBackend` returns immediately on the UI thread, switching mpv's `sid` to `"ASR subtitles"` right away while session loading runs in parallel with audio extraction.
+  - `OnnxController` (`onnxcontroller.h/.cpp`): Manages ONNX model discovery and multi-file Hugging Face downloads (`kitsune-transcribe-t0.6b-ja` default preset and `kitsune-transcribe-p0.3b-ja` selectable preset, plus custom directories) with zero auto-download behavior.
+  - `AsrController` (`asrcontroller.h/.cpp`): Added `m_flightGeneration` and immediate `m_selectInFlight = false` reset in `stop()` so switching from ASR to an embedded subtitle track and back to ASR subtitles never triggers a stale `"ASR is already transcribing."` error.
+- **Verification**:
+  - Configured and built `build-full-release` with `-DASR_BACKENDS="whisper;onnx"`.
+  - Added `onnx_asr_unit_test` verifying 128-mel and 80-mel `MelFrontend`, `OnnxTokenizer`, `OnnxModelConfig` for both `cohere_asr` and `parakeet_ctc`, and end-to-end `OnnxSession::transcribe` inference against `kitsune-transcribe-t0.6b-ja`.
+  - `ctest -V --test-dir build-full-release --output-on-failure`: `2/2` tests passed (`mpv-memory-subtitles` and `onnx-asr-unit-test`).

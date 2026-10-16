@@ -672,6 +672,50 @@ class Settings : public QObject
         NOTIFY whisperSuppressRegexChanged
     )
 
+    /* ONNX Settings */
+
+    Q_PROPERTY(
+        QString onnxModel
+        READ onnxModel
+        WRITE setOnnxModel
+        NOTIFY onnxModelChanged
+    )
+
+    Q_PROPERTY(
+        QString onnxCustomModel
+        READ onnxCustomModel
+        WRITE setOnnxCustomModel
+        NOTIFY onnxCustomModelChanged
+    )
+
+    Q_PROPERTY(
+        bool onnxUseGpu
+        READ onnxUseGpu
+        WRITE setOnnxUseGpu
+        NOTIFY onnxUseGpuChanged
+    )
+
+    Q_PROPERTY(
+        int onnxGpuDevice
+        READ onnxGpuDevice
+        WRITE setOnnxGpuDevice
+        NOTIFY onnxGpuDeviceChanged
+    )
+
+    Q_PROPERTY(
+        int onnxThreads
+        READ onnxThreads
+        WRITE setOnnxThreads
+        NOTIFY onnxThreadsChanged
+    )
+
+    Q_PROPERTY(
+        bool onnxPunctuation
+        READ onnxPunctuation
+        WRITE setOnnxPunctuation
+        NOTIFY onnxPunctuationChanged
+    )
+
 public:
     Settings(QObject *parent = nullptr);
     virtual ~Settings();
@@ -885,6 +929,21 @@ public:
      * @brief Load Whisper settings defaults.
      */
     Q_INVOKABLE void defaultWhisperSettings();
+
+    /**
+     * @brief Load ONNX settings from disc.
+     */
+    Q_INVOKABLE void loadOnnxSettings();
+
+    /**
+     * @brief Write ONNX settings to disc.
+     */
+    Q_INVOKABLE void writeOnnxSettings();
+
+    /**
+     * @brief Load ONNX settings defaults.
+     */
+    Q_INVOKABLE void defaultOnnxSettings();
 
     /**
      * @brief The version of the settings file.
@@ -2346,6 +2405,33 @@ public:
     void setWhisperSuppressRegex(
         const QString &value = Keys::Whisper::SUPPRESS_REGEX_DEFAULT);
 
+    /* ONNX Settings */
+
+    [[nodiscard]]
+    QString onnxModel() const noexcept;
+    void setOnnxModel(const QString &value = Keys::Onnx::MODEL_DEFAULT);
+
+    [[nodiscard]]
+    QString onnxCustomModel() const noexcept;
+    void setOnnxCustomModel(
+        const QString &value = Keys::Onnx::CUSTOM_MODEL_DEFAULT);
+
+    [[nodiscard]]
+    bool onnxUseGpu() const noexcept;
+    void setOnnxUseGpu(bool value = Keys::Onnx::USE_GPU_DEFAULT);
+
+    [[nodiscard]]
+    int onnxGpuDevice() const noexcept;
+    void setOnnxGpuDevice(int value = Keys::Onnx::GPU_DEVICE_DEFAULT);
+
+    [[nodiscard]]
+    int onnxThreads() const noexcept;
+    void setOnnxThreads(int value = Keys::Onnx::THREADS_DEFAULT);
+
+    [[nodiscard]]
+    bool onnxPunctuation() const noexcept;
+    void setOnnxPunctuation(bool value = Keys::Onnx::PUNCTUATION_DEFAULT);
+
 signals:
     /**
      * @brief Emitted when the version is changed.
@@ -2967,6 +3053,15 @@ signals:
      */
     void whisperSuppressRegexChanged(const QString &value);
 
+    /* ONNX Settings */
+
+    void onnxModelChanged(const QString &value);
+    void onnxCustomModelChanged(const QString &value);
+    void onnxUseGpuChanged(bool value);
+    void onnxGpuDeviceChanged(int value);
+    void onnxThreadsChanged(int value);
+    void onnxPunctuationChanged(bool value);
+
 private:
     /**
      * @brief Loads the version from disc.
@@ -3377,4 +3472,18 @@ private:
         QString suppressRegex{Keys::Whisper::SUPPRESS_REGEX_DEFAULT};
     };
     WhisperSettings m_whisper{};
+
+    /**
+     * @brief ONNX Runtime ASR settings.
+     */
+    struct OnnxSettings
+    {
+        QString model{Keys::Onnx::MODEL_DEFAULT};
+        QString customModel{Keys::Onnx::CUSTOM_MODEL_DEFAULT};
+        bool useGpu{Keys::Onnx::USE_GPU_DEFAULT};
+        int gpuDevice{Keys::Onnx::GPU_DEVICE_DEFAULT};
+        int threads{Keys::Onnx::THREADS_DEFAULT};
+        bool punctuation{Keys::Onnx::PUNCTUATION_DEFAULT};
+    };
+    OnnxSettings m_onnx{};
 };

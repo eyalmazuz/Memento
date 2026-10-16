@@ -1,4 +1,4 @@
-if(NOT BUILD_TESTING OR NOT MEMENTO_WHISPER_SUPPORT)
+if(NOT BUILD_TESTING OR NOT MEMENTO_ASR_SUPPORT)
     return()
 endif()
 
@@ -43,6 +43,25 @@ target_link_libraries(
     PRIVATE Qt6::Concurrent
 )
 
+add_executable(
+    onnx_asr_unit_test
+    mpv-memory-subtitles/onnx_asr_unit_test.cpp
+)
+target_compile_features(onnx_asr_unit_test PRIVATE cxx_std_20)
+target_include_directories(
+    onnx_asr_unit_test
+    PRIVATE ${MEMENTO_INCLUDE_DIRS}
+)
+target_compile_options(
+    onnx_asr_unit_test
+    PRIVATE ${MEMENTO_COMPILER_FLAGS}
+)
+target_link_libraries(
+    onnx_asr_unit_test
+    PRIVATE asrtranscriber
+    PRIVATE Qt6::Core
+)
+
 get_filename_component(MPV_SDK "${mpv_INCLUDE_DIR}" DIRECTORY)
 get_filename_component(MPV_LIBRARY_DIR "${mpv_LIBRARY}" DIRECTORY)
 set(
@@ -65,4 +84,13 @@ set_tests_properties(
     PROPERTIES
         ENVIRONMENT "${MPV_TEST_ENV}"
         TIMEOUT 30
+)
+add_test(
+    NAME onnx-asr-unit-test
+    COMMAND "$<TARGET_FILE:onnx_asr_unit_test>"
+)
+set_tests_properties(
+    onnx-asr-unit-test
+    PROPERTIES
+        TIMEOUT 15
 )

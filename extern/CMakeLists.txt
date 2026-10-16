@@ -85,3 +85,84 @@ if(MEMENTO_WHISPER_SUPPORT)
         unset(BUILD_SHARED_LIBS)
     endif()
 endif()
+
+if(MEMENTO_ASR_BACKEND_ONNX)
+    find_path(
+        ONNXRUNTIME_INCLUDE_DIR
+        NAMES onnxruntime_cxx_api.h
+        HINTS "${ONNXRUNTIME_ROOT}"
+        PATH_SUFFIXES include include/onnxruntime include/onnxruntime/core/session
+    )
+    find_library(
+        ONNXRUNTIME_LIBRARY
+        NAMES onnxruntime
+        HINTS "${ONNXRUNTIME_ROOT}"
+        PATH_SUFFIXES lib lib64
+    )
+
+    if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+        set(ONNXRUNTIME_VERSION "1.22.0")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+            if(MEMENTO_ONNX_CUDA)
+                set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-x64-gpu-${ONNXRUNTIME_VERSION}.tgz")
+            else()
+                set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz")
+            endif()
+        elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+            set(ONNXRUNTIME_ARCHIVE "onnxruntime-linux-aarch64-${ONNXRUNTIME_VERSION}.tgz")
+        elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+            set(ONNXRUNTIME_ARCHIVE "onnxruntime-osx-arm64-${ONNXRUNTIME_VERSION}.tgz")
+        elseif(APPLE)
+            set(ONNXRUNTIME_ARCHIVE "onnxruntime-osx-x86_64-${ONNXRUNTIME_VERSION}.tgz")
+        elseif(WIN32)
+            if(MEMENTO_ONNX_CUDA)
+                set(ONNXRUNTIME_ARCHIVE "onnxruntime-win-x64-gpu-${ONNXRUNTIME_VERSION}.zip")
+            else()
+                set(ONNXRUNTIME_ARCHIVE "onnxruntime-win-x64-${ONNXRUNTIME_VERSION}.zip")
+            endif()
+        else()
+            message(FATAL_ERROR "Unsupported platform for automatic ONNX Runtime download; please set -DONNXRUNTIME_ROOT=/path/to/onnxruntime")
+        endif()
+
+        FetchContent_Declare(
+            onnxruntime_prebuilt
+            URL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/${ONNXRUNTIME_ARCHIVE}"
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(onnxruntime_prebuilt)
+
+        set(ONNXRUNTIME_INCLUDE_DIR "${onnxruntime_prebuilt_SOURCE_DIR}/include")
+        if(WIN32)
+            set(ONNXRUNTIME_LIBRARY "${onnxruntime_prebuilt_SOURCE_DIR}/lib/onnxruntime.lib")
+        elseif(APPLE)
+            set(ONNXRUNTIME_LIBRARY "${onnxruntime_prebuilt_SOURCE_DIR}/lib/libonnxruntime.dylib")
+        else()
+            set(ONNXRUNTIME_LIBRARY "${onnxruntime_prebuilt_SOURCE_DIR}/lib/libonnxruntime.so")
+        endif()
+    endif()
+
+    get_filename_component(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
+    message(STATUS "Found ONNX Runtime: include=${ONNXRUNTIME_INCLUDE_DIR}, lib=${ONNXRUNTIME_LIBRARY}")
+
+    if(NOT TARGET onnxruntime::onnxruntime)
+        add_library(onnxruntime::onnxruntime SHARED IMPORTED GLOBAL)
+        set_target_properties(
+            onnxruntime::onnxruntime
+            PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}"
+                IMPORTED_LOCATION "${ONNXRUNTIME_LIBRARY}"
+                IMPORTED_NO_SONAME FALSE
+        )
+        if(UNIX AND NOT APPLE)
+            target_link_options(
+                onnxruntime::onnxruntime
+                INTERFACE "-Wl,-rpath,${ONNXRUNTIME_LIB_DIR}"
+            )
+        elseif(APPLE)
+            target_link_options(
+                onnxruntime::onnxruntime
+                INTERFACE "-Wl,-rpath,${ONNXRUNTIME_LIB_DIR}"
+            )
+        endif()
+    endif()
+endif()

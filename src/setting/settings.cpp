@@ -119,6 +119,7 @@ void Settings::load()
     loadOcrSettings();
     loadAsrSettings();
     loadWhisperSettings();
+    loadOnnxSettings();
 }
 
 void Settings::write()
@@ -138,6 +139,7 @@ void Settings::write()
     writeOcrSettings();
     writeAsrSettings();
     writeWhisperSettings();
+    writeOnnxSettings();
 }
 
 void Settings::defaults()
@@ -153,6 +155,7 @@ void Settings::defaults()
     defaultOcrSettings();
     defaultAsrSettings();
     defaultWhisperSettings();
+    defaultOnnxSettings();
 }
 
 void Settings::loadVersion()
@@ -1786,6 +1789,94 @@ void Settings::defaultWhisperSettings()
     setWhisperSuppressRegex();
 }
 
+void Settings::loadOnnxSettings()
+{
+    QSettings s;
+    s.beginGroup(Keys::Onnx::GROUP);
+
+    setOnnxModel(
+        s.value(
+            Keys::Onnx::MODEL,
+            Keys::Onnx::MODEL_DEFAULT
+        ).toString()
+    );
+    setOnnxCustomModel(
+        s.value(
+            Keys::Onnx::CUSTOM_MODEL,
+            Keys::Onnx::CUSTOM_MODEL_DEFAULT
+        ).toString()
+    );
+    setOnnxUseGpu(
+        s.value(
+            Keys::Onnx::USE_GPU,
+            Keys::Onnx::USE_GPU_DEFAULT
+        ).toBool()
+    );
+    setOnnxGpuDevice(
+        s.value(
+            Keys::Onnx::GPU_DEVICE,
+            Keys::Onnx::GPU_DEVICE_DEFAULT
+        ).toInt()
+    );
+    setOnnxThreads(
+        s.value(
+            Keys::Onnx::THREADS,
+            Keys::Onnx::THREADS_DEFAULT
+        ).toInt()
+    );
+    setOnnxPunctuation(
+        s.value(
+            Keys::Onnx::PUNCTUATION,
+            Keys::Onnx::PUNCTUATION_DEFAULT
+        ).toBool()
+    );
+
+    s.endGroup();
+}
+
+void Settings::writeOnnxSettings()
+{
+    QSettings s;
+    s.beginGroup(Keys::Onnx::GROUP);
+
+    s.setValue(
+        Keys::Onnx::MODEL,
+        onnxModel()
+    );
+    s.setValue(
+        Keys::Onnx::CUSTOM_MODEL,
+        onnxCustomModel()
+    );
+    s.setValue(
+        Keys::Onnx::USE_GPU,
+        onnxUseGpu()
+    );
+    s.setValue(
+        Keys::Onnx::GPU_DEVICE,
+        onnxGpuDevice()
+    );
+    s.setValue(
+        Keys::Onnx::THREADS,
+        onnxThreads()
+    );
+    s.setValue(
+        Keys::Onnx::PUNCTUATION,
+        onnxPunctuation()
+    );
+
+    s.endGroup();
+}
+
+void Settings::defaultOnnxSettings()
+{
+    setOnnxModel();
+    setOnnxCustomModel();
+    setOnnxUseGpu();
+    setOnnxGpuDevice();
+    setOnnxThreads();
+    setOnnxPunctuation();
+}
+
 /* Version Settings */
 
 unsigned int Settings::version() const noexcept
@@ -2947,12 +3038,15 @@ QString Settings::asrBackend() const noexcept
 void Settings::setAsrBackend(const QString &value)
 {
     QStringList backends;
-#ifdef MEMENTO_WHISPER_SUPPORT
+#if defined(HAVE_ASR_BACKEND_WHISPER) || defined(MEMENTO_WHISPER_SUPPORT)
     backends.append(Keys::Asr::BACKEND_WHISPER);
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif
+#if defined(HAVE_ASR_BACKEND_ONNX) || defined(MEMENTO_ONNX_SUPPORT)
+    backends.append(Keys::Asr::BACKEND_ONNX);
+#endif
     if (backends.isEmpty())
     {
-        backends.append(Keys::Asr::BACKEND_WHISPER);
+        backends.append(Keys::Asr::BACKEND_DEFAULT);
     }
 
     const QString defaultBackend = backends.front();
@@ -3173,3 +3267,106 @@ void Settings::setWhisperSuppressRegex(const QString &value)
     emit whisperSuppressRegexChanged(m_whisper.suppressRegex);
 }
 
+/* ONNX Settings */
+
+QString Settings::onnxModel() const noexcept
+{
+    return m_onnx.model;
+}
+
+void Settings::setOnnxModel(const QString &value)
+{
+    static const QStringList MODELS{
+        "kitsune-transcribe-t0.6b-ja",
+        "kitsune-transcribe-p0.3b-ja",
+        "custom",
+    };
+
+    QString model = MODELS.contains(value) ?
+        value : QString(Keys::Onnx::MODEL_DEFAULT);
+    if (m_onnx.model == model)
+    {
+        return;
+    }
+    m_onnx.model = std::move(model);
+    emit onnxModelChanged(m_onnx.model);
+}
+
+QString Settings::onnxCustomModel() const noexcept
+{
+    return m_onnx.customModel;
+}
+
+void Settings::setOnnxCustomModel(const QString &value)
+{
+    if (m_onnx.customModel == value)
+    {
+        return;
+    }
+    m_onnx.customModel = value;
+    emit onnxCustomModelChanged(m_onnx.customModel);
+}
+
+bool Settings::onnxUseGpu() const noexcept
+{
+    return m_onnx.useGpu;
+}
+
+void Settings::setOnnxUseGpu(bool value)
+{
+    if (m_onnx.useGpu == value)
+    {
+        return;
+    }
+    m_onnx.useGpu = value;
+    emit onnxUseGpuChanged(m_onnx.useGpu);
+}
+
+int Settings::onnxGpuDevice() const noexcept
+{
+    return m_onnx.gpuDevice;
+}
+
+void Settings::setOnnxGpuDevice(int value)
+{
+    const int gpuDevice = qBound(0, value, 15);
+    if (m_onnx.gpuDevice == gpuDevice)
+    {
+        return;
+    }
+    m_onnx.gpuDevice = gpuDevice;
+    emit onnxGpuDeviceChanged(m_onnx.gpuDevice);
+}
+
+int Settings::onnxThreads() const noexcept
+{
+    return m_onnx.threads;
+}
+
+void Settings::setOnnxThreads(int value)
+{
+    const int threads = value <= 0 ?
+        qMin(4, whisperMaxThreads()) :
+        qBound(1, value, whisperMaxThreads());
+    if (m_onnx.threads == threads)
+    {
+        return;
+    }
+    m_onnx.threads = threads;
+    emit onnxThreadsChanged(m_onnx.threads);
+}
+
+bool Settings::onnxPunctuation() const noexcept
+{
+    return m_onnx.punctuation;
+}
+
+void Settings::setOnnxPunctuation(bool value)
+{
+    if (m_onnx.punctuation == value)
+    {
+        return;
+    }
+    m_onnx.punctuation = value;
+    emit onnxPunctuationChanged(m_onnx.punctuation);
+}

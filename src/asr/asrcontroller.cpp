@@ -20,9 +20,9 @@
 
 #include "asr/asrcontroller.h"
 
-#ifdef MEMENTO_WHISPER_SUPPORT
+#if defined(MEMENTO_ASR_SUPPORT) || defined(HAVE_ASR_BACKEND_WHISPER) || defined(HAVE_ASR_BACKEND_ONNX) || defined(MEMENTO_WHISPER_SUPPORT)
 #define MEMENTO_ASR_BACKEND_SUPPORT
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +54,7 @@
 #include "state/context.h"
 #include "manager/downloadmanager.h"
 #include "asr/whisper/whispercontroller.h"
+#include "asr/onnx/onnxcontroller.h"
 
 static constexpr const char *KEY_ERROR = "error";
 static constexpr const char *MODEL_SUFFIX = ".bin";
@@ -69,7 +70,8 @@ AsrController::AsrController(Context *context, QObject *parent) :
     QObject(parent),
     m_context(context),
     m_downloader(context != nullptr ? context->downloadManager() : nullptr),
-    m_whisperController(new WhisperController(context, this))
+    m_whisperController(new WhisperController(context, this)),
+    m_onnxController(new OnnxController(context, this))
 {
     if (m_context != nullptr)
     {
@@ -92,6 +94,12 @@ AsrController::AsrController(Context *context, QObject *parent) :
         connect(
             m_whisperController,
             &WhisperController::configurationChanged,
+            this,
+            &AsrController::requestReconfigure
+        );
+        connect(
+            m_onnxController,
+            &OnnxController::configurationChanged,
             this,
             &AsrController::requestReconfigure
         );
@@ -164,14 +172,28 @@ QCoro::QmlTask AsrController::select(MpvController *controller)
 {
     m_retryPaused = false;
     m_retryAwaitingSeekPosition = false;
+    if (m_selectInFlight && !m_active)
+    {
+        ++m_flightGeneration;
+        ++m_selectGeneration;
+        ++m_generation;
+        if (m_abort)
+        {
+            m_abort->store(true);
+        }
+        setRunning(false);
+        m_selectInFlight = false;
+    }
     return selectAsync(controller);
 }
 
 void AsrController::stop()
 {
+    ++m_flightGeneration;
     ++m_selectGeneration;
     ++m_generation;
     ++m_segmentGeneration;
+    m_selectInFlight = false;
     m_restartRequested = false;
     m_reconfigureRequested = false;
     m_isReconfiguring = false;
@@ -229,23 +251,40 @@ bool AsrController::hasAnyModel() const
     Settings *settings = m_context != nullptr ? m_context->settings() : nullptr;
     const QString backend = settings != nullptr
         ? settings->asrBackend()
-        : QString::fromLatin1(Keys::Asr::BACKEND_WHISPER);
+        : QString::fromLatin1(Keys::Asr::BACKEND_DEFAULT);
     if (backend == Keys::Asr::BACKEND_WHISPER)
     {
         return m_whisperController != nullptr ? m_whisperController->hasAnyModel() : false;
+    }
+    if (backend == Keys::Asr::BACKEND_ONNX)
+    {
+        return m_onnxController != nullptr ? m_onnxController->hasAnyModel() : false;
     }
     return false;
 }
 
 bool AsrController::modelAvailable(const QString &model) const
 {
+    if (m_onnxController != nullptr && m_onnxController->isManagedModel(model))
+    {
+        return m_onnxController->modelAvailable(model);
+    }
     return m_whisperController->modelAvailable(model);
 }
 
 bool AsrController::selectedModelAvailable() const
 {
     const QString path = selectedModelPath();
-    return !path.isEmpty() && QFileInfo::exists(path);
+    if (path.isEmpty())
+    {
+        return false;
+    }
+    Settings *settings = m_context != nullptr ? m_context->settings() : nullptr;
+    if (settings != nullptr && settings->asrBackend() == Keys::Asr::BACKEND_ONNX)
+    {
+        return m_onnxController != nullptr && m_onnxController->modelAvailable(path);
+    }
+    return QFileInfo::exists(path);
 }
 
 bool AsrController::selectedModelDownloadable() const
@@ -259,6 +298,11 @@ bool AsrController::selectedModelDownloadable() const
     if (settings->asrBackend() == Keys::Asr::BACKEND_WHISPER)
     {
         return m_whisperController->isManagedModel(settings->whisperModel());
+    }
+    if (settings->asrBackend() == Keys::Asr::BACKEND_ONNX)
+    {
+        return m_onnxController != nullptr &&
+            m_onnxController->isManagedModel(settings->onnxModel());
     }
     return false;
 }
@@ -284,14 +328,61 @@ QCoro::Task<QVariantMap> AsrController::downloadModelAsync(QString model)
         co_return result;
     }
 
+    Settings *settings = m_context->settings();
+
+    if (m_onnxController != nullptr && m_onnxController->isManagedModel(model))
+    {
+#ifndef HAVE_ASR_BACKEND_ONNX
+        result[KEY_ERROR] = tr(
+            "ONNX Runtime subtitle support is not available in this build.");
+        co_return result;
+#else
+        const QString modelDir = m_onnxController->modelDirectory(model);
+        const bool reconfigureWhenDone =
+            m_context != nullptr &&
+            settings != nullptr &&
+            settings->asrBackend() == Keys::Asr::BACKEND_ONNX &&
+            settings->onnxModel() == model;
+
+        if (m_onnxController->modelAvailable(model))
+        {
+            result["path"] = modelDir;
+            if (reconfigureWhenDone)
+            {
+                requestReconfigure();
+            }
+            co_return result;
+        }
+
+        m_downloader->setDownloadName(model);
+        m_downloader->setDownloadProgress(0, 0, 0);
+        m_downloader->setDownloadRunning(true);
+        const bool ok = co_await m_onnxController->downloadManagedModel(model);
+        m_downloader->setDownloadRunning(false);
+
+        if (!ok)
+        {
+            result[KEY_ERROR] = tr("Could not download ASR model: %1")
+                .arg(model);
+            co_return result;
+        }
+
+        result["path"] = modelDir;
+        if (reconfigureWhenDone)
+        {
+            requestReconfigure();
+        }
+        co_return result;
+#endif // HAVE_ASR_BACKEND_ONNX
+    }
+
     QString path;
     QUrl url;
     bool reconfigureWhenDone = false;
-    Settings *settings = m_context->settings();
 
     if (m_whisperController->isManagedModel(model))
     {
-#ifndef MEMENTO_WHISPER_SUPPORT
+#if !defined(HAVE_ASR_BACKEND_WHISPER) && !defined(MEMENTO_WHISPER_SUPPORT)
         result[KEY_ERROR] = tr(
             "Whisper subtitle support is not available in this build.");
         co_return result;
@@ -307,9 +398,8 @@ QCoro::Task<QVariantMap> AsrController::downloadModelAsync(QString model)
             settings->asrBackend() ==
                 Keys::Asr::BACKEND_WHISPER &&
             settings->whisperModel() == model;
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif
     }
-
     else
     {
         result[KEY_ERROR] = tr("This ASR model cannot be downloaded.");
@@ -362,14 +452,20 @@ QCoro::Task<QVariantMap> AsrController::selectAsync(
     QVariantMap result;
     if (m_selectInFlight)
     {
+        if (m_active && controller != nullptr && m_subtitleTrackId >= 0)
+        {
+            controller->setSid(m_subtitleTrackId);
+            co_return result;
+        }
         result[KEY_ERROR] = tr("ASR is already transcribing.");
         co_return result;
     }
 
     m_selectInFlight = true;
+    const int flightGeneration = ++m_flightGeneration;
     QPointer<AsrController> self(this);
     result = co_await selectImplAsync(controller);
-    if (self == nullptr)
+    if (self == nullptr || flightGeneration != m_flightGeneration)
     {
         co_return result;
     }
@@ -431,13 +527,20 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
     const QString backendName = settings->asrBackend();
     if (backendName == Keys::Asr::BACKEND_WHISPER)
     {
-#ifndef MEMENTO_WHISPER_SUPPORT
+#if !defined(HAVE_ASR_BACKEND_WHISPER) && !defined(MEMENTO_WHISPER_SUPPORT)
         result[KEY_ERROR] = tr(
             "Whisper subtitle support is not available in this build.");
         co_return result;
-#endif // MEMENTO_WHISPER_SUPPORT
+#endif
     }
-
+    else if (backendName == Keys::Asr::BACKEND_ONNX)
+    {
+#ifndef HAVE_ASR_BACKEND_ONNX
+        result[KEY_ERROR] = tr(
+            "ONNX Runtime subtitle support is not available in this build.");
+        co_return result;
+#endif
+    }
     else
     {
         result[KEY_ERROR] = tr("The selected ASR backend is not available.");
@@ -450,7 +553,7 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
     const int selectGeneration = ++m_selectGeneration;
     setRunning(true);
     const QString modelPath = selectedModelPath();
-    if (modelPath.isEmpty() || !QFileInfo::exists(modelPath))
+    if (!selectedModelAvailable())
     {
         setRunning(false);
         result["missingModel"] = true;
@@ -477,8 +580,22 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
 
     if (!m_backend)
     {
-        WhisperBackendCreationResult backendResult = co_await
-            m_whisperController->createBackend(modelPath);
+        std::shared_ptr<AsrBackend> createdBackend;
+        QString backendError;
+        if (backendName == Keys::Asr::BACKEND_ONNX)
+        {
+            OnnxBackendCreationResult onnxResult = co_await
+                m_onnxController->createBackend(modelPath);
+            createdBackend = std::move(onnxResult.backend);
+            backendError = std::move(onnxResult.error);
+        }
+        else
+        {
+            WhisperBackendCreationResult whisperResult = co_await
+                m_whisperController->createBackend(modelPath);
+            createdBackend = std::move(whisperResult.backend);
+            backendError = std::move(whisperResult.error);
+        }
         if (self == nullptr)
         {
             co_return result;
@@ -498,18 +615,19 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
         {
             m_reconfigureRequested = false;
             m_isReconfiguring = true;
+            createdBackend.reset();
             setRunning(false);
             co_return co_await selectImplAsync(controller);
         }
-        if (!backendResult.backend)
+        if (!createdBackend)
         {
             setRunning(false);
-            result[KEY_ERROR] = backendResult.error.isEmpty() ?
+            result[KEY_ERROR] = backendError.isEmpty() ?
                 tr("Could not instantiate ASR backend.") :
-                backendResult.error;
+                backendError;
             co_return result;
         }
-        m_backend = std::move(backendResult.backend);
+        m_backend = std::move(createdBackend);
     }
     if (controllerGuard == nullptr || playerGuard == nullptr ||
         stateGuard == nullptr || !playerGuard->isFileLoaded() ||
@@ -525,7 +643,7 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
         setRunning(false);
         co_return result;
     }
-    const std::shared_ptr<AsrBackend> currentBackend = m_backend;
+    std::shared_ptr<AsrBackend> currentBackend = m_backend;
     if (currentBackend == nullptr)
     {
         setRunning(false);
@@ -645,13 +763,6 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
             QFile::remove(audioPath);
             co_return result;
         }
-        if (audioPath.isEmpty())
-        {
-            failed = true;
-            result[KEY_ERROR] = tr("Could not extract audio for ASR.");
-            break;
-        }
-
         double restartPosition = 0.0;
         if (m_reconfigureRequested)
         {
@@ -664,6 +775,12 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
             start = restartPosition;
             rewound = false;
             continue;
+        }
+        if (audioPath.isEmpty())
+        {
+            failed = true;
+            result[KEY_ERROR] = tr("Could not extract audio for ASR.");
+            break;
         }
 
         AsrTranscriptionOptions options{
@@ -731,6 +848,14 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
             co_return result;
         }
         QFile::remove(audioPath);
+        if (generation != m_generation || !m_active)
+        {
+            if (m_abort == attemptAbort)
+            {
+                m_abort.reset();
+            }
+            co_return result;
+        }
         if (controllerGuard == nullptr || playerGuard == nullptr ||
             stateGuard == nullptr)
         {
@@ -748,14 +873,6 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
             start = restartPosition;
             rewound = false;
             continue;
-        }
-        if (generation != m_generation || !m_active)
-        {
-            if (m_abort == attemptAbort)
-            {
-                m_abort.reset();
-            }
-            co_return result;
         }
         if (transcribeResult == AsrTranscriptionResult::Canceled)
         {
@@ -778,10 +895,10 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
                 m_retryAwaitingSeekPosition = false;
                 result["fatal"] = false;
                 result[KEY_ERROR] = failureDetail.isEmpty() ? tr(
-                    "ASR transcription paused after repeated decode "
+                    "ASR transcription paused after repeated "
                     "failures. Seek or change ASR settings to retry."
                 ) : tr(
-                    "ASR transcription paused after repeated decode "
+                    "ASR transcription paused after repeated "
                     "failures: %1. Seek or change ASR settings to retry."
                 ).arg(failureDetail);
                 break;
@@ -828,6 +945,9 @@ QCoro::Task<QVariantMap> AsrController::selectImplAsync(
         if (m_controller != nullptr)
         {
             m_backend.reset();
+            /* Inference has finished; do not retain the old model in this
+             * coroutine frame while awaiting its replacement. */
+            currentBackend.reset();
             m_isReconfiguring = true;
             MpvController *controller = m_controller.data();
             co_return co_await selectImplAsync(controller);
@@ -1361,12 +1481,18 @@ void AsrController::requestReconfigure()
     Settings *settings = m_context != nullptr ? m_context->settings() : nullptr;
     if (settings == nullptr || !settings->asrEnabled())
     {
+        m_backend.reset();
         stop();
         return;
     }
 
+    m_backend.reset();
     if (!m_active)
     {
+        if (m_running && m_selectInFlight)
+        {
+            m_reconfigureRequested = true;
+        }
         return;
     }
 
@@ -1380,7 +1506,6 @@ void AsrController::requestReconfigure()
     }
     if (!m_running)
     {
-        m_backend.reset();
         QMetaObject::invokeMethod(
             this,
             &AsrController::restartAfterReconfigure,
@@ -1465,6 +1590,12 @@ QString AsrController::selectedModelPath() const
     if (settings->asrBackend() == Keys::Asr::BACKEND_WHISPER)
     {
         return m_whisperController->selectedModelPath();
+    }
+    if (settings->asrBackend() == Keys::Asr::BACKEND_ONNX)
+    {
+        return m_onnxController != nullptr
+            ? m_onnxController->selectedModelPath()
+            : QString{};
     }
     return {};
 }

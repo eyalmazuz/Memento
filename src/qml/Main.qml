@@ -370,8 +370,9 @@ ApplicationWindow {
         sourceComponent: Component {
             Dialog {
                 id: asrNoModelDialog
-                readonly property string defaultModel: "tiny"
-                readonly property string defaultModelLabel: qsTr("Whisper tiny")
+                readonly property bool useOnnx: (MementoSettings.asrBackend === "onnx" && Features.asrOnnx) || (!Features.asrWhisper && Features.asrOnnx)
+                readonly property string defaultModel: useOnnx ? "kitsune-transcribe-t0.6b-ja" : "tiny"
+                readonly property string defaultModelLabel: useOnnx ? qsTr("kitsune-transcribe-t0.6b-ja") : qsTr("Whisper tiny")
 
                 parent: Overlay.overlay
                 anchors.centerIn: parent
@@ -380,10 +381,17 @@ ApplicationWindow {
                 title: qsTr("ASR Model Missing")
 
                 onAccepted: {
-                    MementoSettings.asrBackend = "whisper";
-                    MementoSettings.whisperModel = defaultModel;
-                    MementoSettings.writeAsrSettings();
-                    MementoSettings.writeWhisperSettings();
+                    if (useOnnx) {
+                        MementoSettings.asrBackend = "onnx";
+                        MementoSettings.onnxModel = defaultModel;
+                        MementoSettings.writeAsrSettings();
+                        MementoSettings.writeOnnxSettings();
+                    } else {
+                        MementoSettings.asrBackend = "whisper";
+                        MementoSettings.whisperModel = defaultModel;
+                        MementoSettings.writeAsrSettings();
+                        MementoSettings.writeWhisperSettings();
+                    }
                     asrStartupDownloadDialog.start(defaultModel);
                 }
                 onRejected: {

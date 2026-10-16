@@ -3,6 +3,16 @@ add_library(
     asrbackend.h
     asrcontroller.cpp
     asrcontroller.h
+    audio/melfrontend.cpp
+    audio/melfrontend.h
+    audio/wavreader.cpp
+    audio/wavreader.h
+    onnx/onnxcontroller.cpp
+    onnx/onnxcontroller.h
+    onnx/onnxmodelconfig.cpp
+    onnx/onnxmodelconfig.h
+    onnx/onnxtokenizer.cpp
+    onnx/onnxtokenizer.h
     whisper/whispercontroller.cpp
     whisper/whispercontroller.h
 )
@@ -15,12 +25,22 @@ if(MEMENTO_WHISPER_SUPPORT)
         PRIVATE whisper/whispermodel.h
     )
 endif()
+if(MEMENTO_ONNX_SUPPORT)
+    target_sources(
+        asrtranscriber
+        PRIVATE onnx/onnxbackend.cpp
+        PRIVATE onnx/onnxbackend.h
+        PRIVATE onnx/onnxsession.cpp
+        PRIVATE onnx/onnxsession.h
+    )
+endif()
 target_compile_features(asrtranscriber PUBLIC cxx_std_20)
 target_compile_options(asrtranscriber PRIVATE ${MEMENTO_COMPILER_FLAGS})
 target_include_directories(asrtranscriber PRIVATE ${MEMENTO_INCLUDE_DIRS})
 target_link_libraries(
     asrtranscriber
     PRIVATE "$<$<BOOL:${MEMENTO_WHISPER_SUPPORT}>:whisper>"
+    PUBLIC "$<$<BOOL:${MEMENTO_ONNX_SUPPORT}>:onnxruntime::onnxruntime>"
     PRIVATE context
     PRIVATE mpvplayer
     PRIVATE Qt6::Concurrent

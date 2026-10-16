@@ -117,7 +117,7 @@ bool Features::ocr() const noexcept
 
 bool Features::whisper() const noexcept
 {
-#ifdef MEMENTO_WHISPER_SUPPORT
+#if defined(HAVE_ASR_BACKEND_WHISPER) || defined(MEMENTO_WHISPER_SUPPORT)
     return true;
 #else
     return false;
@@ -126,12 +126,21 @@ bool Features::whisper() const noexcept
 
 bool Features::asr() const noexcept
 {
-    return asrWhisper();
+    return asrWhisper() || asrOnnx();
 }
 
 bool Features::asrWhisper() const noexcept
 {
     return whisper();
+}
+
+bool Features::asrOnnx() const noexcept
+{
+#if defined(HAVE_ASR_BACKEND_ONNX) || defined(MEMENTO_ONNX_SUPPORT)
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool Features::qApplication() const noexcept
