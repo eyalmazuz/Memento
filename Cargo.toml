@@ -1,0 +1,61 @@
+[package]
+name = "memento"
+version = "2.0.2"
+edition = "2021"
+publish = false
+default-run = "memento"
+
+[dependencies]
+slint = { version = "=1.16.1", default-features = false, features = [
+    "std",
+    "accessibility",
+    "compat-1-2",
+    "backend-winit",
+    "backend-winit-x11",
+    "renderer-femtovg",
+    "renderer-software",
+] }
+libloading = "=0.8.9"
+log = "=0.4.34"
+icu_provider = { version = "=2.3.1", features = ["logging"] }
+serde_json = "=1.0.154"
+url = "=2.5.8"
+
+memento-config = { path = "crates/memento-config" }
+memento-setting = { path = "crates/memento-setting" }
+memento-player = { path = "crates/memento-player" }
+memento-subtitle = { path = "crates/memento-subtitle" }
+memento-dict = { path = "crates/memento-dict" }
+memento-definition = { path = "crates/memento-definition" }
+memento-anki = { path = "crates/memento-anki" }
+memento-net = { path = "crates/memento-net" }
+memento-audio = { path = "crates/memento-audio" }
+memento-util = { path = "crates/memento-util" }
+memento-asr = { path = "crates/memento-asr" }
+memento-asr-onnx = { path = "crates/memento-asr-onnx" }
+memento-asr-whisper = { path = "crates/memento-asr-whisper" }
+
+[dev-dependencies]
+i-slint-backend-testing = "=1.16.1"
+
+[build-dependencies]
+slint-build = "=1.16.1"
+
+[lib]
+name = "memento_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "memento"
+path = "src/main.rs"
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/*",
+]
+
+[profile.release]
+debug-assertions = false
+overflow-checks = true

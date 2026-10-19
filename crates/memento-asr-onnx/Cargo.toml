@@ -1,0 +1,18 @@
+[package]
+name = "memento-asr-onnx"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento's ONNX ASR inference engine (src/asr/onnx)"
+license = "GPL-2.0-only"
+
+[dependencies]
+memento-asr = { path = "../memento-asr" }
+
+[lib]
+name = "memento_asr_onnx"
+# rlib only: the `memento-asr-engines` facade staticlib embeds the whole
+# graph. Two engine staticlibs linked together would duplicate the shared
+# base symbols (`asr_rust_*`); there must be exactly one rasterization of
+# the base crate in any link.
+crate-type = ["lib"]

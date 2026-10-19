@@ -1,0 +1,17 @@
+[package]
+name = "memento-dict"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento dictionary parsing and query cores"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-general-category = "1.1"
+
+[lib]
+name = "memento_dict"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]

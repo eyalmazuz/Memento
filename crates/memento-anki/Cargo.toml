@@ -1,0 +1,16 @@
+[package]
+name = "memento-anki"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento anki note building pure cores (src/anki)"
+license = "GPL-2.0-only"
+
+# No external dependencies: the pure cores mirror Qt string semantics over
+# raw UTF-16 code units, std-only.
+
+[lib]
+name = "memento_anki"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]
+

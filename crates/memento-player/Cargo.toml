@@ -1,0 +1,16 @@
+[package]
+name = "memento-player"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Patched libmpv command bridge for Memento player"
+license = "GPL-2.0-only"
+build = "build.rs"
+
+[build-dependencies]
+bindgen = "0.73"
+
+[lib]
+name = "memento_player"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]

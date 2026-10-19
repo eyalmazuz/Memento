@@ -1,0 +1,15 @@
+[package]
+name = "memento-config"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Qt-free settings persistence core for Memento"
+license = "GPL-2.0-only"
+
+[dependencies]
+memento-setting = { path = "../memento-setting" }
+
+[lib]
+name = "memento_config"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]

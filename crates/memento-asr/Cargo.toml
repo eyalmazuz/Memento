@@ -1,0 +1,20 @@
+[package]
+name = "memento-asr"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento's ASR module (src/asr), file-by-file mirror of the C++ implementation"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+
+[lib]
+name = "memento_asr"
+path = "src/lib.rs"
+# staticlib: C ABI bridge consumed by the C++ build (see src/asr/CMakeLists.txt)
+# lib: rlib for the crate's own Rust test-suite
+crate-type = ["staticlib", "lib"]

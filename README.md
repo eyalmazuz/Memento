@@ -92,236 +92,69 @@ Move the Memento application to a directory that doesn't have spaces in the path
 like `/Applications`. Unfortunately, this is an limitation of MeCab and there is
 no workaround that can be implemented.
 
-### KDE Plasma: No native file picker
-
-For Memento to be able to use the native file picker on KDE Plasma, you must
-compile with with `-DMEMENTO_QAPPLICATION=ON`.
-This pulls in a dependency on Qt Widgets, so make sure to have that installed on
-your system.
-
 ## Dependencies
 
-* Qt 6.10 or greater
-    * Base
-    * SVG
-* mpv
-* sqlite3
-* Json-C
-* libzip
-* QCoro (optional)
-    * Use `-DMEMENTO_SYSTEM_QCORO=ON`
-* yt-dlp (optional)
-* MeCab (optional)
-    * Use `-DMEMENTO_MECAB_SUPPORT=ON`
-    * With either ipadic or NAIST-jdic installed as a system dictionary on Linux and macOS.
-* [libmocr](https://github.com/ripose-jp/libmocr) (Optional)
-    * Use `-DMEMENTO_OCR_SUPPORT=ON` and `-DMEMENTO_SYSTEM_MOCR=ON`
-* In-Memory Subtitle Patched libmpv / ASR (Optional)
-    * Use `-DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON`
+* **Rust**: 1.80+ (stable toolchain)
+* **mpv**: `libmpv` (version 0.38+ / `libmpv.so.2`)
+* **yt-dlp** (optional, for streaming URL playback)
+* **manga-ocr** (optional, for Manga OCR text extraction: `pip install manga-ocr`)
 
 For the best experience, install [Noto Sans CJK JP](https://github.com/googlefonts/noto-cjk/raw/main/Sans/Variable/TTF/NotoSansCJKjp-VF.ttf)
 and the [Kanji Stroke Order](https://drive.google.com/uc?export=download&id=1oyQoTB531tbhlYaOW7ugvutXZ7HSlJfW) fonts.
 
+## Building and Running
 
-## Building
+Memento is built with standard Rust and Cargo:
 
-**I do not guarantee that any branch will successfully build or be bug-free.**
-**If you want to build a stable version of Memento, compile a [release](https://github.com/ripose-jp/Memento/releases) from source.**
-
-### Linux
-
-To install Memento on Linux, type the following commands:
-
-```
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . -j $(nproc)
-sudo cmake --build . --target install
+```bash
+cargo build --release
 ```
 
-### Windows
-
-1. Install [MSYS2](https://www.msys2.org/)
-1. Open **MSYS2 UCRT64**
-1. Make sure MSYS2 is up to date by running this command multiple times until it stops doing anything:
-   ```
-   pacman -Syu
-   ```
-1. Install the necessary tools and dependencies:
-   ```
-   pacman -S mingw-w64-ucrt-x86_64-git mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-sqlite3 mingw-w64-ucrt-x86_64-qt6 mingw-w64-ucrt-x86_64-mpv mingw-w64-ucrt-x86_64-mecab mingw-w64-ucrt-x86_64-json-c mingw-w64-ucrt-x86_64-libzip
-   ```
-1. Clone the repository:
-   ```
-   git clone https://github.com/ripose-jp/Memento.git
-   ```
-1. Build Memento:
-   ```
-   cd Memento
-   ./windows/build.sh -DCMAKE_BUILD_TYPE=Release
-   ```
-1. The resulting file will be in
-   ```
-   build/Memento_x86_64
-   ```
-
-### macOS
-
-**Important:** Clang is the only officially supported compiler for building Memento on macOS.
-
-1. Install [Homebrew](https://brew.sh/) with this command:
-   ```
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-1. Install the necessary tools and dependencies:
-   ```
-   brew install git cmake sqlite3 qt6 qcoro6 mpv mecab mecab-ipadic json-c libzip
-   ```
-1. Clone the repository:
-   ```
-   git clone https://github.com/ripose-jp/Memento.git
-   ```
-1. Build Memento:
-   ```
-   cd Memento
-   mkdir build
-   cd build
-   cmake -DCMAKE_BUILD_TYPE=Release ..
-   cmake --build . -j $(nproc)
-   ```
-1. The resulting executable will be:
-   ```
-   Memento/build/src/memento
-   ```
-
-### macOS Bundle
-
-1. Follow steps 1 - 3 of the macOS build instructions.
-1. Open the **Keychain Access** app.
-1. Go to **Keychain Access** > **Certificate Assistant** >
-   **Create a Certificate...** in the menubar.
-1. Put the name of your certificate in the 'Name' field, set the
-   'Certificate Type' to 'Code Signing', and click 'Create'.
-1. Return to your terminal and input:
-    ```
-    cd Memento
-    mkdir build
-    cd build
-    cmake -DMEMENTO_CODESIGN_IDENTITY="<certificate name>" -DMEMENTO_BUNDLE=ON -DCMAKE_BUILD_TYPE=Release -DMEMENTO_MECAB_SUPPORT=ON -DMEMENTO_SYSTEM_QCORO=ON ..
-    cmake --build . --target memento_bundle -j$(sysctl -n hw.ncpu)
-    ```
-1. The resulting app bundle will located at:
-    ```
-    Memento/build/src/Memento.app
-    ```
-
-### Adding OCR Support
-
-To build with OCR support, make sure that Python is installed and run:
+Run the application:
+```bash
+cargo run --release
 ```
+
+Run the test suite:
+```bash
+cargo test
+```
+
+### OCR Support
+
+To use OCR in Memento, install `manga-ocr` with Python:
+```bash
 pip install manga-ocr
 ```
-*Any problems you may have getting `manga-ocr` installed using `pip` is beyond the scope of this project.*
-*I wish you the best of luck.*
+Once installed, OCR can be triggered with the OCR keybind (default: `Ctrl+L`) to select screen regions and look up definitions directly in Yomitan dictionaries.
 
-Configure the build with:
-```
-cmake .. -DMEMENTO_OCR_SUPPORT=ON
-```
+### ASR (Speech-to-Text) Subtitles
 
-If you want to use a venv, make sure to configure the build with these additional options:
-```
--DPython_EXECUTABLE=/path/to/.venv/bin/python
--DPython_FIND_VIRTUALENV=ONLY
-```
-
-**Note:** If using `-DMEMENTO_SYSTEM_MOCR=ON`, make sure that the installed libmocr binary links to your preferred venv by building libmocr using the same `-DPython_` options.
-
-Follow the normal build instructions from here.
-
-### Adding ASR Support
-
-Memento supports automatic speech recognition (ASR) to transcribe spoken dialogue in video media directly into subtitles.
-
-ASR generates subtitles in real time into an in-memory subtitle track, allowing speech-to-text subtitles to be interacted with, looked up with Yomitan, and timed with audio without creating temporary subtitle files on disk.
-
-#### Patched libmpv Requirement
-
-Because standard upstream mpv does not yet provide in-memory subtitle track manipulation commands (`sub-create`, `add-subtitle`, `edit-subtitle`, `remove-subtitle`, `clear-subtitles`, `sub-remove`), **ASR requires a patched build of `libmpv`**.
-
-When building with `-DMEMENTO_ASR_MPV=ON` on Linux x86_64, CMake automatically downloads and links a prebuilt patched `libmpv` SDK from GitHub releases:
-```
-cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON
-```
-
-If you compiled your own custom patched `libmpv` from the [mpv fork](https://github.com/eyalmazuz/mpv/tree/feat/in-memory-subtitles), you can point CMake directly to your installation prefix instead:
-```
-cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMPV_SDK=/path/to/mpv-sdk
-```
-
-> **Note:** Enabling `-DMEMENTO_ASR_SUPPORT=ON` without `-DMEMENTO_ASR_MPV=ON` (or `-DMPV_SDK=...`) will produce a configuration error. If you want to build standard Memento like upstream without ASR or patched mpv, omit `-DMEMENTO_ASR_SUPPORT` (it is disabled by default).
-
-#### ASR Backends
-
-Memento supports multiple inference engines configured via `-DASR_BACKENDS="..."`:
-
-1. **Whisper (whisper.cpp - default)**:
-   Enabled by default when ASR is enabled. Whisper.cpp is downloaded and built automatically via CMake `FetchContent`.
-   ```
-   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="whisper"
-   ```
-   - **Hardware Acceleration Options**:
-     - NVIDIA CUDA: `-DMEMENTO_WHISPER_CUDA=ON` (optionally set `-DMEMENTO_WHISPER_CUDA_ARCHITECTURES="75"` or your GPU compute capability)
-     - Vulkan: `-DMEMENTO_WHISPER_VULKAN=ON`
-     - BLAS: `-DMEMENTO_WHISPER_BLAS=ON`
-
-2. **ONNX Runtime (Kitsune / Cohere Transcribe / Parakeet CTC)**:
-   Supports HuggingFace ONNX-based speech models. On Linux x86_64, prebuilt ONNX Runtime binaries are fetched automatically.
-   ```
-   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="onnx"
-   ```
-   - For GPU acceleration with ONNX Runtime: `-DMEMENTO_ONNX_CUDA=ON`
-   - To link against an existing local ONNX Runtime installation: `-DONNXRUNTIME_ROOT=/path/to/onnxruntime`
-
-3. **Multi-Backend**:
-   Both Whisper and ONNX backends can be built into the same binary:
-   ```
-   cmake .. -DMEMENTO_ASR_SUPPORT=ON -DMEMENTO_ASR_MPV=ON -DASR_BACKENDS="whisper;onnx"
-   ```
-
-Follow the normal build instructions from here.
+Memento supports automatic speech recognition (ASR) to transcribe dialogue directly into in-memory subtitle cues in real time.
+Speech recognition supports:
+* **Whisper**: Local GGML models (e.g. `ggml-large-v3-turbo.bin` placed in `~/.config/memento/models/`).
+* **ONNX Runtime**: HuggingFace ONNX-based speech models.
 
 ## Configuration
 
 Most mpv shaders, plugins, and configuration files will work without modification.
 
-It is important to note that mpv and Memento's configuration directories are
-**separate**. This means mpv configuration files, scripts, etc. intended to modify
-Memento's behavior should be placed in Memento's configuration directory.
-
-The Memento configuration directory is located at:
+It is important to note that mpv and Memento's configuration directories are **separate**. mpv configuration files, scripts, etc. intended to modify Memento's behavior should be placed in Memento's configuration directory:
 
 ### Linux
-
 ```
 ~/.config/memento
 ```
 
 ### Windows
-
 ```
 %APPDATA%\Local\memento
 ```
 
 ### macOS
-
 ```
 ~/Library/Preferences/memento
 ```
-
-If any mpv binds or plugins do not work, please create an issue in the issue
-tracker.
 
 ## asbplayer
 
@@ -329,22 +162,12 @@ If you hate Memento, try [asbplayer](https://app.asbplayer.dev/).
 
 ## Acknowledgements
 
-* MpvWidget code is based off of libmpv example code
-  * https://github.com/mpv-player/mpv-examples/tree/master/libmpv/qml
-* Some code based off of Baka-MPlayer
-  * https://github.com/u8sand/Baka-MPlayer
 * UI inspired by Yomichan
   * https://github.com/FooSoft/yomichan
 * Icons sourced from Google Material Symbols and Icons
   * https://fonts.google.com/icons
-* OCR backend written kha-white and contributors
+* OCR backend written by kha-white and contributors
   * https://github.com/kha-white/manga-ocr
-* `mingw-bundledlls.py` based on this script with a slightly expanded blacklist
-  * https://github.com/mpreisler/mingw-bundledlls
-* Flatpak manifest heavily based on the mpv Flatpak
-  * https://github.com/flathub/io.mpv.Mpv
-* QCoro is builtin to the project
-  * https://github.com/qcoro/qcoro
 * Most dictionary links taken from jmdict-yomitan and yomitan-dictionaries
   * https://github.com/yomidevs/jmdict-yomitan
   * https://github.com/Kuuuube/yomitan-dictionaries

@@ -1,0 +1,540 @@
+import { Button, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+// Values and choices are supplied by ConfigController, not by sample settings.
+export struct SettingsField {
+    key: string,
+    label: string,
+    kind: string, // "switch", "choice", or "text"
+    value: string,
+    choices: [string],
+    enabled: bool,
+    visible: bool,
+}
+
+export struct SettingsGroup {
+    category: int,
+    title: string,
+    entry_id: string, // an audio-source index, or empty for ordinary sections
+    fields: [SettingsField],
+}
+export struct InstalledDictionaryRow {
+    id: int,
+    title: string,
+    disabled: bool,
+}
+
+component SettingsSwitch inherits Rectangle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    width: 38px;
+    height: 20px;
+    border-radius: 10px;
+    opacity: enabled ? 1 : 0.45;
+    background: checked ? #00867c : #384045;
+    Rectangle {
+        x: root.checked ? 20px : 2px;
+        y: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: #ffffff;
+        animate x { duration: 120ms; }
+    }
+    TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        enabled: root.enabled;
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+component SidebarItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected;
+    callback clicked();
+    height: 32px;
+    border-radius: 4px;
+    background: selected ? #007A65 : (touch.has-hover ? #2e353a : transparent);
+    Image {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: root.icon;
+        colorize: root.selected ? white : #b0b8bc;
+    }
+    Text {
+        x: 40px;
+        y: 0;
+        width: parent.width - 50px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? white : #dce0e2;
+        font-size: 13px;
+        font-weight: root.selected ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component ToolIcon inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint: #d8dcde;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 30px;
+    height: 30px;
+    background: (root.enabled && touch.has-hover) ? #384046 : transparent;
+    border-radius: 4px;
+    Image {
+        x: 6px;
+        y: 6px;
+        width: 18px;
+        height: 18px;
+        source: root.icon;
+        colorize: root.enabled ? root.tint : #5a6469;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if root.enabled { root.clicked(); } }
+    }
+}
+
+component FieldRow inherits HorizontalLayout {
+    in property <SettingsField> field;
+    callback edited(string, string);
+    height: 42px;
+    visible: root.field.visible;
+    alignment: space-between;
+    Text {
+        text: root.field.label;
+        font-size: 13px;
+        color: root.field.enabled ? #dce0e2 : #7a8387;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        overflow: elide;
+    }
+    if root.field.kind == "switch" : VerticalLayout {
+        alignment: center;
+        SettingsSwitch {
+            checked: root.field.value == "true";
+            enabled: root.field.enabled;
+            toggled(value) => { root.edited(root.field.key, value ? "true" : "false"); }
+        }
+    }
+    if root.field.kind == "choice" : VerticalLayout {
+        alignment: center;
+        ComboBox {
+            width: 220px;
+            enabled: root.field.enabled;
+            model: root.field.choices;
+            current-value: root.field.value;
+            selected(value) => { root.edited(root.field.key, value); }
+        }
+    }
+    if root.field.kind == "text" : VerticalLayout {
+        alignment: center;
+        LineEdit {
+            width: 220px;
+            enabled: root.field.enabled;
+            text: root.field.value;
+            edited(value) => { root.edited(root.field.key, value); }
+        }
+    }
+}
+
+component SettingsSection inherits VerticalLayout {
+    in property <SettingsGroup> group;
+    in-out property <bool> show-advanced: false;
+    callback edited(string, string);
+    callback advanced-changed(bool);
+    callback move-entry(string, int);
+    callback remove-entry(string);
+    callback test-anki-connection();
+
+    spacing: 6px;
+    horizontal-stretch: 1;
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        alignment: space-between;
+        Text {
+            text: root.group.title;
+            font-size: 13px;
+            font-weight: 700;
+            color: #dce0e2;
+            vertical-alignment: center;
+        }
+        if root.group.entry_id != "" : HorizontalLayout {
+            spacing: 4px;
+            ToolIcon {
+                icon: @image-url("icons/arrow-up.svg");
+                clicked => { root.move-entry(root.group.entry_id, -1); }
+            }
+            ToolIcon {
+                icon: @image-url("icons/arrow-down.svg");
+                clicked => { root.move-entry(root.group.entry_id, 1); }
+            }
+            ToolIcon {
+                icon: @image-url("icons/delete.svg");
+                tint: #ed6b72;
+                clicked => { root.remove-entry(root.group.entry_id); }
+            }
+        }
+    }
+    Rectangle {
+        background: #21262a;
+        border-width: 1px;
+        border-color: #384046;
+        border-radius: 8px;
+        VerticalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+            spacing: 0px;
+            for field[index] in root.group.fields : VerticalLayout {
+                spacing: 0px;
+                if index > 0 : Rectangle { height: 1px; background: #2f363b; }
+                FieldRow {
+                    field: field;
+                    edited(key, value) => { root.edited(key, value); }
+                }
+            }
+            if root.group.category == 0 && root.group.title == "General" : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: #2f363b; }
+                HorizontalLayout {
+                    height: 42px;
+                    alignment: space-between;
+                    Text {
+                        text: "Show advanced settings";
+                        font-size: 13px;
+                        color: #dce0e2;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        SettingsSwitch {
+                            checked: root.show-advanced;
+                            toggled(value) => {
+                                root.show-advanced = value;
+                                root.advanced-changed(value);
+                            }
+                        }
+                    }
+                }
+            }
+            if root.group.category == 0 && root.group.title == "AnkiConnect" : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: #2f363b; }
+                HorizontalLayout {
+                    height: 42px;
+                    alignment: space-between;
+                    Text {
+                        text: "Test connection";
+                        font-size: 13px;
+                        color: #dce0e2;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: "Connect";
+                            clicked => { root.test-anki-connection(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Apply/Reset/Defaults operate on the selected category, as in the QML pages.
+// The owner refreshes settings-groups after reset/default/profile/list/category actions.
+export component SettingsWindow inherits Window {
+    title: "Options";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    min-width: 800px;
+    min-height: 550px;
+    background: #282e32;
+    default-font-family: "Noto Sans, sans-serif";
+
+    in-out property <int> active-category: 0;
+    in property <[SettingsGroup]> settings-groups;
+    in property <[InstalledDictionaryRow]> installed-dictionaries;
+    in property <string> current-anki-profile;
+    in property <string> current-keybind-profile;
+    in property <string> settings-status;
+    in property <bool> ocr-available: false;
+    in property <bool> asr-available: false;
+    in-out property <bool> adding-entry: false;
+    in-out property <string> new-entry-name: "";
+    in-out property <bool> showing-advanced: false;
+    in-out property <bool> showing-help: false;
+
+    callback close();
+    callback category-changed(int);
+    callback setting-edited(string, string);
+    callback apply-settings(int);
+    callback reset-settings(int);
+    callback defaults-settings(int);
+    callback test-anki-connection();
+    callback add-entry(int, string);
+    callback remove-entry(int, string);
+    callback move-entry(int, string, int);
+    callback add-dictionary-archive();
+    callback dictionary-enabled-changed(int, bool);
+    callback move-dictionary-up(int);
+    callback move-dictionary-down(int);
+    callback delete-dictionary(int);
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 240px;
+            background: #1e2225;
+            VerticalLayout {
+                padding-top: 20px;
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 3px;
+                SidebarItem { label: "Anki Integration"; icon: @image-url("icons/anki.svg"); selected: root.active-category == 0; clicked => { root.active-category = 0; root.adding-entry = false; root.category-changed(0); } }
+                SidebarItem { label: "Application"; icon: @image-url("icons/settings.svg"); selected: root.active-category == 1; clicked => { root.active-category = 1; root.adding-entry = false; root.category-changed(1); } }
+                SidebarItem { label: "Audio Sources"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 2; clicked => { root.active-category = 2; root.adding-entry = false; root.category-changed(2); } }
+                SidebarItem { label: "Behavior"; icon: @image-url("icons/gear.svg"); selected: root.active-category == 3; clicked => { root.active-category = 3; root.adding-entry = false; root.category-changed(3); } }
+                SidebarItem { label: "Dictionary"; icon: @image-url("icons/dictionary.svg"); selected: root.active-category == 4; clicked => { root.active-category = 4; root.adding-entry = false; root.category-changed(4); } }
+                SidebarItem { label: "Interface"; icon: @image-url("icons/window.svg"); selected: root.active-category == 5; clicked => { root.active-category = 5; root.adding-entry = false; root.category-changed(5); } }
+                SidebarItem { label: "Keybinds"; icon: @image-url("icons/keyboard.svg"); selected: root.active-category == 6; clicked => { root.active-category = 6; root.adding-entry = false; root.category-changed(6); } }
+                SidebarItem { label: "OCR"; icon: @image-url("icons/eye.svg"); selected: root.active-category == 7; clicked => { root.active-category = 7; root.adding-entry = false; root.category-changed(7); } }
+                SidebarItem { label: "ASR"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 8; clicked => { root.active-category = 8; root.adding-entry = false; root.category-changed(8); } }
+                SidebarItem { label: "Search"; icon: @image-url("icons/search.svg"); selected: root.active-category == 9; clicked => { root.active-category = 9; root.adding-entry = false; root.category-changed(9); } }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+            }
+        }
+        Rectangle { width: 1px; background: #384046; }
+        VerticalLayout {
+            spacing: 0px;
+            Rectangle {
+                height: 40px;
+                background: #262c30;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    alignment: end;
+                    spacing: 8px;
+                    if root.adding-entry : LineEdit {
+                        width: 180px;
+                        text <=> root.new-entry-name;
+                        placeholder-text: "Profile name";
+                    }
+                    if root.adding-entry : Button {
+                        text: "Add profile";
+                        enabled: root.new-entry-name != "";
+                        clicked => {
+                            root.add-entry(root.active-category, root.new-entry-name);
+                            root.new-entry-name = "";
+                            root.adding-entry = false;
+                        }
+                    }
+                    if root.active-category == 0 || root.active-category == 6 : ToolIcon {
+                        icon: @image-url("icons/delete.svg");
+                        tint: #ed6b72;
+                        clicked => {
+                            root.remove-entry(root.active-category, root.active-category == 0 ? root.current-anki-profile : root.current-keybind-profile);
+                        }
+                    }
+                    if root.active-category == 0 || root.active-category == 2 || root.active-category == 6 : ToolIcon {
+                        icon: @image-url("icons/add.svg");
+                        clicked => {
+                            if root.active-category == 2 { root.add-entry(2, ""); }
+                            else { root.adding-entry = true; }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: #384046; }
+            ScrollView {
+                VerticalLayout {
+                    width: parent.width;
+                    padding-top: 16px;
+                    padding-bottom: 24px;
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    spacing: 16px;
+                    alignment: start;
+                    if root.active-category == 7 && !root.ocr-available : Rectangle {
+                        height: 38px;
+                        background: #493a24;
+                        border-radius: 6px;
+                        Text {
+                            x: 14px;
+                            text: "OCR runtime unavailable; preferences remain editable.";
+                            color: #ffe0a3;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if root.active-category == 8 && !root.asr-available : Rectangle {
+                        height: 38px;
+                        background: #493a24;
+                        border-radius: 6px;
+                        Text {
+                            x: 14px;
+                            text: "ASR runtime unavailable; preferences remain editable.";
+                            color: #ffe0a3;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    for group in root.settings-groups : VerticalLayout {
+                        if group.category != 4 &&
+                            (group.category != 0 || group.title != "Advanced" || root.showing-advanced) : SettingsSection {
+                            group: group;
+                            show-advanced: root.showing-advanced;
+                            edited(key, value) => { root.setting-edited(key, value); }
+                            advanced-changed(value) => { root.showing-advanced = value; }
+                            move-entry(id, direction) => { root.move-entry(root.active-category, id, direction); }
+                            remove-entry(id) => { root.remove-entry(root.active-category, id); }
+                            test-anki-connection => { root.test-anki-connection(); }
+                        }
+                    }
+                    if root.active-category == 4 : VerticalLayout {
+                        spacing: 10px;
+                        HorizontalLayout {
+                            Text {
+                                text: "Installed dictionaries";
+                                color: #dce0e2;
+                                font-size: 15px;
+                                font-weight: 700;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "Add ZIP…";
+                                clicked => { root.add-dictionary-archive(); }
+                            }
+                        }
+                        if root.installed-dictionaries.length == 0 : Text {
+                            text: "No dictionaries installed.";
+                            color: #8a9499;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                        }
+                        for dictionary[index] in root.installed-dictionaries : Rectangle {
+                            height: 48px;
+                            background: #21262a;
+                            border-width: 1px;
+                            border-color: #384046;
+                            border-radius: 6px;
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: 14px;
+                                padding-right: 14px;
+                                spacing: 14px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    SettingsSwitch {
+                                        checked: !dictionary.disabled;
+                                        toggled(val) => {
+                                            root.dictionary-enabled-changed(dictionary.id, !val);
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: dictionary.title + " [" + dictionary.id + "]";
+                                    color: dictionary.disabled ? #7a8387 : #dce0e2;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    HorizontalLayout {
+                                        spacing: 4px;
+                                        alignment: end;
+                                        ToolIcon {
+                                            icon: @image-url("icons/arrow-up.svg");
+                                            enabled: index > 0;
+                                            clicked => { root.move-dictionary-up(dictionary.id); }
+                                        }
+                                        ToolIcon {
+                                            icon: @image-url("icons/arrow-down.svg");
+                                            enabled: index < root.installed-dictionaries.length - 1;
+                                            clicked => { root.move-dictionary-down(dictionary.id); }
+                                        }
+                                        ToolIcon {
+                                            icon: @image-url("icons/delete.svg");
+                                            tint: #ed6b72;
+                                            clicked => { root.delete-dictionary(dictionary.id); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if root.showing-help : Rectangle {
+                        background: #1c2226;
+                        border-width: 1px;
+                        border-color: #384046;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 14px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            Text {
+                                text: root.active-category == 0 ? "AnkiConnect must be running to list and use decks or note models. Changes take effect after Apply." :
+                                      root.active-category == 2 ? "Audio source URLs can use {expression} and {reading}; MD5 matches are ignored." :
+                                      "Apply saves this page; Reset reloads saved values; Defaults restores the original settings for this page.";
+                                color: #b0b8bc;
+                                font-size: 12px;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: #384046; }
+            Rectangle {
+                height: 48px;
+                background: #21262a;
+                HorizontalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 8px;
+                    alignment: end;
+                    Text {
+                        text: root.settings-status;
+                        color: #9ca6aa;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    Button { text: "Help"; clicked => { root.showing-help = !root.showing-help; } }
+                    Button { text: "Reset"; clicked => { root.reset-settings(root.active-category); } }
+                    Button { text: "Defaults"; clicked => { root.defaults-settings(root.active-category); } }
+                    Button { text: "Apply"; clicked => { root.apply-settings(root.active-category); } }
+                }
+            }
+        }
+    }
+}

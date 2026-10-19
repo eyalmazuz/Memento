@@ -1,0 +1,45 @@
+// Memento Slint Theme Palette
+// Parity with MementoPalette.qml, OptionsWindow.qml and reference screenshots
+
+export global MementoPalette {
+    in-out property <string> scheme: "dark";
+    out property <bool> dark: scheme == "dark";
+
+    // Surface backgrounds
+    out property <color> window-bg:    dark ? #121214 : #F8F9FA;
+    out property <color> surface-bg:   dark ? #18181C : #FFFFFF;
+    out property <color> card-bg:      dark ? #1E1E22 : #F1F3F5;
+    out property <color> sidebar-bg:   dark ? #161619 : #E2E8F0;
+    out property <color> osc-bg:       dark ? #141418EE : #FFFFFFEE;
+
+    // Typography
+    out property <color> text:           dark ? #F8FAFC : #0F172A;
+    out property <color> text-secondary: dark ? #94A3B8 : #64748B;
+    out property <color> text-muted:     dark ? #64748B : #94A3B8;
+
+    // Borders & dividers
+    out property <color> border:       dark ? #28282E : #E2E8F0;
+    out property <color> border-light: dark ? #3A3A42 : #CBD5E1;
+
+    // Memento Brand Accents
+    out property <color> cyan-accent:  #38A3E5; // Memento signature cyan highlight & progress fill
+    out property <color> cyan-hover:   #60BAF5;
+    out property <color> teal-accent:  #0D8269; // Settings active pill & switches
+    out property <color> teal-hover:   #0E7490;
+
+    // Badges & Tag Colors (Yomitan popup)
+    out property <color> badge-blue:        #1E3A8A;
+    out property <color> badge-blue-text:   #93C5FD;
+    out property <color> badge-green:       #064E3B;
+    out property <color> badge-green-text:  #6EE7B7;
+    out property <color> badge-purple:      #4C1D95;
+    out property <color> badge-purple-text: #C4B5FD;
+
+    // Subtitle list hover and selection
+    out property <color> list-hover:     dark ? #222228 : #EDF2F7;
+    out property <color> list-selected:  dark ? #1E3A8A : #BFDBFE;
+    out property <color> list-sel-text:  #FFFFFF;
+    out property <color> list-sel-hover: dark ? #2563EB : #93C5FD;
+    out property <color> active-cue:     #10B981; // emerald indicator
+    out property <color> danger:         #EF4444;
+}

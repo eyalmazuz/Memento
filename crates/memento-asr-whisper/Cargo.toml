@@ -1,0 +1,23 @@
+[package]
+name = "memento-asr-whisper"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento's Whisper ASR inference engine (src/asr/whisper)"
+license = "GPL-2.0-only"
+# Regenerated bindings against whisper.cpp v1.9.4 (extern/CMakeLists.txt
+# FetchContent tag). See build.rs for the regeneration contract.
+build = "build.rs"
+
+[dependencies]
+memento-asr = { path = "../memento-asr" }
+regex = "1"
+
+[build-dependencies]
+bindgen = "0.73"
+
+[lib]
+name = "memento_asr_whisper"
+# rlib only: see the note in ../memento-asr-onnx/Cargo.toml — the facade
+# staticlib (`memento-asr-engines`) is the single static artifact.
+crate-type = ["lib"]

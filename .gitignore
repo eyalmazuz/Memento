@@ -79,9 +79,14 @@ CMakeLists.txt.user*
 .pch/
 .rcc/
 .uic/
+# Build and reference directories
 /build*/
+target/
+/cpp/
+/Testing/
+*.bin
 
-# User Entires
+# User Entries
 .cache
 .qtcreator
 .venv

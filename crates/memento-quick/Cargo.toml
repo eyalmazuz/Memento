@@ -1,0 +1,12 @@
+[package]
+name = "memento-quick"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "File-open queue and readiness state for Memento"
+license = "GPL-2.0-only"
+
+[lib]
+name = "memento_quick"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]

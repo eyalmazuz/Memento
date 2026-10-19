@@ -1,0 +1,1837 @@
+import { MementoPalette } from "palette.slint";
+import { ListView, LineEdit, Button, CheckBox, ComboBox, Slider, ScrollView } from "std-widgets.slint";
+import { SettingsWindow } from "settings.slint";
+
+export { MementoPalette, SettingsWindow }
+
+export struct SubEntry {
+    id: int,
+    start: float,
+    end: float,
+    text: string,
+    selected: bool,
+    is_active: bool,
+}
+
+export struct DictResult {
+    index: int,
+    expression: string,
+    reading: string,
+    pos_tags: string,
+    dict_name: string,
+    glossary: string,
+    notes: string,
+    example_ja: string,
+    example_en: string,
+    selected: bool,
+    score: int,
+    is_kanji: bool,
+}
+
+export struct SubtitleWord {
+    text: string,
+    query: string,
+    index: int,
+}
+
+export struct SubtitleLine {
+    words: [SubtitleWord],
+}
+
+export struct PlayerTrack {
+    id: int,
+    label: string,
+    selected: bool,
+}
+
+
+// ── Floating Yomitan Dictionary Card ────────────────────────────────────
+component YomitanPopup inherits Rectangle {
+    in property <string> headword: "";
+    in property <string> reading: "";
+    in property <string> pitch-accent: "";
+    in property <string> freq-rank: "";
+    in property <string> jpdb-rank: "";
+    in property <[DictResult]> results;
+    in property <bool> is-open: false;
+    callback close-requested();
+    callback add-anki-note(int);
+    callback play-audio();
+    callback kanji-info(string);
+    callback toggle-select-definition(int);
+
+    visible: root.is-open && root.results.length > 0;
+    width: 480px;
+    height: 440px;
+    background: #1C2024;
+    border-width: 1px;
+    border-color: #384046;
+    border-radius: 8px;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #000000DD;
+
+    popup-content := VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+
+        // Top Header: Furigana, Headword & Action Icons
+        HorizontalLayout {
+            vertical-stretch: 0;
+            alignment: space-between;
+
+            VerticalLayout {
+                spacing: 2px;
+                alignment: center;
+
+                // Furigana
+                if root.reading != "" : Text {
+                    text: root.reading;
+                    font-size: 13px;
+                    font-family: "Noto Sans CJK JP, Hiragino Sans, Yu Gothic, sans-serif";
+                    color: #94A3B8;
+                }
+                // Japanese Headword
+                Text {
+                    text: root.headword;
+                    font-size: 26px;
+                    font-weight: 700;
+                    font-family: "Noto Sans CJK JP, Hiragino Sans, Yu Gothic, sans-serif";
+                    color: #FFFFFF;
+                }
+            }
+
+            // Action Icons Row: 🔊 (play audio), close
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+
+                // Audio Speaker Button
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 4px;
+                    background: btn-s-touch.has-hover ? #2e353b : transparent;
+                    Image {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("icons/volume-on.svg");
+                    }
+                    btn-s-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.play-audio(); }
+                    }
+                }
+
+                // Close Button
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 4px;
+                    background: btn-c-touch.has-hover ? #2e353b : transparent;
+                    Image {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 14px;
+                        height: 14px;
+                        source: @image-url("icons/close.svg");
+                    }
+                    btn-c-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+        }
+
+        // Badges Row
+        if root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "" : HorizontalLayout {
+            vertical-stretch: 0;
+            spacing: 6px;
+            alignment: start;
+
+            // JPDB frequency badge (Emerald #064E3B)
+            if root.jpdb-rank != "" : Rectangle {
+                height: 20px;
+                background: #064E3B;
+                border-radius: 3px;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    Text {
+                        text: "JPDB " + root.jpdb-rank;
+                        font-size: 10px;
+                        font-weight: 600;
+                        color: #6EE7B7;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Frequency rank badge (Emerald #064E3B)
+            if root.freq-rank != "" : Rectangle {
+                height: 20px;
+                background: #064E3B;
+                border-radius: 3px;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    Text {
+                        text: root.freq-rank;
+                        font-size: 10px;
+                        font-weight: 600;
+                        color: #6EE7B7;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Pitch Accent badge (Deep Violet #4C1D95)
+            if root.pitch-accent != "" : Rectangle {
+                height: 20px;
+                background: #4C1D95;
+                border-radius: 3px;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    Text {
+                        text: root.pitch-accent;
+                        font-size: 10px;
+                        font-weight: 600;
+                        color: #C4B5FD;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Divider
+        Rectangle {
+            vertical-stretch: 0;
+            height: 1px;
+            background: #333338;
+        }
+
+        // Definitions List
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 12px;
+                padding-right: 6px;
+                for res[idx] in root.results : VerticalLayout {
+                    spacing: 6px;
+
+                    // Header row: POS tags, Dictionary tag
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        // Part of Speech badge(s)
+                        if res.pos-tags != "" : Rectangle {
+                            height: 18px;
+                            background: #2b3238;
+                            border-radius: 3px;
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                Text {
+                                    text: res.pos-tags;
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: #cbd5e1;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Dictionary Source Badge
+                        if res.dict-name != "" : Rectangle {
+                            height: 18px;
+                            background: #6D28D9;
+                            border-radius: 3px;
+                            HorizontalLayout {
+                                padding-left: 7px;
+                                padding-right: 7px;
+                                Text {
+                                    text: res.dict-name;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: #EDE9FE;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // Definition Meaning Text
+                    Text {
+                        text: res.glossary;
+                        font-size: 15px;
+                        font-weight: 400;
+                        color: #FFFFFF;
+                        wrap: word-wrap;
+                    }
+
+                    // Japanese Example Sentence
+                    if res.example-ja != "" : Text {
+                        text: "🇯🇵 " + res.example-ja;
+                        font-size: 13px;
+                        color: #E2E8F0;
+                        wrap: word-wrap;
+                    }
+
+                    // English Example Translation
+                    if res.example-en != "" : Text {
+                        text: "🇬🇧 " + res.example-en;
+                        font-size: 12px;
+                        color: #94A3B8;
+                        wrap: word-wrap;
+                    }
+
+                    // Notes / Explanations
+                    if res.notes != "" : Text {
+                        text: "📝 " + res.notes;
+                        font-size: 12px;
+                        color: #94A3B8;
+                        wrap: word-wrap;
+                    }
+
+                    if idx < root.results.length - 1 : Rectangle {
+                        height: 1px;
+                        background: #2E2E36;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+component InteractiveSubtitleToken inherits Rectangle {
+    in property <SubtitleWord> word;
+    in property <length> type-size;
+    in property <bool> selected;
+    callback clicked();
+    callback hovered(string, bool, bool, bool, bool);
+
+    width: glyph.preferred-width;
+    height: glyph.preferred-height;
+    background: selected && root.word.query != "" ? #38a6d6 : transparent;
+
+    glyph := Text {
+        text: root.word.text;
+        font-size: root.type-size;
+        font-weight: 700;
+        font-family: "Noto Sans CJK JP";
+        color: white;
+    }
+    touch := TouchArea {
+        enabled: root.word.query != "";
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.hovered(
+                    root.word.query,
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.meta
+                );
+            } else if (event.kind == PointerEventKind.cancel) {
+                root.hovered("", false, false, false, false);
+            }
+        }
+        changed has-hover => {
+            if !self.has-hover {
+                root.hovered("", false, false, false, false);
+            }
+        }
+    }
+}
+
+// ── OSC Bottom Controls Bar ─────────────────────────────────────────────
+component PlayerOscBar inherits Rectangle {
+    in property <bool> playing: false;
+    in property <float> position: 0.0;
+    in property <float> duration: 0.0;
+    in property <float> volume: 100.0;
+    in property <string> current-time: "00:00";
+    in property <string> duration-time: "00:00";
+    in property <bool> is-fullscreen: false;
+    in property <bool> ocr-enabled: false;
+
+    callback toggle-play();
+    callback seek(float);
+    callback subtitle-seek(int);
+    callback playlist-prev();
+    callback playlist-next();
+    callback toggle-mute();
+    callback volume-changed(float);
+    callback toggle-sub-list();
+    callback start-ocr();
+    callback toggle-fullscreen();
+
+    height: 50px;
+    background: MementoPalette.osc-bg;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: #28283088;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #00000066;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+
+        // Left transport controls
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            spacing: 4px;
+            alignment: center;
+
+            // Play / Pause
+            btn-play := Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: 4px;
+                background: p-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                }
+                p-touch := TouchArea { clicked => { root.toggle-play(); } }
+            }
+
+            // Previous playlist item
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 4px;
+                background: sp-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 14px;
+                    height: 14px;
+                    source: @image-url("icons/skip-previous.svg");
+                }
+                sp-touch := TouchArea { clicked => { root.playlist-prev(); } }
+            }
+
+            // Previous subtitle cue
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 4px;
+                background: rw-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 14px;
+                    height: 14px;
+                    source: @image-url("icons/fast-rewind.svg");
+                }
+                rw-touch := TouchArea { clicked => { root.subtitle-seek(-1); } }
+            }
+
+            // Next subtitle cue
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 4px;
+                background: ff-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 14px;
+                    height: 14px;
+                    source: @image-url("icons/fast-forward.svg");
+                }
+                ff-touch := TouchArea { clicked => { root.subtitle-seek(1); } }
+            }
+
+            // Next playlist item
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 4px;
+                background: sn-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 14px;
+                    height: 14px;
+                    source: @image-url("icons/skip-next.svg");
+                }
+                sn-touch := TouchArea { clicked => { root.playlist-next(); } }
+            }
+
+            // Current Time label
+            Text {
+                text: root.current-time;
+                font-size: 12px;
+                color: #E2E8F0;
+                vertical-alignment: center;
+                min-width: 45px;
+            }
+        }
+
+        // Center: Segmented Timeline Slider
+        timeline := Rectangle {
+            height: 24px;
+            horizontal-stretch: 1;
+            min-width: 120px;
+
+            track := Rectangle {
+                y: (parent.height - self.height) / 2;
+                width: parent.width;
+                height: 6px;
+                border-radius: 3px;
+                background: #3E3E4C;
+
+                // Cyan Progress Bar
+                progress-fill := Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: max(0px, min(parent.width, parent.width * (root.position / max(1.0, root.duration))));
+                    height: parent.height;
+                    border-radius: 3px;
+                    background: MementoPalette.cyan-accent;
+                }
+
+                // White Scrubber Knob
+                if root.duration > 0.0 : Rectangle {
+                    x: max(0px, min(parent.width - 12px, progress-fill.width - 6px));
+                    y: (parent.height - 12px) / 2;
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 6px;
+                    background: #FFFFFF;
+                    drop-shadow-blur: 4px;
+                    drop-shadow-color: #00000088;
+                }
+            }
+
+            slider-touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: pointer;
+                moved => {
+                    if (self.pressed) {
+                        let ratio = self.mouse-x / self.width;
+                        root.seek(max(0.0, min(root.duration, root.duration * ratio)));
+                    }
+                }
+                clicked => {
+                    let ratio = self.mouse-x / self.width;
+                    root.seek(max(0.0, min(root.duration, root.duration * ratio)));
+                }
+            }
+        }
+
+        // Right: Remaining time, Volume, Subtitle Drawer, Fullscreen
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            spacing: 8px;
+            alignment: center;
+
+            // Duration label
+            Text {
+                text: root.duration-time;
+                font-size: 12px;
+                color: #E2E8F0;
+                vertical-alignment: center;
+            }
+
+            // Volume Icon / Mute Toggle Button
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 4px;
+                background: vol-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: root.volume > 0.0 ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
+                }
+                vol-touch := TouchArea {
+                    clicked => { root.toggle-mute(); }
+                }
+            }
+
+            // Mini Volume Slider
+            Slider {
+                width: 70px;
+                minimum: 0.0;
+                maximum: 100.0;
+                value: root.volume;
+                changed(val) => { root.volume-changed(val); }
+            }
+
+            // Volume % Label
+            Text {
+                text: round(root.volume) + "%";
+                font-size: 11px;
+                color: #94A3B8;
+                vertical-alignment: center;
+                min-width: 32px;
+            }
+
+            // Subtitle Drawer Toggle Button
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 4px;
+                background: sub-t-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: @image-url("icons/list.svg");
+                }
+                sub-t-touch := TouchArea { clicked => { root.toggle-sub-list(); } }
+            }
+
+            if root.ocr-enabled : Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 4px;
+                background: ocr-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: @image-url("icons/eye.svg");
+                }
+                ocr-touch := TouchArea { clicked => { root.start-ocr(); } }
+            }
+
+            // Fullscreen Toggle Button
+            Rectangle {
+                width: 28px;
+                height: 28px;
+                border-radius: 4px;
+                background: fs-touch.has-hover ? #2A2A32 : transparent;
+                Image {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 15px;
+                    height: 15px;
+                    source: root.is-fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                }
+                fs-touch := TouchArea { clicked => { root.toggle-fullscreen(); } }
+            }
+        }
+    }
+}
+
+// ── Subtitle Drawer Panel ───────────────────────────────────────────────
+component SubtitleDrawerPanel inherits Rectangle {
+    in property <[SubEntry]> entries;
+    in-out property <string> search-text: "";
+    pure callback format-timestamp(float) -> string;
+    callback row-clicked(int);
+    callback row-activated(float);
+    callback search-changed(string);
+
+    background: #181A1D;
+    border-width: 1px;
+    border-color: #2D3136;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // Header + Search
+        HorizontalLayout {
+            spacing: 8px;
+            LineEdit {
+                placeholder-text: "Search subtitles (Ctrl+F)…";
+                text <=> root.search-text;
+                edited(val) => { root.search-changed(val); }
+            }
+        }
+
+        // Subtitle Cues List
+        ListView {
+            for entry[idx] in root.entries : Rectangle {
+                height: 36px;
+                border-radius: 4px;
+                background: entry.selected
+                    ? (d-touch.has-hover ? #2A3B4C : #1E2D3D)
+                    : (entry.is_active
+                        ? #134E4A
+                        : (d-touch.has-hover ? #262A30 : transparent));
+
+                // Emerald indicator for active playing cue
+                if entry.is_active : Rectangle {
+                    x: 3px;
+                    y: 4px;
+                    width: 3px;
+                    height: parent.height - 8px;
+                    background: #10B981;
+                    border-radius: 2px;
+                }
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 12px;
+                    alignment: center;
+
+                    // Timecode
+                    Text {
+                        width: 52px;
+                        vertical-alignment: center;
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: entry.selected ? #6EE7B7 : #8A949E;
+                        text: root.format-timestamp(entry.start);
+                    }
+
+                    // Cue Text
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        font-size: 13px;
+                        font-weight: entry.is_active ? 700 : 400;
+                        color: entry.selected ? #FFFFFF : #F0F4F8;
+                        overflow: elide;
+                        text: entry.text;
+                    }
+                }
+
+                d-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.row-clicked(idx); }
+                    double-clicked => { root.row-activated(entry.start); }
+                }
+            }
+        }
+    }
+}
+
+// ── Manual Dictionary Search ───────────────────────────────────────────────
+component DictionarySearchPanel inherits Rectangle {
+    in property <[DictResult]> results;
+    in-out property <string> query: "";
+    callback search-changed(string);
+    callback lookup(string);
+    callback close();
+
+    background: MementoPalette.surface-bg;
+    border-color: MementoPalette.border;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            Text {
+                text: "Search";
+                font-size: 16px;
+                font-weight: 700;
+                color: #F1F5F9;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button { text: "×"; clicked => { root.close(); } }
+        }
+        LineEdit {
+            placeholder-text: "Search Japanese…";
+            text <=> root.query;
+            edited(value) => { root.search-changed(value); }
+        }
+        ListView {
+            for hit[index] in root.results : Rectangle {
+                height: 124px;
+                border-radius: 5px;
+                background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
+                VerticalLayout {
+                    padding: 7px;
+                    spacing: 3px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: hit.expression;
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #F8FAFC;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: hit.reading;
+                            font-size: 12px;
+                            color: #94A3B8;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: hit.dict-name;
+                        font-size: 11px;
+                        color: #72C9B9;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: hit.glossary;
+                        font-size: 12px;
+                        color: #E2E8F0;
+                        wrap: word-wrap;
+                        vertical-alignment: top;
+                    }
+                }
+                result-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.lookup(hit.expression); }
+                }
+            }
+        }
+    }
+}
+
+// ── Top Native Menu Bar ─────────────────────────────────────────────────
+component TopMenuBar inherits Rectangle {
+    in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
+
+    height: 30px;
+    background: MementoPalette.surface-bg;
+    // border-bottom
+
+    border-color: MementoPalette.border;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        spacing: 2px;
+        alignment: start;
+
+        // Media
+        m0 := Rectangle {
+            width: 56px;
+            height: 26px;
+            border-radius: 4px;
+            background: root.open-menu == 0 ? #2E2E36 : (m0-t.has-hover ? #25252C : transparent);
+            Text {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                text: "Media";
+                font-size: 12px;
+                color: #E2E8F0;
+            }
+            m0-t := TouchArea {
+                clicked => { root.open-menu = root.open-menu == 0 ? -1 : 0; }
+            }
+        }
+
+        // Audio
+        m1 := Rectangle {
+            width: 56px;
+            height: 26px;
+            border-radius: 4px;
+            background: root.open-menu == 1 ? #2E2E36 : (m1-t.has-hover ? #25252C : transparent);
+            Text {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                text: "Audio";
+                font-size: 12px;
+                color: #E2E8F0;
+            }
+            m1-t := TouchArea {
+                clicked => { root.open-menu = root.open-menu == 1 ? -1 : 1; }
+            }
+        }
+
+        // Subtitle
+        m2 := Rectangle {
+            width: 66px;
+            height: 26px;
+            border-radius: 4px;
+            background: root.open-menu == 2 ? #2E2E36 : (m2-t.has-hover ? #25252C : transparent);
+            Text {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                text: "Subtitle";
+                font-size: 12px;
+                color: #E2E8F0;
+            }
+            m2-t := TouchArea {
+                clicked => { root.open-menu = root.open-menu == 2 ? -1 : 2; }
+            }
+        }
+
+        // Tools
+        m3 := Rectangle {
+            width: 56px;
+            height: 26px;
+            border-radius: 4px;
+            background: root.open-menu == 3 ? #2E2E36 : (m3-t.has-hover ? #25252C : transparent);
+            Text {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                text: "Tools";
+                font-size: 12px;
+                color: #E2E8F0;
+            }
+            m3-t := TouchArea {
+                clicked => { root.open-menu = root.open-menu == 3 ? -1 : 3; }
+            }
+        }
+
+        // Settings
+        m4 := Rectangle {
+            width: 68px;
+            height: 26px;
+            border-radius: 4px;
+            background: root.open-menu == 4 ? #2E2E36 : (m4-t.has-hover ? #25252C : transparent);
+            Text {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                text: "Settings";
+                font-size: 12px;
+                color: #E2E8F0;
+            }
+            m4-t := TouchArea {
+                clicked => { root.open-menu = root.open-menu == 4 ? -1 : 4; }
+            }
+        }
+    }
+}
+
+// ── Dropdown Menu Item ──────────────────────────────────────────────────
+component DropdownItem inherits Rectangle {
+    in property <string> text: "";
+    in property <string> shortcut: "";
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <bool> has-submenu: false;
+    in property <bool> is-disabled: false;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 4px;
+    background: root.is-disabled ? transparent : (touch.has-hover ? #2A2A32 : transparent);
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            horizontal-stretch: 1;
+
+            if root.checkable : Text {
+                width: 14px;
+                text: root.checked ? "✓" : "";
+                font-size: 11px;
+                font-weight: 700;
+                color: MementoPalette.cyan-accent;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.text;
+                font-size: 12px;
+                color: root.is-disabled ? #64748B : #F8FAFC;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+
+            if root.shortcut != "" : Text {
+                text: root.shortcut;
+                font-size: 11px;
+                color: #888890;
+                vertical-alignment: center;
+            }
+
+            if root.has-submenu : Text {
+                text: "›";
+                font-size: 14px;
+                font-weight: 700;
+                color: #888890;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: !root.is-disabled;
+        mouse-cursor: root.is-disabled ? default : pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── Dropdown Menu Separator ─────────────────────────────────────────────
+component DropdownSeparator inherits Rectangle {
+    height: 9px;
+    Rectangle {
+        y: 4px;
+        height: 1px;
+        background: #28282E;
+    }
+}
+
+// ── Dropdown Menus Overlay ──────────────────────────────────────────────
+component MenuDropdown inherits Rectangle {
+    in property <int> menu-index: -1;
+    in-out property <int> submenu-index: -1; // 0 Recent, 1 Size/Position, 2 Secondary, 3 Primary, 4 Anki profile
+    in property <[PlayerTrack]> audio-tracks: [];
+    in property <[PlayerTrack]> subtitle-tracks: [];
+    in property <[string]> recent-files: [];
+    in property <[string]> anki-profiles: [];
+    in property <int> audio-id: 0;
+    in property <int> primary-sid: 0;
+    in property <int> secondary-sid: 0;
+    in property <string> anki-profile: "";
+    in property <bool> anki-enabled: false;
+    in property <bool> asr-enabled: false;
+    in property <bool> furigana-enabled: false;
+    in property <bool> asr-running: false;
+    in property <bool> ocr-enabled: false;
+    in property <bool> auto-pause: false;
+    in property <bool> subtitles-visible: true;
+    in property <bool> furigana-visible: false;
+    in property <string> key-open-file: "";
+    in property <string> key-open-url: "";
+    in property <string> key-show-search: "";
+    in property <string> key-show-sub-list: "";
+    in property <string> key-start-ocr: "";
+    in property <string> key-sub-auto-pause: "";
+    in property <string> key-sub-show: "";
+    in property <string> key-sub-furigana: "";
+    in property <string> key-sub-increase-size: "";
+    in property <string> key-sub-decrease-size: "";
+    in property <string> key-sub-move-up: "";
+    in property <string> key-sub-move-down: "";
+
+    callback open-file();
+    callback open-url();
+    callback add-subtitle();
+    callback open-recent(string);
+    callback clear-recent();
+    callback select-audio-track(int);
+    callback select-subtitle-track(int);
+    callback select-secondary-subtitle-track(int);
+    callback select-asr();
+    callback auto-pause-changed(bool);
+    callback adjust-subtitle-scale(float);
+    callback adjust-subtitle-offset(float);
+    callback subtitles-visible-changed(bool);
+    callback furigana-visible-changed(bool);
+    callback toggle-search();
+    callback toggle-sub-drawer();
+    callback start-ocr();
+    callback open-options();
+    callback open-config();
+    callback check-updates();
+    callback show-about();
+    callback select-anki-profile(string);
+    callback close-menu();
+
+    changed menu-index => { root.submenu-index = -1; }
+
+    visible: root.menu-index >= 0;
+    x: root.menu-index == 0 ? 8px :
+       root.menu-index == 1 ? 66px :
+       root.menu-index == 2 ? 124px :
+       root.menu-index == 3 ? 192px : 250px;
+    y: 30px;
+    width: root.menu-index == 1 ? (root.audio-tracks.length > 0 ? 210px : 140px) :
+           root.menu-index == 2 ? 220px :
+           root.menu-index == 3 ? 180px : 200px;
+    height: menu-content.preferred-height;
+    background: #1E1E22;
+    border-width: 1px;
+    border-color: #28282E;
+    border-radius: 6px;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #00000088;
+
+    menu-content := VerticalLayout {
+        padding: 6px;
+        spacing: 2px;
+
+        // Media: recent files are the only submenu; their paths stay intact.
+        if root.menu-index == 0 : VerticalLayout {
+            spacing: 2px;
+            DropdownItem {
+                text: "Open File…";
+                shortcut: root.key-open-file;
+                clicked => { root.open-file(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Open URL…";
+                shortcut: root.key-open-url;
+                clicked => { root.open-url(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Recent";
+                has-submenu: true;
+                is-disabled: root.recent-files.length == 0;
+                clicked => { root.submenu-index = root.submenu-index == 0 ? -1 : 0; }
+            }
+        }
+
+        // Audio tracks, including the mpv "None" track (SID 0).
+        if root.menu-index == 1 : VerticalLayout {
+            spacing: 2px;
+            DropdownItem {
+                text: "None";
+                checkable: true;
+                checked: root.audio-id == 0;
+                clicked => { root.select-audio-track(0); root.close-menu(); }
+            }
+            for track[index] in root.audio-tracks : DropdownItem {
+                text: track.label;
+                checkable: true;
+                checked: track.id == root.audio-id;
+                clicked => { root.select-audio-track(track.id); root.close-menu(); }
+            }
+        }
+
+        // Subtitle controls plus independently selectable primary/secondary tracks.
+        if root.menu-index == 2 : VerticalLayout {
+            spacing: 2px;
+            DropdownItem {
+                text: "Auto Pause";
+                shortcut: root.key-sub-auto-pause;
+                checkable: true;
+                checked: root.auto-pause;
+                clicked => { root.auto-pause-changed(!root.auto-pause); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Size and Position";
+                has-submenu: true;
+                clicked => { root.submenu-index = root.submenu-index == 1 ? -1 : 1; }
+            }
+            DropdownSeparator {}
+            DropdownItem {
+                text: "Show Subtitles";
+                shortcut: root.key-sub-show;
+                checkable: true;
+                checked: root.subtitles-visible;
+                clicked => { root.subtitles-visible-changed(!root.subtitles-visible); root.close-menu(); }
+            }
+            if root.furigana-enabled : DropdownItem {
+                text: "Show Furigana";
+                shortcut: root.key-sub-furigana;
+                checkable: true;
+                checked: root.furigana-visible;
+                clicked => { root.furigana-visible-changed(!root.furigana-visible); root.close-menu(); }
+            }
+            DropdownSeparator {}
+            DropdownItem {
+                text: "Add Subtitle…";
+                clicked => { root.add-subtitle(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Second Track";
+                has-submenu: true;
+                clicked => { root.submenu-index = root.submenu-index == 2 ? -1 : 2; }
+            }
+            DropdownItem {
+                text: "Primary Track";
+                has-submenu: true;
+                clicked => { root.submenu-index = root.submenu-index == 3 ? -1 : 3; }
+            }
+        }
+
+        // Search, subtitle list, and OCR are the only real Tools actions.
+        if root.menu-index == 3 : VerticalLayout {
+            spacing: 2px;
+            DropdownItem {
+                text: "Show Search";
+                shortcut: root.key-show-search;
+                clicked => { root.toggle-search(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Show Subtitle List";
+                shortcut: root.key-show-sub-list;
+                clicked => { root.toggle-sub-drawer(); root.close-menu(); }
+            }
+            if root.ocr-enabled : DropdownItem {
+                text: "Start OCR";
+                shortcut: root.key-start-ocr;
+                clicked => { root.start-ocr(); root.close-menu(); }
+            }
+        }
+
+        // Settings: profiles are model-driven and update actions are delegated.
+        if root.menu-index == 4 : VerticalLayout {
+            spacing: 2px;
+            if root.anki-enabled : DropdownItem {
+                text: "Anki Profile";
+                has-submenu: true;
+                clicked => { root.submenu-index = root.submenu-index == 4 ? -1 : 4; }
+            }
+            DropdownItem {
+                text: "Options…";
+                shortcut: "Ctrl+,";
+                clicked => { root.open-options(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Open Config";
+                clicked => { root.open-config(); root.close-menu(); }
+            }
+            DropdownItem {
+                text: "Check for Updates";
+                clicked => { root.check-updates(); root.close-menu(); }
+            }
+            DropdownSeparator {}
+            DropdownItem {
+                text: "About Memento";
+                clicked => { root.show-about(); root.close-menu(); }
+            }
+        }
+    }
+
+    // Dynamic Recent, Size/Position, track, and Anki profile flyouts.
+    if root.submenu-index >= 0 : Rectangle {
+        x: parent.width - 4px;
+        y: root.submenu-index == 0 ? 58px :
+           root.submenu-index == 1 ? 34px :
+           root.submenu-index == 2 ? max(10px, parent.height - self.height - 30px) :
+           root.submenu-index == 3 ? max(10px, parent.height - self.height) : 6px;
+        width: root.submenu-index == 0 ? 320px : 260px;
+        height: root.submenu-index == 0 ? max(44px, min(360px, (root.recent-files.length == 0 ? 1 : root.recent-files.length + 2) * 30px + 14px)) :
+                root.submenu-index == 1 ? 134px :
+                root.submenu-index == 2 ? max(44px, min(300px, (root.subtitle-tracks.length + 1) * 30px + 14px)) :
+                root.submenu-index == 3 ? max(44px, min(300px, (root.subtitle-tracks.length + (root.asr-enabled ? 2 : 1)) * 30px + 14px)) :
+                max(44px, min(300px, max(1, root.anki-profiles.length) * 30px + 14px));
+        background: #1E1E22;
+        border-width: 1px;
+        border-color: #28282E;
+        border-radius: 6px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000088;
+
+        ScrollView {
+            VerticalLayout {
+                padding: 6px;
+                spacing: 2px;
+
+                if root.submenu-index == 0 : VerticalLayout {
+                    spacing: 2px;
+                    if root.recent-files.length == 0 : DropdownItem {
+                        text: "No recent files";
+                        is-disabled: true;
+                    }
+                    for file[index] in root.recent-files : DropdownItem {
+                        text: file;
+                        clicked => { root.open-recent(file); root.close-menu(); }
+                    }
+                    DropdownSeparator {}
+                    DropdownItem {
+                        text: "Clear Recents";
+                        clicked => { root.clear-recent(); root.close-menu(); }
+                    }
+                }
+
+                if root.submenu-index == 1 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "Increase Size";
+                        shortcut: root.key-sub-increase-size;
+                        clicked => { root.adjust-subtitle-scale(0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Decrease Size";
+                        shortcut: root.key-sub-decrease-size;
+                        clicked => { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Move Up";
+                        shortcut: root.key-sub-move-up;
+                        clicked => { root.adjust-subtitle-offset(0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Move Down";
+                        shortcut: root.key-sub-move-down;
+                        clicked => { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
+                    }
+                }
+
+                if root.submenu-index == 2 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "None";
+                        checkable: true;
+                        checked: root.secondary-sid == 0;
+                        clicked => { root.select-secondary-subtitle-track(0); root.close-menu(); }
+                    }
+                    for track[index] in root.subtitle-tracks : DropdownItem {
+                        text: track.label;
+                        checkable: true;
+                        checked: track.id == root.secondary-sid;
+                        is-disabled: track.id == root.primary-sid;
+                        clicked => {
+                            if (track.id != root.primary-sid) {
+                                root.select-secondary-subtitle-track(track.id);
+                                root.close-menu();
+                            }
+                        }
+                    }
+                }
+
+                if root.submenu-index == 3 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "None";
+                        checkable: true;
+                        checked: root.primary-sid == 0 && !root.asr-running;
+                        clicked => { root.select-subtitle-track(0); root.close-menu(); }
+                    }
+                    if root.asr-enabled : DropdownItem {
+                        text: root.asr-running ? "ASR subtitles…" : "ASR subtitles";
+                        checkable: true;
+                        checked: root.asr-running;
+                        clicked => { root.select-asr(); root.close-menu(); }
+                    }
+                    for track[index] in root.subtitle-tracks : DropdownItem {
+                        text: track.label;
+                        checkable: true;
+                        checked: track.id == root.primary-sid && !root.asr-running;
+                        is-disabled: track.id == root.secondary-sid;
+                        clicked => {
+                            if (track.id != root.secondary-sid) {
+                                root.select-subtitle-track(track.id);
+                                root.close-menu();
+                            }
+                        }
+                    }
+                }
+
+                if root.submenu-index == 4 : VerticalLayout {
+                    spacing: 2px;
+                    for profile[index] in root.anki-profiles : DropdownItem {
+                        text: profile;
+                        checkable: true;
+                        checked: profile == root.anki-profile;
+                        clicked => { root.select-anki-profile(profile); root.close-menu(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Main Memento Application Window ─────────────────────────────────────
+export component MementoApp inherits Window {
+    title: root.media-title != "" ? (root.media-title + " — Memento") : "Memento";
+    min-width: 900px;
+    min-height: 580px;
+    preferred-width: 1200px;
+    preferred-height: 720px;
+    background: #000000;
+
+    in-out property <string> media-title: "";
+    in-out property <bool> is-playing: false;
+    in-out property <float> position: 0.0;
+    in-out property <float> duration: 0.0;
+    in-out property <float> volume: 100.0;
+    in-out property <string> current-time: "00:00";
+    in-out property <string> duration-time: "00:00";
+    in-out property <image> video-frame;
+    out property <int> video-width: round(video-area.width / 1px);
+    out property <int> video-height: round(video-area.height / 1px);
+    in-out property <string> status-message: "";
+    in-out property <float> subtitle-scale: 0.05;
+    in-out property <float> subtitle-offset: 0.045;
+    in-out property <string> active-sub-text: "";
+    in-out property <string> secondary-sub-text: "";
+    in-out property <int> selected-token-index: -1;
+    in-out property <int> selected-token-count: 1;
+    in-out property <bool> dict-search-open: false;
+    in-out property <bool> sub-drawer-open: false;
+    in-out property <bool> is-fullscreen: false;
+    in-out property <bool> ocr-mode: false;
+    in-out property <bool> ocr-enabled: false;
+    in-out property <bool> asr-enabled: false;
+    in-out property <bool> asr-running: false;
+    in-out property <bool> auto-pause: false;
+    in-out property <bool> subtitles-visible: true;
+    in-out property <bool> furigana-visible: false;
+    in-out property <bool> furigana-enabled: false;
+    in-out property <[string]> recent-files: [];
+    in-out property <[PlayerTrack]> audio-tracks: [];
+    in-out property <[PlayerTrack]> subtitle-tracks: [];
+    in-out property <int> audio-id: 0;
+    in-out property <int> primary-sid: 0;
+    in-out property <int> secondary-sid: 0;
+    in-out property <[string]> anki-profiles: [];
+    in-out property <string> anki-profile: "";
+    in-out property <bool> anki-enabled: false;
+    in-out property <string> app-version: "";
+    in-out property <string> key-open-file: "Ctrl+O";
+    in-out property <string> key-open-url: "Ctrl+U";
+    in-out property <string> key-show-search: "Ctrl+R";
+    in-out property <string> key-show-sub-list: "Ctrl+E";
+    in-out property <string> key-start-ocr: "Ctrl+L";
+    in-out property <string> key-sub-auto-pause: "Ctrl+P";
+    in-out property <string> key-sub-show: "Ctrl+0";
+    in-out property <string> key-sub-furigana: "Alt+A";
+    in-out property <string> key-sub-increase-size: "Ctrl+2";
+    in-out property <string> key-sub-decrease-size: "Ctrl+1";
+    in-out property <string> key-sub-move-up: "Alt+1";
+    in-out property <string> key-sub-move-down: "Alt+2";
+    in-out property <bool> dict-open: false;
+    in-out property <string> dict-query: "";
+    in-out property <string> dict-reading: "";
+    in-out property <string> dict-pitch-accent: "";
+    in-out property <string> dict-freq-rank: "";
+    in-out property <string> dict-jpdb-rank: "";
+    in-out property <[DictResult]> dict-results: [];
+    in-out property <bool> about-open: false;
+
+    // Subtitle Entries & Interactive Words
+    in-out property <[SubEntry]> subtitle-entries: [];
+    in-out property <[SubtitleWord]> active-sub-words: [];
+    in-out property <[SubtitleLine]> active-sub-lines: [];
+    in-out property <length> popup-offset-x: 0px;
+
+    callback toggle-play();
+    callback seek-to(float);
+    callback seek-relative(float);
+    callback sub-seek(int);
+    callback playlist-prev();
+    callback playlist-next();
+    callback set-volume(float);
+    callback toggle-mute();
+    callback volume-up();
+    callback volume-down();
+    callback open-file();
+    callback open-url();
+    callback open-recent(string);
+    callback clear-recent();
+    callback reload-media();
+    callback close-media();
+    callback quit-app();
+    callback select-audio-track(int);
+    callback select-subtitle-track(int);
+    callback select-secondary-subtitle-track(int);
+    callback select-asr();
+    callback select-anki-profile(string);
+    callback auto-pause-changed(bool);
+    callback adjust-subtitle-scale(float);
+    callback adjust-subtitle-offset(float);
+    callback subtitles-visible-changed(bool);
+    callback furigana-visible-changed(bool);
+    callback toggle-subtitles();
+    callback add-subtitle();
+    callback adjust-sub-delay(float);
+    callback start-ocr();
+    callback ocr-region(float, float, float, float);
+    callback open-config();
+    callback check-updates();
+    callback toggle-fullscreen();
+    callback select-row(int);
+    callback search-subtitles(string);
+    callback search-dictionary(string);
+    callback lookup-word(string);
+    callback lookup-kanji(string);
+    callback hover-word(string, int, bool, bool, bool, bool);
+    callback toggle-definition-selection(int);
+    callback add-anki-note(int);
+    callback open-options();
+    callback play-audio-for-word(string);
+    callback key-pressed(string, bool, bool, bool, bool) -> bool;
+    pure callback format-timestamp(float) -> string;
+    changed dict-search-open => {
+        if root.dict-search-open {
+            root.dict-query = "";
+            root.dict-results = [];
+            root.dict-open = false;
+        }
+    }
+
+    forward-focus: f-scope;
+    f-scope := FocusScope {
+        key-pressed(event) => {
+            if (root.key-pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt, event.modifiers.meta)) {
+                return accept;
+            }
+            reject
+        }
+    }
+
+    // Window Content Layout
+    VerticalLayout {
+        spacing: 0;
+
+        // Top Native Menu Bar
+        menu-bar := TopMenuBar {}
+
+        // Center Area: Video Surface + Optional Subtitle Drawer
+        HorizontalLayout {
+            spacing: 0;
+            horizontal-stretch: 1;
+
+            // Video & Overlays Surface
+            video-area := Rectangle {
+                background: #000000;
+                horizontal-stretch: 1;
+
+                // libmpv frame shares the same Slint scene as all interactive overlays.
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.video-frame;
+                    image-fit: contain;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                // Empty / Placeholder state
+                if root.duration <= 0.0 : VerticalLayout {
+                    alignment: center;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            width: 64px;
+                            height: 64px;
+                            source: @image-url("icons/window.svg");
+                            colorize: #94A3B8;
+                        }
+                    }
+                    Text {
+                        text: "Memento";
+                        font-size: 26px;
+                        font-weight: 700;
+                        color: #E2E8F0;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Open a video file (Ctrl+O) or drag and drop media to start";
+                        font-size: 14px;
+                        color: #94A3B8;
+                        horizontal-alignment: center;
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 140px;
+                            height: 36px;
+                            border-radius: 6px;
+                            background: MementoPalette.cyan-accent;
+                            Text {
+                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                text: "Open Media…";
+                                font-weight: 700;
+                                color: #000000;
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-file(); }
+                            }
+                        }
+                    }
+                }
+
+                // Dismiss popup when clicking anywhere outside on the video surface
+                if root.dict-open : TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => {
+                        root.dict-open = false;
+                        root.selected-token-index = -1;
+                    }
+                }
+
+                // Clickable text units supply the search suffix at each token.
+                subtitle-box := Rectangle {
+                    visible: root.active-sub-text != "" && root.subtitles-visible;
+                    x: (parent.width - self.width) / 2;
+                    y: parent.height - self.height - max(62px, parent.height * root.subtitle-offset);
+                    width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
+                    height: subtitle-lines-layout.preferred-height + 16px;
+                    background: #00000099;
+                    border-radius: 4px;
+                    subtitle-lines-layout := VerticalLayout {
+                        x: 16px;
+                        y: 8px;
+                        spacing: 4px;
+                        alignment: center;
+                        for line in root.active-sub-lines : HorizontalLayout {
+                            alignment: center;
+                            spacing: 0px;
+                            for word in line.words : InteractiveSubtitleToken {
+                                word: word;
+                                type-size: video-area.height * root.subtitle-scale;
+                                selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
+                                hovered(query, control, shift, alt, meta) => {
+                                    root.hover-word(query, word.index, control, shift, alt, meta);
+                                }
+                                clicked => {
+                                    root.selected-token-index = word.index;
+                                    root.hover-word("", word.index, false, false, false, false);
+                                    root.lookup-word(word.query);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.secondary-sub-text != "" && root.subtitles-visible : Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: parent.height - self.height - max(116px, parent.height * root.subtitle-offset + 54px);
+                    width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
+                    height: secondary-subtitle-text.preferred-height + 16px;
+                    background: #00000099;
+                    border-radius: 4px;
+                    secondary-subtitle-text := Text {
+                        x: 16px;
+                        y: 8px;
+                        width: min(parent.width - 72px, self.preferred-width);
+                        text: root.secondary-sub-text;
+                        font-size: video-area.height * root.subtitle-scale;
+                        font-weight: 700;
+                        color: white;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+
+                // Floating Yomitan Dictionary Card
+                yomi-card := YomitanPopup {
+                    width: min(480px, parent.width - 40px);
+                    height: min(440px, parent.height - 80px);
+                    x: min(parent.width - self.width - 20px, max(20px, subtitle-box.x + (subtitle-box.width - self.width) / 2));
+                    y: (subtitle-box.y - self.height - 12px >= 10px) ?
+                       (subtitle-box.y - self.height - 12px) :
+                       min(parent.height - self.height - 10px, max(10px, subtitle-box.y + subtitle-box.height + 12px));
+                    is-open: root.dict-open;
+                    headword: root.dict-query;
+                    reading: root.dict-reading;
+                    pitch-accent: root.dict-pitch-accent;
+                    freq-rank: root.dict-freq-rank;
+                    jpdb-rank: root.dict-jpdb-rank;
+                    results: root.dict-results;
+                    close-requested => { root.dict-open = false; }
+                    add-anki-note(idx) => { root.add-anki-note(idx); }
+                    play-audio => { root.play-audio-for-word(root.dict-query); }
+                    kanji-info(word) => { root.lookup-kanji(word); }
+                    toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
+                }
+
+                // Bottom OSC Bar (Floating, 50px)
+                osc := PlayerOscBar {
+                    x: 16px;
+                    y: parent.height - self.height - 12px;
+                    width: parent.width - 32px;
+                    playing: root.is-playing;
+                    position: root.position;
+                    duration: root.duration;
+                    volume: root.volume;
+                    current-time: root.current-time;
+                    duration-time: root.duration-time;
+                    is-fullscreen: root.is-fullscreen;
+                    ocr-enabled: root.ocr-enabled;
+                    toggle-play => { root.toggle-play(); }
+                    seek(val) => { root.seek-to(val); }
+                    subtitle-seek(dir) => { root.sub-seek(dir); }
+                    playlist-prev => { root.playlist-prev(); }
+                    playlist-next => { root.playlist-next(); }
+                    toggle-mute => { root.toggle-mute(); }
+                    start-ocr => { root.start-ocr(); }
+                    volume-changed(val) => { root.set-volume(val); }
+                    toggle-sub-list => {
+                        root.sub-drawer-open = !root.sub-drawer-open;
+                        root.dict-search-open = false;
+                    }
+                    toggle-fullscreen => { root.toggle-fullscreen(); }
+                }
+
+                // Drag a rectangle over the current video frame for OCR.
+                if root.ocr-mode : Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    ocr-touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-cursor: crosshair;
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.up) {
+                                let min-x = min(self.pressed-x, self.mouse-x);
+                                let min-y = min(self.pressed-y, self.mouse-y);
+                                let max-x = max(self.pressed-x, self.mouse-x);
+                                let max-y = max(self.pressed-y, self.mouse-y);
+                                let box-w = max-x - min-x;
+                                let box-h = max-y - min-y;
+                                if (box-w >= 6px && box-h >= 6px && self.width > 0px && self.height > 0px) {
+                                    root.ocr-region(
+                                        min-x / self.width,
+                                        min-y / self.height,
+                                        box-w / self.width,
+                                        box-h / self.height
+                                    );
+                                }
+                                root.ocr-mode = false;
+                            } else if (event.kind == PointerEventKind.cancel) {
+                                root.ocr-mode = false;
+                            }
+                        }
+                    }
+                    if ocr-touch.pressed : Rectangle {
+                        x: min(ocr-touch.pressed-x, ocr-touch.mouse-x);
+                        y: min(ocr-touch.pressed-y, ocr-touch.mouse-y);
+                        width: max(1px, max(ocr-touch.pressed-x, ocr-touch.mouse-x) - self.x);
+                        height: max(1px, max(ocr-touch.pressed-y, ocr-touch.mouse-y) - self.y);
+                        background: #21a5bb33;
+                        border-width: 2px;
+                        border-color: #21a5bb;
+                    }
+                }
+            }
+
+            DictionarySearchPanel {
+                width: root.dict-search-open ? 340px : 0px;
+                visible: self.width > 0px;
+                results: root.dict-results;
+                query <=> root.dict-query;
+                search-changed(query) => { root.search-dictionary(query); }
+                lookup(word) => { root.lookup-word(word); }
+                close => { root.dict-search-open = false; }
+            }
+            SubtitleDrawerPanel {
+                width: (root.sub-drawer-open && !root.dict-search-open) ? 360px : 0px;
+                visible: self.width > 0px;
+                entries: root.subtitle-entries;
+                format-timestamp(sec) => { root.format-timestamp(sec) }
+                row-clicked(idx) => { root.select-row(idx); }
+                row-activated(sec) => { root.seek-to(sec); }
+                search-changed(q) => { root.search-subtitles(q); }
+            }
+        }
+    }
+
+    // Dismiss overlay when any menu is open (click outside menu bar to close)
+    if menu-bar.open-menu >= 0 : TouchArea {
+        y: 30px;
+        width: 100%;
+        height: parent.height - 30px;
+        clicked => {
+            menu-bar.open-menu = -1;
+        }
+    }
+
+    // Dropdown Menus Overlay
+    menu-drop := MenuDropdown {
+        menu-index: menu-bar.open-menu;
+        audio-tracks: root.audio-tracks;
+        subtitle-tracks: root.subtitle-tracks;
+        recent-files: root.recent-files;
+        anki-profiles: root.anki-profiles;
+        audio-id: root.audio-id;
+        primary-sid: root.primary-sid;
+        secondary-sid: root.secondary-sid;
+        anki-profile: root.anki-profile;
+        anki-enabled: root.anki-enabled;
+        asr-enabled: root.asr-enabled;
+        asr-running: root.asr-running;
+        ocr-enabled: root.ocr-enabled;
+        furigana-enabled: root.furigana-enabled;
+        auto-pause: root.auto-pause;
+        subtitles-visible: root.subtitles-visible;
+        furigana-visible: root.furigana-visible;
+        key-open-file: root.key-open-file;
+        key-open-url: root.key-open-url;
+        key-show-search: root.key-show-search;
+        key-show-sub-list: root.key-show-sub-list;
+        key-start-ocr: root.key-start-ocr;
+        key-sub-auto-pause: root.key-sub-auto-pause;
+        key-sub-show: root.key-sub-show;
+        key-sub-furigana: root.key-sub-furigana;
+        key-sub-increase-size: root.key-sub-increase-size;
+        key-sub-decrease-size: root.key-sub-decrease-size;
+        key-sub-move-up: root.key-sub-move-up;
+        key-sub-move-down: root.key-sub-move-down;
+        open-file => { root.open-file(); }
+        open-url => { root.open-url(); }
+        open-recent(path) => { root.open-recent(path); }
+        clear-recent => { root.clear-recent(); }
+        select-audio-track(id) => { root.select-audio-track(id); }
+        select-subtitle-track(id) => { root.select-subtitle-track(id); }
+        select-secondary-subtitle-track(id) => { root.select-secondary-subtitle-track(id); }
+        select-asr => { root.select-asr(); }
+        select-anki-profile(name) => { root.select-anki-profile(name); }
+        auto-pause-changed(enabled) => { root.auto-pause-changed(enabled); }
+        adjust-subtitle-scale(delta) => { root.adjust-subtitle-scale(delta); }
+        adjust-subtitle-offset(delta) => { root.adjust-subtitle-offset(delta); }
+        subtitles-visible-changed(visible) => { root.subtitles-visible-changed(visible); }
+        furigana-visible-changed(visible) => { root.furigana-visible-changed(visible); }
+        add-subtitle => { root.add-subtitle(); }
+        toggle-search => {
+            root.dict-search-open = !root.dict-search-open;
+            root.sub-drawer-open = false;
+        }
+        toggle-sub-drawer => {
+            root.sub-drawer-open = !root.sub-drawer-open;
+            root.dict-search-open = false;
+        }
+        start-ocr => { root.start-ocr(); }
+        open-options => { root.open-options(); }
+        open-config => { root.open-config(); }
+        check-updates => { root.check-updates(); }
+        show-about => { root.about-open = true; }
+        close-menu => { menu-bar.open-menu = -1; }
+    }
+
+    if root.status-message != "" : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 112px;
+        width: min(650px, parent.width - 40px);
+        height: 42px;
+        background: #252b2ee8;
+        border-radius: 5px;
+        border-width: 1px;
+        border-color: #48535a;
+        Text {
+            text: root.status-message;
+            color: white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width - 16px;
+            height: parent.height;
+            x: 8px;
+            overflow: elide;
+        }
+    }
+
+    if root.about-open : Rectangle {
+        background: #00000099;
+        TouchArea { clicked => { root.about-open = false; } }
+        Rectangle {
+            width: 400px;
+            height: 195px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #30363a;
+            border-color: #48535a;
+            border-width: 1px;
+            border-radius: 7px;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                Text { text: "Memento " + root.app-version; color: white; font-size: 22px; }
+                Text { text: "An mpv-based video player for studying Japanese"; color: #dde4e6; }
+                Text { text: "Copyright © Ripose · GPL-2.0-only"; color: #b6c0c4; }
+                Button { text: "Close"; clicked => { root.about-open = false; } }
+            }
+        }
+    }
+}

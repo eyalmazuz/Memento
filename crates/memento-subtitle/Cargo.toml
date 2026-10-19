@@ -1,0 +1,15 @@
+[package]
+name = "memento-subtitle"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento subtitle parsing and value types (src/subtitle)"
+license = "GPL-2.0-only"
+
+[dependencies]
+regex = "=1.13.1"
+
+[lib]
+name = "memento_subtitle"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]

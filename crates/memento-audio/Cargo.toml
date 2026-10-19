@@ -1,0 +1,12 @@
+[package]
+name = "memento-audio"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust audio-source payload and cache-decision cores for Memento"
+license = "GPL-2.0-only"
+
+[lib]
+name = "memento_audio"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]

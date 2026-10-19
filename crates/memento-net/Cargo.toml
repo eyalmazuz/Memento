@@ -1,0 +1,25 @@
+[package]
+name = "memento-net"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Qt-free network core for Memento (AnkiConnect + downloads)"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde_json = "=1.0.154"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+# Workspace-internal, std-only siblings reused per the port plan (these are not
+# external crates.io dependencies):
+# - memento-anki: the already-ported AnkiConnect reply-shape validation core
+#   (ReplyValidation / TypedReplyStatus / check_ankiconnect_version).
+# - memento-setting: the DownloadManager progress/speed helpers
+#   (download_speed & download_progress_update bounce for memento-net::download).
+memento-anki = { path = "../memento-anki" }
+memento-setting = { path = "../memento-setting" }
+
+[lib]
+name = "memento_net"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]

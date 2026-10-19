@@ -1,0 +1,17 @@
+[package]
+name = "memento-setting"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento settings constants and enums (src/setting/keys.h)"
+license = "GPL-2.0-only"
+
+[dependencies]
+# Intentionally empty: the C++ layer ported here (keys.h) is pure data and
+# requires nothing beyond std.
+
+[lib]
+name = "memento_setting"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+

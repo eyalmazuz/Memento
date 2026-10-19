@@ -1,0 +1,18 @@
+[package]
+name = "memento-util"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Rust port of Memento utility algorithms (src/util)"
+license = "GPL-2.0-only"
+
+[dependencies]
+unicode-segmentation = "=1.13.3"
+unicode-normalization = "=0.1.25"
+md-5 = "=0.10.6"
+base64 = "=0.22.1"
+
+[lib]
+name = "memento_util"
+path = "src/lib.rs"
+crate-type = ["staticlib", "lib"]
