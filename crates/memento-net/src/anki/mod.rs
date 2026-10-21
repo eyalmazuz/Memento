@@ -161,6 +161,8 @@ pub enum AnkiError
         version: i32,
         min: i32,
     },
+    /// `addNote` returned zero or a value that is not a positive note ID.
+    InvalidNoteId,
 }
 
 impl AnkiError
@@ -188,6 +190,7 @@ impl std::fmt::Display for AnkiError
             Self::VersionTooLow { version, min } => {
                 write!(f, "AnkiConnect version {version} < {min}")
             }
+            Self::InvalidNoteId => write!(f, "AnkiConnect did not return a valid note ID"),
             Self::Frame(status) => match status
             {
                 ReplyValidation::Ok => write!(f, "reply validated"),
@@ -463,8 +466,7 @@ impl AnkiClient
             .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
     }
 
-    /// `addNote` with `{ "note": ... }`, returning the note id
-    /// (`requestInt`).
+    /// `addNote` with `{ "note": ... }`, returning its positive 64-bit note ID.
     pub fn add_note(&self, note: Value) -> AnkiResult<i64>
     {
         let params = json!({ "note": note });
@@ -473,7 +475,7 @@ impl AnkiClient
             AnkiAction::AddNote,
             Some(params),
         )?;
-        Ok(as_qint32(&result) as i64)
+        as_note_id(&result).ok_or(AnkiError::InvalidNoteId)
     }
 
     /// `storeMediaFile` inside `multi` (the `addMedia` flow): the caller
@@ -737,9 +739,26 @@ fn as_qint32(value: &Value) -> i32
     }
 }
 
+fn as_note_id(value: &Value) -> Option<i64>
+{
+    if let Some(id) = value.as_i64() {
+        return (id > 0).then_some(id);
+    }
+    if let Some(id) = value.as_u64() {
+        return i64::try_from(id).ok().filter(|id| *id > 0);
+    }
+    let number = value.as_f64()?;
+    // JSON floating point integers are exact only through 2^53.
+    if number.is_finite() && number.fract() == 0.0
+        && (1.0..=(1_u64 << 53) as f64).contains(&number) {
+        return Some(number as i64);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{as_qint32, AnkiEndpoint, DEFAULT_TIMEOUT};
+    use super::{as_note_id, as_qint32, AnkiEndpoint, DEFAULT_TIMEOUT};
     use serde_json::json;
 
     #[test]
@@ -750,6 +769,16 @@ mod tests {
         assert_eq!(as_qint32(&json!(123.5)), 0);
         assert_eq!(as_qint32(&json!(i32::MAX as i64 + 1)), 0);
         assert_eq!(as_qint32(&json!(i32::MIN as i64 - 1)), 0);
+    }
+
+    #[test]
+    fn note_ids_keep_64_bit_values_and_reject_zero()
+    {
+        assert_eq!(as_note_id(&json!(1669909161234_i64)), Some(1669909161234));
+        assert_eq!(as_note_id(&json!(1669909161234_f64)), Some(1669909161234));
+        assert_eq!(as_note_id(&json!(0)), None);
+        assert_eq!(as_note_id(&json!(-1)), None);
+        assert_eq!(as_note_id(&json!(1.5)), None);
     }
 
 

@@ -94,6 +94,143 @@ impl AudioController {
     }
 }
 
+/// Resolve the first configured pronunciation source for AnkiConnect's
+/// `addNote.audio` attachment. JSON source discovery runs on the caller's
+/// background thread; the player remains free to continue rendering.
+pub fn resolve_word_audio(
+    expression: &str,
+    reading: &str,
+    sources: &[AudioSourceEntry],
+) -> Result<(String, String, String), String> {
+    let http = HttpClient::new(HttpClientConfig {
+        timeout: Some(NETWORK_TIMEOUT),
+        connect_timeout: Some(CONNECT_TIMEOUT),
+        ..HttpClientConfig::default()
+    });
+    for source in sources {
+        let source_url = expand_source_url(&source.url, expression, reading)?;
+        if source_url.trim().is_empty() { continue; }
+        let url = match i32::try_from(source.kind).ok().and_then(|kind| AudioSourceType::try_from(kind).ok()) {
+            Some(AudioSourceType::AudioSourceTypeFile) => source_url,
+            Some(AudioSourceType::AudioSourceTypeJson) => {
+                let body = (|| -> Result<Vec<u8>, String> {
+                    match classify_url(&source_url)? {
+                        SourceLocation::File(path) => fs::read(path).map_err(|error| error.to_string()),
+                        SourceLocation::Http(url) => {
+                            let parsed = HttpUrl::parse(&url).map_err(|error| error.to_string())?;
+                            let mut response = http.send(&Request::get(parsed)).map_err(|error| error.to_string())?;
+                            if !(200..300).contains(&response.status()) {
+                                return Err(format!("audio source returned HTTP {}", response.status()));
+                            }
+                            response.read_all(8 * 1024 * 1024).map_err(|error| error.to_string())
+                        }
+                    }
+                })();
+                let Ok(body) = body else { continue };
+                let Ok(urls) = parse_json_audio_sources(&body) else { continue };
+                let Some(url) = urls.into_iter().next() else { continue };
+                url
+            }
+            None => continue,
+        };
+        let (url_units, name_units) = memento_anki::note::format_audio_url_and_filename(
+            &url.encode_utf16().collect::<Vec<_>>(),
+            &source.name.encode_utf16().collect::<Vec<_>>(),
+            &expression.encode_utf16().collect::<Vec<_>>(),
+            &reading.encode_utf16().collect::<Vec<_>>(),
+            false,
+        );
+        return Ok((String::from_utf16_lossy(&url_units), String::from_utf16_lossy(&name_units), source.md5.clone()));
+    }
+    Err("configured audio sources returned no audio files".into())
+}
+
+/// Expand every configured source into the playable files shown in a term's
+/// audio menu. A JSON source can contribute more than one named recording.
+pub fn enumerate_word_audio_sources(
+    expression: &str,
+    reading: &str,
+    sources: &[AudioSourceEntry],
+) -> Vec<AudioSourceEntry> {
+    let http = HttpClient::new(HttpClientConfig {
+        timeout: Some(NETWORK_TIMEOUT),
+        connect_timeout: Some(CONNECT_TIMEOUT),
+        ..HttpClientConfig::default()
+    });
+    let mut available = Vec::new();
+    for source in sources {
+        let Ok(url) = expand_source_url(&source.url, expression, reading) else { continue };
+        if url.trim().is_empty() { continue }
+        match i32::try_from(source.kind).ok().and_then(|kind| AudioSourceType::try_from(kind).ok()) {
+            Some(AudioSourceType::AudioSourceTypeFile) => available.push(AudioSourceEntry {
+                name: source.name.clone(), url, kind: AudioSourceType::AudioSourceTypeFile as i64,
+                md5: source.md5.clone(),
+            }),
+            Some(AudioSourceType::AudioSourceTypeJson) => {
+                let body = match classify_url(&url) {
+                    Ok(SourceLocation::File(path)) => fs::read(path).ok(),
+                    Ok(SourceLocation::Http(url)) => HttpUrl::parse(&url).ok().and_then(|url| {
+                        let mut response = http.send(&Request::get(url)).ok()?;
+                        (200..300).contains(&response.status()).then(|| response.read_all(8 * 1024 * 1024).ok()).flatten()
+                    }),
+                    Err(_) => None,
+                };
+                if let Some(body) = body {
+                    if let Ok(files) = parse_json_audio_entries(&body) {
+                        available.extend(files.into_iter().map(|(name, url)| AudioSourceEntry {
+                            name, url, kind: AudioSourceType::AudioSourceTypeFile as i64,
+                            md5: source.md5.clone(),
+                        }));
+                    }
+                }
+            }
+            None => {},
+        }
+    }
+    available
+}
+
+/// Fetch word audio before note creation. Passing raw Japanese text in an
+/// AnkiConnect attachment URL lets Anki's HTTP client write an encoding error
+/// into the field while still reporting that the note was added successfully.
+pub fn fetch_word_audio(
+    expression: &str,
+    reading: &str,
+    sources: &[AudioSourceEntry],
+) -> Result<(Vec<u8>, String), String> {
+    let (url, filename, skip_hash) = resolve_word_audio(expression, reading, sources)?;
+    let bytes = match classify_url(&url)? {
+        SourceLocation::File(path) => fs::read(&path)
+            .map_err(|error| format!("could not read word audio {}: {error}", path.display()))?,
+        SourceLocation::Http(url) => {
+            let http = HttpClient::new(HttpClientConfig {
+                timeout: Some(NETWORK_TIMEOUT),
+                connect_timeout: Some(CONNECT_TIMEOUT),
+                ..HttpClientConfig::default()
+            });
+            let parsed = HttpUrl::parse(&url).map_err(|error| format!("invalid word audio URL: {error}"))?;
+            let mut response = http.send(&Request::get(parsed))
+                .map_err(|error| format!("word audio download failed: {error}"))?;
+            if !(200..300).contains(&response.status()) {
+                return Err(format!("word audio download returned HTTP {}", response.status()));
+            }
+            response.read_all(32 * 1024 * 1024)
+                .map_err(|error| format!("could not read word audio: {error}"))?
+        }
+    };
+    if bytes.is_empty() {
+        return Err("word audio source returned an empty file".into());
+    }
+    if !skip_hash.is_empty() {
+        let digest = memento_util::fileutils::calculate_md5(bytes.as_slice())
+            .map_err(|error| format!("could not hash word audio: {error}"))?;
+        if md5_hex(digest).eq_ignore_ascii_case(&skip_hash) {
+            return Err(skip_hash_message());
+        }
+    }
+    Ok((bytes, filename))
+}
+
 struct CachedAudio {
     url: String,
     file: Arc<TemporaryAudioFile>,
@@ -313,6 +450,10 @@ fn expand_source_url(template: &str, expression: &str, reading: &str) -> Result<
 }
 
 fn parse_json_audio_sources(data: &[u8]) -> Result<Vec<String>, String> {
+    parse_json_audio_entries(data).map(|entries| entries.into_iter().map(|(_, url)| url).collect())
+}
+
+fn parse_json_audio_entries(data: &[u8]) -> Result<Vec<(String, String)>, String> {
     // The audio crate's parser preserves Qt's JSON/QString UTF-16 behavior,
     // including surrogate escapes. Keep the C-ABI allocation under an RAII
     // guard so all parser outcomes release their nested strings exactly once.
@@ -330,20 +471,15 @@ fn parse_json_audio_sources(data: &[u8]) -> Result<Vec<String>, String> {
     let mut urls = Vec::with_capacity(entries.0.len);
     for item in 0..entries.0.len {
         let entry = unsafe { &*entries.0.entries.add(item) };
-        let text = &entry.url;
-        if text.len > isize::MAX as usize / std::mem::size_of::<u16>()
-            || (text.len != 0 && text.data.is_null())
-        {
-            continue;
-        }
-        let units = if text.len == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(text.data, text.len) }
+        let read = |text: &memento_audio::audiofiles::AudioText| -> Option<String> {
+            if text.len > isize::MAX as usize / std::mem::size_of::<u16>()
+                || (text.len != 0 && text.data.is_null()) { return None }
+            let units = if text.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(text.data, text.len) } };
+            String::from_utf16(units).ok()
         };
-        let url = String::from_utf16(units)
-            .map_err(|error| format!("audio source JSON contains an invalid URL string: {error}"))?;
-        urls.push(url);
+        if let (Some(name), Some(url)) = (read(&entry.name), read(&entry.url)) {
+            urls.push((name, url));
+        }
     }
     Ok(urls)
 }
@@ -448,7 +584,7 @@ impl Drop for TemporaryAudioFile {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_source_url, first_audio_candidate, parse_json_audio_sources};
+    use super::{classify_url, enumerate_word_audio_sources, expand_source_url, first_audio_candidate, parse_json_audio_entries, parse_json_audio_sources, resolve_word_audio, SourceLocation};
     use super::super::config::AudioSourceEntry;
     use memento_setting::enums::AudioSourceType;
 
@@ -474,7 +610,36 @@ mod tests {
     }
 
     #[test]
+    fn anki_word_audio_uses_configured_source_and_skip_hash() {
+        let sources = vec![source(
+            "Japanese Audio", "https://audio.example.test/{expression}/{reading}.mp3",
+            AudioSourceType::AudioSourceTypeFile, "deadbeef",
+        )];
+        let (url, filename, skip_hash) = resolve_word_audio("迎えに行く", "むかえにいく", &sources).unwrap();
+        assert!(url.contains("迎えに行く"));
+        assert!(url.contains("むかえにいく"));
+        assert!(filename.starts_with("memento_Japanese_Audio_"));
+        assert_eq!(skip_hash, "deadbeef");
+    }
+
+    #[test]
+    fn word_audio_http_url_encodes_japanese_before_download() {
+        let SourceLocation::Http(url) = classify_url("http://example.test/?expression=休み&reading=やすみ").unwrap() else {
+            panic!("expected an HTTP URL");
+        };
+        assert!(url.is_ascii());
+        assert!(url.contains("expression=%E4%BC%91%E3%81%BF"));
+    }
+
+    #[test]
     fn json_audio_entries_keep_order_and_reject_invalid_documents() {
+        assert_eq!(
+            parse_json_audio_entries(
+                br#"{"type":"audioSourceList","audioSources":[{"name":"first","url":"https://example.test/1"},{"name":"second","url":"https://example.test/2"}]}"#
+            ).unwrap(),
+            vec![("first".to_owned(), "https://example.test/1".to_owned()),
+                 ("second".to_owned(), "https://example.test/2".to_owned())]
+        );
         assert_eq!(
             parse_json_audio_sources(
                 br#"{"type":"audioSourceList","audioSources":[{"name":"first","url":"https://example.test/1"},{"name":"second","url":"https://example.test/2"}]}"#
@@ -484,6 +649,28 @@ mod tests {
         );
         assert!(parse_json_audio_sources(br#"{"type":"wrong"}"#).is_err());
         assert!(parse_json_audio_sources(b"not json").is_err());
+    }
+
+    #[test]
+    fn source_menu_expands_every_named_recording_from_json() {
+        let path = std::env::temp_dir().join(format!(
+            "memento-audio-menu-{}-{}.json", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::write(&path,
+            br#"{"type":"audioSourceList","audioSources":[{"name":"speaker A","url":"https://example.test/a.mp3"},{"name":"speaker B","url":"https://example.test/b.mp3"}]}"#,
+        ).unwrap();
+        let sources = vec![
+            source("dictionary audio", &path.to_string_lossy(), AudioSourceType::AudioSourceTypeJson, "skip"),
+            source("fallback", "https://example.test/{expression}.mp3", AudioSourceType::AudioSourceTypeFile, ""),
+        ];
+        let files = enumerate_word_audio_sources("食べる", "たべる", &sources);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            ["speaker A", "speaker B", "fallback"]);
+        assert_eq!(files[1].url, "https://example.test/b.mp3");
+        assert_eq!(files[1].md5, "skip");
+        assert!(files[2].url.contains("食べる"));
     }
 
     #[test]

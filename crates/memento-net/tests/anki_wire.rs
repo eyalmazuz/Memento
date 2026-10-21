@@ -207,6 +207,15 @@ fn add_note_body_and_int_reply()
 }
 
 #[test]
+fn add_note_rejects_zero_id()
+{
+    let server = TestServer::start();
+    server.spawn(move |_, _| Action::Respond(reply_of(json!(0))));
+    let client = AnkiClient::new(endpoint_for(&server));
+    assert!(matches!(client.add_note(json!({"deckName": "Default"})), Err(AnkiError::InvalidNoteId)));
+}
+
+#[test]
 fn multi_store_media_file_body_and_string_reply()
 {
     let server = TestServer::start();

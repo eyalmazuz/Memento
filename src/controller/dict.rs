@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use memento_dict::exactquerygenerator;
+use memento_dict::deconjugationquerygenerator;
 use memento_dict::searchcontroller::{self, TagSortItem};
 use memento_dict::sqlite_db;
 use memento_util::furiganaparser;
@@ -26,6 +27,40 @@ pub struct SearchHit {
     pub example_ja: String,
     pub example_en: String,
     pub dict_name: String,
+    pub rich_glossary: Vec<GlossaryBlock>,
+}
+
+/// A display block retained from Yomitan's structured glossary data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlossaryBlock {
+    pub text: String,
+    /// 0: paragraph, 1: heading, 2: list item, 3: link.
+    pub kind: i32,
+    pub href: String,
+}
+
+/// Values used by Anki note field markers for a selected term.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnkiTermMetadata {
+    pub pitch: String,
+    pub pitch_positions: String,
+    pub pitch_categories: String,
+    pub frequencies: String,
+    pub frequency_harmonic_rank: String,
+    pub frequency_average_rank: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermPitchGraph {
+    pub dictionary: String,
+    pub mora: Vec<String>,
+    pub position: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermFrequency {
+    pub dictionary: String,
+    pub value: String,
 }
 
 impl SearchHit {
@@ -48,6 +83,7 @@ impl SearchHit {
             example_ja: String::new(),
             example_en: String::new(),
             dict_name: String::new(),
+            rich_glossary: Vec::new(),
         }
     }
 
@@ -74,6 +110,7 @@ impl SearchHit {
             example_ja: example_ja.into(),
             example_en: example_en.into(),
             dict_name: dict_name.into(),
+            rich_glossary: Vec::new(),
         }
     }
 }
@@ -461,6 +498,7 @@ pub struct DictController {
     database: Option<ReadOnlyDictionaryDb>,
     recent_hits: Vec<SearchHit>,
     last_search_error: Option<String>,
+    last_match_units: usize,
     dictionary_order: HashMap<i64, i64>,
 }
 
@@ -478,6 +516,7 @@ impl DictController {
             database: None,
             recent_hits: Vec::new(),
             last_search_error: None,
+            last_match_units: 0,
             dictionary_order: HashMap::new(),
         }
     }
@@ -535,6 +574,7 @@ impl DictController {
             database: Some(database),
             recent_hits: Vec::new(),
             last_search_error: None,
+            last_match_units: 0,
             dictionary_order: HashMap::new(),
         })
     }
@@ -635,6 +675,7 @@ impl DictController {
     /// An empty result means the query had no real match; no synthetic fallback is added.
     pub fn search(&mut self, query: &str) -> &[SearchHit] {
         self.recent_hits.clear();
+        self.last_match_units = 0;
         self.last_search_error = None;
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -644,6 +685,21 @@ impl DictController {
         let norm_query = normalize_reading(trimmed);
         let u16_query: Vec<u16> = trimmed.encode_utf16().collect();
         let exact_queries = exactquerygenerator::generate_queries(&u16_query);
+        // Prefix queries plus deconjugated base forms (e.g. 残されていた -> 残す).
+        // Longest matched surface first so the most specific entries win ties.
+        let mut lookups: Vec<LookupQuery> = exact_queries
+            .iter()
+            .map(|query| LookupQuery { key: query.deconj.clone(), surface_len: query.deconj.len() })
+            .collect();
+        for query in deconjugationquerygenerator::generate_queries(&u16_query) {
+            lookups.push(LookupQuery { key: query.deconj, surface_len: query.surface.len() });
+        }
+        lookups.sort_by(|a, b| b.surface_len.cmp(&a.surface_len));
+        // Exact and deconjugation generators can produce the same lookup key
+        // many times. The SQL result is identical; keep the longest surface
+        // so ranking and subtitle selection remain stable.
+        let mut seen_lookups = HashSet::new();
+        lookups.retain(|lookup| seen_lookups.insert(lookup.key.clone()));
 
         struct Candidate {
             hit: SearchHit,
@@ -657,7 +713,7 @@ impl DictController {
         let mut seen_database_rows = HashSet::new();
 
         let database_candidates = self.database.as_ref().map(|database| {
-            database_search_candidates(database, trimmed, &norm_query, &exact_queries)
+            database_search_candidates(database, trimmed, &norm_query, &lookups)
         });
         if let Some(Err(error)) = database_candidates.as_ref() {
             self.last_search_error = Some(error.to_string());
@@ -713,17 +769,17 @@ impl DictController {
         }
 
         let mut seen_memory_entries = HashSet::new();
-        for eq in &exact_queries {
-            if eq.deconj.is_empty() {
+        for eq in &lookups {
+            if eq.key.is_empty() {
                 continue;
             }
-            let prefix_str = String::from_utf16_lossy(&eq.deconj);
+            let prefix_str = String::from_utf16_lossy(&eq.key);
             let prefix_trimmed = prefix_str.trim();
             if prefix_trimmed.is_empty() {
                 continue;
             }
             let norm_prefix = normalize_reading(prefix_trimmed);
-            let prefix_len = eq.deconj.len();
+            let prefix_len = eq.surface_len;
 
             for (dictionary_index, dict) in self.dictionaries.iter().enumerate() {
                 for (entry_index, entry) in dict.entries.iter().enumerate() {
@@ -773,8 +829,14 @@ impl DictController {
                 .then_with(|| a.original_index.cmp(&b.original_index))
         });
 
+        self.last_match_units = candidates.first().map_or(0, |candidate| candidate.prefix_len);
         self.recent_hits = candidates.into_iter().map(|candidate| candidate.hit).collect();
         &self.recent_hits
+    }
+
+    /// UTF-16 length of the query text matched by the first hit of the last search.
+    pub fn last_match_units(&self) -> usize {
+        self.last_match_units
     }
 
     /// Search exact kanji definitions from the persisted dictionaries.
@@ -812,6 +874,11 @@ impl DictController {
     /// Returns the most recent search results.
     pub fn hits(&self) -> &[SearchHit] {
         &self.recent_hits
+    }
+
+    pub fn dictionary_id_for_name(&self, name: &str) -> Option<i64> {
+        self.database.as_ref()?.names.iter()
+            .find_map(|(id, title)| (title == name).then_some(*id))
     }
 
     /// Fetches pitch accent, general frequency rank, and JPDB frequency rank for the term.
@@ -889,8 +956,116 @@ impl DictController {
 
         (pitch_accent, freq_rank, jpdb_rank)
     }
+
+    /// Return every pitch accent supplied by enabled dictionaries for the popup.
+    pub fn get_pitch_graphs(&self, expression: &str, reading: &str) -> Vec<TermPitchGraph> {
+        let Some(database) = self.database.as_ref() else { return Vec::new() };
+        let mut rows = Vec::new();
+        if sqlite_db::add_pitches(
+            database.handle,
+            &expression.encode_utf16().collect::<Vec<_>>(),
+            &reading.encode_utf16().collect::<Vec<_>>(),
+            &mut rows,
+        ).is_err() { return Vec::new() }
+        rows.sort_by_key(|row| row.dic_id);
+        let mut result = Vec::new();
+        for row in rows {
+            let Some(dictionary) = database.names.get(&row.dic_id) else { continue };
+            let mora: Vec<String> = row.mora.iter().map(|unit| String::from_utf16_lossy(unit)).collect();
+            for position in row.positions {
+                if position < 0 || position as usize > mora.len() { continue }
+                result.push(TermPitchGraph { dictionary: dictionary.clone(), mora: mora.clone(), position });
+            }
+        }
+        result
+    }
+
+    pub fn get_frequencies(&self, expression: &str, reading: &str) -> Vec<TermFrequency> {
+        let Some(database) = self.database.as_ref() else { return Vec::new() };
+        let mut rows = Vec::new();
+        if sqlite_db::get_frequencies(
+            database.handle,
+            &expression.encode_utf16().collect::<Vec<_>>(),
+            &reading.encode_utf16().collect::<Vec<_>>(),
+            &mut rows,
+        ).is_err() { return Vec::new() }
+        rows.sort_by_key(|row| row.dic_id);
+        rows.into_iter().filter_map(|row| {
+            database.names.get(&row.dic_id).map(|dictionary| TermFrequency {
+                dictionary: dictionary.clone(),
+                value: String::from_utf16_lossy(&row.frequency),
+            })
+        }).collect()
+    }
+
+    /// Gather all enabled frequency and pitch entries for Anki, using the
+    /// shared note formatter so field values match Memento's card format.
+    pub fn get_anki_term_metadata(&self, expression: &str, reading: &str, tags: &[String]) -> AnkiTermMetadata {
+        let Some(database) = self.database.as_ref() else { return AnkiTermMetadata::default() };
+        let expression_units: Vec<u16> = expression.encode_utf16().collect();
+        let reading_units: Vec<u16> = reading.encode_utf16().collect();
+        let mut frequency_rows = Vec::new();
+        let mut pitch_rows = Vec::new();
+        if sqlite_db::get_frequencies(database.handle, &expression_units, &reading_units, &mut frequency_rows).is_err()
+            || sqlite_db::add_pitches(database.handle, &expression_units, &reading_units, &mut pitch_rows).is_err() {
+            return AnkiTermMetadata::default();
+        }
+
+        let mut titles = HashMap::new();
+        if let Ok(mut statement) = sqlite_db::Statement::prepare(database.handle, "SELECT dic_id, title FROM directory") {
+            while let Ok(true) = statement.step() {
+                titles.insert(statement.column_int64(0), statement.column_text_string(1).encode_utf16().collect::<Vec<_>>());
+            }
+        }
+
+        frequency_rows.sort_by_key(|row| row.dic_id);
+        let frequencies_owned: Vec<_> = frequency_rows.iter().map(|row| {
+            (titles.get(&row.dic_id).cloned().unwrap_or_default(), row.frequency.clone())
+        }).collect();
+        let frequencies: Vec<_> = frequencies_owned.iter().map(|(name, value)| memento_anki::note::FrequencyEntry {
+            dictionary: name,
+            freq: value,
+        }).collect();
+        let (_, harmonic, average) = memento_anki::note::frequency_stats(&frequencies);
+
+        let pitches_owned: Vec<_> = pitch_rows.iter().filter_map(|row| {
+            let positions: Vec<u8> = row.positions.iter().filter_map(|position| u8::try_from(*position).ok()).collect();
+            (!positions.is_empty() && !row.mora.is_empty()).then(|| {
+                (titles.get(&row.dic_id).cloned().unwrap_or_default(), positions, row.mora.clone())
+            })
+        }).collect();
+        let mora_refs: Vec<Vec<&[u16]>> = pitches_owned.iter().map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect()).collect();
+        let pitches: Vec<_> = pitches_owned.iter().enumerate().map(|(index, (name, positions, _))| memento_anki::note::PitchEntry {
+            dictionary_name: name,
+            positions,
+            mora: &mora_refs[index],
+        }).collect();
+        let categories: Vec<_> = pitches_owned.iter().map(|(_, positions, mora)| memento_anki::note::PitchCategoryInput {
+            mora_len: mora.len(),
+            positions,
+        }).collect();
+        let rule_units: Vec<Vec<u16>> = tags.iter().map(|tag| tag.encode_utf16().collect()).collect();
+        let rules: Vec<&[u16]> = rule_units.iter().map(Vec::as_slice).collect();
+        let can_be_kifuku = memento_anki::note::is_kifuku_applicable(&rules);
+
+        AnkiTermMetadata {
+            pitch: String::from_utf16_lossy(&memento_anki::note::format_pitch(&pitches)),
+            pitch_positions: String::from_utf16_lossy(&memento_anki::note::format_pitch_positions(&pitches)),
+            pitch_categories: String::from_utf16_lossy(&memento_anki::note::format_pitch_categories(&categories, can_be_kifuku)),
+            frequencies: String::from_utf16_lossy(&memento_anki::note::build_frequencies_html(&frequencies, false, false)),
+            frequency_harmonic_rank: harmonic.map(|value| value.to_string()).unwrap_or_default(),
+            frequency_average_rank: average.map(|value| value.to_string()).unwrap_or_default(),
+        }
+    }
 }
 
+
+/// One dictionary lookup key together with the number of UTF-16 units of the
+/// original query text it accounts for (the matched surface).
+struct LookupQuery {
+    key: Vec<u16>,
+    surface_len: usize,
+}
 
 struct DatabaseCandidate {
     hit: SearchHit,
@@ -969,7 +1144,7 @@ fn database_search_candidates(
     database: &ReadOnlyDictionaryDb,
     query: &str,
     normalized_query: &str,
-    exact_queries: &[exactquerygenerator::ExactQuery],
+    lookups: &[LookupQuery],
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
     const TERM_DETAILS_QUERY: &str =
         "SELECT term_bank.rowid, term_bank.dic_id, term_bank.def_tags, term_bank.term_tags, \
@@ -981,19 +1156,21 @@ fn database_search_candidates(
                            WHERE dict_disabled.dic_id = term_bank.dic_id) \
          ORDER BY term_bank.dic_id ASC, term_bank.sequence ASC;";
 
+    let mut details_statement = sqlite_db::Statement::prepare(database.handle, TERM_DETAILS_QUERY)
+        .map_err(DictControllerError::Sqlite)?;
     let mut results = Vec::new();
-    for exact_query in exact_queries {
-        if exact_query.deconj.is_empty() {
+    for lookup in lookups {
+        if lookup.key.is_empty() {
             continue;
         }
-        let prefix = String::from_utf16_lossy(&exact_query.deconj);
+        let prefix = String::from_utf16_lossy(&lookup.key);
         if prefix.trim().is_empty() {
             continue;
         }
 
         let normalized_prefix = normalize_nfkc_query(&prefix);
         let normalized_prefix: Vec<u16> = normalized_prefix.encode_utf16().collect();
-        let plan = sqlite_db::TermQueryPlan::new(&exact_query.deconj, &normalized_prefix);
+        let plan = sqlite_db::TermQueryPlan::new(&lookup.key, &normalized_prefix);
         let mut terms = Vec::new();
         sqlite_db::query_terms(database.handle, &plan, &mut terms)
             .map_err(DictControllerError::Sqlite)?;
@@ -1001,27 +1178,33 @@ fn database_search_candidates(
         for term in terms {
             let expression = String::from_utf16_lossy(&term.expression);
             let reading = String::from_utf16_lossy(&term.reading);
-            let mut statement =
-                sqlite_db::Statement::prepare(database.handle, TERM_DETAILS_QUERY)
-                    .map_err(DictControllerError::Sqlite)?;
-            statement
+            details_statement.reset().map_err(DictControllerError::Sqlite)?;
+            details_statement
                 .bind_u16_as_utf8(1, &term.expression)
                 .map_err(DictControllerError::Sqlite)?;
-            statement
+            details_statement
                 .bind_u16_as_utf8(2, &term.reading)
                 .map_err(DictControllerError::Sqlite)?;
 
-            while statement.step().map_err(DictControllerError::Sqlite)? {
-                let source_row_id = statement.column_int64(0);
-                let dictionary_id = statement.column_int64(1);
-                let def_tags = statement.column_text_string(2);
-                let term_tags = statement.column_text_string(3);
-                let score = i64::from(statement.column_int(4));
-                let raw_glossary = statement.column_text_string(5);
-                let dictionary_name = statement.column_text_string(6);
+            while details_statement.step().map_err(DictControllerError::Sqlite)? {
+                let source_row_id = details_statement.column_int64(0);
+                let dictionary_id = details_statement.column_int64(1);
+                let def_tags = details_statement.column_text_string(2);
+                let term_tags = details_statement.column_text_string(3);
+                let score = i64::from(details_statement.column_int(4));
+                let raw_glossary = details_statement.column_text_string(5);
+                let dictionary_name = details_statement.column_text_string(6);
                 let norm_expression = normalize_reading(&expression);
                 let norm_reading = normalize_reading(&reading);
-                let (glossary, example_ja, example_en) = parse_glossary_entry(&raw_glossary);
+                let parsed_glossary = serde_json::from_str::<serde_json::Value>(&raw_glossary);
+                let (glossary, example_ja, example_en, rich_glossary) = match parsed_glossary.as_ref() {
+                    Ok(value) => {
+                        let (glossary, example_ja, example_en) = parse_glossary_entry_value(value);
+                        (glossary, example_ja, example_en, parse_rich_glossary_value(value))
+                    }
+                    Err(_) => (strip_glossary_markup(&raw_glossary), String::new(), String::new(),
+                        parse_rich_glossary(&raw_glossary)),
+                };
                 results.push(DatabaseCandidate {
                     hit: SearchHit {
                         expression: expression.clone(),
@@ -1039,11 +1222,12 @@ fn database_search_candidates(
                         example_ja,
                         example_en,
                         dict_name: dictionary_name.clone(),
+                        rich_glossary,
                     },
                     is_exact: expression == query
                         || norm_expression == normalized_query
                         || (!norm_reading.is_empty() && norm_reading == normalized_query),
-                    prefix_len: exact_query.deconj.len(),
+                    prefix_len: lookup.surface_len,
                     dict_priority: dictionary_id,
                     source_row_id: Some(source_row_id),
                 });
@@ -1090,6 +1274,7 @@ fn database_kanji_candidates(
                 example_ja: String::new(),
                 example_en: String::new(),
                 dict_name: dictionary_name.clone(),
+                rich_glossary: Vec::new(),
             },
             is_exact: true,
             prefix_len,
@@ -1164,11 +1349,101 @@ fn format_dictionary_tags(
     format_tags(&selected)
 }
 
+fn rich_node_text(node: &serde_json::Value) -> String {
+    match node {
+        serde_json::Value::String(value) => strip_glossary_markup(value),
+        serde_json::Value::Array(items) => items.iter().map(rich_node_text).collect(),
+        serde_json::Value::Object(map) => {
+            if matches!(map.get("tag").and_then(serde_json::Value::as_str), Some("rt" | "rp" | "img")) {
+                return String::new();
+            }
+            map.get("content").or_else(|| map.get("text")).map(rich_node_text).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Keep headings, list items, and links separate for the popup while the plain
+/// glossary remains available for search and Anki fields.
+fn parse_rich_glossary_value(value: &serde_json::Value) -> Vec<GlossaryBlock> {
+    fn push(blocks: &mut Vec<GlossaryBlock>, text: String, kind: i32, href: &str) {
+        let text = text.trim().trim_start_matches(['◦', '•']).trim().to_owned();
+        if !text.is_empty() {
+            blocks.push(GlossaryBlock { text, kind, href: href.to_owned() });
+        }
+    }
+    fn walk(node: &serde_json::Value, blocks: &mut Vec<GlossaryBlock>) {
+        match node {
+            serde_json::Value::String(value) => {
+                for line in strip_glossary_markup(value).lines() {
+                    push(blocks, line.to_owned(), 2, "");
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items { walk(item, blocks); }
+            }
+            serde_json::Value::Object(map) => {
+                let tag = map.get("tag").and_then(serde_json::Value::as_str).unwrap_or("");
+                let data = map.get("data").and_then(serde_json::Value::as_object);
+                if data.and_then(|data| data.get("content")).and_then(serde_json::Value::as_str) == Some("examples") {
+                    return;
+                }
+                let Some(content) = map.get("content") else { return; };
+                match tag {
+                    "rt" | "rp" | "img" => {},
+                    "li" => push(blocks, rich_node_text(content), 2, ""),
+                    "a" => push(blocks, rich_node_text(content), 3,
+                        map.get("href").and_then(serde_json::Value::as_str).unwrap_or("")),
+                    "span" => {
+                        let has_link = content.as_array().is_some_and(|items| items.iter().any(|item|
+                            item.get("tag").and_then(serde_json::Value::as_str) == Some("a")));
+                        if has_link { walk(content, blocks); }
+                        else {
+                            let bold = map.get("style").and_then(|style| style.get("fontWeight"))
+                                .and_then(serde_json::Value::as_str) == Some("bold")
+                                || content.as_array().is_some_and(|items| items.iter().any(|item|
+                                    item.get("style").and_then(|style| style.get("fontWeight"))
+                                        .and_then(serde_json::Value::as_str) == Some("bold")));
+                            push(blocks, rich_node_text(content), if bold { 1 } else { 0 }, "");
+                        }
+                    }
+                    "div" if data.and_then(|data| data.get("name")).and_then(serde_json::Value::as_str) == Some("definition") =>
+                        push(blocks, rich_node_text(content), 0, ""),
+                    "div" | "ul" | "ol" => walk(content, blocks),
+                    _ => {
+                        if content.is_string() { push(blocks, rich_node_text(content), 0, ""); }
+                        else { walk(content, blocks); }
+                    }
+                }
+            }
+            _ => {},
+        }
+    }
+    let mut blocks = Vec::new();
+    walk(value, &mut blocks);
+    blocks
+}
+
+pub fn parse_rich_glossary(raw: &str) -> Vec<GlossaryBlock> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        parse_rich_glossary_value(&value)
+    } else {
+        strip_glossary_markup(raw).lines().filter_map(|line| {
+            let text = line.trim();
+            (!text.is_empty()).then(|| GlossaryBlock { text: text.to_owned(), kind: 0, href: String::new() })
+        }).collect()
+    }
+}
+
 pub fn parse_glossary_entry(raw: &str) -> (String, String, String) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return (strip_glossary_markup(raw), String::new(), String::new());
-    };
-    let items = value.as_array().map_or_else(|| vec![&value], |items| items.iter().collect());
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => parse_glossary_entry_value(&value),
+        Err(_) => (strip_glossary_markup(raw), String::new(), String::new()),
+    }
+}
+
+fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, String, String) {
+    let items = value.as_array().map_or_else(|| vec![value], |items| items.iter().collect());
     let mut senses = Vec::new();
     let mut ex_ja = Vec::new();
     let mut ex_en = Vec::new();

@@ -7,5 +7,6 @@ pub mod subtitles;
 pub mod dict;
 pub mod dictmanager;
 pub mod anki;
+pub mod anki_media;
 pub mod asr;
 pub mod config;

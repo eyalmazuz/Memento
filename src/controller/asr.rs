@@ -2,7 +2,7 @@
 //!
 //! The controller owns a cancellable background worker and reports status and
 //! cue deltas through [`AsrEvent`]. The UI thread drains those events and
-//! applies cue deltas to libmpv's memory subtitle track and
+//! applies cue deltas to the local ASR track in
 //! [`crate::controller::subtitles::SubtitleController`].
 
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -12,7 +12,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 use memento_config::{config::Config, Value};
 use memento_setting::keys::{asr, onnx, whisper};
@@ -26,8 +25,6 @@ use memento_asr_whisper::{engine as whisper_engine, whisper_sys as whisper_sys};
 
 const WORK_WINDOW_SECONDS: f64 = 30.0;
 const MIN_WORK_WINDOW_SECONDS: f64 = 0.25;
-const SEEK_RESTART_THRESHOLD_SECONDS: f64 = 5.0;
-const SEEK_RESTART_CLOCK_SLOP_SECONDS: f64 = 2.0;
 const SUBTITLE_TIME_DELTA: f64 = 0.0001;
 const MAX_TRANSCRIPTION_FAILURES: u32 = 3;
 // The app targets the same ONNX Runtime 1.22.0 C API as the Rust engine port.
@@ -39,6 +36,22 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 pub enum AsrBackend {
     Whisper,
     Onnx,
+}
+
+/// Count GPU devices registered with the ggml build linked into this app.
+/// Whisper counts both discrete and integrated GPUs for its device index.
+pub fn whisper_gpu_device_count() -> usize {
+    unsafe extern "C" {
+        fn ggml_backend_dev_count() -> usize;
+        fn ggml_backend_dev_get(index: usize) -> *mut c_void;
+        fn ggml_backend_dev_type(device: *mut c_void) -> i32;
+    }
+    (0..unsafe { ggml_backend_dev_count() })
+        .filter(|index| {
+            let device = unsafe { ggml_backend_dev_get(*index) };
+            matches!(unsafe { ggml_backend_dev_type(device) }, 1 | 2)
+        })
+        .count()
 }
 
 #[derive(Clone, Debug)]
@@ -277,9 +290,6 @@ pub struct AsrController {
     shared: Arc<Shared>,
     receiver: mpsc::Receiver<AsrEvent>,
     worker: Option<JoinHandle<()>>,
-    last_position: f64,
-    last_position_at: Instant,
-    start_from_beginning: bool,
 }
 
 impl Default for AsrController {
@@ -300,9 +310,6 @@ impl AsrController {
             }),
             receiver,
             worker: None,
-            last_position: -1.0,
-            last_position_at: Instant::now(),
-            start_from_beginning: false,
         }
     }
 
@@ -358,9 +365,6 @@ impl AsrController {
             running: AtomicBool::new(true),
         });
         self.shared = shared.clone();
-        self.last_position = position;
-        self.last_position_at = Instant::now();
-        self.start_from_beginning = settings.start_from_beginning;
 
         self.worker = Some(thread::Builder::new()
             .name("memento-asr".into())
@@ -369,46 +373,18 @@ impl AsrController {
         Ok(())
     }
 
-    /// Feed the current player clock from the UI timer. A discontinuous seek
-    /// cancels active extraction/inference and causes the worker to restart at
-    /// the new position; no mpv object crosses the thread boundary.
-    pub fn update_position(&mut self, position: f64, duration: f64, paused: bool) {
+    /// Update playback position without restarting VAD or Whisper on seeks.
+    /// The worker transcribes each media interval once, then reuses its cues.
+    pub fn update_position(&mut self, position: f64, duration: f64, _paused: bool) {
         if !position.is_finite() || !duration.is_finite() || duration <= 0.0 {
             return;
         }
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_position_at).as_secs_f64();
-        let seeked = self.last_position >= 0.0 && is_seeked(
-            position,
-            self.last_position,
-            elapsed,
-            paused,
-        );
-        self.last_position = position;
-        self.last_position_at = now;
-
         let mut control = lock(&self.shared.control);
         if !control.active || control.stop {
             return;
         }
         control.position = position;
         control.duration = duration;
-        if !seeked {
-            return;
-        }
-        if self.start_from_beginning && self.shared.running.load(Ordering::Acquire) {
-            return;
-        }
-        control.generation = control.generation.wrapping_add(1);
-        control.restart_position = Some(if self.start_from_beginning {
-            0.0
-        } else {
-            position.max(0.0).min(duration)
-        });
-        if let Some(abort) = &control.current_abort {
-            abort.store(true, Ordering::Release);
-        }
-        self.shared.wake.notify_all();
     }
 
     pub fn is_running(&self) -> bool {
@@ -426,7 +402,10 @@ impl AsrController {
         let generation = lock(&self.shared.control).generation;
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
-            if event.generation() == generation {
+            // CueBook keeps cues across seeks. Its queued deltas remain valid
+            // even if the playback generation changed before the UI polled.
+            if matches!(event, AsrEvent::CueAdded { .. } | AsrEvent::CueRemoved { .. })
+                || event.generation() == generation {
                 events.push(event);
             }
         }
@@ -434,7 +413,7 @@ impl AsrController {
     }
 
     /// Drain worker notifications and synchronously dispatch them to the
-    /// caller, which must update Slint and the mpv memory track here.
+    /// caller, which must update Slint and the local ASR subtitle track here.
     pub fn poll_with(&mut self, mut callback: impl FnMut(AsrEvent)) {
         for event in self.poll() {
             callback(event);
@@ -466,16 +445,6 @@ impl Drop for AsrController {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn is_seeked(position: f64, last: f64, elapsed: f64, paused: bool) -> bool {
-    if last >= 0.0 {
-        let delta = position - last;
-        if delta.abs() > SEEK_RESTART_THRESHOLD_SECONDS {
-            return delta < 0.0 || paused || delta > elapsed + SEEK_RESTART_CLOCK_SLOP_SECONDS;
-        }
-    }
-    false
 }
 
 #[derive(Clone)]
@@ -570,11 +539,17 @@ enum WindowPlan {
 struct CueBook {
     cues: Vec<AsrCue>,
     next_id: u64,
+    processed: Vec<(f64, f64)>,
 }
 
 impl CueBook {
     fn skip_covered_position(&self, mut position: f64) -> f64 {
         loop {
+            if let Some((_, end)) = self.processed.iter().find(|(start, end)|
+                *start <= position + SUBTITLE_TIME_DELTA && position < *end) {
+                position = *end;
+                continue;
+            }
             let Some(cue) = self.cues.iter().find(|cue| {
                 cue.start <= position + SUBTITLE_TIME_DELTA && position < cue.end
             }) else {
@@ -585,11 +560,13 @@ impl CueBook {
     }
 
     fn next_subtitle_start(&self, position: f64) -> f64 {
-        self.cues
+        let next_cue = self.cues
             .iter()
             .filter(|cue| cue.start > position + SUBTITLE_TIME_DELTA)
             .map(|cue| cue.start)
-            .fold(f64::INFINITY, f64::min)
+            .fold(f64::INFINITY, f64::min);
+        self.processed.iter().filter(|(start, _)| *start > position + SUBTITLE_TIME_DELTA)
+            .map(|(start, _)| *start).fold(next_cue, f64::min)
     }
 
     fn plan_window(&self, start: f64, duration: f64, rewound: bool) -> WindowPlan {
@@ -745,8 +722,44 @@ impl Drop for WhisperModel {
     }
 }
 
+struct WhisperVad(*mut whisper_sys::whisper_vad_context);
+
+impl Drop for WhisperVad {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { whisper_sys::whisper_vad_free(self.0) };
+        }
+    }
+}
+
+impl WhisperVad {
+    // Preserve the VAD state as the worker advances through the media. Whisper's
+    // built-in VAD path resets it on every whisper_full call (each 30s window).
+    fn contains_speech(&self, wav_path: &Path, rewind: bool) -> Result<bool, String> {
+        let samples = whisper_engine::read_whisper_wav(wav_path)?;
+        if samples.is_empty() { return Ok(false); }
+        if rewind { unsafe { whisper_sys::whisper_vad_reset_state(self.0) }; }
+        let count = i32::try_from(samples.len())
+            .map_err(|_| "ASR VAD window contains too many audio samples".to_owned())?;
+        if !unsafe { whisper_sys::whisper_vad_detect_speech_no_reset(self.0, samples.as_ptr(), count) } {
+            return Err("Whisper VAD could not scan the audio window".into());
+        }
+        let segments = unsafe {
+            whisper_sys::whisper_vad_segments_from_probs(
+                self.0, whisper_sys::whisper_vad_default_params(),
+            )
+        };
+        if segments.is_null() {
+            return Err("Whisper VAD could not identify speech segments".into());
+        }
+        let count = unsafe { whisper_sys::whisper_vad_segments_n_segments(segments) };
+        unsafe { whisper_sys::whisper_vad_free_segments(segments) };
+        Ok(count > 0)
+    }
+}
+
 enum RuntimeModel {
-    Whisper(WhisperModel, whisper_engine::TranscribeOptions),
+    Whisper(WhisperModel, whisper_engine::TranscribeOptions, Option<WhisperVad>),
     Onnx(Arc<onnx_engine::Engine>),
 }
 
@@ -767,21 +780,32 @@ fn load_runtime_model(settings: &AsrSettings, resolved: &ResolvedModel) -> Resul
                     path.display(),
                 ));
             }
+            let model = WhisperModel(model);
+            let vad = if settings.whisper.vad_enabled {
+                let path_c = path_to_cstring(vad_path)?;
+                let params = unsafe { whisper_sys::whisper_vad_default_context_params() };
+                let context = unsafe {
+                    whisper_sys::whisper_vad_init_from_file_with_params(path_c.as_ptr(), params)
+                };
+                if context.is_null() {
+                    return Err(format!("Whisper could not load VAD model '{}'", vad_path.display()));
+                }
+                Some(WhisperVad(context))
+            } else { None };
             Ok(RuntimeModel::Whisper(
-                WhisperModel(model),
+                model,
                 whisper_engine::TranscribeOptions {
                     language: whisper_engine::LANGUAGE_JAPANESE.to_owned(),
                     threads: settings.whisper.threads,
                     best_of: settings.whisper.best_of,
                     beam_size: settings.whisper.beam_size,
-                    use_vad: settings.whisper.vad_enabled,
-                    vad_model: if settings.whisper.vad_enabled {
-                        path_to_cstring(vad_path)?.to_string_lossy().into_owned()
-                    } else {
-                        String::new()
-                    },
+                    // The persistent scanner above handles VAD once for each
+                    // unprocessed interval; whisper_full must not scan it again.
+                    use_vad: false,
+                    vad_model: String::new(),
                     suppress_regex: settings.whisper.suppress_regex.clone(),
                 },
+                vad,
             ))
         }
         (AsrBackend::Onnx, ResolvedModel::Onnx { path }) => {
@@ -897,7 +921,7 @@ fn run_session(
                     }
                     control.current_abort = Some(abort.clone());
                 }
-                let wav = match extract_audio(&media, window.start, window.end, &abort) {
+                let wav = match extract_audio(&media, window.start, window.end, &abort, None) {
                     Ok(wav) => wav,
                     Err(message) => {
                         clear_attempt(&shared, &abort);
@@ -932,6 +956,9 @@ fn run_session(
                 match status {
                     Transcription::Success => {
                         failures = 0;
+                        // Record silent windows too: they have no cues, but VAD
+                        // must never run on them a second time this session.
+                        cues.processed.push((window.start, window.end));
                         start = window.end;
                     }
                     Transcription::Canceled => {
@@ -1010,7 +1037,15 @@ fn transcribe_window(
     window: &Window,
 ) -> Transcription {
     match model {
-        RuntimeModel::Whisper(model, options) => {
+        RuntimeModel::Whisper(model, options, vad) => {
+            if let Some(vad) = vad {
+                if abort.load(Ordering::Acquire) { return Transcription::Canceled; }
+                match vad.contains_speech(wav_path, window.rewound && window.start < SUBTITLE_TIME_DELTA) {
+                    Ok(false) => return Transcription::Success,
+                    Ok(true) => {},
+                    Err(message) => return Transcription::Failed(message),
+                }
+            }
             let abort_bridge = whisper_engine::AbortBridge {
                 poll: abort_poll,
                 user_data: Arc::as_ptr(abort).cast_mut().cast(),
@@ -1107,6 +1142,20 @@ fn create_temp_wav_path() -> Result<TempWav, String> {
     Err("Could not allocate a unique temporary ASR audio directory.".into())
 }
 
+fn create_temp_mp4_path() -> Result<TempWav, String> {
+    let root = std::env::temp_dir();
+    for _ in 0..32 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = root.join(format!("memento-anki-video-{}-{id}", std::process::id()));
+        match fs::create_dir(&directory) {
+            Ok(()) => return Ok(TempWav { path: directory.join("clip.mp4"), directory }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not create temporary Anki video directory: {error}")),
+        }
+    }
+    Err("Could not allocate a temporary Anki video directory".into())
+}
+
 struct MpvHandle(*mut mpv::mpv_handle);
 
 impl Drop for MpvHandle {
@@ -1126,7 +1175,103 @@ fn mpv_error(status: i32) -> String {
     }
 }
 
-fn extract_audio(media: &AsrMedia, start: f64, end: f64, abort: &AtomicBool) -> Result<TempWav, String> {
+/// Extract a subtitle or context clip for an Anki note on a background thread.
+pub fn extract_clip_wav(media: &AsrMedia, start: f64, end: f64, normalize_db: Option<f64>) -> Result<Vec<u8>, String> {
+    let abort = AtomicBool::new(false);
+    let wav = extract_audio(media, start, end, &abort, normalize_db)?;
+    fs::read(&wav.path).map_err(|error| format!("Could not read extracted note audio: {error}"))
+}
+
+/// Encode an Anki video attachment without blocking the UI's mpv instance.
+pub fn extract_clip_mp4(
+    media: &AsrMedia, subtitle_id: i64, start: f64, end: f64,
+    audio: bool, subtitles: bool, normalize_db: Option<f64>,
+) -> Result<Vec<u8>, String> {
+    if media.path.is_empty() || !start.is_finite() || !end.is_finite() || end <= start {
+        return Err("Could not extract Anki video: media path or clip range is invalid".into());
+    }
+    if audio && media.audio_id <= 0 {
+        return Err("Could not extract Anki video: no audio track is selected".into());
+    }
+    if subtitles && subtitle_id <= 0 {
+        return Err("Could not extract Anki video with subtitles: no subtitle track is selected; use {video:subtitles=false} for this card".into());
+    }
+    let input = CString::new(media.path.as_bytes())
+        .map_err(|_| "Media path contains an invalid NUL byte".to_owned())?;
+    let temporary = create_temp_mp4_path()?;
+    let output = CString::new(temporary.path.to_string_lossy().as_bytes())
+        .map_err(|_| "Temporary video path contains an invalid NUL byte".to_owned())?;
+    let handle = unsafe { mpv::mpv_create() };
+    if handle.is_null() { return Err("Could not create a libmpv video encoding instance".into()); }
+    let handle = MpvHandle(handle);
+    let options: [(&CStr, &CStr); 9] = [
+        (c"ovc", c"libx264"), (c"oac", c"aac"),
+        (c"vid", c"auto"),
+        (c"aid", if audio { c"auto" } else { c"no" }),
+        (c"sid", if subtitles { c"auto" } else { c"no" }),
+        (c"secondary-sid", c"no"),
+        (c"cover-art-auto", c"no"), (c"keep-open", c"no"), (c"config", c"no"),
+    ];
+    for (name, value) in options {
+        let status = unsafe { mpv::mpv_set_option_string(handle.0, name.as_ptr(), value.as_ptr()) };
+        if status < 0 { return Err(format!("Could not configure libmpv video encoding option {}: {}", name.to_string_lossy(), mpv_error(status))); }
+    }
+    if let Some(db) = normalize_db.filter(|_| audio) {
+        if !db.is_finite() { return Err("Invalid Anki video audio normalization dB".into()); }
+        let filter = CString::new(format!("loudnorm=I={db:.1}"))
+            .map_err(|_| "Invalid Anki video audio filter".to_owned())?;
+        let status = unsafe { mpv::mpv_set_option_string(handle.0, c"af".as_ptr(), filter.as_ptr()) };
+        if status < 0 { return Err(format!("Could not configure Anki video audio: {}", mpv_error(status))); }
+    }
+    let ytdl = if media.path.contains("://") { c"yes" } else { c"no" };
+    for (name, value) in [(c"ytdl", ytdl), (c"o", output.as_c_str())] {
+        let status = unsafe { mpv::mpv_set_option_string(handle.0, name.as_ptr(), value.as_ptr()) };
+        if status < 0 { return Err(format!("Could not configure Anki video output: {}", mpv_error(status))); }
+    }
+    let status = unsafe { mpv::mpv_initialize(handle.0) };
+    if status < 0 { return Err(format!("Could not initialize libmpv video encoding: {}", mpv_error(status))); }
+    let mut load_options = format!("start={start:.3},end={end:.3}");
+    if audio { load_options.push_str(&format!(",aid={}", media.audio_id)); }
+    if subtitles { load_options.push_str(&format!(",sid={subtitle_id}")); }
+    let load_options = CString::new(load_options).map_err(|_| "Invalid Anki video options".to_owned())?;
+    let api_version = unsafe { mpv::mpv_client_api_version() };
+    let mut command: Vec<*const c_char> = vec![c"loadfile".as_ptr(), input.as_ptr(), c"replace".as_ptr()];
+    if api_version >= ((2 << 16) | 3) { command.push(c"0".as_ptr()); }
+    command.extend([load_options.as_ptr(), ptr::null()]);
+    let status = unsafe { mpv::mpv_command(handle.0, command.as_mut_ptr()) };
+    if status < 0 { return Err(format!("Could not start Anki video encoding: {}", mpv_error(status))); }
+    loop {
+        let event = unsafe { mpv::mpv_wait_event(handle.0, 0.1) };
+        if event.is_null() { return Err("libmpv returned no event while encoding Anki video".into()); }
+        match unsafe { (*event).event_id } {
+            mpv::MPV_EVENT_QUEUE_OVERFLOW => return Err("libmpv Anki video event queue overflowed".into()),
+            mpv::MPV_EVENT_END_FILE => {
+                let end_file = unsafe { &*((*event).data as *const mpv::mpv_event_end_file) };
+                if end_file.reason == mpv::MPV_END_FILE_REASON_REDIRECT { continue; }
+                if end_file.error < 0 {
+                    return Err(format!("libmpv could not encode the Anki video: {}", mpv_error(end_file.error)));
+                }
+                if end_file.reason != mpv::MPV_END_FILE_REASON_EOF {
+                    return Err(format!("libmpv ended Anki video encoding early (reason {})", end_file.reason));
+                }
+                // The MP4 footer is written while the encoder shuts down.
+                drop(handle);
+                if !temporary.path.is_file() {
+                    return Err("libmpv did not create an Anki video clip".into());
+                }
+                let bytes = fs::read(&temporary.path)
+                    .map_err(|error| format!("Could not read encoded Anki video: {error}"))?;
+                if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+                    return Err(format!("libmpv produced an invalid Anki MP4 clip ({} bytes)", bytes.len()));
+                }
+                return Ok(bytes);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_audio(media: &AsrMedia, start: f64, end: f64, abort: &AtomicBool, normalize_db: Option<f64>) -> Result<TempWav, String> {
     if abort.load(Ordering::Acquire) {
         return Err("Audio extraction canceled.".into());
     }
@@ -1160,6 +1305,13 @@ fn extract_audio(media: &AsrMedia, start: f64, end: f64, abort: &AtomicBool) -> 
             return Err(format!("Could not configure libmpv audio extraction: {}", mpv_error(status)));
         }
     }
+    if let Some(db) = normalize_db {
+        if !db.is_finite() { return Err("Invalid Anki audio normalization dB".into()); }
+        let filter = CString::new(format!("loudnorm=I={db:.1}"))
+            .map_err(|_| "Invalid Anki audio normalization filter".to_owned())?;
+        let status = unsafe { mpv::mpv_set_option_string(handle.0, c"af".as_ptr(), filter.as_ptr()) };
+        if status < 0 { return Err(format!("Could not configure note audio normalization: {}", mpv_error(status))); }
+    }
     let ytdl = if media.path.contains("://") { c"yes" } else { c"no" };
     let status = unsafe { mpv::mpv_set_option_string(handle.0, c"ytdl".as_ptr(), ytdl.as_ptr()) };
     if status < 0 {
@@ -1182,7 +1334,9 @@ fn extract_audio(media: &AsrMedia, start: f64, end: f64, abort: &AtomicBool) -> 
         media.audio_id,
     )).map_err(|_| "Invalid audio extraction options.".to_owned())?;
     let api_version = unsafe { mpv::mpv_client_api_version() };
-    let is_api_23 = api_version >= ((2 << 16) | (3 << 8));
+    // mpv_client_api_version() packs (major << 16) | minor; loadfile gained its
+    // <index> argument in client API 2.3.
+    let is_api_23 = api_version >= ((2 << 16) | 3);
     let mut command: Vec<*const c_char> = vec![
         c"loadfile".as_ptr(),
         input.as_ptr(),
@@ -1230,6 +1384,22 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires ffmpeg and a libmpv build with MP4 encoding"]
+    fn encodes_real_anki_video_clip() {
+        let path = std::env::temp_dir().join(format!("memento-anki-video-test-{}.mp4", std::process::id()));
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=10:d=2", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&path).output().expect("ffmpeg must be installed");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let media = AsrMedia::new(path.to_string_lossy().into_owned(), -1);
+        let clip = extract_clip_mp4(&media, 0, 0.25, 1.25, false, false, None);
+        let _ = fs::remove_file(path);
+        let clip = clip.unwrap();
+        assert!(clip.len() > 100, "encoded clip was {} bytes", clip.len());
+        assert_eq!(&clip[4..8], b"ftyp");
+    }
+
+    #[test]
     fn cue_book_replaces_overlapping_cues_and_plans_sliding_windows() {
         let (sender, receiver) = mpsc::channel();
         let mut cues = CueBook::default();
@@ -1244,9 +1414,44 @@ mod tests {
     }
 
     #[test]
-    fn seek_detection_ignores_playback_clock_progress_but_restarts_backward_seek() {
-        assert!(!is_seeked(7.0, 0.0, 7.0, false));
-        assert!(is_seeked(10.0, 20.0, 0.1, false));
-        assert!(is_seeked(20.0, 10.0, 0.1, true));
+    fn processed_silent_windows_are_never_transcribed_twice() {
+        let mut cues = CueBook::default();
+        cues.processed.push((0.0, 30.0));
+        assert!(matches!(cues.plan_window(0.0, 60.0, false),
+            WindowPlan::Extract(Window { start: 30.0, end: 60.0, .. })));
+        cues.processed.push((30.0, 60.0));
+        assert!(matches!(cues.plan_window(0.0, 60.0, false), WindowPlan::Done));
+    }
+
+    #[test]
+    fn seeking_does_not_restart_vad_or_abort_the_active_window() {
+        let mut controller = AsrController::new();
+        let abort = Arc::new(AtomicBool::new(false));
+        {
+            let mut control = lock(&controller.shared.control);
+            control.active = true;
+            control.duration = 120.0;
+            control.current_abort = Some(abort.clone());
+        }
+        controller.update_position(75.0, 120.0, false);
+        let control = lock(&controller.shared.control);
+        assert_eq!(control.generation, 0);
+        assert_eq!(control.position, 75.0);
+        assert!(!abort.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queued_cues_survive_seek_generation_change() {
+        let mut controller = AsrController::new();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        lock(&controller.shared.control).generation = 1;
+        sender.send(AsrEvent::CueAdded { generation: 0, cue: AsrCue {
+            id: 1, text: "before seek".into(), start: 1.0, end: 2.0,
+        } }).unwrap();
+        sender.send(AsrEvent::Completed { generation: 0, cue_count: 1 }).unwrap();
+        let events = controller.poll();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AsrEvent::CueAdded { cue, .. } if cue.text == "before seek"));
     }
 }

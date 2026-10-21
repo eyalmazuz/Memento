@@ -43,8 +43,7 @@ impl From<AnkiDuplicatePolicy> for NoteOptions {
     }
 }
 
-/// A profile note cannot be built when its fields require data unavailable to
-/// the text-only Rust note context.
+/// A profile note cannot be built when a field or its required source data is invalid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteBuildError {
     NoFieldTemplates,
@@ -63,7 +62,7 @@ impl std::fmt::Display for NoteBuildError {
             }
             Self::MissingMediaCapture { field, marker } => write!(
                 f,
-                "Anki field {field:?} uses {{{marker}}}, but this Rust app has no media capture integration"
+                "Anki field {field:?} uses {{{marker}}}, but media capture failed"
             ),
             Self::MissingMarkerData { field, marker } => write!(
                 f,
@@ -84,6 +83,9 @@ pub struct NotePayload {
     pub fields: HashMap<String, String>,
     pub tags: Vec<String>,
     pub options: NoteOptions,
+    pub audio: Vec<serde_json::Value>,
+    pub picture: Vec<serde_json::Value>,
+    pub video: Vec<serde_json::Value>,
 }
 
 /// Options controlling note creation in AnkiConnect.
@@ -101,6 +103,9 @@ impl NotePayload {
             fields: HashMap::new(),
             tags: Vec::new(),
             options: NoteOptions::default(),
+            audio: Vec::new(),
+            picture: Vec::new(),
+            video: Vec::new(),
         }
     }
 
@@ -132,13 +137,23 @@ impl NotePayload {
             Some(scope) => serde_json::json!({ "duplicateScope": scope }),
             None => serde_json::json!({ "allowDuplicate": self.options.allow_duplicate }),
         };
-        serde_json::json!({
+        let mut note = serde_json::json!({
             "deckName": self.deck_name,
             "modelName": self.model_name,
             "fields": self.fields,
             "tags": self.tags,
             "options": options,
-        })
+        });
+        if !self.audio.is_empty() {
+            note["audio"] = serde_json::Value::Array(self.audio.clone());
+        }
+        if !self.picture.is_empty() {
+            note["picture"] = serde_json::Value::Array(self.picture.clone());
+        }
+        if !self.video.is_empty() {
+            note["video"] = serde_json::Value::Array(self.video.clone());
+        }
+        note
     }
 
     pub fn to_json_string(&self) -> String {
@@ -192,7 +207,7 @@ pub fn validate_note_payload(payload: &NotePayload) -> Result<(), String> {
         }
     }
     let all_empty = payload.fields.values().all(|v| v.trim().is_empty());
-    if all_empty {
+    if all_empty && payload.audio.is_empty() && payload.picture.is_empty() && payload.video.is_empty() {
         return Err("at least one field must have non-empty content".to_string());
     }
     match payload.options.duplicate_scope.as_deref() {
@@ -242,7 +257,9 @@ pub fn validate_json_payload(json: &str) -> Result<(), String> {
         }
         has_content |= !value.trim().is_empty();
     }
-    if !has_content {
+    let has_media = object.get("audio").and_then(serde_json::Value::as_array).is_some_and(|items| !items.is_empty())
+        || object.get("picture").and_then(serde_json::Value::as_array).is_some_and(|items| !items.is_empty());
+    if !has_content && !has_media {
         return Err("at least one field must have non-empty content".to_string());
     }
     Ok(())
@@ -315,6 +332,74 @@ pub struct GlossaryOutput {
     pub glossary_compact: String,
 }
 
+/// A checked dictionary entry belonging to the selected term.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlossaryDefinition {
+    pub dictionary_id: i64,
+    pub dictionary_name: String,
+    pub glossary: String,
+    pub tags: Vec<String>,
+    pub notes: String,
+    pub example_ja: String,
+    pub example_en: String,
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn definition_html(definition: &GlossaryDefinition) -> String {
+    let mut value = escape_html(&definition.glossary).replace('\n', "<br>");
+    for (label, text) in [
+        ("Example", &definition.example_ja),
+        ("Translation", &definition.example_en),
+        ("Notes", &definition.notes),
+    ] {
+        if !text.is_empty() {
+            value.push_str(&format!("<br><small>{label}: {}</small>", escape_html(text).replace('\n', "<br>")));
+        }
+    }
+    value
+}
+
+fn format_context_glossary(ctx: &NoteFieldsContext) -> GlossaryOutput {
+    format_context_glossary_for_dictionary(ctx, None)
+}
+
+fn format_context_glossary_for_dictionary(ctx: &NoteFieldsContext, dictionary_id: Option<i64>) -> GlossaryOutput {
+    if ctx.glossary_definitions.is_empty() {
+        let items: Vec<&str> = ctx.glossary_items.iter().map(String::as_str).collect();
+        let tags: Vec<&str> = ctx.tags.iter().map(String::as_str).collect();
+        return format_glossary(&items, &ctx.dictionary_name, &tags);
+    }
+    let selected: Vec<_> = ctx.glossary_definitions.iter()
+        .filter(|definition| dictionary_id.is_none_or(|id| definition.dictionary_id == id))
+        .collect();
+    let names: Vec<Vec<u16>> = selected.iter().map(|d| d.dictionary_name.encode_utf16().collect()).collect();
+    let items: Vec<Vec<u16>> = selected.iter().map(|d| definition_html(d).encode_utf16().collect()).collect();
+    let item_refs: Vec<Vec<&[u16]>> = items.iter().map(|item| vec![item.as_slice()]).collect();
+    let tag_units: Vec<Vec<Vec<u16>>> = selected.iter()
+        .map(|d| d.tags.iter().map(|tag| tag.encode_utf16().collect()).collect()).collect();
+    let tag_refs: Vec<Vec<&[u16]>> = tag_units.iter().map(|tags| tags.iter().map(Vec::as_slice).collect()).collect();
+    let definitions: Vec<memento_anki::note::TermGlossaryDef<'_>> = selected.iter().enumerate().map(|(i, definition)| {
+        memento_anki::note::TermGlossaryDef {
+            dict_name: &names[i],
+            dict_id: definition.dictionary_id,
+            tags: &tag_refs[i],
+            items: &item_refs[i],
+            has_styles: false,
+            stylesheet: &[],
+        }
+    }).collect();
+    let out = memento_anki::note::format_term_glossary(&definitions);
+    GlossaryOutput {
+        glossary: String::from_utf16_lossy(&out.glossary),
+        glossary_brief: String::from_utf16_lossy(&out.glossary_brief),
+        glossary_compact: String::from_utf16_lossy(&out.glossary_compact),
+    }
+}
+
 /// Formats glossary definition items into Memento's HTML representation.
 pub fn format_glossary(items: &[&str], dict_name: &str, tags: &[&str]) -> GlossaryOutput {
     let dict_name_u16: Vec<u16> = dict_name.encode_utf16().collect();
@@ -353,15 +438,36 @@ pub struct NoteFieldsContext {
     pub expression: String,
     pub reading: String,
     pub sentence: String,
+    pub context: String,
+    pub selection: String,
+    pub secondary_subtitle: String,
+    pub title: String,
     pub cloze_prefix: String,
     pub cloze_body: String,
     pub cloze_suffix: String,
     pub glossary_items: Vec<String>,
+    pub glossary_definitions: Vec<GlossaryDefinition>,
+    pub furigana: String,
+    pub furigana_plain: String,
+    pub pitch: String,
+    pub pitch_positions: String,
+    pub pitch_categories: String,
+    pub frequencies: String,
+    pub frequency_harmonic_rank: String,
+    pub frequency_average_rank: String,
+    pub character: String,
+    pub onyomi: String,
+    pub kunyomi: String,
+    pub stroke_count: String,
     pub dictionary_name: String,
     /// Term/kanji tags used by `{tags}` and glossary formatting. Anki note
     /// tags come from the selected profile, not this context field.
     pub tags: Vec<String>,
     pub cloze_index: usize,
+    /// AnkiConnect attachments populated before submitting a profile note.
+    pub audio_attachments: Vec<serde_json::Value>,
+    pub picture_attachments: Vec<serde_json::Value>,
+    pub video_attachments: Vec<serde_json::Value>,
 }
 
 impl NoteFieldsContext {
@@ -371,22 +477,52 @@ impl NoteFieldsContext {
         sentence: impl Into<String>,
     ) -> Self {
         let expression = expression.into();
+        let reading = reading.into();
         let sentence = sentence.into();
         let (p, b, s) = split_cloze(&sentence, &expression);
         let cloze_prefix = p.to_string();
         let cloze_body = b.to_string();
         let cloze_suffix = s.to_string();
+        let (furigana, furigana_plain) = if !reading.is_empty() && reading != expression {
+            let surface: Vec<u16> = expression.encode_utf16().collect();
+            let pronunciation: Vec<u16> = reading.encode_utf16().collect();
+            let pair = memento_anki::note::FuriganaPair { surface: &surface, reading: &pronunciation };
+            (
+                String::from_utf16_lossy(&memento_anki::note::format_furigana(&[pair], false)),
+                String::from_utf16_lossy(&memento_anki::note::format_furigana(&[pair], true)),
+            )
+        } else { (expression.clone(), expression.clone()) };
         Self {
-            reading: reading.into(),
+            reading,
+            context: sentence.clone(),
+            selection: expression.clone(),
+            secondary_subtitle: String::new(),
+            title: String::new(),
             sentence,
             cloze_prefix,
             cloze_body,
             cloze_suffix,
             expression,
             glossary_items: Vec::new(),
+            glossary_definitions: Vec::new(),
+            furigana,
+            furigana_plain,
+            pitch: String::new(),
+            pitch_positions: String::new(),
+            pitch_categories: String::new(),
+            frequencies: String::new(),
+            frequency_harmonic_rank: String::new(),
+            frequency_average_rank: String::new(),
+            character: String::new(),
+            onyomi: String::new(),
+            kunyomi: String::new(),
+            stroke_count: String::new(),
             dictionary_name: String::new(),
             tags: Vec::new(),
             cloze_index: 1,
+            audio_attachments: Vec::new(),
+            picture_attachments: Vec::new(),
+            video_attachments: Vec::new(),
         }
     }
 
@@ -422,6 +558,14 @@ fn marker_result(value: &str) -> MarkerResult {
         text: value.encode_utf16().collect(),
     }
 }
+
+fn glossary_dictionary_filter(marker: &Marker) -> Option<i64> {
+    marker.args.iter().find_map(|(name, value)| {
+        name.iter().copied().eq("dict".encode_utf16())
+            .then(|| String::from_utf16_lossy(value).parse::<i64>().ok())
+            .flatten()
+    })
+}
 fn common_marker_value<'a>(
     marker: &Marker,
     ctx: &'a NoteFieldsContext,
@@ -434,6 +578,14 @@ fn common_marker_value<'a>(
         Some(ctx.cloze_suffix.as_str())
     } else if marker_is(marker, "subtitle") || marker_is(marker, "sentence") {
         Some(ctx.sentence.as_str())
+    } else if marker_is(marker, "context") {
+        Some(ctx.context.as_str())
+    } else if marker_is(marker, "selection") {
+        Some(ctx.selection.as_str())
+    } else if marker_is(marker, "subtitle-2") || marker_is(marker, "sentence-2") || marker_is(marker, "context-2") {
+        Some(ctx.secondary_subtitle.as_str())
+    } else if marker_is(marker, "title") {
+        Some(ctx.title.as_str())
     } else {
         None
     }
@@ -457,10 +609,47 @@ fn specific_marker_value<'a>(
         Some(glossary.glossary_compact.as_str())
     } else if marker_is(marker, "tags") {
         Some(tags)
+    } else if marker_is(marker, "tags-brief") {
+        Some(tags)
+    } else if marker_is(marker, "furigana") {
+        Some(ctx.furigana.as_str())
+    } else if marker_is(marker, "furigana-plain") {
+        Some(ctx.furigana_plain.as_str())
+    } else if marker_is(marker, "pitch") || marker_is(marker, "pitch-accents") || marker_is(marker, "pitch-accent") {
+        Some(ctx.pitch.as_str())
+    } else if marker_is(marker, "pitch-positions") || marker_is(marker, "pitch-position") || marker_is(marker, "pitch-accent-positions") {
+        Some(ctx.pitch_positions.as_str())
+    } else if marker_is(marker, "pitch-categories") || marker_is(marker, "pitch-accent-categories") {
+        Some(ctx.pitch_categories.as_str())
+    } else if marker_is(marker, "frequencies") {
+        Some(ctx.frequencies.as_str())
+    } else if marker_is(marker, "frequency-harmonic-rank") {
+        Some(ctx.frequency_harmonic_rank.as_str())
+    } else if marker_is(marker, "frequency-average-rank") {
+        Some(ctx.frequency_average_rank.as_str())
+    } else if marker_is(marker, "character") {
+        Some(ctx.character.as_str())
+    } else if marker_is(marker, "onyomi") {
+        Some(ctx.onyomi.as_str())
+    } else if marker_is(marker, "kunyomi") {
+        Some(ctx.kunyomi.as_str())
+    } else if marker_is(marker, "stroke-count") {
+        Some(ctx.stroke_count.as_str())
+    } else if FALLBACK_MARKERS.iter().any(|name| marker_is(marker, name)) {
+        // Media attachments are inserted by AnkiConnect. Other optional
+        // metadata markers remain empty when their source is unavailable,
+        // while alternative markers can still supply a value.
+        Some("")
     } else {
         None
     }
 }
+
+const FALLBACK_MARKERS: &[&str] = &[
+    "audio", "audio-media", "audio-context", "sentence-audio", "screenshot", "screenshot-video", "image", "video",
+    "clipboard", "frequency-average-occurrence",
+    "frequency-harmonic-occurrence", "pitch-graphs", "pitch-graph", "pitch-accent-graphs",
+];
 
 
 /// Maps Anki field templates through the same token parser and ordered
@@ -469,9 +658,7 @@ pub fn map_note_fields(
     field_templates: &HashMap<String, String>,
     ctx: &NoteFieldsContext,
 ) -> HashMap<String, String> {
-    let glossary_refs: Vec<&str> = ctx.glossary_items.iter().map(|s| s.as_str()).collect();
-    let tag_refs: Vec<&str> = ctx.tags.iter().map(|s| s.as_str()).collect();
-    let glossary_out = format_glossary(&glossary_refs, &ctx.dictionary_name, &tag_refs);
+    let glossary_out = format_context_glossary(ctx);
     let tags_joined = ctx.tags.join(" ");
     map_note_fields_with_data(field_templates, ctx, &glossary_out, &tags_joined)
 }
@@ -493,6 +680,18 @@ fn map_note_fields_with_data(
                     .unwrap_or_default()
             },
             |marker| {
+                if (marker_is(marker, "glossary") || marker_is(marker, "glossary-brief") || marker_is(marker, "glossary-compact"))
+                    && glossary_dictionary_filter(marker).is_some() {
+                    let filtered = format_context_glossary_for_dictionary(ctx, glossary_dictionary_filter(marker));
+                    let value = if marker_is(marker, "glossary-brief") {
+                        &filtered.glossary_brief
+                    } else if marker_is(marker, "glossary-compact") {
+                        &filtered.glossary_compact
+                    } else {
+                        &filtered.glossary
+                    };
+                    return marker_result(value);
+                }
                 specific_marker_value(marker, ctx, glossary, tags)
                     .map(marker_result)
                     .unwrap_or_default()
@@ -507,31 +706,11 @@ fn marker_requires_unavailable_data(
     field: &str,
     marker: &Marker,
 ) -> Option<NoteBuildError> {
-    const MEDIA_MARKERS: &[&str] = &[
-        "audio",
-        "audio-media",
-        "audio-context",
-        "screenshot",
-        "screenshot-video",
-        "video",
-    ];
-    const SUPPORTED_MARKERS: &[&str] = &[
-        "cloze-prefix",
-        "cloze-body",
-        "cloze-suffix",
-        "subtitle",
-        "sentence",
-        "expression",
-        "reading",
-        "glossary",
-        "glossary-brief",
-        "glossary-compact",
-        "tags",
-    ];
     const KNOWN_MARKERS: &[&str] = &[
         "audio",
         "audio-media",
         "audio-context",
+        "sentence-audio",
         "clipboard",
         "cloze-prefix",
         "cloze-body",
@@ -548,6 +727,7 @@ fn marker_requires_unavailable_data(
         "glossary-compact",
         "screenshot",
         "screenshot-video",
+        "image",
         "sentence",
         "sentence-2",
         "subtitle",
@@ -560,6 +740,7 @@ fn marker_requires_unavailable_data(
         "furigana",
         "furigana-plain",
         "pitch",
+        "pitch-accent",
         "pitch-accents",
         "pitch-categories",
         "pitch-accent-categories",
@@ -577,28 +758,35 @@ fn marker_requires_unavailable_data(
         "stroke-count",
     ];
 
-    let name = KNOWN_MARKERS
-        .iter()
-        .find(|name| marker_is(marker, name))?;
-    if MEDIA_MARKERS.contains(name) {
-        return Some(NoteBuildError::MissingMediaCapture {
-            field: field.to_owned(),
-            marker: (*name).to_owned(),
-        });
-    }
-    if !SUPPORTED_MARKERS.contains(name)
-        || (name.starts_with("glossary") && !marker.args.is_empty())
-    {
+    if !KNOWN_MARKERS.iter().any(|name| marker_is(marker, name)) {
         return Some(NoteBuildError::MissingMarkerData {
             field: field.to_owned(),
-            marker: if name.starts_with("glossary") && !marker.args.is_empty() {
-                format!("{name} arguments")
-            } else {
-                (*name).to_owned()
-            },
+            marker: String::from_utf16_lossy(&marker.name),
         });
     }
     None
+}
+
+/// Profile markers for which this app currently has no source data. The
+/// corresponding fields are left empty when a note is created.
+pub fn unavailable_profile_markers(profile: &AnkiNoteConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    for template in profile.field_templates.values() {
+        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
+            for marker in token.markers {
+                if FALLBACK_MARKERS.iter().any(|name| marker_is(&marker, name))
+                    && !["audio", "audio-media", "audio-context", "sentence-audio", "screenshot", "screenshot-video", "image", "video"]
+                        .iter().any(|name| marker_is(&marker, name)) {
+                    let name = String::from_utf16_lossy(&marker.name);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
 fn validate_template_markers(
     field: &str,
@@ -638,9 +826,7 @@ pub fn default_note_fields(ctx: &NoteFieldsContext) -> HashMap<String, String> {
         &ctx.cloze_suffix,
         ctx.cloze_index,
     );
-    let glossary_refs: Vec<&str> = ctx.glossary_items.iter().map(|s| s.as_str()).collect();
-    let tag_refs: Vec<&str> = ctx.tags.iter().map(|s| s.as_str()).collect();
-    let glossary_out = format_glossary(&glossary_refs, &ctx.dictionary_name, &tag_refs);
+    let glossary_out = format_context_glossary(ctx);
 
     let mut fields = HashMap::new();
     fields.insert("Expression".to_string(), ctx.expression.clone());
@@ -670,6 +856,9 @@ pub fn build_note_payload(
         fields,
         tags: ctx.tags.clone(),
         options: NoteOptions::default(),
+        audio: ctx.audio_attachments.clone(),
+        picture: ctx.picture_attachments.clone(),
+        video: ctx.video_attachments.clone(),
     }
 }
 
@@ -684,20 +873,35 @@ pub fn build_note_payload_from_profile(
         return Err(NoteBuildError::NoFieldTemplates);
     }
     let policy = AnkiDuplicatePolicy::try_from(profile.duplicate_policy)?;
-    let glossary_refs: Vec<&str> = ctx.glossary_items.iter().map(|s| s.as_str()).collect();
-    let tag_refs: Vec<&str> = ctx.tags.iter().map(|s| s.as_str()).collect();
-    let glossary = format_glossary(&glossary_refs, &ctx.dictionary_name, &tag_refs);
+    let glossary = format_context_glossary(ctx);
     let tags = ctx.tags.join(" ");
     for (field, template) in &profile.field_templates {
         validate_template_markers(field, template, ctx, &glossary, &tags)?;
     }
 
+    let mut text_context = ctx.clone();
+    for value in [
+        &mut text_context.sentence,
+        &mut text_context.context,
+        &mut text_context.selection,
+        &mut text_context.secondary_subtitle,
+        &mut text_context.title,
+        &mut text_context.cloze_prefix,
+        &mut text_context.cloze_body,
+        &mut text_context.cloze_suffix,
+    ] {
+        *value = value.replace('\n', &profile.newline_replacer);
+    }
+
     let payload = NotePayload {
         deck_name: profile.deck.clone(),
         model_name: profile.model.clone(),
-        fields: map_note_fields_with_data(&profile.field_templates, ctx, &glossary, &tags),
+        fields: map_note_fields_with_data(&profile.field_templates, &text_context, &glossary, &tags),
         tags: profile.tags.clone(),
         options: policy.into(),
+        audio: ctx.audio_attachments.clone(),
+        picture: ctx.picture_attachments.clone(),
+        video: ctx.video_attachments.clone(),
     };
     payload
         .validate()

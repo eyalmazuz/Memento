@@ -1,8 +1,9 @@
 import { MementoPalette } from "palette.slint";
 import { ListView, LineEdit, Button, CheckBox, ComboBox, Slider, ScrollView } from "std-widgets.slint";
 import { SettingsWindow } from "settings.slint";
+import { AnkiHelpWindow, HelpArgument, HelpMarker } from "anki_help.slint";
 
-export { MementoPalette, SettingsWindow }
+export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker }
 
 export struct SubEntry {
     id: int,
@@ -13,6 +14,12 @@ export struct SubEntry {
     is_active: bool,
 }
 
+export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
+export struct PitchGraph { dictionary: string, position: int, mora: [PitchMora] }
+export struct PopupFrequency { dictionary: string, value: string }
+export struct PopupGlossaryBlock { text: string, kind: int, href: string }
+export struct PopupAudioSource { name: string, index: int }
+
 export struct DictResult {
     index: int,
     expression: string,
@@ -20,16 +27,24 @@ export struct DictResult {
     pos_tags: string,
     dict_name: string,
     glossary: string,
+    glossary-blocks: [PopupGlossaryBlock],
     notes: string,
     example_ja: string,
     example_en: string,
     selected: bool,
     score: int,
     is_kanji: bool,
+    has_kanji: bool,
+    term_start: bool,
+    term_end: bool,
+    collapsed: bool,
+    pitch_graphs: [PitchGraph],
+    frequencies: [PopupFrequency],
 }
 
 export struct SubtitleWord {
     text: string,
+    reading: string,
     query: string,
     index: int,
 }
@@ -46,6 +61,11 @@ export struct PlayerTrack {
 
 
 // ── Floating Yomitan Dictionary Card ────────────────────────────────────
+// Japanese text uses one family; Slint accepts a single name, not a CSS list.
+component DictionaryText inherits Text {
+    font-family: "Noto Sans CJK JP";
+}
+
 component YomitanPopup inherits Rectangle {
     in property <string> headword: "";
     in property <string> reading: "";
@@ -53,16 +73,37 @@ component YomitanPopup inherits Rectangle {
     in property <string> freq-rank: "";
     in property <string> jpdb-rank: "";
     in property <[DictResult]> results;
+    in property <bool> has-more-results: false;
+    in property <[PopupAudioSource]> audio-sources;
+    in property <bool> audio-sources-loading: false;
+    in-out property <int> selected-audio-source: -1;
+    in-out property <bool> audio-menu-open: false;
+    in-out property <string> audio-menu-expression: "";
+    in-out property <string> audio-menu-reading: "";
     in property <bool> is-open: false;
+    in property <bool> anki-enabled: false;
+    in property <bool> show-anki-checkbox: true;
+    in property <string> added-note-id: "";
+    in property <int> added-result-index: -1;
     callback close-requested();
     callback add-anki-note(int);
-    callback play-audio();
+    callback browse-anki-note(string);
+    callback play-audio(string, string);
+    callback request-audio-sources(string, string);
     callback kanji-info(string);
     callback toggle-select-definition(int);
+    callback toggle-term-collapse(int);
+    callback select-audio-source(int);
+    callback open-rich-link(string);
+    callback reset-scroll();
+    callback load-more-results(bool);
+    out property <bool> needs-more: root.is-open && root.has-more-results
+        && definition-list.height > 0px
+        && definition-list.viewport-height + definition-list.viewport-y <= definition-list.height + 180px;
 
     visible: root.is-open && root.results.length > 0;
     width: 480px;
-    height: 440px;
+    height: 500px;
     background: #1C2024;
     border-width: 1px;
     border-color: #384046;
@@ -70,162 +111,271 @@ component YomitanPopup inherits Rectangle {
     drop-shadow-blur: 24px;
     drop-shadow-color: #000000DD;
 
+    changed is-open => {
+        root.audio-menu-open = false;
+        if root.is-open {
+            definition-list.viewport-y = 0px;
+            definition-list.fill-viewport();
+        }
+    }
+    reset-scroll => { definition-list.viewport-y = 0px; root.audio-menu-open = false; }
+
     popup-content := VerticalLayout {
+        cache-rendering-hint: true;
         padding: 14px;
         spacing: 8px;
 
-        // Top Header: Furigana, Headword & Action Icons
         HorizontalLayout {
             vertical-stretch: 0;
-            alignment: space-between;
-
-            VerticalLayout {
-                spacing: 2px;
-                alignment: center;
-
-                // Furigana
-                if root.reading != "" : Text {
-                    text: root.reading;
-                    font-size: 13px;
-                    font-family: "Noto Sans CJK JP, Hiragino Sans, Yu Gothic, sans-serif";
-                    color: #94A3B8;
-                }
-                // Japanese Headword
-                Text {
-                    text: root.headword;
-                    font-size: 26px;
-                    font-weight: 700;
-                    font-family: "Noto Sans CJK JP, Hiragino Sans, Yu Gothic, sans-serif";
-                    color: #FFFFFF;
-                }
+            DictionaryText {
+                text: "Dictionary results";
+                font-size: 12px;
+                color: #94A3B8;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
             }
-
-            // Action Icons Row: 🔊 (play audio), close
-            HorizontalLayout {
-                spacing: 6px;
-                alignment: center;
-
-                // Audio Speaker Button
-                Rectangle {
-                    width: 28px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: btn-s-touch.has-hover ? #2e353b : transparent;
-                    Image {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        width: 16px;
-                        height: 16px;
-                        source: @image-url("icons/volume-on.svg");
-                    }
-                    btn-s-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.play-audio(); }
-                    }
-                }
-
-                // Close Button
-                Rectangle {
-                    width: 28px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: btn-c-touch.has-hover ? #2e353b : transparent;
-                    Image {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        width: 14px;
-                        height: 14px;
-                        source: @image-url("icons/close.svg");
-                    }
-                    btn-c-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.close-requested(); }
-                    }
-                }
-            }
-        }
-
-        // Badges Row
-        if root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "" : HorizontalLayout {
-            vertical-stretch: 0;
-            spacing: 6px;
-            alignment: start;
-
-            // JPDB frequency badge (Emerald #064E3B)
-            if root.jpdb-rank != "" : Rectangle {
-                height: 20px;
-                background: #064E3B;
-                border-radius: 3px;
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    Text {
-                        text: "JPDB " + root.jpdb-rank;
-                        font-size: 10px;
-                        font-weight: 600;
-                        color: #6EE7B7;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-
-            // Frequency rank badge (Emerald #064E3B)
-            if root.freq-rank != "" : Rectangle {
-                height: 20px;
-                background: #064E3B;
-                border-radius: 3px;
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    Text {
-                        text: root.freq-rank;
-                        font-size: 10px;
-                        font-weight: 600;
-                        color: #6EE7B7;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-
-            // Pitch Accent badge (Deep Violet #4C1D95)
-            if root.pitch-accent != "" : Rectangle {
-                height: 20px;
-                background: #4C1D95;
-                border-radius: 3px;
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    Text {
-                        text: root.pitch-accent;
-                        font-size: 10px;
-                        font-weight: 600;
-                        color: #C4B5FD;
-                        vertical-alignment: center;
-                    }
-                }
-            }
-        }
-
-        // Divider
-        Rectangle {
-            vertical-stretch: 0;
-            height: 1px;
-            background: #333338;
+            Button { text: "×"; clicked => { root.close-requested(); } }
         }
 
         // Definitions List
-        ScrollView {
+        definition-list := ScrollView {
             vertical-stretch: 1;
-            VerticalLayout {
-                spacing: 12px;
-                padding-right: 6px;
-                for res[idx] in root.results : VerticalLayout {
-                    spacing: 6px;
+            callback fill-viewport();
+            fill-viewport => {
+                if root.needs-more {
+                    root.load-more-results(false);
+                }
+            }
+            changed viewport-y => { self.fill-viewport(); }
+            changed viewport-height => { self.fill-viewport(); }
+            changed height => { self.fill-viewport(); }
+            definition-content := VerticalLayout {
+                width: parent.width;
+                height: self.preferred-height;
+                spacing: 0px;
+                for res[idx] in root.results : Rectangle {
+                width: parent.width - 6px;
+                height: res.collapsed && !res.term-start ? 0px : term-segment.height + ((res.term-end || (res.collapsed && res.term-start)) ? 10px : 0px);
+                visible: !res.collapsed || res.term-start;
+                background: transparent;
+                term-segment := Rectangle {
+                    width: parent.width;
+                    height: card-content.preferred-height + 24px;
+                    background: #22282D;
+                    Rectangle { x: 0px; width: 1px; height: parent.height; background: #414B53; }
+                    Rectangle { x: parent.width - 1px; width: 1px; height: parent.height; background: #414B53; }
+                    if res.term-start : Rectangle { y: 0px; height: 1px; width: parent.width; background: #414B53; }
+                    if res.term-end || (res.collapsed && res.term-start) : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #414B53; }
+                    if !res.term-end && !res.collapsed : Rectangle { x: 14px; y: parent.height - 1px; height: 1px; width: parent.width - 28px; background: #354047; }
+                    card-content := VerticalLayout {
+                    x: 14px;
+                    y: 12px;
+                    width: parent.width - 28px;
+                    height: self.preferred-height;
+                    spacing: 7px;
+
+                    if res.term-start : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 8px;
+                        min-height: 34px;
+                        term-title := VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 0px;
+                            DictionaryText {
+                                text: res.expression;
+                                height: self.preferred-height;
+                                wrap: word-wrap;
+                                font-size: 23px;
+                                font-weight: 700;
+                                font-family: "Noto Sans CJK JP";
+                                color: #FFFFFF;
+                            }
+                            if res.reading != "" && res.reading != res.expression : DictionaryText {
+                                text: res.reading;
+                                height: self.preferred-height;
+                                wrap: word-wrap;
+                                font-size: 12px;
+                                color: #94A3B8;
+                            }
+                        }
+                        if root.added-note-id != "" && root.added-result-index == res.index - 1 : Rectangle {
+                            width: 62px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: browse-touch.has-hover ? #385D75 : #24465C;
+                            DictionaryText {
+                                text: "Browse";
+                                color: #BAE6FD;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            browse-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.browse-anki-note(root.added-note-id); }
+                            }
+                        }
+                        if !res.is-kanji && res.has-kanji : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: kanji-touch.has-hover ? #384046 : transparent;
+                            DictionaryText { text: "字"; color: #CBD5E1; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                            kanji-touch := TouchArea { mouse-cursor: pointer; clicked => { root.kanji-info(res.expression); } }
+                        }
+                        if !res.is-kanji : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: row-audio-touch.has-hover ? #384046 : #2B3238;
+                            Image {
+                                x: 6px;
+                                y: 6px;
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("icons/volume-on.svg");
+                                colorize: #CBD5E1;
+                            }
+                            row-audio-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { if (!root.audio-menu-open) { root.play-audio(res.expression, res.reading); } }
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                        root.audio-menu-expression = res.expression;
+                                        root.audio-menu-reading = res.reading;
+                                        root.audio-menu-open = true;
+                                        root.request-audio-sources(res.expression, res.reading);
+                                    }
+                                }
+                            }
+                        }
+                        if root.anki-enabled : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: row-anki-touch.has-hover ? #2D624D : #20503E;
+                            DictionaryText {
+                                text: "+";
+                                color: #A7F3D0;
+                                font-size: 20px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            row-anki-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.add-anki-note(res.index - 1); }
+                            }
+                        }
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: collapse-touch.has-hover ? #384046 : #2B3238;
+                            DictionaryText { text: res.collapsed ? "›" : "⌄"; color: #CBD5E1; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                            collapse-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-term-collapse(res.index - 1); } }
+                        }
+                    }
+
+                    if !res.collapsed && res.index == 1 && res.frequencies.length == 0 && (root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "") : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 6px;
+                        alignment: start;
+                        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: #6EE7B7; font-size: 11px; }
+                        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: #6EE7B7; font-size: 11px; }
+                        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: #C4B5FD; font-size: 11px; }
+                    }
+
+                    if !res.collapsed && res.term-start && res.frequencies.length > 0 : Rectangle {
+                        width: parent.width;
+                        height: ((res.frequencies.length + 2) / 3) * 27px;
+                        background: transparent;
+                        for frequency[idx] in res.frequencies : Rectangle {
+                            x: Math.mod(idx, 3) * parent.width / 3;
+                            y: floor(idx / 3) * 27px;
+                            width: parent.width / 3 - 5px;
+                            height: 23px;
+                            background: #214B3D;
+                            border-width: 1px;
+                            border-color: #35745C;
+                            border-radius: 3px;
+                            DictionaryText {
+                                x: 6px;
+                                width: parent.width - 12px;
+                                height: parent.height;
+                                text: frequency.dictionary + "  " + frequency.value;
+                                font-size: 10px;
+                                color: #C8F8DE;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    if !res.collapsed && res.term-start : VerticalLayout {
+                        spacing: 4px;
+                        for pitch in res.pitch-graphs : Rectangle {
+                            width: parent.width;
+                            height: 43px;
+                            background: #282638;
+                            border-width: 1px;
+                            border-color: #4C4269;
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                x: 8px;
+                                y: 4px;
+                                width: parent.width - 16px;
+                                height: 35px;
+                                spacing: 12px;
+                                alignment: start;
+                                DictionaryText {
+                                    text: pitch.dictionary + " [" + pitch.position + "]";
+                                    width: min(self.preferred-width, 150px);
+                                    horizontal-stretch: 0;
+                                    font-size: 11px;
+                                    color: #C4B5FD;
+                                    vertical-alignment: center;
+                                }
+                                HorizontalLayout {
+                                    width: self.preferred-width;
+                                    height: 35px;
+                                    horizontal-stretch: 0;
+                                    spacing: 0px;
+                                    for mora in pitch.mora : Rectangle {
+                                        width: max(25px, mora-label.preferred-width + 5px);
+                                        height: 35px;
+                                        Rectangle { x: 0px; y: mora.high ? 5px : 16px; width: parent.width; height: 2px; background: #C4B5FD; }
+                                        if mora.rises-after : Rectangle { x: parent.width - 1px; y: 5px; width: 2px; height: 13px; background: #C4B5FD; }
+                                        if mora.falls-after : Rectangle { x: parent.width - 1px; y: 5px; width: 2px; height: 13px; background: #C4B5FD; }
+                                        mora-label := DictionaryText { text: mora.text; y: 19px; horizontal-alignment: center; width: parent.width; font-size: 11px; color: #EDE9FE; }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Header row: POS tags, Dictionary tag
-                    HorizontalLayout {
+                    if !res.collapsed : HorizontalLayout {
                         spacing: 8px;
                         alignment: start;
+
+                        if root.show-anki-checkbox : Rectangle {
+                            width: 17px;
+                            height: 17px;
+                            border-width: 1px;
+                            border-color: res.selected ? #34D399 : #94A3B8;
+                            border-radius: 3px;
+                            background: res.selected ? #047857 : transparent;
+                            DictionaryText {
+                                text: res.selected ? "✓" : "";
+                                color: white;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                font-size: 13px;
+                            }
+                            select-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.toggle-select-definition(res.index - 1); }
+                            }
+                        }
 
                         // Part of Speech badge(s)
                         if res.pos-tags != "" : Rectangle {
@@ -235,7 +385,7 @@ component YomitanPopup inherits Rectangle {
                             HorizontalLayout {
                                 padding-left: 6px;
                                 padding-right: 6px;
-                                Text {
+                                DictionaryText {
                                     text: res.pos-tags;
                                     font-size: 11px;
                                     font-weight: 600;
@@ -253,7 +403,7 @@ component YomitanPopup inherits Rectangle {
                             HorizontalLayout {
                                 padding-left: 7px;
                                 padding-right: 7px;
-                                Text {
+                                DictionaryText {
                                     text: res.dict-name;
                                     font-size: 11px;
                                     font-weight: 700;
@@ -262,46 +412,134 @@ component YomitanPopup inherits Rectangle {
                                 }
                             }
                         }
+
                     }
 
                     // Definition Meaning Text
-                    Text {
+                    if !res.collapsed && res.glossary-blocks.length > 0 : VerticalLayout {
+                        width: parent.width;
+                        spacing: 4px;
+                        for block in res.glossary-blocks : Rectangle {
+                            width: parent.width;
+                            height: rich-text.preferred-height + 2px;
+                            rich-text := DictionaryText {
+                                width: parent.width;
+                                height: self.preferred-height;
+                                text: block.kind == 2 ? "◦  " + block.text : block.text;
+                                wrap: word-wrap;
+                                font-size: block.kind == 1 ? 13px : 15px;
+                                font-weight: block.kind == 1 ? 700 : 400;
+                                color: !res.selected ? #87929C : block.kind == 3 ? #93C5FD : block.kind == 1 ? #D8C9FC : #FFFFFF;
+                            }
+                            if block.href != "" : TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-rich-link(block.href); }
+                            }
+                        }
+                    }
+                    if !res.collapsed && res.glossary-blocks.length == 0 : DictionaryText {
+                        width: parent.width;
                         text: res.glossary;
                         font-size: 15px;
                         font-weight: 400;
-                        color: #FFFFFF;
+                        color: res.selected ? #FFFFFF : #87929C;
                         wrap: word-wrap;
+                        height: self.preferred-height;
                     }
 
                     // Japanese Example Sentence
-                    if res.example-ja != "" : Text {
-                        text: "🇯🇵 " + res.example-ja;
+                    if !res.collapsed && res.example-ja != "" : DictionaryText {
+                        width: parent.width;
+                        text: "JP  " + res.example-ja;
                         font-size: 13px;
                         color: #E2E8F0;
                         wrap: word-wrap;
+                        height: self.preferred-height;
                     }
 
                     // English Example Translation
-                    if res.example-en != "" : Text {
-                        text: "🇬🇧 " + res.example-en;
+                    if !res.collapsed && res.example-en != "" : DictionaryText {
+                        width: parent.width;
+                        text: "EN  " + res.example-en;
                         font-size: 12px;
                         color: #94A3B8;
                         wrap: word-wrap;
+                        height: self.preferred-height;
                     }
 
                     // Notes / Explanations
-                    if res.notes != "" : Text {
-                        text: "📝 " + res.notes;
+                    if !res.collapsed && res.notes != "" : DictionaryText {
+                        width: parent.width;
+                        text: "Note: " + res.notes;
                         font-size: 12px;
                         color: #94A3B8;
                         wrap: word-wrap;
+                        height: self.preferred-height;
                     }
 
-                    if idx < root.results.length - 1 : Rectangle {
-                        height: 1px;
-                        background: #2E2E36;
                     }
                 }
+                }
+                if root.has-more-results : Rectangle {
+                    width: parent.width - 6px;
+                    height: 28px;
+                    background: more-touch.has-hover ? #2A3238 : transparent;
+                    DictionaryText {
+                        text: "Show more results ↓";
+                        font-size: 11px;
+                        color: #84939E;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    more-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.load-more-results(true); }
+                    }
+                }
+            }
+        }
+    }
+    if root.audio-menu-open : TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.audio-menu-open = false; }
+    }
+    if root.audio-menu-open : Rectangle {
+        x: parent.width - self.width - 40px;
+        y: 62px;
+        width: 230px;
+        height: min(source-items.preferred-height + 12px, parent.height - 75px);
+        background: #252A2F;
+        border-width: 1px;
+        border-color: #52616B;
+        border-radius: 4px;
+        source-scroll := ScrollView {
+            x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+            source-items := VerticalLayout {
+            x: 0px; y: 0px; width: parent.width - 6px; height: self.preferred-height;
+            alignment: start;
+            if root.audio-sources-loading : DictionaryText {
+                text: "Loading recordings…";
+                height: 24px;
+                color: #94A3B8;
+                vertical-alignment: center;
+            }
+            if !root.audio-sources-loading && root.audio-sources.length == 0 : DictionaryText {
+                text: "No audio sources available";
+                height: 30px;
+                color: #94A3B8;
+                vertical-alignment: center;
+            }
+            for source in root.audio-sources : Rectangle {
+                height: 30px;
+                background: source-touch.has-hover ? #384046 : transparent;
+                DictionaryText { text: (root.selected-audio-source == source.index ? "✓  " : "   ") + source.name; color: #E2E8F0; vertical-alignment: center; x: 7px; }
+                source-touch := TouchArea { mouse-cursor: pointer; clicked => {
+                    root.select-audio-source(source.index);
+                    root.audio-menu-open = false;
+                    root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+                } }
+            }
             }
         }
     }
@@ -312,21 +550,56 @@ component InteractiveSubtitleToken inherits Rectangle {
     in property <SubtitleWord> word;
     in property <length> type-size;
     in property <bool> selected;
+    in property <bool> show-furigana: false;
     callback clicked();
     callback hovered(string, bool, bool, bool, bool);
+    callback hover-state(bool);
+    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
 
-    width: glyph.preferred-width;
-    height: glyph.preferred-height;
-    background: selected && root.word.query != "" ? #38a6d6 : transparent;
+    preferred-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
+    min-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
+    preferred-height: glyph.preferred-height + root.ruby-space;
+    min-height: glyph.preferred-height + root.ruby-space;
+    background: transparent;
+
+    if root.selected && root.word.query != "" : Rectangle {
+        x: glyph.x;
+        y: glyph.y;
+        width: glyph.width;
+        height: glyph.height;
+        background: #38a6d6;
+    }
+
+    ruby := Text {
+        visible: root.show-furigana && root.word.reading != "";
+        text: root.word.reading;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        wrap: no-wrap;
+        font-size: root.type-size * 0.5;
+        font-family: "Noto Sans CJK JP";
+        color: #E2E8F0;
+        x: (parent.width - self.preferred-width) / 2;
+        y: max(0px, root.ruby-space - self.preferred-height);
+    }
 
     glyph := Text {
         text: root.word.text;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        wrap: no-wrap;
+        x: (parent.width - self.preferred-width) / 2;
+        y: root.ruby-space;
         font-size: root.type-size;
         font-weight: 700;
         font-family: "Noto Sans CJK JP";
         color: white;
     }
     touch := TouchArea {
+        x: glyph.x;
+        y: glyph.y;
+        width: glyph.width;
+        height: glyph.height;
         enabled: root.word.query != "";
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
@@ -344,6 +617,7 @@ component InteractiveSubtitleToken inherits Rectangle {
             }
         }
         changed has-hover => {
+            root.hover-state(self.has-hover);
             if !self.has-hover {
                 root.hovered("", false, false, false, false);
             }
@@ -372,6 +646,7 @@ component PlayerOscBar inherits Rectangle {
     callback toggle-sub-list();
     callback start-ocr();
     callback toggle-fullscreen();
+    callback activity();
 
     height: 50px;
     background: MementoPalette.osc-bg;
@@ -380,6 +655,8 @@ component PlayerOscBar inherits Rectangle {
     border-color: #28283088;
     drop-shadow-blur: 12px;
     drop-shadow-color: #00000066;
+
+    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } }
 
     HorizontalLayout {
         padding-left: 10px;
@@ -405,7 +682,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
                 }
-                p-touch := TouchArea { clicked => { root.toggle-play(); } }
+                p-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-play(); } }
             }
 
             // Previous playlist item
@@ -421,7 +698,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/skip-previous.svg");
                 }
-                sp-touch := TouchArea { clicked => { root.playlist-prev(); } }
+                sp-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.playlist-prev(); } }
             }
 
             // Previous subtitle cue
@@ -437,7 +714,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/fast-rewind.svg");
                 }
-                rw-touch := TouchArea { clicked => { root.subtitle-seek(-1); } }
+                rw-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.subtitle-seek(-1); } }
             }
 
             // Next subtitle cue
@@ -453,7 +730,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/fast-forward.svg");
                 }
-                ff-touch := TouchArea { clicked => { root.subtitle-seek(1); } }
+                ff-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.subtitle-seek(1); } }
             }
 
             // Next playlist item
@@ -469,7 +746,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/skip-next.svg");
                 }
-                sn-touch := TouchArea { clicked => { root.playlist-next(); } }
+                sn-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.playlist-next(); } }
             }
 
             // Current Time label
@@ -522,6 +799,9 @@ component PlayerOscBar inherits Rectangle {
                 width: 100%;
                 height: 100%;
                 mouse-cursor: pointer;
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                }
                 moved => {
                     if (self.pressed) {
                         let ratio = self.mouse-x / self.width;
@@ -563,6 +843,7 @@ component PlayerOscBar inherits Rectangle {
                     source: root.volume > 0.0 ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
                 }
                 vol-touch := TouchArea {
+                    pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                     clicked => { root.toggle-mute(); }
                 }
             }
@@ -573,7 +854,7 @@ component PlayerOscBar inherits Rectangle {
                 minimum: 0.0;
                 maximum: 100.0;
                 value: root.volume;
-                changed(val) => { root.volume-changed(val); }
+                changed(val) => { root.activity(); root.volume-changed(val); }
             }
 
             // Volume % Label
@@ -598,7 +879,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: @image-url("icons/list.svg");
                 }
-                sub-t-touch := TouchArea { clicked => { root.toggle-sub-list(); } }
+                sub-t-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-sub-list(); } }
             }
 
             if root.ocr-enabled : Rectangle {
@@ -613,7 +894,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: @image-url("icons/eye.svg");
                 }
-                ocr-touch := TouchArea { clicked => { root.start-ocr(); } }
+                ocr-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.start-ocr(); } }
             }
 
             // Fullscreen Toggle Button
@@ -629,7 +910,7 @@ component PlayerOscBar inherits Rectangle {
                     height: 15px;
                     source: root.is-fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
                 }
-                fs-touch := TouchArea { clicked => { root.toggle-fullscreen(); } }
+                fs-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-fullscreen(); } }
             }
         }
     }
@@ -684,14 +965,17 @@ component SubtitleDrawerPanel inherits Rectangle {
                 }
 
                 HorizontalLayout {
+                    width: parent.width;
+                    height: parent.height;
                     padding-left: 10px;
                     padding-right: 10px;
                     spacing: 12px;
-                    alignment: center;
+                    alignment: start;
 
                     // Timecode
                     Text {
                         width: 52px;
+                        horizontal-alignment: left;
                         vertical-alignment: center;
                         font-size: 11px;
                         font-weight: 600;
@@ -803,12 +1087,15 @@ component DictionarySearchPanel inherits Rectangle {
 // ── Top Native Menu Bar ─────────────────────────────────────────────────
 component TopMenuBar inherits Rectangle {
     in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
+    callback activity();
 
     height: 30px;
     background: MementoPalette.surface-bg;
     // border-bottom
 
     border-color: MementoPalette.border;
+
+    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } }
 
     HorizontalLayout {
         padding-left: 8px;
@@ -828,6 +1115,7 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m0-t := TouchArea {
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                 clicked => { root.open-menu = root.open-menu == 0 ? -1 : 0; }
             }
         }
@@ -845,6 +1133,7 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m1-t := TouchArea {
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                 clicked => { root.open-menu = root.open-menu == 1 ? -1 : 1; }
             }
         }
@@ -862,6 +1151,7 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m2-t := TouchArea {
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                 clicked => { root.open-menu = root.open-menu == 2 ? -1 : 2; }
             }
         }
@@ -879,6 +1169,7 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m3-t := TouchArea {
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                 clicked => { root.open-menu = root.open-menu == 3 ? -1 : 3; }
             }
         }
@@ -896,6 +1187,7 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m4-t := TouchArea {
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
                 clicked => { root.open-menu = root.open-menu == 4 ? -1 : 4; }
             }
         }
@@ -1345,8 +1637,14 @@ export component MementoApp inherits Window {
     in-out property <string> current-time: "00:00";
     in-out property <string> duration-time: "00:00";
     in-out property <image> video-frame;
+    callback update-video();
+    callback video-frame-ready();
+    in-out property <int> pending-playback-generation: -1;
+    callback video-load-presented(int);
     out property <int> video-width: round(video-area.width / 1px);
     out property <int> video-height: round(video-area.height / 1px);
+    changed video-width => { root.update-video(); }
+    changed video-height => { root.update-video(); }
     in-out property <string> status-message: "";
     in-out property <float> subtitle-scale: 0.05;
     in-out property <float> subtitle-offset: 0.045;
@@ -1357,6 +1655,10 @@ export component MementoApp inherits Window {
     in-out property <bool> dict-search-open: false;
     in-out property <bool> sub-drawer-open: false;
     in-out property <bool> is-fullscreen: false;
+    in-out property <bool> osc-visible: true;
+    in-out property <int> osc-duration-ms: 700;
+    in-out property <int> osc-min-move: 0;
+    out property <bool> menu-open: menu-bar.open-menu >= 0;
     in-out property <bool> ocr-mode: false;
     in-out property <bool> ocr-enabled: false;
     in-out property <bool> asr-enabled: false;
@@ -1364,7 +1666,10 @@ export component MementoApp inherits Window {
     in-out property <bool> auto-pause: false;
     in-out property <bool> subtitles-visible: true;
     in-out property <bool> furigana-visible: false;
-    in-out property <bool> furigana-enabled: false;
+    in-out property <bool> furigana-enabled: true;
+    in-out property <bool> hide-mpv-subtitles: true;
+    in-out property <bool> hide-memento-while-playing: false;
+    in-out property <bool> hover-pause-enabled: false;
     in-out property <[string]> recent-files: [];
     in-out property <[PlayerTrack]> audio-tracks: [];
     in-out property <[PlayerTrack]> subtitle-tracks: [];
@@ -1374,6 +1679,7 @@ export component MementoApp inherits Window {
     in-out property <[string]> anki-profiles: [];
     in-out property <string> anki-profile: "";
     in-out property <bool> anki-enabled: false;
+    in-out property <bool> show-anki-checkbox: true;
     in-out property <string> app-version: "";
     in-out property <string> key-open-file: "Ctrl+O";
     in-out property <string> key-open-url: "Ctrl+U";
@@ -1394,6 +1700,14 @@ export component MementoApp inherits Window {
     in-out property <string> dict-freq-rank: "";
     in-out property <string> dict-jpdb-rank: "";
     in-out property <[DictResult]> dict-results: [];
+    in-out property <[DictResult]> popup-results: [];
+    in-out property <int> popup-loaded-count: 0;
+    out property <bool> popup-needs-more: yomi-card.needs-more;
+    in-out property <[PopupAudioSource]> popup-audio-sources: [];
+    in-out property <bool> popup-audio-sources-loading: false;
+    in-out property <int> popup-selected-audio-source: -1;
+    in-out property <string> anki-added-note-id: "";
+    in-out property <int> anki-added-result-index: -1;
     in-out property <bool> about-open: false;
 
     // Subtitle Entries & Interactive Words
@@ -1429,6 +1743,7 @@ export component MementoApp inherits Window {
     callback adjust-subtitle-offset(float);
     callback subtitles-visible-changed(bool);
     callback furigana-visible-changed(bool);
+    callback subtitle-hover-changed(bool);
     callback toggle-subtitles();
     callback add-subtitle();
     callback adjust-sub-delay(float);
@@ -1437,17 +1752,27 @@ export component MementoApp inherits Window {
     callback open-config();
     callback check-updates();
     callback toggle-fullscreen();
+    callback pointer-moved(float, float);
+    callback osc-activity();
     callback select-row(int);
     callback search-subtitles(string);
     callback search-dictionary(string);
     callback lookup-word(string);
+    callback open-glossary-link(string);
     callback lookup-kanji(string);
     callback hover-word(string, int, bool, bool, bool, bool);
     callback toggle-definition-selection(int);
+    callback toggle-term-collapse(int);
+    callback load-more-definition-results(bool);
     callback add-anki-note(int);
+    callback browse-anki-note(string);
+    callback reset-definition-scroll();
     callback open-options();
-    callback play-audio-for-word(string);
+    callback play-audio-for-word(string, string);
+    callback popup-audio-sources-requested(string, string);
     callback key-pressed(string, bool, bool, bool, bool) -> bool;
+
+    reset-definition-scroll => { yomi-card.reset-scroll(); }
     pure callback format-timestamp(float) -> string;
     changed dict-search-open => {
         if root.dict-search-open {
@@ -1472,7 +1797,10 @@ export component MementoApp inherits Window {
         spacing: 0;
 
         // Top Native Menu Bar
-        menu-bar := TopMenuBar {}
+        menu-bar := TopMenuBar {
+            visible: root.osc-visible || self.open-menu >= 0;
+            activity => { root.osc-activity(); }
+        }
 
         // Center Area: Video Surface + Optional Subtitle Drawer
         HorizontalLayout {
@@ -1492,6 +1820,18 @@ export component MementoApp inherits Window {
                     image-fit: contain;
                     horizontal-alignment: center;
                     vertical-alignment: center;
+                }
+
+                // Track video-surface movement without blocking the subtitle or OSC controls.
+                video-motion := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move {
+                            root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                        }
+                    }
+                    double-clicked => { root.toggle-fullscreen(); }
                 }
 
                 // Empty / Placeholder state
@@ -1554,26 +1894,38 @@ export component MementoApp inherits Window {
 
                 // Clickable text units supply the search suffix at each token.
                 subtitle-box := Rectangle {
-                    visible: root.active-sub-text != "" && root.subtitles-visible;
+                    visible: root.active-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
                     x: (parent.width - self.width) / 2;
                     y: parent.height - self.height - max(62px, parent.height * root.subtitle-offset);
                     width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
                     height: subtitle-lines-layout.preferred-height + 16px;
                     background: #00000099;
                     border-radius: 4px;
+                    subtitle-hover-area := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        changed has-hover => { root.subtitle-hover-changed(self.has-hover); }
+                    }
                     subtitle-lines-layout := VerticalLayout {
                         x: 16px;
                         y: 8px;
+                        width: self.preferred-width;
+                        height: self.preferred-height;
                         spacing: 4px;
                         alignment: center;
                         for line in root.active-sub-lines : HorizontalLayout {
+                            width: self.preferred-width;
+                            height: self.preferred-height;
                             alignment: center;
                             spacing: 0px;
                             for word in line.words : InteractiveSubtitleToken {
                                 word: word;
                                 type-size: video-area.height * root.subtitle-scale;
+                                show-furigana: root.furigana-visible;
                                 selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
+                                hover-state(hovering) => { root.subtitle-hover-changed(hovering); }
                                 hovered(query, control, shift, alt, meta) => {
+                                    root.osc-activity();
                                     root.hover-word(query, word.index, control, shift, alt, meta);
                                 }
                                 clicked => {
@@ -1586,7 +1938,7 @@ export component MementoApp inherits Window {
                     }
                 }
 
-                if root.secondary-sub-text != "" && root.subtitles-visible : Rectangle {
+                if root.secondary-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing) : Rectangle {
                     x: (parent.width - self.width) / 2;
                     y: parent.height - self.height - max(116px, parent.height * root.subtitle-offset + 54px);
                     width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
@@ -1604,6 +1956,11 @@ export component MementoApp inherits Window {
                         horizontal-alignment: center;
                         wrap: word-wrap;
                     }
+                    secondary-hover-area := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        changed has-hover => { root.subtitle-hover-changed(self.has-hover); }
+                    }
                 }
 
                 // Floating Yomitan Dictionary Card
@@ -1615,21 +1972,36 @@ export component MementoApp inherits Window {
                        (subtitle-box.y - self.height - 12px) :
                        min(parent.height - self.height - 10px, max(10px, subtitle-box.y + subtitle-box.height + 12px));
                     is-open: root.dict-open;
+                    anki-enabled: root.anki-enabled;
+                    show-anki-checkbox: root.show-anki-checkbox;
+                    added-note-id: root.anki-added-note-id;
+                    added-result-index: root.anki-added-result-index;
                     headword: root.dict-query;
                     reading: root.dict-reading;
                     pitch-accent: root.dict-pitch-accent;
                     freq-rank: root.dict-freq-rank;
                     jpdb-rank: root.dict-jpdb-rank;
-                    results: root.dict-results;
+                    results: root.popup-results;
+                    has-more-results: root.popup-loaded-count < root.dict-results.length;
+                    audio-sources: root.popup-audio-sources;
+                    audio-sources-loading: root.popup-audio-sources-loading;
+                    selected-audio-source: root.popup-selected-audio-source;
                     close-requested => { root.dict-open = false; }
                     add-anki-note(idx) => { root.add-anki-note(idx); }
-                    play-audio => { root.play-audio-for-word(root.dict-query); }
+                    browse-anki-note(id) => { root.browse-anki-note(id); }
+                    play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
+                    request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
                     kanji-info(word) => { root.lookup-kanji(word); }
                     toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
+                    toggle-term-collapse(idx) => { root.toggle-term-collapse(idx); }
+                    load-more-results(force) => { root.load-more-definition-results(force); }
+                    select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
+                    open-rich-link(link) => { root.open-glossary-link(link); }
                 }
 
                 // Bottom OSC Bar (Floating, 50px)
                 osc := PlayerOscBar {
+                    visible: root.osc-visible && !root.ocr-mode;
                     x: 16px;
                     y: parent.height - self.height - 12px;
                     width: parent.width - 32px;
@@ -1654,6 +2026,7 @@ export component MementoApp inherits Window {
                         root.dict-search-open = false;
                     }
                     toggle-fullscreen => { root.toggle-fullscreen(); }
+                    activity => { root.osc-activity(); }
                 }
 
                 // Drag a rectangle over the current video frame for OCR.
@@ -1788,7 +2161,7 @@ export component MementoApp inherits Window {
         open-config => { root.open-config(); }
         check-updates => { root.check-updates(); }
         show-about => { root.about-open = true; }
-        close-menu => { menu-bar.open-menu = -1; }
+        close-menu => { menu-bar.open-menu = -1; root.osc-activity(); }
     }
 
     if root.status-message != "" : Rectangle {

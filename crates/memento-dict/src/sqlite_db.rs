@@ -50,8 +50,9 @@ extern "C" {
         tail: *mut *const c_char,
     ) -> c_int;
     pub fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int;
-    pub fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> c_int;
+    pub fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_int;
+    pub fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int;
     pub fn sqlite3_bind_text(
         stmt: *mut sqlite3_stmt,
         index: c_int,
@@ -242,6 +243,18 @@ impl Statement {
                 message: format!("step failed with code {rc}"),
             })
         }
+    }
+
+    pub fn reset(&mut self) -> Result<(), DictError> {
+        let reset = unsafe { sqlite3_reset(self.stmt) };
+        if reset != SQLITE_OK {
+            return Err(DictError::Sqlite { code: reset, message: "reset failed".into() });
+        }
+        let clear = unsafe { sqlite3_clear_bindings(self.stmt) };
+        if clear != SQLITE_OK {
+            return Err(DictError::Sqlite { code: clear, message: "clear bindings failed".into() });
+        }
+        Ok(())
     }
 
     #[must_use]

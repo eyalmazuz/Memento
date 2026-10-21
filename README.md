@@ -110,15 +110,98 @@ Memento is built with standard Rust and Cargo:
 cargo build --release
 ```
 
+The Whisper **Use GPU** setting selects a GPU only when the linked whisper.cpp
+build contains a CUDA or Vulkan backend and the graphics driver exposes a
+device. A CPU-only build continues on the CPU and shows a warning when GPU is
+requested. For NVIDIA CUDA on Linux, check that `nvidia-smi` works, then build
+the backend and relink Memento:
+
+```bash
+cmake -S build-rust-master/_deps/whispercpp-src \
+  -B build-whisper-cuda/_deps/whispercpp-build \
+  -DGGML_CUDA=ON \
+  -DWHISPER_BUILD_EXAMPLES=OFF -DBUILD_SHARED_LIBS=OFF
+cmake --build build-whisper-cuda/_deps/whispercpp-build --target whisper -j"$(nproc)"
+cargo build --release
+```
+
+Set `CUDA_HOME` when the toolkit is outside `/opt/cuda`. Vulkan builds use
+`-DGGML_VULKAN=ON` and target `whisper` instead.
+If CMake cannot see a GPU during configuration, add
+`-DCMAKE_CUDA_ARCHITECTURES=all-major` for a portable CUDA build. To use
+ccache, set `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, and
+`CMAKE_CUDA_COMPILER_LAUNCHER` to `ccache`; point `CCACHE_DIR` at a writable
+directory when building in a restricted environment.
+
 Run the application:
 ```bash
 cargo run --release
 ```
 
+Plain `cargo run` also optimizes Slint's UI core, renderer, text layout and
+font parsing/rasterization libraries, while retaining debug symbols and assertions.
+These settings do not select a CPU/GPU architecture or rebuild the native Whisper
+backend. System fallback font metadata is cached before playback starts, avoiding
+Fontconfig scans when dictionary entries introduce unfamiliar symbols.
+
+For playback diagnostics, run `MEMENTO_VIDEO_STATS=1 cargo run`. Every five
+seconds during rendering, `[video]` reports frame drops, the active hardware decoder,
+pause state, frame delivery delay, mpv render time and total UI drawing time.
+`draw-popup-rows` counts the dictionary entries open during the slowest draw;
+unchanged idle intervals are omitted. Slow frames and
+changes in drop counts are also reported without this environment variable.
+`wake-max` measures delivery to the UI callback; `sync-max` measures the playback
+UI synchronization callback, and `sync-gap` measures time between its ticks
+(normally about 100 ms). `pending` shows the age of a frame still awaiting drawing.
+These distinguish event-loop/layout stalls from time spent inside the renderer.
+On hybrid GPUs, an explicit `hwdec=nvdec` uses `nvdec-copy` when the window is
+rendered by Intel/AMD; this preserves NVIDIA decoding without requiring
+CUDA/OpenGL interop across different GPUs.
+
 Run the test suite:
 ```bash
 cargo test
 ```
+
+The optional Linux playback timing test renders the actual Slint window through
+surfaceless EGL, including the video image, controls and changing furigana subtitles:
+
+```bash
+MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
+  cargo test --test video_render_timing_test -- --ignored --nocapture
+```
+
+It measures video and UI rendering together, but does not test a desktop
+compositor or physical display. Without a media path it generates a 1080p test
+pattern through libavfilter.
+Set `MEMENTO_VIDEO_TEST_POPUP=1` to also open a dictionary popup during playback.
+First-use shader compilation by the software GL driver can affect this test;
+`MESA_SHADER_CACHE_DIR` can point to a writable directory when the default
+Mesa cache is inaccessible.
+
+For the interaction stress run, use a finite video at least 30 seconds long and
+an existing dictionary database (opened read-only):
+
+```bash
+MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
+MEMENTO_VIDEO_TEST_INTERACTIONS=1 \
+MEMENTO_VIDEO_TEST_DICTIONARY=/path/to/dictionaries.sqlite \
+  cargo test --test video_render_timing_test -- --ignored --nocapture
+```
+
+This run toggles furigana and subtitle visibility, performs five term searches,
+scrolls and collapses definitions, changes a definition's selection, pauses and
+resumes, resizes the window, and seeks forward/backward to seeded random positions.
+Drop counts are accumulated across seeks, so resetting mpv's counter cannot
+hide an earlier stall. It exercises the shared UI/controller code through the
+headless window; desktop fullscreen, input delivery and presentation still need
+a desktop session.
+
+To check a cold subtitle start without searches or furigana toggles, use a video
+with embedded Japanese subtitles and `MEMENTO_VIDEO_TEST_STARTUP_FURIGANA=1`
+instead of `MEMENTO_VIDEO_TEST_INTERACTIONS`. This uses mpv's actual subtitle
+notifications and the desktop's subtitle model publication functions, leaving
+furigana enabled throughout the run.
 
 ### OCR Support
 

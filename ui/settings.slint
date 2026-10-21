@@ -111,6 +111,10 @@ component ToolIcon inherits Rectangle {
 
 component FieldRow inherits HorizontalLayout {
     in property <SettingsField> field;
+    in property <[string]> anki-decks;
+    in property <[string]> anki-models;
+    property <bool> use-anki-decks: (root.field.key == "anki/profile/term/deck" || root.field.key == "anki/profile/kanji/deck") && root.anki-decks.length > 0;
+    property <bool> use-anki-models: (root.field.key == "anki/profile/term/model" || root.field.key == "anki/profile/kanji/model") && root.anki-models.length > 0;
     callback edited(string, string);
     height: 42px;
     visible: root.field.visible;
@@ -141,7 +145,17 @@ component FieldRow inherits HorizontalLayout {
             selected(value) => { root.edited(root.field.key, value); }
         }
     }
-    if root.field.kind == "text" : VerticalLayout {
+    if root.field.kind == "text" && (root.use-anki-decks || root.use-anki-models) : VerticalLayout {
+        alignment: center;
+        ComboBox {
+            width: 220px;
+            enabled: root.field.enabled;
+            model: root.use-anki-decks ? root.anki-decks : root.anki-models;
+            current-value: root.field.value;
+            selected(value) => { root.edited(root.field.key, value); }
+        }
+    }
+    if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : VerticalLayout {
         alignment: center;
         LineEdit {
             width: 220px;
@@ -154,12 +168,15 @@ component FieldRow inherits HorizontalLayout {
 
 component SettingsSection inherits VerticalLayout {
     in property <SettingsGroup> group;
+    in property <[string]> anki-decks;
+    in property <[string]> anki-models;
     in-out property <bool> show-advanced: false;
     callback edited(string, string);
     callback advanced-changed(bool);
     callback move-entry(string, int);
     callback remove-entry(string);
     callback test-anki-connection();
+    callback load-anki-fields(string);
 
     spacing: 6px;
     horizontal-stretch: 1;
@@ -208,7 +225,24 @@ component SettingsSection inherits VerticalLayout {
                 if index > 0 : Rectangle { height: 1px; background: #2f363b; }
                 FieldRow {
                     field: field;
+                    anki-decks: root.anki-decks;
+                    anki-models: root.anki-models;
                     edited(key, value) => { root.edited(key, value); }
+                }
+            }
+            if root.group.category == 0 && (root.group.title == "Term Notes" || root.group.title == "Kanji Notes") : HorizontalLayout {
+                height: 44px;
+                alignment: end;
+                if root.group.fields.length <= 2 : Text {
+                    text: "No model fields loaded.";
+                    color: #9CA6AA;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                }
+                Button {
+                    text: "Load model fields";
+                    clicked => { root.load-anki-fields(root.group.title == "Term Notes" ? "term" : "kanji"); }
                 }
             }
             if root.group.category == 0 && root.group.title == "General" : VerticalLayout {
@@ -281,18 +315,25 @@ export component SettingsWindow inherits Window {
     in property <string> settings-status;
     in property <bool> ocr-available: false;
     in property <bool> asr-available: false;
+    in-out property <[string]> available-anki-decks: [];
+    in-out property <[string]> available-anki-models: [];
     in-out property <bool> adding-entry: false;
     in-out property <string> new-entry-name: "";
     in-out property <bool> showing-advanced: false;
-    in-out property <bool> showing-help: false;
+    in-out property <bool> showing-audio-help: false;
+    in-out property <bool> connection-popup-open: false;
+    in-out property <bool> connection-popup-ok: false;
+    in-out property <string> connection-popup-text: "";
 
     callback close();
+    callback anki-help-requested();
     callback category-changed(int);
     callback setting-edited(string, string);
     callback apply-settings(int);
     callback reset-settings(int);
     callback defaults-settings(int);
     callback test-anki-connection();
+    callback load-anki-fields(string);
     callback add-entry(int, string);
     callback remove-entry(int, string);
     callback move-entry(int, string, int);
@@ -404,12 +445,15 @@ export component SettingsWindow inherits Window {
                         if group.category != 4 &&
                             (group.category != 0 || group.title != "Advanced" || root.showing-advanced) : SettingsSection {
                             group: group;
+                            anki-decks: root.available-anki-decks;
+                            anki-models: root.available-anki-models;
                             show-advanced: root.showing-advanced;
                             edited(key, value) => { root.setting-edited(key, value); }
                             advanced-changed(value) => { root.showing-advanced = value; }
                             move-entry(id, direction) => { root.move-entry(root.active-category, id, direction); }
                             remove-entry(id) => { root.remove-entry(root.active-category, id); }
                             test-anki-connection => { root.test-anki-connection(); }
+                            load-anki-fields(section) => { root.load-anki-fields(section); }
                         }
                     }
                     if root.active-category == 4 : VerticalLayout {
@@ -490,26 +534,6 @@ export component SettingsWindow inherits Window {
                             }
                         }
                     }
-                    if root.showing-help : Rectangle {
-                        background: #1c2226;
-                        border-width: 1px;
-                        border-color: #384046;
-                        border-radius: 6px;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 14px;
-                            padding-top: 10px;
-                            padding-bottom: 10px;
-                            Text {
-                                text: root.active-category == 0 ? "AnkiConnect must be running to list and use decks or note models. Changes take effect after Apply." :
-                                      root.active-category == 2 ? "Audio source URLs can use {expression} and {reading}; MD5 matches are ignored." :
-                                      "Apply saves this page; Reset reloads saved values; Defaults restores the original settings for this page.";
-                                color: #b0b8bc;
-                                font-size: 12px;
-                                horizontal-stretch: 1;
-                            }
-                        }
-                    }
                 }
             }
             Rectangle { height: 1px; background: #384046; }
@@ -529,10 +553,94 @@ export component SettingsWindow inherits Window {
                         horizontal-stretch: 1;
                         overflow: elide;
                     }
-                    Button { text: "Help"; clicked => { root.showing-help = !root.showing-help; } }
+                    if root.active-category == 0 : Button { text: "Help"; clicked => { root.anki-help-requested(); } }
+                    if root.active-category == 2 : Button { text: "Help"; clicked => { root.showing-audio-help = true; } }
                     Button { text: "Reset"; clicked => { root.reset-settings(root.active-category); } }
                     Button { text: "Defaults"; clicked => { root.defaults-settings(root.active-category); } }
                     Button { text: "Apply"; clicked => { root.apply-settings(root.active-category); } }
+                }
+            }
+        }
+    }
+
+    if root.showing-audio-help : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000099;
+        TouchArea { clicked => { root.showing-audio-help = false; } }
+        Rectangle {
+            width: min(560px, parent.width - 48px);
+            height: 270px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #21262a;
+            border-width: 1px;
+            border-color: #50606A;
+            border-radius: 8px;
+            TouchArea { }
+            VerticalLayout {
+                padding: 20px;
+                spacing: 14px;
+                Text {
+                    text: "Audio Sources Help";
+                    color: white;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Source Name: The name of the audio source as it will appear in Memento.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
+                    color: #DCE3E7;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Button { text: "OK"; clicked => { root.showing-audio-help = false; } }
+                }
+            }
+        }
+    }
+
+    // Modal result popup for the AnkiConnect "Connect" button.
+    if root.connection-popup-open : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #00000088;
+        TouchArea { clicked => { root.connection-popup-open = false; } }
+        Rectangle {
+            width: 380px;
+            height: 170px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #21262a;
+            border-radius: 10px;
+            border-width: 2px;
+            border-color: root.connection-popup-ok ? #2F8F5B : #ED6B72;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #000000DD;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: root.connection-popup-ok ? "✔ Connected to Anki" : "✖ Connection failed";
+                    color: root.connection-popup-ok ? #6EE7B7 : #ED6B72;
+                    font-size: 18px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: root.connection-popup-text;
+                    color: #dce0e2;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    vertical-stretch: 1;
+                }
+                HorizontalLayout {
+                    alignment: center;
+                    Button { text: "OK"; clicked => { root.connection-popup-open = false; } }
                 }
             }
         }

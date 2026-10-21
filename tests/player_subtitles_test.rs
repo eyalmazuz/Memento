@@ -5,7 +5,32 @@ use memento_app::controller::player::{
     QT_ALT_MODIFIER, QT_CONTROL_MODIFIER, QT_KEY_ESCAPE, QT_KEY_F1, QT_KEY_F30,
     QT_KEY_RETURN, QT_KEY_SHIFT, QT_NO_MODIFIER, QT_SHIFT_MODIFIER,
 };
-use memento_app::controller::subtitles::{create_cue, filter_and_sort_cues, SubtitleController};
+use memento_app::controller::subtitles::{create_cue, filter_and_sort_cues, MemorySubtitleCue, SubtitleController, SubtitleTrackInfo};
+
+#[test]
+fn asr_cues_accumulate_survive_mpv_sync_and_follow_playback() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.start_asr_track();
+    let cue = |id, text: &str, start, end| MemorySubtitleCue {
+        id, text: text.encode_utf16().collect(), start, end,
+    };
+    assert!(ctrl.add_asr_cue(cue(1, "Second", 5.0, 7.0), 0.0));
+    assert!(ctrl.add_asr_cue(cue(0, "First", 1.0, 3.0), 0.0));
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.cue_text(0).as_deref(), Some("First"));
+    ctrl.toggle_select(1);
+    assert!(ctrl.add_asr_cue(cue(2, "Middle", 3.0, 4.0), 0.0));
+    assert_eq!(ctrl.selected_indices(), &[2]);
+    ctrl.sync_tracks(&[SubtitleTrackInfo { id: 2, external: false, external_path: String::new() }]);
+    assert_eq!(ctrl.primary_entries().len(), 3);
+    ctrl.update_position(5.5);
+    assert_eq!(ctrl.active_cue_text().as_deref(), Some("Second"));
+    assert!(ctrl.remove_asr_cue(1, 5.5));
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.active_cue_text(), None);
+    ctrl.clear_asr_track();
+    assert!(ctrl.primary_entries().is_empty());
+}
 
 #[test]
 fn test_subtitle_cue_filtering_and_sorting() {

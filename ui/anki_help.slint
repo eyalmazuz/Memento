@@ -1,0 +1,110 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct HelpArgument {
+    name: string,
+    description: string,
+    default-value: string,
+}
+
+export struct HelpMarker {
+    name: string,
+    description: string,
+    arguments: [HelpArgument],
+}
+
+component HelpHeading inherits Text {
+    color: #e5e9eb;
+    font-size: 26px;
+    font-weight: 500;
+    height: self.preferred-height;
+}
+
+component HelpParagraph inherits Text {
+    color: #dce0e2;
+    font-size: 14px;
+    wrap: word-wrap;
+    height: self.preferred-height;
+}
+
+component MarkerDescription inherits VerticalLayout {
+    in property <HelpMarker> marker;
+    spacing: 4px;
+
+    Text {
+        text: "{" + root.marker.name + "}";
+        color: #e5e9eb;
+        font-family: "monospace";
+        font-size: 14px;
+        font-weight: 700;
+        height: self.preferred-height;
+    }
+    HelpParagraph { text: root.marker.description; }
+    for argument in root.marker.arguments : HorizontalLayout {
+        spacing: 10px;
+        padding-left: 20px;
+        Text {
+            text: argument.name;
+            color: #e5e9eb;
+            font-family: "monospace";
+            font-size: 14px;
+            font-weight: 700;
+            width: 125px;
+            height: self.preferred-height;
+        }
+        VerticalLayout {
+            spacing: 3px;
+            horizontal-stretch: 1;
+            HelpParagraph { text: "Default Value: " + argument.default-value; }
+            HelpParagraph { text: argument.description; }
+        }
+    }
+}
+
+// Matches the separate, scrollable Anki Integration Help window in Memento C++.
+export component AnkiHelpWindow inherits Window {
+    title: "Anki Integration Help";
+    preferred-width: 920px;
+    preferred-height: 700px;
+    min-width: 540px;
+    min-height: 420px;
+    background: #282e32;
+    default-font-family: "Noto Sans, sans-serif";
+
+    in property <[HelpMarker]> term-markers;
+    in property <[HelpMarker]> kanji-markers;
+
+    ScrollView {
+        width: 100%;
+        height: 100%;
+        VerticalLayout {
+            width: min(parent.width - 20px, 900px);
+            padding-top: 10px;
+            padding-bottom: 20px;
+            spacing: 10px;
+
+            HelpHeading { text: "Introduction"; }
+            HelpParagraph {
+                text: "This document describes the syntax and the associated markers available for use in note templates.";
+            }
+
+            HelpHeading { text: "Syntax"; }
+            HelpParagraph {
+                text: "A marker is a section of text enclosed in curly braces like {subtitle}. When Memento's template processor sees a marker, it replaces it with its associated value. In the case of {subtitle} that is the currently displayed subtitle.";
+            }
+            HelpParagraph {
+                text: "Some markers have arguments that allow their functionality to be modified. For example, {glossary : dict = 1} makes it so the glossary marker only uses entries from the dictionary with the ID of 1. The : character indicates the beginning of marker arguments. Arguments are set in the form of name = value. If a marker has multiple arguments, arguments are separated by the , character. An example of a marker with multiple arguments is {screenshot : max-width = 1280, max-height = 720}.";
+            }
+            HelpParagraph {
+                text: "A single marker can specify whether to use one or another value. For example, {selection | clipboard} specifies if {selection} is empty, use {clipboard} instead. This functionality is triggered by the | character. Multiple ors can be chained together like {selection | clipboard | glossary : dict = 1}.";
+            }
+
+            HelpHeading { text: "Term Markers"; }
+            HelpParagraph { text: "This section describes the markers available for use in term notes."; }
+            for marker in root.term-markers : MarkerDescription { marker: marker; }
+
+            HelpHeading { text: "Kanji Markers"; }
+            HelpParagraph { text: "This section describes the markers available for use in kanji notes."; }
+            for marker in root.kanji-markers : MarkerDescription { marker: marker; }
+        }
+    }
+}

@@ -18,10 +18,14 @@ fn main() {
         render_header.is_file(),
         "the selected mpv SDK does not contain mpv/render.h"
     );
+    let render_gl_header = include_dir.join("mpv/render_gl.h");
+    println!("cargo:rerun-if-changed={}", render_gl_header.display());
+    assert!(render_gl_header.is_file(), "the selected mpv SDK does not contain mpv/render_gl.h");
 
     let bindings = bindgen::Builder::default()
         .header(header.to_string_lossy().into_owned())
         .header(render_header.to_string_lossy().into_owned())
+        .header(render_gl_header.to_string_lossy().into_owned())
         .clang_arg(format!("-I{}", include_dir.display()))
         .rust_target(bindgen::RustTarget::stable(77, 0).unwrap())
         // C examples in client.h are not Rust doctests.

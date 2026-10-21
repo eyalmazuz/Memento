@@ -25,6 +25,12 @@ pub struct AnkiNoteConfig {
     pub field_templates: std::collections::HashMap<String, String>,
     pub tags: Vec<String>,
     pub duplicate_policy: i32,
+    pub screenshot_type: i32,
+    pub audio_pad_start: f64,
+    pub audio_pad_end: f64,
+    pub audio_normalize: bool,
+    pub audio_db: f64,
+    pub newline_replacer: String,
 }
 
 impl AnkiNoteConfig {
@@ -252,13 +258,57 @@ impl ConfigController {
             .unwrap_or(false)
     }
 
+    pub fn anki_excluded_glossaries(&self) -> Vec<String> {
+        let profiles = self.anki_profiles.borrow();
+        current_anki_profile(&profiles)
+            .get("ex-glos")
+            .and_then(JsonValue::as_array)
+            .map(|items| items.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn anki_note_model(&self, section: &str) -> Option<String> {
+        if section != "term" && section != "kanji" { return None; }
+        let profiles = self.anki_profiles.borrow();
+        current_anki_profile(&profiles)
+            .get(section)?
+            .get("model")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    pub fn set_anki_model_fields(&self, section: &str, fields: &[String]) -> Result<(), String> {
+        if section != "term" && section != "kanji" {
+            return Err("unknown Anki note type".into());
+        }
+        let profiles = self.anki_profiles.borrow();
+        let note = current_anki_profile(&profiles).get(section)
+            .ok_or("Anki note profile is missing")?;
+        let existing = json_fields_to_map(note.get("fields").ok_or("Anki fields are missing")?)
+            .unwrap_or_default();
+        let rows: Vec<JsonValue> = fields.iter().map(|name| {
+            let marker = existing.get(name).cloned().unwrap_or_else(|| default_anki_field_marker(section, name));
+            json!([name, marker])
+        }).collect();
+        drop(profiles);
+        self.edit_setting(&format!("anki/profile/{section}/fields"), &JsonValue::Array(rows).to_string())
+    }
+
     pub fn anki_profile_note_config(&self) -> Option<AnkiNoteConfig> {
+        self.anki_note_config("term")
+    }
+
+    pub fn anki_kanji_note_config(&self) -> Option<AnkiNoteConfig> {
+        self.anki_note_config("kanji")
+    }
+
+    fn anki_note_config(&self, section: &str) -> Option<AnkiNoteConfig> {
         let profiles = self.anki_profiles.borrow();
         let profile = current_anki_profile(&profiles);
-        let term = profile.get("term")?;
-        let deck = term.get("deck").and_then(JsonValue::as_str)?.to_owned();
-        let model = term.get("model").and_then(JsonValue::as_str)?.to_owned();
-        let field_templates = json_fields_to_map(term.get("fields")?)?;
+        let note = profile.get(section)?;
+        let deck = note.get("deck").and_then(JsonValue::as_str)?.to_owned();
+        let model = note.get("model").and_then(JsonValue::as_str)?.to_owned();
+        let field_templates = json_fields_to_map(note.get("fields")?)?;
         let tags = profile
             .get("tags")
             .and_then(JsonValue::as_array)
@@ -283,6 +333,12 @@ impl ConfigController {
                 .get("duplicate")
                 .and_then(JsonValue::as_i64)
                 .unwrap_or(1) as i32,
+            screenshot_type: anki_profile_i64(profile, "screenshot", 0) as i32,
+            audio_pad_start: anki_profile_real(profile, "audio-pad-start", 0.0),
+            audio_pad_end: anki_profile_real(profile, "audio-pad-end", 0.0),
+            audio_normalize: anki_profile_bool(profile, "audio-normalize", false),
+            audio_db: anki_profile_real(profile, "audio-db", -20.0),
+            newline_replacer: anki_profile_string(profile, "newline-replace", "<br>").to_owned(),
         })
     }
 
@@ -2383,6 +2439,39 @@ fn anki_fields_to_string(fields: &JsonValue) -> String {
     serde_json::to_string(fields).unwrap_or_else(|_| "[]".to_owned())
 }
 
+fn default_anki_field_marker(section: &str, field: &str) -> String {
+    let normalized: String = field.chars().filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase).collect();
+    let marker = if section == "kanji" {
+        match normalized.as_str() {
+            "character" | "kanji" => "character",
+            "onyomi" => "onyomi",
+            "kunyomi" => "kunyomi",
+            "meaning" | "glossary" | "definition" | "definitions" => "glossary",
+            "strokecount" => "stroke-count",
+            _ => return String::new(),
+        }
+    } else {
+        match normalized.as_str() {
+            "expression" | "word" | "term" => "expression",
+            "reading" | "expressionreading" => "reading",
+            "furigana" | "expressionfurigana" => "furigana",
+            "sentence" | "subtitle" => "sentence",
+            "context" => "context",
+            "selection" | "textselection" | "textselection12" => "selection",
+            "meaning" | "glossary" | "definition" | "definitions" => "glossary",
+            "audio" | "wordaudio" | "expressionaudio" => "audio",
+            "sentenceaudio" | "audiosentence" | "subtitleaudio" => "audio-media",
+            "contextaudio" | "audiocontext" => "audio-context",
+            "image" | "picture" | "screenshot" | "snapshot" => "screenshot",
+            "pitch" | "pitchaccent" => "pitch",
+            "frequency" | "frequencies" => "frequencies",
+            _ => return String::new(),
+        }
+    };
+    format!("{{{marker}}}")
+}
+
 fn anki_settings_groups(config: &JsonValue) -> Vec<SettingsGroup> {
     let profiles = anki_profiles(config);
     let names = profiles
@@ -2569,30 +2658,6 @@ fn unpack_note_fields(section: &str, note: &JsonValue) -> Vec<SettingsField> {
                     found_fields.push((name.to_owned(), template.to_owned()));
                 }
             }
-        }
-    }
-
-    if found_fields.is_empty() {
-        if section == "term" {
-            found_fields = vec![
-                ("Expression".to_owned(), "{expression}".to_owned()),
-                ("ExpressionFurigana".to_owned(), "{furigana}".to_owned()),
-                ("ExpressionReading".to_owned(), "{reading}".to_owned()),
-                ("Sentence".to_owned(), "{sentence}".to_owned()),
-                ("Glossary".to_owned(), "{glossary}".to_owned()),
-                ("Audio".to_owned(), "{audio}".to_owned()),
-                ("Image".to_owned(), "{image}".to_owned()),
-                ("SentenceAudio".to_owned(), "{sentence-audio}".to_owned()),
-                ("PitchAccent".to_owned(), "{pitch-accent}".to_owned()),
-            ];
-        } else {
-            found_fields = vec![
-                ("Character".to_owned(), "{character}".to_owned()),
-                ("Onyomi".to_owned(), "{onyomi}".to_owned()),
-                ("Kunyomi".to_owned(), "{kunyomi}".to_owned()),
-                ("Meaning".to_owned(), "{glossary}".to_owned()),
-                ("StrokeCount".to_owned(), "{stroke-count}".to_owned()),
-            ];
         }
     }
 

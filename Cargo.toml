@@ -14,12 +14,15 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "backend-winit-x11",
     "renderer-femtovg",
     "renderer-software",
+    "unstable-fontique-08",
 ] }
 libloading = "=0.8.9"
+glow = "=0.17.0"
 log = "=0.4.34"
 icu_provider = { version = "=2.3.1", features = ["logging"] }
 serde_json = "=1.0.154"
 url = "=2.5.8"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 memento-config = { path = "crates/memento-config" }
 memento-setting = { path = "crates/memento-setting" }
@@ -37,6 +40,7 @@ memento-asr-whisper = { path = "crates/memento-asr-whisper" }
 
 [dev-dependencies]
 i-slint-backend-testing = "=1.16.1"
+i-slint-renderer-femtovg = { version = "=1.16.1", features = ["opengl"] }
 
 [build-dependencies]
 slint-build = "=1.16.1"
@@ -59,3 +63,40 @@ members = [
 [profile.release]
 debug-assertions = false
 overflow-checks = true
+
+# `cargo run` is also used for playback. Keep debug symbols/assertions while
+# optimizing the UI libraries' per-frame work.
+[profile.dev.package.i-slint-core]
+opt-level = 2
+
+[profile.dev.package.i-slint-renderer-femtovg]
+opt-level = 2
+
+[profile.dev.package.femtovg]
+opt-level = 2
+
+[profile.dev.package.parley]
+opt-level = 2
+
+[profile.dev.package.swash]
+opt-level = 2
+
+# Shaping and rasterizing a new popup also calls into these font libraries.
+# Optimizing only Slint/Swash leaves their font parsing/hinting in debug mode.
+[profile.dev.package.fontique]
+opt-level = 2
+
+[profile.dev.package.harfrust]
+opt-level = 2
+
+[profile.dev.package."skrifa@0.40.0"]
+opt-level = 2
+
+[profile.dev.package."skrifa@0.44.0"]
+opt-level = 2
+
+[profile.dev.package."read-fonts@0.37.0"]
+opt-level = 2
+
+[profile.dev.package."read-fonts@0.41.0"]
+opt-level = 2

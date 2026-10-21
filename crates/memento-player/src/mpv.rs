@@ -2,10 +2,12 @@
 //! independent audio-only pronunciation handle. Both use the same SDK header
 //! as the C++ player; audio playback never borrows or replaces the movie handle.
 
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::cell::{Cell, Ref, RefCell};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 pub mod ffi {
@@ -805,27 +807,236 @@ pub unsafe extern "C" fn memento_player_decode_cursor_autohide(
     true
 }
 
-/// An initialized mpv instance using libmpv's software renderer. Rendering
-/// writes into caller-owned RGBA8 images so Slint can composite its UI above
-/// the video without a native child window covering the top-level surface.
+/// An initialized mpv instance. It starts with a software render context and
+/// can switch to OpenGL after the UI has created its graphics context.
 pub struct MpvInstance {
     handle: *mut ffi::mpv_handle,
-    render: std::ptr::NonNull<ffi::mpv_render_context>,
+    render_lock: Arc<Mutex<RenderContext>>,
     // mpv may call the update callback from another thread. Dropped only
     // after unregistering it and freeing the render context.
-    render_pending: Box<AtomicBool>,
+    render_pending: Box<RenderNotification>,
+    playback: RefCell<PlaybackState>,
+    configured_hwdec: String,
+    render_update_delay: Cell<std::time::Duration>,
 }
 unsafe impl Send for MpvInstance {}
 
+/// Owned values delivered by mpv's property notifications. Reading these does
+/// not wait on mpv's core, which must never block the UI's render thread.
+#[derive(Default)]
+pub struct PlaybackState {
+    pub file_loaded: bool,
+    pub playback_ready: bool,
+    pub position: f64,
+    pub duration: f64,
+    pub paused: bool,
+    pub volume: f64,
+    pub dimensions: (u32, u32),
+    pub audio_id: i64,
+    pub primary_sid: i64,
+    pub secondary_sid: i64,
+    pub sub_text: String,
+    pub secondary_sub_text: String,
+    pub sub_start: f64,
+    pub sub_end: f64,
+    pub sub_delay: f64,
+    pub sub_speed: f64,
+    pub secondary_sub_start: f64,
+    pub secondary_sub_end: f64,
+    pub secondary_sub_delay: f64,
+    pub audio_tracks: Vec<AudioTrack>,
+    pub subtitle_tracks: Vec<SubtitleTrack>,
+    pub sub_lines: Vec<SubLine>,
+    pub frame_drops: i64,
+    pub decoder_drops: i64,
+    pub hwdec_current: String,
+}
+
+const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
+    (c"time-pos", ffi::MPV_FORMAT_DOUBLE),
+    (c"duration", ffi::MPV_FORMAT_DOUBLE),
+    (c"pause", ffi::MPV_FORMAT_FLAG),
+    (c"volume", ffi::MPV_FORMAT_DOUBLE),
+    (c"dwidth", ffi::MPV_FORMAT_INT64),
+    (c"dheight", ffi::MPV_FORMAT_INT64),
+    (c"aid", ffi::MPV_FORMAT_INT64),
+    (c"sid", ffi::MPV_FORMAT_INT64),
+    (c"secondary-sid", ffi::MPV_FORMAT_INT64),
+    (c"sub-text", ffi::MPV_FORMAT_STRING),
+    (c"secondary-sub-text", ffi::MPV_FORMAT_STRING),
+    (c"sub-start", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-end", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-delay", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-speed", ffi::MPV_FORMAT_DOUBLE),
+    (c"secondary-sub-start", ffi::MPV_FORMAT_DOUBLE),
+    (c"secondary-sub-end", ffi::MPV_FORMAT_DOUBLE),
+    (c"secondary-sub-delay", ffi::MPV_FORMAT_DOUBLE),
+    (c"track-list", ffi::MPV_FORMAT_NODE),
+    (c"sub-lines", ffi::MPV_FORMAT_NODE),
+    (c"frame-drop-count", ffi::MPV_FORMAT_INT64),
+    (c"decoder-frame-drop-count", ffi::MPV_FORMAT_INT64),
+    (c"hwdec-current", ffi::MPV_FORMAT_STRING),
+];
+
+impl PlaybackState {
+    // Event storage belongs to mpv and expires at the next mpv_wait_event call.
+    // Copy strings and node contents here, while that storage is still valid.
+    unsafe fn update(&mut self, property: &ffi::mpv_event_property) {
+        if property.name.is_null() { return; }
+        let name = unsafe { CStr::from_ptr(property.name) }.to_bytes();
+        let data = property.data;
+        let number = |default| {
+            if property.format == ffi::MPV_FORMAT_DOUBLE && !data.is_null() {
+                unsafe { *data.cast::<f64>() }
+            } else { default }
+        };
+        let integer = || {
+            if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                unsafe { *data.cast::<i64>() }
+            } else { 0 }
+        };
+        let string = || {
+            if property.format == ffi::MPV_FORMAT_STRING && !data.is_null() {
+                copy_mpv_string(unsafe { *data.cast::<*const c_char>() })
+            } else { String::new() }
+        };
+        match name {
+            b"time-pos" => self.position = number(0.0).max(0.0),
+            b"duration" => self.duration = number(0.0).max(0.0),
+            b"pause" => self.paused = property.format != ffi::MPV_FORMAT_FLAG
+                || data.is_null() || unsafe { *data.cast::<c_int>() } != 0,
+            b"volume" => self.volume = number(100.0),
+            b"dwidth" => self.dimensions.0 = u32::try_from(integer()).unwrap_or(0),
+            b"dheight" => self.dimensions.1 = u32::try_from(integer()).unwrap_or(0),
+            b"aid" => self.audio_id = integer(),
+            b"sid" => self.primary_sid = integer(),
+            b"secondary-sid" => self.secondary_sid = integer(),
+            b"sub-text" => self.sub_text = string().trim().to_owned(),
+            b"secondary-sub-text" => self.secondary_sub_text = string().trim().to_owned(),
+            b"sub-start" => self.sub_start = number(0.0),
+            b"sub-end" => self.sub_end = number(0.0),
+            b"sub-delay" => self.sub_delay = number(0.0),
+            b"sub-speed" => self.sub_speed = number(1.0).max(f64::EPSILON),
+            b"secondary-sub-start" => self.secondary_sub_start = number(0.0),
+            b"secondary-sub-end" => self.secondary_sub_end = number(0.0),
+            b"secondary-sub-delay" => self.secondary_sub_delay = number(0.0),
+            b"frame-drop-count" => self.frame_drops = integer(),
+            b"decoder-frame-drop-count" => self.decoder_drops = integer(),
+            b"hwdec-current" => self.hwdec_current = string(),
+            b"track-list" => {
+                let tracks = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    Some(OwnedTrackList(unsafe { memento_player_extract_tracks(data.cast()) }))
+                } else { None };
+                let tracks = tracks.as_ref().map_or(&[][..], |list| list.as_slice());
+                self.audio_tracks = tracks.iter()
+                    .filter(|t| t.track_type == TrackType::Audio as i32)
+                    .map(|t| AudioTrack {
+                        id: t.id, language: copy_mpv_string(t.lang), title: copy_mpv_string(t.title),
+                        external_filename: copy_mpv_string(t.external_filename),
+                        external: t.external, default_track: t.default_track, selected: t.selected,
+                    }).collect();
+                self.subtitle_tracks = tracks.iter()
+                    .filter(|t| t.track_type == TrackType::Subtitle as i32)
+                    .map(|t| SubtitleTrack {
+                        id: t.id, language: copy_mpv_string(t.lang), title: copy_mpv_string(t.title),
+                        external_path: copy_mpv_string(t.external_filename),
+                        external: t.external, default_track: t.default_track, selected: t.selected,
+                    }).collect();
+            }
+            b"sub-lines" => {
+                self.sub_lines = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    let lines = OwnedSubLineList(unsafe { memento_player_extract_sub_lines(data.cast()) });
+                    lines.as_slice().iter().map(|line| SubLine {
+                        id: line.id, text: copy_mpv_string(line.text),
+                        start: line.start, end: line.end,
+                    }).collect()
+                } else { Vec::new() };
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct RenderNotification {
+    pending: AtomicBool,
+    wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    pending_since: Mutex<Option<std::time::Instant>>,
+}
+
+impl RenderNotification {
+    fn notify(&self) {
+        let should_wake = {
+            let mut since = self.pending_since.lock().unwrap_or_else(|error| error.into_inner());
+            if !self.pending.swap(true, Ordering::AcqRel) {
+                *since = Some(std::time::Instant::now());
+                true
+            } else { false }
+        };
+        if should_wake {
+            if let Some(wake) = self.wake.get() { wake(); }
+        }
+    }
+
+    fn take(&self) -> Option<std::time::Duration> {
+        let mut since = self.pending_since.lock().unwrap_or_else(|error| error.into_inner());
+        self.pending.swap(false, Ordering::AcqRel).then(|| {
+            since.take().map_or(std::time::Duration::ZERO, |time| time.elapsed())
+        })
+    }
+}
+
+/// A render-only handle for a video worker. Its owner must join the worker
+/// before dropping the originating MpvInstance.
+pub struct MpvSoftwareRenderer {
+    render_lock: Arc<Mutex<RenderContext>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenderApi { Software, OpenGl }
+
+struct RenderContext {
+    pointer: Option<std::ptr::NonNull<ffi::mpv_render_context>>,
+    api: RenderApi,
+}
+
+unsafe impl Send for RenderContext {}
+
+impl MpvSoftwareRenderer {
+    /// # Safety
+    /// The originating `MpvInstance` must remain alive until this call returns.
+    /// Join the render worker before dropping that instance.
+    pub unsafe fn render_rgba(&self, width: u32, height: u32, pixels: &mut [u8]) -> Result<(), String> {
+        let guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
+        if guard.api != RenderApi::Software { return Err("software rendering is inactive".into()); }
+        let pointer = guard.pointer.ok_or("mpv render context is unavailable")?;
+        render_rgba_context(pointer.as_ptr(), width, height, pixels)
+    }
+}
+
+thread_local! {
+    // mpv resolves OpenGL symbols while creating its render context. Keep the
+    // borrowed Slint resolver available only for that synchronous call.
+    static GL_PROC_RESOLVER: Cell<*const c_void> = const { Cell::new(ptr::null()) };
+}
+
+unsafe extern "C" fn resolve_gl_proc(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
+    if name.is_null() { return ptr::null_mut(); }
+    GL_PROC_RESOLVER.with(|slot| {
+        let resolver = slot.get() as *const &dyn Fn(&CStr) -> *const c_void;
+        if resolver.is_null() { return ptr::null_mut(); }
+        unsafe { (*resolver)(CStr::from_ptr(name)).cast_mut() }
+    })
+}
+
 unsafe extern "C" fn on_render_update(userdata: *mut std::ffi::c_void) {
     if !userdata.is_null() {
-        unsafe { &*(userdata as *const AtomicBool) }.store(true, Ordering::Release);
+        unsafe { &*(userdata as *const RenderNotification) }.notify();
     }
 }
 
 impl MpvInstance {
-    /// Initialize mpv and its software renderer before the first media load.
-    /// Use [`Self::render_rgba`] to draw into an image in the UI's scene graph.
+    /// Initialize mpv and a software fallback before the first media load.
     pub fn new_software(config_dir: Option<&Path>) -> Result<Self, String> {
         Self::create(config_dir)
     }
@@ -850,12 +1061,18 @@ impl MpvInstance {
                 (c"pause", c"yes"),
                 (c"sub-visibility", c"no"),
                 (c"profile", c"fast"),
-                (c"hwdec", c"auto-safe"),
+                // Software rendering needs decoded frames in CPU memory.
+                // Request a copy-back decoder when hardware decode is available.
+                (c"hwdec", c"auto-copy-safe"),
                 (c"hwdec-codecs", c"all"),
                 (c"framedrop", c"vo"),
+                // Rendering never sleeps on the UI thread. Ask mpv to notify
+                // us at the frame deadline instead of its default 50ms ahead.
+                (c"video-timing-offset", c"0"),
                 (c"vd-lavc-threads", c"0"),
                 (c"sws-scaler", c"fast-bilinear"),
                 (c"sws-fast", c"yes"),
+                (c"sw-fast", c"yes"),
             ] {
                 opt(name, value);
             }
@@ -878,45 +1095,46 @@ impl MpvInstance {
                 return Err(format!("mpv initialization failed with code {status}"));
             }
 
-            let mut context = ptr::null_mut();
-            let mut params = [
-                ffi::mpv_render_param {
-                    type_: ffi::MPV_RENDER_PARAM_API_TYPE,
-                    data: c"sw".as_ptr().cast_mut().cast(),
-                },
-                ffi::mpv_render_param {
-                    type_: ffi::MPV_RENDER_PARAM_INVALID,
-                    data: ptr::null_mut(),
-                },
-            ];
-            let status = unsafe {
-                ffi::mpv_render_context_create(&mut context, handle, params.as_mut_ptr())
+            // Read the effective configuration before media/rendering starts.
+            // A user mpv.conf can override the auto-copy default above.
+            let configured_hwdec = unsafe {
+                let value = ffi::mpv_get_property_string(handle, c"hwdec".as_ptr());
+                let text = copy_mpv_string(value);
+                if !value.is_null() { ffi::mpv_free(value.cast()); }
+                text
             };
-            if status < 0 {
-                if !context.is_null() {
-                    unsafe { ffi::mpv_render_context_free(context) };
-                }
-                return Err(format!("mpv software render context failed with code {status}"));
-            }
-            let Some(context) = std::ptr::NonNull::new(context) else {
-                return Err("mpv software render context was null".into());
-            };
-            let mut pending = Box::new(AtomicBool::new(true));
+            let context = create_software_context(handle)?;
+            let mut pending = Box::new(RenderNotification::default());
             unsafe {
                 ffi::mpv_render_context_set_update_callback(
                     context.as_ptr(),
                     Some(on_render_update),
-                    (&mut *pending as *mut AtomicBool).cast(),
+                    (&mut *pending as *mut RenderNotification).cast(),
                 );
             }
-            Ok((context, pending))
+            for (id, (name, format)) in PLAYBACK_PROPERTIES.iter().enumerate() {
+                let status = unsafe {
+                    ffi::mpv_observe_property(handle, id as u64 + 1, name.as_ptr(), *format)
+                };
+                if status < 0 {
+                    eprintln!("Could not observe mpv property {}: {status}", name.to_string_lossy());
+                }
+            }
+            Ok((context, pending, configured_hwdec))
         };
 
         match initialize() {
-            Ok((render, render_pending)) => Ok(Self {
+            Ok((render, render_pending, configured_hwdec)) => Ok(Self {
                 handle,
-                render,
+                render_lock: Arc::new(Mutex::new(RenderContext {
+                    pointer: Some(render), api: RenderApi::Software,
+                })),
                 render_pending,
+                playback: RefCell::new(PlaybackState {
+                    paused: true, volume: 100.0, sub_speed: 1.0, ..Default::default()
+                }),
+                configured_hwdec,
+                render_update_delay: Cell::new(std::time::Duration::ZERO),
             }),
             Err(error) => {
                 unsafe { ffi::mpv_terminate_destroy(handle) };
@@ -925,15 +1143,83 @@ impl MpvInstance {
         }
     }
 
-    /// Consume the render callback notification on the UI/render thread.
+    /// NVDEC's direct CUDA/GL interop requires an NVIDIA GL context. Hybrid
+    /// systems can still decode on NVIDIA and display on Intel/AMD by copying.
+    /// Preserve the user's decoder choice and order; adapt only that interop.
+    pub fn configure_opengl_decoder(&self, renderer: &str) -> Result<(), String> {
+        let compatible = compatible_opengl_hwdec(&self.configured_hwdec, renderer);
+        if compatible != self.configured_hwdec {
+            self.command_async(&["set", "hwdec", &compatible])?;
+            eprintln!("Video decoder compatibility: {} -> {compatible} ({renderer})", self.configured_hwdec);
+        }
+        Ok(())
+    }
+
+    /// Register a lightweight event-loop wakeup once. Called from mpv's threads;
+    /// it must only enqueue work, never call mpv or render synchronously.
+    pub fn set_render_wakeup(&self, wake: impl Fn() + Send + Sync + 'static) {
+        if self.render_pending.wake.set(Box::new(wake)).is_ok() && self.has_render_update() {
+            if let Some(wake) = self.render_pending.wake.get() { wake(); }
+        }
+    }
+
+    pub fn has_render_update(&self) -> bool {
+        self.render_pending.pending.load(Ordering::Acquire)
+    }
+
+    /// Drain asynchronous property events without waiting for mpv's core.
+    pub fn poll_playback_state(&self) -> Ref<'_, PlaybackState> {
+        {
+            let mut state = self.playback.borrow_mut();
+            loop {
+                let event = unsafe { ffi::mpv_wait_event(self.handle, 0.0) };
+                if event.is_null() || unsafe { (*event).event_id } == ffi::MPV_EVENT_NONE { break; }
+                match unsafe { (*event).event_id } {
+                    ffi::MPV_EVENT_START_FILE | ffi::MPV_EVENT_END_FILE => {
+                        state.file_loaded = false;
+                        state.playback_ready = false;
+                    }
+                    ffi::MPV_EVENT_FILE_LOADED => state.file_loaded = true,
+                    ffi::MPV_EVENT_PLAYBACK_RESTART => state.playback_ready = true,
+                    _ => {}
+                }
+                if unsafe { (*event).event_id } == ffi::MPV_EVENT_PROPERTY_CHANGE {
+                    let property = unsafe { (*event).data.cast::<ffi::mpv_event_property>().as_ref() };
+                    if let Some(property) = property { unsafe { state.update(property) }; }
+                }
+            }
+        }
+        self.playback.borrow()
+    }
+
+    pub fn cached_video_dimensions(&self) -> (u32, u32) {
+        self.playback.borrow().dimensions
+    }
+
+    pub fn render_update_delay(&self) -> std::time::Duration {
+        self.render_update_delay.get()
+    }
+
+    /// Age of an unconsumed frame notification, without calling into mpv.
+    pub fn pending_render_delay(&self) -> std::time::Duration {
+        self.render_pending.pending_since.lock().unwrap_or_else(|error| error.into_inner())
+            .map_or(std::time::Duration::ZERO, |since| since.elapsed())
+    }
+
+    /// Consume the notification on the render thread with its GL context current
+    /// (or on the software-render thread when the software API is active).
     /// A `true` result means a new frame (or video configuration) needs a
     /// redraw. Render again on a viewport resize even if this returns false.
     pub fn take_render_update(&self) -> bool {
-        if !self.render_pending.swap(false, Ordering::AcqRel) {
+        if !self.has_render_update() {
             return false;
         }
+        let Ok(guard) = self.render_lock.try_lock() else { return false };
+        let Some(delay) = self.render_pending.take() else { return false };
+        self.render_update_delay.set(delay);
+        let Some(context) = guard.pointer else { return false };
         unsafe {
-            ffi::mpv_render_context_update(self.render.as_ptr())
+            ffi::mpv_render_context_update(context.as_ptr())
                 & u64::from(ffi::MPV_RENDER_UPDATE_FRAME)
                 != 0
         }
@@ -944,6 +1230,171 @@ impl MpvInstance {
     /// mpv returns. mpv requires at least 4-byte pixel alignment; a 64-byte
     /// aligned buffer and stride are preferred for SIMD performance.
     pub fn render_rgba(&self, width: u32, height: u32, pixels: &mut [u8]) -> Result<(), String> {
+        let guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
+        if guard.api != RenderApi::Software { return Err("software rendering is inactive".into()); }
+        let context = guard.pointer.ok_or("mpv render context is unavailable")?;
+        render_rgba_context(context.as_ptr(), width, height, pixels)
+    }
+
+    pub fn software_renderer(&self) -> MpvSoftwareRenderer {
+        MpvSoftwareRenderer {
+            render_lock: self.render_lock.clone(),
+        }
+    }
+
+    /// Replace the slow CPU render context with libmpv's OpenGL renderer.
+    /// Call only while the UI's OpenGL context is current. If GL setup fails,
+    /// the software context is restored for playback compatibility.
+    pub fn activate_opengl(&self, resolver: &dyn Fn(&CStr) -> *const c_void) -> Result<(), String> {
+        let mut guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
+        if guard.api == RenderApi::OpenGl { return Ok(()); }
+        if let Some(old) = guard.pointer.take() {
+            unsafe {
+                ffi::mpv_render_context_set_update_callback(old.as_ptr(), None, ptr::null_mut());
+                ffi::mpv_render_context_free(old.as_ptr());
+            }
+        }
+        let gl_result = create_opengl_context(self.handle, resolver);
+        let (context, api) = match gl_result {
+            Ok(context) => (context, RenderApi::OpenGl),
+            Err(error) => {
+                let fallback = create_software_context(self.handle)?;
+                guard.pointer = Some(fallback);
+                guard.api = RenderApi::Software;
+                self.install_render_callback(fallback);
+                return Err(error);
+            }
+        };
+        guard.pointer = Some(context);
+        guard.api = api;
+        self.install_render_callback(context);
+        self.render_pending.notify();
+        Ok(())
+    }
+
+    /// Free GL resources before Slint destroys the graphics context.
+    pub fn deactivate_opengl(&self) {
+        if let Ok(mut guard) = self.render_lock.lock() {
+            if guard.api == RenderApi::OpenGl {
+                if let Some(context) = guard.pointer.take() {
+                    unsafe {
+                        ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
+                        ffi::mpv_render_context_free(context.as_ptr());
+                    }
+                }
+                guard.api = RenderApi::Software;
+            }
+        }
+    }
+
+    pub fn fallback_to_software(&self) -> Result<(), String> {
+        let mut guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
+        if guard.api == RenderApi::Software && guard.pointer.is_some() { return Ok(()); }
+        if let Some(context) = guard.pointer.take() {
+            unsafe {
+                ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
+                ffi::mpv_render_context_free(context.as_ptr());
+            }
+        }
+        let context = create_software_context(self.handle)?;
+        guard.pointer = Some(context);
+        guard.api = RenderApi::Software;
+        self.install_render_callback(context);
+        self.render_pending.notify();
+        Ok(())
+    }
+
+    pub fn is_opengl_active(&self) -> bool {
+        self.render_lock.lock().is_ok_and(|guard| guard.api == RenderApi::OpenGl && guard.pointer.is_some())
+    }
+
+    /// Draw to an RGBA8 GL framebuffer while the UI's context is current.
+    pub fn render_opengl(&self, fbo: u32, width: u32, height: u32) -> Result<(), String> {
+        let guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
+        if guard.api != RenderApi::OpenGl { return Err("OpenGL rendering is inactive".into()); }
+        let context = guard.pointer.ok_or("mpv render context is unavailable")?;
+        let mut target = ffi::mpv_opengl_fbo {
+            fbo: fbo as c_int, w: width as c_int, h: height as c_int,
+            internal_format: 0, // Let libmpv query the framebuffer format.
+        };
+        // The UI thread must not wait inside mpv's frame pacing. Slint schedules
+        // redraws from mpv's update callback and presents the frame afterward.
+        let mut block_for_target_time: c_int = 0;
+        let mut params = [
+            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_OPENGL_FBO, data: (&mut target as *mut ffi::mpv_opengl_fbo).cast() },
+            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, data: (&mut block_for_target_time as *mut c_int).cast() },
+            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+        ];
+        let status = unsafe { ffi::mpv_render_context_render(context.as_ptr(), params.as_mut_ptr()) };
+        if status < 0 { Err(format!("mpv OpenGL render failed with code {status}")) } else { Ok(()) }
+    }
+
+    pub fn report_render_swap(&self) {
+        if let Ok(guard) = self.render_lock.lock() {
+            if let Some(context) = guard.pointer {
+                unsafe { ffi::mpv_render_context_report_swap(context.as_ptr()) };
+            }
+        }
+    }
+
+    fn install_render_callback(&self, context: std::ptr::NonNull<ffi::mpv_render_context>) {
+        unsafe {
+            ffi::mpv_render_context_set_update_callback(
+                context.as_ptr(), Some(on_render_update),
+                (&*self.render_pending as *const RenderNotification).cast_mut().cast(),
+            );
+        }
+    }
+
+}
+
+fn compatible_opengl_hwdec(configured: &str, renderer: &str) -> String {
+    if renderer.to_ascii_lowercase().contains("nvidia") {
+        return configured.to_owned();
+    }
+    configured.split(',').map(|decoder| {
+        if decoder.trim() == "nvdec" { "nvdec-copy" } else { decoder }
+    }).collect::<Vec<_>>().join(",")
+}
+
+fn create_software_context(handle: *mut ffi::mpv_handle) -> Result<std::ptr::NonNull<ffi::mpv_render_context>, String> {
+    let mut context = ptr::null_mut();
+    let mut params = [
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_API_TYPE, data: c"sw".as_ptr().cast_mut().cast() },
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+    ];
+    let status = unsafe { ffi::mpv_render_context_create(&mut context, handle, params.as_mut_ptr()) };
+    if status < 0 {
+        if !context.is_null() { unsafe { ffi::mpv_render_context_free(context) }; }
+        return Err(format!("mpv software render context failed with code {status}"));
+    }
+    std::ptr::NonNull::new(context).ok_or_else(|| "mpv software render context was null".into())
+}
+
+fn create_opengl_context(
+    handle: *mut ffi::mpv_handle, resolver: &dyn Fn(&CStr) -> *const c_void,
+) -> Result<std::ptr::NonNull<ffi::mpv_render_context>, String> {
+    let mut init = ffi::mpv_opengl_init_params {
+        get_proc_address: Some(resolve_gl_proc), get_proc_address_ctx: ptr::null_mut(),
+    };
+    let mut context = ptr::null_mut();
+    let mut params = [
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_API_TYPE, data: c"opengl".as_ptr().cast_mut().cast() },
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: (&mut init as *mut ffi::mpv_opengl_init_params).cast() },
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+    ];
+    let resolver_ref = resolver;
+    let previous = GL_PROC_RESOLVER.with(|slot| slot.replace((&resolver_ref as *const _) as *const c_void));
+    let status = unsafe { ffi::mpv_render_context_create(&mut context, handle, params.as_mut_ptr()) };
+    GL_PROC_RESOLVER.with(|slot| slot.set(previous));
+    if status < 0 {
+        if !context.is_null() { unsafe { ffi::mpv_render_context_free(context) }; }
+        return Err(format!("mpv OpenGL render context failed with code {status}"));
+    }
+    std::ptr::NonNull::new(context).ok_or_else(|| "mpv OpenGL render context was null".into())
+}
+
+fn render_rgba_context(render: *mut ffi::mpv_render_context, width: u32, height: u32, pixels: &mut [u8]) -> Result<(), String> {
         let needed = usize::try_from(width)
             .ok()
             .and_then(|w| w.checked_mul(4))
@@ -964,7 +1415,7 @@ impl MpvInstance {
             ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
         ];
         let status = unsafe {
-            ffi::mpv_render_context_render(self.render.as_ptr(), params.as_mut_ptr())
+            ffi::mpv_render_context_render(render, params.as_mut_ptr())
         };
         if status < 0 {
             return Err(format!("mpv software render failed with code {status}"));
@@ -991,6 +1442,7 @@ impl MpvInstance {
         Ok(())
     }
 
+impl MpvInstance {
     fn with_tracks<R>(&self, read: impl FnOnce(&[MementoTrackC]) -> R) -> R {
         let mut node = OwnedNode::new();
         let status = unsafe {
@@ -1342,7 +1794,8 @@ impl MpvInstance {
         self.set_track_property(c"secondary-sid", id)
     }
 
-    fn command_async(&self, args: &[&str]) -> Result<(), String> {
+    /// Queue a command without blocking the render/UI thread on mpv's core.
+    pub fn command_async(&self, args: &[&str]) -> Result<(), String> {
         let c_args: Result<Vec<std::ffi::CString>, _> =
             args.iter().map(|arg| std::ffi::CString::new(*arg)).collect();
         let c_args = c_args.map_err(|error| error.to_string())?;
@@ -1536,19 +1989,22 @@ impl MpvInstance {
     }
 
     pub fn load_file(&self, path: &str) -> Result<(), String> {
+        drop(self.poll_playback_state());
+        self.playback.borrow_mut().file_loaded = false;
+        self.playback.borrow_mut().playback_ready = false;
         self.command(&["loadfile", path, "replace"])
     }
 
     pub fn play(&self) -> Result<(), String> {
-        self.command(&["set", "pause", "no"])
+        self.command_async(&["set", "pause", "no"])
     }
 
     pub fn pause(&self) -> Result<(), String> {
-        self.command(&["set", "pause", "yes"])
+        self.command_async(&["set", "pause", "yes"])
     }
 
     pub fn toggle_pause(&self) -> Result<(), String> {
-        self.command(&["cycle", "pause"])
+        self.command_async(&["cycle", "pause"])
     }
 
     pub fn is_paused(&self) -> bool {
@@ -1571,18 +2027,18 @@ impl MpvInstance {
 
     pub fn seek(&self, sec: f64) -> Result<(), String> {
         let sec_str = format!("{:.3}", sec.max(0.0));
-        self.command(&["seek", &sec_str, "absolute"])
+        self.command_async(&["seek", &sec_str, "absolute"])
     }
 
     pub fn seek_relative(&self, delta: f64) -> Result<(), String> {
         let sec_str = format!("{:.3}", delta);
-        self.command(&["seek", &sec_str, "relative"])
+        self.command_async(&["seek", &sec_str, "relative"])
     }
 
 
     pub fn set_volume(&self, vol: f64) -> Result<(), String> {
         let vol_str = format!("{:.1}", vol.clamp(0.0, 100.0));
-        self.command(&["set", "volume", &vol_str])
+        self.command_async(&["set", "volume", &vol_str])
     }
 
     pub fn get_volume(&self) -> f64 {
@@ -1669,13 +2125,13 @@ impl MpvInstance {
 
 impl Drop for MpvInstance {
     fn drop(&mut self) {
-        unsafe {
-            ffi::mpv_render_context_set_update_callback(
-                self.render.as_ptr(),
-                None,
-                ptr::null_mut(),
-            );
-            ffi::mpv_render_context_free(self.render.as_ptr());
+        if let Ok(mut guard) = self.render_lock.lock() {
+            if let Some(context) = guard.pointer.take() {
+                unsafe {
+                    ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
+                    ffi::mpv_render_context_free(context.as_ptr());
+                }
+            }
         }
         if !self.handle.is_null() {
             unsafe { ffi::mpv_terminate_destroy(self.handle) };
@@ -1810,6 +2266,105 @@ impl Drop for AudioInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_gpu_decoder_uses_copyback_without_overriding_other_choices() {
+        assert_eq!(compatible_opengl_hwdec("nvdec", "Mesa Intel UHD 630"), "nvdec-copy");
+        assert_eq!(compatible_opengl_hwdec("nvdec,vaapi", "AMD Radeon"), "nvdec-copy,vaapi");
+        assert_eq!(compatible_opengl_hwdec("nvdec", "NVIDIA GeForce"), "nvdec");
+        for choice in ["no", "auto", "auto-copy-safe", "nvdec-copy", "vaapi"] {
+            assert_eq!(compatible_opengl_hwdec(choice, "Mesa Intel UHD 630"), choice);
+        }
+    }
+
+    #[test]
+    fn render_wakeup_coalesces_and_rearms_after_consumption() {
+        let notification = Arc::new(RenderNotification::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        assert!(notification.wake.set(Box::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        })).is_ok());
+        let source = notification.clone();
+        std::thread::spawn(move || {
+            for _ in 0..100 { source.notify(); }
+        }).join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(notification.take().is_some());
+        assert!(notification.take().is_none());
+        notification.notify();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn playback_events_own_text_and_clear_unavailable_values() {
+        let mut state = PlaybackState::default();
+        let mut text = CString::new(" subtitle ").unwrap();
+        let mut pointer = text.as_ptr();
+        let mut event = ffi::mpv_event_property {
+            name: c"sub-text".as_ptr(),
+            format: ffi::MPV_FORMAT_STRING,
+            data: (&mut pointer as *mut *const c_char).cast(),
+        };
+        unsafe { state.update(&event); }
+        text = CString::new("reused event storage").unwrap();
+        assert_eq!(state.sub_text, "subtitle");
+        assert_eq!(text.to_bytes(), b"reused event storage");
+        event.format = ffi::MPV_FORMAT_NONE;
+        event.data = ptr::null_mut();
+        unsafe { state.update(&event); }
+        assert!(state.sub_text.is_empty());
+        event.name = c"sub-speed".as_ptr();
+        unsafe { state.update(&event); }
+        assert_eq!(state.sub_speed, 1.0);
+    }
+
+    #[test]
+    fn live_frames_wake_renderer_and_deliver_playback_properties() {
+        let dir = std::env::temp_dir().join(format!("memento-frame-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("input.conf"), "").unwrap();
+        // Small deterministic source: no display, decoder hardware or media
+        // downloads required. Exercise real libmpv notifications and rendering.
+        let player = MpvInstance::new_software(Some(&dir)).unwrap();
+        let (wake, frames) = std::sync::mpsc::channel();
+        player.set_render_wakeup(move || { let _ = wake.send(()); });
+        player.load_file("av://lavfi:testsrc=size=64x64:rate=24,format=yuv420p").unwrap();
+        player.play().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut pixels = vec![0u32; 64 * 64];
+        let pixels = unsafe {
+            std::slice::from_raw_parts_mut(pixels.as_mut_ptr().cast::<u8>(), pixels.len() * 4)
+        };
+        let mut rendered = 0;
+        while rendered < 24 && std::time::Instant::now() < deadline {
+            frames.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("mpv frame wakeup must not get lost");
+            while frames.try_recv().is_ok() {}
+            if player.take_render_update() {
+                player.render_rgba(64, 64, pixels).unwrap();
+                if player.poll_playback_state().dimensions == (64, 64) { rendered += 1; }
+            }
+        }
+        assert_eq!(rendered, 24, "real frames should continue without a polling timer");
+        {
+            let state = player.poll_playback_state();
+            assert_eq!(state.dimensions, (64, 64));
+            assert!(!state.paused);
+            assert!(state.position > 0.0);
+        }
+        // Stop the render clock before using synchronous diagnostic queries.
+        player.command(&["set", "pause", "yes"]).unwrap();
+        assert_eq!(player.get_i64(c"frame-drop-count", -1), 0);
+        player.command(&["stop"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while player.poll_playback_state().dimensions != (0, 0) {
+            assert!(std::time::Instant::now() < deadline, "stopped video state must clear");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(player);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn cue_time_and_text_limits_match_qt() {
@@ -2326,6 +2881,13 @@ mod tests {
         assert!(inst.render_rgba(1, 1, &mut pixels.0[1..5]).is_err());
         inst.render_rgba(2, 2, &mut pixels.0).expect("rendering should succeed");
         assert!(pixels.0.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        let worker_renderer = inst.software_renderer();
+        let worker_pixels = std::thread::spawn(move || {
+            let mut pixels = AlignedBytes([0; 16]);
+            unsafe { worker_renderer.render_rgba(2, 2, &mut pixels.0) }.unwrap();
+            pixels
+        }).join().expect("render worker should finish before mpv is dropped");
+        assert!(worker_pixels.0.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 }
 

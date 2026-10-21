@@ -2,7 +2,7 @@
 
 use memento_app::controller::dict::{
     format_cloze_for_term, format_cloze_spans, format_tags, format_tags_with_notes,
-    generate_prefix_queries, normalize_reading, rank_hits, ClozeSentence, DictController,
+    generate_prefix_queries, normalize_reading, parse_rich_glossary, rank_hits, ClozeSentence, DictController,
     DictTag, InMemoryDictionary, SearchHit,
 };
 
@@ -15,6 +15,21 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct TemporaryDictionaryDatabase(PathBuf);
+
+#[test]
+fn structured_glossary_keeps_heading_list_and_link_blocks() {
+    let raw = r#"[{"type":"structured-content","content":[
+        {"tag":"span","content":[{"tag":"span","style":{"fontWeight":"bold"},"content":"せかいじゅう"},{"tag":"span","content":"【世界中】"}]},
+        {"tag":"div","data":{"name":"definition"},"content":"地球上のあらゆる場所。"},
+        {"tag":"ul","content":[{"tag":"li","content":"around the world"}]},
+        {"tag":"a","href":"?query=世界","content":"←世界"},
+        {"tag":"ul","data":{"content":"examples"},"content":[{"tag":"li","content":"example"}]}
+    ]}]"#;
+    let blocks = parse_rich_glossary(raw);
+    assert_eq!(blocks.iter().map(|block| block.kind).collect::<Vec<_>>(), vec![1, 0, 2, 3]);
+    assert_eq!(blocks[0].text, "せかいじゅう【世界中】");
+    assert_eq!(blocks[3].href, "?query=世界");
+}
 
 impl Drop for TemporaryDictionaryDatabase {
     fn drop(&mut self) {
@@ -99,6 +114,10 @@ fn create_dictionary_fixture() -> TemporaryDictionaryDatabase {
              dic_id INTEGER NOT NULL, expression TEXT NOT NULL, mode TEXT NOT NULL,
              type INTEGER NOT NULL, data BLOB
          );
+         INSERT INTO term_meta_bank VALUES
+             (1, '食べる', 'freq', 4, '{\"reading\":\"たべる\",\"frequency\":120}'),
+             (2, '食べる', 'freq', 4, '{\"reading\":\"たべる\",\"frequency\":180}'),
+             (1, '食べる', 'pitch', 4, '{\"reading\":\"たべる\",\"pitches\":[{\"position\":2}]}');
          INSERT INTO directory VALUES
              (1, 'Primary', 3, 'fixture', 0),
              (2, 'Secondary', 3, 'fixture', 0);
@@ -197,6 +216,28 @@ fn test_open_dictionary_searches_real_term_kanji_and_normalized_rows_read_only()
         .all(|hit| hit.dict_name == "Primary"));
     drop(controller);
     assert_eq!(fs::read(&fixture.0).unwrap(), original_contents);
+}
+
+#[test]
+fn anki_term_metadata_fills_frequency_and_pitch_markers() {
+    let fixture = create_dictionary_fixture();
+    let dictionary = DictController::open(&fixture.0).unwrap();
+    let metadata = dictionary.get_anki_term_metadata("食べる", "たべる", &["v1".into()]);
+    assert!(metadata.frequencies.contains("Primary: 120"));
+    assert!(metadata.frequencies.contains("Secondary: 180"));
+    assert_eq!(metadata.frequency_harmonic_rank, "144");
+    assert_eq!(metadata.frequency_average_rank, "150");
+    assert_eq!(metadata.pitch_positions, "<span class=\"memento-pitch-position\">[2]</span>");
+    assert_eq!(metadata.pitch_categories, "kifuku");
+    let graphs = dictionary.get_pitch_graphs("食べる", "たべる");
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].dictionary, "Primary");
+    assert_eq!(graphs[0].mora, ["た", "べ", "る"]);
+    assert_eq!(graphs[0].position, 2);
+    let frequencies = dictionary.get_frequencies("食べる", "たべる");
+    assert_eq!(frequencies.len(), 2);
+    assert_eq!(frequencies[0].dictionary, "Primary");
+    assert_eq!(frequencies[1].dictionary, "Secondary");
 }
 
 #[test]

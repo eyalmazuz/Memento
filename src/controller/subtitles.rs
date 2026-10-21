@@ -1,6 +1,8 @@
 //! Subtitle controller connecting memento-subtitle to Slint SubtitlePanel.
 
 use std::path::PathBuf;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use memento_subtitle::model::{
     self, ActiveCueActionKind, SubtitleExternalPathInput, SubtitleTrackInput, TrackAction,
 };
@@ -35,8 +37,8 @@ pub fn create_cue(text: &str, start: f64, end: f64) -> SubtitleEntry {
     }
 }
 
-/// A subtitle track reported by mpv. Track IDs are mpv SIDs; zero and negative
-/// IDs do not represent subtitle models.
+/// A subtitle track reported by mpv. Positive IDs are mpv SIDs; zero is
+/// reserved by this controller for the application's ASR subtitles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubtitleTrackInfo {
     pub id: i64,
@@ -119,6 +121,7 @@ impl SubtitleTrackModel {
 /// independent, so their active cues can overlap and be shown simultaneously.
 pub struct SubtitleController {
     tracks: Vec<SubtitleTrackModel>,
+    asr_cues: Vec<MemorySubtitleCue>,
     primary_sid: i64,
     secondary_sid: i64,
 }
@@ -133,6 +136,7 @@ impl SubtitleController {
     pub fn new() -> Self {
         Self {
             tracks: Vec::new(),
+            asr_cues: Vec::new(),
             primary_sid: 0,
             secondary_sid: 0,
         }
@@ -153,7 +157,9 @@ impl SubtitleController {
                 SubtitleTrackInput::new(false, track.id, track.external, path.as_slice())
             })
             .collect();
-        let model_ids: Vec<i64> = self.tracks.iter().map(|track| track.id).collect();
+        // The local ASR track is not in mpv's track list and must survive its
+        // regular reconciliation while transcription is running.
+        let model_ids: Vec<i64> = self.tracks.iter().map(|track| track.id).filter(|id| *id > 0).collect();
         let external_path_units: Vec<(i64, Vec<u16>)> = self
             .tracks
             .iter()
@@ -250,6 +256,63 @@ impl SubtitleController {
             self.tracks.push(SubtitleTrackModel::new(sid));
         }
         true
+    }
+
+    /// Begin a local ASR track, independent of mpv's positive subtitle SIDs.
+    pub fn start_asr_track(&mut self) {
+        self.asr_cues.clear();
+        self.tracks.retain(|track| track.id != 0);
+        self.tracks.push(SubtitleTrackModel::new(0));
+        self.primary_sid = 0;
+    }
+
+    pub fn clear_asr_track(&mut self) {
+        self.asr_cues.clear();
+        self.tracks.retain(|track| track.id != 0);
+    }
+
+    pub fn add_asr_cue(&mut self, cue: MemorySubtitleCue, position: f64) -> bool {
+        if self.track(0).is_none() {
+            return false;
+        }
+        let selected_ids = self.selected_asr_ids();
+        self.asr_cues.retain(|existing| existing.id != cue.id);
+        self.asr_cues.push(cue);
+        self.rebuild_asr_track(position, &selected_ids);
+        true
+    }
+
+    pub fn remove_asr_cue(&mut self, cue_id: i64, position: f64) -> bool {
+        let selected_ids = self.selected_asr_ids();
+        let before = self.asr_cues.len();
+        self.asr_cues.retain(|cue| cue.id != cue_id);
+        if self.asr_cues.len() == before {
+            return false;
+        }
+        self.rebuild_asr_track(position, &selected_ids);
+        true
+    }
+
+    fn selected_asr_ids(&self) -> Vec<i64> {
+        self.track(0).map(|track| track.selected_indices.iter()
+            .filter_map(|index| self.asr_cues.get(*index).map(|cue| cue.id))
+            .collect()).unwrap_or_default()
+    }
+
+    fn rebuild_asr_track(&mut self, position: f64, selected_ids: &[i64]) {
+        self.asr_cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let selected_indices = self.asr_cues.iter().enumerate()
+            .filter_map(|(index, cue)| selected_ids.contains(&cue.id).then_some(index))
+            .collect();
+        let entries: Vec<_> = self.asr_cues.iter().map(|cue| SubtitleEntry {
+            text: cue.text.clone(), start: cue.start, end: cue.end,
+        }).collect();
+        if let Some(track) = self.track_mut(0) {
+            track.entries = entries;
+            track.is_memory_track = true;
+            track.selected_indices = selected_indices;
+            track.active_indices = select_active_indices(&track.entries, position);
+        }
     }
 
     pub fn remove_track(&mut self, sid: i64) -> bool {
@@ -495,6 +558,7 @@ impl SubtitleController {
 
     pub fn clear(&mut self) {
         self.tracks.clear();
+        self.asr_cues.clear();
         self.primary_sid = 0;
         self.secondary_sid = 0;
     }
@@ -616,6 +680,67 @@ fn select_active_indices(entries: &[SubtitleEntry], raw_time: f64) -> Vec<usize>
         .collect()
 }
 
+/// Tokenize the current subtitle with MeCab and attach approximate readings.
+/// Run this on a worker: starting MeCab must never delay video rendering.
+pub fn subtitle_furigana_parts(text: &str) -> Result<Vec<(String, String)>, String> {
+    if text.is_empty() { return Ok(Vec::new()); }
+    let mut child = Command::new("mecab")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|error| format!("MeCab is unavailable: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes()).map_err(|error| format!("MeCab input failed: {error}"))?;
+        if !text.ends_with('\n') { stdin.write_all(b"\n").map_err(|error| error.to_string())?; }
+    }
+    let output = child.wait_with_output().map_err(|error| format!("MeCab failed: {error}"))?;
+    if !output.status.success() { return Err("MeCab could not parse the subtitle".into()); }
+    parse_mecab_furigana(text, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_mecab_furigana(text: &str, output: &str) -> Result<Vec<(String, String)>, String> {
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    for line in output.lines() {
+        if line == "EOS" || line.is_empty() { continue; }
+        let Some((surface, features)) = line.split_once('\t') else { continue; };
+        if surface.is_empty() { continue; }
+        let remaining = &text[offset..];
+        let Some(gap) = remaining.find(surface) else {
+            return Err("MeCab token text did not match the subtitle".into());
+        };
+        if gap > 0 {
+            let skipped = &remaining[..gap];
+            for token in segment_subtitle_text(skipped) { parts.push((token, String::new())); }
+            offset += gap;
+        }
+        let fields: Vec<&str> = features.split(',').collect();
+        let is_kana = |value: &&str| !value.is_empty() && *value != "*"
+            && value.chars().all(|character| matches!(character, '\u{3040}'..='\u{30ff}'));
+        let contains_kanji = surface.chars().any(|character| matches!(character, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'));
+        let reading = if contains_kanji {
+            // UniDic exposes surface pronunciation at column 9; IPADic uses
+            // column 7. Prefer UniDic's lemma reading for plain kanji words.
+            let preferred = if surface.chars().any(|c| matches!(c, '\u{3040}'..='\u{30ff}')) {
+                [9, 6, 7]
+            } else { [6, 7, 9] };
+            preferred.into_iter().filter_map(|index| fields.get(index))
+                .find(|candidate| is_kana(candidate))
+                .map(|reading| {
+                    let units = reading.encode_utf16().collect::<Vec<_>>();
+                    String::from_utf16_lossy(&memento_util::furiganaparser::katakana_to_hiragana(&units))
+                }).unwrap_or_default()
+        } else { String::new() };
+        parts.push((surface.to_owned(), reading));
+        offset += surface.len();
+    }
+    if offset < text.len() {
+        for token in segment_subtitle_text(&text[offset..]) { parts.push((token, String::new())); }
+    }
+    if parts.iter().map(|(surface, _)| surface.as_str()).collect::<String>() != text {
+        return Err("MeCab did not preserve the subtitle text".into());
+    }
+    Ok(parts)
+}
+
 /// Segments a subtitle line into interactive word/token units for Yomitan lookup and hover.
 /// Handles Japanese text (Kanji runs, Okurigana/suffixes, particles, whitespace) as well as
 /// space-separated languages.
@@ -709,5 +834,23 @@ pub fn segment_subtitle_text(text: &str) -> Vec<String> {
 
 
     tokens
+}
+
+#[cfg(test)]
+mod furigana_tests {
+    use super::parse_mecab_furigana;
+
+    #[test]
+    fn mecab_readings_preserve_spacing_and_inflected_surface() {
+        let text = "昨日 は行った";
+        let output = "昨日\t名詞,普通名詞,副詞可能,,,,キノウ,昨日,昨日,キノー\n\
+は\t助詞,係助詞,,,,,ハ,は,は,ワ\n\
+行っ\t動詞,非自立可能,,,五段-カ行,連用形-促音便,イク,行く,行っ,イッ\n\
+た\t助動詞,,,,助動詞-タ,連体形-一般,タ,た,た,タ\nEOS\n";
+        let parts = parse_mecab_furigana(text, output).unwrap();
+        assert_eq!(parts.iter().map(|(surface, _)| surface.as_str()).collect::<String>(), text);
+        assert_eq!(parts.iter().find(|(surface, _)| surface == "昨日").unwrap().1, "きのう");
+        assert_eq!(parts.iter().find(|(surface, _)| surface == "行っ").unwrap().1, "いっ");
+    }
 }
 
