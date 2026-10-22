@@ -154,9 +154,16 @@ changes in drop counts are also reported without this environment variable.
 UI synchronization callback, and `sync-gap` measures time between its ticks
 (normally about 100 ms). `pending` shows the age of a frame still awaiting drawing.
 These distinguish event-loop/layout stalls from time spent inside the renderer.
-On hybrid GPUs, an explicit `hwdec=nvdec` uses `nvdec-copy` when the window is
-rendered by Intel/AMD; this preserves NVIDIA decoding without requiring
-CUDA/OpenGL interop across different GPUs.
+`present-max` measures the delay from submitted drawing to the next event-loop
+callback, including buffer presentation.
+On Linux hybrid GPUs, an explicit `hwdec=nvdec` selects NVIDIA PRIME rendering
+before creating the window when the NVIDIA driver is accessible. This keeps
+decoding and rendering on the same GPU. Explicit graphics environment settings
+(such as `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`, and `SLINT_BACKEND`) take
+precedence. When the window uses Intel/AMD, direct `nvdec` falls back to
+`nvdec-copy` for compatibility. Other decoder choices retain the system's default
+rendering device. When a subtitle is present at startup, playback waits for its
+furigana to be drawn before starting the playback clock.
 
 Run the test suite:
 ```bash
@@ -201,7 +208,8 @@ To check a cold subtitle start without searches or furigana toggles, use a video
 with embedded Japanese subtitles and `MEMENTO_VIDEO_TEST_STARTUP_FURIGANA=1`
 instead of `MEMENTO_VIDEO_TEST_INTERACTIONS`. This uses mpv's actual subtitle
 notifications and the desktop's subtitle model publication functions, leaving
-furigana enabled throughout the run.
+furigana enabled throughout the run. `MEMENTO_VIDEO_TEST_START=335` starts at a
+chosen timestamp, which also checks loading a video in the middle of a subtitle.
 
 ### OCR Support
 

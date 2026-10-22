@@ -1036,6 +1036,11 @@ unsafe extern "C" fn on_render_update(userdata: *mut std::ffi::c_void) {
 }
 
 impl MpvInstance {
+    /// Effective decoder preference, including the user's mpv.conf overrides.
+    pub fn configured_hwdec(&self) -> &str {
+        &self.configured_hwdec
+    }
+
     /// Initialize mpv and a software fallback before the first media load.
     pub fn new_software(config_dir: Option<&Path>) -> Result<Self, String> {
         Self::create(config_dir)

@@ -18,6 +18,10 @@ mod headless_slint;
 mod playback_actions;
 #[path = "support/startup_subtitles.rs"]
 mod startup_subtitles;
+#[path = "support/compact_popup.rs"]
+mod compact_popup;
+#[path = "../src/video_gl.rs"]
+mod video_gl;
 
 fn change_subtitle(app: &MementoApp, index: usize) {
     let lines = [
@@ -77,6 +81,13 @@ fn change_subtitle(app: &MementoApp, index: usize) {
 }
 
 fn open_dictionary(app: &MementoApp) {
+    if std::env::var_os("MEMENTO_VIDEO_TEST_COMPACT_POPUP").is_some() {
+        memento_app::install_popup_navigation(app);
+        memento_app::set_dictionary_rows(app, compact_popup::definitions());
+        app.set_anki_enabled(true);
+        app.set_dict_open(true);
+        return;
+    }
     let rows: Vec<_> = (0..8)
         .map(|index| DictResult {
             index: index + 1,
@@ -338,7 +349,12 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         let source = std::env::var("MEMENTO_VIDEO_TEST_MEDIA").unwrap_or_else(|_| {
             "av://lavfi:testsrc2=size=1920x1080:rate=24000/1001,format=yuv420p10le".into()
         });
+        if let Ok(start) = std::env::var("MEMENTO_VIDEO_TEST_START") {
+            player.command(&["set", "start", &start]).unwrap();
+        }
         player.load_file(&source).unwrap();
+        let mut startup_subtitles = std::env::var_os("MEMENTO_VIDEO_TEST_STARTUP_FURIGANA")
+            .map(|_| startup_subtitles::StartupSubtitles::new());
         // Match application startup: prepare the first decoded frame and the
         // playback metadata in the real UI before starting the audio clock.
         let ready_deadline = Instant::now() + Duration::from_secs(10);
@@ -352,14 +368,18 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             let _ = events.recv_timeout(Duration::from_millis(20));
             while events.try_recv().is_ok() {}
             if player.take_render_update() {
-                player.render_opengl(fbo.0.get(), 1920, 1080).unwrap();
+                video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
                 first_frame = true;
             }
             let state = player.poll_playback_state();
             app.set_position(state.position as f32);
             app.set_duration(state.duration as f32);
             app.set_current_time(format!("{:.0}", state.position).into());
-            let ready = first_frame && state.playback_ready && state.dimensions.0 > 0;
+            if let Some(subtitles) = &mut startup_subtitles {
+                subtitles.tick(&app, &state);
+            }
+            let ready = first_frame && state.playback_ready && state.dimensions.0 > 0
+                && !app.get_subtitle_furigana_pending();
             drop(state);
             window.renderer.render().unwrap();
             gl.finish();
@@ -370,6 +390,27 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 }
             }
         }
+        // A paused frame must be identical after a UI flush, even when the UI
+        // left blending enabled. Zero blend factors make a leaked state turn
+        // the video black instead of silently adding extra blending work.
+        let read_patch = || {
+            let mut pixels = vec![0; 32 * 32 * 4];
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.read_pixels(960, 540, 32, 32, glow::RGBA, glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            pixels
+        };
+        gl.disable(glow::BLEND);
+        video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+        let expected = read_patch();
+        assert!(expected.iter().any(|&byte| byte != 0));
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::ZERO, glow::ZERO);
+        video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+        assert!(gl.is_enabled(glow::BLEND), "UI blend state was not restored");
+        assert_eq!(read_patch(), expected, "UI blend state corrupted the video frame");
+        gl.disable(glow::BLEND);
         // Read the paused baseline directly: property notifications can lag
         // behind the final redraw, especially while the playback clock is off.
         let mut startup_drops: i64 = -1;
@@ -403,8 +444,6 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         let with_popup = std::env::var_os("MEMENTO_VIDEO_TEST_POPUP").is_some();
         let mut actions = std::env::var_os("MEMENTO_VIDEO_TEST_INTERACTIONS")
             .map(|_| playback_actions::PlaybackActions::new(&app));
-        let mut startup_subtitles = std::env::var_os("MEMENTO_VIDEO_TEST_STARTUP_FURIGANA")
-            .map(|_| startup_subtitles::StartupSubtitles::new());
         assert!(
             actions.is_none() || startup_subtitles.is_none(),
             "startup test must leave furigana on without interactions"
@@ -448,7 +487,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             let video_ready = player.take_render_update();
             if video_ready {
                 let start = Instant::now();
-                player.render_opengl(fbo.0.get(), 1920, 1080).unwrap();
+                video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
                 // Include GPU completion in this headless measurement.
                 gl.finish();
                 let elapsed = start.elapsed();

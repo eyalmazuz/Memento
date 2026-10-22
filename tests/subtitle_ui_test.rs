@@ -15,6 +15,7 @@ fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_wor
     let epoch = Arc::new(AtomicU64::new(0));
     let text = "世界中を旅行する";
     publish_active_subtitle(&app, text, &requests, &epoch);
+    assert!(app.get_subtitle_furigana_pending());
     let first = worker.try_recv().unwrap();
     assert_eq!(first.1, text);
     app.set_selected_token_index(0);
@@ -31,6 +32,7 @@ fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_wor
             ("する".into(), "".into()),
         ],
     );
+    assert!(!app.get_subtitle_furigana_pending());
     assert_eq!(app.get_selected_token_index(), 0);
     assert_eq!(app.get_selected_token_count(), 2);
     assert_eq!(
@@ -51,6 +53,7 @@ fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_wor
 
     app.set_furigana_visible(false);
     publish_active_subtitle(&app, text, &requests, &epoch);
+    assert!(!app.get_subtitle_furigana_pending());
     assert!(epoch.load(Ordering::Acquire) > first.0);
     assert!(worker.try_recv().is_err());
     assert!(app
@@ -59,5 +62,15 @@ fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_wor
         .all(|w| w.reading.is_empty()));
     app.set_furigana_visible(true);
     publish_active_subtitle(&app, text, &requests, &epoch);
+    assert!(app.get_subtitle_furigana_pending());
     assert!(worker.try_recv().unwrap().0 > first.0);
+
+    publish_active_subtitle(&app, "", &requests, &epoch);
+    assert!(!app.get_subtitle_furigana_pending());
+    drop(worker);
+    publish_active_subtitle(&app, text, &requests, &epoch);
+    assert!(
+        !app.get_subtitle_furigana_pending(),
+        "a stopped worker must not hold playback paused"
+    );
 }

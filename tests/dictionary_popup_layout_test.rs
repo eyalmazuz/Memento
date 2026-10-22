@@ -4,6 +4,55 @@ use slint::{ComponentHandle, Model, VecModel};
 use std::cell::Cell;
 use std::rc::Rc;
 
+#[path = "support/compact_popup.rs"]
+mod compact_popup;
+
+#[test]
+fn compact_header_keeps_all_frequencies_and_wraps_at_small_widths() {
+    init_no_event_loop();
+    let app = MementoApp::new().unwrap();
+    memento_app::install_popup_navigation(&app);
+    let rows = compact_popup::definitions();
+    let frequencies = rows[0].frequencies.clone();
+    let normal = app
+        .global::<memento_app::PopupLayout>()
+        .invoke_frequency_lines(frequencies.clone(), 442.);
+    assert_eq!(
+        normal.row_count(),
+        2,
+        "seven ranks should occupy two compact rows"
+    );
+    let narrow = app
+        .global::<memento_app::PopupLayout>()
+        .invoke_frequency_lines(frequencies.clone(), 240.);
+    assert!(narrow.row_count() > normal.row_count());
+    let flattened: Vec<_> = narrow
+        .iter()
+        .flat_map(|line| line.entries.iter().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(
+        flattened,
+        frequencies.iter().collect::<Vec<_>>(),
+        "wrapping must retain every source and rank in order"
+    );
+    memento_app::set_dictionary_rows(&app, rows);
+    app.set_anki_enabled(true);
+    app.set_dict_open(true);
+    app.window().set_size(slint::LogicalSize::new(1280., 720.));
+    app.show().unwrap();
+    if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+        let first = ElementQuery::from_root(&app)
+            .match_id("YomitanPopup::term-segment")
+            .find_first()
+            .unwrap();
+        assert!(
+            first.size().height < 285.,
+            "header crowds out the definitions: {:?}",
+            first.size()
+        );
+    }
+}
+
 fn definition(
     expression: &str,
     reading: &str,

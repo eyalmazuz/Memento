@@ -192,6 +192,42 @@ pub fn popup_pitch_graphs(graphs: Vec<crate::controller::dict::TermPitchGraph>) 
 
 /// Shared popup actions used by the desktop window and the GL interaction test.
 pub fn install_popup_navigation(app: &MementoApp) {
+    app.global::<PopupLayout>()
+        .on_frequency_lines(|frequencies, available_width| {
+            // Pack natural-width badges into lines. Use a conservative character
+            // advance so each line also fits when the platform uses a fallback font.
+            // The UI measures the actual text for each badge; no fixed grid cells.
+            let available_width = available_width.max(1.0);
+            let mut lines = Vec::new();
+            let mut entries = Vec::new();
+            let mut line_width = 0.0;
+            for frequency in frequencies.iter() {
+                let label = format!("{} {}", frequency.dictionary, frequency.value);
+                let width = label
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { 6.0 } else { 10.0 })
+                    .sum::<f32>()
+                    + 10.0;
+                let gap = if entries.is_empty() { 0.0 } else { 4.0 };
+                if !entries.is_empty() && line_width + gap + width > available_width {
+                    lines.push(PopupFrequencyLine {
+                        entries: Rc::new(VecModel::from(std::mem::take(&mut entries))).into(),
+                    });
+                    line_width = 0.0;
+                }
+                if !entries.is_empty() {
+                    line_width += 4.0;
+                }
+                entries.push(frequency);
+                line_width += width;
+            }
+            if !entries.is_empty() {
+                lines.push(PopupFrequencyLine {
+                    entries: Rc::new(VecModel::from(entries)).into(),
+                });
+            }
+            Rc::new(VecModel::from(lines)).into()
+        });
     let selection_app = app.as_weak();
     app.on_toggle_definition_selection(move |index| {
         let Some(app) = selection_app.upgrade() else {
@@ -406,9 +442,9 @@ pub fn publish_active_subtitle(
     app.set_selected_token_index(-1);
     app.set_active_sub_text(text.into());
     let epoch = furigana_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-    if app.get_furigana_visible() && !text.is_empty() {
-        let _ = furigana_sender.send((epoch, text.to_owned()));
-    }
+    let pending = app.get_furigana_visible() && !text.is_empty()
+        && furigana_sender.send((epoch, text.to_owned())).is_ok();
+    app.set_subtitle_furigana_pending(pending);
 }
 
 /// Apply a worker result while preserving the selected base-text span.
@@ -444,4 +480,5 @@ pub fn apply_subtitle_furigana(app: &MementoApp, text: &str, parts: Vec<(String,
     app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
     app.set_selected_token_index(selected_index);
     app.set_selected_token_count(selected_count);
+    app.set_subtitle_furigana_pending(false);
 }

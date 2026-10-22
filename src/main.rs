@@ -12,6 +12,8 @@ use slint::{ComponentHandle, Model as _, Rgba8Pixel, SharedPixelBuffer, VecModel
 pub mod ui;
 pub mod controller;
 mod anki_help;
+mod video_gl;
+mod graphics_device;
 
 pub use ui::{
     DictResult, InstalledDictionaryRow, MementoApp, MementoPalette, PlayerTrack,
@@ -548,6 +550,7 @@ struct VideoTimings {
     wake_max: std::time::Duration,
     sync_max: std::time::Duration,
     sync_gap_max: std::time::Duration,
+    present_max: std::time::Duration,
     frames: u32,
 }
 
@@ -565,7 +568,7 @@ impl VideoTimings {
     fn report(&mut self, state: &memento_player::mpv::PlaybackState, drops_changed: bool, verbose: bool, pending: std::time::Duration) {
         if (verbose && self.frames > 0) || drops_changed || self.paint_max.as_millis() > 40 || self.queue_max.as_millis() > 40 {
             eprintln!(
-                "[video] frames={} drops={} decoder-drops={} hwdec={} paused={} queue-max={:.1}ms mpv-max={:.1}ms draw-max={:.1}ms draw-popup-rows={} wake-max={:.1}ms sync-max={:.1}ms sync-gap={:.1}ms pending={:.1}ms",
+                "[video] frames={} drops={} decoder-drops={} hwdec={} paused={} queue-max={:.1}ms mpv-max={:.1}ms draw-max={:.1}ms draw-popup-rows={} wake-max={:.1}ms sync-max={:.1}ms sync-gap={:.1}ms pending={:.1}ms present-max={:.1}ms",
                 self.frames, state.frame_drops, state.decoder_drops,
                 if state.hwdec_current.is_empty() { "no" } else { &state.hwdec_current },
                 state.paused,
@@ -577,6 +580,7 @@ impl VideoTimings {
                 self.sync_max.as_secs_f64() * 1000.0,
                 self.sync_gap_max.as_secs_f64() * 1000.0,
                 pending.as_secs_f64() * 1000.0,
+                self.present_max.as_secs_f64() * 1000.0,
             );
         }
         *self = Self::default();
@@ -679,7 +683,9 @@ impl GlVideoSurface {
             ];
             let mut old_viewport = [0; 4];
             gl.get_parameter_i32_slice(glow::VIEWPORT, &mut old_viewport);
-            let result = player.render_opengl(framebuffer.0.get(), self.size.0, self.size.1);
+            let result = video_gl::without_blending(gl, || {
+                player.render_opengl(framebuffer.0.get(), self.size.0, self.size.1)
+            });
             gl.bind_framebuffer(glow::FRAMEBUFFER,
                 std::num::NonZeroU32::new(old_framebuffer as u32).map(glow::NativeFramebuffer));
             gl.active_texture(old_active_texture as u32);
@@ -1576,6 +1582,14 @@ fn create_settings_session(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = log::set_logger(&APP_LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
+    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+        .ok_or("HOME or XDG_CONFIG_HOME must be set to load Anki profiles")?;
+    // Read effective mpv options before creating the UI's GL context. On a
+    // hybrid system a direct decoder needs the matching rendering device.
+    let mpv = MpvInstance::new_software(Some(&config_dir));
+    if let Ok(player) = &mpv {
+        graphics_device::select_for_decoder(player.configured_hwdec());
+    }
     // libmpv shares the UI's context. On desktop platforms prefer desktop GL
     // with the driver's supported version, rather than Slint's GLES 2 default.
     // An explicitly selected Slint backend (including software) still wins.
@@ -1587,8 +1601,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache_dir = memento_xdg_dir("XDG_CACHE_HOME", ".cache")
         .ok_or("HOME or XDG_CACHE_HOME must be set to load Memento settings")?;
-    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
-        .ok_or("HOME or XDG_CONFIG_HOME must be set to load Anki profiles")?;
     let data_dir = memento_xdg_dir("XDG_DATA_HOME", ".local/share")
         .ok_or("HOME or XDG_DATA_HOME must be set to load dictionaries")?;
     let anki_json_path = config_dir.join("anki_connect.json");
@@ -1621,7 +1633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mpv renders into a Slint image, never into the toplevel native window:
     // a native child would occlude the OSC, subtitles and dictionary popup.
     let args: Vec<String> = std::env::args().collect();
-    let mpv = match MpvInstance::new_software(Some(&config_dir)) {
+    let mpv = match mpv {
         Ok(instance) => Rc::new(RefCell::new(Some(instance))),
         Err(err) => {
             eprintln!("Could not initialize video playback: {err}");
@@ -1635,6 +1647,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_video_load_presented(move |generation| {
         let Some(app) = start_app.upgrade() else { return };
         if app.get_pending_playback_generation() != generation { return; }
+        // The first base-text frame can be presented before the reading worker
+        // replies. Keep the clock paused until that reading has also been laid
+        // out and drawn, including the first small-font glyph upload.
+        if app.get_subtitle_furigana_pending() { return; }
         app.set_pending_playback_generation(-1);
         if let Some(player) = start_player.borrow().as_ref() {
             if let Err(error) = player.play() { app.set_status_message(error.into()); }
@@ -3205,6 +3221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ui::apply_subtitle_furigana(&app, &request.1, parts);
                     }
                     Err(error) => {
+                        app.set_subtitle_furigana_pending(false);
                         if report_error { app.set_status_message(format!("Furigana unavailable: {error}").into()); }
                     }
                 }
@@ -3650,6 +3667,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             slint::RenderingState::AfterRendering => {
                 notifier_timings.borrow_mut().finish_paint();
+                let presented_at = std::time::Instant::now();
+                let timings = notifier_timings.clone();
+                // Slint presents after AfterRendering returns. Measure the
+                // time until control returns to the event loop as well.
+                slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                    let mut timings = timings.borrow_mut();
+                    timings.present_max = timings.present_max.max(presented_at.elapsed());
+                });
                 if notifier_texture.get().is_some() {
                     if let Some(generation) = notifier_pending_frame.take() {
                         // This runs after Slint returns from drawing/presenting,
