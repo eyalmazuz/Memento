@@ -1,23 +1,32 @@
-# Memento
+# Memento — Rust
 
-[![AUR](https://img.shields.io/aur/version/memento)](https://aur.archlinux.org/packages/memento/)
-[![Flathub](https://img.shields.io/flathub/v/io.github.ripose_jp.Memento)](https://flathub.org/apps/details/io.github.ripose_jp.Memento)
+Memento is a free and open-source video player for studying Japanese. This fork
+uses Rust for the application, Slint for the interface, and libmpv for playback.
+It builds on the original [Memento](https://github.com/ripose-jp/Memento).
 
-Memento is a FOSS, mpv-based video player for studying Japanese.
+## Branches
 
-**Memento has been drastically overhauled since v1.7.2. If you're looking**
-**for the README relevant to that version, click**
-**[here](https://github.com/ripose-jp/Memento/tree/9aa39ec4f6c4c033db68253988ccfc2a9898df78).**
+| Branch | Contents |
+| --- | --- |
+| [`master`](https://github.com/eyalmazuz/Memento/tree/master) | Active Rust application, promoted from the `rust` branch. |
+| [`cpp`](https://github.com/eyalmazuz/Memento/tree/cpp) | Preserved C++/Qt `master`, including its source, build instructions, and history. |
 
-![Example](example.png)
+The earlier C++ ASR work also remains on
+[`feature/whisper-subtitle-provider-refactor`](https://github.com/eyalmazuz/Memento/tree/feature/whisper-subtitle-provider-refactor).
+For the C++ application, use the [C++ README](https://github.com/eyalmazuz/Memento/blob/cpp/README.md).
+Previously packaged C++ releases have separate installation instructions.
+
+The Rust migration is still in progress; see the ASR integration limitation below.
 
 ## Features
 
 * Grammar aware subtitle search
-* Yomichan-style Kanji cards
-* Support for Yomichan dictionaries
+* Yomitan-style term and kanji lookup with multiple dictionary results
+* Yomitan dictionaries, frequency badges, and pitch-accent graphs
 * Anki card creation through [AnkiConnect](https://ankiweb.net/shared/info/2055492159)
-* Support for mpv upscalers, plugins, and configuration files
+* Selectable subtitle overlay, subtitle sidebar, and optional furigana
+* Whisper and ONNX speech recognition
+* mpv configuration, shaders, and scripts, subject to the ASR limitation below
 
 ## Dictionaries
 
@@ -67,35 +76,25 @@ This means there is a mistake in your card template.
 When this happens, AnkiConnect will report that all potential cards are not addable.
 Double check your card template to see if the front of the card is missing something.
 
-### Windows: Updating yt-dlp
+### Streaming URLs fail to open
 
-If you're version of yt-dlp is out of date, you may experience degraded streaming performance or websites not working entirely.
-
-Memento's version of yt-dlp can be updated by doing the following:
-
-1. Download [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe)
-1. Put `yt-dlp.exe` in Memento's install directory. For the portable version of Memento, this is located in the same folder as the executable. For the installed version, this is located at `C:\Program Files\Memento` by default.
-
-### macOS: Streaming video doesn't work
-
-This means that mpv cannot find your yt-dlp installation.
-
-To install yt-dlp, paste these commands into Terminal:
-```
-curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/Library/Preferences/memento/yt-dlp
-chmod a+rx ~/Library/Preferences/memento/yt-dlp
-```
-
-### macOS: Could not initialize MeCab
-
-Move the Memento application to a directory that doesn't have spaces in the path
-like `/Applications`. Unfortunately, this is an limitation of MeCab and there is
-no workaround that can be implemented.
+Install or update `yt-dlp` and make it available to libmpv. See the C++ branch
+for troubleshooting older packaged releases.
 
 ## Dependencies
 
-* **Rust**: 1.80+ (stable toolchain)
-* **mpv**: `libmpv` (version 0.38+ / `libmpv.so.2`)
+The current development and playback checks run on Linux.
+
+* **Rust and Cargo**: use a current stable toolchain. Slint 1.16.1 requires at
+  least Rust 1.88; the locked dependency set may require a newer compiler.
+* **libmpv SDK**: matching development headers and library. The current build
+  has been exercised with the patched SDK; full stock-libmpv compatibility
+  has not been verified.
+* **Native build tools**: a C/C++ toolchain, Clang/libclang for bindgen, and
+  CMake when building the native speech backends.
+* **Dictionary libraries**: SQLite, libzip, and json-c development libraries.
+* **Speech libraries**: whisper.cpp/ggml and ONNX Runtime. The current desktop
+  binary links both backends; see the native dependency setup below.
 * **yt-dlp** (optional, for streaming URL playback)
 * **manga-ocr** (optional, for Manga OCR text extraction: `pip install manga-ocr`)
 
@@ -104,7 +103,37 @@ and the [Kanji Stroke Order](https://drive.google.com/uc?export=download&id=1oyQ
 
 ## Building and Running
 
-Memento is built with standard Rust and Cargo:
+### Native dependency setup
+
+The Rust application uses Cargo, while libmpv and the speech engines remain
+native dependencies. Cargo currently reuses prepared native libraries; a fresh
+clone does not download or build all of them automatically.
+
+Set `MPV_SDK` to the SDK prefix containing `include/mpv/client.h`, the rendering
+headers, and `lib/libmpv.so` (or `lib64/libmpv.so`):
+
+```bash
+export MPV_SDK=/path/to/mpv-sdk
+```
+
+Existing `build*/CMakeCache.txt` files can also supply the SDK location.
+The top-level `build.rs` looks for prepared speech libraries in
+`build-whisper-cuda`, `build-rust-master`, and `build`. Set
+`MEMENTO_WHISPER_BUILD_DIR` to add another build directory. Each directory uses
+the existing native dependency layout:
+
+```text
+_deps/whispercpp-build/src/libwhisper.a
+_deps/whispercpp-build/ggml/src/libggml*.a
+_deps/onnxruntime_prebuilt-src/lib/libonnxruntime.so
+```
+
+The checked-in Whisper bindings target whisper.cpp v1.9.4, and the ONNX backend
+targets ONNX Runtime API 1.22.0. Keep the headers and native libraries compatible.
+
+### Build and run
+
+Once the native dependencies are available, build the application:
 
 ```bash
 cargo build --release
@@ -170,6 +199,15 @@ Run the test suite:
 cargo test
 ```
 
+To include the popup geometry checks, run:
+
+```bash
+SLINT_EMIT_DEBUG_INFO=1 cargo test --test dictionary_popup_layout_test
+```
+
+The legacy CMake build and release workflows are scoped to `cpp`. Rust build
+and test commands currently run locally through Cargo.
+
 The optional Linux playback timing test renders the actual Slint window through
 surfaceless EGL, including the video image, controls and changing furigana subtitles:
 
@@ -221,31 +259,36 @@ Once installed, OCR can be triggered with the OCR keybind (default: `Ctrl+L`) to
 
 ### ASR (Speech-to-Text) Subtitles
 
-Memento supports automatic speech recognition (ASR) to transcribe dialogue directly into in-memory subtitle cues in real time.
+Memento transcribes audio in a background worker and displays generated cues
+in its Rust subtitle overlay and sidebar.
 Speech recognition supports:
+
 * **Whisper**: Local GGML models (e.g. `ggml-large-v3-turbo.bin` placed in `~/.config/memento/models/`).
 * **ONNX Runtime**: HuggingFace ONNX-based speech models.
 
+**Current integration limitation:** generated ASR cues are stored in Rust and
+are not inserted into an mpv subtitle track. mpv subtitle properties, events,
+and scripts therefore cannot see those cues. The current subtitle-seek and
+auto-pause handlers still use mpv's subtitle state and are not correctly wired
+to ASR cues. Loading the patched SDK alone does not fix this; the ASR controller
+still needs to feed its in-memory subtitle API or another real mpv track.
+
 ## Configuration
 
-Most mpv shaders, plugins, and configuration files will work without modification.
+Place mpv configuration files and scripts for this application in Memento's
+configuration directory, separate from mpv's own configuration.
 
-It is important to note that mpv and Memento's configuration directories are **separate**. mpv configuration files, scripts, etc. intended to modify Memento's behavior should be placed in Memento's configuration directory:
+The Rust application uses these XDG directories, falling back to the paths
+shown when the corresponding environment variable is unset:
 
-### Linux
-```
-~/.config/memento
-```
+| Purpose | Environment variable | Default directory |
+| --- | --- | --- |
+| Settings, mpv configuration, Anki profiles | `XDG_CONFIG_HOME` | `~/.config/memento` |
+| Dictionaries and application data | `XDG_DATA_HOME` | `~/.local/share/memento` |
+| Cache | `XDG_CACHE_HOME` | `~/.cache/memento` |
 
-### Windows
-```
-%APPDATA%\Local\memento
-```
-
-### macOS
-```
-~/Library/Preferences/memento
-```
+The Windows and macOS paths documented for the C++ application are available
+in the [C++ README](https://github.com/eyalmazuz/Memento/blob/cpp/README.md).
 
 ## asbplayer
 
