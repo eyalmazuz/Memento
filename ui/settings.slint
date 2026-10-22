@@ -313,6 +313,7 @@ export component SettingsWindow inherits Window {
     in property <string> current-anki-profile;
     in property <string> current-keybind-profile;
     in property <string> settings-status;
+    in property <bool> ocr-built: false;
     in property <bool> ocr-available: false;
     in property <bool> asr-available: false;
     in-out property <[string]> available-anki-decks: [];
@@ -360,8 +361,8 @@ export component SettingsWindow inherits Window {
                 SidebarItem { label: "Dictionary"; icon: @image-url("icons/dictionary.svg"); selected: root.active-category == 4; clicked => { root.active-category = 4; root.adding-entry = false; root.category-changed(4); } }
                 SidebarItem { label: "Interface"; icon: @image-url("icons/window.svg"); selected: root.active-category == 5; clicked => { root.active-category = 5; root.adding-entry = false; root.category-changed(5); } }
                 SidebarItem { label: "Keybinds"; icon: @image-url("icons/keyboard.svg"); selected: root.active-category == 6; clicked => { root.active-category = 6; root.adding-entry = false; root.category-changed(6); } }
-                SidebarItem { label: "OCR"; icon: @image-url("icons/eye.svg"); selected: root.active-category == 7; clicked => { root.active-category = 7; root.adding-entry = false; root.category-changed(7); } }
-                SidebarItem { label: "ASR"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 8; clicked => { root.active-category = 8; root.adding-entry = false; root.category-changed(8); } }
+                if root.ocr-built : SidebarItem { label: "OCR"; icon: @image-url("icons/eye.svg"); selected: root.active-category == 7; clicked => { root.active-category = 7; root.adding-entry = false; root.category-changed(7); } }
+                if root.asr-available : SidebarItem { label: "ASR"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 8; clicked => { root.active-category = 8; root.adding-entry = false; root.category-changed(8); } }
                 SidebarItem { label: "Search"; icon: @image-url("icons/search.svg"); selected: root.active-category == 9; clicked => { root.active-category = 9; root.adding-entry = false; root.category-changed(9); } }
                 Rectangle { vertical-stretch: 1; background: transparent; }
             }

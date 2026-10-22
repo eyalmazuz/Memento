@@ -250,8 +250,7 @@ pub struct OrtApiBase {
     pub GetVersionString: unsafe extern "system" fn() -> *const c_char,
 }
 
-extern "system" {
-    /// Exported by libonnxruntime; resolved by the C++ link that pulls this
-    /// staticlib into `asrtranscriber` (single-library-instance guarantee).
+extern "C" {
+    /// Entry point for the matching ONNX Runtime 1.22 library.
     pub fn OrtGetApiBase() -> *const OrtApiBase;
 }

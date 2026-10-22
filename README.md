@@ -25,8 +25,71 @@ The Rust migration is still in progress; see the ASR integration limitation belo
 * Yomitan dictionaries, frequency badges, and pitch-accent graphs
 * Anki card creation through [AnkiConnect](https://ankiweb.net/shared/info/2055492159)
 * Selectable subtitle overlay, subtitle sidebar, and optional furigana
-* Whisper and ONNX speech recognition
+* Optional Whisper/ONNX speech recognition and Manga OCR
 * mpv configuration, shaders, and scripts, subject to the ASR limitation below
+
+## Build and run
+
+Install current stable [Rust](https://rustup.rs/) and the system libraries below once. Then:
+
+```bash
+git clone https://github.com/eyalmazuz/Memento.git
+cd Memento
+cargo build
+```
+
+Run `cargo run`, or launch `target/debug/memento`. Add `--release` for a release build.
+The default build includes playback, dictionaries, subtitles and Anki integration.
+
+<details>
+<summary>System packages (Linux)</summary>
+
+Arch Linux:
+
+```bash
+sudo pacman -S --needed base-devel clang pkgconf mpv sqlite libzip json-c
+```
+
+Debian / Ubuntu:
+
+```bash
+sudo apt install build-essential libclang-dev pkg-config libmpv-dev libsqlite3-dev libzip-dev libjson-c-dev
+```
+
+Other distributions need the equivalent C/C++ toolchain, libclang, pkg-config,
+and development libraries for libmpv, SQLite, libzip and json-c.
+Cargo finds the installed libmpv automatically. No custom SDK or existing build
+folder is needed. Linux is the currently tested platform.
+
+</details>
+
+### Optional build flags
+
+ASR and OCR are disabled by default. Enable them with Cargo features:
+
+| Feature | Command |
+| --- | --- |
+| Whisper ASR (CPU) | `cargo build --features asr` |
+| Whisper ASR (CUDA) | `cargo build --features whisper-cuda` |
+| Whisper ASR (Vulkan) | `cargo build --features whisper-vulkan` |
+| ONNX ASR (CPU) | `cargo build --features asr-onnx` |
+| OCR | `cargo build --features ocr` |
+| Whisper ASR + OCR | `cargo build --features asr,ocr` |
+
+Use the same flags with `cargo run`, for example `cargo run --features asr,ocr`.
+Unavailable features are hidden in Settings.
+
+Whisper builds need CMake and a C++ compiler. Cargo downloads and builds the pinned
+Whisper sources automatically; ONNX builds download the matching official runtime.
+Downloads are checksum-verified and cached in Cargo's build directory. CUDA requires
+the CUDA toolkit; Vulkan requires the Vulkan SDK (including `glslc`). GPU support
+is selected by the build flag; the **Use GPU** setting controls its use at runtime.
+
+OCR runtime requirements and speech models are described below. Optional streaming
+URL playback uses `yt-dlp`. Japanese fonts such as Noto Sans CJK JP are recommended.
+
+See [development and playback diagnostics](docs/development.md) for tests,
+performance measurements, and advanced build overrides.
 
 ## Dictionaries
 
@@ -81,182 +144,15 @@ Double check your card template to see if the front of the card is missing somet
 Install or update `yt-dlp` and make it available to libmpv. See the C++ branch
 for troubleshooting older packaged releases.
 
-## Dependencies
-
-The current development and playback checks run on Linux.
-
-* **Rust and Cargo**: use a current stable toolchain. Slint 1.16.1 requires at
-  least Rust 1.88; the locked dependency set may require a newer compiler.
-* **libmpv SDK**: matching development headers and library. The current build
-  has been exercised with the patched SDK; full stock-libmpv compatibility
-  has not been verified.
-* **Native build tools**: a C/C++ toolchain, Clang/libclang for bindgen, and
-  CMake when building the native speech backends.
-* **Dictionary libraries**: SQLite, libzip, and json-c development libraries.
-* **Speech libraries**: whisper.cpp/ggml and ONNX Runtime. The current desktop
-  binary links both backends; see the native dependency setup below.
-* **yt-dlp** (optional, for streaming URL playback)
-* **manga-ocr** (optional, for Manga OCR text extraction: `pip install manga-ocr`)
-
-For the best experience, install [Noto Sans CJK JP](https://github.com/googlefonts/noto-cjk/raw/main/Sans/Variable/TTF/NotoSansCJKjp-VF.ttf)
-and the [Kanji Stroke Order](https://drive.google.com/uc?export=download&id=1oyQoTB531tbhlYaOW7ugvutXZ7HSlJfW) fonts.
-
-## Building and Running
-
-### Native dependency setup
-
-The Rust application uses Cargo, while libmpv and the speech engines remain
-native dependencies. Cargo currently reuses prepared native libraries; a fresh
-clone does not download or build all of them automatically.
-
-Set `MPV_SDK` to the SDK prefix containing `include/mpv/client.h`, the rendering
-headers, and `lib/libmpv.so` (or `lib64/libmpv.so`):
-
-```bash
-export MPV_SDK=/path/to/mpv-sdk
-```
-
-Existing `build*/CMakeCache.txt` files can also supply the SDK location.
-The top-level `build.rs` looks for prepared speech libraries in
-`build-whisper-cuda`, `build-rust-master`, and `build`. Set
-`MEMENTO_WHISPER_BUILD_DIR` to add another build directory. Each directory uses
-the existing native dependency layout:
-
-```text
-_deps/whispercpp-build/src/libwhisper.a
-_deps/whispercpp-build/ggml/src/libggml*.a
-_deps/onnxruntime_prebuilt-src/lib/libonnxruntime.so
-```
-
-The checked-in Whisper bindings target whisper.cpp v1.9.4, and the ONNX backend
-targets ONNX Runtime API 1.22.0. Keep the headers and native libraries compatible.
-
-### Build and run
-
-Once the native dependencies are available, build the application:
-
-```bash
-cargo build --release
-```
-
-The Whisper **Use GPU** setting selects a GPU only when the linked whisper.cpp
-build contains a CUDA or Vulkan backend and the graphics driver exposes a
-device. A CPU-only build continues on the CPU and shows a warning when GPU is
-requested. For NVIDIA CUDA on Linux, check that `nvidia-smi` works, then build
-the backend and relink Memento:
-
-```bash
-cmake -S build-rust-master/_deps/whispercpp-src \
-  -B build-whisper-cuda/_deps/whispercpp-build \
-  -DGGML_CUDA=ON \
-  -DWHISPER_BUILD_EXAMPLES=OFF -DBUILD_SHARED_LIBS=OFF
-cmake --build build-whisper-cuda/_deps/whispercpp-build --target whisper -j"$(nproc)"
-cargo build --release
-```
-
-Set `CUDA_HOME` when the toolkit is outside `/opt/cuda`. Vulkan builds use
-`-DGGML_VULKAN=ON` and target `whisper` instead.
-If CMake cannot see a GPU during configuration, add
-`-DCMAKE_CUDA_ARCHITECTURES=all-major` for a portable CUDA build. To use
-ccache, set `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER`, and
-`CMAKE_CUDA_COMPILER_LAUNCHER` to `ccache`; point `CCACHE_DIR` at a writable
-directory when building in a restricted environment.
-
-Run the application:
-```bash
-cargo run --release
-```
-
-Plain `cargo run` also optimizes Slint's UI core, renderer, text layout and
-font parsing/rasterization libraries, while retaining debug symbols and assertions.
-These settings do not select a CPU/GPU architecture or rebuild the native Whisper
-backend. System fallback font metadata is cached before playback starts, avoiding
-Fontconfig scans when dictionary entries introduce unfamiliar symbols.
-
-For playback diagnostics, run `MEMENTO_VIDEO_STATS=1 cargo run`. Every five
-seconds during rendering, `[video]` reports frame drops, the active hardware decoder,
-pause state, frame delivery delay, mpv render time and total UI drawing time.
-`draw-popup-rows` counts the dictionary entries open during the slowest draw;
-unchanged idle intervals are omitted. Slow frames and
-changes in drop counts are also reported without this environment variable.
-`wake-max` measures delivery to the UI callback; `sync-max` measures the playback
-UI synchronization callback, and `sync-gap` measures time between its ticks
-(normally about 100 ms). `pending` shows the age of a frame still awaiting drawing.
-These distinguish event-loop/layout stalls from time spent inside the renderer.
-`present-max` measures the delay from submitted drawing to the next event-loop
-callback, including buffer presentation.
-On Linux hybrid GPUs, an explicit `hwdec=nvdec` selects NVIDIA PRIME rendering
-before creating the window when the NVIDIA driver is accessible. This keeps
-decoding and rendering on the same GPU. Explicit graphics environment settings
-(such as `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`, and `SLINT_BACKEND`) take
-precedence. When the window uses Intel/AMD, direct `nvdec` falls back to
-`nvdec-copy` for compatibility. Other decoder choices retain the system's default
-rendering device. When a subtitle is present at startup, playback waits for its
-furigana to be drawn before starting the playback clock.
-
-Run the test suite:
-```bash
-cargo test
-```
-
-To include the popup geometry checks, run:
-
-```bash
-SLINT_EMIT_DEBUG_INFO=1 cargo test --test dictionary_popup_layout_test
-```
-
-Rust build and test commands currently run locally through Cargo. This branch
-has no GitHub Actions workflows or legacy Windows/Gentoo packaging. The original
-C++ build and packaging files remain in the `cpp` branch.
-
-The optional Linux playback timing test renders the actual Slint window through
-surfaceless EGL, including the video image, controls and changing furigana subtitles:
-
-```bash
-MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
-  cargo test --test video_render_timing_test -- --ignored --nocapture
-```
-
-It measures video and UI rendering together, but does not test a desktop
-compositor or physical display. Without a media path it generates a 1080p test
-pattern through libavfilter.
-Set `MEMENTO_VIDEO_TEST_POPUP=1` to also open a dictionary popup during playback.
-First-use shader compilation by the software GL driver can affect this test;
-`MESA_SHADER_CACHE_DIR` can point to a writable directory when the default
-Mesa cache is inaccessible.
-
-For the interaction stress run, use a finite video at least 30 seconds long and
-an existing dictionary database (opened read-only):
-
-```bash
-MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
-MEMENTO_VIDEO_TEST_INTERACTIONS=1 \
-MEMENTO_VIDEO_TEST_DICTIONARY=/path/to/dictionaries.sqlite \
-  cargo test --test video_render_timing_test -- --ignored --nocapture
-```
-
-This run toggles furigana and subtitle visibility, performs five term searches,
-scrolls and collapses definitions, changes a definition's selection, pauses and
-resumes, resizes the window, and seeks forward/backward to seeded random positions.
-Drop counts are accumulated across seeks, so resetting mpv's counter cannot
-hide an earlier stall. It exercises the shared UI/controller code through the
-headless window; desktop fullscreen, input delivery and presentation still need
-a desktop session.
-
-To check a cold subtitle start without searches or furigana toggles, use a video
-with embedded Japanese subtitles and `MEMENTO_VIDEO_TEST_STARTUP_FURIGANA=1`
-instead of `MEMENTO_VIDEO_TEST_INTERACTIONS`. This uses mpv's actual subtitle
-notifications and the desktop's subtitle model publication functions, leaving
-furigana enabled throughout the run. `MEMENTO_VIDEO_TEST_START=335` starts at a
-chosen timestamp, which also checks loading a video in the middle of a subtitle.
-
 ### OCR Support
 
-To use OCR in Memento, install `manga-ocr` with Python:
-```bash
-pip install manga-ocr
-```
-Once installed, OCR can be triggered with the OCR keybind (default: `Ctrl+L`) to select screen regions and look up definitions directly in Yomitan dictionaries.
+Build with `--features ocr`. At runtime, OCR currently requires
+[libmocr](https://github.com/ripose-jp/libmocr) and the Python `manga-ocr` package
+in the Python environment used by libmocr. These are not required to compile
+Memento. Installing `manga-ocr` alone does not install libmocr.
+
+The OCR keybind (default: `Ctrl+L`) selects a video region for text recognition
+and dictionary lookup.
 
 ### ASR (Speech-to-Text) Subtitles
 

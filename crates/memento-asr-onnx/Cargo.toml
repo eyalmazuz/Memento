@@ -5,9 +5,17 @@ edition = "2021"
 rust-version = "1.77"
 description = "Rust port of Memento's ONNX ASR inference engine (src/asr/onnx)"
 license = "GPL-2.0-only"
+links = "onnxruntime"
 
 [dependencies]
 memento-asr = { path = "../memento-asr" }
+
+[build-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [lib]
 name = "memento_asr_onnx"

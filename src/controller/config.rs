@@ -1749,7 +1749,11 @@ fn ocr_settings_groups(config: &Config) -> Vec<SettingsGroup> {
 
 fn asr_settings_groups(config: &Config) -> Vec<SettingsGroup> {
     let backend = effective_text(config, raw::asr::GROUP, raw::asr::BACKEND)
-        .unwrap_or_else(|| raw::asr::backend_default(true, true).to_owned());
+        .filter(|name| super::asr::backend_available(name))
+        .unwrap_or_else(|| super::asr::default_backend().to_owned());
+    let mut backend_choices = Vec::new();
+    if cfg!(feature = "asr-whisper") { backend_choices.push("Whisper"); }
+    if cfg!(feature = "asr-onnx") { backend_choices.push("ONNX Runtime"); }
     let whisper_selected = backend == raw::asr::BACKEND_WHISPER;
     let onnx_selected = backend == raw::asr::BACKEND_ONNX;
     let whisper_model = value_text(&effective_value(
@@ -1828,7 +1832,7 @@ fn asr_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     } else {
                         "Whisper".to_owned()
                     },
-                    &["Whisper", "ONNX Runtime"],
+                    &backend_choices,
                 ),
                 switch_field(
                     "asr/enable",

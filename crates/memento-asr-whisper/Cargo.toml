@@ -5,9 +5,13 @@ edition = "2021"
 rust-version = "1.77"
 description = "Rust port of Memento's Whisper ASR inference engine (src/asr/whisper)"
 license = "GPL-2.0-only"
-# Regenerated bindings against whisper.cpp v1.9.4 (extern/CMakeLists.txt
-# FetchContent tag). See build.rs for the regeneration contract.
+# Cargo builds the pinned whisper.cpp backend only when this crate is enabled.
 build = "build.rs"
+
+[features]
+default = []
+cuda = []
+vulkan = []
 
 [dependencies]
 memento-asr = { path = "../memento-asr" }
@@ -15,6 +19,11 @@ regex = "1"
 
 [build-dependencies]
 bindgen = "0.73"
+cmake = "0.1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
 
 [lib]
 name = "memento_asr_whisper"

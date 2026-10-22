@@ -1115,8 +1115,9 @@ fn create_settings_session(
     asr_restart_pending: Rc<Cell<bool>>,
 ) -> Result<SettingsSession, slint::PlatformError> {
     let settings = SettingsWindow::new()?;
+    settings.set_ocr_built(cfg!(feature = "ocr"));
     settings.set_ocr_available(ocr_available);
-    settings.set_asr_available(true);
+    settings.set_asr_available(controller::asr::AVAILABLE);
     refresh_settings(&settings, &config_ctrl);
     refresh_dictionary_settings(&settings, dictionary_manager.as_deref(), &config_ctrl);
 
@@ -1236,7 +1237,7 @@ fn create_settings_session(
                         raw::ocr::ENABLED_DEFAULT,
                     ),
                 );
-                app.set_asr_enabled(
+                app.set_asr_enabled(controller::asr::AVAILABLE &&
                     setting_enabled(
                         &apply_config, raw::asr::GROUP, raw::asr::ENABLED,
                         raw::asr::ENABLED_DEFAULT,
@@ -1272,7 +1273,7 @@ fn create_settings_session(
                         raw::ocr::ENABLED_DEFAULT,
                     ),
                 );
-                app.set_asr_enabled(
+                app.set_asr_enabled(controller::asr::AVAILABLE &&
                     setting_enabled(
                         &reset_config, raw::asr::GROUP, raw::asr::ENABLED,
                         raw::asr::ENABLED_DEFAULT,
@@ -1306,7 +1307,7 @@ fn create_settings_session(
         let result = defaults_config.defaults_settings(category);
         if result.is_ok() && category == 8 {
             if let Some(app) = defaults_app.upgrade() {
-                app.set_asr_enabled(setting_enabled(&defaults_config, raw::asr::GROUP, raw::asr::ENABLED, raw::asr::ENABLED_DEFAULT));
+                app.set_asr_enabled(controller::asr::AVAILABLE && setting_enabled(&defaults_config, raw::asr::GROUP, raw::asr::ENABLED, raw::asr::ENABLED_DEFAULT));
                 clear_asr_for_settings(&app, &defaults_asr, &defaults_subtitles, &defaults_subtitle_model, &defaults_restart);
             }
         }
@@ -1666,11 +1667,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_app_version(env!("CARGO_PKG_VERSION").into());
     refresh_player_preferences(&app, &config_ctrl);
     refresh_recent_files(&app, &config_ctrl);
+    #[cfg(feature = "ocr")]
     let ocr_controller = controller::ocr::OcrController::new();
+    #[cfg(feature = "ocr")]
     if let Err(error) = &ocr_controller {
         eprintln!("OCR unavailable: {error}");
     }
+    #[cfg(feature = "ocr")]
     let ocr_available = ocr_controller.is_ok();
+    #[cfg(not(feature = "ocr"))]
+    let ocr_available = false;
     let asr_session = Rc::new(RefCell::new(controller::asr::AsrController::new()));
     let asr_restart_pending = Rc::new(Cell::new(false));
     app.set_ocr_enabled(
@@ -1679,7 +1685,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             raw::ocr::ENABLED_DEFAULT,
         ),
     );
-    app.set_asr_enabled(
+    app.set_asr_enabled(controller::asr::AVAILABLE &&
         setting_enabled(
             &config_ctrl, raw::asr::GROUP, raw::asr::ENABLED,
             raw::asr::ENABLED_DEFAULT,
@@ -2229,7 +2235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let gpu_unavailable = settings.backend == controller::asr::AsrBackend::Whisper
             && settings.whisper.use_gpu
             && settings.whisper.gpu_device.max(0) as usize >= controller::asr::whisper_gpu_device_count();
-        let media = controller::asr::AsrMedia::new(media_ctx.path, media_ctx.audio_id);
+        let media = controller::media::MediaContext::new(media_ctx.path, media_ctx.audio_id);
         let pos = player.get_position();
         let dur = player.get_duration();
         match asr.start(settings, media, dur, pos) {
@@ -2507,6 +2513,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    #[cfg(feature = "ocr")]
+    {
     let ocr_region_app = app.as_weak();
     let ocr_region_mpv = mpv.clone();
     let ocr_region_config = config_ctrl.clone();
@@ -2581,6 +2589,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_status_message(error.to_string().into());
         }
     });
+    }
 
 
     let update_app = app.as_weak();
@@ -3104,7 +3113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let player_ref = note_mpv.borrow();
             let player = player_ref.as_ref();
             let media = player.and_then(MpvInstance::capture_encode_context)
-                .map(|ctx| controller::asr::AsrMedia::new(ctx.path, ctx.audio_id));
+                .map(|ctx| controller::media::MediaContext::new(ctx.path, ctx.audio_id));
             let mpv_start = player.map(MpvInstance::get_sub_start).unwrap_or(0.0);
             let mpv_end = player.map(MpvInstance::get_sub_end).unwrap_or(0.0);
             let subtitle_start = if active_end > active_start { active_start } else { mpv_start };
@@ -3344,7 +3353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| PathBuf::from("."));
                     match controller::asr::AsrSettings::from_config(&config_dir, &*timer_asr_config.store()) {
                         Ok(settings) => {
-                            let media = controller::asr::AsrMedia::new(media_ctx.path, media_ctx.audio_id);
+                            let media = controller::media::MediaContext::new(media_ctx.path, media_ctx.audio_id);
                             match timer_asr.borrow_mut().start(settings, media, duration, pos) {
                                 Ok(()) => {
                                     timer_asr_restart.set(false);

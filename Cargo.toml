@@ -5,6 +5,15 @@ edition = "2021"
 publish = false
 default-run = "memento"
 
+[features]
+default = []
+asr = ["asr-whisper"]
+asr-whisper = ["dep:memento-asr-whisper"]
+asr-onnx = ["dep:memento-asr-onnx"]
+ocr = ["dep:libloading"]
+whisper-cuda = ["asr-whisper", "memento-asr-whisper/cuda"]
+whisper-vulkan = ["asr-whisper", "memento-asr-whisper/vulkan"]
+
 [dependencies]
 slint = { version = "=1.16.1", default-features = false, features = [
     "std",
@@ -16,7 +25,7 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "renderer-software",
     "unstable-fontique-08",
 ] }
-libloading = "=0.8.9"
+libloading = { version = "=0.8.9", optional = true }
 glow = "=0.17.0"
 log = "=0.4.34"
 icu_provider = { version = "=2.3.1", features = ["logging"] }
@@ -35,10 +44,11 @@ memento-net = { path = "crates/memento-net" }
 memento-audio = { path = "crates/memento-audio" }
 memento-util = { path = "crates/memento-util" }
 memento-asr = { path = "crates/memento-asr" }
-memento-asr-onnx = { path = "crates/memento-asr-onnx" }
-memento-asr-whisper = { path = "crates/memento-asr-whisper" }
+memento-asr-onnx = { path = "crates/memento-asr-onnx", optional = true }
+memento-asr-whisper = { path = "crates/memento-asr-whisper", optional = true }
 
 [dev-dependencies]
+libloading = "=0.8.9"
 i-slint-backend-testing = "=1.16.1"
 i-slint-renderer-femtovg = { version = "=1.16.1", features = ["opengl"] }
 

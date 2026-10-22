@@ -12,12 +12,12 @@ use memento_player::RawFrame;
 use serde_json::json;
 
 use super::anki::NoteFieldsContext;
-use super::asr::{extract_clip_mp4, extract_clip_wav, AsrMedia};
+use super::media::{extract_clip_mp4, extract_clip_wav, MediaContext};
 use super::audio::fetch_word_audio;
 use super::config::{AnkiNoteConfig, AudioSourceEntry};
 
 pub struct NoteMediaInput {
-    pub media: Option<AsrMedia>,
+    pub media: Option<MediaContext>,
     pub subtitle_start: f64,
     pub subtitle_end: f64,
     pub context_start: f64,
