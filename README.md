@@ -205,8 +205,9 @@ To include the popup geometry checks, run:
 SLINT_EMIT_DEBUG_INFO=1 cargo test --test dictionary_popup_layout_test
 ```
 
-The legacy CMake build and release workflows are scoped to `cpp`. Rust build
-and test commands currently run locally through Cargo.
+Rust build and test commands currently run locally through Cargo. This branch
+has no GitHub Actions workflows or legacy Windows/Gentoo packaging. The original
+C++ build and packaging files remain in the `cpp` branch.
 
 The optional Linux playback timing test renders the actual Slint window through
 surfaceless EGL, including the video image, controls and changing furigana subtitles:
