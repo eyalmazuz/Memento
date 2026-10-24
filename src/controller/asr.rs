@@ -55,7 +55,7 @@ pub fn whisper_gpu_device_count() -> usize {
     0
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhisperSettings {
     pub model: String,
     pub custom_model: String,
@@ -70,7 +70,7 @@ pub struct WhisperSettings {
     pub suppress_regex: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OnnxSettings {
     pub model: String,
     pub custom_model: String,
@@ -81,7 +81,7 @@ pub struct OnnxSettings {
 }
 
 /// ASR settings captured from the existing application config store.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsrSettings {
     pub config_dir: PathBuf,
     pub enabled: bool,
@@ -287,6 +287,12 @@ impl AsrEvent {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStart {
+    New,
+    Resumed,
+}
+
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx"))]
 mod runtime;
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx"))]
@@ -301,10 +307,15 @@ impl AsrController {
     pub fn new() -> Self {
         Self
     }
-    pub fn start(&mut self, _: AsrSettings, _: AsrMedia, _: f64, _: f64) -> Result<(), String> {
+    pub fn start(&mut self, _: AsrSettings, _: AsrMedia, _: f64, _: f64) -> Result<SessionStart, String> {
         Err("Speech recognition is not included in this build.".into())
     }
+    pub fn suspend(&mut self) {}
+    pub fn matches_settings(&self, _: &AsrSettings) -> bool { false }
     pub fn cancel(&mut self) {}
+    pub fn begin_shutdown(&mut self) {}
+    pub fn try_finish_shutdown(&mut self) -> bool { true }
+    pub fn shutdown(&mut self) {}
     pub fn update_position(&mut self, _: f64, _: f64, _: bool) {}
     pub fn poll_with(&mut self, _: impl FnMut(AsrEvent)) {}
     pub fn poll(&mut self) -> Vec<AsrEvent> {

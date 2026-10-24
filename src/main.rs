@@ -26,7 +26,7 @@ use ui::{subtitle_lines_from_words, subtitle_token_width};
 use controller::anki::AnkiController;
 use controller::config::ConfigController;
 use controller::dict::DictController;
-use controller::subtitles::{MemorySubtitleCue, SubtitleController, SubtitleTrackInfo};
+use controller::subtitles::{MemorySubtitleCue, SubtitleController, SubtitleTrackInfo, ASR_TRACK_ID};
 use controller::dictmanager::{DictionaryManager, InstalledDictionary};
 use memento_config::Value;
 use memento_player::MpvInstance;
@@ -298,7 +298,7 @@ fn load_media_into(
     app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
     app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
     app.set_selected_token_index(-1);
-    app.set_dict_open(false);
+    app.invoke_dismiss_definition();
     Ok(())
 }
 
@@ -663,43 +663,16 @@ impl GlVideoSurface {
         self.texture.map(|texture| (texture.0, self.size.0, self.size.1))
     }
 
+    fn update(&self, player: &MpvInstance) -> bool {
+        if !player.has_render_update() { return false; }
+        video_gl::with_saved_state(&self.gl, || player.take_render_update())
+    }
+
     fn render(&self, player: &MpvInstance) -> Result<(), String> {
         let Some(framebuffer) = self.framebuffer else { return Ok(()) };
-        let gl = &self.gl;
-        unsafe {
-            let old_framebuffer = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
-            let old_texture = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
-            let old_active_texture = gl.get_parameter_i32(glow::ACTIVE_TEXTURE);
-            let old_program = gl.get_parameter_i32(glow::CURRENT_PROGRAM);
-            let old_vertex_array = gl.get_parameter_i32(glow::VERTEX_ARRAY_BINDING);
-            let old_scissor_enabled = gl.is_enabled(glow::SCISSOR_TEST);
-            let mut old_scissor = [0; 4];
-            gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut old_scissor);
-            let old_blend = [
-                gl.get_parameter_i32(glow::BLEND_SRC_RGB),
-                gl.get_parameter_i32(glow::BLEND_DST_RGB),
-                gl.get_parameter_i32(glow::BLEND_SRC_ALPHA),
-                gl.get_parameter_i32(glow::BLEND_DST_ALPHA),
-            ];
-            let mut old_viewport = [0; 4];
-            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut old_viewport);
-            let result = video_gl::without_blending(gl, || {
-                player.render_opengl(framebuffer.0.get(), self.size.0, self.size.1)
-            });
-            gl.bind_framebuffer(glow::FRAMEBUFFER,
-                std::num::NonZeroU32::new(old_framebuffer as u32).map(glow::NativeFramebuffer));
-            gl.active_texture(old_active_texture as u32);
-            gl.bind_texture(glow::TEXTURE_2D,
-                std::num::NonZeroU32::new(old_texture as u32).map(glow::NativeTexture));
-            gl.use_program(std::num::NonZeroU32::new(old_program as u32).map(glow::NativeProgram));
-            gl.bind_vertex_array(std::num::NonZeroU32::new(old_vertex_array as u32).map(glow::NativeVertexArray));
-            gl.viewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
-            gl.scissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
-            if old_scissor_enabled { gl.enable(glow::SCISSOR_TEST); } else { gl.disable(glow::SCISSOR_TEST); }
-            gl.blend_func_separate(old_blend[0] as u32, old_blend[1] as u32,
-                old_blend[2] as u32, old_blend[3] as u32);
-            result
-        }
+        video_gl::with_saved_state(&self.gl, || {
+            player.render_opengl(framebuffer.0.get(), self.size.0, self.size.1)
+        })
     }
 
     fn destroy(mut self) {
@@ -812,6 +785,51 @@ mod subtitle_layout_tests {
     use super::*;
 
     #[test]
+    fn mpv_track_sync_preserves_asr_and_settings_reset_only_clears_its_cache() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.set_asr_enabled(true);
+        let asr = Rc::new(RefCell::new(controller::asr::AsrController::new()));
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        let restart = Rc::new(Cell::new(false));
+        {
+            let mut subtitles = subtitles.borrow_mut();
+            subtitles.ensure_track(2);
+            subtitles.set_track_cues(2, vec![controller::subtitles::create_cue("File", 1.0, 3.0)]);
+            subtitles.start_asr_track();
+            subtitles.add_asr_cue(MemorySubtitleCue {
+                id: 1, text: "ASR".encode_utf16().collect(), start: 1.0, end: 3.0,
+            }, 2.0);
+        }
+        app.set_asr_running(true);
+        let mut state = memento_player::mpv::PlaybackState::default();
+        state.position = 2.0;
+        let mut audio = Vec::new();
+        let mut tracks = Vec::new();
+        sync_player_tracks(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks);
+        assert_eq!(subtitles.borrow().primary_sid(), ASR_TRACK_ID);
+        assert_eq!(subtitles.borrow().active_cue_text().as_deref(), Some("ASR"));
+        app.set_asr_running(false);
+        state.primary_sid = 2;
+        sync_player_tracks(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks);
+        assert_eq!(rows.row_data(0).unwrap().text, "File");
+        app.set_active_sub_text("File".into());
+        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart);
+        assert_eq!(app.get_active_sub_text(), "File");
+        assert_eq!(rows.row_data(0).unwrap().text, "File");
+        assert!(!restart.get());
+        assert!(!subtitles.borrow_mut().resume_asr_track(2.0));
+        // Reset while ASR is selected queues a fresh model and clears its view.
+        subtitles.borrow_mut().start_asr_track();
+        app.set_asr_running(true);
+        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart);
+        assert!(restart.get());
+        assert!(rows.row_count() == 0);
+        assert!(app.get_active_sub_text().is_empty());
+    }
+
+    #[test]
     fn furigana_subtitle_wraps_within_narrow_video_without_losing_text() {
         let parts = [
             ("生前", "せいぜん"), ("に", ""), ("世界", "せかい"), ("中", "じゅう"),
@@ -891,16 +909,17 @@ fn sync_player_tracks(
         previous_subtitles.clone_from(tracks);
         refresh_subtitle_list(subtitle_rows, subtitles);
     }
-    let primary = state.primary_sid;
+    let primary = if app.get_asr_running() { ASR_TRACK_ID } else { state.primary_sid };
     if subtitles.primary_sid() != primary {
-        subtitles.set_primary_sid(primary);
+        if primary == ASR_TRACK_ID { subtitles.resume_asr_track(state.position); }
+        else { subtitles.set_primary_sid(primary); }
         refresh_subtitle_list(subtitle_rows, subtitles);
     }
     let secondary = state.secondary_sid;
     if subtitles.secondary_sid() != secondary {
         subtitles.set_secondary_sid(secondary);
     }
-    app.set_primary_sid(i32::try_from(primary).unwrap_or(0));
+    app.set_primary_sid(i32::try_from(state.primary_sid).unwrap_or(0));
     app.set_secondary_sid(i32::try_from(secondary).unwrap_or(0));
 }
 
@@ -1086,18 +1105,23 @@ fn clear_asr_for_settings(
     subtitle_model: &Rc<VecModel<SubEntry>>,
     restart_pending: &Rc<Cell<bool>>,
 ) {
-    let restart = app.get_asr_running() && app.get_asr_enabled();
+    let selected = app.get_asr_running();
+    let restart = selected && app.get_asr_enabled();
     asr.borrow_mut().cancel();
     let mut subtitles = subtitles.borrow_mut();
     subtitles.clear_asr_track();
     refresh_subtitle_list(subtitle_model, &subtitles);
     app.set_asr_running(false);
+    restart_pending.set(restart);
+    if selected { clear_primary_subtitle(app); }
+}
+
+fn clear_primary_subtitle(app: &MementoApp) {
     app.set_active_sub_text("".into());
     app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
     app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
-    restart_pending.set(restart);
-    app.set_selected_token_index(-1);
-    app.set_dict_open(false);
+    app.set_subtitle_furigana_pending(false);
+    app.invoke_dismiss_definition();
 }
 
 fn create_settings_session(
@@ -1244,7 +1268,13 @@ fn create_settings_session(
                     ),
                 );
                 if category == 8 {
-                    clear_asr_for_settings(&app, &apply_asr, &apply_subtitles, &apply_subtitle_model, &apply_restart);
+                    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let unchanged = controller::asr::AsrSettings::from_config(config_dir, &apply_config.store())
+                        .is_ok_and(|settings| apply_asr.borrow().matches_settings(&settings));
+                    if !unchanged {
+                        clear_asr_for_settings(&app, &apply_asr, &apply_subtitles, &apply_subtitle_model, &apply_restart);
+                    }
                 }
             }
         }
@@ -1679,6 +1709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ocr_available = false;
     let asr_session = Rc::new(RefCell::new(controller::asr::AsrController::new()));
     let asr_restart_pending = Rc::new(Cell::new(false));
+    let closing = Rc::new(Cell::new(false));
     app.set_ocr_enabled(
         ocr_available && setting_enabled(
             &config_ctrl, raw::ocr::GROUP, raw::ocr::ENABLED,
@@ -1797,20 +1828,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let lookup_epoch = Arc::new(AtomicU64::new(0));
-    let key_hover_timer = hover_timer.clone();
-    let key_hover_pending = hover_pending.clone();
-    let key_lookup_epoch = lookup_epoch.clone();
     let key_mpv = mpv.clone();
+    let key_closing = closing.clone();
     let shortcut_app = app.as_weak();
     app.on_key_pressed(move |text, control, shift, alt, meta| {
+        if key_closing.get() { return true; }
         let Some(app) = shortcut_app.upgrade() else { return false };
         // Any keyboard input dismisses a definition, even when the key is
         // handled by the player or a child widget.
         let had_dict_open = app.get_dict_open();
-        app.set_dict_open(false);
-        key_lookup_epoch.fetch_add(1, Ordering::AcqRel);
-        key_hover_timer.stop();
-        key_hover_pending.borrow_mut().take();
+        app.invoke_dismiss_definition();
         let chord = keyboard_chord(&text, control, shift, alt, meta);
         let assigned = |binding: &slint::SharedString| {
             !binding.is_empty() && chord.eq_ignore_ascii_case(binding.as_str())
@@ -1862,7 +1889,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             if !control && !alt && (text == "q" || text == "Q") {
-                let _ = slint::quit_event_loop();
+                app.invoke_quit_app();
                 return true;
             }
             let key_base = match text.as_str() {
@@ -2156,22 +2183,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let primary_sub_model = sub_model.clone();
     let primary_app = app.as_weak();
     let primary_asr = asr_session.clone();
+    let primary_asr_restart = asr_restart_pending.clone();
     app.on_select_subtitle_track(move |id| {
-        if let Some(app) = primary_app.upgrade() {
-            if app.get_asr_running() {
-                primary_asr.borrow_mut().cancel();
-                app.set_asr_running(false);
-                let mut subtitles = primary_subs.borrow_mut();
-                subtitles.clear_asr_track();
-                refresh_subtitle_list(&primary_sub_model, &subtitles);
-            }
-        }
         if let Some(player) = &*primary_mpv.borrow() {
             match player.set_sid(id.into()) {
                 Ok(()) => {
-                    primary_subs.borrow_mut().set_primary_sid(id.into());
+                    primary_asr.borrow_mut().suspend();
+                    primary_asr_restart.set(false);
+                    let mut subtitles = primary_subs.borrow_mut();
+                    subtitles.set_primary_sid(id.into());
+                    refresh_subtitle_list(&primary_sub_model, &subtitles);
                     if let Some(app) = primary_app.upgrade() {
+                        app.set_asr_running(false);
                         app.set_primary_sid(id);
+                        clear_primary_subtitle(&app);
                     }
                 }
                 Err(error) => eprintln!("Cannot select primary subtitle track {id}: {error}"),
@@ -2199,19 +2224,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let select_asr_mpv = mpv.clone();
     let select_asr_config = config_ctrl.clone();
     let select_asr_session = asr_session.clone();
+    let select_asr_restart = asr_restart_pending.clone();
     let select_asr_sub_ctrl = sub_ctrl.clone();
     let select_asr_sub_model = sub_model.clone();
     app.on_select_asr(move || {
         let Some(app) = select_asr_app.upgrade() else { return };
         let mut asr = select_asr_session.borrow_mut();
         if app.get_asr_running() {
-            asr.cancel();
+            asr.suspend();
+            select_asr_restart.set(false);
             app.set_asr_running(false);
             let mut subtitles = select_asr_sub_ctrl.borrow_mut();
-            subtitles.clear_asr_track();
+            subtitles.set_primary_sid(0);
             refresh_subtitle_list(&select_asr_sub_model, &subtitles);
-            app.set_active_sub_text("".into());
-            app.set_status_message("ASR subtitles stopped".into());
+            clear_primary_subtitle(&app);
+            app.set_status_message("ASR paused; subtitles and model kept in memory".into());
             return;
         }
         if app.get_duration() <= 0.0 {
@@ -2239,26 +2266,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pos = player.get_position();
         let dur = player.get_duration();
         match asr.start(settings, media, dur, pos) {
-            Ok(()) => {
+            Ok(session) => {
                 if let Err(error) = player.set_sid(0) {
-                    asr.cancel();
+                    if session == controller::asr::SessionStart::Resumed { asr.suspend(); }
+                    else { asr.cancel(); }
                     app.set_status_message(format!("Could not select ASR subtitles: {error}").into());
                     return;
                 }
                 let mut subtitles = select_asr_sub_ctrl.borrow_mut();
-                subtitles.start_asr_track();
+                match session {
+                    controller::asr::SessionStart::New => subtitles.start_asr_track(),
+                    controller::asr::SessionStart::Resumed => { subtitles.resume_asr_track(pos); }
+                }
+                select_asr_restart.set(false);
+                clear_primary_subtitle(&app);
                 refresh_subtitle_list(&select_asr_sub_model, &subtitles);
                 app.set_primary_sid(0);
                 app.set_asr_running(true);
-                app.set_status_message(if gpu_unavailable {
+                app.set_status_message(if session == controller::asr::SessionStart::Resumed {
+                    "ASR resumed with saved subtitles"
+                } else if gpu_unavailable {
                     "Whisper GPU unavailable; transcribing on CPU. Check GPU driver and CUDA/Vulkan build."
                 } else {
                     "ASR subtitles started…"
                 }.into());
             }
-            Err(err) => {
-                app.set_status_message(err.into());
+            Err(err) if err.contains("still stopping") => {
+                select_asr_sub_ctrl.borrow_mut().clear_asr_track();
+                refresh_subtitle_list(&select_asr_sub_model, &select_asr_sub_ctrl.borrow());
+                select_asr_restart.set(true);
+                app.set_status_message("Reloading ASR for the current media and settings…".into());
             }
+            Err(err) => { app.set_status_message(err.into()); }
         }
     });
     let auto_app = app.as_weak();
@@ -2469,10 +2508,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    app.on_quit_app(|| {
-        if let Err(error) = slint::quit_event_loop() {
-            eprintln!("Could not close Memento: {error}");
+    let quit_timer = Rc::new(slint::Timer::default());
+    let quit_poll = quit_timer.clone();
+    let quit_asr = asr_session.clone();
+    let quit_restart = asr_restart_pending.clone();
+    let quit_closing = closing.clone();
+    let quit_player = mpv.clone();
+    let quit_hover_resume = hover_resume_timer.clone();
+    let quit_hover_owned = hover_pause_owned.clone();
+    let quit_app = app.as_weak();
+    app.on_quit_app(move || {
+        if quit_closing.replace(true) { return; }
+        quit_restart.set(false);
+        quit_hover_resume.stop();
+        quit_hover_owned.set(false);
+        quit_asr.borrow_mut().begin_shutdown();
+        if let Some(app) = quit_app.upgrade() {
+            app.invoke_dismiss_definition();
+            app.set_asr_running(false);
+            app.set_pending_playback_generation(-1);
+            app.set_status_message("Closing Memento — stopping speech recognition…".into());
         }
+        if let Some(player) = quit_player.borrow().as_ref() {
+            let _ = player.command_async(&["set", "pause", "yes"]);
+        }
+        if quit_asr.borrow_mut().try_finish_shutdown() {
+            if let Err(error) = slint::quit_event_loop() {
+                eprintln!("Could not close Memento: {error}");
+            }
+            return;
+        }
+        let asr = quit_asr.clone();
+        quit_poll.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(25), move || {
+            if asr.borrow_mut().try_finish_shutdown() {
+                if let Err(error) = slint::quit_event_loop() {
+                    eprintln!("Could not close Memento: {error}");
+                }
+            }
+        });
+    });
+    let close_app = app.as_weak();
+    app.window().on_close_requested(move || {
+        if let Some(app) = close_app.upgrade() { app.invoke_quit_app(); }
+        slint::CloseRequestResponse::KeepWindowShown
     });
 
     let visibility_app = app.as_weak();
@@ -2521,21 +2599,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_ocr_region(move |x, y, width, height| {
         let Some(app) = ocr_region_app.upgrade() else { return };
         app.set_status_message("Recognizing selected text…".into());
-        let Some(controller) = ocr_controller.as_ref().ok() else { return };
+        let Some(controller) = ocr_controller.as_ref().ok().cloned() else { return };
         let Some(player) = &*ocr_region_mpv.borrow() else { return };
-        let raw = match player.screenshot_raw_rgba(false) {
-            Ok(raw) => raw,
+        let capture = match player.request_screenshot(false) {
+            Ok(capture) => capture,
             Err(error) => {
                 app.set_status_message(format!("Cannot capture video: {error}").into());
-                return;
-            }
-        };
-        let frame = match controller::ocr::OcrFrame::from_rgba(
-            raw.width, raw.height, raw.pixels,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                app.set_status_message(error.to_string().into());
                 return;
             }
         };
@@ -2556,38 +2625,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         };
         let response_app = ocr_region_app.clone();
-        let result = controller.read_region_async(
-            frame,
-            controller::ocr::OcrRegion {
-                x: x.into(), y: y.into(), width: width.into(), height: height.into(),
-            },
-            controller::ocr::OcrViewport {
-                width: app.get_video_width().into(),
-                height: app.get_video_height().into(),
-            },
-            settings,
-            move |recognized| {
-                let _ = response_app.upgrade_in_event_loop(move |app| match recognized {
-                    Ok(text) => {
-                        let text = text.trim();
-                        if !text.is_empty() {
-                            app.set_dict_open(false);
-                            app.set_dict_query(text.into());
-                            app.set_dict_search_open(true);
-                            app.set_sub_drawer_open(false);
-                            app.invoke_search_dictionary(text.into());
-                            app.set_status_message(format!("OCR: {text}").into());
-                        } else {
-                            app.set_status_message("No text recognized in selected region".into());
+        let viewport = controller::ocr::OcrViewport {
+            width: app.get_video_width().into(),
+            height: app.get_video_height().into(),
+        };
+        std::thread::spawn(move || {
+            let frame = capture.wait().and_then(|raw| {
+                controller::ocr::OcrFrame::from_rgba(raw.width, raw.height, raw.pixels)
+                    .map_err(|error| error.to_string())
+            });
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = response_app.upgrade_in_event_loop(move |app| {
+                        app.set_status_message(format!("Cannot capture video: {error}").into());
+                    });
+                    return;
+                }
+            };
+            let error_app = response_app.clone();
+            let result = controller.read_region_async(
+                frame,
+                controller::ocr::OcrRegion {
+                    x: x.into(), y: y.into(), width: width.into(), height: height.into(),
+                },
+                viewport,
+                settings,
+                move |recognized| {
+                    let _ = response_app.upgrade_in_event_loop(move |app| match recognized {
+                        Ok(text) => {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                app.invoke_dismiss_definition();
+                                app.set_dict_query(text.into());
+                                app.set_dict_search_open(true);
+                                app.set_sub_drawer_open(false);
+                                app.invoke_search_dictionary(text.into());
+                                app.set_status_message(format!("OCR: {text}").into());
+                            } else {
+                                app.set_status_message("No text recognized in selected region".into());
+                            }
                         }
-                    }
-                    Err(error) => app.set_status_message(error.to_string().into()),
+                        Err(error) => app.set_status_message(error.to_string().into()),
+                    });
+                },
+            );
+            if let Err(error) = result {
+                let _ = error_app.upgrade_in_event_loop(move |app| {
+                    app.set_status_message(error.to_string().into());
                 });
-            },
-        );
-        if let Err(error) = result {
-            app.set_status_message(error.to_string().into());
-        }
+            }
+        });
     });
     }
 
@@ -2787,6 +2875,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hover_timer_callback.stop();
         if word.is_empty() {
             hover_cursor_callback.borrow_mut().take();
+            hover_pending_callback.borrow_mut().take();
             hover_generation.fetch_add(1, Ordering::AcqRel);
             return;
         }
@@ -2870,7 +2959,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             hits
         };
-        app.set_dict_open(false);
+        app.invoke_dismiss_definition();
         set_dictionary_rows(&app, dictionary_result_rows(&hits, &search_dict_config.anki_excluded_glossaries()));
         app.invoke_reset_definition_scroll();
     });
@@ -3107,9 +3196,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let context_end = selected.iter().map(|cue| cue.end).reduce(f64::max).unwrap_or(end);
             (start, end, context_start, context_end)
         };
-        let wants_screenshot = profile.field_templates.values().any(|value| value.contains("{screenshot}") || value.contains("{screenshot:") || value.contains("{image}") || value.contains("{image:"));
-        let wants_video_screenshot = profile.field_templates.values().any(|value| value.contains("{screenshot-video}" ) || value.contains("{screenshot-video:"));
-        let media_input = {
+        let (wants_screenshot, wants_video_screenshot) =
+            controller::anki_media::requested_screenshots(&profile);
+        let mut screenshot_request = None;
+        let mut video_screenshot_request = None;
+        let mut media_input = {
             let player_ref = note_mpv.borrow();
             let player = player_ref.as_ref();
             let media = player.and_then(MpvInstance::capture_encode_context)
@@ -3118,16 +3209,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mpv_end = player.map(MpvInstance::get_sub_end).unwrap_or(0.0);
             let subtitle_start = if active_end > active_start { active_start } else { mpv_start };
             let subtitle_end = if active_end > active_start { active_end } else { mpv_end };
-            let screenshot = if wants_screenshot { player.and_then(|p| p.screenshot_raw_rgba(true).ok()) } else { None };
-            let screenshot_video = if wants_video_screenshot { player.and_then(|p| p.screenshot_raw_rgba(false).ok()) } else { None };
+            for (wanted, subtitles, request) in [
+                (wants_screenshot, true, &mut screenshot_request),
+                (wants_video_screenshot, false, &mut video_screenshot_request),
+            ] {
+                if wanted {
+                    *request = Some(player.ok_or_else(|| "No video is loaded".to_owned())
+                        .and_then(|player| player.request_screenshot(subtitles)));
+                }
+            }
             controller::anki_media::NoteMediaInput {
                 media,
                 subtitle_start,
                 subtitle_end,
                 context_start: if context_end > context_start { context_start } else { subtitle_start },
                 context_end: if context_end > context_start { context_end } else { subtitle_end },
-                screenshot,
-                screenshot_video,
+                screenshot: None,
+                screenshot_video: None,
                 subtitle_id: player.map(MpvInstance::primary_sid).unwrap_or(0),
                 audio_sources: {
                     let state = note_audio_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3150,6 +3248,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let request_epoch = response_epoch.load(Ordering::Acquire);
         let metadata_path = note_database_path.clone();
         std::thread::spawn(move || {
+            // Receive captures before any dictionary/audio/network work. The
+            // commands were queued at the click and the UI keeps rendering.
+            let captures = (|| -> Result<(), String> {
+                media_input.screenshot = screenshot_request
+                    .map(|request| request.and_then(|request| request.wait())).transpose()
+                    .map_err(|error| format!("Could not capture {{screenshot}} for Anki: {error}"))?;
+                media_input.screenshot_video = video_screenshot_request
+                    .map(|request| request.and_then(|request| request.wait())).transpose()
+                    .map_err(|error| format!("Could not capture {{screenshot-video}} for Anki: {error}"))?;
+                Ok(())
+            })();
             let controller = AnkiController::new(profile.endpoint());
             if let Ok(dictionary) = DictController::open(&metadata_path) {
                 for definition in &mut context.glossary_definitions {
@@ -3163,7 +3272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context.frequency_harmonic_rank = meta.frequency_harmonic_rank;
                 context.frequency_average_rank = meta.frequency_average_rank;
             }
-            let result = controller::anki_media::prepare_note_media(&profile, &mut context, media_input)
+            let result = captures.and_then(|()| controller::anki_media::prepare_note_media(&profile, &mut context, media_input))
                 .and_then(|()| controller.add_note_from_profile(&profile, &context));
             let expire_app = response_app.clone();
             let _ = response_app.upgrade_in_event_loop(move |app| {
@@ -3188,7 +3297,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("Anki note {note_id}: unavailable profile markers left empty: {}", unavailable.join(", "));
                         format!("Added Anki note {note_id}; some fields are empty").into()
                     },
-                    Err(error) => format!("Could not add Anki note: {error}").into(),
+                    Err(error) => {
+                        eprintln!("Could not add Anki note: {error}");
+                        format!("Could not add Anki note: {error}").into()
+                    },
                 });
             });
         });
@@ -3248,6 +3360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timer_asr = asr_session.clone();
     let timer_asr_config = config_ctrl.clone();
     let timer_asr_restart = asr_restart_pending.clone();
+    let timer_closing = closing.clone();
     let timer_hover_owned = hover_pause_owned.clone();
     let timer_furigana_sender = furigana_sender.clone();
     let timer_furigana_epoch = furigana_epoch.clone();
@@ -3279,6 +3392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(100),
         move || {
+            if timer_closing.get() { return; }
             let sync_started = std::time::Instant::now();
             {
                 let mut timings = timer_video_timings.borrow_mut();
@@ -3339,11 +3453,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
                 app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
                 app.set_selected_token_index(-1);
-                app.set_dict_open(false);
+                app.invoke_dismiss_definition();
             }
             let pos = state.position;
             let duration = state.duration;
             let paused = state.paused;
+
+            // mpv keybindings can change SID without using our subtitle menu.
+            if app.get_asr_running() && state.primary_sid > 0 {
+                timer_asr.borrow_mut().suspend();
+                app.set_asr_running(false);
+                clear_primary_subtitle(&app);
+            }
 
             if timer_asr_restart.get() {
                 if !app.get_asr_enabled() {
@@ -3354,15 +3475,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match controller::asr::AsrSettings::from_config(&config_dir, &*timer_asr_config.store()) {
                         Ok(settings) => {
                             let media = controller::media::MediaContext::new(media_ctx.path, media_ctx.audio_id);
-                            match timer_asr.borrow_mut().start(settings, media, duration, pos) {
-                                Ok(()) => {
+                            let started = timer_asr.borrow_mut().start(settings, media, duration, pos);
+                            match started {
+                                Ok(session) => {
                                     timer_asr_restart.set(false);
                                     if let Err(error) = player.set_sid(0) {
                                         timer_asr.borrow_mut().cancel();
                                         app.set_status_message(format!("Could not restart ASR subtitles: {error}").into());
                                     } else {
                                         let mut subtitles = timer_sub_ctrl.borrow_mut();
-                                        subtitles.start_asr_track();
+                                        match session {
+                                            controller::asr::SessionStart::New => subtitles.start_asr_track(),
+                                            controller::asr::SessionStart::Resumed => { subtitles.resume_asr_track(pos); }
+                                        }
                                         refresh_subtitle_list(&timer_sub_model, &subtitles);
                                         app.set_primary_sid(0);
                                         app.set_asr_running(true);
@@ -3462,8 +3587,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let primary_times = (state.sub_start, state.sub_end);
             if !app.get_asr_running()
-                && (primary_text != previous_primary_text || primary_times != previous_sub_times) {
-                app.set_dict_open(false);
+                && (primary_text != previous_primary_text || primary_times != previous_sub_times
+                    || primary_text != app.get_active_sub_text().as_str()) {
+                app.invoke_dismiss_definition();
                 timer_lookup_epoch.fetch_add(1, Ordering::AcqRel);
                 let previous_count = subtitles.primary_entries().len();
                 let cue = (!primary_text.is_empty()).then(|| {
@@ -3490,7 +3616,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.set_secondary_sub_text(secondary_text.clone().into());
                 previous_secondary_text = secondary_text;
             }
-            if app.get_asr_running() {
+            {
+                // Always drain the worker: a window may finish after switching
+                // tracks, and its cues belong in the retained ASR cache.
                 let mut asr = timer_asr.borrow_mut();
                 asr.update_position(pos, duration, paused);
                 let mut refreshed_subtitles = false;
@@ -3512,7 +3640,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     controller::asr::AsrEvent::Completed { cue_count, .. } => {
-                        app.set_status_message(format!("ASR transcription completed ({cue_count} cues)").into());
+                        if app.get_asr_running() {
+                            app.set_status_message(format!("ASR transcription completed ({cue_count} cues)").into());
+                        }
                     }
                     controller::asr::AsrEvent::Failed { message, .. } => {
                         app.set_status_message(format!("ASR error: {message}").into());
@@ -3526,19 +3656,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     _ => {}
                 });
-                if refreshed_subtitles {
+                if refreshed_subtitles && app.get_asr_running() {
                     refresh_subtitle_list(&timer_sub_model, &subtitles);
                 }
             }
-            let before_active = subtitles.active_indices(primary_sid).to_vec();
+            let selected_sid = subtitles.primary_sid();
+            let before_active = subtitles.active_indices(selected_sid).to_vec();
             subtitles.update_positions(if app.get_asr_running() { pos } else { raw_primary }, raw_secondary);
             refresh_active_rows(
-                &timer_sub_model, &before_active, subtitles.active_indices(primary_sid),
+                &timer_sub_model, &before_active, subtitles.active_indices(selected_sid),
             );
             if app.get_asr_running() {
                 let asr_text = subtitles.active_cue_text().unwrap_or_default();
-                if asr_text != previous_primary_text {
-                    app.set_dict_open(false);
+                if asr_text != previous_primary_text || asr_text != app.get_active_sub_text().as_str() {
+                    app.invoke_dismiss_definition();
                     timer_lookup_epoch.fetch_add(1, Ordering::AcqRel);
                     publish_active_subtitle(&app, &asr_text, &timer_furigana_sender, &timer_furigana_epoch);
                     previous_primary_text = asr_text;
@@ -3647,10 +3778,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some(player) = player_ref.as_ref() else { return };
                 let mut surface_ref = notifier_surface.borrow_mut();
                 let Some(surface) = surface_ref.as_mut() else { return };
+                // All mpv_render_* GL calls require this context to be current.
+                // Control updates also complete paused GPU screenshots, even
+                // before a drawable viewport has been allocated.
+                let frame_ready = surface.update(player);
                 let size = notifier_size.get();
                 if size == (0, 0) { return; }
-                // All mpv_render_* GL calls require this context to be current.
-                let frame_ready = player.take_render_update();
                 if !notifier_pending.replace(false) && !frame_ready && surface.size == size { return; }
                 let render_started = std::time::Instant::now();
                 if let Err(error) = surface.ensure_size(size).and_then(|()| surface.render(player)) {
@@ -3836,6 +3969,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.invoke_update_video();
 
     let run_result = app.run();
+    timer.stop();
+    quit_timer.stop();
+    // Also cover an event-loop error or any exit that bypasses the close callback.
+    asr_session.borrow_mut().shutdown();
     drop(render_worker);
     drop(render_request_tx);
     run_result?;

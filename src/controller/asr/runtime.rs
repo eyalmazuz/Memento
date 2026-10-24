@@ -33,6 +33,7 @@ const ORT_API_VERSION: u32 = 22;
 struct Control {
     stop: bool,
     active: bool,
+    suspended: bool,
     generation: u64,
     duration: f64,
     position: f64,
@@ -51,6 +52,8 @@ pub struct AsrController {
     shared: Arc<Shared>,
     receiver: mpsc::Receiver<AsrEvent>,
     worker: Option<JoinHandle<()>>,
+    closing: bool,
+    session: Option<(AsrSettings, AsrMedia)>,
 }
 
 impl Default for AsrController {
@@ -71,10 +74,12 @@ impl AsrController {
             }),
             receiver,
             worker: None,
+            closing: false,
+            session: None,
         }
     }
 
-    /// Start a background transcription session for a loaded media file.
+    /// Resume a matching retained session, or start one for new media/settings.
     /// Missing or malformed model configuration is returned synchronously so
     /// the caller can present the exact setup action instead of a fake result.
     pub fn start(
@@ -83,19 +88,12 @@ impl AsrController {
         media: AsrMedia,
         duration: f64,
         position: f64,
-    ) -> Result<(), String> {
+    ) -> Result<SessionStart, String> {
+        if self.closing {
+            return Err("ASR is shutting down.".into());
+        }
         if !AVAILABLE {
             return Err("Speech recognition is not included in this build.".into());
-        }
-        if self.is_active() {
-            return Err("ASR is already active. Stop it before starting another session.".into());
-        }
-        if let Some(worker) = self.worker.take() {
-            if !worker.is_finished() {
-                self.worker = Some(worker);
-                return Err("The previous ASR session is still stopping.".into());
-            }
-            let _ = worker.join();
         }
         if !settings.enabled {
             return Err("ASR subtitles are disabled in the current settings.".into());
@@ -105,6 +103,24 @@ impl AsrController {
         }
         if !duration.is_finite() || duration <= 0.0 || !position.is_finite() {
             return Err("The active media has no usable duration or playback position.".into());
+        }
+        if self.session.as_ref().is_some_and(|(loaded, source)| loaded == &settings && source == &media) {
+            let mut control = lock(&self.shared.control);
+            if control.active && !control.stop {
+                control.position = position;
+                control.duration = duration;
+                control.suspended = false;
+                self.shared.wake.notify_all();
+                return Ok(SessionStart::Resumed);
+            }
+        }
+        if self.is_active() { self.cancel(); }
+        if let Some(worker) = self.worker.take() {
+            if !worker.is_finished() {
+                self.worker = Some(worker);
+                return Err("The previous ASR session is still stopping.".into());
+            }
+            let _ = worker.join();
         }
         let model = resolve_model(&settings)?;
 
@@ -119,6 +135,7 @@ impl AsrController {
             control: Mutex::new(Control {
                 stop: false,
                 active: true,
+                suspended: false,
                 generation: 0,
                 duration,
                 position,
@@ -130,6 +147,7 @@ impl AsrController {
         });
         self.shared = shared.clone();
 
+        let session = (settings.clone(), media.clone());
         self.worker = Some(
             thread::Builder::new()
                 .name("memento-asr".into())
@@ -138,7 +156,19 @@ impl AsrController {
                 })
                 .map_err(|error| format!("Could not start ASR worker: {error}"))?,
         );
-        Ok(())
+        self.session = Some(session);
+        Ok(SessionStart::New)
+    }
+
+    pub fn matches_settings(&self, settings: &AsrSettings) -> bool {
+        self.is_active() && self.session.as_ref().is_some_and(|(loaded, _)| loaded == settings)
+    }
+
+    /// Hide ASR without discarding its model, cues or completed VAD intervals.
+    /// Finish an in-flight window so returning never has to transcribe it again.
+    pub fn suspend(&mut self) {
+        let mut control = lock(&self.shared.control);
+        if control.active && !control.stop { control.suspended = true; }
     }
 
     /// Update playback position without restarting VAD or Whisper on seeks.
@@ -159,8 +189,8 @@ impl AsrController {
         self.shared.running.load(Ordering::Acquire)
     }
 
-    /// True while the controller is active, including the wait state after it
-    /// has reached the end of the file and can resume after a seek.
+    /// True while a session is retained, including when another subtitle track
+    /// is selected or all media intervals have already been transcribed.
     pub fn is_active(&self) -> bool {
         lock(&self.shared.control).active
     }
@@ -194,6 +224,7 @@ impl AsrController {
     /// Stop the session without blocking the UI thread. The worker observes
     /// cancellation during audio extraction or Whisper inference and exits.
     pub fn cancel(&mut self) {
+        self.session = None;
         let mut control = lock(&self.shared.control);
         if !control.active && control.stop {
             return;
@@ -206,11 +237,47 @@ impl AsrController {
         self.shared.running.store(false, Ordering::Release);
         self.shared.wake.notify_all();
     }
+
+    /// Permanently stop accepting sessions, and request cancellation without
+    /// waiting for an inference call or a native model destructor on the UI.
+    pub fn begin_shutdown(&mut self) {
+        self.closing = true;
+        self.cancel();
+    }
+
+    /// Poll from the event loop until the entire worker, including native
+    /// model/CUDA cleanup, has finished. `is_running()` only tracks inference
+    /// and becomes false before that cleanup, so it is not a shutdown gate.
+    pub fn try_finish_shutdown(&mut self) -> bool {
+        self.begin_shutdown();
+        if self.worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            return false;
+        }
+        self.join_worker();
+        true
+    }
+
+    /// Final shutdown barrier for event-loop errors and controller destruction.
+    /// Interactive close uses `try_finish_shutdown` to keep the UI responsive.
+    pub fn shutdown(&mut self) {
+        self.begin_shutdown();
+        self.join_worker();
+    }
+
+    fn join_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("ASR worker panicked during shutdown");
+            }
+        }
+    }
 }
 
 impl Drop for AsrController {
     fn drop(&mut self) {
-        self.cancel();
+        // Dropping a JoinHandle detaches the thread. Never let the process
+        // unload CUDA while a detached worker is still using/freeing buffers.
+        self.shutdown();
     }
 }
 
@@ -709,6 +776,9 @@ fn run_session(
     initial_position: f64,
 ) {
     let generation = lock(&shared.control).generation;
+    if is_stale_or_stopped(&shared, generation) {
+        return;
+    }
     let _ = sender.send(AsrEvent::Started { generation });
     let model = match load_runtime_model(&settings, &resolved) {
         Ok(model) => model,
@@ -724,6 +794,7 @@ fn run_session(
     let mut failures = 0;
 
     loop {
+        if !wait_for_selection(&shared) { break; }
         let (stop, active_generation, duration, position, restart_position) = {
             let mut control = lock(&shared.control);
             if control.stop || !control.active {
@@ -793,7 +864,7 @@ fn run_session(
                 let abort = Arc::new(AtomicBool::new(false));
                 {
                     let mut control = lock(&shared.control);
-                    if control.stop || control.generation != seen_generation {
+                    if control.stop || control.suspended || control.generation != seen_generation {
                         continue;
                     }
                     control.current_abort = Some(abort.clone());
@@ -881,6 +952,16 @@ fn run_session(
     let mut control = lock(&shared.control);
     control.active = false;
     control.current_abort = None;
+}
+
+/// Wait between windows, retaining the worker's model and CueBook on its stack.
+fn wait_for_selection(shared: &Shared) -> bool {
+    let mut control = lock(&shared.control);
+    while control.active && !control.stop && control.suspended {
+        shared.running.store(false, Ordering::Release);
+        control = shared.wake.wait(control).unwrap_or_else(|error| error.into_inner());
+    }
+    control.active && !control.stop
 }
 
 fn finish_with_error(
@@ -1020,6 +1101,215 @@ fn transcribe_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn cached_session() -> (AsrController, AsrSettings, AsrMedia) {
+        let mut controller = AsrController::new();
+        let mut settings = AsrSettings::from_config("/unused", &Config::default_empty()).unwrap();
+        settings.enabled = true;
+        let media = AsrMedia::new("/unused/video.mkv", 1);
+        controller.session = Some((settings.clone(), media.clone()));
+        {
+            let mut control = lock(&controller.shared.control);
+            control.active = true;
+            control.duration = 90.0;
+        }
+        (controller, settings, media)
+    }
+
+    #[test]
+    fn switching_away_keeps_worker_model_progress_and_queued_cues_until_resume() {
+        let (mut controller, settings, media) = cached_session();
+        let shared = controller.shared.clone();
+        let abort = Arc::new(AtomicBool::new(false));
+        lock(&shared.control).current_abort = Some(abort.clone());
+        controller.suspend();
+        assert!(!abort.load(Ordering::Acquire), "finish the current window instead of redoing VAD");
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resumed_tx, resumed_rx) = mpsc::channel();
+        let freed = Arc::new(AtomicBool::new(false));
+        let worker_freed = freed.clone();
+        controller.worker = Some(thread::spawn(move || {
+            struct ModelLifetime(Arc<AtomicBool>);
+            impl Drop for ModelLifetime {
+                fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+            }
+            let _model = ModelLifetime(worker_freed);
+            let mut cues = CueBook::default();
+            cues.processed.push((0.0, 30.0));
+            cues.add("saved".into(), 1.0, 3.0, 0, &sender);
+            entered_tx.send(()).unwrap();
+            assert!(wait_for_selection(&shared));
+            assert_eq!(cues.cues.len(), 1);
+            assert!(matches!(cues.plan_window(0.0, 90.0, false),
+                WindowPlan::Extract(Window { start: 30.0, .. })));
+            resumed_tx.send(()).unwrap();
+            let mut control = lock(&shared.control);
+            while !control.stop { control = shared.wake.wait(control).unwrap(); }
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(controller.is_active());
+        assert!(!freed.load(Ordering::Acquire));
+        assert!(matches!(controller.poll().as_slice(), [AsrEvent::CueAdded { .. }]));
+        controller.update_position(75.0, 90.0, false);
+        assert!(controller.matches_settings(&settings));
+        // No model exists at the fixture path: this can only succeed by reusing
+        // the original worker, rather than resolving/loading a model again.
+        assert_eq!(controller.start(settings, media, 90.0, 75.0).unwrap(), SessionStart::Resumed);
+        resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(lock(&controller.shared.control).generation, 0);
+        assert_eq!(lock(&controller.shared.control).position, 75.0);
+        assert!(!freed.load(Ordering::Acquire));
+        controller.shutdown();
+        assert!(freed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_wakes_a_suspended_worker_and_invalidates_the_cache() {
+        let (mut controller, settings, _) = cached_session();
+        controller.suspend();
+        let shared = controller.shared.clone();
+        controller.worker = Some(thread::spawn(move || {
+            assert!(!wait_for_selection(&shared));
+        }));
+        controller.cancel();
+        controller.join_worker();
+        assert!(!controller.matches_settings(&settings));
+        assert!(!controller.is_active());
+    }
+
+    #[test]
+    fn changed_settings_or_source_cannot_resume_the_old_session() {
+        for change_source in [false, true] {
+            let (mut controller, mut settings, mut media) = cached_session();
+            controller.suspend();
+            if change_source { media.audio_id = 2; }
+            else { settings.whisper.threads += 1; }
+            // The new session's deliberately missing model must be validated.
+            assert!(controller.start(settings, media, 90.0, 30.0).is_err());
+            assert!(!controller.is_active());
+            assert!(controller.session.is_none());
+        }
+    }
+
+    #[test]
+    fn shutdown_poll_keeps_waiting_until_worker_cleanup_finishes() {
+        let mut controller = AsrController::new();
+        let abort = Arc::new(AtomicBool::new(false));
+        {
+            let mut control = lock(&controller.shared.control);
+            control.active = true;
+            control.current_abort = Some(abort.clone());
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let worker_cleaned = cleaned.clone();
+        let shared = controller.shared.clone();
+        controller.worker = Some(thread::spawn(move || {
+            let mut control = lock(&shared.control);
+            while !control.stop {
+                control = shared.wake.wait(control).unwrap();
+            }
+            drop(control);
+            entered_tx.send(()).unwrap();
+            // Simulate a native destructor still freeing buffers after cancel.
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker_cleaned.store(true, Ordering::Release);
+        }));
+        controller.begin_shutdown();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(abort.load(Ordering::Acquire));
+        assert!(!controller.is_running());
+        assert!(!controller.try_finish_shutdown(), "cancel is not worker completion");
+        assert!(!cleaned.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        controller.shutdown();
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(controller.worker.is_none());
+        assert!(controller.try_finish_shutdown());
+    }
+
+    #[test]
+    fn dropping_controller_joins_worker_and_does_not_hold_control_lock() {
+        let mut controller = AsrController::new();
+        lock(&controller.shared.control).active = true;
+        let shared = controller.shared.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let worker_cleaned = cleaned.clone();
+        controller.worker = Some(thread::spawn(move || {
+            let mut control = lock(&shared.control);
+            while !control.stop {
+                control = shared.wake.wait(control).unwrap();
+            }
+            // Give a detached worker time to expose the old premature exit.
+            thread::sleep(Duration::from_millis(30));
+            worker_cleaned.store(true, Ordering::Release);
+        }));
+        drop(controller);
+        assert!(cleaned.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "asr-whisper")]
+    #[test]
+    #[ignore = "requires MEMENTO_ASR_TEST_MODEL pointing to a local Whisper model"]
+    fn shutdown_during_native_whisper_inference_releases_model() {
+        struct AbortContext {
+            abort: Arc<AtomicBool>,
+            entered: mpsc::Sender<()>,
+            signaled: bool,
+        }
+        unsafe extern "C" fn signal_inference(data: *mut c_void) -> bool {
+            let context = &mut *data.cast::<AbortContext>();
+            if !context.signaled {
+                context.signaled = true;
+                let _ = context.entered.send(());
+            }
+            context.abort.load(Ordering::Acquire)
+        }
+        let path = std::env::var_os("MEMENTO_ASR_TEST_MODEL").expect("set MEMENTO_ASR_TEST_MODEL");
+        let path = path_to_cstring(Path::new(&path)).unwrap();
+        let use_gpu = std::env::var_os("MEMENTO_ASR_TEST_GPU").is_some();
+        let mut controller = AsrController::new();
+        let abort = Arc::new(AtomicBool::new(false));
+        {
+            let mut control = lock(&controller.shared.control);
+            control.active = true;
+            control.current_abort = Some(abort.clone());
+        }
+        let (entered, receiver) = mpsc::channel();
+        let released = Arc::new(AtomicBool::new(false));
+        let worker_released = released.clone();
+        controller.worker = Some(thread::spawn(move || unsafe {
+            let mut params = whisper_sys::whisper_context_default_params();
+            params.use_gpu = use_gpu;
+            let model = WhisperModel(whisper_sys::whisper_init_from_file_with_params(path.as_ptr(), params));
+            assert!(!model.0.is_null(), "test model could not be loaded");
+            let mut context = AbortContext { abort, entered, signaled: false };
+            let mut params = whisper_sys::whisper_full_default_params(
+                whisper_sys::whisper_sampling_strategy_WHISPER_SAMPLING_GREEDY,
+            );
+            params.language = c"ja".as_ptr();
+            params.n_threads = thread::available_parallelism().map_or(1, |count| count.get().min(4)) as i32;
+            params.print_progress = false;
+            params.print_realtime = false;
+            params.print_timestamps = false;
+            params.abort_callback = Some(signal_inference);
+            params.abort_callback_user_data = (&mut context as *mut AbortContext).cast();
+            let samples: Vec<f32> = (0..30 * 16000).map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
+            let result = whisper_sys::whisper_full(model.0, params, samples.as_ptr(), samples.len() as i32);
+            assert!(context.abort.load(Ordering::Acquire), "inference exited before cancellation");
+            assert_ne!(result, 0, "native inference should report cancellation");
+            drop(model);
+            worker_released.store(true, Ordering::Release);
+        }));
+        receiver.recv_timeout(Duration::from_secs(60)).expect("native inference did not begin");
+        controller.begin_shutdown();
+        controller.shutdown();
+        assert!(released.load(Ordering::Acquire), "model must be freed before shutdown returns");
+    }
 
     #[test]
     fn cue_book_replaces_overlapping_cues_and_plans_sliding_windows() {

@@ -5,7 +5,7 @@
 
 use glow::HasContext;
 use memento_app::{DictResult, MementoApp, PopupGlossaryBlock, SubtitleLine, SubtitleWord};
-use memento_player::mpv::{ffi, MpvInstance};
+use memento_player::mpv::MpvInstance;
 use slint::{ComponentHandle, Model};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -363,11 +363,17 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         loop {
             assert!(
                 Instant::now() < ready_deadline,
-                "first video frame did not load"
+                "first video frame did not load (rendered={first_frame}, ready={}, dimensions={:?})",
+                player.poll_playback_state().playback_ready,
+                player.cached_video_dimensions()
             );
             let _ = events.recv_timeout(Duration::from_millis(20));
             while events.try_recv().is_ok() {}
-            if player.take_render_update() {
+            let frame_ready = video_gl::with_saved_state(&gl, || player.take_render_update());
+            // Like the app's initial viewport/size change, render once after
+            // configuration even if the initial paused-frame wakeup preceded
+            // this window's first usable layout.
+            if frame_ready || (!first_frame && player.cached_video_dimensions().0 > 0) {
                 video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
                 first_frame = true;
             }
@@ -411,20 +417,75 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         assert!(gl.is_enabled(glow::BLEND), "UI blend state was not restored");
         assert_eq!(read_patch(), expected, "UI blend state corrupted the video frame");
         gl.disable(glow::BLEND);
-        // Read the paused baseline directly: property notifications can lag
-        // behind the final redraw, especially while the playback clock is off.
-        let mut startup_drops: i64 = -1;
-        assert_eq!(
-            ffi::mpv_get_property(
-                player.raw_handle(),
-                c"frame-drop-count".as_ptr(),
-                ffi::MPV_FORMAT_INT64,
-                (&mut startup_drops as *mut i64).cast()
-            ),
-            0
-        );
+        let startup_drops = player.poll_playback_state().frame_drops;
         eprintln!("Prepared first frame while paused; startup drops={startup_drops}");
+        assert!(player.screenshot_raw_rgba(false).is_err(),
+            "synchronous GPU capture would deadlock the render thread");
+        let capture_paused = |subtitles| {
+            let request = player.request_screenshot(subtitles).unwrap();
+            let capture = std::thread::spawn(move || request.wait());
+            let deadline = Instant::now() + Duration::from_secs(12);
+            while !capture.is_finished() {
+                assert!(Instant::now() < deadline, "paused GPU capture stalled");
+                let _ = events.recv_timeout(Duration::from_millis(10));
+                // Also exercise UI getters and commands while the screenshot
+                // holds mpv's core waiting for this render thread.
+                let _ = player.capture_encode_context();
+                let _ = player.get_position();
+                let _ = player.is_paused();
+                player.command(&["set", "pause", "yes"]).unwrap();
+                // The UI may leave blending enabled; both control-only updates
+                // and video draws must preserve it and the framebuffer binding.
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ZERO, glow::ZERO);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                let frame_ready = video_gl::with_saved_state(&gl, || player.take_render_update());
+                assert!(gl.is_enabled(glow::BLEND));
+                assert_eq!(gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING), fbo.0.get() as i32);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                if frame_ready {
+                    video_gl::with_saved_state(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+                }
+                drop(player.poll_playback_state());
+            }
+            gl.disable(glow::BLEND);
+            let frame = capture.join().unwrap()
+                .unwrap_or_else(|error| panic!("OpenGL screenshot (subtitles={subtitles}): {error}"));
+            assert_eq!((frame.width, frame.height), (1920, 1080));
+            assert_eq!(frame.pixels.len(), 1920 * 1080 * 4);
+            assert!(frame.pixels.chunks_exact(4).any(|p| p[0] > 32 || p[1] > 32 || p[2] > 32),
+                "GPU screenshot was black");
+            frame
+        };
+        let normal = capture_paused(false);
+        capture_paused(true);
+        // Brightness is applied by the GPU renderer, but ignored by mpv's
+        // software screenshot fallback. This proves capture uses the renderer,
+        // without requiring a CUDA device on the test machine.
+        player.command(&["set", "brightness", "50"]).unwrap();
+        let bright = capture_paused(false);
+        assert_ne!(normal.pixels, bright.pixels, "screenshot bypassed GPU color processing");
+        player.command(&["set", "brightness", "0"]).unwrap();
+        // mpv's normal screenshot command (also used by keyboard bindings)
+        // must use the same GPU path instead of sending CUDA to libswscale.
+        let screenshot_file = directory.join("capture.png");
+        player.command(&["screenshot-to-file", screenshot_file.to_str().unwrap(), "video"]).unwrap();
+        let screenshot_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = events.recv_timeout(Duration::from_millis(10));
+            if video_gl::with_saved_state(&gl, || player.take_render_update()) {
+                video_gl::with_saved_state(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+            }
+            drop(player.poll_playback_state());
+            if let Ok(image) = image::open(&screenshot_file) {
+                assert_eq!((image.width(), image.height()), (1920, 1080));
+                break;
+            }
+            assert!(Instant::now() < screenshot_deadline, "mpv screenshot-to-file failed or stalled");
+        }
         player.play().unwrap();
+        let request = player.request_screenshot(false).unwrap();
+        let playing_capture = std::thread::spawn(move || request.wait());
         let started = Instant::now();
         let seconds = std::env::var("MEMENTO_VIDEO_TEST_SECONDS")
             .ok()
@@ -484,7 +545,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 updates.push("popup opened".into());
             }
             let update_time = ui_started.elapsed();
-            let video_ready = player.take_render_update();
+            let video_ready = video_gl::with_saved_state(&gl, || player.take_render_update());
             if video_ready {
                 let start = Instant::now();
                 video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
@@ -534,16 +595,9 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             }
         }
         player.command(&["set", "pause", "yes"]).unwrap();
-        let mut drops: i64 = -1;
-        assert_eq!(
-            ffi::mpv_get_property(
-                player.raw_handle(),
-                c"frame-drop-count".as_ptr(),
-                ffi::MPV_FORMAT_INT64,
-                (&mut drops as *mut i64).cast()
-            ),
-            0
-        );
+        let frame = playing_capture.join().unwrap().expect("capture during playback");
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        let drops = player.poll_playback_state().frame_drops;
         accumulated_drops += (drops - last_drops).max(0);
         eprintln!("{} frames in {:.2}s; drops={}; render mean={:.2}ms max={:.2}ms; state poll max={:.2}ms",
             rendered, started.elapsed().as_secs_f64(), drops,
@@ -610,8 +664,12 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         app.hide().unwrap();
         drop(app);
         drop(window);
+        let closing_capture = player.request_screenshot(false).unwrap();
         player.deactivate_opengl();
         drop(player);
+        // An in-flight capture can either finish or report closure. It must
+        // never keep the player (or its weak capture client) alive on exit.
+        let _ = closing_capture.wait();
         gl.delete_framebuffer(fbo);
         gl.delete_texture(texture);
         make_current(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());

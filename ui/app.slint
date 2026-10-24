@@ -125,6 +125,9 @@ component YomitanPopup inherits Rectangle {
     }
     reset-scroll => { definition-list.viewport-y = 0px; root.audio-menu-open = false; }
 
+    // Keep clicks on the card's padding from reaching the video underneath.
+    TouchArea { }
+
     popup-content := VerticalLayout {
         cache-rendering-hint: true;
         padding: 12px;
@@ -660,6 +663,7 @@ component PlayerOscBar inherits Rectangle {
     callback start-ocr();
     callback toggle-fullscreen();
     callback activity();
+    callback interacted();
 
     height: 50px;
     background: MementoPalette.osc-bg;
@@ -669,7 +673,8 @@ component PlayerOscBar inherits Rectangle {
     drop-shadow-blur: 12px;
     drop-shadow-color: #00000066;
 
-    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } }
+    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } }
 
     HorizontalLayout {
         padding-left: 10px;
@@ -695,7 +700,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
                 }
-                p-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-play(); } }
+                p-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-play(); } }
             }
 
             // Previous playlist item
@@ -711,7 +717,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/skip-previous.svg");
                 }
-                sp-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.playlist-prev(); } }
+                sp-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.playlist-prev(); } }
             }
 
             // Previous subtitle cue
@@ -727,7 +734,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/fast-rewind.svg");
                 }
-                rw-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.subtitle-seek(-1); } }
+                rw-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.subtitle-seek(-1); } }
             }
 
             // Next subtitle cue
@@ -743,7 +751,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/fast-forward.svg");
                 }
-                ff-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.subtitle-seek(1); } }
+                ff-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.subtitle-seek(1); } }
             }
 
             // Next playlist item
@@ -759,7 +768,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 14px;
                     source: @image-url("icons/skip-next.svg");
                 }
-                sn-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.playlist-next(); } }
+                sn-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.playlist-next(); } }
             }
 
             // Current Time label
@@ -814,6 +824,7 @@ component PlayerOscBar inherits Rectangle {
                 mouse-cursor: pointer;
                 pointer-event(event) => {
                     if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
                 }
                 moved => {
                     if (self.pressed) {
@@ -856,7 +867,8 @@ component PlayerOscBar inherits Rectangle {
                     source: root.volume > 0.0 ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
                 }
                 vol-touch := TouchArea {
-                    pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                    pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                     clicked => { root.toggle-mute(); }
                 }
             }
@@ -867,7 +879,7 @@ component PlayerOscBar inherits Rectangle {
                 minimum: 0.0;
                 maximum: 100.0;
                 value: root.volume;
-                changed(val) => { root.activity(); root.volume-changed(val); }
+                changed(val) => { root.interacted(); root.activity(); root.volume-changed(val); }
             }
 
             // Volume % Label
@@ -892,7 +904,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: @image-url("icons/list.svg");
                 }
-                sub-t-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-sub-list(); } }
+                sub-t-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-sub-list(); } }
             }
 
             if root.ocr-enabled : Rectangle {
@@ -907,7 +920,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 16px;
                     source: @image-url("icons/eye.svg");
                 }
-                ocr-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.start-ocr(); } }
+                ocr-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.start-ocr(); } }
             }
 
             // Fullscreen Toggle Button
@@ -923,7 +937,8 @@ component PlayerOscBar inherits Rectangle {
                     height: 15px;
                     source: root.is-fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
                 }
-                fs-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } clicked => { root.toggle-fullscreen(); } }
+                fs-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-fullscreen(); } }
             }
         }
     }
@@ -1101,6 +1116,7 @@ component DictionarySearchPanel inherits Rectangle {
 component TopMenuBar inherits Rectangle {
     in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
     callback activity();
+    callback interacted();
 
     height: 30px;
     background: MementoPalette.surface-bg;
@@ -1108,7 +1124,8 @@ component TopMenuBar inherits Rectangle {
 
     border-color: MementoPalette.border;
 
-    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } } }
+    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } } }
 
     HorizontalLayout {
         padding-left: 8px;
@@ -1128,7 +1145,8 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m0-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                 clicked => { root.open-menu = root.open-menu == 0 ? -1 : 0; }
             }
         }
@@ -1146,7 +1164,8 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m1-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                 clicked => { root.open-menu = root.open-menu == 1 ? -1 : 1; }
             }
         }
@@ -1164,7 +1183,8 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m2-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                 clicked => { root.open-menu = root.open-menu == 2 ? -1 : 2; }
             }
         }
@@ -1182,7 +1202,8 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m3-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                 clicked => { root.open-menu = root.open-menu == 3 ? -1 : 3; }
             }
         }
@@ -1200,7 +1221,8 @@ component TopMenuBar inherits Rectangle {
                 color: #E2E8F0;
             }
             m4-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); } }
+                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); } }
                 clicked => { root.open-menu = root.open-menu == 4 ? -1 : 4; }
             }
         }
@@ -1786,6 +1808,15 @@ export component MementoApp inherits Window {
     callback play-audio-for-word(string, string);
     callback popup-audio-sources-requested(string, string);
     callback key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback dismiss-definition();
+
+    dismiss-definition => {
+        root.dict-open = false;
+        root.selected-token-index = -1;
+        root.selected-token-count = 1;
+        // Cancel delayed hover searches and invalidate results already in flight.
+        root.hover-word("", -1, false, false, false, false);
+    }
 
     reset-definition-scroll => { yomi-card.reset-scroll(); }
     pure callback format-timestamp(float) -> string;
@@ -1793,7 +1824,7 @@ export component MementoApp inherits Window {
         if root.dict-search-open {
             root.dict-query = "";
             root.dict-results = [];
-            root.dict-open = false;
+            root.dismiss-definition();
         }
     }
 
@@ -1815,6 +1846,7 @@ export component MementoApp inherits Window {
         menu-bar := TopMenuBar {
             visible: root.osc-visible || self.open-menu >= 0;
             activity => { root.osc-activity(); }
+            interacted => { root.dismiss-definition(); }
         }
 
         // Center Area: Video Surface + Optional Subtitle Drawer
@@ -1844,6 +1876,8 @@ export component MementoApp inherits Window {
                     pointer-event(event) => {
                         if event.kind == PointerEventKind.move {
                             root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                        } else if event.kind == PointerEventKind.down {
+                            root.dismiss-definition();
                         }
                     }
                     double-clicked => { root.toggle-fullscreen(); }
@@ -1894,16 +1928,6 @@ export component MementoApp inherits Window {
                                 clicked => { root.open-file(); }
                             }
                         }
-                    }
-                }
-
-                // Dismiss popup when clicking anywhere outside on the video surface
-                if root.dict-open : TouchArea {
-                    width: parent.width;
-                    height: parent.height;
-                    clicked => {
-                        root.dict-open = false;
-                        root.selected-token-index = -1;
                     }
                 }
 
@@ -2001,7 +2025,7 @@ export component MementoApp inherits Window {
                     audio-sources: root.popup-audio-sources;
                     audio-sources-loading: root.popup-audio-sources-loading;
                     selected-audio-source: root.popup-selected-audio-source;
-                    close-requested => { root.dict-open = false; }
+                    close-requested => { root.dismiss-definition(); }
                     add-anki-note(idx) => { root.add-anki-note(idx); }
                     browse-anki-note(id) => { root.browse-anki-note(id); }
                     play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
@@ -2042,6 +2066,7 @@ export component MementoApp inherits Window {
                     }
                     toggle-fullscreen => { root.toggle-fullscreen(); }
                     activity => { root.osc-activity(); }
+                    interacted => { root.dismiss-definition(); }
                 }
 
                 // Drag a rectangle over the current video frame for OCR.
@@ -2100,9 +2125,9 @@ export component MementoApp inherits Window {
                 visible: self.width > 0px;
                 entries: root.subtitle-entries;
                 format-timestamp(sec) => { root.format-timestamp(sec) }
-                row-clicked(idx) => { root.select-row(idx); }
-                row-activated(sec) => { root.seek-to(sec); }
-                search-changed(q) => { root.search-subtitles(q); }
+                row-clicked(idx) => { root.dismiss-definition(); root.select-row(idx); }
+                row-activated(sec) => { root.dismiss-definition(); root.seek-to(sec); }
+                search-changed(q) => { root.dismiss-definition(); root.search-subtitles(q); }
             }
         }
     }

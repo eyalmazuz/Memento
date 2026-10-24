@@ -27,6 +27,25 @@ pub struct NoteMediaInput {
     pub subtitle_id: i64,
     pub audio_sources: Vec<AudioSourceEntry>,
 }
+
+/// Use the same marker grammar for capture and attachment generation, including
+/// whitespace and alternatives such as `{screenshot-video|screenshot}`.
+pub fn requested_screenshots(profile: &AnkiNoteConfig) -> (bool, bool) {
+    let mut pictures = false;
+    let mut video_pictures = false;
+    for template in profile.field_templates.values() {
+        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
+            for marker in token.markers {
+                match String::from_utf16_lossy(&marker.name).as_ref() {
+                    "screenshot" | "image" => pictures = true,
+                    "screenshot-video" => video_pictures = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (pictures, video_pictures)
+}
 fn encode_base64(bytes: &[u8]) -> Result<String, String> {
     let len = memento_util::fileutils::base64_len(bytes.len())
         .ok_or("Anki media is too large to encode")?;
@@ -217,7 +236,7 @@ mod tests {
     #[test]
     fn picture_marker_attaches_capture_to_configured_field() {
         let mut fields = std::collections::HashMap::new();
-        fields.insert("Picture".into(), "{screenshot:max-width=1}".into());
+        fields.insert("Picture".into(), "{ screenshot-video : max-width=1 | image : max-width=1 }".into());
         let profile = AnkiNoteConfig {
             enabled: true,
             endpoint: memento_net::anki::AnkiEndpoint::default(),
@@ -233,6 +252,7 @@ mod tests {
             audio_db: -20.0,
             newline_replacer: "<br>".into(),
         };
+        assert_eq!(requested_screenshots(&profile), (true, true));
         let frame = RawFrame { width: 2, height: 2, pixels: vec![255; 16] };
         let mut ctx = NoteFieldsContext::new("日本語", "にほんご", "日本語を勉強する");
         let input = NoteMediaInput {
@@ -241,13 +261,13 @@ mod tests {
             subtitle_end: 0.0,
             context_start: 0.0,
             context_end: 0.0,
-            screenshot: Some(frame),
-            screenshot_video: None,
+            screenshot: Some(frame.clone()),
+            screenshot_video: Some(frame),
             subtitle_id: 0,
             audio_sources: Vec::new(),
         };
         prepare_note_media(&profile, &mut ctx, input).unwrap();
-        assert_eq!(ctx.picture_attachments.len(), 1);
+        assert_eq!(ctx.picture_attachments.len(), 2);
         assert_eq!(ctx.picture_attachments[0]["fields"][0], "Picture");
         assert!(ctx.picture_attachments[0]["filename"].as_str().unwrap().ends_with(".png"));
     }

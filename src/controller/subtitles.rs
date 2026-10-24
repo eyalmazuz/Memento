@@ -116,6 +116,9 @@ impl SubtitleTrackModel {
     }
 }
 
+/// Local ASR must not share SID 0 with mpv's "no subtitles" selection.
+pub const ASR_TRACK_ID: i64 = -1;
+
 /// Tracks subtitle cue lists per mpv SID, including external-file reloads and
 /// dynamically supplied in-memory cues. The primary and secondary SIDs remain
 /// independent, so their active cues can overlap and be shown simultaneously.
@@ -158,7 +161,7 @@ impl SubtitleController {
             })
             .collect();
         // The local ASR track is not in mpv's track list and must survive its
-        // regular reconciliation while transcription is running.
+        // regular reconciliation, including while another track is selected.
         let model_ids: Vec<i64> = self.tracks.iter().map(|track| track.id).filter(|id| *id > 0).collect();
         let external_path_units: Vec<(i64, Vec<u16>)> = self
             .tracks
@@ -261,18 +264,27 @@ impl SubtitleController {
     /// Begin a local ASR track, independent of mpv's positive subtitle SIDs.
     pub fn start_asr_track(&mut self) {
         self.asr_cues.clear();
-        self.tracks.retain(|track| track.id != 0);
-        self.tracks.push(SubtitleTrackModel::new(0));
-        self.primary_sid = 0;
+        self.tracks.retain(|track| track.id != ASR_TRACK_ID);
+        self.tracks.push(SubtitleTrackModel::new(ASR_TRACK_ID));
+        self.primary_sid = ASR_TRACK_ID;
+    }
+
+    /// Restore cached cues and select the subtitle at the current media time.
+    pub fn resume_asr_track(&mut self, position: f64) -> bool {
+        if self.track(ASR_TRACK_ID).is_none() { return false; }
+        self.primary_sid = ASR_TRACK_ID;
+        self.update_sid_position(ASR_TRACK_ID, position);
+        true
     }
 
     pub fn clear_asr_track(&mut self) {
+        if self.primary_sid == ASR_TRACK_ID { self.primary_sid = 0; }
         self.asr_cues.clear();
-        self.tracks.retain(|track| track.id != 0);
+        self.tracks.retain(|track| track.id != ASR_TRACK_ID);
     }
 
     pub fn add_asr_cue(&mut self, cue: MemorySubtitleCue, position: f64) -> bool {
-        if self.track(0).is_none() {
+        if self.track(ASR_TRACK_ID).is_none() {
             return false;
         }
         let selected_ids = self.selected_asr_ids();
@@ -294,7 +306,7 @@ impl SubtitleController {
     }
 
     fn selected_asr_ids(&self) -> Vec<i64> {
-        self.track(0).map(|track| track.selected_indices.iter()
+        self.track(ASR_TRACK_ID).map(|track| track.selected_indices.iter()
             .filter_map(|index| self.asr_cues.get(*index).map(|cue| cue.id))
             .collect()).unwrap_or_default()
     }
@@ -307,7 +319,7 @@ impl SubtitleController {
         let entries: Vec<_> = self.asr_cues.iter().map(|cue| SubtitleEntry {
             text: cue.text.clone(), start: cue.start, end: cue.end,
         }).collect();
-        if let Some(track) = self.track_mut(0) {
+        if let Some(track) = self.track_mut(ASR_TRACK_ID) {
             track.entries = entries;
             track.is_memory_track = true;
             track.selected_indices = selected_indices;

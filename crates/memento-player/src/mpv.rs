@@ -8,6 +8,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 pub mod ffi {
@@ -538,6 +539,192 @@ fn copy_mpv_string(value: *const c_char) -> String {
     }
 }
 
+/// A queued capture. Wait on a worker, never on the UI/render thread: mpv
+/// needs that thread to service its GPU screenshot request even while paused.
+pub struct ScreenshotRequest {
+    result: Receiver<Result<RawFrame, String>>,
+}
+
+impl ScreenshotRequest {
+    pub fn wait(self) -> Result<RawFrame, String> {
+        self.result.recv().map_err(|_| "Screenshot worker stopped".to_owned())?
+    }
+}
+
+struct CaptureJob {
+    subtitles: bool,
+    result: SyncSender<Result<RawFrame, String>>,
+}
+
+/// Created before rendering starts, then owned exclusively by the capture
+/// worker. Creating/destroying an mpv client can wait on the core too.
+struct ScreenshotClient {
+    handle: *mut ffi::mpv_handle,
+}
+
+unsafe impl Send for ScreenshotClient {}
+
+impl ScreenshotClient {
+    fn capture(&self, subtitles: bool, id: u64) -> Result<RawFrame, String> {
+        let mut args = [
+            c"screenshot-raw".as_ptr(),
+            if subtitles { c"subtitles".as_ptr() } else { c"video".as_ptr() },
+            c"rgba".as_ptr(),
+            ptr::null(),
+        ];
+        let status = unsafe { ffi::mpv_command_async(self.handle, id, args.as_mut_ptr()) };
+        if status < 0 { return Err(screenshot_error(status)); }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("mpv screenshot timed out waiting for a video frame".into());
+            }
+            let event = unsafe { ffi::mpv_wait_event(self.handle, remaining.as_secs_f64()) };
+            let Some(event) = (unsafe { event.as_ref() }) else {
+                return Err("mpv returned no screenshot event".into());
+            };
+            match event.event_id {
+                ffi::MPV_EVENT_COMMAND_REPLY if event.reply_userdata == id => {
+                    if event.error < 0 { return Err(screenshot_error(event.error)); }
+                    let result = unsafe { event.data.cast::<ffi::mpv_event_command>().as_ref() }
+                        .ok_or("mpv screenshot returned no command result")?;
+                    // The event owns the node. Copy pixels before polling again
+                    // or destroying the client; do not free the node ourselves.
+                    return unsafe { copy_screenshot_node(&result.result) };
+                }
+                ffi::MPV_EVENT_SHUTDOWN => return Err("Player closed during screenshot capture".into()),
+                ffi::MPV_EVENT_QUEUE_OVERFLOW => return Err("mpv screenshot event queue overflowed".into()),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Drop for ScreenshotClient {
+    fn drop(&mut self) {
+        unsafe { ffi::mpv_destroy(self.handle) };
+    }
+}
+
+fn start_screenshot_worker(handle: *mut ffi::mpv_handle) -> Result<SyncSender<CaptureJob>, String> {
+    let handle = unsafe { ffi::mpv_create_weak_client(handle, c"memento-screenshots".as_ptr()) };
+    if handle.is_null() { return Err("Could not create mpv screenshot client".into()); }
+    let client = ScreenshotClient { handle };
+    let (requests, jobs) = mpsc::sync_channel::<CaptureJob>(8);
+    std::thread::Builder::new().name("memento-screenshots".into()).spawn(move || {
+        let mut id = 0u64;
+        while let Ok(job) = jobs.recv() {
+            // Unique IDs prevent a timed-out command's late reply from being
+            // mistaken for the next capture. No render/UI state is borrowed.
+            id = id.wrapping_add(1);
+            let _ = job.result.send(client.capture(job.subtitles, id));
+        }
+    }).map_err(|error| format!("Could not start screenshot worker: {error}"))?;
+    Ok(requests)
+}
+
+fn screenshot_error(status: i32) -> String {
+    let message = copy_mpv_string(unsafe { ffi::mpv_error_string(status) });
+    format!("mpv screenshot-raw failed: {message} ({status})")
+}
+
+/// `result` and its nested pointers must remain valid for the whole copy.
+unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawFrame, String> {
+    let Some(fields) = (unsafe { iter_node_map(result) }) else {
+        return Err("mpv screenshot-raw returned no result map".into());
+    };
+    let mut width = None;
+    let mut height = None;
+    let mut stride = None;
+    let mut is_rgba = false;
+    let mut data = None;
+    for (key, value) in fields {
+        match key {
+            b"w" if value.format == ffi::MPV_FORMAT_INT64 => {
+                width = Some(unsafe { value.u.int64 });
+            }
+            b"h" if value.format == ffi::MPV_FORMAT_INT64 => {
+                height = Some(unsafe { value.u.int64 });
+            }
+            b"stride" if value.format == ffi::MPV_FORMAT_INT64 => {
+                stride = Some(unsafe { value.u.int64 });
+            }
+            b"format" if value.format == ffi::MPV_FORMAT_STRING => {
+                let format = unsafe { value.u.string };
+                is_rgba = !format.is_null()
+                    && unsafe { CStr::from_ptr(format) }.to_bytes() == b"rgba";
+            }
+            b"data" if value.format == ffi::MPV_FORMAT_BYTE_ARRAY => {
+                if let Some(bytes) = unsafe { value.u.ba.as_ref() } {
+                    data = Some((bytes.data.cast::<u8>() as *const u8, bytes.size));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let has_data = data.is_some_and(|(pointer, _)| !pointer.is_null());
+    let min_line_size = crate::controller::ScreenshotSpec::validate(
+        width.is_some(),
+        width.unwrap_or(0),
+        height.is_some(),
+        height.unwrap_or(0),
+        stride.is_some(),
+        stride.unwrap_or(0),
+        is_rgba.then_some("rgba"),
+        has_data,
+    )
+    .map_err(|error| format!("invalid mpv raw screenshot: {error:?}"))?;
+    let width = usize::try_from(width.expect("validated width"))
+        .map_err(|_| "mpv screenshot width exceeds addressable memory")?;
+    let height = usize::try_from(height.expect("validated height"))
+        .map_err(|_| "mpv screenshot height exceeds addressable memory")?;
+    let stride = stride.expect("validated stride");
+    let stride_abs = usize::try_from(stride.unsigned_abs())
+        .map_err(|_| "mpv screenshot stride exceeds addressable memory")?;
+    let line_size = usize::try_from(min_line_size)
+        .map_err(|_| "mpv screenshot row exceeds addressable memory")?;
+    let source_len = stride_abs
+        .checked_mul(height - 1)
+        .and_then(|offset| offset.checked_add(line_size))
+        .ok_or("mpv screenshot source dimensions overflow")?;
+    let output_len = line_size
+        .checked_mul(height)
+        .ok_or("mpv screenshot output dimensions overflow")?;
+    let (source, source_size) = data.expect("validated screenshot data");
+    if source_size < source_len {
+        return Err("mpv screenshot data is shorter than its dimensions and stride".into());
+    }
+
+    let mut pixels: Vec<u8> = Vec::new();
+    pixels
+        .try_reserve_exact(output_len)
+        .map_err(|error| format!("could not allocate raw screenshot: {error}"))?;
+    unsafe { pixels.set_len(output_len) };
+    for output_row in 0..height {
+        let source_row = if stride < 0 {
+            height - 1 - output_row
+        } else {
+            output_row
+        };
+        let source_offset = source_row * stride_abs;
+        let output_offset = output_row * line_size;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                source.add(source_offset),
+                pixels.as_mut_ptr().add(output_offset),
+                line_size,
+            );
+        }
+    }
+    Ok(RawFrame {
+        width: width as u32,
+        height: height as u32,
+        pixels,
+    })
+}
+
 /// C ABI list of f64 values (e.g. chapter timestamps).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -817,6 +1004,8 @@ pub struct MpvInstance {
     render_pending: Box<RenderNotification>,
     playback: RefCell<PlaybackState>,
     configured_hwdec: String,
+    memory_subtitles_supported: bool,
+    screenshot_jobs: Option<SyncSender<CaptureJob>>,
     render_update_delay: Cell<std::time::Duration>,
 }
 unsafe impl Send for MpvInstance {}
@@ -825,6 +1014,8 @@ unsafe impl Send for MpvInstance {}
 /// not wait on mpv's core, which must never block the UI's render thread.
 #[derive(Default)]
 pub struct PlaybackState {
+    pub path: String,
+    pub media_title: String,
     pub file_loaded: bool,
     pub playback_ready: bool,
     pub position: f64,
@@ -853,6 +1044,8 @@ pub struct PlaybackState {
 }
 
 const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
+    (c"path", ffi::MPV_FORMAT_STRING),
+    (c"media-title", ffi::MPV_FORMAT_STRING),
     (c"time-pos", ffi::MPV_FORMAT_DOUBLE),
     (c"duration", ffi::MPV_FORMAT_DOUBLE),
     (c"pause", ffi::MPV_FORMAT_FLAG),
@@ -901,6 +1094,8 @@ impl PlaybackState {
             } else { String::new() }
         };
         match name {
+            b"path" => self.path = string(),
+            b"media-title" => self.media_title = string(),
             b"time-pos" => self.position = number(0.0).max(0.0),
             b"duration" => self.duration = number(0.0).max(0.0),
             b"pause" => self.paused = property.format != ffi::MPV_FORMAT_FLAG
@@ -1108,6 +1303,8 @@ impl MpvInstance {
                 if !value.is_null() { ffi::mpv_free(value.cast()); }
                 text
             };
+            let memory_subtitles_supported = unsafe { memento_player_supports_memory_subtitles(handle) };
+            let screenshot_jobs = start_screenshot_worker(handle)?;
             let context = create_software_context(handle)?;
             let mut pending = Box::new(RenderNotification::default());
             unsafe {
@@ -1125,11 +1322,11 @@ impl MpvInstance {
                     eprintln!("Could not observe mpv property {}: {status}", name.to_string_lossy());
                 }
             }
-            Ok((context, pending, configured_hwdec))
+            Ok((context, pending, configured_hwdec, memory_subtitles_supported, screenshot_jobs))
         };
 
         match initialize() {
-            Ok((render, render_pending, configured_hwdec)) => Ok(Self {
+            Ok((render, render_pending, configured_hwdec, memory_subtitles_supported, screenshot_jobs)) => Ok(Self {
                 handle,
                 render_lock: Arc::new(Mutex::new(RenderContext {
                     pointer: Some(render), api: RenderApi::Software,
@@ -1139,6 +1336,8 @@ impl MpvInstance {
                     paused: true, volume: 100.0, sub_speed: 1.0, ..Default::default()
                 }),
                 configured_hwdec,
+                memory_subtitles_supported,
+                screenshot_jobs: Some(screenshot_jobs),
                 render_update_delay: Cell::new(std::time::Duration::ZERO),
             }),
             Err(error) => {
@@ -1186,6 +1385,11 @@ impl MpvInstance {
                     }
                     ffi::MPV_EVENT_FILE_LOADED => state.file_loaded = true,
                     ffi::MPV_EVENT_PLAYBACK_RESTART => state.playback_ready = true,
+                    ffi::MPV_EVENT_COMMAND_REPLY if unsafe { (*event).error } < 0 => {
+                        let status = unsafe { (*event).error };
+                        eprintln!("mpv command failed: {} ({status})",
+                            copy_mpv_string(unsafe { ffi::mpv_error_string(status) }));
+                    }
                     _ => {}
                 }
                 if unsafe { (*event).event_id } == ffi::MPV_EVENT_PROPERTY_CHANGE {
@@ -1383,9 +1587,14 @@ fn create_opengl_context(
         get_proc_address: Some(resolve_gl_proc), get_proc_address_ctx: ptr::null_mut(),
     };
     let mut context = ptr::null_mut();
+    // Enables GPU screenshots (including direct NVDEC frames). All player
+    // operations on the UI/render thread are asynchronous or cached; every
+    // update callback must be serviced even if no video frame is due.
+    let mut advanced_control: c_int = 1;
     let mut params = [
         ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_API_TYPE, data: c"opengl".as_ptr().cast_mut().cast() },
         ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: (&mut init as *mut ffi::mpv_opengl_init_params).cast() },
+        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_ADVANCED_CONTROL, data: (&mut advanced_control as *mut c_int).cast() },
         ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
     ];
     let resolver_ref = resolver;
@@ -1448,161 +1657,53 @@ fn render_rgba_context(render: *mut ffi::mpv_render_context, width: u32, height:
     }
 
 impl MpvInstance {
-    fn with_tracks<R>(&self, read: impl FnOnce(&[MementoTrackC]) -> R) -> R {
-        let mut node = OwnedNode::new();
-        let status = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                c"track-list".as_ptr(),
-                ffi::MPV_FORMAT_NODE,
-                (&mut node.0 as *mut ffi::mpv_node).cast(),
-            )
-        };
-        if status < 0 {
-            return read(&[]);
-        }
-        let tracks = OwnedTrackList(unsafe { memento_player_extract_tracks(&node.0) });
-        read(tracks.as_slice())
-    }
-
-    /// Read the live primary `sub-lines` property into owned subtitle cues.
-    ///
-    /// mpv node strings are copied before the node is freed, so returned text
-    /// remains valid independently of libmpv's property storage.
+    /// Snapshots copied from mpv's property notifications; these never wait
+    /// for the core while the same thread is responsible for rendering.
     pub fn primary_sub_lines(&self) -> Vec<SubLine> {
-        let mut node = OwnedNode::new();
-        let status = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                c"sub-lines".as_ptr(),
-                ffi::MPV_FORMAT_NODE,
-                (&mut node.0 as *mut ffi::mpv_node).cast(),
-            )
-        };
-        if status < 0 {
-            return Vec::new();
-        }
-
-        let lines = OwnedSubLineList(unsafe { memento_player_extract_sub_lines(&node.0) });
-        lines
-            .as_slice()
-            .iter()
-            .map(|line| SubLine {
-                id: line.id,
-                text: unsafe { CStr::from_ptr(line.text) }
-                    .to_string_lossy()
-                    .into_owned(),
-                start: line.start,
-                end: line.end,
-            })
-            .collect()
+        self.playback.borrow().sub_lines.clone()
     }
 
     pub fn audio_tracks(&self) -> Vec<AudioTrack> {
-        self.with_tracks(|tracks| {
-            tracks
-                .iter()
-                .filter(|track| track.track_type == TrackType::Audio as i32)
-                .map(|track| AudioTrack {
-                    id: track.id,
-                    language: copy_mpv_string(track.lang),
-                    title: copy_mpv_string(track.title),
-                    external_filename: copy_mpv_string(track.external_filename),
-                    external: track.external,
-                    default_track: track.default_track,
-                    selected: track.selected,
-                })
-                .collect()
-        })
+        self.playback.borrow().audio_tracks.clone()
     }
 
     pub fn subtitle_tracks(&self) -> Vec<SubtitleTrack> {
-        self.with_tracks(|tracks| {
-            tracks
-                .iter()
-                .filter(|track| track.track_type == TrackType::Subtitle as i32)
-                .map(|track| SubtitleTrack {
-                    id: track.id,
-                    external_path: copy_mpv_string(track.external_filename),
-                    language: copy_mpv_string(track.lang),
-                    title: copy_mpv_string(track.title),
-                    external: track.external,
-                    default_track: track.default_track,
-                    selected: track.selected,
-                })
-                .collect()
-        })
+        self.playback.borrow().subtitle_tracks.clone()
     }
 
     pub fn supports_memory_subtitles(&self) -> bool {
-        unsafe { memento_player_supports_memory_subtitles(self.handle) }
+        self.memory_subtitles_supported
     }
 
     /// Returns the native decoded dimensions of the current video stream, or
     /// (0, 0) if no video is playing.
     pub fn video_dimensions(&self) -> (u32, u32) {
-        let w = self.get_i64(c"dwidth", 0);
-        let h = self.get_i64(c"dheight", 0);
-        if w > 0 && h > 0 {
-            (w as u32, h as u32)
-        } else {
-            (0, 0)
-        }
-    }
-
-    fn get_i64(&self, property: &CStr, default: i64) -> i64 {
-        let mut value = default;
-        let status = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                property.as_ptr(),
-                ffi::MPV_FORMAT_INT64,
-                (&mut value as *mut i64).cast(),
-            )
-        };
-        if status < 0 { default } else { value }
-    }
-
-    fn get_f64(&self, property: &CStr, default: f64) -> f64 {
-        let mut value = default;
-        let status = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                property.as_ptr(),
-                ffi::MPV_FORMAT_DOUBLE,
-                (&mut value as *mut f64).cast(),
-            )
-        };
-        if status < 0 { default } else { value }
-    }
-
-    fn get_string(&self, property: &CStr) -> Option<String> {
-        unsafe {
-            let value = ffi::mpv_get_property_string(self.handle, property.as_ptr());
-            if value.is_null() {
-                None
-            } else {
-                let text = CStr::from_ptr(value).to_string_lossy().into_owned();
-                ffi::mpv_free(value.cast());
-                Some(text)
-            }
-        }
+        self.cached_video_dimensions()
     }
 
     pub fn capture_encode_context(&self) -> Option<EncodeContext> {
-        let path = self.get_string(c"path")?;
-        if path.is_empty() {
-            return None;
-        }
-        Some(EncodeContext {
-            path,
-            audio_id: self.selected_aid(),
+        let state = self.playback.borrow();
+        (state.file_loaded && !state.path.is_empty()).then(|| EncodeContext {
+            path: state.path.clone(), audio_id: state.audio_id,
         })
+    }
+
+    /// Queue the capture now, then consume it on a worker so mpv can continue
+    /// receiving render updates while it waits for the current video frame.
+    pub fn request_screenshot(&self, subtitles: bool) -> Result<ScreenshotRequest, String> {
+        let (result, receiver) = mpsc::sync_channel(1);
+        self.screenshot_jobs.as_ref().ok_or("Player is closing")?
+            .try_send(CaptureJob { subtitles, result })
+            .map_err(|error| format!("Cannot queue screenshot: {error}"))?;
+        Ok(ScreenshotRequest { result: receiver })
     }
 
     /// Capture the active video at source resolution without the software
     /// renderer's viewport scaling or any letterbox bars.
     pub fn screenshot_raw_rgba(&self, subtitles: bool) -> Result<RawFrame, String> {
+        if self.is_opengl_active() {
+            return Err("OpenGL screenshots must use request_screenshot on a worker".into());
+        }
         let pointers = [
             c"screenshot-raw".as_ptr(),
             if subtitles {
@@ -1618,129 +1719,38 @@ impl MpvInstance {
             memento_player_command_ret_raw(self.handle, pointers.as_ptr(), &mut result.0)
         };
         if status < 0 {
-            return Err(format!("mpv screenshot-raw failed with code {status}"));
+            return Err(screenshot_error(status));
         }
 
-        let Some(fields) = (unsafe { iter_node_map(&result.0) }) else {
-            return Err("mpv screenshot-raw returned no result map".into());
-        };
-        let mut width = None;
-        let mut height = None;
-        let mut stride = None;
-        let mut is_rgba = false;
-        let mut data = None;
-        for (key, value) in fields {
-            match key {
-                b"w" if value.format == ffi::MPV_FORMAT_INT64 => {
-                    width = Some(unsafe { value.u.int64 });
-                }
-                b"h" if value.format == ffi::MPV_FORMAT_INT64 => {
-                    height = Some(unsafe { value.u.int64 });
-                }
-                b"stride" if value.format == ffi::MPV_FORMAT_INT64 => {
-                    stride = Some(unsafe { value.u.int64 });
-                }
-                b"format" if value.format == ffi::MPV_FORMAT_STRING => {
-                    let format = unsafe { value.u.string };
-                    is_rgba = !format.is_null()
-                        && unsafe { CStr::from_ptr(format) }.to_bytes() == b"rgba";
-                }
-                b"data" if value.format == ffi::MPV_FORMAT_BYTE_ARRAY => {
-                    if let Some(bytes) = unsafe { value.u.ba.as_ref() } {
-                        data = Some((bytes.data.cast::<u8>() as *const u8, bytes.size));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let has_data = data.is_some_and(|(pointer, _)| !pointer.is_null());
-        let min_line_size = crate::controller::ScreenshotSpec::validate(
-            width.is_some(),
-            width.unwrap_or(0),
-            height.is_some(),
-            height.unwrap_or(0),
-            stride.is_some(),
-            stride.unwrap_or(0),
-            is_rgba.then_some("rgba"),
-            has_data,
-        )
-        .map_err(|error| format!("invalid mpv raw screenshot: {error:?}"))?;
-        let width = usize::try_from(width.expect("validated width"))
-            .map_err(|_| "mpv screenshot width exceeds addressable memory")?;
-        let height = usize::try_from(height.expect("validated height"))
-            .map_err(|_| "mpv screenshot height exceeds addressable memory")?;
-        let stride = stride.expect("validated stride");
-        let stride_abs = usize::try_from(stride.unsigned_abs())
-            .map_err(|_| "mpv screenshot stride exceeds addressable memory")?;
-        let line_size = usize::try_from(min_line_size)
-            .map_err(|_| "mpv screenshot row exceeds addressable memory")?;
-        let source_len = stride_abs
-            .checked_mul(height - 1)
-            .and_then(|offset| offset.checked_add(line_size))
-            .ok_or("mpv screenshot source dimensions overflow")?;
-        let output_len = line_size
-            .checked_mul(height)
-            .ok_or("mpv screenshot output dimensions overflow")?;
-        let (source, source_size) = data.expect("validated screenshot data");
-        if source_size < source_len {
-            return Err("mpv screenshot data is shorter than its dimensions and stride".into());
-        }
-
-        let mut pixels: Vec<u8> = Vec::new();
-        pixels
-            .try_reserve_exact(output_len)
-            .map_err(|error| format!("could not allocate raw screenshot: {error}"))?;
-        unsafe { pixels.set_len(output_len) };
-        for output_row in 0..height {
-            let source_row = if stride < 0 {
-                height - 1 - output_row
-            } else {
-                output_row
-            };
-            let source_offset = source_row * stride_abs;
-            let output_offset = output_row * line_size;
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    source.add(source_offset),
-                    pixels.as_mut_ptr().add(output_offset),
-                    line_size,
-                );
-            }
-        }
-        Ok(RawFrame {
-            width: width as u32,
-            height: height as u32,
-            pixels,
-        })
+        unsafe { copy_screenshot_node(&result.0) }
     }
 
     pub fn selected_aid(&self) -> i64 {
-        self.get_i64(c"aid", 0)
+        self.playback.borrow().audio_id
     }
 
     pub fn primary_sid(&self) -> i64 {
-        self.get_i64(c"sid", 0)
+        self.playback.borrow().primary_sid
     }
 
     pub fn secondary_sid(&self) -> i64 {
-        self.get_i64(c"secondary-sid", 0)
+        self.playback.borrow().secondary_sid
     }
 
     pub fn get_sub_start(&self) -> f64 {
-        self.get_f64(c"sub-start", 0.0)
+        self.playback.borrow().sub_start
     }
 
     pub fn get_sub_end(&self) -> f64 {
-        self.get_f64(c"sub-end", 0.0)
+        self.playback.borrow().sub_end
     }
 
     pub fn get_sub_delay(&self) -> f64 {
-        self.get_f64(c"sub-delay", 0.0)
+        self.playback.borrow().sub_delay
     }
 
     pub fn get_sub_speed(&self) -> f64 {
-        self.get_f64(c"sub-speed", 1.0)
+        self.playback.borrow().sub_speed
     }
 
     pub fn get_sub_raw_time(&self, playback_time: f64) -> f64 {
@@ -1748,15 +1758,15 @@ impl MpvInstance {
     }
 
     pub fn get_secondary_sub_start(&self) -> f64 {
-        self.get_f64(c"secondary-sub-start", 0.0)
+        self.playback.borrow().secondary_sub_start
     }
 
     pub fn get_secondary_sub_end(&self) -> f64 {
-        self.get_f64(c"secondary-sub-end", 0.0)
+        self.playback.borrow().secondary_sub_end
     }
 
     pub fn get_secondary_sub_delay(&self) -> f64 {
-        self.get_f64(c"secondary-sub-delay", 0.0)
+        self.playback.borrow().secondary_sub_delay
     }
 
     pub fn get_secondary_sub_speed(&self) -> f64 {
@@ -1833,6 +1843,9 @@ impl MpvInstance {
     }
 
     fn command_ret_id(&self, args: &[&str]) -> Result<i64, String> {
+        if self.is_opengl_active() {
+            return Err("Synchronous subtitle commands are unavailable on the OpenGL render thread".into());
+        }
         let c_args: Result<Vec<std::ffi::CString>, _> =
             args.iter().map(|arg| std::ffi::CString::new(*arg)).collect();
         let c_args = c_args.map_err(|error| error.to_string())?;
@@ -1979,24 +1992,19 @@ impl MpvInstance {
         self.handle
     }
 
+    /// Queues a command. Success means it was accepted; execution errors are
+    /// reported through the player event queue, without blocking rendering.
     pub fn command(&self, args: &[&str]) -> Result<(), String> {
-        let c_args: Result<Vec<std::ffi::CString>, _> = args.iter().map(|s| std::ffi::CString::new(*s)).collect();
-        let c_args = c_args.map_err(|e| e.to_string())?;
-        let mut pt_args: Vec<*const std::ffi::c_char> = c_args.iter().map(|s| s.as_ptr()).collect();
-        pt_args.push(std::ptr::null());
-
-        let err = unsafe { ffi::mpv_command(self.handle, pt_args.as_mut_ptr()) };
-        if err < 0 {
-            Err(format!("mpv_command failed with code {err}"))
-        } else {
-            Ok(())
-        }
+        self.command_async(args)
     }
 
     pub fn load_file(&self, path: &str) -> Result<(), String> {
         drop(self.poll_playback_state());
-        self.playback.borrow_mut().file_loaded = false;
-        self.playback.borrow_mut().playback_ready = false;
+        {
+            let mut state = self.playback.borrow_mut();
+            state.file_loaded = false;
+            state.playback_ready = false;
+        }
         self.command(&["loadfile", path, "replace"])
     }
 
@@ -2013,21 +2021,7 @@ impl MpvInstance {
     }
 
     pub fn is_paused(&self) -> bool {
-        let prop = std::ffi::CString::new("pause").unwrap();
-        let mut val: std::ffi::c_int = 0;
-        let err = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                prop.as_ptr(),
-                ffi::MPV_FORMAT_FLAG,
-                (&mut val as *mut std::ffi::c_int).cast(),
-            )
-        };
-        if err >= 0 {
-            val != 0
-        } else {
-            true
-        }
+        self.playback.borrow().paused
     }
 
     pub fn seek(&self, sec: f64) -> Result<(), String> {
@@ -2047,89 +2041,40 @@ impl MpvInstance {
     }
 
     pub fn get_volume(&self) -> f64 {
-        let prop = std::ffi::CString::new("volume").unwrap();
-        let mut val: f64 = 100.0;
-        let err = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                prop.as_ptr(),
-                ffi::MPV_FORMAT_DOUBLE,
-                (&mut val as *mut f64).cast(),
-            )
-        };
-        if err >= 0 { val } else { 100.0 }
+        self.playback.borrow().volume
     }
 
     pub fn get_position(&self) -> f64 {
-        let prop = std::ffi::CString::new("time-pos").unwrap();
-        let mut val: f64 = 0.0;
-        let err = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                prop.as_ptr(),
-                ffi::MPV_FORMAT_DOUBLE,
-                (&mut val as *mut f64).cast(),
-            )
-        };
-        if err >= 0 { val.max(0.0) } else { 0.0 }
+        self.playback.borrow().position
     }
 
     pub fn get_duration(&self) -> f64 {
-        let prop = std::ffi::CString::new("duration").unwrap();
-        let mut val: f64 = 0.0;
-        let err = unsafe {
-            ffi::mpv_get_property(
-                self.handle,
-                prop.as_ptr(),
-                ffi::MPV_FORMAT_DOUBLE,
-                (&mut val as *mut f64).cast(),
-            )
-        };
-        if err >= 0 { val.max(0.0) } else { 0.0 }
+        self.playback.borrow().duration
     }
 
     pub fn get_sub_text(&self) -> Option<String> {
-        let prop = std::ffi::CString::new("sub-text").unwrap();
-        unsafe {
-            let ptr = ffi::mpv_get_property_string(self.handle, prop.as_ptr());
-            if ptr.is_null() {
-                None
-            } else {
-                let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                ffi::mpv_free(ptr.cast());
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            }
-        }
+        let state = self.playback.borrow();
+        (!state.sub_text.is_empty()).then(|| state.sub_text.clone())
     }
 
     /// Text decoded by the independently selected secondary subtitle track.
     pub fn get_secondary_sub_text(&self) -> Option<String> {
-        self.get_string(c"secondary-sub-text")
-            .filter(|text| !text.trim().is_empty())
+        let state = self.playback.borrow();
+        (!state.secondary_sub_text.is_empty()).then(|| state.secondary_sub_text.clone())
     }
 
     pub fn get_media_title(&self) -> Option<String> {
-        let prop = std::ffi::CString::new("media-title").unwrap();
-        unsafe {
-            let ptr = ffi::mpv_get_property_string(self.handle, prop.as_ptr());
-            if ptr.is_null() {
-                None
-            } else {
-                let s = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                ffi::mpv_free(ptr.cast());
-                Some(s)
-            }
-        }
+        let state = self.playback.borrow();
+        (!state.media_title.is_empty()).then(|| state.media_title.clone())
     }
 }
 
 impl Drop for MpvInstance {
     fn drop(&mut self) {
+        // Even weak mpv clients must close before terminate_destroy returns.
+        // Disconnect the worker before waiting for core shutdown. Freeing the
+        // renderer below services any GPU capture that is already in flight.
+        self.screenshot_jobs.take();
         if let Ok(mut guard) = self.render_lock.lock() {
             if let Some(context) = guard.pointer.take() {
                 unsafe {
@@ -2360,13 +2305,32 @@ mod tests {
         }
         // Stop the render clock before using synchronous diagnostic queries.
         player.command(&["set", "pause", "yes"]).unwrap();
-        assert_eq!(player.get_i64(c"frame-drop-count", -1), 0);
+        assert_eq!(player.poll_playback_state().frame_drops, 0);
+        for subtitles in [false, true] {
+            let frame = player.screenshot_raw_rgba(subtitles)
+                .unwrap_or_else(|error| panic!("screenshot (subtitles={subtitles}): {error}"));
+            assert_eq!((frame.width, frame.height), (64, 64));
+            assert_eq!(frame.pixels.len(), 64 * 64 * 4);
+            let request = player.request_screenshot(subtitles).unwrap();
+            let capture = std::thread::spawn(move || request.wait());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !capture.is_finished() && std::time::Instant::now() < deadline {
+                let _ = frames.recv_timeout(std::time::Duration::from_millis(10));
+                if player.take_render_update() {
+                    player.render_rgba(64, 64, pixels).unwrap();
+                }
+            }
+            assert!(capture.is_finished(), "background screenshot stalled");
+            assert_eq!(capture.join().unwrap().unwrap(), frame);
+        }
         player.command(&["stop"]).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         while player.poll_playback_state().dimensions != (0, 0) {
             assert!(std::time::Instant::now() < deadline, "stopped video state must clear");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let error = player.request_screenshot(false).unwrap().wait().unwrap_err();
+        assert!(error.contains("mpv screenshot-raw failed:"), "{error}");
         drop(player);
         std::fs::remove_dir_all(&dir).unwrap();
     }

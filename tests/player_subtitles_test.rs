@@ -33,6 +33,43 @@ fn asr_cues_accumulate_survive_mpv_sync_and_follow_playback() {
 }
 
 #[test]
+fn switching_subtitle_tracks_retains_asr_cues_and_restores_current_position() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.ensure_track(2);
+    ctrl.set_track_cues(2, vec![create_cue("File subtitle", 10.0, 12.0)]);
+    ctrl.start_asr_track();
+    let cue = |id, text: &str, start, end| MemorySubtitleCue {
+        id, text: text.encode_utf16().collect(), start, end,
+    };
+    ctrl.add_asr_cue(cue(1, "Earlier ASR", 1.0, 3.0), 2.0);
+    ctrl.add_asr_cue(cue(2, "Current ASR", 10.0, 12.0), 2.0);
+    ctrl.toggle_select(1);
+    ctrl.set_primary_sid(2);
+    ctrl.update_positions(11.0, 11.0);
+    assert_eq!(ctrl.active_cue_text().as_deref(), Some("File subtitle"));
+    // An already-running window may finish while the other track is visible.
+    ctrl.add_asr_cue(cue(3, "Later ASR", 13.0, 15.0), 11.0);
+    ctrl.sync_tracks(&[SubtitleTrackInfo { id: 2, external: false, external_path: String::new() }]);
+    assert_eq!(ctrl.primary_entries().len(), 1);
+    assert!(ctrl.secondary_entries().is_empty(), "disabled secondary subtitles must not show ASR");
+    ctrl.set_primary_sid(0);
+    assert!(ctrl.primary_entries().is_empty(), "None must not show the cached ASR track");
+    assert!(ctrl.resume_asr_track(11.0));
+    assert_eq!(ctrl.primary_entries().len(), 3);
+    assert_eq!(ctrl.selected_indices(), &[1]);
+    assert_eq!(ctrl.active_cue_text().as_deref(), Some("Current ASR"));
+    ctrl.set_primary_sid(2);
+    assert!(ctrl.resume_asr_track(14.0));
+    assert_eq!(ctrl.active_cue_text().as_deref(), Some("Later ASR"));
+    ctrl.set_primary_sid(2);
+    ctrl.clear_asr_track();
+    assert_eq!(ctrl.primary_entries().len(), 1, "reset must preserve the file track");
+    assert!(!ctrl.resume_asr_track(14.0), "reset must invalidate cached ASR cues");
+    ctrl.start_asr_track();
+    assert!(ctrl.primary_entries().is_empty());
+}
+
+#[test]
 fn test_subtitle_cue_filtering_and_sorting() {
     let cues = vec![
         // Valid cue at 10.0
