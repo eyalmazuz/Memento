@@ -31,7 +31,6 @@
 //! QStandardPaths derived paths, conditionals on CMake feature defines)
 //! stays in C++ and is documented where the corresponding Rust key lives.
 
-pub mod capi;
 pub mod enums;
 pub mod keys;
 pub mod migration;

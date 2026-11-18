@@ -12,4 +12,4 @@ unicode-general-category = "1.1"
 [lib]
 name = "memento_definition"
 path = "src/lib.rs"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]

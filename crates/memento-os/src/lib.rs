@@ -19,7 +19,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 //! Linux session-bus screensaver inhibition. The handle owns both the
-//! idempotence state and the D-Bus cookie; the Qt object only forwards UTF-8.
+//! idempotence state and the D-Bus cookie.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -87,20 +87,27 @@ fn screen_saver_proxy(connection: &Connection) -> Option<Proxy<'_>> {
 }
 
 impl Screensaver {
+    fn apply_inhibit_reply(&mut self, reply: Option<u32>) {
+        if let Some(cookie) = reply {
+            if cookie != 0 {
+                self.cookie = cookie;
+                self.inhibited = true;
+            }
+        }
+    }
+
     pub fn inhibit(&mut self, reason: &str) {
         if self.inhibited {
             return;
         }
-        if let Some(connection) = session_connection() {
-            if let Some(proxy) = screen_saver_proxy(connection) {
-                if let Ok(cookie) = proxy.call("Inhibit", &(APPLICATION_ID, reason)) {
-                    self.cookie = cookie;
-                }
-            }
-        }
-        // The flag is set even if opening the bus, finding the interface, or
-        // calling Inhibit failed. The cookie is unchanged on failed calls.
-        self.inhibited = true;
+        let reply = session_connection()
+            .and_then(screen_saver_proxy)
+            .and_then(|proxy| {
+                proxy
+                    .call::<_, _, u32>("Inhibit", &(APPLICATION_ID, reason))
+                    .ok()
+            });
+        self.apply_inhibit_reply(reply);
     }
 
     pub fn uninhibit(&mut self) {
@@ -111,11 +118,9 @@ impl Screensaver {
             if let Some(connection) = session_connection() {
                 if let Some(proxy) = screen_saver_proxy(connection) {
                     let _: zbus::Result<()> = proxy.call("UnInhibit", &(self.cookie,));
-                    // Qt clears the cookie when the interface is valid,
-                    // regardless of the method reply (but not when absent).
-                    self.cookie = 0;
                 }
             }
+            self.cookie = 0;
         }
         self.inhibited = false;
     }
@@ -127,65 +132,27 @@ impl Drop for Screensaver {
     }
 }
 
-/// The C++ shells call these through `src/os/rust/screensaver_capi.h`.
-///
-/// Mirrors the QDBus C-string marshaling semantics: `reason` bytes are read
-/// up to the first NUL, exactly like `QByteArray::constData()` fed to a
-/// D-Bus `"s"` argument.
-#[no_mangle]
-pub extern "C" fn memento_os_screensaver_new() -> *mut Screensaver {
-    Box::into_raw(Box::new(Screensaver::default()))
-}
+#[cfg(test)]
+mod tests {
+    use super::Screensaver;
 
-/// # Safety
-/// `handle` must be null or a live handle returned by `memento_os_screensaver_new`,
-/// passed exactly once. No concurrent calls on the same handle are permitted.
-#[no_mangle]
-pub unsafe extern "C" fn memento_os_screensaver_free(handle: *mut Screensaver) {
-    if !handle.is_null() {
-        drop(Box::from_raw(handle));
-    }
-}
+    #[test]
+    fn inhibit_stays_false_on_failed_or_zero_cookie() {
+        let mut s = Screensaver::default();
+        s.apply_inhibit_reply(None);
+        assert!(!s.inhibited);
+        assert_eq!(s.cookie, 0);
 
-/// # Safety
-/// `handle` must be a live exclusive handle (or null); `reason` must point to
-/// `reason_len` readable bytes while this function runs, or be null if empty.
-/// The bytes are borrowed, never retained. `QString::toUtf8()` supplies valid UTF-8.
-#[no_mangle]
-pub unsafe extern "C" fn memento_os_screensaver_inhibit(
-    handle: *mut Screensaver,
-    reason: *const u8,
-    reason_len: usize,
-) {
-    let Some(handle) = handle.as_mut() else {
-        return;
-    };
-    if reason_len != 0 && reason.is_null() {
-        return;
-    }
-    let bytes = if reason_len == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(reason, reason_len)
-    };
-    // QDBus marshals `const char *` arguments as C strings: truncate at the
-    // first NUL byte. Rejects ill-formed UTF-8 defensively; QString::toUtf8
-    // replaces unpaired surrogates, so production inputs are always valid.
-    if let Some(reason_str) = core::str::from_utf8(
-        bytes.split(|&byte| byte == 0).next().unwrap_or_default(),
-    )
-    .ok()
-    {
-        handle.inhibit(reason_str);
-    }
-}
+        s.apply_inhibit_reply(Some(0));
+        assert!(!s.inhibited);
+        assert_eq!(s.cookie, 0);
 
-/// # Safety
-/// `handle` must be a live exclusive handle (or null).
-#[no_mangle]
-pub unsafe extern "C" fn memento_os_screensaver_uninhibit(handle: *mut Screensaver) {
-    if let Some(handle) = handle.as_mut() {
-        handle.uninhibit();
+        s.apply_inhibit_reply(Some(17));
+        assert!(s.inhibited);
+        assert_eq!(s.cookie, 17);
+
+        s.inhibited = false;
+        s.cookie = 0;
     }
 }
 

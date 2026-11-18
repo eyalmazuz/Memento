@@ -45,7 +45,6 @@
 //! dependence on any external host.
 
 pub mod anki;
-pub mod capi;
 pub mod download;
 pub mod error;
 pub mod http;

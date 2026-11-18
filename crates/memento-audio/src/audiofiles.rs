@@ -1,6 +1,4 @@
 //! Audio source URL templates and JSON audioSourceList extraction.
-//! The C ABI transports UTF-16 code units rather than decoded strings, so
-//! QString null/empty and even unpaired surrogate values survive expansion.
 
 use std::borrow::Cow;
 use std::panic::catch_unwind;
@@ -13,10 +11,6 @@ pub struct AudioText {
 }
 
 impl AudioText {
-    fn null() -> Self {
-        Self { data: ptr::null_mut(), len: 0 }
-    }
-
     fn from_units(units: Vec<u16>) -> Self {
         let owned = units.into_boxed_slice();
         let len = owned.len();
@@ -262,11 +256,12 @@ impl JsonReader<'_> {
     }
 }
 
-fn parse_json(data: &[u8]) -> Option<Vec<(Vec<u16>, Vec<u16>)>> {
-    let mut reader = JsonReader { bytes: data, pos: 0 };
+/// Parses an `audioSourceList` JSON payload into `(name, url)` UTF-16 pairs.
+pub fn parse_json(bytes: &[u8]) -> Option<Vec<(Vec<u16>, Vec<u16>)>> {
+    let mut reader = JsonReader { bytes, pos: 0 };
     let root = reader.value(0)?;
     reader.whitespace();
-    if reader.pos != data.len() { return None }
+    if reader.pos != bytes.len() { return None }
     let ty = root.field("type")?.text()?;
     if ty.len() != b"audioSourceList".len()
         || !ty.iter().zip(b"audioSourceList").all(|(&unit, &ascii)| unit == u16::from(ascii))
@@ -284,34 +279,10 @@ fn parse_json(data: &[u8]) -> Option<Vec<(Vec<u16>, Vec<u16>)>> {
 }
 
 /// # Safety
-/// Each non-null argument must point to its specified number of readable
-/// UTF-16 units. A null pointer is only permitted with zero length. The
-/// returned text must be passed to `memento_audio_free_text` exactly once.
-#[no_mangle]
-pub unsafe extern "C" fn memento_audio_expand_url(
-    url: *const u16, url_len: usize,
-    expression: *const u16, expression_len: usize,
-    reading: *const u16, reading_len: usize,
-) -> AudioText {
-    let (Some(url_units), Some(expression_units), Some(reading_units)) = (
-        unsafe { input(url, url_len) },
-        unsafe { input(expression, expression_len) },
-        unsafe { input(reading, reading_len) },
-    ) else {
-        return AudioText::null();
-    };
-    if url.is_null() {
-        return AudioText::null();
-    }
-    catch_unwind(|| AudioText::from_units(expand_url(url_units, expression_units, reading_units)))
-        .unwrap_or_else(|_| AudioText::null())
-}
-
-/// # Safety
 /// `data` must point to `len` readable bytes (or be null with zero length).
 /// The returned array and its nested texts must be passed to
 /// `memento_audio_free_entries` exactly once, including for invalid JSON.
-#[no_mangle]
+#[deprecated(note = "use memento_audio::audiofiles::parse_json")]
 pub unsafe extern "C" fn memento_audio_parse_json(data: *const u8, len: usize) -> AudioEntries {
     let Some(bytes) = (unsafe { input(data, len) }) else { return AudioEntries::invalid() };
     catch_unwind(|| parse_json(bytes).map_or_else(AudioEntries::invalid, AudioEntries::from_entries))
@@ -325,17 +296,9 @@ unsafe fn free_text(text: &AudioText) {
 }
 
 /// # Safety
-/// `text` must be a value returned by `memento_audio_expand_url` or one of
-/// the nested texts returned by `memento_audio_parse_json`, not yet freed.
-#[no_mangle]
-pub unsafe extern "C" fn memento_audio_free_text(text: AudioText) {
-    unsafe { free_text(&text) };
-}
-
-/// # Safety
 /// `entries` must be a value returned by `memento_audio_parse_json`, not yet
 /// freed. This frees both the entry array and all of its nested texts.
-#[no_mangle]
+#[deprecated(note = "use memento_audio::audiofiles::parse_json")]
 pub unsafe extern "C" fn memento_audio_free_entries(entries: AudioEntries) {
     if entries.entries.is_null() {
         return;
@@ -374,26 +337,6 @@ mod tests {
         ill_formed.extend(utf16("{reading}"));
         ill_formed.push(0xdc00);
         assert_eq!(expand_url(&ill_formed, &[0xdfff], &[]), vec![0xd800, 0xdfff, 0xdc00]);
-    }
-
-    #[test]
-    fn ffi_preserves_null_and_nonnull_empty_urls() {
-        let missing = unsafe { memento_audio_expand_url(ptr::null(), 0, ptr::null(), 0, ptr::null(), 0) };
-        assert!(missing.data.is_null());
-        unsafe { memento_audio_free_text(missing) };
-        let empty = unsafe { memento_audio_expand_url(ptr::NonNull::<u16>::dangling().as_ptr(), 0,
-                                                        ptr::null(), 0, ptr::null(), 0) };
-        assert!(!empty.data.is_null());
-        assert_eq!(empty.len, 0);
-        unsafe { memento_audio_free_text(empty) };
-        let term_url = utf16("{term}");
-        let removed = unsafe {
-            memento_audio_expand_url(term_url.as_ptr(), term_url.len(),
-                                     ptr::null(), 0, ptr::null(), 0)
-        };
-        assert!(!removed.data.is_null());
-        assert_eq!(removed.len, 0);
-        unsafe { memento_audio_free_text(removed) };
     }
 
     #[test]
@@ -437,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn ffi_entries_release_nested_unicode_and_empty_text() {
         let json = r#"{"type":"audioSourceList","audioSources":[{"name":"音🎵","url":""}]}"#.as_bytes();
         let parsed = unsafe { memento_audio_parse_json(json.as_ptr(), json.len()) };

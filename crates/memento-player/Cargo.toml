@@ -14,4 +14,4 @@ pkg-config = "0.3"
 [lib]
 name = "memento_player"
 path = "src/lib.rs"
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

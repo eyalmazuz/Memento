@@ -13,5 +13,5 @@ license = "GPL-2.0-only"
 [lib]
 name = "memento_setting"
 path = "src/lib.rs"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]
 

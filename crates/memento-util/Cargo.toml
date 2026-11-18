@@ -15,4 +15,4 @@ base64 = "=0.22.1"
 [lib]
 name = "memento_util"
 path = "src/lib.rs"
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

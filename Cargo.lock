@@ -2835,15 +2835,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memento-asr-engines"
-version = "2.0.2"
-dependencies = [
- "memento-asr",
- "memento-asr-onnx",
- "memento-asr-whisper",
-]
-
-[[package]]
 name = "memento-asr-onnx"
 version = "2.0.2"
 dependencies = [
@@ -2922,10 +2913,6 @@ dependencies = [
  "bindgen 0.73.2",
  "pkg-config",
 ]
-
-[[package]]
-name = "memento-quick"
-version = "2.0.2"
 
 [[package]]
 name = "memento-setting"

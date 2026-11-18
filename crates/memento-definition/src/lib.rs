@@ -34,7 +34,6 @@
 //!   [`std::collections::HashMap`]/[`std::collections::HashSet`] are used and
 //!   any resulting output is sorted explicitly.
 
-pub mod capi;
 pub mod color;
 pub mod content;
 pub mod css;

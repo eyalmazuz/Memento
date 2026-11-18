@@ -44,7 +44,6 @@
 //! directory is a call parameter everywhere.
 
 pub mod canonical;
-pub mod capi;
 pub mod config;
 pub mod error;
 pub mod keys;

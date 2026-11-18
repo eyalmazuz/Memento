@@ -15,6 +15,4 @@ serde_json = "1"
 [lib]
 name = "memento_asr"
 path = "src/lib.rs"
-# staticlib: C ABI bridge consumed by the C++ build (see src/asr/CMakeLists.txt)
-# lib: rlib for the crate's own Rust test-suite
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

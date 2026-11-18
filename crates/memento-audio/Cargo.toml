@@ -9,4 +9,4 @@ license = "GPL-2.0-only"
 [lib]
 name = "memento_audio"
 path = "src/lib.rs"
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

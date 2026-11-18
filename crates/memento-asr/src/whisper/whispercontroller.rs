@@ -1,13 +1,6 @@
-//! Port of `asr/whisper/whispercontroller.{h,cpp}` — the model-registry,
-//! path-resolution, and URL pure core.
-//!
-//! The C++ class stays the `QObject` (settings plumbing, `QCoro` backend
-//! creation, localized failure strings); only its Qt-filesystem-backed pure
-//! methods were converted here. Every semantic contract below is checked
-//! against the compiled C++ implementation by
-//! `tests/mpv-memory-subtitles/controllers_equal_test.cpp`.
+//! Model-registry, path-resolution, and URL helpers for Whisper ASR.
 
-use crate::compat;
+use std::path::{Path, PathBuf};
 
 /// `WhisperController::MODEL_PREFIX`.
 pub const MODEL_PREFIX: &str = "ggml-";
@@ -56,10 +49,10 @@ pub fn whisper_model_url(model: &str) -> String {
 /// filenames outside the Silero VAD whitelist; the exact Hugging Face URL
 /// otherwise.
 pub fn vad_model_url(model_path: &str) -> String {
-    if compat::is_absolute(model_path) {
+    if Path::new(model_path).is_absolute() {
         return String::new();
     }
-    let filename = compat::file_name(model_path);
+    let filename = file_name(model_path);
     if filename != VAD_SILERO_5 && filename != VAD_SILERO_6 {
         return String::new();
     }
@@ -68,7 +61,7 @@ pub fn vad_model_url(model_path: &str) -> String {
 
 /// `WhisperController::modelsDirectory`.
 pub fn models_directory(config_dir: &str) -> String {
-    compat::qdir_join(config_dir, WHISPER_MODEL_DIR)
+    join_dir(config_dir, WHISPER_MODEL_DIR)
 }
 
 /// `WhisperController::modelAvailable`.
@@ -76,25 +69,36 @@ pub fn model_available(model: &str, config_dir: &str) -> bool {
     if !is_managed_model(model) {
         return false;
     }
-    compat::file_exists(&resolve_model_path(
+    Path::new(&resolve_model_path(
         &model_filename(model),
         &[MODEL_SUFFIX],
         config_dir,
     ))
+    .exists()
 }
 
 /// `WhisperController::hasAnyModel`: any readable file entry that ends with
 /// the model suffix and is not one of the two Silero VAD files.
 pub fn has_any_model(config_dir: &str) -> bool {
-    for entry in compat::entry_files_readable(&models_directory(config_dir)) {
-        let filename = entry.name;
-        if !filename.ends_with(MODEL_SUFFIX)
+    let Ok(entries) = std::fs::read_dir(models_directory(config_dir)) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(filename) = name.to_str() else {
+            continue;
+        };
+        if filename.starts_with('.')
+            || !filename.ends_with(MODEL_SUFFIX)
             || filename == VAD_SILERO_5
             || filename == VAD_SILERO_6
         {
             continue;
         }
-        return true;
+        let path = entry.path();
+        if path.is_file() && std::fs::File::open(&path).is_ok() {
+            return true;
+        }
     }
     false
 }
@@ -106,11 +110,10 @@ pub fn has_any_model(config_dir: &str) -> bool {
 /// - absolute input → returned untouched;
 /// - candidate list: the raw path, then every suffix-append the path does not
 ///   already end with (list preserves order, then duplicate-first removal);
-/// - the first existing candidate is returned as `modelsDirectory.file(_:n)`
-///   composes it (no cleaning);
+/// - the first existing candidate is returned joined into the model directory;
 /// - otherwise a bare filename (no separator) falls back to the *last*
 ///   (deduplicated) candidate joined into the model directory;
-/// - otherwise `QFileInfo::absoluteFilePath()` of the original input.
+/// - otherwise an absolute cleaned path relative to the current directory.
 pub fn resolve_model_path(
     path: &str,
     suffixes: &[&str],
@@ -119,7 +122,7 @@ pub fn resolve_model_path(
     if path.is_empty() {
         return String::new();
     }
-    if compat::is_absolute(path) {
+    if Path::new(path).is_absolute() {
         return path.to_string();
     }
 
@@ -133,18 +136,65 @@ pub fn resolve_model_path(
     dedupe_keep_first(&mut filenames);
 
     for filename in &filenames {
-        let candidate = compat::qdir_join(&model_dir, filename);
-        if compat::file_exists(&candidate) {
+        let candidate = join_dir(&model_dir, filename);
+        if Path::new(&candidate).exists() {
             return candidate;
         }
     }
 
-    let bare_filename = compat::file_name(path) == path;
+    let bare_filename = file_name(path) == path;
     if bare_filename {
         let last = filenames.last().map(String::as_str).unwrap_or(path);
-        return compat::qdir_join(&model_dir, last);
+        return join_dir(&model_dir, last);
     }
-    compat::qfileinfo_absolute(path)
+    to_absolute_path(path)
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn join_dir(dir: &str, name: &str) -> String {
+    if Path::new(name).is_absolute() {
+        return name.to_string();
+    }
+    let base = if dir.is_empty() { "." } else { dir };
+    if name.is_empty() {
+        let trimmed = base.trim_end_matches('/');
+        return if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        };
+    }
+    Path::new(base).join(name).to_string_lossy().into_owned()
+}
+
+fn to_absolute_path(path: &str) -> String {
+    let base = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut components: Vec<String> = Vec::new();
+    for segment in base.to_string_lossy().split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            components.pop();
+        } else {
+            components.push(segment.to_string());
+        }
+    }
+    let cleaned = format!("/{}", components.join("/"));
+    if path.ends_with('/') && path != "/" && cleaned != "/" {
+        format!("{cleaned}/")
+    } else {
+        cleaned
+    }
 }
 
 fn dedupe_keep_first(entries: &mut Vec<String>) {
@@ -158,4 +208,59 @@ fn dedupe_keep_first(entries: &mut Vec<String>) {
         result.push(entry);
     }
     *entries = result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "memento_asr_whisper_test_{label}_{}_{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn vad_url_and_path_resolution() {
+        assert_eq!(vad_model_url("/abs/ggml-silero-v5.1.2.bin"), "");
+        assert_eq!(vad_model_url("unknown.bin"), "");
+        assert_eq!(
+            vad_model_url(VAD_SILERO_5),
+            format!("{WHISPER_VAD_URL}{VAD_SILERO_5}")
+        );
+
+        let root = unique_temp_dir("paths");
+        let root_str = root.to_string_lossy().into_owned();
+        let models = PathBuf::from(models_directory(&root_str));
+        fs::create_dir_all(&models).unwrap();
+
+        assert!(!has_any_model(&root_str));
+        fs::write(models.join(VAD_SILERO_5), b"vad").unwrap();
+        assert!(!has_any_model(&root_str));
+
+        let model_file = models.join("ggml-tiny.bin");
+        fs::write(&model_file, b"model").unwrap();
+        assert!(has_any_model(&root_str));
+        assert!(model_available("tiny", &root_str));
+        assert_eq!(
+            resolve_model_path("ggml-tiny", &[MODEL_SUFFIX], &root_str),
+            model_file.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_model_path("missing", &[MODEL_SUFFIX], &root_str),
+            models.join("missing.bin").to_string_lossy()
+        );
+        assert_eq!(resolve_model_path("/abs/custom.bin", &[MODEL_SUFFIX], &root_str), "/abs/custom.bin");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

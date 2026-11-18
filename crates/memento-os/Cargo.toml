@@ -13,4 +13,4 @@ zbus_xml = "=4.0.0"
 [lib]
 name = "memento_os"
 path = "src/lib.rs"
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

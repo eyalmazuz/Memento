@@ -1,9 +1,8 @@
-//! Subtitle value objects, file-format parsing and the opt-in Qt boundary.
+//! Subtitle value objects and file-format parsing.
 
 pub mod subtitleentry;
 pub mod subtitleparser;
 pub mod model;
-pub mod capi;
 
 pub use subtitleentry::SubtitleEntry;
 pub use subtitleparser::{parse_subtitles, Format};

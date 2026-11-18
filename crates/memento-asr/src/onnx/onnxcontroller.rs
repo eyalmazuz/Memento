@@ -1,13 +1,7 @@
-//! Port of `asr/onnx/onnxcontroller.{h,cpp}` — the preset registry, model
-//! directory, and availability pure core.
-//!
-//! The C++ class stays the `QObject` (settings plumbing, `QCoro` download
-//! orchestration, backend creation with localized failure strings); the pure
-//! registry/path/availability logic was converted here, reusing the verified
-//! [`crate::onnx::onnxmodelconfig`] port for availability. Every contract is
-//! cross-checked by `tests/mpv-memory-subtitles/controllers_equal_test.cpp`.
+//! Model-preset registry, directory, and availability helpers for ONNX ASR.
 
-use crate::compat;
+use std::path::Path;
+
 use crate::onnx::onnxmodelconfig;
 
 /// `OnnxController::MODEL_CUSTOM` (settings key handling stays in C++, the
@@ -79,12 +73,23 @@ fn spec(relative_path: &str, base: &str) -> OnnxModelFileSpec {
 
 /// `OnnxController::modelsDirectory`.
 pub fn models_directory(config_dir: &str) -> String {
-    compat::qdir_join(config_dir, ONNX_MODEL_DIR)
+    let base = if config_dir.is_empty() { "." } else { config_dir };
+    Path::new(base)
+        .join(ONNX_MODEL_DIR)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `OnnxController::modelDirectory`.
 pub fn model_directory(model: &str, config_dir: &str) -> String {
-    compat::qdir_join(&models_directory(config_dir), model)
+    if Path::new(model).is_absolute() {
+        return model.to_string();
+    }
+    let dir = models_directory(config_dir);
+    if model.is_empty() {
+        return dir;
+    }
+    Path::new(&dir).join(model).to_string_lossy().into_owned()
 }
 
 /// `OnnxController::modelAvailable` (delegates to the verified
@@ -126,13 +131,38 @@ pub fn has_any_model(selected_model_path: &str, config_dir: &str) -> bool {
         }
     }
 
-    for entry in compat::entry_dirs_readable(&models_directory(config_dir)) {
-        let (config, _error) = onnxmodelconfig::OnnxModelConfig::load_from_path(
-            entry.absolute_path,
-        );
-        if config.is_valid() {
-            return true;
+    if let Ok(entries) = std::fs::read_dir(&models_directory(config_dir)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() || std::fs::read_dir(&path).is_err() {
+                continue;
+            }
+            let (config, _error) = onnxmodelconfig::OnnxModelConfig::load_from_path(path);
+            if config.is_valid() {
+                return true;
+            }
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directories_and_empty_checks() {
+        assert_eq!(models_directory("/tmp/memento"), "/tmp/memento/models");
+        assert_eq!(
+            model_directory(PRESET_KITSUNE_T06B_JA, "/tmp/memento"),
+            format!("/tmp/memento/models/{PRESET_KITSUNE_T06B_JA}")
+        );
+        assert_eq!(model_directory("", "/tmp/memento"), "/tmp/memento/models");
+        assert!(!model_available("", "/tmp/nonexistent-memento-dir"));
+        assert!(!has_any_model("", "/tmp/nonexistent-memento-dir"));
+    }
 }

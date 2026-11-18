@@ -18,8 +18,7 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! Rust ports of Memento utility, furigana, and OCR algorithms. The C++
-//! application currently consumes the opt-in utility static library through [`capi`].
+//! Rust ports of Memento utility, furigana, and OCR algorithms.
 
 pub mod furiganautils;
 pub use furiganautils::{simplify_surface, FuriganaSpan};
@@ -27,17 +26,11 @@ pub use furiganautils::{simplify_surface, FuriganaSpan};
 pub mod furiganaparser;
 
 pub mod ocrutils;
-pub mod ocrutils_capi;
-
-pub mod capi;
 
 pub mod fileutils;
-pub mod fileutils_capi;
 
 pub mod directoryutils;
-pub mod directoryutils_capi;
 
 pub mod imageutils;
-pub mod imageutils_capi;
 
 pub mod quickutils;

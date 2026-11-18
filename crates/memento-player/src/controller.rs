@@ -1,8 +1,6 @@
 //! Controller helpers for `MpvController` and `MpvPlayer`: subtitle file extension
 //! checks, input formatting, screenshot validation, and command-line option parsing.
 
-use std::ffi::{c_char, c_void, CStr, CString};
-
 // --- Subtitle Extensions ---
 
 pub const SUBTITLE_EXTENSIONS: &[&[u8]] = &[
@@ -432,160 +430,6 @@ where
     options
 }
 
-// --- C ABI Wiring ---
-
-#[repr(C)]
-pub struct MementoPlayerUtf16Arg {
-    pub data: *const u16,
-    pub len: usize,
-}
-
-pub type MementoPlayerCliOptionCb = unsafe extern "C" fn(
-    userdata: *mut c_void,
-    name: *const c_char,
-    value: *const c_char,
-);
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_is_subtitle_file(path: *const u16, len: usize) -> bool {
-    if path.is_null() || len == 0 {
-        return false;
-    }
-    let slice = std::slice::from_raw_parts(path, len);
-    is_subtitle_file(slice)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_format_modifiers(
-    modifiers: i32,
-    out_buf: *mut c_char,
-    cap: usize,
-) -> usize {
-    let formatted = format_modifiers(modifiers);
-    let bytes = formatted.as_bytes();
-    if !out_buf.is_null() && cap > 0 {
-        let to_copy = bytes.len().min(cap - 1);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, to_copy);
-        *out_buf.add(to_copy) = 0;
-    }
-    bytes.len()
-}
-
-#[no_mangle]
-pub extern "C" fn memento_player_mouse_button_name(button: u32) -> *const c_char {
-    match MouseButton::from_qt(button) {
-        Some(MouseButton::Left) => c"MOUSE_BTN0".as_ptr(),
-        Some(MouseButton::Middle) => c"MOUSE_BTN1".as_ptr(),
-        Some(MouseButton::Right) => c"MOUSE_BTN2".as_ptr(),
-        Some(MouseButton::Back) => c"MOUSE_BTN7".as_ptr(),
-        Some(MouseButton::Forward) => c"MOUSE_BTN8".as_ptr(),
-        None => std::ptr::null(),
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn memento_player_wheel_button(delta_x: i32, delta_y: i32) -> *const c_char {
-    match WheelButton::from_deltas(delta_x, delta_y) {
-        Some(WheelButton::Up) => c"3".as_ptr(),
-        Some(WheelButton::Down) => c"4".as_ptr(),
-        Some(WheelButton::Left) => c"5".as_ptr(),
-        Some(WheelButton::Right) => c"6".as_ptr(),
-        None => std::ptr::null(),
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_format_keypress(
-    key: i32,
-    modifiers: i32,
-    is_macos: bool,
-    fallback_key_seq_utf8: *const c_char,
-    fallback_len: usize,
-    out_buf: *mut c_char,
-    cap: usize,
-) -> usize {
-    let fallback = if !fallback_key_seq_utf8.is_null() && fallback_len > 0 {
-        let bytes = std::slice::from_raw_parts(fallback_key_seq_utf8 as *const u8, fallback_len);
-        std::str::from_utf8(bytes).unwrap_or("")
-    } else {
-        ""
-    };
-
-    let Some(formatted) = format_keypress(key, modifiers, is_macos, fallback) else {
-        return 0;
-    };
-
-    let bytes = formatted.as_bytes();
-    if !out_buf.is_null() && cap > 0 {
-        let to_copy = bytes.len().min(cap - 1);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf as *mut u8, to_copy);
-        *out_buf.add(to_copy) = 0;
-    }
-    bytes.len()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_validate_raw_screenshot(
-    has_w: bool,
-    w: i64,
-    has_h: bool,
-    h: i64,
-    has_stride: bool,
-    stride: i64,
-    format_utf8: *const c_char,
-    has_data: bool,
-    out_min_line_size: *mut i64,
-) -> i32 {
-    let format = if !format_utf8.is_null() {
-        CStr::from_ptr(format_utf8).to_str().ok()
-    } else {
-        None
-    };
-
-    match ScreenshotSpec::validate(has_w, w, has_h, h, has_stride, stride, format, has_data) {
-        Ok(min_line_size) => {
-            if !out_min_line_size.is_null() {
-                *out_min_line_size = min_line_size;
-            }
-            0
-        }
-        Err(e) => e as i32,
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_parse_cli_options(
-    args: *const MementoPlayerUtf16Arg,
-    count: usize,
-    userdata: *mut c_void,
-    cb: Option<MementoPlayerCliOptionCb>,
-) {
-    let Some(cb) = cb else {
-        return;
-    };
-    if args.is_null() || count == 0 {
-        return;
-    }
-    let raw_slices = std::slice::from_raw_parts(args, count);
-    let mut u16_slices = Vec::with_capacity(count);
-    for item in raw_slices {
-        if item.data.is_null() || item.len == 0 {
-            u16_slices.push(&[][..]);
-        } else {
-            u16_slices.push(std::slice::from_raw_parts(item.data, item.len));
-        }
-    }
-
-    let parsed = parse_cli_options_u16(u16_slices);
-    for opt in parsed {
-        let clean_name = opt.name.split('\0').next().unwrap_or("");
-        let clean_val = opt.value.split('\0').next().unwrap_or("");
-        if let (Ok(c_name), Ok(c_val)) = (CString::new(clean_name), CString::new(clean_val)) {
-            cb(userdata, c_name.as_ptr(), c_val.as_ptr());
-        }
-    }
-}
-
 // --- Unit Tests ---
 
 #[cfg(test)]
@@ -774,43 +618,10 @@ mod tests {
         // Empty fallback for unmapped key returns None
         assert_eq!(format_keypress(0x1234, QT_CONTROL_MODIFIER, false, ""), None);
         assert_eq!(format_keypress(0x1234, 0, false, "   "), None);
-
-        // Safe null-termination on FFI calls even when truncated
-        let mut small_buf = [0o77 as c_char; 4];
-        let len = unsafe {
-            let fallback_seq = c"";
-            memento_player_format_keypress(
-                QT_KEY_LEFT,
-                QT_CONTROL_MODIFIER,
-                false,
-                fallback_seq.as_ptr(),
-                0,
-                small_buf.as_mut_ptr(),
-                small_buf.len(),
-            )
-        };
-        assert_eq!(len, "Ctrl+LEFT".len());
-        assert_eq!(small_buf[3], 0);
-        let s = unsafe { CStr::from_ptr(small_buf.as_ptr()) }.to_str().unwrap();
-        assert_eq!(s, "Ctr");
-
-        let mut mod_buf = [0o77 as c_char; 5];
-        let mod_len = unsafe {
-            memento_player_format_modifiers(
-                QT_SHIFT_MODIFIER | QT_CONTROL_MODIFIER,
-                mod_buf.as_mut_ptr(),
-                mod_buf.len(),
-            )
-        };
-        assert_eq!(mod_len, "Shift+Ctrl+".len());
-        assert_eq!(mod_buf[4], 0);
-        let s_mod = unsafe { CStr::from_ptr(mod_buf.as_ptr()) }.to_str().unwrap();
-        assert_eq!(s_mod, "Shif");
     }
 
     #[test]
     fn screenshot_validation() {
-        let mut min_line = 0i64;
         // Valid RGBA
         assert_eq!(
             ScreenshotSpec::validate(true, 1920, true, 1080, true, 1920 * 4, Some("rgba"), true),
@@ -880,25 +691,6 @@ mod tests {
             ScreenshotSpec::validate(true, 1920, true, 1080, true, 0, Some("rgba"), true),
             Err(ScreenshotValidationError::InvalidStride)
         );
-
-        // Via FFI
-        unsafe {
-            assert_eq!(
-                memento_player_validate_raw_screenshot(
-                    true,
-                    100,
-                    true,
-                    50,
-                    true,
-                    400,
-                    c"rgba".as_ptr(),
-                    true,
-                    &mut min_line
-                ),
-                0
-            );
-            assert_eq!(min_line, 400);
-        }
     }
 
     #[test]
