@@ -8,7 +8,7 @@ use std::rc::Rc;
 use memento_config::canonical::FORMAT_MAGIC;
 use memento_config::config::{Config, RawDocument};
 use memento_config::keys::lookup;
-use memento_config::{parse_legacy_ini, KeyPath, Value};
+use memento_config::{parse_legacy_ini, ArgbColor, KeyPath, QtFontSpec, Value};
 use memento_net::anki::AnkiEndpoint;
 use memento_setting::keys as raw;
 use memento_setting::migration::{migrate_2_to_3_list_result, migration_plan};
@@ -280,6 +280,144 @@ impl ConfigController {
             .get("enabled")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false)
+    }
+
+    pub fn anki_show_tag(&self) -> bool {
+        let profiles = self.anki_profiles.borrow();
+        anki_profile_bool(current_anki_profile(&profiles), "show-tag", false)
+    }
+
+    pub fn apply_anki_note_preset(&self, preset_name: &str) -> Result<usize, String> {
+        let preset = AnkiNotePreset::from_name(preset_name)
+            .ok_or_else(|| format!("unknown Anki note preset {preset_name:?}"))?;
+        let preset_rows = anki_note_preset_fields(preset);
+        let profiles = self.anki_profiles.borrow();
+        let note = current_anki_profile(&profiles)
+            .get("term")
+            .ok_or("Anki term profile is missing")?;
+        let existing_rows = note
+            .get("fields")
+            .and_then(JsonValue::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let pair = row.as_array().filter(|pair| pair.len() == 2)?;
+                        Some((
+                            pair[0].as_str()?.to_owned(),
+                            pair[1].as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        drop(profiles);
+
+        let updated_rows = apply_preset_to_fields(&existing_rows, &preset_rows);
+        let count = updated_rows.len();
+        let json_rows: Vec<JsonValue> = updated_rows
+            .into_iter()
+            .map(|(name, template)| json!([name, template]))
+            .collect();
+        self.edit_setting(
+            "anki/profile/term/fields",
+            &JsonValue::Array(json_rows).to_string(),
+        )?;
+        Ok(count)
+    }
+
+    pub fn keybind_conflicts(&self) -> Vec<(String, String, Vec<String>)> {
+        let store = self.store.borrow();
+        compute_keybind_conflicts(&store)
+    }
+
+    pub fn keybind_conflict_count(&self) -> usize {
+        self.keybind_conflicts().len()
+    }
+
+    pub fn edit_font_setting(
+        &self,
+        key: &str,
+        family: &str,
+        size: &str,
+        bold: bool,
+        italic: bool,
+    ) -> Result<(), String> {
+        let family = family.trim();
+        if family.is_empty() {
+            return Err("font family cannot be empty".to_owned());
+        }
+        let point_size = size
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .ok_or_else(|| "font size must be a positive number".to_owned())?;
+        let (group, raw_key) = key
+            .rsplit_once('/')
+            .ok_or_else(|| format!("invalid font setting key: {key}"))?;
+        let existing_raw = {
+            let store = self.store.borrow();
+            match effective_value(&store, group, raw_key) {
+                Value::Text(raw) if !raw.is_empty() => Some(raw),
+                _ => None,
+            }
+        };
+        let serialized = QtFontSpec::new(family, point_size, bold, italic)
+            .to_qt_string_preserving(existing_raw.as_deref());
+        self.edit_setting(key, &serialized)
+    }
+
+    pub fn edit_color_setting(
+        &self,
+        key: &str,
+        a: i32,
+        r: i32,
+        g: i32,
+        b: i32,
+    ) -> Result<(), String> {
+        let color = ArgbColor::new(
+            a.clamp(0, 255) as u8,
+            r.clamp(0, 255) as u8,
+            g.clamp(0, 255) as u8,
+            b.clamp(0, 255) as u8,
+        );
+        self.edit_setting(key, &color.to_argb_hex())
+    }
+
+    pub fn configured_font_families(&self) -> Vec<String> {
+        let store = self.store.borrow();
+        let mut families = Vec::new();
+        for key in INTERFACE_FONT_KEYS {
+            if let Some(raw) = effective_text(&store, raw::interface::GROUP, key) {
+                if let Ok(spec) = QtFontSpec::parse(&raw) {
+                    if !families.contains(&spec.family) {
+                        families.push(spec.family);
+                    }
+                }
+            }
+        }
+        families
+    }
+
+    pub fn asr_backend_selected(&self) -> String {
+        let store = self.store.borrow();
+        effective_text(&store, raw::asr::GROUP, raw::asr::BACKEND)
+            .filter(|name| super::asr::backend_available(name))
+            .unwrap_or_else(|| super::asr::default_backend().to_owned())
+    }
+
+    pub fn whisper_selected_model(&self) -> String {
+        let store = self.store.borrow();
+        value_text(&effective_value(
+            &store,
+            raw::whisper::GROUP,
+            raw::whisper::MODEL,
+        ))
+    }
+
+    pub fn onnx_selected_model(&self) -> String {
+        let store = self.store.borrow();
+        value_text(&effective_value(&store, raw::onnx::GROUP, raw::onnx::MODEL))
     }
 
     pub fn anki_excluded_glossaries(&self) -> Vec<String> {
@@ -716,6 +854,37 @@ fn strings_model(values: &[String]) -> ModelRc<SharedString> {
     .into()
 }
 
+const INTERFACE_FONT_KEYS: &[&str] = &[
+    raw::interface::subtitle::FONT,
+    raw::interface::SEARCH_EXPRESSION_FONT,
+    raw::interface::SEARCH_READING_FONT,
+    raw::interface::SEARCH_CONJ_FONT,
+    raw::interface::SEARCH_TAG_FONT,
+    raw::interface::SEARCH_GLOSSARY_FONT,
+    raw::interface::SEARCH_KANJI_FONT,
+    raw::interface::subtitle_list::PRIMARY_FONT,
+    raw::interface::subtitle_list::SECONDARY_FONT,
+];
+
+fn is_font_key(group: &str, key: &str) -> bool {
+    group == raw::interface::GROUP && INTERFACE_FONT_KEYS.contains(&key)
+}
+
+fn is_color_key(group: &str, key: &str) -> bool {
+    group == raw::interface::GROUP
+        && matches!(
+            key,
+            raw::interface::subtitle::TEXT_COLOR
+                | raw::interface::subtitle::BACKGROUND_COLOR
+                | raw::interface::subtitle::STROKE_COLOR
+                | raw::interface::subtitle_list::BACKGROUND_COLOR
+                | raw::interface::subtitle_list::TEXT_COLOR
+                | raw::interface::subtitle_list::HOVER_COLOR
+                | raw::interface::subtitle_list::SELECTED_COLOR
+                | raw::interface::subtitle_list::SELECTED_HOVER_COLOR
+        )
+}
+
 fn field(
     key: &str,
     label: &str,
@@ -738,7 +907,308 @@ fn field(
         ),
         enabled,
         visible,
+        font_family: SharedString::default(),
+        font_size: SharedString::default(),
+        font_bold: false,
+        font_italic: false,
+        color_swatch: slint::Color::from_argb_u8(255, 255, 255, 255),
+        color_a: 255,
+        color_r: 255,
+        color_g: 255,
+        color_b: 255,
+        conflict: SharedString::default(),
     }
+}
+
+fn font_field(key: &str, label: &str, value: String) -> SettingsField {
+    let spec = QtFontSpec::parse(&value)
+        .unwrap_or_else(|_| QtFontSpec::new("Noto Sans CJK JP", 12.0, false, false));
+    let mut item = field(key, label, "font", value, &[], true, true);
+    item.font_family = spec.family.clone().into();
+    item.font_size = spec.formatted_size().into();
+    item.font_bold = spec.bold;
+    item.font_italic = spec.italic;
+    item
+}
+
+fn color_field(key: &str, label: &str, value: String) -> SettingsField {
+    let argb = ArgbColor::parse(&value).unwrap_or_else(|_| ArgbColor::new(255, 255, 255, 255));
+    let mut item = field(key, label, "color", value, &[], true, true);
+    item.color_swatch = slint::Color::from_argb_u8(argb.a, argb.r, argb.g, argb.b);
+    item.color_a = i32::from(argb.a);
+    item.color_r = i32::from(argb.r);
+    item.color_g = i32::from(argb.g);
+    item.color_b = i32::from(argb.b);
+    item
+}
+
+fn keybind_field(key: &str, label: &str, value: String, conflict: String) -> SettingsField {
+    let mut item = field(key, label, "keybind", value, &[], true, true);
+    item.conflict = conflict.into();
+    item
+}
+
+/// Supported one-click Anki note card presets (#328 / #214).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnkiNotePreset {
+    Lapis,
+    Kiku,
+    Senren,
+    Animecards,
+    Jpmn,
+}
+
+impl AnkiNotePreset {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "lapis" => Some(Self::Lapis),
+            "kiku" => Some(Self::Kiku),
+            "senren" => Some(Self::Senren),
+            "animecards" => Some(Self::Animecards),
+            "jpmn" => Some(Self::Jpmn),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Lapis => "Lapis",
+            Self::Kiku => "Kiku",
+            Self::Senren => "Senren",
+            Self::Animecards => "Animecards",
+            Self::Jpmn => "JPMN",
+        }
+    }
+}
+
+/// Returns the ordered `(field_name, memento_marker_template)` mapping for a
+/// popular Japanese Anki note type preset.
+pub fn anki_note_preset_fields(preset: AnkiNotePreset) -> Vec<(&'static str, &'static str)> {
+    match preset {
+        AnkiNotePreset::Lapis => vec![
+            ("Expression", "{expression}"),
+            ("ExpressionFurigana", "{furigana-plain}"),
+            ("ExpressionReading", "{reading}"),
+            ("ExpressionAudio", "{audio | audio-media}"),
+            ("SelectionText", "{selection}"),
+            ("MainDefinition", "{selection | glossary}"),
+            ("Sentence", "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"),
+            ("SentenceFurigana", "{sentence}"),
+            ("SentenceAudio", "{audio-context}"),
+            ("Picture", "{screenshot-video | screenshot}"),
+            ("Glossary", "{glossary}"),
+            ("PitchPosition", "{pitch-positions}"),
+            ("PitchCategories", "{pitch-categories}"),
+            ("Frequency", "{frequencies}"),
+            ("FreqSort", "{frequency-harmonic-rank}"),
+            ("MiscInfo", "{title}"),
+        ],
+        AnkiNotePreset::Kiku => vec![
+            ("Expression", "{expression}"),
+            ("ExpressionFurigana", "{furigana-plain}"),
+            ("ExpressionReading", "{reading}"),
+            ("ExpressionAudio", "{audio | audio-media}"),
+            ("MainDefinition", "{selection | glossary}"),
+            ("Sentence", "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"),
+            ("SentenceAudio", "{audio-context}"),
+            ("Picture", "{screenshot-video | screenshot}"),
+            ("Glossary", "{glossary}"),
+            ("PitchPosition", "{pitch-positions}"),
+            ("PitchGraph", "{pitch-graphs}"),
+            ("PitchCategories", "{pitch-categories}"),
+            ("Frequency", "{frequencies}"),
+            ("FreqSort", "{frequency-harmonic-rank}"),
+            ("MiscInfo", "{title}"),
+        ],
+        AnkiNotePreset::Senren => vec![
+            ("word", "{expression}"),
+            ("reading", "{reading}"),
+            ("furigana", "{furigana-plain}"),
+            ("wordAudio", "{audio | audio-media}"),
+            ("sentence", "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"),
+            ("sentenceAudio", "{audio-context}"),
+            ("picture", "{screenshot-video | screenshot}"),
+            ("definition", "{selection | glossary}"),
+            ("glossary", "{glossary}"),
+            ("pitchPosition", "{pitch-positions}"),
+            ("pitchGraph", "{pitch-graphs}"),
+            ("pitchCategory", "{pitch-categories}"),
+            ("frequency", "{frequencies}"),
+            ("freqSort", "{frequency-harmonic-rank}"),
+            ("miscInfo", "{title}"),
+        ],
+        AnkiNotePreset::Animecards => vec![
+            ("Word", "{expression}"),
+            ("Word Reading", "{reading}"),
+            ("Word Furigana", "{furigana-plain}"),
+            ("Word Audio", "{audio | audio-media}"),
+            ("Sentence", "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"),
+            ("Sentence Audio", "{audio-context}"),
+            ("Picture", "{screenshot-video | screenshot}"),
+            ("Definition", "{selection | glossary}"),
+            ("Pitch Accent", "{pitch-graphs}"),
+            ("Pitch Position", "{pitch-positions}"),
+            ("Frequency", "{frequencies}"),
+            ("FreqSort", "{frequency-harmonic-rank}"),
+            ("Source", "{title}"),
+        ],
+        AnkiNotePreset::Jpmn => vec![
+            ("Word", "{expression}"),
+            ("WordReadingHiragana", "{reading}"),
+            ("WordFurigana", "{furigana-plain}"),
+            ("WordAudio", "{audio | audio-media}"),
+            ("PrimaryDefinition", "{selection | glossary}"),
+            ("SecondaryDefinition", "{glossary}"),
+            ("Sentence", "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}"),
+            ("SentenceAudio", "{audio-context}"),
+            ("Picture", "{screenshot-video | screenshot}"),
+            ("PAOverride", "{pitch-positions}"),
+            ("PAGraphs", "{pitch-graphs}"),
+            ("PitchCategories", "{pitch-categories}"),
+            ("Frequencies", "{frequencies}"),
+            ("FreqSort", "{frequency-harmonic-rank}"),
+            ("UtilityDictionaries", "{title}"),
+        ],
+    }
+}
+
+fn normalize_anki_field_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn apply_preset_to_fields(
+    existing_rows: &[(String, String)],
+    preset_rows: &[(&'static str, &'static str)],
+) -> Vec<(String, String)> {
+    if existing_rows.is_empty() {
+        return preset_rows
+            .iter()
+            .map(|(name, marker)| ((*name).to_owned(), (*marker).to_owned()))
+            .collect();
+    }
+
+    let lookup: std::collections::HashMap<String, &'static str> = preset_rows
+        .iter()
+        .map(|(name, marker)| (normalize_anki_field_name(name), *marker))
+        .collect();
+    let mut matched = 0usize;
+    let mapped: Vec<(String, String)> = existing_rows
+        .iter()
+        .map(|(name, current)| {
+            let norm = normalize_anki_field_name(name);
+            if let Some(marker) = lookup.get(&norm) {
+                matched += 1;
+                (name.clone(), (*marker).to_owned())
+            } else {
+                (name.clone(), current.clone())
+            }
+        })
+        .collect();
+
+    if matched > 0 {
+        mapped
+    } else {
+        preset_rows
+            .iter()
+            .map(|(name, marker)| ((*name).to_owned(), (*marker).to_owned()))
+            .collect()
+    }
+}
+
+fn normalize_shortcut_for_conflict(chord: &str) -> String {
+    let trimmed = chord.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = trimmed
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut has_ctrl = false;
+    let mut has_alt = false;
+    let mut has_shift = false;
+    let mut has_meta = false;
+    let mut rest = Vec::new();
+    for part in parts {
+        match part.as_str() {
+            "ctrl" | "control" => has_ctrl = true,
+            "alt" => has_alt = true,
+            "shift" => has_shift = true,
+            "meta" | "super" => has_meta = true,
+            _ => rest.push(part),
+        }
+    }
+    let mut canonical = Vec::new();
+    if has_ctrl {
+        canonical.push("ctrl".to_owned());
+    }
+    if has_alt {
+        canonical.push("alt".to_owned());
+    }
+    if has_shift {
+        canonical.push("shift".to_owned());
+    }
+    if has_meta {
+        canonical.push("meta".to_owned());
+    }
+    canonical.extend(rest);
+    canonical.join("+")
+}
+
+fn active_keybind_profile_name(config: &Config) -> String {
+    let names = keybind_profile_names(config);
+    effective_text(config, raw::keybind::GROUP, raw::keybind::CURRENT_PROFILE)
+        .filter(|current| names.iter().any(|name| name == current))
+        .or_else(|| names.first().cloned())
+        .unwrap_or_else(|| ANKI_PROFILE_DEFAULT.to_owned())
+}
+
+fn compute_keybind_conflicts(config: &Config) -> Vec<(String, String, Vec<String>)> {
+    let current = active_keybind_profile_name(config);
+    let profile_group = format!(
+        "{}/{}/{}",
+        raw::keybind::GROUP,
+        raw::keybind::profile::GROUP,
+        current
+    );
+    let mut by_chord: std::collections::HashMap<String, Vec<(&'static str, &'static str)>> =
+        std::collections::HashMap::new();
+    for &(key, label) in KEYBIND_FIELDS {
+        let chord = keybind_value(config, &profile_group, key);
+        let norm = normalize_shortcut_for_conflict(&chord);
+        if !norm.is_empty() {
+            by_chord.entry(norm).or_default().push((key, label));
+        }
+    }
+    let mut conflicts = Vec::new();
+    for &(key, _) in KEYBIND_FIELDS {
+        let chord = keybind_value(config, &profile_group, key);
+        let norm = normalize_shortcut_for_conflict(&chord);
+        if norm.is_empty() {
+            continue;
+        }
+        if let Some(entries) = by_chord.get(&norm) {
+            if entries.len() > 1 {
+                let others: Vec<String> = entries
+                    .iter()
+                    .filter(|(other_key, _)| *other_key != key)
+                    .map(|(_, other_label)| (*other_label).to_owned())
+                    .collect();
+                if !others.is_empty() {
+                    conflicts.push((key.to_owned(), chord, others));
+                }
+            }
+        }
+    }
+    conflicts
 }
 
 fn text_field(key: &str, label: &str, value: String) -> SettingsField {
@@ -1036,6 +1506,8 @@ fn interface_paths() -> Vec<(&'static str, &'static str)> {
         (group, raw::interface::subtitle_list::SELECTED_HOVER_COLOR),
         (group, raw::interface::subtitle_list::PRIMARY_FONT),
         (group, raw::interface::subtitle_list::SECONDARY_FONT),
+        (raw::subtitle_list::GROUP, raw::subtitle_list::IGNORE_WHITESPACE),
+        (raw::subtitle_list::GROUP, raw::subtitle_list::AUTO_SEEK),
     ]
 }
 
@@ -1539,9 +2011,9 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             "Subtitle",
             "",
             vec![
-                text_field(
+                font_field(
                     "interface/sub-font",
-                    "Font (Qt font string)",
+                    "Font",
                     value_text(&effective_value(
                         config,
                         group_name,
@@ -1572,7 +2044,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     "Stroke size",
                     value_text(&effective_value(config, group_name, raw::interface::subtitle::STROKE)),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-text-color",
                     "Text color",
                     value_text(&effective_value(
@@ -1581,7 +2053,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle::TEXT_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-bg-color",
                     "Background color",
                     value_text(&effective_value(
@@ -1590,7 +2062,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle::BACKGROUND_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-stroke-color",
                     "Stroke color",
                     value_text(&effective_value(
@@ -1630,54 +2102,54 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     "Subtitle pop-up height",
                     value_text(&effective_value(config, group_name, raw::interface::POPUP_HEIGHT)),
                 ),
-                text_field(
+                font_field(
                     "interface/search-expression-font",
-                    "Expression font (Qt font string)",
+                    "Expression font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::SEARCH_EXPRESSION_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/search-reading-font",
-                    "Reading font (Qt font string)",
+                    "Reading font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::SEARCH_READING_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/search-conj-font",
-                    "Conjugation font (Qt font string)",
+                    "Conjugation font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::SEARCH_CONJ_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/search-tag-font",
-                    "Tag font (Qt font string)",
+                    "Tag font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::SEARCH_TAG_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/search-glossary-font",
-                    "Glossary font (Qt font string)",
+                    "Glossary font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::SEARCH_GLOSSARY_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/search-kanji-font",
-                    "Kanji font (Qt font string)",
+                    "Kanji font",
                     value_text(&effective_value(
                         config,
                         group_name,
@@ -1709,7 +2181,25 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::TIMESTAMPS,
                     ),
                 ),
-                text_field(
+                switch_field(
+                    "subtitle-list/ignore-whitespace",
+                    "Ignore whitespace when matching subtitles",
+                    effective_bool(
+                        config,
+                        raw::subtitle_list::GROUP,
+                        raw::subtitle_list::IGNORE_WHITESPACE,
+                    ),
+                ),
+                switch_field(
+                    "subtitle-list/auto-seek",
+                    "Auto-seek subtitle list to playback position",
+                    effective_bool(
+                        config,
+                        raw::subtitle_list::GROUP,
+                        raw::subtitle_list::AUTO_SEEK,
+                    ),
+                ),
+                color_field(
                     "interface/sub-list-background-color",
                     "Background color",
                     value_text(&effective_value(
@@ -1718,7 +2208,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::BACKGROUND_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-list-text-color",
                     "Text color",
                     value_text(&effective_value(
@@ -1727,7 +2217,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::TEXT_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-list-hover-color",
                     "Hover color",
                     value_text(&effective_value(
@@ -1736,7 +2226,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::HOVER_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-list-selected-color",
                     "Selected color",
                     value_text(&effective_value(
@@ -1745,7 +2235,7 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::SELECTED_COLOR,
                     )),
                 ),
-                text_field(
+                color_field(
                     "interface/sub-list-selected-hover-color",
                     "Selected hover color",
                     value_text(&effective_value(
@@ -1754,18 +2244,18 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::interface::subtitle_list::SELECTED_HOVER_COLOR,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/sub-list-primary-font",
-                    "Primary font (Qt font string)",
+                    "Primary font",
                     value_text(&effective_value(
                         config,
                         group_name,
                         raw::interface::subtitle_list::PRIMARY_FONT,
                     )),
                 ),
-                text_field(
+                font_field(
                     "interface/sub-list-secondary-font",
-                    "Secondary font (Qt font string)",
+                    "Secondary font",
                     value_text(&effective_value(
                         config,
                         group_name,
@@ -1779,16 +2269,17 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
 
 fn keybind_settings_groups(config: &Config) -> Vec<SettingsGroup> {
     let names = keybind_profile_names(config);
-    let current = effective_text(config, raw::keybind::GROUP, raw::keybind::CURRENT_PROFILE)
-        .filter(|current| names.iter().any(|name| name == current))
-        .or_else(|| names.first().cloned())
-        .unwrap_or_else(|| ANKI_PROFILE_DEFAULT.to_owned());
+    let current = active_keybind_profile_name(config);
     let profile_group = format!(
         "{}/{}/{}",
         raw::keybind::GROUP,
         raw::keybind::profile::GROUP,
         current
     );
+    let conflicts: std::collections::HashMap<String, String> = compute_keybind_conflicts(config)
+        .into_iter()
+        .map(|(key, _, others)| (key, format!("Conflicts with: {}", others.join(", "))))
+        .collect();
     let mut groups = vec![group(
         6,
         "Profile",
@@ -1807,10 +2298,12 @@ fn keybind_settings_groups(config: &Config) -> Vec<SettingsGroup> {
         KEYBIND_FIELDS
             .iter()
             .map(|(key, label)| {
-                text_field(
+                let conflict = conflicts.get(*key).cloned().unwrap_or_default();
+                keybind_field(
                     &format!("{profile_group}/{key}"),
                     label,
                     keybind_value(config, &profile_group, key),
+                    conflict,
                 )
             })
             .collect(),
@@ -2250,6 +2743,7 @@ fn default_anki_profile() -> JsonValue {
         "audio-normalize": false,
         "audio-db": -20.0,
         "tags": ["memento"],
+        "show-tag": false,
         "ex-glos": [],
         "term": { "deck": "", "model": "", "fields": [] },
         "kanji": { "deck": "", "model": "", "fields": [] }
@@ -2295,7 +2789,8 @@ fn normalize_anki_profile(mut profile: JsonValue) -> JsonValue {
             | ("audio-pad-start", Some(JsonValue::Number(_)))
             | ("audio-pad-end", Some(JsonValue::Number(_)))
             | ("audio-normalize", Some(JsonValue::Bool(_)))
-            | ("audio-db", Some(JsonValue::Number(_))) => {}
+            | ("audio-db", Some(JsonValue::Number(_)))
+            | ("show-tag", Some(JsonValue::Bool(_))) => {}
             _ => {
                 object.insert(key.clone(), default.clone());
             }
@@ -2705,21 +3200,28 @@ fn anki_settings_groups(config: &JsonValue) -> Vec<SettingsGroup> {
             0,
             "Cards",
             "",
-            vec![text_field(
-                "anki/profile/tags",
-                "Tags (space or comma-separated)",
-                profile
-                    .get("tags")
-                    .and_then(JsonValue::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(JsonValue::as_str)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default(),
-            )],
+            vec![
+                switch_field(
+                    "anki/profile/show-tag",
+                    "Show tag",
+                    anki_profile_bool(profile, "show-tag", false),
+                ),
+                text_field(
+                    "anki/profile/tags",
+                    "Tags (space or comma-separated)",
+                    profile
+                        .get("tags")
+                        .and_then(JsonValue::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(JsonValue::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default(),
+                ),
+            ],
         ),
         group(
             0,
@@ -2898,7 +3400,7 @@ fn edit_anki_profile_field(
                 .map_err(|_| "Anki port must be between 0 and 65535".to_owned())?;
             object.insert("port".to_owned(), JsonValue::String(port.to_string()));
         }
-        "use-api-key" | "audio-normalize" => {
+        "use-api-key" | "audio-normalize" | "show-tag" => {
             object.insert(key.to_owned(), JsonValue::Bool(parse_bool(value)?));
         }
         "api-key" | "newline-replace" => {
@@ -3074,6 +3576,7 @@ fn reset_anki_profile_defaults(profile: &mut JsonValue) {
         "audio-normalize",
         "audio-db",
         "tags",
+        "show-tag",
         "ex-glos",
     ] {
         if let Some(value) = defaults.get(key) {
@@ -3252,7 +3755,17 @@ fn parse_config_value(
             }
             Ok(Value::Real(number))
         }
-        Value::Text(_) => Ok(Value::Text(value.to_owned())),
+        Value::Text(_) => {
+            if is_color_key(group, key) {
+                let parsed = ArgbColor::parse(value)?;
+                Ok(Value::Text(parsed.to_argb_hex()))
+            } else if is_font_key(group, key) {
+                let _ = QtFontSpec::parse(value)?;
+                Ok(Value::Text(value.trim().to_owned()))
+            } else {
+                Ok(Value::Text(value.to_owned()))
+            }
+        }
         Value::Strings(_) => {
             let strings = value
                 .split(',')
@@ -3284,7 +3797,7 @@ fn integer_range(group: &str, key: &str) -> Option<(i64, i64)> {
         (raw::behavior::GROUP, raw::behavior::AUTO_FIT_PERCENT) => Some((1, 1000)),
         (raw::behavior::GROUP, raw::behavior::OSC_DURATION) => Some((50, 9999)),
         (raw::behavior::GROUP, raw::behavior::OSC_FADE) => Some((0, 9999)),
-        (raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE) => Some((0, 99)),
+        (raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE) => Some((0, i64::MAX)),
         (raw::behavior::GROUP, raw::behavior::FILE_OPEN_DIR) => Some((0, 4)),
         (raw::interface::GROUP, raw::interface::POPUP_WIDTH)
         | (raw::interface::GROUP, raw::interface::POPUP_HEIGHT) => Some((1, 99999)),
@@ -3462,5 +3975,99 @@ mod tests {
         assert_eq!(loaded.store().revision(), 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn osc_min_move_has_no_artificial_upper_clamp() {
+        let ctrl = ConfigController::new();
+        ctrl.edit_setting("behavior/osc-min-move", "250").unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE),
+            Some(Value::Int(250))
+        );
+        ctrl.edit_setting("behavior/osc-min-move", "5000").unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE),
+            Some(Value::Int(5000))
+        );
+        ctrl.edit_setting("behavior/osc-min-move", "-12").unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE),
+            Some(Value::Int(0))
+        );
+    }
+
+    #[test]
+    fn subtitle_list_behavior_settings_are_wired_and_persisted() {
+        let dir = temp_dir("sub-list-prefs");
+        let anki = dir.join("anki_connect.json");
+        let ctrl = ConfigController::new();
+
+        ctrl.edit_setting("subtitle-list/ignore-whitespace", "true")
+            .unwrap();
+        ctrl.edit_setting("subtitle-list/auto-seek", "true").unwrap();
+        ctrl.apply_settings(5, &dir, "memento.conf", &anki).unwrap();
+
+        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(
+            reloaded.effective_setting(
+                raw::subtitle_list::GROUP,
+                raw::subtitle_list::IGNORE_WHITESPACE
+            ),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            reloaded.effective_setting(raw::subtitle_list::GROUP, raw::subtitle_list::AUTO_SEEK),
+            Some(Value::Bool(true))
+        );
+
+        reloaded.defaults_settings(5).unwrap();
+        assert_eq!(
+            reloaded.effective_setting(
+                raw::subtitle_list::GROUP,
+                raw::subtitle_list::IGNORE_WHITESPACE
+            ),
+            Some(Value::Bool(false))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn font_and_color_editors_preserve_qfont_and_argb_formats() {
+        let ctrl = ConfigController::new();
+        ctrl.edit_font_setting("interface/sub-font", "Source Han Sans JP", "28", true, true)
+            .unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::interface::GROUP, raw::interface::subtitle::FONT),
+            Some(Value::Text(
+                "Source Han Sans JP,28,-1,5,75,1,0,0,0,0".to_owned()
+            ))
+        );
+
+        ctrl.edit_color_setting("interface/sub-text-color", 200, 16, 32, 48)
+            .unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::interface::GROUP, raw::interface::subtitle::TEXT_COLOR),
+            Some(Value::Text("#C8102030".to_owned()))
+        );
+    }
+
+    #[test]
+    fn keybind_conflicts_detect_duplicates_case_and_modifier_order_insensitively() {
+        let ctrl = ConfigController::new();
+        assert!(ctrl.keybind_conflicts().is_empty());
+
+        let profile = ctrl.current_keybind_profile();
+        ctrl.edit_setting(
+            &format!("keybind/profiles/{profile}/open-file"),
+            "Shift+Ctrl+C",
+        )
+        .unwrap();
+        let conflicts = ctrl.keybind_conflicts();
+        assert_eq!(conflicts.len(), 2);
+        assert!(conflicts.iter().any(|(k, _, _)| k == "open-file"));
+        assert!(conflicts
+            .iter()
+            .any(|(k, _, _)| k == "sub-list-copy-selected"));
     }
 }
