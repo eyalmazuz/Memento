@@ -89,6 +89,8 @@ static NEXT_PORTAL_TOKEN: AtomicU64 = AtomicU64::new(1);
 pub struct Screensaver {
     inhibited: bool,
     cookie: u32,
+    last_active_request: Option<bool>,
+    inhibit_attempts: u64,
 }
 
 // Qt's QDBusInterface::isValid() checks whether the service currently owns
@@ -179,6 +181,10 @@ impl Screensaver {
         self.cookie
     }
 
+    pub fn inhibit_attempts(&self) -> u64 {
+        self.inhibit_attempts
+    }
+
     fn apply_inhibit_reply(&mut self, reply: Option<u32>) {
         if let Some(cookie) = reply {
             if cookie != 0 {
@@ -189,9 +195,11 @@ impl Screensaver {
     }
 
     pub fn inhibit(&mut self, reason: &str) {
+        self.last_active_request = Some(true);
         if self.inhibited {
             return;
         }
+        self.inhibit_attempts = self.inhibit_attempts.saturating_add(1);
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             let reply = session_connection()
@@ -259,6 +267,7 @@ impl Screensaver {
     }
 
     pub fn uninhibit(&mut self) {
+        self.last_active_request = Some(false);
         if !self.inhibited {
             return;
         }
@@ -293,8 +302,15 @@ impl Screensaver {
     }
 
     /// Synchronize screensaver inhibition with active playback (`!paused && file_loaded`).
+    /// Transition-gated so repeated 60Hz ticks in the same playback state never
+    /// issue redundant D-Bus calls when no ScreenSaver service is running.
     pub fn sync_playback(&mut self, file_loaded: bool, paused: bool, reason: &str) {
-        if file_loaded && !paused {
+        let active = file_loaded && !paused;
+        if self.last_active_request == Some(active) {
+            return;
+        }
+        self.last_active_request = Some(active);
+        if active {
             self.inhibit(reason);
         } else {
             self.uninhibit();
@@ -799,5 +815,23 @@ mod tests {
         assert!(sub_filters[0].patterns.iter().any(|p| p == "*.ass"));
         assert!(sub_filters[0].patterns.iter().any(|p| p == "*.vtt"));
         assert!(sub_filters[0].patterns.iter().any(|p| p == "*.sub"));
+    }
+
+    #[test]
+    fn sync_playback_is_transition_gated_across_repeated_active_ticks() {
+        let mut ss = Screensaver::new();
+        assert_eq!(ss.inhibit_attempts(), 0);
+        // Repeated active playback ticks must only attempt inhibition once per transition.
+        for _ in 0..10 {
+            ss.sync_playback(true, false, "Playing media");
+        }
+        assert_eq!(ss.inhibit_attempts(), 1);
+        // Transition to paused resets the gate; next active transition attempts once more.
+        ss.sync_playback(true, true, "Playing media");
+        assert_eq!(ss.inhibit_attempts(), 1);
+        for _ in 0..10 {
+            ss.sync_playback(true, false, "Playing media");
+        }
+        assert_eq!(ss.inhibit_attempts(), 2);
     }
 }

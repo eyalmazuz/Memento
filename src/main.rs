@@ -35,7 +35,8 @@ use controller::config::ConfigController;
 use controller::dict::DictController;
 use controller::player::{
     clear_primary_subtitle, compute_video_render_size, effective_media_title,
-    refresh_subtitle_list, refresh_subtitle_marks, LivePlayerCoordinator, MouseInputForwarder,
+    refresh_subtitle_list as base_refresh_subtitle_list, refresh_subtitle_marks,
+    LivePlayerCoordinator, MouseInputForwarder,
 };
 #[cfg(test)]
 use controller::player::{
@@ -423,6 +424,8 @@ fn load_playlist_into(
     let title = effective_media_title("", &first_path);
     app.set_media_title(title.into());
     app.set_secondary_sub_text("".into());
+    app.set_thumbnail_frame(slint::Image::default());
+    app.set_hover_chapter_title("".into());
     clear_primary_subtitle(app);
     Ok(Some(first_path))
 }
@@ -890,6 +893,86 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
 }
 
 
+fn estimate_drawer_row_height(text: &str, available_text_width: f32) -> f32 {
+    let usable_w = available_text_width.max(120.0);
+    let mut visual_lines = 0usize;
+    for raw_line in text.split('\n') {
+        let line_px: f32 = raw_line
+            .chars()
+            .map(|ch| if ch.is_ascii() { 7.5 } else { 13.5 })
+            .sum();
+        let wrapped = ((line_px / usable_w).ceil() as usize).max(1);
+        visual_lines += wrapped;
+    }
+    let visual_lines = visual_lines.max(1);
+    if visual_lines <= 1 {
+        36.0
+    } else {
+        (visual_lines as f32 * 18.0 + 14.0).max(36.0)
+    }
+}
+
+pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
+    let entries = if app.get_subtitle_drawer_tab() == 1 {
+        app.get_secondary_subtitle_entries()
+    } else {
+        app.get_subtitle_entries()
+    };
+    let count = entries.row_count();
+    if count == 0 || row_idx >= count {
+        return;
+    }
+    let text_width = (app.get_sidebar_width() - 104.0).max(120.0);
+    let mut row_y = 0.0f32;
+    let mut target_h = 36.0f32;
+    let mut total_h = 0.0f32;
+    for idx in 0..count {
+        let h = entries
+            .row_data(idx)
+            .map(|entry| estimate_drawer_row_height(entry.text.as_str(), text_width))
+            .unwrap_or(36.0);
+        if idx < row_idx {
+            row_y += h;
+        } else if idx == row_idx {
+            target_h = h;
+        }
+        total_h += h;
+    }
+    app.invoke_scroll_subtitle_drawer_to_offset(row_y, target_h, total_h);
+}
+
+pub fn auto_scroll_subtitle_drawer_if_needed(
+    app: &MementoApp,
+    subtitles: &SubtitleController,
+) {
+    if !app.get_sub_drawer_open() || app.get_subtitle_drawer_user_scrolling() {
+        return;
+    }
+    let active_idx = if app.get_subtitle_drawer_tab() == 1 {
+        subtitles
+            .active_indices(subtitles.secondary_sid())
+            .first()
+            .copied()
+    } else {
+        subtitles
+            .active_indices(subtitles.primary_sid())
+            .first()
+            .copied()
+    };
+    if let Some(row) = active_idx {
+        scroll_drawer_to_row_accurate(app, row);
+    }
+}
+
+pub fn refresh_subtitle_list(
+    app: &MementoApp,
+    model: &VecModel<SubEntry>,
+    subtitles: &SubtitleController,
+) {
+    base_refresh_subtitle_list(app, model, subtitles);
+    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+}
+
 pub fn refresh_secondary_subtitle_list(
     app: &MementoApp,
     model: &VecModel<SubEntry>,
@@ -918,6 +1001,7 @@ pub fn refresh_secondary_subtitle_list(
         })
         .collect();
     model.set_vec(rows);
+    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
 }
 
 fn search_entries(
@@ -1098,7 +1182,7 @@ fn install_subtitle_selection(
         if let Some(&first_row) = matching.first() {
             app.set_subtitle_search_current_match(1);
             app.set_subtitle_search_focused_row(first_row as i32);
-            app.invoke_scroll_subtitle_drawer_to_row(first_row as i32);
+            scroll_drawer_to_row_accurate(&app, first_row);
         } else {
             app.set_subtitle_search_current_match(0);
             app.set_subtitle_search_focused_row(-1);
@@ -1120,7 +1204,7 @@ fn install_subtitle_selection(
         let row = matches[next_idx];
         app.set_subtitle_search_current_match((next_idx + 1) as i32);
         app.set_subtitle_search_focused_row(row as i32);
-        app.invoke_scroll_subtitle_drawer_to_row(row as i32);
+        scroll_drawer_to_row_accurate(&app, row);
     });
 
     let prev_matches = search_matches.clone();
@@ -1137,14 +1221,36 @@ fn install_subtitle_selection(
         let row = matches[prev_idx];
         app.set_subtitle_search_current_match((prev_idx + 1) as i32);
         app.set_subtitle_search_focused_row(row as i32);
-        app.invoke_scroll_subtitle_drawer_to_row(row as i32);
+        scroll_drawer_to_row_accurate(&app, row);
     });
 
     let tab_weak = app.as_weak();
+    let tab_subs = subtitles.clone();
     app.on_subtitle_drawer_tab_changed(move |_tab| {
         let Some(app) = tab_weak.upgrade() else { return; };
         let q = app.get_subtitle_search_query();
-        app.invoke_search_subtitles(q);
+        app.invoke_search_subtitles(q.clone());
+        if q.trim().is_empty() {
+            if let Ok(subs) = tab_subs.try_borrow() {
+                auto_scroll_subtitle_drawer_if_needed(&app, &subs);
+            }
+        }
+    });
+
+    let user_scroll_timer = Rc::new(slint::Timer::default());
+    let scroll_timer_handle = user_scroll_timer.clone();
+    let scroll_weak = app.as_weak();
+    app.on_subtitle_drawer_user_scrolled(move || {
+        let weak = scroll_weak.clone();
+        scroll_timer_handle.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(2500),
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    app.set_subtitle_drawer_user_scrolling(false);
+                }
+            },
+        );
     });
 
     let copy_subs = subtitles.clone();
@@ -1969,19 +2075,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // YomitanPopup and must NOT dismiss it.
         if app.get_dict_open() {
             if assigned(&app.get_key_card_next()) {
-                let count = app.get_popup_results().row_count() as i32;
-                if count > 0 {
-                    let next = (app.get_popup_focused_index() + 1).clamp(0, count - 1);
-                    app.set_popup_focused_index(next);
-                }
+                app.invoke_navigate_popup(1);
                 return true;
             }
             if assigned(&app.get_key_card_prev()) {
-                let count = app.get_popup_results().row_count() as i32;
-                if count > 0 {
-                    let prev = (app.get_popup_focused_index() - 1).clamp(0, count - 1);
-                    app.set_popup_focused_index(prev);
-                }
+                app.invoke_navigate_popup(-1);
                 return true;
             }
             if assigned(&app.get_key_card_add()) && app.get_anki_enabled() {
@@ -4161,6 +4259,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let previous_chapters_dur = Cell::new(0.0f64);
         let previous_title_pair: RefCell<(String, String)> = RefCell::new((String::new(), String::new()));
         let previous_sec_state: Cell<(i64, usize, Option<usize>)> = Cell::new((0, 0, None));
+        let previous_playback_active: Cell<Option<bool>> = Cell::new(None);
+        let previous_active_scroll: Cell<(bool, i32, Option<usize>, Option<usize>)> =
+            Cell::new((false, 0, None, None));
         let last_video_report = Cell::new(std::time::Instant::now());
         let previous_drops = Cell::new((0i64, 0i64));
         let last_sync = Cell::new(std::time::Instant::now());
@@ -4241,9 +4342,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if (app.get_volume_max() - effective_vol_max).abs() > 0.5 {
                 app.set_volume_max(effective_vol_max);
             }
-            if let Ok(mut ss) = sync_screensaver.try_borrow_mut() {
-                ss.sync_playback(state.file_loaded, state.paused, "Playing media");
+            let playback_active = state.file_loaded && !state.paused;
+            if previous_playback_active.replace(Some(playback_active)) != Some(playback_active) {
+                if let Ok(mut ss) = sync_screensaver.try_borrow_mut() {
+                    ss.sync_playback(state.file_loaded, state.paused, "Playing media");
+                }
             }
+            let prim_active = subtitles
+                .active_indices(subtitles.primary_sid())
+                .first()
+                .copied();
             let sec_sid = subtitles.secondary_sid();
             let sec_count = subtitles.secondary_entries().len();
             let sec_active = subtitles.active_indices(sec_sid).first().copied();
@@ -4251,6 +4359,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 != (sec_sid, sec_count, sec_active)
             {
                 refresh_secondary_subtitle_list(&app, &sync_sec_sub_model, &subtitles);
+            }
+            let scroll_state = (
+                app.get_sub_drawer_open(),
+                app.get_subtitle_drawer_tab(),
+                prim_active,
+                sec_active,
+            );
+            if previous_active_scroll.replace(scroll_state) != scroll_state {
+                auto_scroll_subtitle_drawer_if_needed(&app, &subtitles);
             }
             if !state.path.is_empty() && !state.media_title.is_empty() {
                 let mut prev_pair = previous_title_pair.borrow_mut();
@@ -4966,8 +5083,15 @@ mod window_ux_tests {
         app.set_dict_open(true);
         app.show().unwrap();
 
-        // Secondary subtitles must sit at the top edge of the video viewport.
+        // Secondary subtitles must sit at the top edge of the video viewport and not wrap short text.
         assert_eq!(app.get_secondary_subtitle_y(), 12.0);
+        let short_sec_h = app.get_secondary_subtitle_height();
+        app.set_secondary_sub_text("Hi".into());
+        assert!(
+            (app.get_secondary_subtitle_height() - short_sec_h).abs() <= 4.0,
+            "Short secondary subtitle must stay single-line without wrapping (short_sec_h={short_sec_h}, two_char_h={})",
+            app.get_secondary_subtitle_height()
+        );
 
         // With default bottom subtitles (subtitle_offset = 0.045), YomitanPopup must sit ABOVE primary subtitles.
         let sub_top = app.get_primary_subtitle_y();
@@ -5119,6 +5243,109 @@ mod window_ux_tests {
         assert_eq!(
             format_recent_file_label("", "/home/user/Videos/ep01.mkv"),
             "ep01.mkv — /home/user/Videos/ep01.mkv"
+        );
+    }
+
+    #[test]
+    fn subtitle_drawer_auto_scrolls_on_active_cue_advance_and_respects_user_scrolling_and_hover_pause_release() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_sub_drawer_open(true);
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        let mut cues = Vec::new();
+        for i in 0..30 {
+            let start = (i * 2 + 1) as f64;
+            let text = if i < 5 {
+                format!("Multi-line wrapped subtitle cue #{i} with extra long text that wraps across multiple lines in the subtitle drawer panel")
+            } else {
+                format!("Cue line #{i}")
+            };
+            cues.push(controller::subtitles::create_cue(&text, start, start + 1.5));
+        }
+        subtitles.borrow_mut().load_cues(cues);
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(rows.clone().into());
+        install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+        app.show().unwrap();
+
+        assert_eq!(app.get_subtitle_drawer_viewport_y(), 0.0);
+
+        // Advancing active playback cue to row 22 while user is NOT scrolling auto-scrolls the drawer.
+        subtitles.borrow_mut().update_position(45.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        let scrolled_y = app.get_subtitle_drawer_viewport_y();
+        assert!(
+            scrolled_y < -100.0,
+            "Active cue advance must auto-scroll SubtitleDrawerPanel (viewport_y={scrolled_y})"
+        );
+
+        // When user-scrolling is active, advancing the playback cue must NOT overwrite the user's scroll position.
+        app.set_subtitle_drawer_user_scrolling(true);
+        subtitles.borrow_mut().update_position(1.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        assert_eq!(
+            app.get_subtitle_drawer_viewport_y(),
+            scrolled_y,
+            "Auto-scroll must not fight the user while user_scrolling is active"
+        );
+
+        // Clearing user_scrolling allows active-cue auto-scroll to resume.
+        app.set_subtitle_drawer_user_scrolling(false);
+        subtitles.borrow_mut().update_position(1.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        assert_eq!(app.get_subtitle_drawer_viewport_y(), 0.0);
+
+        // Hover-pause latches across subtitle -> YomitanPopup and releases when moving onto OSC / menu bar / sidebar.
+        let hover_state = Rc::new(Cell::new(false));
+        let hover_sink = hover_state.clone();
+        app.on_subtitle_hover_changed(move |hovering| hover_sink.set(hovering));
+        app.set_subtitles_visible(true);
+        app.set_active_sub_text("生前に世界中".into());
+        let words = vec![
+            SubtitleWord { text: "生前".into(), reading: "せいぜん".into(), query: "生前".into(), index: 0 },
+        ];
+        let lines = subtitle_lines_for_app(&app, words.clone());
+        app.set_active_sub_words(Rc::new(VecModel::from(words)).into());
+        app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
+        set_dictionary_rows(
+            &app,
+            vec![DictResult {
+                index: 0,
+                expression: "生前".into(),
+                reading: "せいぜん".into(),
+                glossary: "during one's lifetime".into(),
+                dict_name: "JMdict".into(),
+                selected: true,
+                term_start: true,
+                term_end: true,
+                ..Default::default()
+            }],
+        );
+        app.set_dict_open(true);
+
+        // Move pointer over primary subtitle box -> hover-pause activates.
+        let sub_y = 30.0 + app.get_primary_subtitle_y() + 10.0;
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(470., sub_y),
+        });
+        assert!(hover_state.get(), "Hovering primary subtitle must activate hover-pause");
+
+        // Move pointer into YomitanPopup -> hover-pause stays active.
+        let popup_y = 30.0 + app.get_popup_y() + 40.0;
+        let popup_x = app.get_popup_x() + 40.0;
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(popup_x, popup_y),
+        });
+        assert!(hover_state.get(), "Hovering YomitanPopup must keep hover-pause active");
+
+        // Move pointer directly from YomitanPopup onto the top menu bar (or sidebar/OSC) -> hover-pause releases!
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(30., 12.),
+        });
+        assert!(
+            !hover_state.get(),
+            "Moving pointer from YomitanPopup onto menu bar / OSC / sidebar must release hover-pause"
         );
     }
 }
