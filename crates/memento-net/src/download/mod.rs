@@ -40,7 +40,10 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 use memento_setting::models::download_progress_update;
 use memento_setting::models::download_speed;
@@ -124,7 +127,7 @@ pub enum DownloadError
     Transport(HttpError),
     /// Network read/write I/O (connect refused, resets, timeouts).
     Network(io::Error),
-    /// Server answered with >= 400.
+    /// Server answered with a non-2xx status.
     Status
     {
         status: u16,
@@ -256,24 +259,18 @@ impl Downloader
             }
         }
 
-        let staging = staging_path(target);
-        let _cleanup = StagingCleanup { path: staging.clone() };
-        let mut staging_file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&staging)
-            .map_err(DownloadError::Io)?;
-
         let request = Request::get(parsed);
         let mut response = self.http.send(&request)?;
-        if response.status() >= 400
+        if !(200..300).contains(&response.status())
         {
             return Err(DownloadError::Status {
                 status: response.status(),
                 reason: response.reason().to_owned(),
             });
         }
+
+        let (staging, mut staging_file) = create_unique_staging_file(target).map_err(DownloadError::Io)?;
+        let mut cleanup = StagingCleanup { path: Some(staging.clone()) };
 
         let total = response.content_length().unwrap_or(0);
         let started = Instant::now();
@@ -314,9 +311,11 @@ impl Downloader
         }
 
         staging_file.flush().map_err(DownloadError::Io)?;
+        staging_file.sync_all().map_err(DownloadError::Io)?;
         drop(staging_file);
-        let _ = fs::remove_file(target);
         fs::rename(&staging, target).map_err(DownloadError::Io)?;
+        cleanup.path = None;
+        let _ = fs::remove_file(staging_path(target));
 
         Ok(DownloadOutcome {
             target: target.to_owned(),
@@ -327,15 +326,47 @@ impl Downloader
 
 struct StagingCleanup
 {
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl Drop for StagingCleanup
 {
     fn drop(&mut self)
     {
-        let _ = fs::remove_file(&self.path);
+        if let Some(path) = self.path.take()
+        {
+            let _ = fs::remove_file(path);
+        }
     }
+}
+
+fn create_unique_staging_file(target: &Path) -> io::Result<(PathBuf, fs::File)>
+{
+    let pid = std::process::id();
+    for _ in 0..128
+    {
+        let seq = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let mut name = target.as_os_str().to_owned();
+        name.push(format!(".part.{pid}.{seq}"));
+        let candidate = PathBuf::from(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate unique download staging file",
+    ))
 }
 
 fn progress_for(
@@ -417,5 +448,50 @@ mod tests
             Err(DownloadError::Io(error))
                 if error.kind() == io::ErrorKind::InvalidInput
         ));
+    }
+
+    #[test]
+    fn non_2xx_300_or_304_status_is_rejected_without_creating_target()
+    {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        for status_line in [
+            "HTTP/1.1 300 Multiple Choices",
+            "HTTP/1.1 304 Not Modified",
+            "HTTP/1.1 500 Internal Server Error",
+        ]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let line = status_line.to_owned();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!("{line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+            });
+
+            let dir = std::env::temp_dir().join(format!(
+                "memento-dl-status-test-{}-{}",
+                std::process::id(),
+                NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("file.bin");
+            let url = format!("http://{}:{}/file.bin", addr.ip(), addr.port());
+            let err = Downloader::default()
+                .download(&url, &target, |_| Ok(()))
+                .unwrap_err();
+            assert!(
+                matches!(err, DownloadError::Status { status, .. } if !(200..300).contains(&status)),
+                "expected Status error for {status_line}, got {err:?}"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let _ = fs::remove_dir_all(&dir);
+            let _ = handle.join();
+        }
     }
 }

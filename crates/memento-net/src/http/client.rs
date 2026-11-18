@@ -71,6 +71,8 @@ impl TcpTransport
 
 fn tls_config() -> Arc<ClientConfig> {
     static CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    // Use bundled `webpki_roots` (`rustls-native-certs` is absent from Cargo.lock
+    // so offline and reproducible builds remain self-contained).
     Arc::clone(CLIENT_CONFIG.get_or_init(|| {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -237,6 +239,7 @@ impl HttpClient
     pub fn send(&self, request: &Request) -> HttpResult<Response>
     {
         let mut current = request.clone();
+        let started_remote = !is_local_or_loopback_host(&current.url.host);
         let mut visited: Vec<String> = vec![current.url.key()];
         let mut redirects = 0usize;
 
@@ -263,6 +266,24 @@ impl HttpClient
             // The response owns the previous connection; drop it before the
             // next exchange.
             let next_url = current.url.resolve_relative(&location)?;
+
+            if current.url.scheme == super::url::Scheme::Https
+                && next_url.scheme == super::url::Scheme::Http
+            {
+                return Err(HttpError::Protocol(
+                    "refusing HTTPS to HTTP downgrade redirect".into(),
+                ));
+            }
+            if is_link_local_host(&next_url.host)
+                || ((started_remote || !is_local_or_loopback_host(&current.url.host))
+                    && is_restricted_redirect_target(&next_url))
+            {
+                return Err(HttpError::Protocol(format!(
+                    "refusing redirect to restricted host {:?}",
+                    next_url.host
+                )));
+            }
+
             let next_key = next_url.key();
             if visited.contains(&next_key)
             {
@@ -292,12 +313,36 @@ impl HttpClient
             {
                 None
             };
+            let dropped_body = current.body.is_some() && body.is_none();
+            let same_origin = same_origin(&current.url, &next_url);
+            let mut next_headers = super::headers::Headers::new();
+            for (name, value) in current.headers.iter()
+            {
+                if name.eq_ignore_ascii_case("host")
+                {
+                    continue;
+                }
+                if !same_origin
+                    && (name.eq_ignore_ascii_case("authorization")
+                        || name.eq_ignore_ascii_case("cookie"))
+                {
+                    continue;
+                }
+                if dropped_body
+                    && (name.eq_ignore_ascii_case("content-length")
+                        || name.eq_ignore_ascii_case("transfer-encoding")
+                        || name.eq_ignore_ascii_case("content-type"))
+                {
+                    continue;
+                }
+                next_headers.insert(name, value);
+            }
             drop(response);
 
             current = Request {
                 method,
                 url: next_url,
-                headers: current.headers.clone(),
+                headers: next_headers,
                 body,
             };
         }
@@ -324,6 +369,82 @@ impl HttpClient
     {
         matches!(status, 301 | 302 | 303 | 307 | 308)
     }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool
+{
+    left.scheme == right.scheme
+        && left.host.eq_ignore_ascii_case(&right.host)
+        && left.port_or_default() == right.port_or_default()
+}
+
+fn is_localhost_name(host: &str) -> bool
+{
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    normalized == "localhost" || normalized.ends_with(".localhost")
+}
+
+fn ip_is_loopback_or_unspecified(ip: IpAddr) -> bool
+{
+    match ip
+    {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+fn ip_is_link_local(ip: IpAddr) -> bool
+{
+    match ip
+    {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+fn is_local_or_loopback_host(host: &str) -> bool
+{
+    is_localhost_name(host)
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(ip_is_loopback_or_unspecified)
+}
+
+fn is_link_local_host(host: &str) -> bool
+{
+    host.parse::<IpAddr>().is_ok_and(ip_is_link_local)
+}
+
+fn is_restricted_redirect_target(url: &Url) -> bool
+{
+    if is_local_or_loopback_host(&url.host) || is_link_local_host(&url.host)
+    {
+        return true;
+    }
+    if url.host.parse::<IpAddr>().is_err()
+    {
+        if let Ok(addrs) = (url.host.as_str(), url.port_or_default()).to_socket_addrs()
+        {
+            for addr in addrs
+            {
+                let ip = addr.ip();
+                if ip_is_loopback_or_unspecified(ip) || ip_is_link_local(ip)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Adapts the transport's boxed stream into the reader `Response::decode`
@@ -373,5 +494,164 @@ mod tests
         assert_eq!(effective_connect_timeout(Some(short), Some(long)), Some(short));
         assert_eq!(effective_connect_timeout(Some(long), None), Some(long));
         assert_eq!(effective_connect_timeout(None, Some(short)), Some(short));
+    }
+
+    #[derive(Clone)]
+    struct ArcScriptedTransport
+    {
+        responses: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>,
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+        connected_hosts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ArcScriptedTransport
+    {
+        fn new(responses: Vec<Vec<u8>>) -> Self
+        {
+            Self {
+                responses: Arc::new(std::sync::Mutex::new(responses.into())),
+                captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+                connected_hosts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    struct ArcStream
+    {
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+        response: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl Read for ArcStream
+    {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
+        {
+            self.response.read(buf)
+        }
+    }
+
+    impl Write for ArcStream
+    {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>
+        {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()>
+        {
+            if !self.written.is_empty()
+            {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&self.written).into_owned());
+                self.written.clear();
+            }
+            Ok(())
+        }
+    }
+
+    impl Transport for ArcScriptedTransport
+    {
+        fn connect(
+            &self,
+            url: &Url,
+            _io_timeout: Option<Duration>,
+        ) -> HttpResult<Box<dyn SingleStream>>
+        {
+            self.connected_hosts.lock().unwrap().push(url.host.clone());
+            let bytes = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(Box::new(ArcStream {
+                captured: Arc::clone(&self.captured),
+                response: std::io::Cursor::new(bytes),
+                written: Vec::new(),
+            }))
+        }
+    }
+
+    #[test]
+    fn blocks_https_to_http_downgrade_redirect()
+    {
+        let transport = ArcScriptedTransport::new(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: http://example.test/insecure\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        ]);
+        let client = HttpClient::with_transport(HttpClientConfig::default(), Box::new(transport.clone()));
+        let req = Request::get(Url::parse("https://example.test/start").unwrap());
+        let err = client.send(&req).unwrap_err();
+        assert!(matches!(err, HttpError::Protocol(_)));
+        assert_eq!(transport.connected_hosts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn blocks_remote_redirect_to_loopback_and_link_local()
+    {
+        for target in [
+            "http://127.0.0.1:8765/",
+            "http://[::1]:8765/",
+            "http://[::ffff:127.0.0.1]:8765/",
+            "http://localhost:8765/",
+            "http://169.254.169.254/latest/meta-data/",
+        ]
+        {
+            let raw = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n"
+            );
+            let transport = ArcScriptedTransport::new(vec![raw.into_bytes()]);
+            let client = HttpClient::with_transport(
+                HttpClientConfig::default(),
+                Box::new(transport.clone()),
+            );
+            let req = Request::get(Url::parse("http://remote.example.test/file").unwrap());
+            let err = client.send(&req).unwrap_err();
+            assert!(
+                matches!(err, HttpError::Protocol(_)),
+                "expected SSRF redirect block for {target}, got {err:?}"
+            );
+            assert_eq!(transport.connected_hosts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn strips_auth_and_cookie_on_cross_origin_redirect_and_clears_host_and_content_length()
+    {
+        let transport = ArcScriptedTransport::new(vec![
+            b"HTTP/1.1 303 See Other\r\nLocation: https://other.example.test/done\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ]);
+        let client = HttpClient::with_transport(
+            HttpClientConfig::default(),
+            Box::new(transport.clone()),
+        );
+        let req = Request::post(
+            Url::parse("https://auth.example.test/submit").unwrap(),
+            b"{}".to_vec(),
+        )
+        .header("Host", "auth.example.test")
+        .header("Content-Length", "2")
+        .header("Authorization", "Bearer secret")
+        .header("Cookie", "session=xyz")
+        .header("X-Custom", "keep");
+
+        let mut resp = client.send(&req).unwrap();
+        assert_eq!(resp.read_all(64).unwrap(), b"ok");
+
+        let sent = transport.captured.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        let redirected = &sent[1];
+        assert!(redirected.starts_with("GET /done HTTP/1.1\r\n"));
+        assert!(redirected.contains("Host: other.example.test\r\n"));
+        assert!(!redirected.contains("Authorization"));
+        assert!(!redirected.contains("Cookie"));
+        assert!(!redirected.contains("Content-Length"));
+        assert!(redirected.contains("X-Custom: keep\r\n"));
     }
 }

@@ -5,9 +5,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::fs;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+use std::sync::atomic::{AtomicBool, Ordering};
+use tempfile::TempDir;
 
 /// An immutable snapshot of the media and selected mpv audio track. Capture it
 /// on the UI thread with `MpvInstance::capture_encode_context` before starting.
@@ -28,60 +27,35 @@ impl MediaContext {
 
 pub(super) struct TempWav {
     pub(super) path: PathBuf,
-    directory: PathBuf,
+    _directory: TempDir,
 }
 
-impl Drop for TempWav {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_dir(&self.directory);
-    }
+fn create_temp_media_path(
+    prefix: &str,
+    file_name: &str,
+    context: &str,
+) -> Result<TempWav, String> {
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .map_err(|error| format!("Could not create {context}: {error}"))?;
+    let path = directory.path().join(file_name);
+    Ok(TempWav {
+        path,
+        _directory: directory,
+    })
 }
 
 fn create_temp_wav_path() -> Result<TempWav, String> {
-    let root = std::env::temp_dir();
-    for _ in 0..32 {
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let directory = root.join(format!("memento-audio-{}-{id}", std::process::id()));
-        match fs::create_dir(&directory) {
-            Ok(()) => {
-                return Ok(TempWav {
-                    path: directory.join("window.wav"),
-                    directory,
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "Could not create temporary audio directory: {error}"
-                ))
-            }
-        }
-    }
-    Err("Could not allocate a unique temporary audio directory.".into())
+    create_temp_media_path("memento-audio-", "window.wav", "temporary audio directory")
 }
 
 fn create_temp_mp4_path() -> Result<TempWav, String> {
-    let root = std::env::temp_dir();
-    for _ in 0..32 {
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let directory = root.join(format!("memento-anki-video-{}-{id}", std::process::id()));
-        match fs::create_dir(&directory) {
-            Ok(()) => {
-                return Ok(TempWav {
-                    path: directory.join("clip.mp4"),
-                    directory,
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "Could not create temporary Anki video directory: {error}"
-                ))
-            }
-        }
-    }
-    Err("Could not allocate a temporary Anki video directory".into())
+    create_temp_media_path(
+        "memento-anki-video-",
+        "clip.mp4",
+        "temporary Anki video directory",
+    )
 }
 
 struct MpvHandle(*mut mpv::mpv_handle);
@@ -409,6 +383,28 @@ pub(super) fn extract_audio(
             return Err("libmpv audio extraction event queue overflowed.".into());
         }
         if event_id == mpv::MPV_EVENT_END_FILE {
+            let end_file_ptr = unsafe { (*event).data as *const mpv::mpv_event_end_file };
+            if !end_file_ptr.is_null() {
+                let end_file = unsafe { &*end_file_ptr };
+                if end_file.reason == mpv::MPV_END_FILE_REASON_REDIRECT {
+                    continue;
+                }
+                if end_file.error < 0 {
+                    return Err(format!(
+                        "libmpv could not extract audio for '{}': {}",
+                        media.path,
+                        mpv_error(end_file.error)
+                    ));
+                }
+                if end_file.reason != mpv::MPV_END_FILE_REASON_EOF {
+                    return Err(format!(
+                        "libmpv ended audio extraction early (reason {})",
+                        end_file.reason
+                    ));
+                }
+            }
+            // Terminate/flush the libmpv encoder handle before checking the output WAV.
+            drop(handle);
             if !temporary.path.is_file() {
                 return Err(format!(
                     "libmpv did not create an audio clip for '{}'. Check that the selected audio track is available.",

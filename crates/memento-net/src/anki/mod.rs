@@ -359,7 +359,7 @@ impl AnkiClient
     {
         let request = self.endpoint_request(action, params)?;
         let response = self.http.send(&request).map_err(anki_http_err)?;
-        if response.status() >= 400
+        if !(200..300).contains(&response.status())
         {
             return Err(AnkiError::HttpStatus {
                 status: response.status(),
@@ -639,33 +639,24 @@ pub fn typed_status(kind: TypedReplyKind, result: &Value) -> TypedReplyStatus
         match kind
         {
             TypedReplyKind::AddMedia | TypedReplyKind::RequestStringList => {
-                let is_array = result.is_array();
-                let elements_match = is_array
-                    && result
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .all(|element| element.is_string());
+                let elements = result.as_array();
+                let is_array = elements.is_some();
+                let elements_match = elements
+                    .is_some_and(|items| items.iter().all(|element| element.is_string()));
                 (is_array, false, elements_match)
             }
             TypedReplyKind::OpenBrowse => {
-                let is_array = result.is_array();
-                let elements_match = is_array
-                    && result
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .all(|element| element.is_number());
+                let elements = result.as_array();
+                let is_array = elements.is_some();
+                let elements_match = elements
+                    .is_some_and(|items| items.iter().all(|element| element.is_number()));
                 (is_array, false, elements_match)
             }
             TypedReplyKind::RequestBoolList => {
-                let is_array = result.is_array();
-                let elements_match = is_array
-                    && result
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .all(Value::is_boolean);
+                let elements = result.as_array();
+                let is_array = elements.is_some();
+                let elements_match = elements
+                    .is_some_and(|items| items.iter().all(Value::is_boolean));
                 (is_array, false, elements_match)
             }
             TypedReplyKind::RequestInt => {

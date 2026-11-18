@@ -45,6 +45,9 @@ use super::headers::{split_header, Headers};
 /// Upper bound for a single status/header/chunk-size/trailer line before it
 /// is treated as an attack rather than a header.
 pub const MAX_LINE_BYTES: usize = 16 * 1024;
+const MAX_TRAILER_LINES: usize = 64;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+const MAX_INTERIM_RESPONSES: usize = 16;
 
 const TE_NOT_CHUNKED: &str = "unsupported transfer-encoding (only chunked is decoded)";
 const TE_WITH_CL: &str = "both transfer-encoding and content-length present";
@@ -263,6 +266,8 @@ struct ChunkState
 {
     stage: ChunkStage,
     remaining: u64,
+    trailer_lines: usize,
+    trailer_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -369,12 +374,22 @@ fn read_chunked<S: Read>(
                 let line = source.read_line(MAX_LINE_BYTES)?;
                 let line = String::from_utf8(line)
                     .map_err(|_| chunk_error("chunk size is not valid text"))?;
-                let size_token = match line.split_once(';')
+                let (size_token, has_ext) = match line.split_once(';')
                 {
-                    Some((size, _extensions)) => size,
-                    None => line.as_str(),
+                    Some((size, _extensions)) => (size, true),
+                    None => (line.as_str(), false),
                 };
-                let size = u64::from_str_radix(size_token.trim(), 16)
+                let size_token = if has_ext {
+                    size_token.trim_end_matches([' ', '\t'])
+                } else {
+                    size_token
+                };
+                if size_token.is_empty()
+                    || !size_token.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err(chunk_error("malformed chunk size"));
+                }
+                let size = u64::from_str_radix(size_token, 16)
                     .map_err(|_| chunk_error("malformed chunk size"))?;
                 if size == 0
                 {
@@ -413,6 +428,16 @@ fn read_chunked<S: Read>(
                 if line.is_empty()
                 {
                     state.stage = ChunkStage::Done;
+                }
+                else
+                {
+                    state.trailer_lines += 1;
+                    state.trailer_bytes = state.trailer_bytes.saturating_add(line.len());
+                    if state.trailer_lines > MAX_TRAILER_LINES
+                        || state.trailer_bytes > MAX_TRAILER_BYTES
+                    {
+                        return Err(chunk_error("chunk trailers exceed limit"));
+                    }
                 }
             }
         }
@@ -519,6 +544,8 @@ fn body_framing(headers: &Headers, status: u16, minor: u8) -> HttpResult<BodyKin
         return Ok(BodyKind::Chunked(ChunkState {
             stage: ChunkStage::Size,
             remaining: 0,
+            trailer_lines: 0,
+            trailer_bytes: 0,
         }));
     }
 
@@ -530,10 +557,29 @@ fn body_framing(headers: &Headers, status: u16, minor: u8) -> HttpResult<BodyKin
     Ok(BodyKind::UntilClose)
 }
 
+fn validate_content_encoding(headers: &Headers) -> HttpResult<()>
+{
+    for value in headers.get_all("content-encoding")
+    {
+        for coding in value.split(',')
+        {
+            let coding = coding.trim();
+            if !coding.is_empty() && !coding.eq_ignore_ascii_case("identity")
+            {
+                return Err(HttpError::Protocol(format!(
+                    "unsupported content-encoding: {coding}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Response
 {
     /// Parses the full head off `stream` and returns the response with a
-    /// lazy body decoder.
+    /// lazy body decoder. Interim `1xx` responses (except `101 Switching
+    /// Protocols`) are skipped cleanly.
     pub(crate) fn decode(
         stream: Box<dyn Read>,
         max_header_bytes: usize,
@@ -541,34 +587,63 @@ impl Response
     ) -> HttpResult<Self>
     {
         let mut reader = PrefillReader::new(stream);
+        let mut head_size = 0usize;
+        let mut interim_count = 0usize;
 
-        let status_bytes = reader
-            .read_line(MAX_LINE_BYTES)
-            .map_err(|err| wrap_head_io(&err))?;
-        let status_line = std::str::from_utf8(&status_bytes)
-            .map_err(|_| head_block_not_ansi("status line is not valid text"))?;
-        let StatusLine { minor, code, reason } = parse_status_line(status_line)?;
-
-        let mut headers = Headers::new();
-        let mut head_size = status_bytes.len();
-        loop
+        let (minor, code, reason, headers) = loop
         {
-            let raw = reader.read_line(MAX_LINE_BYTES).map_err(|err| wrap_head_io(&err))?;
-            head_size += raw.len();
+            let status_bytes = reader
+                .read_line(MAX_LINE_BYTES)
+                .map_err(|err| wrap_head_io(&err))?;
+            head_size = head_size.saturating_add(status_bytes.len());
             if head_size > max_header_bytes
             {
                 return Err(HttpError::Protocol(
                     "header block exceeds size limit".to_owned(),
                 ));
             }
-            let line = std::str::from_utf8(&raw)
-                .map_err(|_| head_block_not_ansi("header line is not valid text"))?;
-            if line.is_empty()
+            let status_line = std::str::from_utf8(&status_bytes)
+                .map_err(|_| head_block_not_ansi("status line is not valid text"))?;
+            let StatusLine { minor, code, reason } = parse_status_line(status_line)?;
+
+            let mut headers = Headers::new();
+            loop
             {
-                break;
+                let raw = reader.read_line(MAX_LINE_BYTES).map_err(|err| wrap_head_io(&err))?;
+                head_size = head_size.saturating_add(raw.len());
+                if head_size > max_header_bytes
+                {
+                    return Err(HttpError::Protocol(
+                        "header block exceeds size limit".to_owned(),
+                    ));
+                }
+                let line = std::str::from_utf8(&raw)
+                    .map_err(|_| head_block_not_ansi("header line is not valid text"))?;
+                if line.is_empty()
+                {
+                    break;
+                }
+                let (name, value) = split_header(line)?;
+                headers.insert(name, value);
             }
-            let (name, value) = split_header(line)?;
-            headers.insert(name, value);
+
+            if (100..200).contains(&code) && code != 101
+            {
+                interim_count += 1;
+                if interim_count > MAX_INTERIM_RESPONSES
+                {
+                    return Err(HttpError::Protocol(
+                        "too many interim 1xx responses".to_owned(),
+                    ));
+                }
+                continue;
+            }
+            break (minor, code, reason, headers);
+        };
+
+        if !is_head_request && code != 204 && code != 304
+        {
+            validate_content_encoding(&headers)?;
         }
 
         let kind = if is_head_request
@@ -912,5 +987,77 @@ mod tests
     {
         let response = decode(b"HTTP/1.1 20");
         assert!(matches!(response, Err(HttpError::Io(_))));
+    }
+
+    #[test]
+    fn interim_1xx_responses_are_skipped_until_final_response()
+    {
+        let raw = concat!(
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+        );
+        let mut response = decode(raw.as_bytes()).unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.read_all(64).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn chunked_size_rejects_plus_and_whitespace()
+    {
+        for bad in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+3\r\nabc\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n 3\r\nabc\r\n0\r\n\r\n".as_slice(),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\u{00a0}3\r\nabc\r\n0\r\n\r\n".as_bytes(),
+        ]
+        {
+            let mut response = decode(bad).unwrap();
+            let err = response.read_all(64).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn chunked_trailers_enforce_line_and_byte_bounds()
+    {
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        for i in 0..=MAX_TRAILER_LINES {
+            raw.extend_from_slice(format!("X-T{i}: v\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+        let mut response = decode(&raw).unwrap();
+        let err = response.read_all(64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut big = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+        for i in 0..3 {
+            big.extend_from_slice(format!("X-Big{i}: ").as_bytes());
+            big.extend(vec![b'a'; 6000]);
+            big.extend_from_slice(b"\r\n");
+        }
+        big.extend_from_slice(b"\r\n");
+        let mut response = decode(&big).unwrap();
+        let err = response.read_all(64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn compressed_content_encoding_is_rejected()
+    {
+        for encoding in ["gzip", "br", "deflate", "zstd", "gzip, chunked"] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: 4\r\n\r\nbody"
+            );
+            let res = decode(raw.as_bytes());
+            assert!(
+                matches!(res, Err(HttpError::Protocol(ref msg)) if msg.contains("content-encoding")),
+                "expected protocol error for {encoding}, got {res:?}"
+            );
+        }
+        let identity = decode(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\nContent-Length: 4\r\n\r\nbody",
+        )
+        .unwrap();
+        assert_eq!(identity.status(), 200);
     }
 }

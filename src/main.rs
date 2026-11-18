@@ -55,6 +55,30 @@ fn memento_xdg_dir(variable: &str, home_suffix: &str) -> Option<PathBuf> {
         .map(|root| root.join("memento"))
 }
 
+/// Migrate a legacy config file from `legacy_dir` (`~/.cache/memento`) into
+/// `config_dir` (`~/.config/memento`) if the destination does not exist yet.
+fn migrate_xdg_config_if_needed(
+    legacy_dir: &Path,
+    config_dir: &Path,
+    file_name: &str,
+) -> std::io::Result<bool> {
+    let legacy_path = legacy_dir.join(file_name);
+    let target_path = config_dir.join(file_name);
+    if legacy_path == target_path || target_path.exists() || !legacy_path.is_file() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(config_dir)?;
+    let mut source = std::fs::File::open(&legacy_path)?;
+    let mut temp = tempfile::NamedTempFile::new_in(config_dir)?;
+    std::io::copy(&mut source, temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(&target_path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error),
+    }
+}
+
 fn format_time(sec: f64) -> String {
     let total = sec.max(0.0) as i64;
     let h = total / 3600;
@@ -1845,6 +1869,13 @@ fn create_settings_session(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // libmpv requires the C numeric locale (`.` decimal separator) before initialization.
+    // SAFETY: invoked on the main thread before any worker threads or GUI/libmpv init.
+    unsafe {
+        libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+    }
+    #[cfg(feature = "ocr")]
+    controller::ocr::prepare_python_executable();
     let _ = log::set_logger(&APP_LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
     let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
@@ -1864,12 +1895,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = MementoApp::new()?;
     ui::prepare_text_fonts();
 
-    let cache_dir = memento_xdg_dir("XDG_CACHE_HOME", ".cache")
-        .ok_or("HOME or XDG_CACHE_HOME must be set to load Memento settings")?;
+    if let Some(cache_dir) = memento_xdg_dir("XDG_CACHE_HOME", ".cache") {
+        if let Err(error) = migrate_xdg_config_if_needed(&cache_dir, &config_dir, "memento.conf") {
+            eprintln!("Could not migrate player settings from {}: {error}", cache_dir.display());
+        }
+    }
     let data_dir = memento_xdg_dir("XDG_DATA_HOME", ".local/share")
         .ok_or("HOME or XDG_DATA_HOME must be set to load dictionaries")?;
     let anki_json_path = config_dir.join("anki_connect.json");
-    let config = ConfigController::load(&cache_dir, "memento.conf")
+    let config = ConfigController::load(&config_dir, "memento.conf")
         .map_err(|error| format!("could not load player settings: {error}"))?;
     config.load_anki_profiles(&anki_json_path)?;
     let config_ctrl = Rc::new(config);
@@ -1964,7 +1998,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open_dict = dict_ctrl.clone();
     let open_manager = dictionary_manager.clone();
     let open_dictionary_path = dictionary_database_path.clone();
-    let open_cache = cache_dir.clone();
+    let open_cache = config_dir.clone();
     let open_anki = anki_json_path.clone();
     let open_app = app.as_weak();
     let open_asr_session = asr_session.clone();
@@ -2013,7 +2047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selected_profile_app = app.as_weak();
     let selected_profile_config = config_ctrl.clone();
     let selected_profile_path = anki_json_path.clone();
-    let selected_profile_cache = cache_dir.clone();
+    let selected_profile_cache = config_dir.clone();
     app.on_select_anki_profile(move |name| {
         let Some(app) = selected_profile_app.upgrade() else { return };
         let result = selected_profile_config.edit_setting("anki/profile", &name)
@@ -2235,7 +2269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let initial_generation = media_generation.clone();
         let initial_media = current_media.clone();
         let initial_config = config_ctrl.clone();
-        let initial_cache = cache_dir.clone();
+        let initial_cache = config_dir.clone();
         // The first window render initializes the OpenGL context. Load the
         // command-line media only after that render has had time to run.
         slint::Timer::single_shot(std::time::Duration::from_millis(100), move || {
@@ -2263,7 +2297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open_current_media = current_media.clone();
     let open_config = config_ctrl.clone();
     let open_generation = media_generation.clone();
-    let open_cache = cache_dir.clone();
+    let open_cache = config_dir.clone();
 
     app.on_open_file(move || {
         let Some(file_path) = pick_file_with_zenity() else { return };
@@ -2308,7 +2342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recent_current = current_media.clone();
     let recent_generation = media_generation.clone();
     let recent_config = config_ctrl.clone();
-    let recent_cache = cache_dir.clone();
+    let recent_cache = config_dir.clone();
     app.on_open_recent(move |path| {
         let Some(app) = recent_app.upgrade() else { return };
         let player = recent_mpv.borrow();
@@ -2329,7 +2363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let clear_app = app.as_weak();
     let clear_config = config_ctrl.clone();
-    let clear_cache = cache_dir.clone();
+    let clear_cache = config_dir.clone();
     app.on_clear_recent(move || {
         let result = clear_config.clear_recent_files()
             .and_then(|_| clear_config.save(&clear_cache, "memento.conf"));
@@ -2536,7 +2570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let auto_app = app.as_weak();
     let auto_config = config_ctrl.clone();
-    let auto_cache = cache_dir.clone();
+    let auto_cache = config_dir.clone();
     let auto_anki = anki_json_path.clone();
     app.on_auto_pause_changed(move |enabled| {
         let result = auto_config
@@ -2555,7 +2589,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let scale_app = app.as_weak();
     let scale_config = config_ctrl.clone();
-    let scale_cache = cache_dir.clone();
+    let scale_cache = config_dir.clone();
     let scale_anki = anki_json_path.clone();
     app.on_adjust_subtitle_scale(move |delta| {
         if let Some(app) = scale_app.upgrade() {
@@ -2573,7 +2607,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let offset_app = app.as_weak();
     let offset_config = config_ctrl.clone();
-    let offset_cache = cache_dir.clone();
+    let offset_cache = config_dir.clone();
     let offset_anki = anki_json_path.clone();
     app.on_adjust_subtitle_offset(move |delta| {
         if let Some(app) = offset_app.upgrade() {
@@ -2597,7 +2631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let furigana_app = app.as_weak();
     let furigana_config = config_ctrl.clone();
-    let furigana_cache = cache_dir.clone();
+    let furigana_cache = config_dir.clone();
     let furigana_anki = anki_json_path.clone();
     app.on_furigana_visible_changed(move |visible| {
         let Some(app) = furigana_app.upgrade() else { return };
@@ -4191,4 +4225,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(render_request_tx);
     run_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod xdg_migration_tests {
+    use super::migrate_xdg_config_if_needed;
+
+    #[test]
+    fn migrates_legacy_cache_config_only_when_config_missing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let legacy_dir = root.path().join("cache/memento");
+        let config_dir = root.path().join("config/memento");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("memento.conf"), "legacy=1\n").unwrap();
+
+        assert!(migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "memento.conf").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("memento.conf")).unwrap(),
+            "legacy=1\n"
+        );
+
+        std::fs::write(config_dir.join("memento.conf"), "existing=2\n").unwrap();
+        assert!(!migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "memento.conf").unwrap());
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("memento.conf")).unwrap(),
+            "existing=2\n"
+        );
+    }
 }

@@ -69,10 +69,14 @@ const ORT_LOGGING_LEVEL_WARNING: c_int = 2;
 const ORT_ENABLE_ALL: c_int = 99;
 /// C++ `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT`.
 const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: c_int = 1;
+/// C++ `ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32`.
+const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: c_int = 6;
 /// C++ `ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64`.
 const ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: c_int = 7;
 /// C++ `ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL`.
 const ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: c_int = 9;
+/// C++ `ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16`.
+const ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: c_int = 10;
 /// C++ `OrtArenaAllocator`.
 const ORT_ARENA_ALLOCATOR: c_int = 1;
 /// C++ `OrtMemTypeDefault`.
@@ -722,23 +726,31 @@ impl Engine {
                     let element_type = shape_info.element_type()?;
                     let shape = shape_info.dimensions()?;
                     let element_count = shape_info.element_count()?;
-                    // Mirrors the C++ branch structure: bool / int64 / (else)
-                    // float, with the byte count of the chosen element type.
-                    let (tensor_element_type, element_size) = match element_type {
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => {
-                            (ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL, 1usize)
+                    let element_size = match element_type {
+                        ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => 1usize,
+                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => 2usize,
+                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                        | ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => 4usize,
+                        ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => 8usize,
+                        other => {
+                            return Err(format!(
+                                "unsupported encoder output tensor element type {other}"
+                            ));
                         }
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => {
-                            (ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, 8usize)
-                        }
-                        _ => (ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, 4usize),
                     };
+                    let byte_count = element_count
+                        .checked_mul(element_size)
+                        .ok_or_else(|| "encoder output tensor byte count overflow".to_string())?;
+                    let data = source.mutable_data()?;
+                    if byte_count > 0 && data.is_null() {
+                        return Err("encoder output tensor data pointer is null".to_string());
+                    }
                     decoder_inputs.push(create_tensor(
                         &mem_info,
-                        source.mutable_data()?,
-                        element_count * element_size,
+                        data,
+                        byte_count,
                         &shape,
-                        tensor_element_type,
+                        element_type,
                     )?);
                 }
 
@@ -758,30 +770,36 @@ impl Engine {
 
                 // Extract logits [1, seqLen, vocabSize] and find the argmax of
                 // the last position.
-                let logits = &decoder_outputs[0];
-                let logits_shape = logits.type_and_shape()?.dimensions()?;
+                let logits = decoder_outputs
+                    .first()
+                    .ok_or_else(|| "decoder returned no outputs".to_string())?;
+                let logits_info = logits.type_and_shape()?;
+                let logits_type = logits_info.element_type()?;
+                let logits_shape = logits_info.dimensions()?;
+                let logits_count = logits_info.element_count()?;
+                let batch_size = shape_at(&logits_shape, 0)?;
                 let seq_len = shape_at(&logits_shape, 1)?;
                 let vocab_size = shape_at(&logits_shape, 2)?;
-                if seq_len < 1 || vocab_size < 1 {
-                    // The C++ code reads out of bounds on such a shape; this
-                    // port fails cleanly instead.
+                if batch_size < 1 || seq_len < 1 || vocab_size < 1 {
                     return Err("decoder returned invalid logits shape".to_string());
                 }
-                let logits_index = (seq_len as i128 - 1) * vocab_size as i128;
-                let logits_index =
-                    usize::try_from(logits_index).map_err(|_| "invalid logits shape")?;
-                let logits_data = logits.mutable_data()? as *const f32;
-                let last_logits = unsafe { logits_data.add(logits_index) };
-
-                let mut next_token: i64 = 0;
-                let mut max_logit = unsafe { *last_logits };
-                for value in 1..vocab_size {
-                    let logit = unsafe { *last_logits.add(value as usize) };
-                    if logit > max_logit {
-                        max_logit = logit;
-                        next_token = value;
-                    }
-                }
+                let seq_len_usize =
+                    usize::try_from(seq_len).map_err(|_| "invalid decoder seq_len")?;
+                let vocab_usize =
+                    usize::try_from(vocab_size).map_err(|_| "invalid decoder vocab_size")?;
+                let logits_index = (seq_len_usize - 1)
+                    .checked_mul(vocab_usize)
+                    .ok_or_else(|| "invalid logits offset".to_string())?;
+                let expected_elements = seq_len_usize
+                    .checked_mul(vocab_usize)
+                    .ok_or_else(|| "invalid logits element count".to_string())?;
+                let logits_data = logits.mutable_data()?;
+                // SAFETY: `logits_data` is owned by `logits` (alive until end of loop),
+                // and `LogitsTensor::from_raw` checks type, alignment, non-null, and count.
+                let logits_tensor = unsafe {
+                    LogitsTensor::from_raw(logits_type, logits_data, logits_count, expected_elements)?
+                };
+                let next_token = logits_tensor.argmax_row(logits_index, vocab_usize)? as i64;
 
                 if next_token == initialized.config.eos_token_id
                     || next_token == initialized.config.no_speech_token_id
@@ -885,10 +903,19 @@ impl Engine {
             return Ok(RESULT_CANCELED);
         }
 
-        let logits = &ctc_outputs[0];
-        let logits_shape = logits.type_and_shape()?.dimensions()?;
+        let logits = ctc_outputs
+            .first()
+            .ok_or_else(|| "CTC session returned no outputs".to_string())?;
+        let logits_info = logits.type_and_shape()?;
+        let logits_type = logits_info.element_type()?;
+        let logits_shape = logits_info.dimensions()?;
+        let logits_count = logits_info.element_count()?;
+        let batch_size = shape_at(&logits_shape, 0)?;
         let out_frames = shape_at(&logits_shape, 1)?;
         let vocab_dim = shape_at(&logits_shape, 2)?;
+        if batch_size < 1 || out_frames < 0 || vocab_dim < 1 {
+            return Err("CTC model returned invalid logits shape".to_string());
+        }
         let blank_id =
             if initialized.config.ctc_blank_token_id >= 0 && initialized.config.ctc_blank_token_id < vocab_dim
             {
@@ -897,13 +924,36 @@ impl Engine {
                 vocab_dim - 1
             };
 
-        let logits_data = logits.mutable_data()? as *const f32;
-        let mut out_mask_data: Option<*const i64> = None;
-        if ctc_outputs.len() > 1 {
-            let mask_shape_info = ctc_outputs[1].type_and_shape()?;
-            if mask_shape_info.element_type()? == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 {
-                out_mask_data = Some(ctc_outputs[1].mutable_data()? as *const i64);
-            }
+        let out_frames_usize =
+            usize::try_from(out_frames).map_err(|_| "invalid CTC output frames".to_string())?;
+        let vocab_usize =
+            usize::try_from(vocab_dim).map_err(|_| "invalid CTC vocab dimension".to_string())?;
+        let expected_logits = out_frames_usize
+            .checked_mul(vocab_usize)
+            .ok_or_else(|| "CTC logits element count overflow".to_string())?;
+        let logits_data = logits.mutable_data()?;
+        // SAFETY: `logits_data` is owned by `logits` (alive for this function),
+        // and `LogitsTensor::from_raw` checks element type, alignment, null, and count.
+        let logits_tensor = unsafe {
+            LogitsTensor::from_raw(logits_type, logits_data, logits_count, expected_logits)?
+        };
+
+        let out_mask = if let Some(mask_val) = ctc_outputs.get(1) {
+            let mask_shape_info = mask_val.type_and_shape()?;
+            let mask_type = mask_shape_info.element_type()?;
+            let mask_count = mask_shape_info.element_count()?;
+            let mask_data = mask_val.mutable_data()?;
+            // SAFETY: `mask_data` is owned by `ctc_outputs[1]`, and `MaskTensor::from_raw`
+            // verifies type (`INT64`/`INT32`/`BOOL`), alignment, null, and count >= out_frames.
+            Some(unsafe {
+                MaskTensor::from_raw(mask_type, mask_data, mask_count, out_frames_usize)?
+            })
+        } else {
+            None
+        };
+
+        if out_frames == 0 {
+            return Ok(RESULT_SUCCESS);
         }
 
         // Duration of one subsampled CTC output frame (8 * 160 / 16000 = 0.08 s).
@@ -922,19 +972,17 @@ impl Engine {
         let mut last_non_blank_frame: i64 = -1;
         let mut prev_token: i64 = -1;
 
-        for frame in 0..out_frames {
+        for frame_idx in 0..out_frames_usize {
+            let frame = frame_idx as i64;
             let mut best_id = blank_id;
-            if out_mask_data.map_or(true, |mask| unsafe { *mask.add(frame as usize) } != 0) {
-                let row = unsafe { logits_data.add((frame * vocab_dim) as usize) };
-                best_id = 0;
-                let mut max_value = unsafe { *row };
-                for token in 1..vocab_dim {
-                    let value = unsafe { *row.add(token as usize) };
-                    if value > max_value {
-                        max_value = value;
-                        best_id = token;
-                    }
-                }
+            if out_mask
+                .as_ref()
+                .map_or(true, |mask| mask.is_active(frame_idx))
+            {
+                let row_offset = frame_idx
+                    .checked_mul(vocab_usize)
+                    .ok_or_else(|| "CTC frame offset overflow".to_string())?;
+                best_id = logits_tensor.argmax_row(row_offset, vocab_usize)? as i64;
             }
 
             if best_id == blank_id {
@@ -1542,4 +1590,310 @@ fn run(
         )
     })?;
     Ok(outputs.into_iter().map(ValueHandle).collect())
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let frac = u32::from(bits & 0x03FF);
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut e = 127u32 - 15 + 1;
+        let mut m = frac;
+        while (m & 0x0400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        return f32::from_bits(sign | (e << 23) | ((m & 0x03FF) << 13));
+    }
+    if exp == 0x1F {
+        if frac == 0 {
+            return f32::from_bits(sign | 0x7F80_0000);
+        }
+        return f32::from_bits(sign | 0x7FC0_0000 | (frac << 13));
+    }
+    f32::from_bits(sign | ((exp + 112) << 23) | (frac << 13))
+}
+
+enum LogitsTensor<'a> {
+    F32(&'a [f32]),
+    F16(&'a [u16]),
+}
+
+impl<'a> LogitsTensor<'a> {
+    unsafe fn from_raw(
+        element_type: c_int,
+        data: *const c_void,
+        element_count: usize,
+        expected_elements: usize,
+    ) -> Result<Self, String> {
+        if element_count < expected_elements {
+            return Err(format!(
+                "logits tensor element count ({element_count}) is smaller than expected ({expected_elements})"
+            ));
+        }
+        if expected_elements == 0 {
+            return match element_type {
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => Ok(Self::F32(&[])),
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => Ok(Self::F16(&[])),
+                other => Err(format!("unsupported logits tensor element type {other}")),
+            };
+        }
+        if data.is_null() {
+            return Err("logits tensor data pointer is null".to_string());
+        }
+        match element_type {
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => {
+                if (data as usize) % std::mem::align_of::<f32>() != 0 {
+                    return Err("logits tensor f32 pointer is unaligned".to_string());
+                }
+                Ok(Self::F32(std::slice::from_raw_parts(
+                    data as *const f32,
+                    expected_elements,
+                )))
+            }
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => {
+                if (data as usize) % std::mem::align_of::<u16>() != 0 {
+                    return Err("logits tensor f16 pointer is unaligned".to_string());
+                }
+                Ok(Self::F16(std::slice::from_raw_parts(
+                    data as *const u16,
+                    expected_elements,
+                )))
+            }
+            other => Err(format!("unsupported logits tensor element type {other}")),
+        }
+    }
+
+    fn argmax_row(&self, row_offset: usize, row_len: usize) -> Result<usize, String> {
+        if row_len == 0 {
+            return Err("logits row length must be positive".to_string());
+        }
+        let end = row_offset
+            .checked_add(row_len)
+            .ok_or_else(|| "logits row offset overflow".to_string())?;
+        match self {
+            Self::F32(slice) => {
+                let row = slice
+                    .get(row_offset..end)
+                    .ok_or_else(|| "logits row out of bounds".to_string())?;
+                let mut best_idx = 0usize;
+                let mut max_val = row[0];
+                for (idx, &val) in row.iter().enumerate().skip(1) {
+                    if val > max_val {
+                        max_val = val;
+                        best_idx = idx;
+                    }
+                }
+                Ok(best_idx)
+            }
+            Self::F16(slice) => {
+                let row = slice
+                    .get(row_offset..end)
+                    .ok_or_else(|| "logits row out of bounds".to_string())?;
+                let mut best_idx = 0usize;
+                let mut max_val = f16_to_f32(row[0]);
+                for (idx, &bits) in row.iter().enumerate().skip(1) {
+                    let val = f16_to_f32(bits);
+                    if val > max_val {
+                        max_val = val;
+                        best_idx = idx;
+                    }
+                }
+                Ok(best_idx)
+            }
+        }
+    }
+}
+
+enum MaskTensor<'a> {
+    I64(&'a [i64]),
+    I32(&'a [i32]),
+    Bool(&'a [u8]),
+}
+
+impl<'a> MaskTensor<'a> {
+    unsafe fn from_raw(
+        element_type: c_int,
+        data: *const c_void,
+        element_count: usize,
+        expected_frames: usize,
+    ) -> Result<Self, String> {
+        if element_count < expected_frames {
+            return Err(format!(
+                "CTC mask element count ({element_count}) is smaller than output frames ({expected_frames})"
+            ));
+        }
+        if expected_frames == 0 {
+            return match element_type {
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => Ok(Self::I64(&[])),
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => Ok(Self::I32(&[])),
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => Ok(Self::Bool(&[])),
+                other => Err(format!("unsupported CTC mask element type {other}")),
+            };
+        }
+        if data.is_null() {
+            return Err("CTC mask tensor data pointer is null".to_string());
+        }
+        match element_type {
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => {
+                if (data as usize) % std::mem::align_of::<i64>() != 0 {
+                    return Err("CTC mask i64 pointer is unaligned".to_string());
+                }
+                Ok(Self::I64(std::slice::from_raw_parts(
+                    data as *const i64,
+                    expected_frames,
+                )))
+            }
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => {
+                if (data as usize) % std::mem::align_of::<i32>() != 0 {
+                    return Err("CTC mask i32 pointer is unaligned".to_string());
+                }
+                Ok(Self::I32(std::slice::from_raw_parts(
+                    data as *const i32,
+                    expected_frames,
+                )))
+            }
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => Ok(Self::Bool(std::slice::from_raw_parts(
+                data as *const u8,
+                expected_frames,
+            ))),
+            other => Err(format!("unsupported CTC mask element type {other}")),
+        }
+    }
+
+    fn is_active(&self, frame: usize) -> bool {
+        match self {
+            Self::I64(slice) => slice.get(frame).is_some_and(|&v| v != 0),
+            Self::I32(slice) => slice.get(frame).is_some_and(|&v| v != 0),
+            Self::Bool(slice) => slice.get(frame).is_some_and(|&v| v != 0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_to_f32_decodes_normals_subnormals_and_specials() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xC000), -2.0);
+        assert_eq!(f16_to_f32(0x0001), 2.0f32.powi(-24));
+        assert!(f16_to_f32(0x7C00).is_infinite());
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn logits_tensor_validates_type_and_bounds_before_reading() {
+        let data = [0.1f32, 0.9, 0.2, 0.4];
+        let err = unsafe {
+            LogitsTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                data.as_ptr().cast(),
+                4,
+                4,
+            )
+        };
+        assert!(err.is_err());
+
+        let short = unsafe {
+            LogitsTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                data.as_ptr().cast(),
+                3,
+                4,
+            )
+        };
+        assert!(short.is_err());
+
+        let ok = unsafe {
+            LogitsTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                data.as_ptr().cast(),
+                4,
+                4,
+            )
+            .unwrap()
+        };
+        assert_eq!(ok.argmax_row(0, 2).unwrap(), 1);
+        assert_eq!(ok.argmax_row(2, 2).unwrap(), 1);
+
+        let fp16_data = [0x3C00u16, 0x4000u16, 0xC000u16]; // 1.0, 2.0, -2.0
+        let fp16 = unsafe {
+            LogitsTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+                fp16_data.as_ptr().cast(),
+                3,
+                3,
+            )
+            .unwrap()
+        };
+        assert_eq!(fp16.argmax_row(0, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn mask_tensor_validates_type_and_supports_i64_i32_bool() {
+        let i64_mask = [1i64, 0, 1];
+        let m64 = unsafe {
+            MaskTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                i64_mask.as_ptr().cast(),
+                3,
+                3,
+            )
+            .unwrap()
+        };
+        assert!(m64.is_active(0));
+        assert!(!m64.is_active(1));
+
+        let i32_mask = [0i32, 1];
+        let m32 = unsafe {
+            MaskTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+                i32_mask.as_ptr().cast(),
+                2,
+                2,
+            )
+            .unwrap()
+        };
+        assert!(!m32.is_active(0));
+        assert!(m32.is_active(1));
+
+        let bool_mask = [1u8, 0];
+        let mb = unsafe {
+            MaskTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+                bool_mask.as_ptr().cast(),
+                2,
+                2,
+            )
+            .unwrap()
+        };
+        assert!(mb.is_active(0));
+        assert!(!mb.is_active(1));
+
+        let short = unsafe {
+            MaskTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                i64_mask.as_ptr().cast(),
+                2,
+                3,
+            )
+        };
+        assert!(short.is_err());
+
+        let bad_type = unsafe {
+            MaskTensor::from_raw(
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                i64_mask.as_ptr().cast(),
+                3,
+                3,
+            )
+        };
+        assert!(bad_type.is_err());
+    }
 }
