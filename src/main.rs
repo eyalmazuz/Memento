@@ -26,10 +26,20 @@ use ui::{subtitle_lines_from_words, subtitle_token_width};
 use controller::anki::AnkiController;
 use controller::config::ConfigController;
 use controller::dict::DictController;
-use controller::subtitles::{MemorySubtitleCue, SubtitleController, SubtitleTrackInfo, ASR_TRACK_ID};
+use controller::player::{
+    clear_primary_subtitle, compute_video_render_size, effective_media_title,
+    refresh_subtitle_list, refresh_subtitle_marks, LivePlayerCoordinator, MouseInputForwarder,
+};
+#[cfg(test)]
+use controller::player::{
+    clear_subtitle_marks_on_advance, sync_player_tracks as sync_player_tracks_with_asr,
+};
+use controller::subtitles::{SubtitleController, ExternalSubtitleLoad};
+#[cfg(test)]
+use controller::subtitles::{MemorySubtitleCue, ASR_TRACK_ID};
 use controller::dictmanager::{DictionaryManager, InstalledDictionary};
 use memento_config::Value;
-use memento_player::MpvInstance;
+use memento_player::{MpvInstance, PlaylistLoad};
 use memento_setting::keys as raw;
 
 struct AppLogger;
@@ -115,34 +125,84 @@ fn latest_release() -> Result<String, String> {
         .ok_or_else(|| "GitHub did not return a release tag".to_string())
 }
 
-/// Read a subtitle file supporting UTF-8 (with or without BOM), UTF-16 LE/BE, and lossy UTF-8.
-fn read_subtitle_file(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
-    if bytes.starts_with(b"\xef\xbb\xbf") {
-        return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+/// Decode subtitle file bytes supporting UTF-8 (with or without BOM),
+/// UTF-16 LE/BE (with or without BOM, including CJK leading characters), and
+/// lossy UTF-8 fallback.
+fn decode_subtitle_bytes(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        return String::from_utf8_lossy(rest).into_owned();
     }
-    if bytes.starts_with(b"\xff\xfe") {
-        let u16s: Vec<u16> = bytes[2..]
+    if let Some(rest) = bytes.strip_prefix(b"\xff\xfe") {
+        let u16s: Vec<u16> = rest
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
-        return Ok(String::from_utf16_lossy(&u16s));
+        return String::from_utf16_lossy(&u16s);
     }
-    if bytes.starts_with(b"\xfe\xff") {
-        let u16s: Vec<u16> = bytes[2..]
+    if let Some(rest) = bytes.strip_prefix(b"\xfe\xff") {
+        let u16s: Vec<u16> = rest
             .chunks_exact(2)
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect();
-        return Ok(String::from_utf16_lossy(&u16s));
+        return String::from_utf16_lossy(&u16s);
     }
-    if bytes.len() >= 4 && bytes[1] == 0 && bytes[3] == 0 {
-        let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        return Ok(String::from_utf16_lossy(&u16s));
+    if !bytes.contains(&0) {
+        if let Ok(utf8) = std::str::from_utf8(bytes) {
+            return utf8.to_owned();
+        }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    if bytes.len() >= 2 && bytes.len() % 2 == 0 {
+        let sample_len = bytes.len().min(4096) & !1;
+        let sample = &bytes[..sample_len];
+        let total_pairs = sample.len() / 2;
+        let mut le_newlines = 0usize;
+        let mut be_newlines = 0usize;
+        let mut le_ascii = 0usize;
+        let mut be_ascii = 0usize;
+        for chunk in sample.chunks_exact(2) {
+            if chunk[1] == 0 {
+                if matches!(chunk[0], b'\n' | b'\r') {
+                    le_newlines += 1;
+                }
+                if matches!(chunk[0], b'\t' | b'\n' | b'\r' | 0x20..=0x7e) {
+                    le_ascii += 1;
+                }
+            }
+            if chunk[0] == 0 {
+                if matches!(chunk[1], b'\n' | b'\r') {
+                    be_newlines += 1;
+                }
+                if matches!(chunk[1], b'\t' | b'\n' | b'\r' | 0x20..=0x7e) {
+                    be_ascii += 1;
+                }
+            }
+        }
+        let looks_like_utf16 = le_newlines > 0
+            || be_newlines > 0
+            || ((le_ascii + be_ascii) * 4 >= total_pairs && (le_ascii >= 2 || be_ascii >= 2));
+        if looks_like_utf16 {
+            let u16s: Vec<u16> = if (le_newlines, le_ascii) >= (be_newlines, be_ascii) {
+                bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect()
+            } else {
+                bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .collect()
+            };
+            return String::from_utf16_lossy(&u16s);
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Read a subtitle file supporting UTF-8 (with or without BOM), UTF-16 LE/BE, and lossy UTF-8.
+fn read_subtitle_file(path: &Path) -> Result<String, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    Ok(decode_subtitle_bytes(&bytes))
 }
 
 fn parse_lenient_timecode(s: &str) -> Option<f64> {
@@ -287,16 +347,77 @@ fn parse_external_subtitles(path: &Path) -> Result<Vec<memento_subtitle::Subtitl
     Err(format!("Could not parse subtitle file: {}", path.display()))
 }
 
-fn track_label(id: i64, language: &str, title: &str) -> String {
-    let mut label = format!("Track {id}");
-    if !language.is_empty() {
-        label.push_str(&format!(" [{language}]"));
+#[allow(clippy::too_many_arguments)]
+fn load_playlist_into(
+    app: &MementoApp,
+    player: &MpvInstance,
+    loads: &[PlaylistLoad],
+    media_generation: &Cell<u64>,
+    shared_media_generation: &AtomicU64,
+    coordinator: Option<&RefCell<Option<LivePlayerCoordinator>>>,
+    keep_paused: bool,
+) -> Result<Option<String>, String> {
+    let mut subtitle_paths = Vec::new();
+    let mut media_entries = Vec::new();
+    for entry in loads {
+        if entry.path.is_empty() {
+            continue;
+        }
+        if controller::player::is_subtitle_file(entry.path.as_str()) {
+            subtitle_paths.push(entry.path.clone());
+        } else {
+            media_entries.push(entry);
+        }
     }
-    if !title.is_empty() {
-        label.push_str(" - ");
-        label.push_str(title);
+    if media_entries.is_empty() {
+        for sub_path in &subtitle_paths {
+            player.command(&["sub-add", sub_path])?;
+        }
+        return Ok(None);
     }
-    label
+    let mut first_media_path: Option<String> = None;
+    for entry in media_entries {
+        if first_media_path.is_none() {
+            player.pause()?;
+            let mut opts = entry.options.clone();
+            for sub_path in &subtitle_paths {
+                opts.push(format!("sub-files-append={sub_path}"));
+            }
+            player.load_file_with_options(&entry.path, false, &opts)?;
+            first_media_path = Some(entry.path.clone());
+        } else {
+            player.load_file_with_options(&entry.path, true, &entry.options)?;
+        }
+    }
+    let Some(first_path) = first_media_path else {
+        return Ok(None);
+    };
+    let next_gen = media_generation.get().wrapping_add(1);
+    media_generation.set(next_gen);
+    shared_media_generation.store(next_gen, Ordering::Release);
+    if let Some(coord_cell) = coordinator {
+        if let Ok(mut guard) = coord_cell.try_borrow_mut() {
+            if let Some(coord) = guard.as_mut() {
+                coord.mark_explicit_media_load(next_gen);
+            }
+        }
+    }
+    if keep_paused {
+        app.set_pending_playback_generation(-1);
+        app.set_is_playing(false);
+    } else if player.is_opengl_active() {
+        app.set_pending_playback_generation((next_gen & i32::MAX as u64) as i32);
+        app.set_is_playing(true);
+    } else {
+        app.set_pending_playback_generation(-1);
+        player.play()?;
+        app.set_is_playing(true);
+    }
+    let title = effective_media_title("", &first_path);
+    app.set_media_title(title.into());
+    app.set_secondary_sub_text("".into());
+    clear_primary_subtitle(app);
+    Ok(Some(first_path))
 }
 
 fn load_media_into(
@@ -304,25 +425,22 @@ fn load_media_into(
     player: &MpvInstance,
     path: &str,
     media_generation: &Cell<u64>,
+    shared_media_generation: &AtomicU64,
+    coordinator: Option<&RefCell<Option<LivePlayerCoordinator>>>,
 ) -> Result<(), String> {
-    player.pause()?;
-    player.load_file(path)?;
-    media_generation.set(media_generation.get().wrapping_add(1));
-    if player.is_opengl_active() {
-        app.set_pending_playback_generation((media_generation.get() & i32::MAX as u64) as i32);
-    } else {
-        app.set_pending_playback_generation(-1);
-        player.play()?;
-    }
-    app.set_is_playing(true);
-    let title = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path);
-    app.set_media_title(title.into());
-    app.set_active_sub_text("".into());
-    app.set_secondary_sub_text("".into());
-    app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
-    app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
-    app.set_selected_token_index(-1);
-    app.invoke_dismiss_definition();
+    let single = [PlaylistLoad {
+        path: path.to_owned(),
+        options: Vec::new(),
+    }];
+    load_playlist_into(
+        app,
+        player,
+        &single,
+        media_generation,
+        shared_media_generation,
+        coordinator,
+        false,
+    )?;
     Ok(())
 }
 
@@ -630,6 +748,7 @@ struct GlVideoSurface {
     gl: glow::Context,
     texture: Option<glow::NativeTexture>,
     framebuffer: Option<glow::NativeFramebuffer>,
+    internal_format: i32,
     size: (u32, u32),
 }
 
@@ -642,44 +761,48 @@ impl GlVideoSurface {
         if let Err(error) = player.configure_opengl_decoder(&renderer) {
             eprintln!("Could not configure video decoder interop: {error}");
         }
-        Self { gl, texture: None, framebuffer: None, size: (0, 0) }
+        Self {
+            gl,
+            texture: None,
+            framebuffer: None,
+            internal_format: glow::RGBA8 as i32,
+            size: (0, 0),
+        }
+    }
+
+    fn should_reallocate(&self, requested: (u32, u32)) -> bool {
+        if self.texture.is_none() || self.framebuffer.is_none() || self.size == (0, 0) {
+            return true;
+        }
+        if self.size == requested {
+            return false;
+        }
+        if requested.0 > self.size.0 || requested.1 > self.size.1 {
+            return true;
+        }
+        let aspect_diff = (u64::from(requested.0) * u64::from(self.size.1))
+            .abs_diff(u64::from(self.size.0) * u64::from(requested.1));
+        if aspect_diff > u64::from(self.size.0.max(requested.0)) * 2 {
+            return true;
+        }
+        requested.0 + 64 <= self.size.0 || requested.1 + 64 <= self.size.1
     }
 
     fn ensure_size(&mut self, size: (u32, u32)) -> Result<(), String> {
-        if self.size == size { return Ok(()); }
-        let gl = &self.gl;
-        unsafe {
-            let old_framebuffer = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
-            let old_texture = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
-            if self.texture.is_none() {
-                self.texture = Some(gl.create_texture().map_err(|error| error.to_string())?);
-            }
-            if self.framebuffer.is_none() {
-                self.framebuffer = Some(gl.create_framebuffer().map_err(|error| error.to_string())?);
-            }
-            let texture = self.texture.expect("created GL texture");
-            let framebuffer = self.framebuffer.expect("created GL framebuffer");
-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-            gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                size.0 as i32, size.1 as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(None));
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D, Some(texture), 0);
-            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-            gl.bind_framebuffer(glow::FRAMEBUFFER,
-                std::num::NonZeroU32::new(old_framebuffer as u32).map(glow::NativeFramebuffer));
-            gl.bind_texture(glow::TEXTURE_2D,
-                std::num::NonZeroU32::new(old_texture as u32).map(glow::NativeTexture));
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                return Err(format!("video framebuffer is incomplete: 0x{status:x}"));
-            }
-            self.size = size;
+        if !self.should_reallocate(size) {
+            return Ok(());
         }
+        let target = video_gl::create_video_fbo_texture(
+            &self.gl,
+            self.texture,
+            self.framebuffer,
+            size.0,
+            size.1,
+        )?;
+        self.texture = Some(target.texture);
+        self.framebuffer = Some(target.framebuffer);
+        self.internal_format = target.internal_format;
+        self.size = size;
         Ok(())
     }
 
@@ -695,7 +818,12 @@ impl GlVideoSurface {
     fn render(&self, player: &MpvInstance) -> Result<(), String> {
         let Some(framebuffer) = self.framebuffer else { return Ok(()) };
         video_gl::with_saved_state(&self.gl, || {
-            player.render_opengl(framebuffer.0.get(), self.size.0, self.size.1)
+            player.render_opengl_with_format(
+                framebuffer.0.get(),
+                self.size.0,
+                self.size.1,
+                self.internal_format,
+            )
         })
     }
 
@@ -707,20 +835,118 @@ impl GlVideoSurface {
     }
 }
 
-fn video_render_size(app: &MementoApp, player: &MpvInstance) -> (u32, u32) {
-    if app.get_video_width() <= 0 || app.get_video_height() <= 0 { return (0, 0); }
-    let (vw, vh) = player.cached_video_dimensions();
-    let scale = app.window().scale_factor();
-    let viewport_w = ((app.get_video_width() as f32 * scale).round() as u32).max(1);
-    let viewport_h = ((app.get_video_height() as f32 * scale).round() as u32).max(1);
-    if vw > 0 && vh > 0 {
-        let ratio = (viewport_w as f64 / vw as f64)
-            .min(viewport_h as f64 / vh as f64).min(1.0);
-        (((vw as f64 * ratio).round() as u32).max(1),
-         ((vh as f64 * ratio).round() as u32).max(1))
-    } else {
-        (viewport_w, viewport_h)
+fn native_window_display_pointers(
+    window: &slint::Window,
+) -> (Option<*mut std::ffi::c_void>, Option<*mut std::ffi::c_void>) {
+    use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+    let handle = window.window_handle();
+    let Ok(display) = handle.display_handle() else {
+        return (None, None);
+    };
+    match display.as_raw() {
+        RawDisplayHandle::Xlib(xlib) => (xlib.display.map(|p| p.as_ptr()), None),
+        RawDisplayHandle::Wayland(wl) => (None, Some(wl.display.as_ptr())),
+        _ => (None, None),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn build_owned_gl_proc_resolver(
+    scoped: &dyn Fn(&std::ffi::CStr) -> *const std::ffi::c_void,
+    prefer_wayland_egl: bool,
+) -> Option<impl Fn(&std::ffi::CStr) -> *const std::ffi::c_void + Send + Sync + 'static> {
+    type GetProcFn = unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void;
+    type GetCtxFn = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+
+    unsafe fn noload_sym(
+        libs: &[&std::ffi::CStr],
+        sym: &std::ffi::CStr,
+    ) -> *const std::ffi::c_void {
+        for lib in libs {
+            let handle =
+                unsafe { libc::dlopen(lib.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+            if !handle.is_null() {
+                let ptr = unsafe { libc::dlsym(handle, sym.as_ptr()) };
+                unsafe { libc::dlclose(handle) };
+                if !ptr.is_null() {
+                    return ptr;
+                }
+            }
+        }
+        std::ptr::null()
+    }
+
+    let lookup_meta = |sym: &std::ffi::CStr, libs: &[&std::ffi::CStr]| -> *const std::ffi::c_void {
+        let direct = scoped(sym);
+        if !direct.is_null() {
+            direct
+        } else {
+            unsafe { noload_sym(libs, sym) }
+        }
+    };
+
+    let egl_libs: &[&std::ffi::CStr] = &[c"libEGL.so.1", c"libEGL.so"];
+    let glx_libs: &[&std::ffi::CStr] = &[c"libGLX.so.0", c"libGL.so.1", c"libGLX.so"];
+
+    let try_egl = || -> Option<GetProcFn> {
+        let ctx_fn_ptr = lookup_meta(c"eglGetCurrentContext", egl_libs);
+        let proc_fn_ptr = lookup_meta(c"eglGetProcAddress", egl_libs);
+        if proc_fn_ptr.is_null() {
+            return None;
+        }
+        if !ctx_fn_ptr.is_null() {
+            let get_ctx: GetCtxFn = unsafe { std::mem::transmute(ctx_fn_ptr) };
+            if unsafe { get_ctx() }.is_null() && !prefer_wayland_egl {
+                return None;
+            }
+        } else if !prefer_wayland_egl {
+            return None;
+        }
+        Some(unsafe { std::mem::transmute(proc_fn_ptr) })
+    };
+
+    let try_glx = || -> Option<GetProcFn> {
+        let ctx_fn_ptr = lookup_meta(c"glXGetCurrentContext", glx_libs);
+        let mut proc_fn_ptr = lookup_meta(c"glXGetProcAddressARB", glx_libs);
+        if proc_fn_ptr.is_null() {
+            proc_fn_ptr = lookup_meta(c"glXGetProcAddress", glx_libs);
+        }
+        if proc_fn_ptr.is_null() {
+            return None;
+        }
+        if !ctx_fn_ptr.is_null() {
+            let get_ctx: GetCtxFn = unsafe { std::mem::transmute(ctx_fn_ptr) };
+            if unsafe { get_ctx() }.is_null() {
+                return None;
+            }
+        }
+        Some(unsafe { std::mem::transmute(proc_fn_ptr) })
+    };
+
+    let loader = if prefer_wayland_egl {
+        try_egl().or_else(try_glx)
+    } else {
+        try_glx().or_else(try_egl)
+    }?;
+
+    Some(move |name: &std::ffi::CStr| unsafe {
+        let ptr = loader(name.as_ptr());
+        if !ptr.is_null() {
+            ptr
+        } else {
+            libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr())
+        }
+    })
+}
+
+fn video_render_size(app: &MementoApp, player: &MpvInstance, opengl_active: bool) -> (u32, u32) {
+    compute_video_render_size(
+        app.get_video_width(),
+        app.get_video_height(),
+        app.window().scale_factor(),
+        player.cached_video_dimensions(),
+        opengl_active,
+    )
 }
 
 impl Drop for VideoRenderWorker {
@@ -775,52 +1001,6 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
 }
 
 
-fn refresh_subtitle_list(app: &MementoApp, model: &VecModel<SubEntry>, subtitles: &SubtitleController) {
-    let query = app.get_subtitle_search_query();
-    let matching = if query.trim().is_empty() { Vec::new() } else { subtitles.search(&query, true) };
-    let active = subtitles.active_indices(subtitles.primary_sid());
-    let rows: Vec<SubEntry> = subtitles.primary_entries().iter().enumerate().map(|(index, cue)| SubEntry {
-        id: (index + 1) as i32,
-        start: cue.start as f32,
-        end: cue.end as f32,
-        text: String::from_utf16_lossy(&cue.text).into(),
-        selected: subtitles.is_selected(index),
-        is_active: active.contains(&index),
-        search_match: matching.contains(&index),
-    }).collect();
-    model.set_vec(rows);
-}
-
-fn refresh_subtitle_marks(model: &VecModel<SubEntry>, subtitles: &SubtitleController) {
-    for index in 0..model.row_count() {
-        if let Some(mut row) = model.row_data(index) {
-            let selected = subtitles.is_selected(index);
-            if row.selected != selected {
-                row.selected = selected;
-                model.set_row_data(index, row);
-            }
-        }
-    }
-}
-
-fn clear_subtitle_marks_on_advance(
-    model: &VecModel<SubEntry>, subtitles: &mut SubtitleController,
-    previous: &mut Option<(i64, f64)>, paused: bool,
-) {
-    let sid = subtitles.primary_sid();
-    if previous.is_some_and(|(previous_sid, _)| previous_sid != sid) { *previous = None; }
-    // Keep the last cue across gaps. Cue times, rather than row indices or
-    // text, distinguish repeated lines without reacting to ASR insertions.
-    if let Some(current) = subtitles.active_cue().map(|cue| (sid, cue.start)) {
-        let advanced = previous.is_some_and(|previous| previous != current);
-        *previous = Some(current);
-        if advanced && !paused && !subtitles.selected_indices().is_empty() {
-            subtitles.clear_selection();
-            refresh_subtitle_marks(model, subtitles);
-        }
-    }
-}
-
 fn install_subtitle_selection(
     app: &MementoApp,
     subtitles: Rc<RefCell<SubtitleController>>,
@@ -869,22 +1049,6 @@ fn install_subtitle_selection(
             }
         }
     });
-}
-
-fn refresh_active_rows(
-    model: &VecModel<SubEntry>,
-    previous: &[usize],
-    active: &[usize],
-) {
-    for index in previous.iter().chain(active) {
-        if let Some(mut row) = model.row_data(*index) {
-            let now_active = active.contains(index);
-            if row.is_active != now_active {
-                row.is_active = now_active;
-                model.set_row_data(*index, row);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1060,31 +1224,74 @@ mod subtitle_layout_tests {
                 id: 1, text: "ASR".encode_utf16().collect(), start: 1.0, end: 3.0,
             }, 2.0);
         }
+        app.set_asr_track_selected(true);
         app.set_asr_running(true);
         let mut state = memento_player::mpv::PlaybackState::default();
         state.position = 2.0;
         let mut audio = Vec::new();
         let mut tracks = Vec::new();
-        sync_player_tracks(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks);
+        let _ = sync_player_tracks_with_asr(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks, None);
         assert_eq!(subtitles.borrow().primary_sid(), ASR_TRACK_ID);
         assert_eq!(subtitles.borrow().active_cue_text().as_deref(), Some("ASR"));
+        // Worker completion/pause (`asr_running = false`) keeps ASR cues visible while `asr_track_selected` stays true.
         app.set_asr_running(false);
+        let _ = sync_player_tracks_with_asr(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks, None);
+        assert_eq!(subtitles.borrow().primary_sid(), ASR_TRACK_ID);
+        assert_eq!(subtitles.borrow().active_cue_text().as_deref(), Some("ASR"));
+        // Deselecting ASR switches cleanly to track 2.
+        app.set_asr_track_selected(false);
         state.primary_sid = 2;
-        sync_player_tracks(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks);
+        let _ = sync_player_tracks_with_asr(&app, &state, &mut subtitles.borrow_mut(), &rows, &mut audio, &mut tracks, None);
         assert_eq!(rows.row_data(0).unwrap().text, "File");
         app.set_active_sub_text("File".into());
-        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart);
+        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart, None, None);
         assert_eq!(app.get_active_sub_text(), "File");
         assert_eq!(rows.row_data(0).unwrap().text, "File");
         assert!(!restart.get());
         assert!(!subtitles.borrow_mut().resume_asr_track(2.0));
         // Reset while ASR is selected queues a fresh model and clears its view.
         subtitles.borrow_mut().start_asr_track();
+        app.set_asr_track_selected(true);
         app.set_asr_running(true);
-        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart);
+        clear_asr_for_settings(&app, &asr, &subtitles, &rows, &restart, None, None);
         assert!(restart.get());
+        assert!(app.get_asr_track_selected());
+        assert!(!app.get_asr_running());
         assert!(rows.row_count() == 0);
         assert!(app.get_active_sub_text().is_empty());
+    }
+
+    #[test]
+    fn bomless_utf16_and_utf8_cjk_subtitle_files_decode_accurately() {
+        // Leading CJK character `一` (U+4E00 -> LE `[0x00, 0x4E]`, BE `[0x4E, 0x00]`)
+        // has a zero byte in the first code unit and non-ASCII first character!
+        let sample = "一話「旅立ち」\n1\n00:00:01,000 --> 00:00:03,000\n世界を旅する\n";
+        let utf16le: Vec<u8> = sample.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16be: Vec<u8> = sample.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        assert_eq!(decode_subtitle_bytes(&utf16le), sample);
+        assert_eq!(decode_subtitle_bytes(&utf16be), sample);
+        assert_eq!(decode_subtitle_bytes(sample.as_bytes()), sample);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let srt_le = dir.path().join("cjk_le.srt");
+        let srt_be = dir.path().join("cjk_be.srt");
+        let srt_content = "1\n00:00:01,000 --> 00:00:03,000\n一話「旅立ち」\n";
+        std::fs::write(
+            &srt_le,
+            srt_content.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        std::fs::write(
+            &srt_be,
+            srt_content.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let cues_le = parse_external_subtitles(&srt_le).unwrap();
+        let cues_be = parse_external_subtitles(&srt_be).unwrap();
+        assert_eq!(cues_le.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&cues_le[0].text), "一話「旅立ち」");
+        assert_eq!(cues_be.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&cues_be[0].text), "一話「旅立ち」");
     }
 
     #[test]
@@ -1108,77 +1315,6 @@ mod subtitle_layout_tests {
         }
         assert_eq!(rebuilt, "生前に世界中を旅行して集めた遺品が");
     }
-}
-
-
-
-fn sync_player_tracks(
-    app: &MementoApp,
-    state: &memento_player::mpv::PlaybackState,
-    subtitles: &mut SubtitleController,
-    subtitle_rows: &VecModel<SubEntry>,
-    previous_audio: &mut Vec<memento_player::AudioTrack>,
-    previous_subtitles: &mut Vec<memento_player::SubtitleTrack>,
-) {
-    let audio = &state.audio_tracks;
-    if audio != previous_audio {
-        let rows: Vec<PlayerTrack> = audio.iter().filter_map(|track| {
-            Some(PlayerTrack {
-                id: i32::try_from(track.id).ok()?,
-                label: track_label(track.id, &track.language, &track.title).into(),
-                selected: track.selected,
-            })
-        }).collect();
-        app.set_audio_tracks(Rc::new(VecModel::from(rows)).into());
-        previous_audio.clone_from(audio);
-    }
-    app.set_audio_id(i32::try_from(state.audio_id).unwrap_or(0));
-
-    let tracks = &state.subtitle_tracks;
-    if tracks != previous_subtitles {
-        let ui_tracks: Vec<PlayerTrack> = tracks.iter().filter_map(|track| {
-            Some(PlayerTrack {
-                id: i32::try_from(track.id).ok()?,
-                label: track_label(track.id, &track.language, &track.title).into(),
-                selected: track.selected,
-            })
-        }).collect();
-        app.set_subtitle_tracks(Rc::new(VecModel::from(ui_tracks)).into());
-        let info: Vec<SubtitleTrackInfo> = tracks.iter().map(|track| SubtitleTrackInfo {
-            id: track.id,
-            external: track.external,
-            external_path: track.external_path.clone(),
-        }).collect();
-        for load in subtitles.sync_tracks(&info) {
-            match parse_external_subtitles(&load.path) {
-                Ok(cues) => {
-                    subtitles.set_external_cues(
-                        load.track_id, &load.path.to_string_lossy(), cues,
-                    );
-                }
-                Err(error) => {
-                    subtitles.set_external_cues(
-                        load.track_id, &load.path.to_string_lossy(), Vec::new(),
-                    );
-                    app.set_status_message(error.into());
-                }
-            }
-        }
-        previous_subtitles.clone_from(tracks);
-        refresh_subtitle_list(app, subtitle_rows, subtitles);
-    }
-    let primary = if app.get_asr_running() { ASR_TRACK_ID } else { state.primary_sid };
-    if subtitles.primary_sid() != primary {
-        if primary == ASR_TRACK_ID { subtitles.resume_asr_track(state.position); }
-        else { subtitles.set_primary_sid(primary); }
-        refresh_subtitle_list(app, subtitle_rows, subtitles);
-    }
-    let secondary = state.secondary_sid;
-    if subtitles.secondary_sid() != secondary {
-        subtitles.set_secondary_sid(secondary);
-    }
-    app.set_primary_sid(i32::try_from(state.primary_sid).unwrap_or(0));
-    app.set_secondary_sid(i32::try_from(secondary).unwrap_or(0));
 }
 
 fn keyboard_chord(
@@ -1362,26 +1498,33 @@ fn clear_asr_for_settings(
     subtitles: &Rc<RefCell<SubtitleController>>,
     subtitle_model: &Rc<VecModel<SubEntry>>,
     restart_pending: &Rc<Cell<bool>>,
+    mpv: Option<&Rc<RefCell<Option<MpvInstance>>>>,
+    coordinator: Option<&Rc<RefCell<Option<LivePlayerCoordinator>>>>,
 ) {
-    let selected = app.get_asr_running();
+    let selected = app.get_asr_track_selected() || app.get_asr_running();
     let restart = selected && app.get_asr_enabled();
     asr.borrow_mut().cancel();
+    if let Some(coord_rc) = coordinator {
+        if let Ok(mut coord_guard) = coord_rc.try_borrow_mut() {
+            if let Some(coord) = coord_guard.as_mut() {
+                let player_guard = mpv.and_then(|p| p.try_borrow().ok());
+                let player_ref = player_guard.as_deref().and_then(Option::as_ref);
+                coord.remove_asr_track(player_ref);
+            }
+        }
+    }
     let mut subtitles = subtitles.borrow_mut();
     subtitles.clear_asr_track();
     refresh_subtitle_list(app, subtitle_model, &subtitles);
     app.set_asr_running(false);
+    app.set_asr_track_selected(restart);
     restart_pending.set(restart);
-    if selected { clear_primary_subtitle(app); }
+    if selected {
+        clear_primary_subtitle(app);
+    }
 }
 
-fn clear_primary_subtitle(app: &MementoApp) {
-    app.set_active_sub_text("".into());
-    app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
-    app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
-    app.set_subtitle_furigana_pending(false);
-    app.invoke_dismiss_definition();
-}
-
+#[allow(clippy::too_many_arguments)]
 fn create_settings_session(
     app: &MementoApp,
     config_ctrl: Rc<ConfigController>,
@@ -1395,6 +1538,8 @@ fn create_settings_session(
     subtitles: Rc<RefCell<SubtitleController>>,
     subtitle_model: Rc<VecModel<SubEntry>>,
     asr_restart_pending: Rc<Cell<bool>>,
+    mpv: Rc<RefCell<Option<MpvInstance>>>,
+    coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
 ) -> Result<SettingsSession, slint::PlatformError> {
     let settings = SettingsWindow::new()?;
     settings.set_ocr_built(cfg!(feature = "ocr"));
@@ -1497,6 +1642,8 @@ fn create_settings_session(
     let apply_subtitles = subtitles.clone();
     let apply_subtitle_model = subtitle_model.clone();
     let apply_restart = asr_restart_pending.clone();
+    let apply_mpv = mpv.clone();
+    let apply_coord = coordinator.clone();
     settings.on_apply_settings(move |category| {
         let result =
             apply_config.apply_settings(category, &apply_cache, "memento.conf", &apply_anki);
@@ -1531,7 +1678,7 @@ fn create_settings_session(
                     let unchanged = controller::asr::AsrSettings::from_config(config_dir, &apply_config.store())
                         .is_ok_and(|settings| apply_asr.borrow().matches_settings(&settings));
                     if !unchanged {
-                        clear_asr_for_settings(&app, &apply_asr, &apply_subtitles, &apply_subtitle_model, &apply_restart);
+                        clear_asr_for_settings(&app, &apply_asr, &apply_subtitles, &apply_subtitle_model, &apply_restart, Some(&apply_mpv), Some(&apply_coord));
                     }
                 }
             }
@@ -1549,6 +1696,8 @@ fn create_settings_session(
     let reset_subtitles = subtitles.clone();
     let reset_subtitle_model = subtitle_model.clone();
     let reset_restart = asr_restart_pending.clone();
+    let reset_mpv = mpv.clone();
+    let reset_coord = coordinator.clone();
     settings.on_reset_settings(move |category| {
         let result =
             reset_config.reset_settings(category, &reset_cache, "memento.conf", &reset_anki);
@@ -1568,7 +1717,7 @@ fn create_settings_session(
                     ),
                 );
                 if category == 8 {
-                    clear_asr_for_settings(&app, &reset_asr, &reset_subtitles, &reset_subtitle_model, &reset_restart);
+                    clear_asr_for_settings(&app, &reset_asr, &reset_subtitles, &reset_subtitle_model, &reset_restart, Some(&reset_mpv), Some(&reset_coord));
                 }
             }
             if category == 4 {
@@ -1591,12 +1740,14 @@ fn create_settings_session(
     let defaults_subtitles = subtitles.clone();
     let defaults_subtitle_model = subtitle_model.clone();
     let defaults_restart = asr_restart_pending.clone();
+    let defaults_mpv = mpv.clone();
+    let defaults_coord = coordinator.clone();
     settings.on_defaults_settings(move |category| {
         let result = defaults_config.defaults_settings(category);
         if result.is_ok() && category == 8 {
             if let Some(app) = defaults_app.upgrade() {
                 app.set_asr_enabled(controller::asr::AVAILABLE && setting_enabled(&defaults_config, raw::asr::GROUP, raw::asr::ENABLED, raw::asr::ENABLED_DEFAULT));
-                clear_asr_for_settings(&app, &defaults_asr, &defaults_subtitles, &defaults_subtitle_model, &defaults_restart);
+                clear_asr_for_settings(&app, &defaults_asr, &defaults_subtitles, &defaults_subtitle_model, &defaults_restart, Some(&defaults_mpv), Some(&defaults_coord));
             }
         }
         report_settings(
@@ -1874,18 +2025,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
     }
+    let raw_args: Vec<String> = std::env::args().collect();
+    let parsed_args = memento_player::parse_args(&raw_args)
+        .map_err(|err| format!("invalid command-line arguments: {err:?}"))?;
+    if parsed_args.show_help {
+        print!("{}", memento_player::help_text());
+        return Ok(());
+    }
+    if parsed_args.show_version {
+        println!("{}", memento_player::version_text(env!("CARGO_PKG_VERSION")));
+        return Ok(());
+    }
     #[cfg(feature = "ocr")]
     controller::ocr::prepare_python_executable();
     let _ = log::set_logger(&APP_LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
     let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
         .ok_or("HOME or XDG_CONFIG_HOME must be set to load Anki profiles")?;
-    // Read effective mpv options before creating the UI's GL context. On a
-    // hybrid system a direct decoder needs the matching rendering device.
-    let mpv = MpvInstance::new_software(Some(&config_dir));
-    if let Ok(player) = &mpv {
-        graphics_device::select_for_decoder(player.configured_hwdec());
-    }
+    // Pre-select matching GPU offload env vars from CLI `--hwdec=...` / `mpv.conf`
+    // BEFORE creating Slint's OpenGL context or initializing libmpv.
+    graphics_device::select_for_config_dir(&config_dir);
     // libmpv shares the UI's context. On desktop platforms prefer desktop GL
     // with the driver's supported version, rather than Slint's GLES 2 default.
     // An explicitly selected Slint backend (including software) still wins.
@@ -1931,16 +2090,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // mpv renders into a Slint image, never into the toplevel native window:
     // a native child would occlude the OSC, subtitles and dictionary popup.
-    let args: Vec<String> = std::env::args().collect();
-    let mpv = match mpv {
-        Ok(instance) => Rc::new(RefCell::new(Some(instance))),
+    let (mpv, coordinator) = match MpvInstance::new_with_options(
+        Some(&config_dir),
+        &parsed_args.global_options,
+    ) {
+        Ok(instance) => {
+            let coord = LivePlayerCoordinator::new(&instance);
+            (
+                Rc::new(RefCell::new(Some(instance))),
+                Rc::new(RefCell::new(Some(coord))),
+            )
+        }
         Err(err) => {
             eprintln!("Could not initialize video playback: {err}");
-            Rc::new(RefCell::new(None))
+            (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)))
         }
     };
     let video_timings = Rc::new(RefCell::new(VideoTimings::default()));
     let pending_playback_frame = Rc::new(Cell::new(None::<i32>));
+    let current_render_size = Rc::new(Cell::new((0u32, 0u32)));
     let start_player = mpv.clone();
     let start_app = app.as_weak();
     app.on_video_load_presented(move |generation| {
@@ -2005,6 +2173,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open_subtitles = sub_ctrl.clone();
     let open_subtitle_model = sub_model.clone();
     let open_asr_restart = asr_restart_pending.clone();
+    let open_settings_mpv = mpv.clone();
+    let open_settings_coord = coordinator.clone();
     app.on_open_options(move || {
         let Some(app) = open_app.upgrade() else { return };
         if settings_on_open.borrow().is_none() {
@@ -2021,6 +2191,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 open_subtitles.clone(),
                 open_subtitle_model.clone(),
                 open_asr_restart.clone(),
+                open_settings_mpv.clone(),
+                open_settings_coord.clone(),
             ) {
                 Ok(session) => *settings_on_open.borrow_mut() = Some(session),
                 Err(error) => {
@@ -2062,6 +2234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let current_media: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let media_generation = Rc::new(Cell::new(0u64));
+    let shared_media_generation = Arc::new(AtomicU64::new(0));
     // Timestamp formatting callback
     app.on_format_timestamp(|sec| format_time(sec as f64).into());
 
@@ -2237,9 +2410,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let pointer_app = app.as_weak();
     let pointer_osc_timer = osc_timer.clone();
+    let pointer_mpv = mpv.clone();
+    let pointer_coord = coordinator.clone();
+    let pointer_render_size = current_render_size.clone();
     let last_pointer = Rc::new(Cell::new(None::<(f32, f32)>));
     app.on_pointer_moved(move |x, y| {
         let Some(app) = pointer_app.upgrade() else { return };
+        if !app.get_dict_open() && !app.get_menu_open() && !app.get_ocr_mode() && !app.get_about_open() {
+            if let (Ok(player_ref), Ok(mut coord_ref)) =
+                (pointer_mpv.try_borrow(), pointer_coord.try_borrow_mut())
+            {
+                if let (Some(player), Some(coord)) = (player_ref.as_ref(), coord_ref.as_mut()) {
+                    let (mx, my) = MouseInputForwarder::map_to_render_coords(
+                        x,
+                        y,
+                        app.get_video_width() as f32,
+                        app.get_video_height() as f32,
+                        app.window().scale_factor(),
+                        pointer_render_size.get(),
+                    );
+                    coord.mouse.send_move(player, mx, my);
+                }
+            }
+        }
         let minimum = app.get_osc_min_move().max(0) as f32;
         let last = last_pointer.get();
         if last.is_some_and(|(old_x, old_y)| {
@@ -2252,6 +2445,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pointer_osc_timer.set_interval(std::time::Duration::from_millis(app.get_osc_duration_ms() as u64));
         pointer_osc_timer.restart();
     });
+    let button_app = app.as_weak();
+    let button_mpv = mpv.clone();
+    let button_coord = coordinator.clone();
+    let button_render_size = current_render_size.clone();
+    app.on_video_pointer_button(move |x, y, qt_button, pressed, control, shift, alt, meta| {
+        let Some(app) = button_app.upgrade() else { return };
+        let (Ok(player_ref), Ok(mut coord_ref)) =
+            (button_mpv.try_borrow(), button_coord.try_borrow_mut())
+        else {
+            return;
+        };
+        let (Some(player), Some(coord)) = (player_ref.as_ref(), coord_ref.as_mut()) else {
+            return;
+        };
+        if qt_button <= 0 {
+            coord.mouse.release_all(player);
+            return;
+        }
+        let (mx, my) = MouseInputForwarder::map_to_render_coords(
+            x,
+            y,
+            app.get_video_width() as f32,
+            app.get_video_height() as f32,
+            app.window().scale_factor(),
+            button_render_size.get(),
+        );
+        let modifiers = MouseInputForwarder::modifiers_mask(control, shift, alt, meta);
+        coord
+            .mouse
+            .send_button(player, mx, my, qt_button as u32, modifiers, pressed);
+    });
+    let wheel_app = app.as_weak();
+    let wheel_mpv = mpv.clone();
+    let wheel_coord = coordinator.clone();
+    let wheel_render_size = current_render_size.clone();
+    app.on_video_wheel(move |x, y, delta_x, delta_y| {
+        let Some(app) = wheel_app.upgrade() else { return };
+        let (Ok(player_ref), Ok(mut coord_ref)) =
+            (wheel_mpv.try_borrow(), wheel_coord.try_borrow_mut())
+        else {
+            return;
+        };
+        let (Some(player), Some(coord)) = (player_ref.as_ref(), coord_ref.as_mut()) else {
+            return;
+        };
+        let (mx, my) = MouseInputForwarder::map_to_render_coords(
+            x,
+            y,
+            app.get_video_width() as f32,
+            app.get_video_height() as f32,
+            app.window().scale_factor(),
+            wheel_render_size.get(),
+        );
+        coord.mouse.send_wheel(player, mx, my, delta_x, delta_y);
+    });
     let activity_app = app.as_weak();
     let activity_osc_timer = osc_timer.clone();
     app.on_osc_activity(move || {
@@ -2261,42 +2509,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         activity_osc_timer.restart();
     });
 
-    let initial_file = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
-
-    if let Some(file_str) = initial_file {
+    let cli_keep_paused = parsed_args.global_options.iter().any(|opt| {
+        opt.name == "pause" && matches!(opt.value.trim(), "yes" | "true" | "1")
+    });
+    let pending_initial_loads: Rc<RefCell<Option<Vec<PlaylistLoad>>>> = Rc::new(RefCell::new(
+        (!parsed_args.loads.is_empty()).then_some(parsed_args.loads),
+    ));
+    let trigger_initial_loads: Rc<dyn Fn()> = {
         let initial_app = app.as_weak();
         let initial_mpv = mpv.clone();
+        let initial_coord = coordinator.clone();
         let initial_generation = media_generation.clone();
+        let initial_shared_gen = shared_media_generation.clone();
         let initial_media = current_media.clone();
         let initial_config = config_ctrl.clone();
         let initial_cache = config_dir.clone();
-        // The first window render initializes the OpenGL context. Load the
-        // command-line media only after that render has had time to run.
-        slint::Timer::single_shot(std::time::Duration::from_millis(100), move || {
-            let Some(app) = initial_app.upgrade() else { return };
-            let player_ref = initial_mpv.borrow();
-            let Some(player) = player_ref.as_ref() else { return };
-            match load_media_into(&app, player, &file_str, &initial_generation) {
-                Ok(()) => {
-                    *initial_media.borrow_mut() = Some(file_str.clone());
-                    if Path::new(&file_str).is_file() {
-                        if let Err(error) = record_recent_media(&app, &initial_config, &initial_cache, &file_str) {
-                            eprintln!("Cannot save recent media: {error}");
+        let initial_loads = pending_initial_loads.clone();
+        Rc::new(move || {
+            let Some(loads) = initial_loads.borrow_mut().take() else {
+                return;
+            };
+            let app_weak = initial_app.clone();
+            let mpv_rc = initial_mpv.clone();
+            let coord_rc = initial_coord.clone();
+            let gen_rc = initial_generation.clone();
+            let shared_gen = initial_shared_gen.clone();
+            let media_rc = initial_media.clone();
+            let cfg_rc = initial_config.clone();
+            let cache_path = initial_cache.clone();
+            slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                let player_ref = mpv_rc.borrow();
+                let Some(player) = player_ref.as_ref() else { return };
+                match load_playlist_into(
+                    &app,
+                    player,
+                    &loads,
+                    &gen_rc,
+                    &shared_gen,
+                    Some(&coord_rc),
+                    cli_keep_paused,
+                ) {
+                    Ok(Some(first_path)) => {
+                        *media_rc.borrow_mut() = Some(first_path.clone());
+                        if Path::new(&first_path).is_file() {
+                            if let Err(error) =
+                                record_recent_media(&app, &cfg_rc, &cache_path, &first_path)
+                            {
+                                eprintln!("Cannot save recent media: {error}");
+                            }
                         }
                     }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("Cannot open CLI media: {error}"),
                 }
-                Err(error) => eprintln!("Cannot open {}: {error}", file_str),
-            }
-        });
-    }
+            });
+        })
+    };
 
     let weak_app = app.as_weak();
     let open_mpv = mpv.clone();
+    let open_coord = coordinator.clone();
     let open_sub_ctrl = sub_ctrl.clone();
     let open_sub_model = sub_model.clone();
     let open_current_media = current_media.clone();
     let open_config = config_ctrl.clone();
     let open_generation = media_generation.clone();
+    let open_shared_gen = shared_media_generation.clone();
     let open_cache = config_dir.clone();
 
     app.on_open_file(move || {
@@ -2308,19 +2589,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_status_message("Playback backend unavailable".into());
             return;
         };
-        let is_subtitle = file_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "srt" | "ass" | "ssa" | "vtt")
-            });
-        if is_subtitle {
+        if controller::player::is_subtitle_file(file_path.as_path()) {
             if let Err(error) = player.command(&["sub-add", &file_str]) {
                 app.set_status_message(format!("Could not add subtitles: {error}").into());
             }
             return;
         }
-        match load_media_into(&app, player, &file_str, &open_generation) {
+        match load_media_into(
+            &app,
+            player,
+            &file_str,
+            &open_generation,
+            &open_shared_gen,
+            Some(&open_coord),
+        ) {
             Ok(()) => {
                 *open_current_media.borrow_mut() = Some(file_str.clone());
                 open_sub_ctrl.borrow_mut().clear();
@@ -2337,17 +2619,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let recent_app = app.as_weak();
     let recent_mpv = mpv.clone();
+    let recent_coord = coordinator.clone();
     let recent_subs = sub_ctrl.clone();
     let recent_model = sub_model.clone();
     let recent_current = current_media.clone();
     let recent_generation = media_generation.clone();
+    let recent_shared_gen = shared_media_generation.clone();
     let recent_config = config_ctrl.clone();
     let recent_cache = config_dir.clone();
     app.on_open_recent(move |path| {
         let Some(app) = recent_app.upgrade() else { return };
         let player = recent_mpv.borrow();
         let Some(player) = player.as_ref() else { return };
-        match load_media_into(&app, player, &path, &recent_generation) {
+        match load_media_into(
+            &app,
+            player,
+            &path,
+            &recent_generation,
+            &recent_shared_gen,
+            Some(&recent_coord),
+        ) {
             Ok(()) => {
                 *recent_current.borrow_mut() = Some(path.to_string());
                 recent_subs.borrow_mut().clear();
@@ -2396,23 +2687,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let seek_mpv = mpv.clone();
+    let seek_coord = coordinator.clone();
+    let seek_asr = asr_session.clone();
     app.on_seek_to(move |sec| {
         if let Some(mpv_inst) = &*seek_mpv.borrow() {
-            let _ = mpv_inst.seek(sec as f64);
+            let target = (sec as f64).max(0.0);
+            if mpv_inst.seek(target).is_ok() {
+                if let (Ok(mut coord_ref), Ok(mut asr)) =
+                    (seek_coord.try_borrow_mut(), seek_asr.try_borrow_mut())
+                {
+                    if let Some(coord) = coord_ref.as_mut() {
+                        coord.notify_user_seek(&mut asr, Some(target), mpv_inst.get_duration());
+                    }
+                }
+            }
         }
     });
 
     let rel_seek_mpv = mpv.clone();
+    let rel_seek_coord = coordinator.clone();
+    let rel_seek_asr = asr_session.clone();
     app.on_seek_relative(move |delta| {
         if let Some(mpv_inst) = &*rel_seek_mpv.borrow() {
-            let _ = mpv_inst.seek_relative(delta as f64);
+            let dur = mpv_inst.get_duration();
+            let target = (mpv_inst.get_position() + delta as f64).clamp(0.0, dur.max(0.0));
+            if mpv_inst.seek_relative(delta as f64).is_ok() {
+                if let (Ok(mut coord_ref), Ok(mut asr)) =
+                    (rel_seek_coord.try_borrow_mut(), rel_seek_asr.try_borrow_mut())
+                {
+                    if let Some(coord) = coord_ref.as_mut() {
+                        coord.notify_user_seek(&mut asr, Some(target), dur);
+                    }
+                }
+            }
         }
     });
 
     let sub_seek_mpv = mpv.clone();
+    let sub_seek_coord = coordinator.clone();
+    let sub_seek_asr = asr_session.clone();
     app.on_sub_seek(move |direction| {
         if let Some(mpv_inst) = &*sub_seek_mpv.borrow() {
-            let _ = mpv_inst.subtitle_seek(direction, true);
+            if mpv_inst.subtitle_seek(direction, true).is_ok() {
+                if let (Ok(mut coord_ref), Ok(mut asr)) =
+                    (sub_seek_coord.try_borrow_mut(), sub_seek_asr.try_borrow_mut())
+                {
+                    if let Some(coord) = coord_ref.as_mut() {
+                        coord.notify_user_seek(&mut asr, None, mpv_inst.get_duration());
+                    }
+                }
+            }
         }
     });
     let prev_mpv = mpv.clone();
@@ -2447,6 +2771,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let primary_mpv = mpv.clone();
+    let primary_coord = coordinator.clone();
     let primary_subs = sub_ctrl.clone();
     let primary_sub_model = sub_model.clone();
     let primary_app = app.as_weak();
@@ -2458,10 +2783,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {
                     primary_asr.borrow_mut().suspend();
                     primary_asr_restart.set(false);
+                    if let Ok(mut coord_ref) = primary_coord.try_borrow_mut() {
+                        if let Some(coord) = coord_ref.as_mut() {
+                            coord.reset_auto_pause();
+                        }
+                    }
                     let mut subtitles = primary_subs.borrow_mut();
                     subtitles.set_primary_sid(id.into());
                     if let Some(app) = primary_app.upgrade() {
                         refresh_subtitle_list(&app, &primary_sub_model, &subtitles);
+                        app.set_asr_track_selected(false);
                         app.set_asr_running(false);
                         app.set_primary_sid(id);
                         clear_primary_subtitle(&app);
@@ -2490,6 +2821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let select_asr_app = app.as_weak();
     let select_asr_mpv = mpv.clone();
+    let select_asr_coord = coordinator.clone();
     let select_asr_config = config_ctrl.clone();
     let select_asr_session = asr_session.clone();
     let select_asr_restart = asr_restart_pending.clone();
@@ -2497,76 +2829,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let select_asr_sub_model = sub_model.clone();
     app.on_select_asr(move || {
         let Some(app) = select_asr_app.upgrade() else { return };
+        let Some(player) = &*select_asr_mpv.borrow() else {
+            app.set_status_message("Playback backend unavailable".into());
+            return;
+        };
+        let mut coord_ref = select_asr_coord.borrow_mut();
+        let Some(coord) = coord_ref.as_mut() else { return };
         let mut asr = select_asr_session.borrow_mut();
-        if app.get_asr_running() {
-            asr.suspend();
-            select_asr_restart.set(false);
-            app.set_asr_running(false);
-            let mut subtitles = select_asr_sub_ctrl.borrow_mut();
-            subtitles.set_primary_sid(0);
-            refresh_subtitle_list(&app, &select_asr_sub_model, &subtitles);
-            clear_primary_subtitle(&app);
-            app.set_status_message("ASR paused; subtitles and model kept in memory".into());
-            return;
-        }
-        if app.get_duration() <= 0.0 {
-            app.set_status_message("Open a video before starting ASR subtitles".into());
-            return;
-        }
-        let Some(player) = &*select_asr_mpv.borrow() else { return };
-        let Some(media_ctx) = player.capture_encode_context() else {
-            app.set_status_message("No media loaded or no audio track selected".into());
-            return;
-        };
-        let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
-            .unwrap_or_else(|| PathBuf::from("."));
-        let settings = match controller::asr::AsrSettings::from_config(&config_dir, &*select_asr_config.store()) {
-            Ok(s) => s,
-            Err(err) => {
-                app.set_status_message(err.into());
-                return;
-            }
-        };
-        let gpu_unavailable = settings.backend == controller::asr::AsrBackend::Whisper
-            && settings.whisper.use_gpu
-            && settings.whisper.gpu_device.max(0) as usize >= controller::asr::whisper_gpu_device_count();
-        let media = controller::media::MediaContext::new(media_ctx.path, media_ctx.audio_id);
-        let pos = player.get_position();
-        let dur = player.get_duration();
-        match asr.start(settings, media, dur, pos) {
-            Ok(session) => {
-                if let Err(error) = player.set_sid(0) {
-                    if session == controller::asr::SessionStart::Resumed { asr.suspend(); }
-                    else { asr.cancel(); }
-                    app.set_status_message(format!("Could not select ASR subtitles: {error}").into());
-                    return;
-                }
-                let mut subtitles = select_asr_sub_ctrl.borrow_mut();
-                match session {
-                    controller::asr::SessionStart::New => subtitles.start_asr_track(),
-                    controller::asr::SessionStart::Resumed => { subtitles.resume_asr_track(pos); }
-                }
-                select_asr_restart.set(false);
-                clear_primary_subtitle(&app);
-                refresh_subtitle_list(&app, &select_asr_sub_model, &subtitles);
-                app.set_primary_sid(0);
-                app.set_asr_running(true);
-                app.set_status_message(if session == controller::asr::SessionStart::Resumed {
-                    "ASR resumed with saved subtitles"
-                } else if gpu_unavailable {
-                    "Whisper GPU unavailable; transcribing on CPU. Check GPU driver and CUDA/Vulkan build."
-                } else {
-                    "ASR subtitles started…"
-                }.into());
-            }
-            Err(err) if err.contains("still stopping") => {
-                select_asr_sub_ctrl.borrow_mut().clear_asr_track();
-                refresh_subtitle_list(&app, &select_asr_sub_model, &select_asr_sub_ctrl.borrow());
-                select_asr_restart.set(true);
-                app.set_status_message("Reloading ASR for the current media and settings…".into());
-            }
-            Err(err) => { app.set_status_message(err.into()); }
-        }
+        let mut subtitles = select_asr_sub_ctrl.borrow_mut();
+        coord.toggle_or_start_asr(
+            &app,
+            player,
+            &mut asr,
+            &mut subtitles,
+            &select_asr_sub_model,
+            &select_asr_restart,
+            || {
+                let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+                    .unwrap_or_else(|| PathBuf::from("."));
+                controller::asr::AsrSettings::from_config(&config_dir, &*select_asr_config.store())
+            },
+        );
     });
     let auto_app = app.as_weak();
     let auto_config = config_ctrl.clone();
@@ -2648,6 +2931,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_set_volume(move |vol| {
         if let Some(mpv_inst) = &*vol_mpv.borrow() {
             let _ = mpv_inst.set_volume(vol as f64);
+            if vol > 0.0 {
+                let _ = mpv_inst.command_async(&["set", "mute", "no"]);
+            }
         }
     });
 
@@ -2655,13 +2941,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak_mute = app.as_weak();
     let mute_mpv = mpv.clone();
     app.on_toggle_mute(move || {
-        if let Some(app) = weak_mute.upgrade() {
+        if let Some(mpv_inst) = &*mute_mpv.borrow() {
+            let _ = mpv_inst.command_async(&["cycle", "mute"]);
+        } else if let Some(app) = weak_mute.upgrade() {
             let vol = app.get_volume();
-            let new_vol = if vol > 0.0 { 0.0 } else { 100.0 };
-            app.set_volume(new_vol);
-            if let Some(mpv_inst) = &*mute_mpv.borrow() {
-                let _ = mpv_inst.set_volume(new_vol as f64);
-            }
+            app.set_volume(if vol > 0.0 { 0.0 } else { 100.0 });
         }
     });
 
@@ -2672,6 +2956,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let new_vol = (app.get_volume() + 5.0).min(100.0);
             app.set_volume(new_vol);
             if let Some(mpv_inst) = &*vup_mpv.borrow() {
+                let _ = mpv_inst.command_async(&["set", "mute", "no"]);
                 let _ = mpv_inst.set_volume(new_vol as f64);
             }
         }
@@ -2691,9 +2976,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak_url = app.as_weak();
     let url_mpv = mpv.clone();
+    let url_coord = coordinator.clone();
     let url_current = current_media.clone();
     let url_subs = sub_ctrl.clone();
     let url_generation = media_generation.clone();
+    let url_shared_gen = shared_media_generation.clone();
     let url_model = sub_model.clone();
     app.on_open_url(move || {
         let Some(app) = weak_url.upgrade() else { return };
@@ -2711,7 +2998,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if url.is_empty() { return }
         if let Some(player) = &*url_mpv.borrow() {
-            match load_media_into(&app, player, &url, &url_generation) {
+            match load_media_into(
+                &app,
+                player,
+                &url,
+                &url_generation,
+                &url_shared_gen,
+                Some(&url_coord),
+            ) {
                 Ok(()) => {
                     *url_current.borrow_mut() = Some(url);
                     url_subs.borrow_mut().clear();
@@ -2724,16 +3018,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reload_app = app.as_weak();
     let reload_mpv = mpv.clone();
+    let reload_coord = coordinator.clone();
     let reload_current = current_media.clone();
     let reload_subs = sub_ctrl.clone();
     let reload_generation = media_generation.clone();
+    let reload_shared_gen = shared_media_generation.clone();
     let reload_model = sub_model.clone();
     app.on_reload_media(move || {
         let Some(app) = reload_app.upgrade() else { return };
-        let current = reload_current.borrow();
+        let current = reload_current.borrow().clone();
         let Some(path) = current.as_deref() else { return };
         if let Some(player) = &*reload_mpv.borrow() {
-            match load_media_into(&app, player, path, &reload_generation) {
+            match load_media_into(
+                &app,
+                player,
+                path,
+                &reload_generation,
+                &reload_shared_gen,
+                Some(&reload_coord),
+            ) {
                 Ok(()) => {
                     reload_subs.borrow_mut().clear();
                     reload_model.set_vec(Vec::new());
@@ -2745,22 +3048,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak_close = app.as_weak();
     let close_mpv = mpv.clone();
+    let close_coord = coordinator.clone();
     let close_sub_ctrl = sub_ctrl.clone();
     let close_sub_model = sub_model.clone();
     let close_current = current_media.clone();
     let close_generation = media_generation.clone();
+    let close_shared_gen = shared_media_generation.clone();
     let close_asr = asr_session.clone();
     app.on_close_media(move || {
-        if let Some(mpv_inst) = &*close_mpv.borrow() {
-            let _ = mpv_inst.command(&["stop"]);
+        {
+            let player_ref = close_mpv.borrow();
+            if let Some(mpv_inst) = player_ref.as_ref() {
+                if let Ok(mut coord_ref) = close_coord.try_borrow_mut() {
+                    if let Some(coord) = coord_ref.as_mut() {
+                        coord.remove_asr_track(Some(mpv_inst));
+                    }
+                }
+                let _ = mpv_inst.command(&["stop"]);
+            }
         }
         close_asr.borrow_mut().cancel();
-        close_generation.set(close_generation.get().wrapping_add(1));
+        let next_gen = close_generation.get().wrapping_add(1);
+        close_generation.set(next_gen);
+        close_shared_gen.store(next_gen, Ordering::Release);
         *close_current.borrow_mut() = None;
         close_sub_ctrl.borrow_mut().clear();
         close_sub_model.set_vec(Vec::new());
         if let Some(app) = weak_close.upgrade() {
             app.set_pending_playback_generation(-1);
+            app.set_asr_track_selected(false);
             app.set_asr_running(false);
             app.set_media_title("".into());
             app.set_position(0.0);
@@ -2793,6 +3109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         quit_asr.borrow_mut().begin_shutdown();
         if let Some(app) = quit_app.upgrade() {
             app.invoke_dismiss_definition();
+            app.set_asr_track_selected(false);
             app.set_asr_running(false);
             app.set_pending_playback_generation(-1);
             app.set_status_message("Closing Memento — stopping speech recognition…".into());
@@ -3593,188 +3910,284 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     });
-    // ── 100ms Playback Synchronization Timer ────────────────────────────────
-    let timer = slint::Timer::default();
-    let weak_timer_app = app.as_weak();
-    let timer_mpv = mpv.clone();
-    let timer_sub_ctrl = sub_ctrl.clone();
-    let timer_sub_model = sub_model.clone();
-    let timer_media_generation = media_generation.clone();
-    let timer_lookup_epoch = lookup_epoch.clone();
-    let timer_asr = asr_session.clone();
-    let timer_asr_config = config_ctrl.clone();
-    let timer_asr_restart = asr_restart_pending.clone();
-    let timer_closing = closing.clone();
-    let timer_hover_owned = hover_pause_owned.clone();
-    let timer_furigana_sender = furigana_sender.clone();
-    let timer_furigana_epoch = furigana_epoch.clone();
-    let mut previous_audio = Vec::new();
-    let mut previous_tracks = Vec::new();
-    let mut previous_lines = Vec::new();
-    let mut previous_context_cue = None;
-    let mut previous_primary_text = String::new();
-    let mut previous_secondary_text = String::new();
-    let mut previous_sub_times = (0.0, 0.0);
-    let mut previous_auto_pause = false;
-    let mut previous_mpv_subtitles_hidden: Option<bool> = None;
-    let mut previous_furigana_visible = app.get_furigana_visible();
-    let mut previous_subtitle_layout: Option<(i32, i32, u32, bool)> = None;
-    let mut auto_pause_state = memento_player::AutoPauseState::default();
-    let mut poll_number = 0usize;
-    let mut observed_media_generation = u64::MAX;
-    let mut status_message_ticks = 0usize;
-    let mut last_observed_status = slint::SharedString::default();
-    let timer_video_timings = video_timings.clone();
-    let timer_pending_frame = pending_playback_frame.clone();
-    let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
-    let mut last_video_report = std::time::Instant::now();
-    let mut previous_drops = (0, 0);
-    let mut last_sync = std::time::Instant::now();
-    let mut previous_video_dimensions = (0, 0);
+    // ── Async External Subtitle Parser Worker ───────────────────────────────
+    let (ext_sub_sender, ext_sub_receiver) =
+        std::sync::mpsc::channel::<(u64, ExternalSubtitleLoad)>();
+    let ext_sub_app = app.as_weak();
+    let ext_sub_shared_gen = shared_media_generation.clone();
+    let ext_sub_ui_gen = media_generation.clone();
+    let ext_sub_ctrl = sub_ctrl.clone();
+    let ext_sub_model = sub_model.clone();
+    let ext_sub_coord = coordinator.clone();
+    // Move Send-only clones into the parser worker; UI Rc handles stay inside upgrade_in_event_loop?
+    // Wait: upgrade_in_event_loop requires a `Send` closure! Use a result channel or thread_local UI sink!
+    let (ext_parsed_tx, ext_parsed_rx) = std::sync::mpsc::channel::<(
+        u64,
+        i64,
+        String,
+        Result<Vec<memento_subtitle::SubtitleEntry>, String>,
+    )>();
+    std::thread::spawn(move || {
+        while let Ok((generation, load)) = ext_sub_receiver.recv() {
+            if ext_sub_shared_gen.load(Ordering::Acquire) != generation {
+                continue;
+            }
+            let parsed = parse_external_subtitles(&load.path);
+            if ext_sub_shared_gen.load(Ordering::Acquire) != generation {
+                continue;
+            }
+            let path_str = load.path.to_string_lossy().into_owned();
+            if ext_parsed_tx
+                .send((generation, load.track_id, path_str, parsed))
+                .is_ok()
+            {
+                let _ = slint::invoke_from_event_loop(|| {
+                    EXTERNAL_SUBTITLE_SINK.with(|slot| {
+                        let cb = slot.borrow().clone();
+                        if let Some(apply) = cb {
+                            apply();
+                        }
+                    });
+                });
+            }
+        }
+    });
 
+    thread_local! {
+        static EXTERNAL_SUBTITLE_SINK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+        static MPV_EVENT_SYNC: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+    }
 
-    timer.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(100),
-        move || {
-            if timer_closing.get() { return; }
+    EXTERNAL_SUBTITLE_SINK.with(|slot| {
+        let app_weak = ext_sub_app.clone();
+        let ui_gen = ext_sub_ui_gen.clone();
+        let subs_rc = ext_sub_ctrl.clone();
+        let model_rc = ext_sub_model.clone();
+        let coord_rc = ext_sub_coord.clone();
+        *slot.borrow_mut() = Some(Rc::new(move || {
+            while let Ok((generation, track_id, path_str, result)) = ext_parsed_rx.try_recv() {
+                let Some(app) = app_weak.upgrade() else {
+                    continue;
+                };
+                if ui_gen.get() != generation {
+                    continue;
+                }
+                let Ok(mut subtitles) = subs_rc.try_borrow_mut() else {
+                    continue;
+                };
+                match result {
+                    Ok(cues) => {
+                        subtitles.set_external_cues(track_id, &path_str, cues);
+                    }
+                    Err(error) => {
+                        subtitles.set_external_cues(track_id, &path_str, Vec::new());
+                        app.set_status_message(error.into());
+                    }
+                }
+                if let Ok(coord_guard) = coord_rc.try_borrow() {
+                    if let Some(coord) = coord_guard.as_ref() {
+                        let st = coord.playback_state();
+                        let speed = st.sub_speed.max(f64::EPSILON);
+                        let raw_primary = (st.position - st.sub_delay) / speed;
+                        let raw_secondary = (st.position - st.secondary_sub_delay) / speed;
+                        subtitles.update_positions(raw_primary, raw_secondary);
+                    }
+                }
+                refresh_subtitle_list(&app, &model_rc, &subtitles);
+            }
+        }));
+    });
+
+    // ── Event-Driven Playback Synchronization (`set_wakeup_callback` + Low-Freq Tick) ──
+    let run_player_sync: Rc<dyn Fn()> = {
+        let sync_app = app.as_weak();
+        let sync_mpv = mpv.clone();
+        let sync_coord = coordinator.clone();
+        let sync_sub_ctrl = sub_ctrl.clone();
+        let sync_sub_model = sub_model.clone();
+        let sync_media_generation = media_generation.clone();
+        let sync_shared_gen = shared_media_generation.clone();
+        let sync_current_media = current_media.clone();
+        let sync_lookup_epoch = lookup_epoch.clone();
+        let sync_asr = asr_session.clone();
+        let sync_asr_config = config_ctrl.clone();
+        let sync_asr_restart = asr_restart_pending.clone();
+        let sync_closing = closing.clone();
+        let sync_hover_owned = hover_pause_owned.clone();
+        let sync_furigana_sender = furigana_sender.clone();
+        let sync_furigana_epoch = furigana_epoch.clone();
+        let sync_video_timings = video_timings.clone();
+        let sync_pending_frame = pending_playback_frame.clone();
+        let sync_ext_sub_tx = ext_sub_sender.clone();
+        let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
+        let previous_furigana_visible = Cell::new(app.get_furigana_visible());
+        let previous_subtitle_layout: Cell<Option<(i32, i32, u32, bool)>> = Cell::new(None);
+        let last_video_report = Cell::new(std::time::Instant::now());
+        let previous_drops = Cell::new((0i64, 0i64));
+        let last_sync = Cell::new(std::time::Instant::now());
+
+        Rc::new(move || {
+            if sync_closing.get() {
+                return;
+            }
             let sync_started = std::time::Instant::now();
             {
-                let mut timings = timer_video_timings.borrow_mut();
-                timings.sync_gap_max = timings.sync_gap_max.max(sync_started.duration_since(last_sync));
+                let mut timings = sync_video_timings.borrow_mut();
+                timings.sync_gap_max = timings
+                    .sync_gap_max
+                    .max(sync_started.duration_since(last_sync.get()));
             }
-            last_sync = sync_started;
-            let _sync_timing = SyncTiming { started: sync_started, timings: timer_video_timings.clone() };
-            let Some(app) = weak_timer_app.upgrade() else { return };
-            let Ok(player_ref) = timer_mpv.try_borrow() else { return };
-            let Some(player) = player_ref.as_ref() else { return };
-            let state = player.poll_playback_state();
+            last_sync.set(sync_started);
+            let _sync_timing = SyncTiming {
+                started: sync_started,
+                timings: sync_video_timings.clone(),
+            };
+            let Some(app) = sync_app.upgrade() else {
+                return;
+            };
+            let (Ok(player_ref), Ok(mut coord_ref), Ok(mut subtitles), Ok(mut asr)) = (
+                sync_mpv.try_borrow(),
+                sync_coord.try_borrow_mut(),
+                sync_sub_ctrl.try_borrow_mut(),
+                sync_asr.try_borrow_mut(),
+            ) else {
+                return;
+            };
+            let (Some(player), Some(coord)) = (player_ref.as_ref(), coord_ref.as_mut()) else {
+                return;
+            };
+
+            let gen_before = sync_media_generation.get();
+            let external_loads = coord.sync(
+                &app,
+                player,
+                &mut subtitles,
+                &sync_sub_model,
+                &mut asr,
+                &sync_media_generation,
+                &sync_current_media,
+                &sync_asr_restart,
+                &sync_hover_owned,
+                || {
+                    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    controller::asr::AsrSettings::from_config(
+                        &config_dir,
+                        &*sync_asr_config.store(),
+                    )
+                },
+                |app, primary_text| {
+                    sync_lookup_epoch.fetch_add(1, Ordering::AcqRel);
+                    publish_active_subtitle(
+                        app,
+                        primary_text,
+                        &sync_furigana_sender,
+                        &sync_furigana_epoch,
+                    );
+                },
+            );
+            let gen_after = sync_media_generation.get();
+            if gen_after != gen_before {
+                sync_shared_gen.store(gen_after, Ordering::Release);
+            }
+            for load in external_loads {
+                let _ = sync_ext_sub_tx.send((gen_after, load));
+            }
+
+            let state = coord.playback_state();
             if app.get_pending_playback_generation() >= 0 && state.playback_ready {
                 if player.is_opengl_active() {
-                    // Metadata/subtitle UI updates in this tick are painted before
-                    // the rendering notifier releases the playback clock.
-                    timer_pending_frame.set(Some(app.get_pending_playback_generation()));
+                    sync_pending_frame.set(Some(app.get_pending_playback_generation()));
                     app.window().request_redraw();
                 } else {
-                    // A GL failure during loading must not leave the software
-                    // fallback permanently paused.
                     app.set_pending_playback_generation(-1);
                     let _ = player.play();
                 }
             }
-            if last_video_report.elapsed() >= std::time::Duration::from_secs(5) {
+            if last_video_report.get().elapsed() >= std::time::Duration::from_secs(5) {
                 let drops = (state.frame_drops, state.decoder_drops);
-                timer_video_timings.borrow_mut().report(&state, drops != previous_drops, verbose_video_timings, player.pending_render_delay());
-                previous_drops = drops;
-                last_video_report = std::time::Instant::now();
-            }
-            let media_revision = timer_media_generation.get();
-            if observed_media_generation != media_revision {
-                observed_media_generation = media_revision;
-                timer_asr_restart.set(false);
-                timer_asr.borrow_mut().cancel();
-                app.set_asr_running(false);
-                previous_audio.clear();
-                previous_tracks.clear();
-                previous_lines.clear();
-                previous_context_cue = None;
-                previous_primary_text.clear();
-                previous_secondary_text.clear();
-                previous_sub_times = (0.0, 0.0);
-                previous_auto_pause = false;
-                previous_mpv_subtitles_hidden = None;
-                timer_hover_owned.set(false);
-                auto_pause_state = memento_player::AutoPauseState::default();
-                poll_number = 0;
-
-                timer_sub_ctrl.borrow_mut().clear();
-                timer_sub_model.set_vec(Vec::new());
-                app.set_subtitle_search_query("".into());
-                app.set_audio_tracks(Rc::new(VecModel::<PlayerTrack>::default()).into());
-                app.set_subtitle_tracks(Rc::new(VecModel::<PlayerTrack>::default()).into());
-                app.set_audio_id(0);
-                app.set_primary_sid(0);
-                app.set_secondary_sid(0);
-                app.set_active_sub_text("".into());
-                app.set_secondary_sub_text("".into());
-                app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
-                app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
-                app.set_selected_token_index(-1);
-                app.invoke_dismiss_definition();
-            }
-            let pos = state.position;
-            let duration = state.duration;
-            let paused = state.paused;
-
-            // mpv keybindings can change SID without using our subtitle menu.
-            if app.get_asr_running() && state.primary_sid > 0 {
-                timer_asr.borrow_mut().suspend();
-                app.set_asr_running(false);
-                clear_primary_subtitle(&app);
+                sync_video_timings.borrow_mut().report(
+                    state,
+                    drops != previous_drops.get(),
+                    verbose_video_timings,
+                    player.pending_render_delay(),
+                );
+                previous_drops.set(drops);
+                last_video_report.set(std::time::Instant::now());
             }
 
-            if timer_asr_restart.get() {
-                if !app.get_asr_enabled() {
-                    timer_asr_restart.set(false);
-                } else if let Some(media_ctx) = player.capture_encode_context() {
-                    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    match controller::asr::AsrSettings::from_config(&config_dir, &*timer_asr_config.store()) {
-                        Ok(settings) => {
-                            let media = controller::media::MediaContext::new(media_ctx.path, media_ctx.audio_id);
-                            let started = timer_asr.borrow_mut().start(settings, media, duration, pos);
-                            match started {
-                                Ok(session) => {
-                                    timer_asr_restart.set(false);
-                                    if let Err(error) = player.set_sid(0) {
-                                        timer_asr.borrow_mut().cancel();
-                                        app.set_status_message(format!("Could not restart ASR subtitles: {error}").into());
-                                    } else {
-                                        let mut subtitles = timer_sub_ctrl.borrow_mut();
-                                        match session {
-                                            controller::asr::SessionStart::New => subtitles.start_asr_track(),
-                                            controller::asr::SessionStart::Resumed => { subtitles.resume_asr_track(pos); }
-                                        }
-                                        refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
-                                        app.set_primary_sid(0);
-                                        app.set_asr_running(true);
-                                        app.set_status_message("ASR model reloaded; transcribing subtitles…".into());
-                                    }
-                                }
-                                Err(error) if error.contains("still stopping") => {},
-                                Err(error) => {
-                                    timer_asr_restart.set(false);
-                                    app.set_status_message(format!("Could not restart ASR subtitles: {error}").into());
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            timer_asr_restart.set(false);
-                            app.set_status_message(format!("Could not reload ASR model: {error}").into());
-                        }
-                    }
-                } else {
-                    timer_asr_restart.set(false);
+            if previous_furigana_visible.get() != app.get_furigana_visible() {
+                previous_furigana_visible.set(app.get_furigana_visible());
+                publish_active_subtitle(
+                    &app,
+                    &app.get_active_sub_text(),
+                    &sync_furigana_sender,
+                    &sync_furigana_epoch,
+                );
+            }
+            let subtitle_layout = (
+                app.get_video_width(),
+                app.get_video_height(),
+                app.get_subtitle_scale().to_bits(),
+                app.get_furigana_visible(),
+            );
+            if previous_subtitle_layout.get() != Some(subtitle_layout) {
+                previous_subtitle_layout.set(Some(subtitle_layout));
+                let words: Vec<_> = app.get_active_sub_words().iter().collect();
+                if !words.is_empty() {
+                    let lines = subtitle_lines_for_app(&app, words);
+                    app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
                 }
             }
+        })
+    };
 
-            app.set_position(pos as f32);
-            app.set_duration(duration as f32);
-            app.set_is_playing(!paused || app.get_pending_playback_generation() >= 0);
-            app.set_volume(state.volume as f32);
-            app.set_current_time(format_time(pos).into());
-            app.set_duration_time(format_time(duration).into());
-            if previous_video_dimensions != state.dimensions {
-                previous_video_dimensions = state.dimensions;
-                app.invoke_update_video();
-            }
-            // A notification can arrive before the first usable viewport or
-            // while the window is being reconfigured. Retry a stale redraw;
-            // normal frame delivery still uses mpv's event-driven callback.
-            if !paused && player.pending_render_delay() > std::time::Duration::from_millis(100) {
-                app.invoke_video_frame_ready();
-            }
+    MPV_EVENT_SYNC.with(|slot| {
+        *slot.borrow_mut() = Some(run_player_sync.clone());
+    });
+    if let Some(player) = mpv.borrow().as_ref() {
+        player.set_wakeup_callback(|| {
+            let _ = slint::invoke_from_event_loop(|| {
+                let cb = MPV_EVENT_SYNC.with(|slot| slot.borrow().clone());
+                if let Some(sync) = cb {
+                    sync();
+                }
+            });
+        });
+    }
 
+    // Lightweight 200ms fallback/housekeeping tick: expires transient status
+    // messages and drains background ASR events or active playback without
+    // redundant property dirtying when paused & idle.
+    let timer = slint::Timer::default();
+    let timer_app = app.as_weak();
+    let timer_mpv = mpv.clone();
+    let timer_asr = asr_session.clone();
+    let timer_asr_restart = asr_restart_pending.clone();
+    let timer_closing = closing.clone();
+    let timer_sync = run_player_sync.clone();
+    let mut status_message_ticks = 0usize;
+    let mut last_observed_status = slint::SharedString::default();
+    let mut last_ui_flags = (
+        app.get_subtitles_visible(),
+        app.get_hide_mpv_subtitles(),
+        app.get_hide_memento_while_playing(),
+        app.get_auto_pause(),
+        app.get_furigana_visible(),
+        app.get_video_width(),
+        app.get_video_height(),
+        app.get_subtitle_scale().to_bits(),
+    );
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(200),
+        move || {
+            if timer_closing.get() {
+                return;
+            }
+            let Some(app) = timer_app.upgrade() else {
+                return;
+            };
             let current_status = app.get_status_message();
             if !current_status.is_empty() {
                 if current_status != last_observed_status {
@@ -3782,7 +4195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     status_message_ticks = 0;
                 } else {
                     status_message_ticks += 1;
-                    if status_message_ticks >= 40 {
+                    if status_message_ticks >= 20 {
                         app.set_status_message("".into());
                         last_observed_status = "".into();
                         status_message_ticks = 0;
@@ -3793,189 +4206,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 status_message_ticks = 0;
             }
 
-            poll_number += 1;
-            if poll_number >= 5 {
-                poll_number = 0;
-                sync_player_tracks(
-                    &app, &state, &mut timer_sub_ctrl.borrow_mut(),
-                    &timer_sub_model, &mut previous_audio, &mut previous_tracks,
-                );
-            }
-
-            let primary_sid = state.primary_sid;
-            let secondary_sid = state.secondary_sid;
-            let primary_text = state.sub_text.clone();
-            let secondary_text = state.secondary_sub_text.clone();
-            let raw_primary = (pos - state.sub_delay) / state.sub_speed;
-            let raw_secondary = (pos - state.secondary_sub_delay) / state.sub_speed;
-            let Ok(mut subtitles) = timer_sub_ctrl.try_borrow_mut() else { return };
-            if primary_sid > 0 {
-                subtitles.ensure_track(primary_sid);
-            }
-            if secondary_sid > 0 {
-                subtitles.ensure_track(secondary_sid);
-            }
-
-            let current_lines = &state.sub_lines;
-            if current_lines != &previous_lines {
-                let cues: Vec<MemorySubtitleCue> = current_lines.iter().map(|line| {
-                    MemorySubtitleCue {
-                        id: line.id,
-                        text: line.text.encode_utf16().collect(),
-                        start: line.start,
-                        end: line.end,
-                    }
-                }).collect();
-                if subtitles.update_memory_cues(primary_sid, &cues, raw_primary) {
-                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
-                }
-                previous_lines.clone_from(current_lines);
-            }
-
-            let primary_times = (state.sub_start, state.sub_end);
-            if !app.get_asr_running()
-                && (primary_text != previous_primary_text || primary_times != previous_sub_times
-                    || primary_text != app.get_active_sub_text().as_str()) {
-                app.invoke_dismiss_definition();
-                timer_lookup_epoch.fetch_add(1, Ordering::AcqRel);
-                let previous_count = subtitles.primary_entries().len();
-                let cue = (!primary_text.is_empty()).then(|| {
-                    controller::subtitles::create_cue(
-                        &primary_text, state.sub_start, state.sub_end,
-                    )
-                });
-                subtitles.update_active_cue(primary_sid, cue.as_ref(), raw_primary);
-                if subtitles.primary_entries().len() != previous_count {
-                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
-                }
-                publish_active_subtitle(&app, &primary_text, &timer_furigana_sender, &timer_furigana_epoch);
-                previous_primary_text = primary_text;
-            }
-            if secondary_text != previous_secondary_text {
-                let cue = (!secondary_text.is_empty()).then(|| {
-                    controller::subtitles::create_cue(
-                        &secondary_text,
-                        state.secondary_sub_start,
-                        state.secondary_sub_end,
-                    )
-                });
-                subtitles.update_active_cue(secondary_sid, cue.as_ref(), raw_secondary);
-                app.set_secondary_sub_text(secondary_text.clone().into());
-                previous_secondary_text = secondary_text;
-            }
-            {
-                // Always drain the worker: a window may finish after switching
-                // tracks, and its cues belong in the retained ASR cache.
-                let mut asr = timer_asr.borrow_mut();
-                asr.update_position(pos, duration, paused);
-                let mut refreshed_subtitles = false;
-                asr.poll_with(|event| match event {
-                    controller::asr::AsrEvent::CueAdded { cue, .. } => {
-                        let mem_cue = MemorySubtitleCue {
-                            id: cue.id as i64,
-                            text: cue.text.encode_utf16().collect(),
-                            start: cue.start,
-                            end: cue.end,
-                        };
-                        if subtitles.add_asr_cue(mem_cue, pos) {
-                            refreshed_subtitles = true;
-                        }
-                    }
-                    controller::asr::AsrEvent::CueRemoved { cue_id, .. } => {
-                        if subtitles.remove_asr_cue(cue_id as i64, pos) {
-                            refreshed_subtitles = true;
-                        }
-                    }
-                    controller::asr::AsrEvent::Completed { cue_count, .. } => {
-                        if app.get_asr_running() {
-                            app.set_status_message(format!("ASR transcription completed ({cue_count} cues)").into());
-                        }
-                    }
-                    controller::asr::AsrEvent::Failed { message, .. } => {
-                        app.set_status_message(format!("ASR error: {message}").into());
-                        app.set_asr_running(false);
-                    }
-                    controller::asr::AsrEvent::Paused { message, .. } => {
-                        app.set_status_message(format!("ASR paused: {message}").into());
-                    }
-                    controller::asr::AsrEvent::Canceled { .. } => {
-                        app.set_asr_running(false);
-                    }
-                    _ => {}
-                });
-                if refreshed_subtitles && app.get_asr_running() {
-                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
-                }
-            }
-            let selected_sid = subtitles.primary_sid();
-            let before_active = subtitles.active_indices(selected_sid).to_vec();
-            subtitles.update_positions(if app.get_asr_running() { pos } else { raw_primary }, raw_secondary);
-            clear_subtitle_marks_on_advance(&timer_sub_model, &mut subtitles, &mut previous_context_cue, paused);
-            refresh_active_rows(
-                &timer_sub_model, &before_active, subtitles.active_indices(selected_sid),
+            let ui_flags = (
+                app.get_subtitles_visible(),
+                app.get_hide_mpv_subtitles(),
+                app.get_hide_memento_while_playing(),
+                app.get_auto_pause(),
+                app.get_furigana_visible(),
+                app.get_video_width(),
+                app.get_video_height(),
+                app.get_subtitle_scale().to_bits(),
             );
-            if app.get_asr_running() {
-                let asr_text = subtitles.active_cue_text().unwrap_or_default();
-                if asr_text != previous_primary_text || asr_text != app.get_active_sub_text().as_str() {
-                    app.invoke_dismiss_definition();
-                    timer_lookup_epoch.fetch_add(1, Ordering::AcqRel);
-                    publish_active_subtitle(&app, &asr_text, &timer_furigana_sender, &timer_furigana_epoch);
-                    previous_primary_text = asr_text;
-                }
-            }
-            if previous_furigana_visible != app.get_furigana_visible() {
-                previous_furigana_visible = app.get_furigana_visible();
-                publish_active_subtitle(&app, &app.get_active_sub_text(), &timer_furigana_sender, &timer_furigana_epoch);
-            }
-            let subtitle_layout = (
-                app.get_video_width(), app.get_video_height(),
-                app.get_subtitle_scale().to_bits(), app.get_furigana_visible(),
-            );
-            if previous_subtitle_layout != Some(subtitle_layout) {
-                previous_subtitle_layout = Some(subtitle_layout);
-                let words: Vec<_> = app.get_active_sub_words().iter().collect();
-                if !words.is_empty() {
-                    let lines = subtitle_lines_for_app(&app, words);
-                    app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
-                }
-            }
-            drop(subtitles);
+            let ui_flags_changed = ui_flags != last_ui_flags;
+            last_ui_flags = ui_flags;
 
-            if !app.get_hover_pause_enabled() && timer_hover_owned.replace(false) {
-                let _ = player.play();
-            }
-            let memento_subtitles_visible = app.get_subtitles_visible()
-                && !(app.get_hide_memento_while_playing() && !paused)
-                && (!app.get_active_sub_text().is_empty() || !app.get_secondary_sub_text().is_empty());
-            let hide_mpv = app.get_hide_mpv_subtitles() && memento_subtitles_visible;
-            if previous_mpv_subtitles_hidden != Some(hide_mpv) {
-                let visibility = if hide_mpv { "no" } else { "yes" };
-                let primary = player.command_async(&["set", "sub-visibility", visibility]);
-                let secondary = player.command_async(&["set", "secondary-sub-visibility", visibility]);
-                previous_mpv_subtitles_hidden = Some(hide_mpv);
-                if primary.is_err() || secondary.is_err() {
-                    eprintln!("Could not update mpv subtitle visibility: {primary:?}; {secondary:?}");
-                }
-            }
-
-            auto_pause_state.update_position(pos, state.sub_speed, state.sub_delay);
-            let times = primary_times;
-            let auto_pause = app.get_auto_pause();
-            if times != previous_sub_times || auto_pause != previous_auto_pause {
-                previous_sub_times = times;
-                previous_auto_pause = auto_pause;
-                if let Some(seek_time) = auto_pause_state.step(
-                    auto_pause,
-                    times.0,
-                    times.1,
-                    state.sub_speed,
-                    state.sub_delay,
-                    paused,
-                    duration,
-                ) {
-                    let _ = player.pause();
-                    let _ = player.seek(seek_time);
-                }
+            let needs_sync = ui_flags_changed
+                || timer_asr_restart.get()
+                || timer_asr.try_borrow().is_ok_and(|asr| asr.is_active())
+                || timer_mpv.try_borrow().is_ok_and(|p| {
+                    p.as_ref().is_some_and(|player| {
+                        player.has_pending_events() || !player.is_paused()
+                    })
+                });
+            if needs_sync {
+                timer_sync();
             }
         },
     );
@@ -3992,54 +4245,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let notifier_surface = gl_surface.clone();
     let notifier_pending = gl_pending.clone();
     let notifier_size = gl_target_size.clone();
+    let notifier_render_size = current_render_size.clone();
     let notifier_texture = gl_ready_texture.clone();
     let notifier_app = app.as_weak();
     let notifier_timings = video_timings.clone();
     let notifier_pending_frame = pending_playback_frame.clone();
+    let notifier_trigger_initial = trigger_initial_loads.clone();
     if let Err(error) = app.window().set_rendering_notifier(move |state, graphics_api| {
-        let slint::GraphicsAPI::NativeOpenGL { get_proc_address } = graphics_api else { return };
+        let slint::GraphicsAPI::NativeOpenGL { get_proc_address } = graphics_api else {
+            if matches!(state, slint::RenderingState::RenderingSetup) {
+                notifier_trigger_initial();
+            }
+            return;
+        };
         match state {
             slint::RenderingState::RenderingSetup => {
-                let player_ref = gl_mpv.borrow();
-                let Some(player) = player_ref.as_ref() else { return };
-                match player.activate_opengl(*get_proc_address) {
-                    Ok(()) => {
-                        *notifier_surface.borrow_mut() = Some(GlVideoSurface::new(*get_proc_address, player));
-                        notifier_pending.set(true);
-                        eprintln!("Video renderer: libmpv OpenGL");
+                {
+                    let player_ref = gl_mpv.borrow();
+                    if let Some(player) = player_ref.as_ref() {
+                        let (x11_display, wl_display) = notifier_app
+                            .upgrade()
+                            .map(|app| native_window_display_pointers(app.window()))
+                            .unwrap_or((None, None));
+                        #[cfg(target_os = "linux")]
+                        let gl_res = if let Some(owned_resolver) =
+                            build_owned_gl_proc_resolver(*get_proc_address, wl_display.is_some())
+                        {
+                            player.activate_opengl_owned_with_display(
+                                owned_resolver,
+                                x11_display,
+                                wl_display,
+                            )
+                        } else {
+                            player.activate_opengl_with_display(
+                                *get_proc_address,
+                                x11_display,
+                                wl_display,
+                            )
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let gl_res = player.activate_opengl_with_display(
+                            *get_proc_address,
+                            x11_display,
+                            wl_display,
+                        );
+                        match gl_res {
+                            Ok(()) => {
+                                *notifier_surface.borrow_mut() =
+                                    Some(GlVideoSurface::new(*get_proc_address, player));
+                                notifier_pending.set(true);
+                                eprintln!("Video renderer: libmpv OpenGL");
+                            }
+                            Err(error) => eprintln!(
+                                "OpenGL video unavailable; using software rendering: {error}"
+                            ),
+                        }
                     }
-                    Err(error) => eprintln!("OpenGL video unavailable; using software rendering: {error}"),
                 }
+                notifier_trigger_initial();
             }
             slint::RenderingState::BeforeRendering => {
                 {
                     let mut timings = notifier_timings.borrow_mut();
                     timings.paint_started = Some(std::time::Instant::now());
-                    timings.paint_popup_rows = notifier_app.upgrade()
+                    timings.paint_popup_rows = notifier_app
+                        .upgrade()
                         .filter(|app| app.get_dict_open())
                         .map_or(0, |app| app.get_popup_results().row_count());
                 }
-                let player_ref = gl_mpv.borrow();
-                let Some(player) = player_ref.as_ref() else { return };
-                let mut surface_ref = notifier_surface.borrow_mut();
-                let Some(surface) = surface_ref.as_mut() else { return };
-                // All mpv_render_* GL calls require this context to be current.
-                // Control updates also complete paused GPU screenshots, even
-                // before a drawable viewport has been allocated.
-                let frame_ready = surface.update(player);
                 let size = notifier_size.get();
-                if size == (0, 0) { return; }
-                if !notifier_pending.replace(false) && !frame_ready && surface.size == size { return; }
+                if size == (0, 0) {
+                    return;
+                }
+                let player_ref = gl_mpv.borrow();
+                let Some(player) = player_ref.as_ref() else {
+                    return;
+                };
+                let mut surface_ref = notifier_surface.borrow_mut();
+                let Some(surface) = surface_ref.as_mut() else {
+                    return;
+                };
+                // Check `size == (0, 0)` BEFORE `surface.update(player)` (`take_render_update()`)
+                // so early frames before initial viewport layout are never dropped!
+                let frame_ready = surface.update(player);
+                let needs_realloc = surface.should_reallocate(size);
+                if !notifier_pending.replace(false) && !frame_ready && !needs_realloc {
+                    return;
+                }
                 let render_started = std::time::Instant::now();
-                if let Err(error) = surface.ensure_size(size).and_then(|()| surface.render(player)) {
+                if let Err(error) = surface.ensure_size(size).and_then(|()| surface.render(player))
+                {
                     eprintln!("OpenGL video failed; switching to software rendering: {error}");
                     notifier_texture.set(None);
-                    if let Some(old_surface) = surface_ref.take() { old_surface.destroy(); }
+                    notifier_render_size.set((0, 0));
+                    if let Some(old_surface) = surface_ref.take() {
+                        old_surface.destroy();
+                    }
                     if let Err(fallback_error) = player.fallback_to_software() {
                         eprintln!("Software video fallback failed: {fallback_error}");
                     }
                     let _ = notifier_app.upgrade_in_event_loop(|app| app.invoke_update_video());
                 } else {
+                    notifier_render_size.set(surface.size);
                     let texture = surface.texture_info();
                     if notifier_texture.replace(texture) != texture {
                         // Publishing an Image inside the rendering notifier
@@ -4050,9 +4357,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut timings = notifier_timings.borrow_mut();
                 timings.frames += 1;
                 timings.video_max = timings.video_max.max(render_started.elapsed());
-                if frame_ready { timings.queue_max = timings.queue_max.max(player.render_update_delay()); }
+                if frame_ready {
+                    timings.queue_max = timings.queue_max.max(player.render_update_delay());
+                }
             }
             slint::RenderingState::AfterRendering => {
+                if notifier_surface.borrow().is_some() {
+                    if let Some(player) = gl_mpv.borrow().as_ref() {
+                        player.report_render_swap();
+                    }
+                }
                 notifier_timings.borrow_mut().finish_paint();
                 let presented_at = std::time::Instant::now();
                 let timings = notifier_timings.clone();
@@ -4074,13 +4388,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             slint::RenderingState::RenderingTeardown => {
                 notifier_texture.set(None);
-                if let Some(player) = gl_mpv.borrow().as_ref() { player.deactivate_opengl(); }
-                if let Some(surface) = notifier_surface.borrow_mut().take() { surface.destroy(); }
+                notifier_render_size.set((0, 0));
+                if let Some(player) = gl_mpv.borrow().as_ref() {
+                    player.deactivate_opengl();
+                }
+                if let Some(surface) = notifier_surface.borrow_mut().take() {
+                    surface.destroy();
+                }
             }
             _ => {}
         }
     }) {
         eprintln!("OpenGL video integration unavailable; using software rendering: {error}");
+        trigger_initial_loads();
     }
 
     // Fallback CPU renderer runs off the UI thread and is inactive while GL
@@ -4124,11 +4444,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let video_gl_pending = gl_pending.clone();
     let video_gl_target_size = gl_target_size.clone();
     let video_gl_ready_texture = gl_ready_texture.clone();
+    let video_current_render_size = current_render_size.clone();
     let mut published_gl_texture = None;
     let mut rendered_size = (0, 0);
     app.on_update_video(move || {
             let Some(app) = video_app.upgrade() else { return };
             if app.get_video_width() <= 0 || app.get_video_height() <= 0 {
+                video_gl_target_size.set((0, 0));
+                video_current_render_size.set((0, 0));
                 if published_gl_texture.take().is_some() {
                     app.set_video_frame(slint::Image::default());
                 }
@@ -4149,7 +4472,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         published_gl_texture = Some(texture);
                     }
                 }
-                let size = video_render_size(&app, player);
+                let size = video_render_size(&app, player, true);
                 if video_gl_target_size.replace(size) != size {
                     video_gl_pending.set(true);
                     app.window().request_redraw();
@@ -4165,7 +4488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut latest_frame = None;
             while let Ok(frame) = render_frame_rx.try_recv() { latest_frame = Some(frame); }
             if let Some(frame) = latest_frame { app.set_video_frame(slint::Image::from_rgba8(frame)); }
-            let (mut target_w, mut target_h) = video_render_size(&app, player);
+            let (mut target_w, mut target_h) = video_render_size(&app, player, false);
             // mpv's software API converts and scales on one CPU thread. Cap
             // fallback output area so a 1080p window does not upload 8 MB on
             // every frame if GL cannot be used.
@@ -4175,6 +4498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_w = ((target_w as f64 * ratio).round() as u32).max(1);
                 target_h = ((target_h as f64 * ratio).round() as u32).max(1);
             }
+            video_current_render_size.set((target_w, target_h));
 
             if rendered_size == (target_w, target_h) && !player.take_render_update() {
                 return;
@@ -4216,6 +4540,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_result = app.run();
     timer.stop();
     quit_timer.stop();
+    MPV_EVENT_SYNC.with(|slot| *slot.borrow_mut() = None);
+    EXTERNAL_SUBTITLE_SINK.with(|slot| *slot.borrow_mut() = None);
+    drop(ext_sub_sender);
     // Also cover an event-loop error or any exit that bypasses the close callback.
     asr_session.borrow_mut().shutdown();
     drop(render_worker);
