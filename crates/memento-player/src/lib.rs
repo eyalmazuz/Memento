@@ -11,8 +11,7 @@
 //!   discrimination, derived decisions (position clamp, duration handling,
 //!   renderer-carry) and the `autopause.rs` integration.
 
-mod args;
-mod args_capi;
+pub mod args;
 pub mod autopause;
 pub mod controller;
 pub mod events;
@@ -21,17 +20,15 @@ pub mod mpv;
 pub mod state;
 
 pub use autopause::{
-    memento_player_autopause_position, memento_player_autopause_step,
-    memento_player_subtitle_playback_time, memento_player_subtitle_raw_time,
-    memento_player_subtitle_valid_speed, MementoAutoPauseStateC,
+    subtitle_playback_time, subtitle_raw_time, subtitle_valid_speed, AutoPauseState,
+};
+#[allow(deprecated)]
+pub use autopause::{
+    memento_player_autopause_position, memento_player_autopause_step, MementoAutoPauseStateC,
 };
 pub use controller::{
-    format_keypress, format_modifiers, is_subtitle_file, memento_player_format_keypress,
-    memento_player_format_modifiers, memento_player_is_subtitle_file,
-    memento_player_mouse_button_name, memento_player_parse_cli_options,
-    memento_player_validate_raw_screenshot, memento_player_wheel_button,
-    parse_cli_options_u16, parse_cli_options_utf8, CliOption, KeyMapping, KeypadPrefix,
-    MementoPlayerCliOptionCb, MementoPlayerUtf16Arg, MouseButton, ScreenshotSpec,
+    format_keypress, format_modifiers, is_subtitle_file, parse_cli_options_u16,
+    parse_cli_options_utf8, CliOption, KeyMapping, KeypadPrefix, MouseButton, ScreenshotSpec,
     ScreenshotValidationError, WheelButton,
 };
 pub use mpv::{
@@ -46,19 +43,13 @@ pub use mpv::{
     MementoTrackListC, MpvInstance, RawFrame, SubtitleTrack, TrackType,
 };
 pub use state::{
-    memento_player_state_active_subtitle_track, memento_player_state_create,
-    memento_player_state_find_track_by_id, memento_player_state_free,
-    memento_player_state_get_duration, memento_player_state_get_mute,
-    memento_player_state_get_pause, memento_player_state_get_property,
-    memento_player_state_get_speed, memento_player_state_get_sub_delay,
-    memento_player_state_get_time_pos, memento_player_state_get_volume,
-    memento_player_state_update_property, q_bound, AutoHideType, MpvStateCore, Signal, Subtitle,
-    SubtitleChange, VideoParams, PROPERTY_AID_CHANGED, PROPERTY_AUDIO_TRACKS_CHANGED,
-    PROPERTY_CHAPTERS_CHANGED, PROPERTY_CURSOR_AUTOHIDE_CHANGED,
-    PROPERTY_CURSOR_AUTOHIDE_FS_ONLY_CHANGED, PROPERTY_CURSOR_AUTOHIDE_TIME_CHANGED,
-    PROPERTY_CURSOR_AUTOHIDE_TYPE_CHANGED, PROPERTY_DURATION_CHANGED, PROPERTY_FULLSCREEN_CHANGED,
-    PROPERTY_MUTE_CHANGED, PROPERTY_NONE, PROPERTY_PATH_CHANGED, PROPERTY_PAUSE_CHANGED,
-    PROPERTY_POSITION_CHANGED, PROPERTY_SECONDARY_SID_CHANGED, PROPERTY_SECONDARY_SUB_DELAY_CHANGED,
+    q_bound, AutoHideType, MpvStateCore, Signal, Subtitle, SubtitleChange, VideoParams,
+    PROPERTY_AID_CHANGED, PROPERTY_AUDIO_TRACKS_CHANGED, PROPERTY_CHAPTERS_CHANGED,
+    PROPERTY_CURSOR_AUTOHIDE_CHANGED, PROPERTY_CURSOR_AUTOHIDE_FS_ONLY_CHANGED,
+    PROPERTY_CURSOR_AUTOHIDE_TIME_CHANGED, PROPERTY_CURSOR_AUTOHIDE_TYPE_CHANGED,
+    PROPERTY_DURATION_CHANGED, PROPERTY_FULLSCREEN_CHANGED, PROPERTY_MUTE_CHANGED,
+    PROPERTY_NONE, PROPERTY_PATH_CHANGED, PROPERTY_PAUSE_CHANGED, PROPERTY_POSITION_CHANGED,
+    PROPERTY_SECONDARY_SID_CHANGED, PROPERTY_SECONDARY_SUB_DELAY_CHANGED,
     PROPERTY_SECONDARY_SUB_TEXT_CHANGED, PROPERTY_SECONDARY_SUB_VISIBILITY_CHANGED,
     PROPERTY_SID_CHANGED, PROPERTY_SPEED_CHANGED, PROPERTY_SUBTITLE_TRACKS_CHANGED,
     PROPERTY_SUB_DELAY_CHANGED, PROPERTY_SUB_TEXT_CHANGED, PROPERTY_SUB_VISIBILITY_CHANGED,

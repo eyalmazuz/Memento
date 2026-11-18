@@ -12,4 +12,4 @@ regex = "=1.13.1"
 [lib]
 name = "memento_subtitle"
 path = "src/lib.rs"
-crate-type = ["staticlib", "lib"]
+crate-type = ["lib"]

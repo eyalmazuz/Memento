@@ -23,8 +23,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 use crate::autopause::{
-    memento_player_subtitle_playback_time, memento_player_subtitle_raw_time,
-    memento_player_subtitle_valid_speed,
+    subtitle_playback_time, subtitle_raw_time, subtitle_valid_speed,
 };
 use crate::events::{PropertyChange, Track};
 use crate::mpv::{CursorAutohide, TrackType};
@@ -126,23 +125,20 @@ impl Subtitle {
         self.visible
     }
 
-    /// `MpvSubtitle::playbackTime` — delegated to the certified
-    /// `memento_player_subtitle_playback_time`.
+    /// `MpvSubtitle::playbackTime` — delegated to `subtitle_playback_time`.
     pub fn playback_time(&self, raw_time: f64) -> f64 {
-        memento_player_subtitle_playback_time(raw_time, self.speed, self.delay)
+        subtitle_playback_time(raw_time, self.speed, self.delay)
     }
 
-    /// `MpvSubtitle::rawTime` — delegated to the certified
-    /// `memento_player_subtitle_raw_time`.
+    /// `MpvSubtitle::rawTime` — delegated to `subtitle_raw_time`.
     pub fn raw_time(&self, playback_time: f64) -> f64 {
-        memento_player_subtitle_raw_time(playback_time, self.speed, self.delay)
+        subtitle_raw_time(playback_time, self.speed, self.delay)
     }
 
     /// `MpvSubtitle::setSpeed` — non-finite/non-positive values are rejected
-    /// via the certified `memento_player_subtitle_valid_speed` (speed stays
-    /// at its previous value).
+    /// via `subtitle_valid_speed` (speed stays at its previous value).
     pub fn set_speed(&mut self, value: f64) -> Option<SubtitleChange> {
-        if !memento_player_subtitle_valid_speed(self.speed, value) {
+        if !subtitle_valid_speed(self.speed, value) {
             return None;
         }
         self.speed = value;
@@ -1662,285 +1658,6 @@ unsafe fn extract_c_string(data: *const c_void) -> Option<String> {
     None
 }
 
-// -- C ABI functions -----------------------------------------------------
-
-#[no_mangle]
-pub extern "C" fn memento_player_state_create() -> *mut MpvStateCore {
-    Box::into_raw(Box::new(MpvStateCore::new()))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_free(state: *mut MpvStateCore) {
-    if !state.is_null() {
-        drop(unsafe { Box::from_raw(state) });
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_update_property(
-    state: *mut MpvStateCore,
-    property_name: *const c_char,
-    property_format: i32,
-    property_data: *const c_void,
-    out_changed_flags: *mut u32,
-) -> bool {
-    if state.is_null() || property_name.is_null() {
-        if !out_changed_flags.is_null() {
-            *out_changed_flags = 0;
-        }
-        return false;
-    }
-    let name_str = match CStr::from_ptr(property_name).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            if !out_changed_flags.is_null() {
-                *out_changed_flags = 0;
-            }
-            return false;
-        }
-    };
-    let (handled, flags) = (*state).update_property_raw(name_str, property_format, property_data);
-    if !out_changed_flags.is_null() {
-        *out_changed_flags = flags;
-    }
-    handled
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_property(
-    state: *const MpvStateCore,
-    property_name: *const c_char,
-    property_format: i32,
-    out_data: *mut c_void,
-) -> bool {
-    if state.is_null() || property_name.is_null() || out_data.is_null() {
-        return false;
-    }
-    let name = match CStr::from_ptr(property_name).to_str() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let s = &*state;
-    match name {
-        "time-pos" | "time_pos" | "position" => {
-            if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.time_pos;
-                return true;
-            }
-        }
-        "duration" => {
-            if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.duration;
-                return true;
-            }
-        }
-        "pause" => {
-            if property_format == 3 /* FLAG */ {
-                *(out_data as *mut c_int) = if s.pause { 1 } else { 0 };
-                return true;
-            } else if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = if s.pause { 1 } else { 0 };
-                return true;
-            }
-        }
-        "volume" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.volume;
-                return true;
-            } else if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.volume as f64;
-                return true;
-            }
-        }
-        "volume-max" | "volume_max" | "max-volume" | "max_volume" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.max_volume;
-                return true;
-            }
-        }
-        "mute" => {
-            if property_format == 3 /* FLAG */ {
-                *(out_data as *mut c_int) = if s.mute { 1 } else { 0 };
-                return true;
-            }
-        }
-        "speed" => {
-            if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.speed;
-                return true;
-            }
-        }
-        "sub-delay" | "sub_delay" => {
-            if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.sub_delay;
-                return true;
-            }
-        }
-        "secondary-sub-delay" | "secondary_sub_delay" => {
-            if property_format == 5 /* DOUBLE */ {
-                *(out_data as *mut f64) = s.secondary_subtitle.delay();
-                return true;
-            }
-        }
-        "aid" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.aid;
-                return true;
-            }
-        }
-        "sid" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.sid;
-                return true;
-            }
-        }
-        "secondary-sid" | "secondary_sid" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.secondary_sid;
-                return true;
-            }
-        }
-        "vid" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.vid;
-                return true;
-            }
-        }
-        "fullscreen" => {
-            if property_format == 3 /* FLAG */ {
-                *(out_data as *mut c_int) = if s.fullscreen { 1 } else { 0 };
-                return true;
-            }
-        }
-        "media-title" | "media_title" | "title" => {
-            if property_format == 1 /* STRING */ {
-                *(out_data as *mut *const c_char) = s.title_c_str.as_ptr();
-                return true;
-            }
-        }
-        "path" => {
-            if property_format == 1 /* STRING */ {
-                *(out_data as *mut *const c_char) = s.path_c_str.as_ptr();
-                return true;
-            }
-        }
-        "cursor-autohide" | "cursor_autohide" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.cursor_auto_hide_time;
-                return true;
-            }
-        }
-        "cursor-autohide-fs-only" | "cursor_autohide_fs_only" => {
-            if property_format == 3 /* FLAG */ {
-                *(out_data as *mut c_int) = if s.cursor_auto_hide_fullscreen_only { 1 } else { 0 };
-                return true;
-            }
-        }
-        "video-params/w" | "video_params/w" | "video-width" | "video_width" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.video_width;
-                return true;
-            }
-        }
-        "video-params/h" | "video_params/h" | "video-height" | "video_height" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.video_height;
-                return true;
-            }
-        }
-        "track-list/count" | "tracks/count" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.tracks.len() as i64;
-                return true;
-            }
-        }
-        "chapter-list/count" | "chapters/count" => {
-            if property_format == 4 /* INT64 */ {
-                *(out_data as *mut i64) = s.chapters.len() as i64;
-                return true;
-            }
-        }
-        _ => {}
-    }
-    false
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_find_track_by_id(
-    state: *const MpvStateCore,
-    id: i64,
-    out_track_id: *mut i64,
-    out_track_type: *mut i32,
-) -> bool {
-    if state.is_null() {
-        return false;
-    }
-    if let Some(t) = (*state).find_track_by_id(id) {
-        if !out_track_id.is_null() {
-            *out_track_id = t.id;
-        }
-        if !out_track_type.is_null() {
-            *out_track_type = t.track_type as i32;
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_active_subtitle_track(
-    state: *const MpvStateCore,
-    out_track_id: *mut i64,
-) -> bool {
-    if state.is_null() {
-        return false;
-    }
-    if let Some(t) = (*state).active_subtitle_track() {
-        if !out_track_id.is_null() {
-            *out_track_id = t.id;
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_time_pos(state: *const MpvStateCore) -> f64 {
-    if state.is_null() { 0.0 } else { (*state).time_pos }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_duration(state: *const MpvStateCore) -> f64 {
-    if state.is_null() { 0.0 } else { (*state).duration }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_pause(state: *const MpvStateCore) -> bool {
-    if state.is_null() { false } else { (*state).pause }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_volume(state: *const MpvStateCore) -> i64 {
-    if state.is_null() { 0 } else { (*state).volume }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_mute(state: *const MpvStateCore) -> bool {
-    if state.is_null() { false } else { (*state).mute }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_speed(state: *const MpvStateCore) -> f64 {
-    if state.is_null() { 1.0 } else { (*state).speed }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memento_player_state_get_sub_delay(state: *const MpvStateCore) -> f64 {
-    if state.is_null() { 0.0 } else { (*state).sub_delay }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2437,52 +2154,5 @@ mod tests {
         // When sid is set explicitly
         state.update_sid(2);
         assert_eq!(state.active_subtitle_track(), Some(&t2));
-    }
-
-    #[test]
-    fn c_abi_state_lifecycle_and_updates() {
-        unsafe {
-            let state = memento_player_state_create();
-            assert!(!state.is_null());
-
-            let mut flags: u32 = 0;
-            let pause_val: c_int = 1;
-            let pause_name = CString::new("pause").unwrap();
-            let ok = memento_player_state_update_property(
-                state,
-                pause_name.as_ptr(),
-                3,
-                &pause_val as *const c_int as *const c_void,
-                &mut flags,
-            );
-            assert!(ok);
-            assert_eq!(flags, PROPERTY_PAUSE_CHANGED);
-            assert!(memento_player_state_get_pause(state));
-
-            let mut out_pause: c_int = 0;
-            let ok_get = memento_player_state_get_property(
-                state,
-                pause_name.as_ptr(),
-                3,
-                &mut out_pause as *mut c_int as *mut c_void,
-            );
-            assert!(ok_get);
-            assert_eq!(out_pause, 1);
-
-            let pos_val: f64 = 15.5;
-            let pos_name = CString::new("time-pos").unwrap();
-            let ok = memento_player_state_update_property(
-                state,
-                pos_name.as_ptr(),
-                5,
-                &pos_val as *const f64 as *const c_void,
-                &mut flags,
-            );
-            assert!(ok);
-            assert_eq!(flags, PROPERTY_POSITION_CHANGED);
-            assert_eq!(memento_player_state_get_time_pos(state), 15.5);
-
-            memento_player_state_free(state);
-        }
     }
 }

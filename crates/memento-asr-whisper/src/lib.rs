@@ -22,20 +22,12 @@
 //!
 //! This crate binds the same whisper.cpp build the C++ application links
 //! (FetchContent v1.9.4, see `extern/CMakeLists.txt`) through its C API and
-//! reproduces the C++ `WhisperModel`/`WhisperBackend` behavior, exposed to
-//! C++ via a C ABI (`capi`, declared in the header
-//! `src/asr/rust/asr_whisper_capi.h`).
+//! reproduces the C++ `WhisperModel`/`WhisperBackend` behavior.
 //!
 //! Layout:
 //! - [`engine`]: file-by-file port of `whispermodel.cpp` (WAV decode, full
 //!   parameters, segment loop, abort handling, failure strings).
-//! - [`capi`]: `extern "C"` surface consumed by the C++ shim in
-//!   `src/asr/whisper/whispermodel.cpp` (`MEMENTO_ASR_WHISPER_RUST`).
 //! - [`whisper_sys`]: bindgen bindings to the fetched `whisper.h` (build.rs).
-//!
-//! The `WhisperBackend` QFuture/retry machinery stays in C++ (see the port
-//! plan): the Rust side performs exactly one transcription attempt per call.
 
-pub mod capi;
 pub mod engine;
 pub mod whisper_sys;

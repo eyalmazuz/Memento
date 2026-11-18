@@ -9,14 +9,10 @@
 
 pub mod strings;
 pub mod tokenizer;
-pub mod capi;
 pub mod json;
 pub mod glossary;
-pub mod glossary_capi;
 pub mod note;
-pub mod note_capi;
 pub mod client;
-pub mod client_capi;
 
 pub use strings::{token_spans, TokenSpan};
 pub use tokenizer::{tokenize, Marker, Token};
