@@ -5900,6 +5900,7 @@ pub fn install_rich_ui_bridges(
             && !app.get_menu_open()
             && !app.get_ocr_mode()
             && !app.get_about_open()
+            && !app.get_url_dialog_open()
             && !has_glossary_selection
     });
 
@@ -6097,10 +6098,21 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     let middle_mouse = {
         let mut st = bridge.state.borrow_mut();
         st.settings.apply_controller(config);
+        let sig = crate::controller::dict::db_file_fingerprint(&bridge.db_path);
+        if sig != st.db_sig {
+            st.db_sig = sig;
+            st.dict_ctrl = DictController::open(&bridge.db_path).unwrap_or_default();
+        }
         let order = st.settings.dict_order.clone();
         st.dict_ctrl.set_order(&order);
+        st.db_helper.refresh_if_needed();
+        st.rich_epoch = st.rich_epoch.wrapping_add(1);
+        st.glossary_cache.clear();
+        st.last_rendered_key.clear();
         st.settings.middle_mouse_scan
     };
+    let pb = app.global::<PopupBridge>();
+    pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
     let sb = app.global::<SubtitleOverlayBridge>();
     sb.set_middle_mouse_scan_enabled(middle_mouse);
     sb.set_style_revision(sb.get_style_revision().wrapping_add(1));

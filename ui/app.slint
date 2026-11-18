@@ -1671,6 +1671,11 @@ export component MementoApp inherits Window {
             f-scope.focus();
         }
     }
+    changed token-hovered => {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+            f-scope.focus();
+        }
+    }
     changed secondary-sid => {
         if root.secondary-sid == 0 && root.secondary-subtitle-entries.length == 0 && root.subtitle-drawer-tab == 1 {
             root.subtitle-drawer-tab = 0;

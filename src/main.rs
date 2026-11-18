@@ -1571,11 +1571,25 @@ fn is_bare_modifier_key(key: &str) -> bool {
 }
 
 fn bare_modifier_flags(key: &str) -> (bool, bool, bool, bool) {
+    use slint::platform::Key;
+    if let Some(ch) = key.chars().next().filter(|_| key.chars().count() == 1) {
+        if ch == char::from(Key::Shift) || ch == char::from(Key::ShiftR) {
+            return (false, true, false, false);
+        } else if ch == char::from(Key::Control) || ch == char::from(Key::ControlR) {
+            return (true, false, false, false);
+        } else if ch == char::from(Key::Alt) || ch == char::from(Key::AltGr) {
+            return (false, false, true, false);
+        } else if ch == char::from(Key::Meta) || ch == char::from(Key::MetaR) {
+            return (false, false, false, true);
+        } else if ch == char::from(Key::CapsLock) {
+            return (false, false, false, false);
+        }
+    }
     match key {
-        "\u{0010}" | "\u{0011}" | "Shift" => (false, true, false, false),
-        "\u{0012}" | "\u{0013}" | "Control" | "Ctrl" => (true, false, false, false),
-        "\u{0014}" | "\u{0015}" | "Alt" => (false, false, true, false),
-        "\u{0016}" | "\u{0017}" | "Meta" | "Super" => (false, false, false, true),
+        "Shift" | "ShiftR" => (false, true, false, false),
+        "Control" | "Ctrl" => (true, false, false, false),
+        "Alt" => (false, false, true, false),
+        "Meta" | "Super" => (false, false, false, true),
         _ => (false, false, false, false),
     }
 }
@@ -4953,6 +4967,22 @@ mod window_ux_tests {
             assert!(is_bare_modifier_key(bare_mod));
             assert_eq!(keyboard_chord(bare_mod, true, true, true, true), "");
         }
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::Shift))), (false, true, false, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::ShiftR))), (false, true, false, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::Control))), (true, false, false, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::ControlR))), (true, false, false, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::Alt))), (false, false, true, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::AltGr))), (false, false, true, false));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::Meta))), (false, false, false, true));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::MetaR))), (false, false, false, true));
+        assert_eq!(bare_modifier_flags(&String::from(char::from(Key::CapsLock))), (false, false, false, false));
+        assert_eq!(bare_modifier_flags("Shift"), (false, true, false, false));
+        assert_eq!(bare_modifier_flags("ShiftR"), (false, true, false, false));
+        assert_eq!(bare_modifier_flags("Control"), (true, false, false, false));
+        assert_eq!(bare_modifier_flags("Ctrl"), (true, false, false, false));
+        assert_eq!(bare_modifier_flags("Alt"), (false, false, true, false));
+        assert_eq!(bare_modifier_flags("Meta"), (false, false, false, true));
+        assert_eq!(bare_modifier_flags("Super"), (false, false, false, true));
     }
 
     #[test]
