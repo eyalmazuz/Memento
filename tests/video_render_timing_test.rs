@@ -263,53 +263,15 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             "Test GL device: {}",
             gl.get_parameter_string(glow::RENDERER)
         );
-        let texture = gl.create_texture().unwrap();
-        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MIN_FILTER,
-            glow::LINEAR as i32,
+        let target = video_gl::create_video_fbo_texture(&gl, None, None, 1920, 1080).unwrap();
+        let texture = target.texture;
+        let fbo = target.framebuffer;
+        let internal_format = target.internal_format;
+        eprintln!(
+            "Test FBO internal_format: 0x{:X} (RGBA16F={})",
+            internal_format,
+            internal_format == glow::RGBA16F as i32
         );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_MAG_FILTER,
-            glow::LINEAR as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_S,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameter_i32(
-            glow::TEXTURE_2D,
-            glow::TEXTURE_WRAP_T,
-            glow::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_image_2d(
-            glow::TEXTURE_2D,
-            0,
-            glow::RGBA8 as i32,
-            1920,
-            1080,
-            0,
-            glow::RGBA,
-            glow::UNSIGNED_BYTE,
-            glow::PixelUnpackData::Slice(None),
-        );
-        let fbo = gl.create_framebuffer().unwrap();
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(
-            glow::FRAMEBUFFER,
-            glow::COLOR_ATTACHMENT0,
-            glow::TEXTURE_2D,
-            Some(texture),
-            0,
-        );
-        assert_eq!(
-            gl.check_framebuffer_status(glow::FRAMEBUFFER),
-            glow::FRAMEBUFFER_COMPLETE
-        );
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         let (app, window) = headless_slint::create_window(TestGlContext {
             display,
             surface,
@@ -341,7 +303,14 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         )
         .unwrap();
         let player = MpvInstance::new_software(Some(&directory)).unwrap();
-        player.activate_opengl(&resolver).unwrap();
+        let proc_fn = *get_proc;
+        player
+            .activate_opengl_owned_with_display(
+                move |name: &CStr| proc_fn(name.as_ptr()),
+                None,
+                None,
+            )
+            .unwrap();
         let (wake, events) = std::sync::mpsc::channel();
         player.set_render_wakeup(move || {
             let _ = wake.send(());
@@ -374,7 +343,10 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             // configuration even if the initial paused-frame wakeup preceded
             // this window's first usable layout.
             if frame_ready || (!first_frame && player.cached_video_dimensions().0 > 0) {
-                video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+                video_gl::without_blending(&gl, || {
+                    player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+                })
+                .unwrap();
                 first_frame = true;
             }
             let state = player.poll_playback_state();
@@ -388,6 +360,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 && !app.get_subtitle_furigana_pending();
             drop(state);
             window.renderer.render().unwrap();
+            player.report_render_swap();
             gl.finish();
             if ready {
                 let since = ready_since.get_or_insert_with(Instant::now);
@@ -408,12 +381,18 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             pixels
         };
         gl.disable(glow::BLEND);
-        video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+        video_gl::without_blending(&gl, || {
+            player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+        })
+        .unwrap();
         let expected = read_patch();
         assert!(expected.iter().any(|&byte| byte != 0));
         gl.enable(glow::BLEND);
         gl.blend_func(glow::ZERO, glow::ZERO);
-        video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+        video_gl::without_blending(&gl, || {
+            player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+        })
+        .unwrap();
         assert!(gl.is_enabled(glow::BLEND), "UI blend state was not restored");
         assert_eq!(read_patch(), expected, "UI blend state corrupted the video frame");
         gl.disable(glow::BLEND);
@@ -444,7 +423,10 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 assert_eq!(gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING), fbo.0.get() as i32);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 if frame_ready {
-                    video_gl::with_saved_state(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+                    video_gl::with_saved_state(&gl, || {
+                        player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+                    })
+                    .unwrap();
                 }
                 drop(player.poll_playback_state());
             }
@@ -474,7 +456,10 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         loop {
             let _ = events.recv_timeout(Duration::from_millis(10));
             if video_gl::with_saved_state(&gl, || player.take_render_update()) {
-                video_gl::with_saved_state(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+                video_gl::with_saved_state(&gl, || {
+                    player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+                })
+                .unwrap();
             }
             drop(player.poll_playback_state());
             if let Ok(image) = image::open(&screenshot_file) {
@@ -548,7 +533,10 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             let video_ready = video_gl::with_saved_state(&gl, || player.take_render_update());
             if video_ready {
                 let start = Instant::now();
-                video_gl::without_blending(&gl, || player.render_opengl(fbo.0.get(), 1920, 1080)).unwrap();
+                video_gl::without_blending(&gl, || {
+                    player.render_opengl_with_format(fbo.0.get(), 1920, 1080, internal_format)
+                })
+                .unwrap();
                 // Include GPU completion in this headless measurement.
                 gl.finish();
                 let elapsed = start.elapsed();
@@ -560,6 +548,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 window.redraw_requested.set(false);
                 let ui_started = Instant::now();
                 window.renderer.render().unwrap();
+                player.report_render_swap();
                 gl.finish();
                 let ui_elapsed = ui_started.elapsed() + update_time;
                 ui_time += ui_elapsed;

@@ -23,7 +23,7 @@ fn expression(cell: &'static OnceLock<Regex>, pattern: &'static str) -> &'static
 
 fn ass_style() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    expression(&REGEX, r"\{\\.*?\}")
+    expression(&REGEX, r"\{[^}]*\}")
 }
 
 fn ass_newline() -> &'static Regex {
@@ -41,11 +41,21 @@ fn vtt_tags() -> &'static Regex {
     expression(&REGEX, r"<[^>]*>")
 }
 
+fn is_pcre2_ascii_space(ch: char) -> bool {
+    matches!(ch, '\t' | '\n' | '\x0b' | '\x0c' | '\r' | ' ')
+}
+
+fn split_pcre2_whitespace(text: &str) -> Vec<&str> {
+    text.split(is_pcre2_ascii_space)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 // QString::toInt converts through Latin-1, trims ASCII whitespace, and treats
 // an embedded NUL as the end of its numeric input.
 fn qt_to_i32(value: &str) -> Option<i32> {
     let value = value.split_once('\0').map_or(value, |(prefix, _)| prefix);
-    value.trim_matches(|ch: char| ch.is_ascii_whitespace()).parse().ok()
+    value.trim_matches(is_pcre2_ascii_space).parse().ok()
 }
 
 fn timecode_to_double(timecode: &str) -> Option<f64> {
@@ -197,6 +207,9 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
     let mut output = Vec::new();
     for line in &lines[format_idx + 1..] {
         let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            break;
+        }
         let dialogue = if let Some(d) = trimmed.strip_prefix("Dialogue: ") {
             d
         } else if let Some(d) = trimmed.strip_prefix("Dialogue:") {
@@ -242,7 +255,7 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         if index == lines.len() { break; }
         let position = line.trim().parse::<u32>().map_err(|_| ())?;
         let position = i32::try_from(position).map_err(|_| ())?;
-        let timing: Vec<&str> = lines[index].split_ascii_whitespace().collect();
+        let timing = split_pcre2_whitespace(lines[index]);
         index += 1;
         if timing.len() != 3 || timing[1] != "-->" { return Err(()); }
         let start = timecode_to_double(timing[0]).ok_or(())?;
@@ -282,7 +295,8 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         let line = lines[index].trim();
         index += 1;
         if line.is_empty() { continue; }
-        let first = line.split_ascii_whitespace().next().unwrap_or("");
+        let tokens = split_pcre2_whitespace(line);
+        let first = tokens.first().copied().unwrap_or("");
         if matches!(first, "NOTE" | "STYLE" | "REGION") {
             while index < lines.len() {
                 let line = lines[index];
@@ -291,12 +305,11 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
             }
             continue;
         }
-        let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
         let timing = if tokens.len() >= 3 && tokens[1] == "-->" {
             tokens
         } else {
             if index == lines.len() { return Err(()); }
-            let tokens = lines[index].split_ascii_whitespace().collect::<Vec<_>>();
+            let tokens = split_pcre2_whitespace(lines[index]);
             index += 1;
             if tokens.len() < 3 || tokens[1] != "-->" { return Err(()); }
             tokens
@@ -363,8 +376,12 @@ mod tests {
 
     #[test]
     fn ass_requires_unique_columns_and_preserves_dialogue_commas() {
-        let input = "[Script Info]\n[Events]\nFormat: Start,End,Text\nDialogue: 0:00:01.00,0:00:02.00,{\\i1}hello\\Nworld,again\n";
+        let input = "[Script Info]\n[Events]\nFormat: Start,End,Text\n\
+            Dialogue: 0:00:01.00,0:00:02.00,{translator note}{\\i1}hello\\Nworld,again{ \\i0 }{}\n\
+            [Aegisub Extradata]\n\
+            Dialogue: 0:00:03.00,0:00:04.00,not an event\n";
         let result = parse(Format::Ass, input).unwrap();
+        assert_eq!(result.len(), 1);
         assert_eq!(String::from_utf16(&result[0].text).unwrap(), "hello\nworld,again");
         assert!(parse(Format::Ass, "[Script Info]\n[Events]\nFormat: Start,Start,End,Text\n").is_err());
     }
@@ -421,15 +438,30 @@ mod tests {
     #[test]
     fn timecode_integer_fields_match_qt_conversion() {
         // QString::toInt accepts ASCII edge whitespace but not NBSP after
-        // converting the field to Latin-1.
+        // converting the field to Latin-1. In SRT, ASCII whitespace inside a
+        // timecode splits the timing line before timecodeToDouble; ASS splits
+        // columns on commas, reaching QString::toInt directly.
         assert!(parse(
             Format::Srt,
             "1\n00:\u{00a0}00:01,00 --> 00:00:02,00\ncue\n",
         ).is_err());
+        assert!(parse(
+            Format::Srt,
+            "1\n00: 00:01,00 --> 00:00:02,00\ncue\n",
+        ).is_err());
+        assert!(parse(
+            Format::Ass,
+            "[Script Info]\n[Events]\nFormat: Start,End,Text\nDialogue: 00:\u{00a0}00:01.00,00:00:02.00,cue\n",
+        )
+        .unwrap()
+        .is_empty());
         assert_eq!(
-            parse(Format::Srt, "1\n00: 00:01,00 --> 00:00:02,00\ncue\n")
-                .unwrap()
-                .len(),
+            parse(
+                Format::Ass,
+                "[Script Info]\n[Events]\nFormat: Start,End,Text\nDialogue: 00: 00:01.00,00:00:02.00,cue\n",
+            )
+            .unwrap()
+            .len(),
             1,
         );
         // The bounded C++ conversion treats an embedded NUL as a terminator.

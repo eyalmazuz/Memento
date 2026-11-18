@@ -1362,6 +1362,7 @@ component MenuDropdown inherits Rectangle {
     in property <bool> asr-enabled: false;
     in property <bool> furigana-enabled: false;
     in property <bool> asr-running: false;
+    in property <bool> asr-track-selected: false;
     in property <bool> ocr-enabled: false;
     in property <bool> auto-pause: false;
     in property <bool> subtitles-visible: true;
@@ -1653,19 +1654,19 @@ component MenuDropdown inherits Rectangle {
                     DropdownItem {
                         text: "None";
                         checkable: true;
-                        checked: root.primary-sid == 0 && !root.asr-running;
+                        checked: root.primary-sid == 0 && !root.asr-track-selected;
                         clicked => { root.select-subtitle-track(0); root.close-menu(); }
                     }
                     if root.asr-enabled : DropdownItem {
                         text: root.asr-running ? "ASR subtitles…" : "ASR subtitles";
                         checkable: true;
-                        checked: root.asr-running;
+                        checked: root.asr-track-selected;
                         clicked => { root.select-asr(); root.close-menu(); }
                     }
                     for track[index] in root.subtitle-tracks : DropdownItem {
                         text: track.label;
                         checkable: true;
-                        checked: track.id == root.primary-sid && !root.asr-running;
+                        checked: track.id == root.primary-sid && !root.asr-track-selected;
                         is-disabled: track.id == root.secondary-sid;
                         clicked => {
                             if (track.id != root.secondary-sid) {
@@ -1733,6 +1734,7 @@ export component MementoApp inherits Window {
     in-out property <bool> ocr-enabled: false;
     in-out property <bool> asr-enabled: false;
     in-out property <bool> asr-running: false;
+    in-out property <bool> asr-track-selected: false;
     in-out property <bool> auto-pause: false;
     in-out property <bool> subtitles-visible: true;
     in-out property <bool> furigana-visible: false;
@@ -1826,6 +1828,8 @@ export component MementoApp inherits Window {
     callback check-updates();
     callback toggle-fullscreen();
     callback pointer-moved(float, float);
+    callback video-pointer-button(float, float, int, bool, bool, bool, bool, bool);
+    callback video-wheel(float, float, float, float);
     callback osc-activity();
     callback select-row(int, bool);
     callback select-subtitle-range(int, int, bool);
@@ -1907,16 +1911,50 @@ export component MementoApp inherits Window {
                     vertical-alignment: center;
                 }
 
-                // Track video-surface movement without blocking the subtitle or OSC controls.
+                // Track video-surface movement and forward unhandled mouse/wheel events to mpv.
                 video-motion := TouchArea {
                     width: 100%;
                     height: 100%;
                     pointer-event(event) => {
                         if event.kind == PointerEventKind.move {
                             root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
-                        } else if event.kind == PointerEventKind.down {
-                            root.dismiss-definition();
+                        } else if event.kind == PointerEventKind.down || event.kind == PointerEventKind.up {
+                            let btn = event.button == PointerEventButton.left ? 1
+                                : event.button == PointerEventButton.right ? 2
+                                : event.button == PointerEventButton.middle ? 4
+                                : event.button == PointerEventButton.back ? 8
+                                : event.button == PointerEventButton.forward ? 16 : 0;
+                            let had-popup = root.dict-open;
+                            if event.kind == PointerEventKind.down {
+                                root.dismiss-definition();
+                            }
+                            if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && btn > 0 {
+                                root.video-pointer-button(
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    btn,
+                                    event.kind == PointerEventKind.down,
+                                    event.modifiers.control,
+                                    event.modifiers.shift,
+                                    event.modifiers.alt,
+                                    event.modifiers.meta
+                                );
+                            }
+                        } else if event.kind == PointerEventKind.cancel {
+                            root.video-pointer-button(0.0, 0.0, 0, false, false, false, false, false);
                         }
+                    }
+                    scroll-event(event) => {
+                        if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open {
+                            root.video-wheel(
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px,
+                                event.delta-x / 1px,
+                                event.delta-y / 1px
+                            );
+                            return accept;
+                        }
+                        reject
                     }
                     double-clicked => { root.toggle-fullscreen(); }
                 }
@@ -2196,6 +2234,7 @@ export component MementoApp inherits Window {
         anki-enabled: root.anki-enabled;
         asr-enabled: root.asr-enabled;
         asr-running: root.asr-running;
+        asr-track-selected: root.asr-track-selected;
         ocr-enabled: root.ocr-enabled;
         furigana-enabled: root.furigana-enabled;
         auto-pause: root.auto-pause;
