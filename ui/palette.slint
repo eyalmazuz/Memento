@@ -11,11 +11,15 @@ export global MementoPalette {
     out property <color> card-bg:      dark ? #1E1E22 : #F1F3F5;
     out property <color> sidebar-bg:   dark ? #161619 : #E2E8F0;
     out property <color> osc-bg:       dark ? #141418EE : #FFFFFFEE;
+    out property <color> hover-bg:     dark ? #2A2A32 : #E2E8F0;
+    out property <color> active-bg:    dark ? #2E2E36 : #CBD5E1;
 
-    // Typography
+    // Typography & SVG icon tinting
     out property <color> text:           dark ? #F8FAFC : #0F172A;
     out property <color> text-secondary: dark ? #94A3B8 : #64748B;
     out property <color> text-muted:     dark ? #64748B : #94A3B8;
+    out property <color> icon:           dark ? #E2E8F0 : #1E293B;
+    out property <color> icon-muted:     dark ? #94A3B8 : #64748B;
 
     // Borders & dividers
     out property <color> border:       dark ? #28282E : #E2E8F0;
@@ -38,7 +42,7 @@ export global MementoPalette {
     // Subtitle list hover and selection
     out property <color> list-hover:     dark ? #222228 : #EDF2F7;
     out property <color> list-selected:  dark ? #1E3A8A : #BFDBFE;
-    out property <color> list-sel-text:  #FFFFFF;
+    out property <color> list-sel-text:  dark ? #FFFFFF : #0F172A;
     out property <color> list-sel-hover: dark ? #2563EB : #93C5FD;
     out property <color> active-cue:     #10B981; // emerald indicator
     out property <color> danger:         #EF4444;

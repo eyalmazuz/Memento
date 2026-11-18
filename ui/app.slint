@@ -35,16 +35,37 @@ export struct PlayerTrack {
     selected: bool,
 }
 
+export struct ChapterMark {
+    time: float,
+    title: string,
+}
+
 // ── OSC Bottom Controls Bar ─────────────────────────────────────────────
 component PlayerOscBar inherits Rectangle {
     in property <bool> playing: false;
     in property <float> position: 0.0;
     in property <float> duration: 0.0;
     in property <float> volume: 100.0;
+    in property <float> volume-max: 100.0;
+    in property <bool> is-muted: false;
     in property <string> current-time: "00:00";
     in property <string> duration-time: "00:00";
     in property <bool> is-fullscreen: false;
     in property <bool> ocr-enabled: false;
+    in property <[float]> chapters: [];
+    in property <[ChapterMark]> chapter-marks: [];
+
+    out property <bool> timeline-hovered: slider-touch.has-hover || slider-touch.pressed;
+    out property <float> hover-time: root.duration > 0.0 && slider-touch.width > 0px
+        ? max(0.0, min(root.duration, root.duration * (slider-touch.mouse-x / slider-touch.width)))
+        : 0.0;
+    out property <length> hover-x: timeline.x + max(0px, min(timeline.width, slider-touch.mouse-x));
+    out property <bool> is-hovered:
+        bar-touch.has-hover || p-touch.has-hover || sp-touch.has-hover
+        || rw-touch.has-hover || ff-touch.has-hover || sn-touch.has-hover
+        || slider-touch.has-hover || slider-touch.pressed
+        || vol-touch.has-hover || sub-t-touch.has-hover
+        || fs-touch.has-hover;
 
     callback toggle-play();
     callback seek(float);
@@ -56,6 +77,7 @@ component PlayerOscBar inherits Rectangle {
     callback toggle-sub-list();
     callback start-ocr();
     callback toggle-fullscreen();
+    callback timeline-hover-moved(float);
     callback activity();
     callback interacted();
 
@@ -63,12 +85,16 @@ component PlayerOscBar inherits Rectangle {
     background: MementoPalette.osc-bg;
     border-radius: 8px;
     border-width: 1px;
-    border-color: #28283088;
+    border-color: MementoPalette.border;
     drop-shadow-blur: 12px;
     drop-shadow-color: #00000066;
 
-    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } }
+    bar-touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+    }
 
     HorizontalLayout {
         padding-left: 10px;
@@ -86,16 +112,22 @@ component PlayerOscBar inherits Rectangle {
                 width: 32px;
                 height: 32px;
                 border-radius: 4px;
-                background: p-touch.has-hover ? #2A2A32 : transparent;
+                background: p-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 16px;
                     height: 16px;
                     source: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                    colorize: MementoPalette.icon;
                 }
-                p-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-play(); } }
+                p-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.toggle-play(); }
+                }
             }
 
             // Previous playlist item
@@ -103,16 +135,22 @@ component PlayerOscBar inherits Rectangle {
                 width: 30px;
                 height: 30px;
                 border-radius: 4px;
-                background: sp-touch.has-hover ? #2A2A32 : transparent;
+                background: sp-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 14px;
                     height: 14px;
                     source: @image-url("icons/skip-previous.svg");
+                    colorize: MementoPalette.icon;
                 }
-                sp-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.playlist-prev(); } }
+                sp-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.playlist-prev(); }
+                }
             }
 
             // Previous subtitle cue
@@ -120,16 +158,22 @@ component PlayerOscBar inherits Rectangle {
                 width: 30px;
                 height: 30px;
                 border-radius: 4px;
-                background: rw-touch.has-hover ? #2A2A32 : transparent;
+                background: rw-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 14px;
                     height: 14px;
                     source: @image-url("icons/fast-rewind.svg");
+                    colorize: MementoPalette.icon;
                 }
-                rw-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.subtitle-seek(-1); } }
+                rw-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.subtitle-seek(-1); }
+                }
             }
 
             // Next subtitle cue
@@ -137,16 +181,22 @@ component PlayerOscBar inherits Rectangle {
                 width: 30px;
                 height: 30px;
                 border-radius: 4px;
-                background: ff-touch.has-hover ? #2A2A32 : transparent;
+                background: ff-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 14px;
                     height: 14px;
                     source: @image-url("icons/fast-forward.svg");
+                    colorize: MementoPalette.icon;
                 }
-                ff-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.subtitle-seek(1); } }
+                ff-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.subtitle-seek(1); }
+                }
             }
 
             // Next playlist item
@@ -154,23 +204,29 @@ component PlayerOscBar inherits Rectangle {
                 width: 30px;
                 height: 30px;
                 border-radius: 4px;
-                background: sn-touch.has-hover ? #2A2A32 : transparent;
+                background: sn-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 14px;
                     height: 14px;
                     source: @image-url("icons/skip-next.svg");
+                    colorize: MementoPalette.icon;
                 }
-                sn-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.playlist-next(); } }
+                sn-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.playlist-next(); }
+                }
             }
 
             // Current Time label
             Text {
                 text: root.current-time;
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
                 vertical-alignment: center;
                 min-width: 45px;
             }
@@ -187,7 +243,7 @@ component PlayerOscBar inherits Rectangle {
                 width: parent.width;
                 height: 6px;
                 border-radius: 3px;
-                background: #3E3E4C;
+                background: MementoPalette.dark ? #3E3E4C : #CBD5E1;
 
                 // Cyan Progress Bar
                 progress-fill := Rectangle {
@@ -197,6 +253,16 @@ component PlayerOscBar inherits Rectangle {
                     height: parent.height;
                     border-radius: 3px;
                     background: MementoPalette.cyan-accent;
+                }
+
+                // Chapter tick marks
+                for ch-time in root.chapters : Rectangle {
+                    visible: root.duration > 0.0 && ch-time > 0.0 && ch-time < root.duration;
+                    x: parent.width * (ch-time / max(1.0, root.duration));
+                    y: 0px;
+                    width: 2px;
+                    height: parent.height;
+                    background: MementoPalette.window-bg;
                 }
 
                 // White Scrubber Knob
@@ -217,17 +283,28 @@ component PlayerOscBar inherits Rectangle {
                 height: 100%;
                 mouse-cursor: pointer;
                 pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                    if event.kind == PointerEventKind.move {
+                        root.activity();
+                        if root.duration > 0.0 && self.width > 0px {
+                            let ratio = max(0.0, min(1.0, self.mouse-x / self.width));
+                            root.timeline-hover-moved(root.duration * ratio);
+                        }
+                    } else if event.kind == PointerEventKind.down {
+                        root.interacted();
+                    }
                 }
                 moved => {
-                    if (self.pressed) {
-                        let ratio = self.mouse-x / self.width;
-                        root.seek(max(0.0, min(root.duration, root.duration * ratio)));
+                    if root.duration > 0.0 && self.width > 0px {
+                        let ratio = max(0.0, min(1.0, self.mouse-x / self.width));
+                        let target = root.duration * ratio;
+                        root.timeline-hover-moved(target);
+                        if (self.pressed) {
+                            root.seek(target);
+                        }
                     }
                 }
                 clicked => {
-                    let ratio = self.mouse-x / self.width;
+                    let ratio = self.mouse-x / max(1px, self.width);
                     root.seek(max(0.0, min(root.duration, root.duration * ratio)));
                 }
             }
@@ -243,7 +320,7 @@ component PlayerOscBar inherits Rectangle {
             Text {
                 text: root.duration-time;
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
                 vertical-alignment: center;
             }
 
@@ -252,37 +329,40 @@ component PlayerOscBar inherits Rectangle {
                 width: 28px;
                 height: 28px;
                 border-radius: 4px;
-                background: vol-touch.has-hover ? #2A2A32 : transparent;
+                background: vol-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 16px;
                     height: 16px;
-                    source: root.volume > 0.0 ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
+                    source: (!root.is-muted && root.volume > 0.0) ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
+                    colorize: MementoPalette.icon;
                 }
                 vol-touch := TouchArea {
-                    pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
                     clicked => { root.toggle-mute(); }
                 }
             }
 
-            // Mini Volume Slider
+            // Mini Volume Slider (supports >100% boost via volume-max)
             Slider {
                 width: 70px;
                 minimum: 0.0;
-                maximum: 100.0;
-                value: root.volume;
+                maximum: max(100.0, root.volume-max);
+                value: root.is-muted ? 0.0 : root.volume;
                 changed(val) => { root.interacted(); root.activity(); root.volume-changed(val); }
             }
 
             // Volume % Label
             Text {
-                text: round(root.volume) + "%";
+                text: (root.is-muted ? 0 : round(root.volume)) + "%";
                 font-size: 11px;
-                color: #94A3B8;
+                color: MementoPalette.text-secondary;
                 vertical-alignment: center;
-                min-width: 32px;
+                min-width: 36px;
             }
 
             // Subtitle Drawer Toggle Button
@@ -290,32 +370,44 @@ component PlayerOscBar inherits Rectangle {
                 width: 28px;
                 height: 28px;
                 border-radius: 4px;
-                background: sub-t-touch.has-hover ? #2A2A32 : transparent;
+                background: sub-t-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 16px;
                     height: 16px;
                     source: @image-url("icons/list.svg");
+                    colorize: MementoPalette.icon;
                 }
-                sub-t-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-sub-list(); } }
+                sub-t-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.toggle-sub-list(); }
+                }
             }
 
             if root.ocr-enabled : Rectangle {
                 width: 28px;
                 height: 28px;
                 border-radius: 4px;
-                background: ocr-touch.has-hover ? #2A2A32 : transparent;
+                background: ocr-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 16px;
                     height: 16px;
                     source: @image-url("icons/eye.svg");
+                    colorize: MementoPalette.icon;
                 }
-                ocr-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.start-ocr(); } }
+                ocr-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.start-ocr(); }
+                }
             }
 
             // Fullscreen Toggle Button
@@ -323,16 +415,22 @@ component PlayerOscBar inherits Rectangle {
                 width: 28px;
                 height: 28px;
                 border-radius: 4px;
-                background: fs-touch.has-hover ? #2A2A32 : transparent;
+                background: fs-touch.has-hover ? MementoPalette.hover-bg : transparent;
                 Image {
                     x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     width: 15px;
                     height: 15px;
                     source: root.is-fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
+                    colorize: MementoPalette.icon;
                 }
-                fs-touch := TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } clicked => { root.toggle-fullscreen(); } }
+                fs-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.activity(); }
+                        else if event.kind == PointerEventKind.down { root.interacted(); }
+                    }
+                    clicked => { root.toggle-fullscreen(); }
+                }
             }
         }
     }
@@ -343,45 +441,125 @@ component SubtitleDrawerPanel inherits Rectangle {
     // A hidden drawer must not reserve space in the window layout.
     min-height: 0px;
     in property <[SubEntry]> entries;
+    in property <[SubEntry]> secondary-entries: [];
+    in property <bool> has-secondary: false;
+    in-out property <int> active-tab: 0; // 0: Primary, 1: Secondary
     in-out property <string> search-text: "";
+    in property <int> current-match: 0;
+    in property <int> total-matches: 0;
+    in property <int> focused-match-row: -1;
+    in-out property <bool> user-scrolling: false;
+
     pure callback format-timestamp(float) -> string;
     callback row-clicked(int, bool);
     callback range-dragged(int, int, bool);
     callback row-activated(int, float);
     callback search-changed(string);
+    callback next-match();
+    callback prev-match();
+    callback tab-changed(int);
+    callback scroll-to-row(int);
+    callback focus-search();
 
-    background: #181A1D;
+    scroll-to-row(row-idx) => {
+        if row-idx >= 0 && sub-list-view.visible-height > 0px {
+            let target = -(row-idx * 36px - (sub-list-view.visible-height - 36px) / 2);
+            let min-y = min(0px, sub-list-view.visible-height - sub-list-view.viewport-height);
+            sub-list-view.viewport-y = max(min-y, min(0px, target));
+        }
+    }
+
+    focus-search => {
+        search-input.focus();
+        search-input.select-all();
+    }
+
+    background: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
     border-width: 1px;
-    border-color: #2D3136;
+    border-color: MementoPalette.border;
 
     VerticalLayout {
         padding: 10px;
         spacing: 8px;
 
-        // Header + Search
+        // Top 28px header: Primary / Secondary Tabs
         HorizontalLayout {
-            spacing: 8px;
-            LineEdit {
-                placeholder-text: "Search subtitles (Ctrl+F)…";
-                text <=> root.search-text;
-                edited(val) => { root.search-changed(val); }
+            height: 28px;
+            spacing: 6px;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 28px;
+                border-radius: 4px;
+                background: root.active-tab == 0
+                    ? MementoPalette.list-selected
+                    : (prim-tab-touch.has-hover ? MementoPalette.list-hover : transparent);
+                border-width: 1px;
+                border-color: root.active-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border;
+                Text {
+                    text: "Primary";
+                    font-size: 12px;
+                    font-weight: root.active-tab == 0 ? 700 : 500;
+                    color: MementoPalette.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                prim-tab-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if root.active-tab != 0 {
+                            root.active-tab = 0;
+                            root.tab-changed(0);
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 28px;
+                border-radius: 4px;
+                background: root.active-tab == 1
+                    ? MementoPalette.list-selected
+                    : (sec-tab-touch.has-hover ? MementoPalette.list-hover : transparent);
+                border-width: 1px;
+                border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
+                opacity: root.has-secondary || root.secondary-entries.length > 0 ? 1.0 : 0.65;
+                Text {
+                    text: "Secondary";
+                    font-size: 12px;
+                    font-weight: root.active-tab == 1 ? 700 : 500;
+                    color: MementoPalette.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                sec-tab-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if root.active-tab != 1 {
+                            root.active-tab = 1;
+                            root.tab-changed(1);
+                        }
+                    }
+                }
             }
         }
 
-        // Subtitle Cues List
-        ListView {
+        // Subtitle Cues List (starts at y = 30 + 10 + 28 + 8 = 76px)
+        sub-list-view := ListView {
+            vertical-stretch: 1;
             // Mouse dragging marks subtitles; scrolling uses the wheel or bar.
             mouse-drag-pan-enabled: false;
-            for entry[idx] in root.entries : Rectangle {
-                height: 36px;
+            for entry[idx] in (root.active-tab == 1 ? root.secondary-entries : root.entries) : Rectangle {
+                height: max(36px, cue-text.preferred-height + 14px);
                 border-radius: 4px;
-                border-width: entry.search-match ? 1px : 0px;
-                border-color: #C29D4B;
+                border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
+                border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : #C29D4B;
                 background: entry.selected
                     ? (d-touch.has-hover ? #2A3B4C : #1E2D3D)
                     : (entry.is_active
                         ? #134E4A
-                        : (d-touch.has-hover ? #262A30 : transparent));
+                        : (d-touch.has-hover ? MementoPalette.list-hover : transparent));
 
                 // Emerald indicator for active playing cue
                 if entry.is_active : Rectangle {
@@ -389,7 +567,7 @@ component SubtitleDrawerPanel inherits Rectangle {
                     y: 4px;
                     width: 3px;
                     height: parent.height - 8px;
-                    background: #10B981;
+                    background: MementoPalette.active-cue;
                     border-radius: 2px;
                 }
 
@@ -408,18 +586,18 @@ component SubtitleDrawerPanel inherits Rectangle {
                         vertical-alignment: center;
                         font-size: 11px;
                         font-weight: 600;
-                        color: entry.selected ? #6EE7B7 : #8A949E;
+                        color: entry.selected ? #6EE7B7 : MementoPalette.text-secondary;
                         text: root.format-timestamp(entry.start);
                     }
 
-                    // Cue Text
-                    Text {
+                    // Wrapped Multi-Line Cue Text
+                    cue-text := Text {
                         horizontal-stretch: 1;
                         vertical-alignment: center;
                         font-size: 13px;
                         font-weight: entry.is_active ? 700 : 400;
-                        color: entry.selected ? #FFFFFF : #F0F4F8;
-                        overflow: elide;
+                        color: entry.selected ? MementoPalette.list-sel-text : MementoPalette.text;
+                        wrap: word-wrap;
                         text: entry.text;
                     }
                 }
@@ -439,7 +617,7 @@ component SubtitleDrawerPanel inherits Rectangle {
                         }
                     }
                     moved => {
-                        if self.pressed {
+                        if self.pressed && root.active-tab == 0 {
                             // TouchArea keeps the pointer grab outside its row.
                             let end = min(root.entries.length - 1, max(0, idx + floor(self.mouse-y / self.height)));
                             if end != self.drag-end {
@@ -450,32 +628,104 @@ component SubtitleDrawerPanel inherits Rectangle {
                         }
                     }
                     clicked => {
-                        if !self.dragging-range { root.row-clicked(idx, self.extend-range); }
+                        if !self.dragging-range && root.active-tab == 0 {
+                            root.row-clicked(idx, self.extend-range);
+                        }
                     }
                     double-clicked => {
-                        if !self.dragging-range { root.row-activated(idx, entry.start); }
+                        if !self.dragging-range {
+                            root.row-activated(idx, entry.start);
+                        }
                     }
                 }
             }
         }
 
+        // Bottom Search Bar + X of Y Counter + Up/Down Navigation
+        HorizontalLayout {
+            height: 30px;
+            spacing: 6px;
+            alignment: center;
+
+            search-input := LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: "Search subtitles (Ctrl+F)…";
+                text <=> root.search-text;
+                edited(val) => { root.search-changed(val); }
+                accepted => { root.next-match(); }
+            }
+
+            if root.search-text != "" : Text {
+                text: root.total-matches > 0
+                    ? (root.current-match + " of " + root.total-matches)
+                    : "0 of 0";
+                font-size: 11px;
+                color: MementoPalette.text-secondary;
+                vertical-alignment: center;
+                min-width: 44px;
+                horizontal-alignment: center;
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                background: prev-m-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                Image {
+                    x: 4px;
+                    y: 4px;
+                    width: 16px;
+                    height: 16px;
+                    source: @image-url("icons/arrow-up.svg");
+                    colorize: MementoPalette.icon;
+                }
+                prev-m-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.prev-match(); }
+                }
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                background: next-m-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                Image {
+                    x: 4px;
+                    y: 4px;
+                    width: 16px;
+                    height: 16px;
+                    source: @image-url("icons/arrow-down.svg");
+                    colorize: MementoPalette.icon;
+                }
+                next-m-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.next-match(); }
+                }
+            }
+        }
     }
 }
 
 // ── Top Native Menu Bar ─────────────────────────────────────────────────
 component TopMenuBar inherits Rectangle {
     in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
+    out property <bool> is-hovered:
+        top-touch.has-hover || m0-t.has-hover || m1-t.has-hover
+        || m2-t.has-hover || m3-t.has-hover || m4-t.has-hover;
     callback activity();
     callback interacted();
 
     height: 30px;
     background: MementoPalette.surface-bg;
-    // border-bottom
-
     border-color: MementoPalette.border;
 
-    TouchArea { pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } } }
+    top-touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+    }
 
     HorizontalLayout {
         padding-left: 8px;
@@ -487,16 +737,18 @@ component TopMenuBar inherits Rectangle {
             width: 56px;
             height: 26px;
             border-radius: 4px;
-            background: root.open-menu == 0 ? #2E2E36 : (m0-t.has-hover ? #25252C : transparent);
+            background: root.open-menu == 0 ? MementoPalette.active-bg : (m0-t.has-hover ? MementoPalette.hover-bg : transparent);
             Text {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 text: "Media";
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
             }
             m0-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                }
                 clicked => { root.open-menu = root.open-menu == 0 ? -1 : 0; }
             }
         }
@@ -506,16 +758,18 @@ component TopMenuBar inherits Rectangle {
             width: 56px;
             height: 26px;
             border-radius: 4px;
-            background: root.open-menu == 1 ? #2E2E36 : (m1-t.has-hover ? #25252C : transparent);
+            background: root.open-menu == 1 ? MementoPalette.active-bg : (m1-t.has-hover ? MementoPalette.hover-bg : transparent);
             Text {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 text: "Audio";
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
             }
             m1-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                }
                 clicked => { root.open-menu = root.open-menu == 1 ? -1 : 1; }
             }
         }
@@ -525,16 +779,18 @@ component TopMenuBar inherits Rectangle {
             width: 66px;
             height: 26px;
             border-radius: 4px;
-            background: root.open-menu == 2 ? #2E2E36 : (m2-t.has-hover ? #25252C : transparent);
+            background: root.open-menu == 2 ? MementoPalette.active-bg : (m2-t.has-hover ? MementoPalette.hover-bg : transparent);
             Text {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 text: "Subtitle";
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
             }
             m2-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                }
                 clicked => { root.open-menu = root.open-menu == 2 ? -1 : 2; }
             }
         }
@@ -544,16 +800,18 @@ component TopMenuBar inherits Rectangle {
             width: 56px;
             height: 26px;
             border-radius: 4px;
-            background: root.open-menu == 3 ? #2E2E36 : (m3-t.has-hover ? #25252C : transparent);
+            background: root.open-menu == 3 ? MementoPalette.active-bg : (m3-t.has-hover ? MementoPalette.hover-bg : transparent);
             Text {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 text: "Tools";
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
             }
             m3-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                }
                 clicked => { root.open-menu = root.open-menu == 3 ? -1 : 3; }
             }
         }
@@ -563,16 +821,18 @@ component TopMenuBar inherits Rectangle {
             width: 68px;
             height: 26px;
             border-radius: 4px;
-            background: root.open-menu == 4 ? #2E2E36 : (m4-t.has-hover ? #25252C : transparent);
+            background: root.open-menu == 4 ? MementoPalette.active-bg : (m4-t.has-hover ? MementoPalette.hover-bg : transparent);
             Text {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 text: "Settings";
                 font-size: 12px;
-                color: #E2E8F0;
+                color: MementoPalette.text;
             }
             m4-t := TouchArea {
-                pointer-event(event) => { if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); } }
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.activity(); }
+                    else if event.kind == PointerEventKind.down { root.interacted(); }
+                }
                 clicked => { root.open-menu = root.open-menu == 4 ? -1 : 4; }
             }
         }
@@ -591,7 +851,7 @@ component DropdownItem inherits Rectangle {
 
     height: 30px;
     border-radius: 4px;
-    background: root.is-disabled ? transparent : (touch.has-hover ? #2A2A32 : transparent);
+    background: root.is-disabled ? transparent : (touch.has-hover ? MementoPalette.hover-bg : transparent);
 
     HorizontalLayout {
         padding-left: 10px;
@@ -616,7 +876,7 @@ component DropdownItem inherits Rectangle {
             Text {
                 text: root.text;
                 font-size: 12px;
-                color: root.is-disabled ? #64748B : #F8FAFC;
+                color: root.is-disabled ? MementoPalette.text-muted : MementoPalette.text;
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
@@ -630,7 +890,7 @@ component DropdownItem inherits Rectangle {
             if root.shortcut != "" : Text {
                 text: root.shortcut;
                 font-size: 11px;
-                color: #888890;
+                color: MementoPalette.text-secondary;
                 vertical-alignment: center;
             }
 
@@ -638,7 +898,7 @@ component DropdownItem inherits Rectangle {
                 text: "›";
                 font-size: 14px;
                 font-weight: 700;
-                color: #888890;
+                color: MementoPalette.text-secondary;
                 vertical-alignment: center;
             }
         }
@@ -657,7 +917,7 @@ component DropdownSeparator inherits Rectangle {
     Rectangle {
         y: 4px;
         height: 1px;
-        background: #28282E;
+        background: MementoPalette.border;
     }
 }
 
@@ -668,6 +928,7 @@ component MenuDropdown inherits Rectangle {
     in property <[PlayerTrack]> audio-tracks: [];
     in property <[PlayerTrack]> subtitle-tracks: [];
     in property <[string]> recent-files: [];
+    in property <[string]> recent-file-labels: [];
     in property <[string]> anki-profiles: [];
     in property <int> audio-id: 0;
     in property <int> primary-sid: 0;
@@ -731,9 +992,9 @@ component MenuDropdown inherits Rectangle {
            root.menu-index == 2 ? 220px :
            root.menu-index == 3 ? 180px : 200px;
     height: menu-content.preferred-height;
-    background: #1E1E22;
+    background: MementoPalette.card-bg;
     border-width: 1px;
-    border-color: #28282E;
+    border-color: MementoPalette.border;
     border-radius: 6px;
     drop-shadow-blur: 16px;
     drop-shadow-color: #00000088;
@@ -883,15 +1144,15 @@ component MenuDropdown inherits Rectangle {
            root.submenu-index == 1 ? 34px :
            root.submenu-index == 2 ? max(10px, parent.height - self.height - 30px) :
            root.submenu-index == 3 ? max(10px, parent.height - self.height) : 6px;
-        width: root.submenu-index == 0 ? 320px : 260px;
+        width: root.submenu-index == 0 ? 380px : 260px;
         height: root.submenu-index == 0 ? max(44px, min(360px, (root.recent-files.length == 0 ? 1 : root.recent-files.length + 2) * 30px + 14px)) :
                 root.submenu-index == 1 ? 134px :
                 root.submenu-index == 2 ? max(44px, min(300px, (root.subtitle-tracks.length + 1) * 30px + 14px)) :
                 root.submenu-index == 3 ? max(44px, min(300px, (root.subtitle-tracks.length + (root.asr-enabled ? 2 : 1)) * 30px + 14px)) :
                 max(44px, min(300px, max(1, root.anki-profiles.length) * 30px + 14px));
-        background: #1E1E22;
+        background: MementoPalette.card-bg;
         border-width: 1px;
-        border-color: #28282E;
+        border-color: MementoPalette.border;
         border-radius: 6px;
         drop-shadow-blur: 16px;
         drop-shadow-color: #00000088;
@@ -908,7 +1169,9 @@ component MenuDropdown inherits Rectangle {
                         is-disabled: true;
                     }
                     for file[index] in root.recent-files : DropdownItem {
-                        text: file;
+                        text: index < root.recent-file-labels.length && root.recent-file-labels[index] != ""
+                            ? root.recent-file-labels[index]
+                            : file;
                         clicked => { root.open-recent(file); root.close-menu(); }
                     }
                     DropdownSeparator {}
@@ -1020,9 +1283,16 @@ export component MementoApp inherits Window {
     in-out property <float> position: 0.0;
     in-out property <float> duration: 0.0;
     in-out property <float> volume: 100.0;
+    in-out property <float> volume-max: 100.0;
+    in-out property <bool> is-muted: false;
     in-out property <string> current-time: "00:00";
     in-out property <string> duration-time: "00:00";
     in-out property <image> video-frame;
+    in-out property <image> thumbnail-frame;
+    in-out property <bool> preview-thumbnails-enabled: true;
+    in-out property <string> hover-chapter-title: "";
+    in-out property <[float]> chapters: [];
+    in-out property <[ChapterMark]> chapter-marks: [];
     callback update-video();
     callback video-frame-ready();
     in-out property <int> pending-playback-generation: -1;
@@ -1040,11 +1310,20 @@ export component MementoApp inherits Window {
     in-out property <int> selected-token-count: 1;
     in-out property <bool> dict-search-open: false;
     in-out property <bool> sub-drawer-open: false;
+    in-out property <length> sidebar-width: 360px;
+    in-out property <float> sidebar-split-ratio: 0.45;
     in-out property <bool> is-fullscreen: false;
     in-out property <bool> osc-visible: true;
+    in-out property <int> osc-visibility-mode: 0; // 0: Auto, 1: Hidden, 2: Visible
     in-out property <int> osc-duration-ms: 700;
     in-out property <int> osc-min-move: 0;
+    in-out property <bool> cursor-hidden: false;
     out property <bool> menu-open: menu-bar.open-menu >= 0;
+    out property <bool> osc-hovered:
+        osc.is-hovered || menu-bar.is-hovered || root.menu-open
+        || subtitle-hover-area.has-hover || secondary-hover-area.has-hover
+        || root.token-hovered;
+    in-out property <bool> token-hovered: false;
     in-out property <bool> ocr-mode: false;
     in-out property <bool> ocr-enabled: false;
     in-out property <bool> asr-enabled: false;
@@ -1060,6 +1339,7 @@ export component MementoApp inherits Window {
     in-out property <bool> hide-memento-while-playing: false;
     in-out property <bool> hover-pause-enabled: false;
     in-out property <[string]> recent-files: [];
+    in-out property <[string]> recent-file-labels: [];
     in-out property <[PlayerTrack]> audio-tracks: [];
     in-out property <[PlayerTrack]> subtitle-tracks: [];
     in-out property <int> audio-id: 0;
@@ -1082,6 +1362,16 @@ export component MementoApp inherits Window {
     in-out property <string> key-sub-decrease-size: "Ctrl+1";
     in-out property <string> key-sub-move-up: "Alt+1";
     in-out property <string> key-sub-move-down: "Alt+2";
+    in-out property <string> key-card-add: "Ctrl+D";
+    in-out property <string> key-card-next: "Ctrl+Down";
+    in-out property <string> key-card-prev: "Ctrl+Up";
+    in-out property <string> key-osc-visibility: "Delete";
+    in-out property <string> key-sub-list-copy: "Ctrl+Shift+C";
+    in-out property <string> key-sub-list-find: "Ctrl+F";
+    in-out property <string> key-sub-list-find-next: "F3";
+    in-out property <string> key-sub-list-find-prev: "Shift+F3";
+    in-out property <bool> custom-key-handler-installed: false;
+
     in-out property <bool> dict-open: false;
     in-out property <string> dict-query: "";
     in-out property <string> dict-reading: "";
@@ -1091,17 +1381,35 @@ export component MementoApp inherits Window {
     in-out property <[DictResult]> dict-results: [];
     in-out property <[DictResult]> popup-results: [];
     in-out property <int> popup-loaded-count: 0;
+    in-out property <int> popup-focused-index: 0;
+    in-out property <length> popup-configured-width: 480px;
+    in-out property <length> popup-configured-height: 440px;
     out property <bool> popup-needs-more: yomi-card.needs-more;
+    out property <length> popup-x: yomi-card.x;
+    out property <length> popup-y: yomi-card.y;
+    out property <length> popup-width: yomi-card.width;
+    out property <length> popup-height: yomi-card.height;
+    out property <length> primary-subtitle-y: subtitle-box.y;
+    out property <length> primary-subtitle-height: subtitle-box.height;
+    out property <length> secondary-subtitle-y: secondary-subtitle-box.y;
     in-out property <[PopupAudioSource]> popup-audio-sources: [];
     in-out property <bool> popup-audio-sources-loading: false;
     in-out property <int> popup-selected-audio-source: -1;
     in-out property <string> anki-added-note-id: "";
     in-out property <int> anki-added-result-index: -1;
     in-out property <bool> about-open: false;
+    in-out property <bool> url-dialog-open: false;
+    in-out property <string> url-dialog-text: "";
+    in-out property <string> copied-subtitle-text: "";
 
     // Subtitle Entries & Interactive Words
     in-out property <[SubEntry]> subtitle-entries: [];
+    in-out property <[SubEntry]> secondary-subtitle-entries: [];
+    in-out property <int> subtitle-drawer-tab: 0;
     in-out property <string> subtitle-search-query: "";
+    in-out property <int> subtitle-search-current-match: 0;
+    in-out property <int> subtitle-search-total-matches: 0;
+    in-out property <int> subtitle-search-focused-row: -1;
     in-out property <[SubtitleWord]> active-sub-words: [];
     in-out property <[SubtitleLine]> active-sub-lines: [];
     in-out property <length> popup-offset-x: 0px;
@@ -1118,11 +1426,14 @@ export component MementoApp inherits Window {
     callback volume-down();
     callback open-file();
     callback open-url();
+    callback open-url-submitted(string);
     callback open-recent(string);
     callback clear-recent();
     callback reload-media();
     callback close-media();
     callback quit-app();
+    callback file-dropped(string);
+    callback files-dropped([string]);
     callback select-audio-track(int);
     callback select-subtitle-track(int);
     callback select-secondary-subtitle-track(int);
@@ -1141,7 +1452,9 @@ export component MementoApp inherits Window {
     callback ocr-region(float, float, float, float);
     callback open-config();
     callback check-updates();
+    callback open-external-link(string);
     callback toggle-fullscreen();
+    callback timeline-hover-moved(float);
     callback pointer-moved(float, float);
     callback video-pointer-button(float, float, int, bool, bool, bool, bool, bool);
     callback video-wheel(float, float, float, float);
@@ -1150,6 +1463,12 @@ export component MementoApp inherits Window {
     callback select-subtitle-range(int, int, bool);
     callback mark-subtitle-row(int);
     callback search-subtitles(string);
+    callback next-subtitle-search-match();
+    callback prev-subtitle-search-match();
+    callback copy-selected-subtitles();
+    callback scroll-subtitle-drawer-to-row(int);
+    callback focus-subtitle-search();
+    callback subtitle-drawer-tab-changed(int);
     callback search-dictionary(string);
     callback lookup-word(string);
     callback open-glossary-link(string);
@@ -1158,6 +1477,7 @@ export component MementoApp inherits Window {
     callback toggle-definition-selection(int);
     callback toggle-term-collapse(int);
     callback load-more-definition-results(bool);
+    callback navigate-popup(int);
     callback add-anki-note(int);
     callback browse-anki-note(string);
     callback reset-definition-scroll();
@@ -1171,11 +1491,38 @@ export component MementoApp inherits Window {
         root.dict-open = false;
         root.selected-token-index = -1;
         root.selected-token-count = 1;
+        root.popup-focused-index = 0;
+        root.popup-offset-x = 0px;
         // Cancel delayed hover searches and invalidate results already in flight.
         root.hover-word("", -1, false, false, false, false);
     }
 
-    reset-definition-scroll => { yomi-card.reset-scroll(); }
+    scroll-subtitle-drawer-to-row(row-idx) => {
+        sub-drawer.scroll-to-row(row-idx);
+    }
+
+    focus-subtitle-search => {
+        root.sub-drawer-open = true;
+        sub-drawer.focus-search();
+    }
+
+    navigate-popup(direction) => {
+        if direction > 0 {
+            let count = root.popup-results.length;
+            if count > 0 {
+                root.popup-focused-index = min(count - 1, root.popup-focused-index + 1);
+            }
+            root.load-more-definition-results(true);
+        } else {
+            root.popup-focused-index = max(0, root.popup-focused-index - 1);
+            yomi-card.reset-scroll();
+        }
+    }
+
+    reset-definition-scroll => {
+        root.popup-focused-index = 0;
+        yomi-card.reset-scroll();
+    }
     pure callback format-timestamp(float) -> string;
     changed dict-search-open => {
         if root.dict-search-open {
@@ -1184,460 +1531,932 @@ export component MementoApp inherits Window {
             root.dismiss-definition();
         }
     }
+    changed dict-open => {
+        if !root.dict-open {
+            root.subtitle-hover-changed(
+                subtitle-hover-area.has-hover
+                || secondary-hover-area.has-hover
+                || root.token-hovered
+            );
+        }
+    }
+    changed secondary-sid => {
+        if root.secondary-sid == 0 && root.secondary-subtitle-entries.length == 0 && root.subtitle-drawer-tab == 1 {
+            root.subtitle-drawer-tab = 0;
+        }
+    }
 
     forward-focus: f-scope;
     f-scope := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        capture-key-pressed(event) => {
+            if (event.text == Key.F3) {
+                if (root.key-pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt, event.modifiers.meta)) {
+                    return accept;
+                }
+                if (!root.custom-key-handler-installed) {
+                    if (event.modifiers.shift) { root.prev-subtitle-search-match(); }
+                    else { root.next-subtitle-search-match(); }
+                    return accept;
+                }
+            }
+            if (event.modifiers.control && event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta
+                && (event.text == "c" || event.text == "C")) {
+                if (root.key-pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt, event.modifiers.meta)) {
+                    return accept;
+                }
+                if (!root.custom-key-handler-installed) {
+                    root.copy-selected-subtitles();
+                    return accept;
+                }
+            }
+            reject
+        }
+
         key-pressed(event) => {
             if (root.key-pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt, event.modifiers.meta)) {
                 return accept;
             }
+            if (root.custom-key-handler-installed) {
+                return reject;
+            }
+            // Built-in fallback for standalone Slint component tests when `main.rs` handler is not attached:
+            if (event.text == Key.Shift || event.text == Key.ShiftR
+                || event.text == Key.Control || event.text == Key.ControlR
+                || event.text == Key.Alt || event.text == Key.AltGr
+                || event.text == Key.Meta || event.text == Key.MetaR
+                || event.text == Key.CapsLock || event.text == "") {
+                return reject;
+            }
+            if (event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta
+                && (event.text == Key.UpArrow || event.text == Key.DownArrow)) {
+                if (root.dict-open) {
+                    root.navigate-popup(event.text == Key.DownArrow ? 1 : -1);
+                } else if (root.sub-drawer-open) {
+                    if (event.text == Key.DownArrow) { root.next-subtitle-search-match(); }
+                    else { root.prev-subtitle-search-match(); }
+                }
+                return accept;
+            }
+            if (event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta
+                && (event.text == "d" || event.text == "D")) {
+                if (root.dict-open && root.anki-enabled && root.dict-results.length > 0) {
+                    root.add-anki-note(0);
+                } else {
+                    root.dict-search-open = !root.dict-search-open;
+                }
+                return accept;
+            }
+            let had-dict = root.dict-open;
+            root.dismiss-definition();
+            if (event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta
+                && (event.text == "f" || event.text == "F")) {
+                root.focus-subtitle-search();
+                return accept;
+            }
+            if (event.modifiers.control && event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta
+                && (event.text == "c" || event.text == "C")) {
+                root.copy-selected-subtitles();
+                return accept;
+            }
+            if (event.text == Key.F3) {
+                if (event.modifiers.shift) { root.prev-subtitle-search-match(); }
+                else { root.next-subtitle-search-match(); }
+                return accept;
+            }
+            if (event.text == Key.Delete) {
+                root.osc-visibility-mode = mod(root.osc-visibility-mode + 1, 3);
+                root.osc-visible = root.osc-visibility-mode != 2;
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                if (root.ocr-mode) { root.ocr-mode = false; return accept; }
+                if (root.url-dialog-open) { root.url-dialog-open = false; return accept; }
+                if (root.about-open) { root.about-open = false; return accept; }
+                if (had-dict) { return accept; }
+                if (root.dict-search-open) { root.dict-search-open = false; return accept; }
+                if (root.sub-drawer-open) { root.sub-drawer-open = false; return accept; }
+                if (root.is-fullscreen) { root.toggle-fullscreen(); return accept; }
+            }
             reject
         }
-    }
 
-    // Window Content Layout
-    VerticalLayout {
-        spacing: 0;
-
-        // Top Native Menu Bar
-        menu-bar := TopMenuBar {
-            visible: root.osc-visible || self.open-menu >= 0;
-            activity => { root.osc-activity(); }
-            interacted => { root.dismiss-definition(); }
-        }
-
-        // Center Area: Video Surface + Optional Subtitle Drawer
-        HorizontalLayout {
+        // Window Content Layout
+        VerticalLayout {
+            width: 100%;
+            height: 100%;
             spacing: 0;
-            horizontal-stretch: 1;
 
-            // Video & Overlays Surface
-            video-area := Rectangle {
-                background: #000000;
+            // Top Native Menu Bar
+            menu-bar := TopMenuBar {
+                visible: root.osc-visible || self.open-menu >= 0;
+                activity => { root.osc-activity(); }
+                interacted => { root.dismiss-definition(); }
+            }
+
+            // Center Area: Video Surface + Optional Resizable Sidebar (Search + Subtitle Drawer)
+            HorizontalLayout {
+                spacing: 0;
                 horizontal-stretch: 1;
+                vertical-stretch: 1;
 
-                // libmpv frame shares the same Slint scene as all interactive overlays.
-                Image {
-                    width: parent.width;
-                    height: parent.height;
-                    source: root.video-frame;
-                    image-fit: contain;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                // Video & Overlays Surface
+                video-area := Rectangle {
+                    background: #000000;
+                    horizontal-stretch: 1;
 
-                // Track video-surface movement and forward unhandled mouse/wheel events to mpv.
-                video-motion := TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move {
-                            root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
-                        } else if event.kind == PointerEventKind.down || event.kind == PointerEventKind.up {
-                            let btn = event.button == PointerEventButton.left ? 1
-                                : event.button == PointerEventButton.right ? 2
-                                : event.button == PointerEventButton.middle ? 4
-                                : event.button == PointerEventButton.back ? 8
-                                : event.button == PointerEventButton.forward ? 16 : 0;
-                            let had-popup = root.dict-open;
-                            if event.kind == PointerEventKind.down {
-                                root.dismiss-definition();
-                            }
-                            if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && btn > 0 {
-                                root.video-pointer-button(
-                                    self.mouse-x / 1px,
-                                    self.mouse-y / 1px,
-                                    btn,
-                                    event.kind == PointerEventKind.down,
-                                    event.modifiers.control,
-                                    event.modifiers.shift,
-                                    event.modifiers.alt,
-                                    event.modifiers.meta
-                                );
-                            }
-                        } else if event.kind == PointerEventKind.cancel {
-                            root.video-pointer-button(0.0, 0.0, 0, false, false, false, false, false);
-                        }
-                    }
-                    scroll-event(event) => {
-                        if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open {
-                            root.video-wheel(
-                                self.mouse-x / 1px,
-                                self.mouse-y / 1px,
-                                event.delta-x / 1px,
-                                event.delta-y / 1px
-                            );
-                            return accept;
-                        }
-                        reject
-                    }
-                    double-clicked => { root.toggle-fullscreen(); }
-                }
-
-                // Empty / Placeholder state
-                if root.duration <= 0.0 : VerticalLayout {
-                    alignment: center;
-                    spacing: 12px;
-
-                    HorizontalLayout {
-                        alignment: center;
-                        Image {
-                            width: 64px;
-                            height: 64px;
-                            source: @image-url("icons/window.svg");
-                            colorize: #94A3B8;
-                        }
-                    }
-                    Text {
-                        text: "Memento";
-                        font-size: 26px;
-                        font-weight: 700;
-                        color: #E2E8F0;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Open a video file (Ctrl+O) or drag and drop media to start";
-                        font-size: 14px;
-                        color: #94A3B8;
-                        horizontal-alignment: center;
-                    }
-                    HorizontalLayout {
-                        alignment: center;
-                        Rectangle {
-                            width: 140px;
-                            height: 36px;
-                            border-radius: 6px;
-                            background: MementoPalette.cyan-accent;
-                            Text {
-                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                                text: "Open Media…";
-                                font-weight: 700;
-                                color: #000000;
-                            }
-                            TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.open-file(); }
-                            }
-                        }
-                    }
-                }
-
-                // Clickable text units supply the search suffix at each token.
-                subtitle-box := Rectangle {
-                    visible: root.active-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
-                    x: (parent.width - self.width) / 2;
-                    y: parent.height - self.height - max(62px, parent.height * root.subtitle-offset);
-                    width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
-                    height: subtitle-lines-layout.preferred-height + 16px;
-                    background: #00000099;
-                    border-radius: 4px;
-                    subtitle-hover-area := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        changed has-hover => { root.subtitle-hover-changed(self.has-hover); }
-                    }
-                    subtitle-lines-layout := VerticalLayout {
-                        x: 16px;
-                        y: 8px;
-                        width: self.preferred-width;
-                        height: self.preferred-height;
-                        spacing: 4px;
-                        alignment: center;
-                        for line in root.active-sub-lines : HorizontalLayout {
-                            width: self.preferred-width;
-                            height: self.preferred-height;
-                            alignment: center;
-                            spacing: 0px;
-                            for word in line.words : InteractiveSubtitleToken {
-                                word: word;
-                                type-size: video-area.height * root.subtitle-scale;
-                                show-furigana: root.furigana-visible;
-                                selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
-                                hover-state(hovering) => { root.subtitle-hover-changed(hovering); }
-                                hovered(query, control, shift, alt, meta) => {
-                                    root.osc-activity();
-                                    root.hover-word(query, word.index, control, shift, alt, meta);
-                                }
-                                clicked => {
-                                    root.selected-token-index = word.index;
-                                    root.hover-word("", word.index, false, false, false, false);
-                                    root.lookup-word(word.query);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if root.secondary-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing) : Rectangle {
-                    x: (parent.width - self.width) / 2;
-                    y: parent.height - self.height - max(116px, parent.height * root.subtitle-offset + 54px);
-                    width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
-                    height: secondary-subtitle-text.preferred-height + 16px;
-                    background: #00000099;
-                    border-radius: 4px;
-                    secondary-subtitle-text := Text {
-                        x: 16px;
-                        y: 8px;
-                        width: min(parent.width - 72px, self.preferred-width);
-                        text: root.secondary-sub-text;
-                        font-size: video-area.height * root.subtitle-scale;
-                        font-weight: 700;
-                        color: white;
-                        horizontal-alignment: center;
-                        wrap: word-wrap;
-                    }
-                    secondary-hover-area := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        changed has-hover => { root.subtitle-hover-changed(self.has-hover); }
-                    }
-                }
-
-                // Floating Yomitan Dictionary Card
-                yomi-card := YomitanPopup {
-                    width: min(480px, parent.width - 40px);
-                    height: min(440px, parent.height - 80px);
-                    x: min(parent.width - self.width - 20px, max(20px, subtitle-box.x + (subtitle-box.width - self.width) / 2));
-                    // Clamp toward the top when space above the subtitles is tight.
-                    // Falling below them would put definitions behind the OSC.
-                    y: max(10px, subtitle-box.y - self.height - 12px);
-                    is-open: root.dict-open;
-                    anki-enabled: root.anki-enabled;
-                    show-anki-checkbox: root.show-anki-checkbox;
-                    added-note-id: root.anki-added-note-id;
-                    added-result-index: root.anki-added-result-index;
-                    headword: root.dict-query;
-                    reading: root.dict-reading;
-                    pitch-accent: root.dict-pitch-accent;
-                    freq-rank: root.dict-freq-rank;
-                    jpdb-rank: root.dict-jpdb-rank;
-                    results: root.popup-results;
-                    has-more-results: root.popup-loaded-count < root.dict-results.length;
-                    audio-sources: root.popup-audio-sources;
-                    audio-sources-loading: root.popup-audio-sources-loading;
-                    selected-audio-source: root.popup-selected-audio-source;
-                    close-requested => { root.dismiss-definition(); }
-                    add-anki-note(idx) => { root.add-anki-note(idx); }
-                    browse-anki-note(id) => { root.browse-anki-note(id); }
-                    play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
-                    request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
-                    kanji-info(word) => { root.lookup-kanji(word); }
-                    toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
-                    toggle-term-collapse(idx) => { root.toggle-term-collapse(idx); }
-                    load-more-results(force) => { root.load-more-definition-results(force); }
-                    select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
-                    open-rich-link(link) => { root.open-glossary-link(link); }
-                }
-
-                // Bottom OSC Bar (Floating, 50px)
-                osc := PlayerOscBar {
-                    visible: root.osc-visible && !root.ocr-mode;
-                    x: 16px;
-                    y: parent.height - self.height - 12px;
-                    width: parent.width - 32px;
-                    playing: root.is-playing;
-                    position: root.position;
-                    duration: root.duration;
-                    volume: root.volume;
-                    current-time: root.current-time;
-                    duration-time: root.duration-time;
-                    is-fullscreen: root.is-fullscreen;
-                    ocr-enabled: root.ocr-enabled;
-                    toggle-play => { root.toggle-play(); }
-                    seek(val) => { root.seek-to(val); }
-                    subtitle-seek(dir) => { root.sub-seek(dir); }
-                    playlist-prev => { root.playlist-prev(); }
-                    playlist-next => { root.playlist-next(); }
-                    toggle-mute => { root.toggle-mute(); }
-                    start-ocr => { root.start-ocr(); }
-                    volume-changed(val) => { root.set-volume(val); }
-                    toggle-sub-list => {
-                        root.sub-drawer-open = !root.sub-drawer-open;
-                        root.dict-search-open = false;
-                    }
-                    toggle-fullscreen => { root.toggle-fullscreen(); }
-                    activity => { root.osc-activity(); }
-                    interacted => { root.dismiss-definition(); }
-                }
-
-                // Drag a rectangle over the current video frame for OCR.
-                if root.ocr-mode : Rectangle {
-                    width: parent.width;
-                    height: parent.height;
-                    ocr-touch := TouchArea {
+                    // libmpv frame shares the same Slint scene as all interactive overlays.
+                    Image {
                         width: parent.width;
                         height: parent.height;
-                        mouse-cursor: crosshair;
+                        source: root.video-frame;
+                        image-fit: contain;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    // Track video-surface movement and forward unhandled mouse/wheel events to mpv.
+                    video-motion := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: (root.is-fullscreen && (root.cursor-hidden || (!root.osc-visible && !root.osc-hovered && !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open)))
+                            ? none
+                            : default;
+                        changed has-hover => {
+                            if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
+                                root.subtitle-hover-changed(false);
+                            }
+                        }
                         pointer-event(event) => {
-                            if (event.kind == PointerEventKind.up) {
-                                let min-x = min(self.pressed-x, self.mouse-x);
-                                let min-y = min(self.pressed-y, self.mouse-y);
-                                let max-x = max(self.pressed-x, self.mouse-x);
-                                let max-y = max(self.pressed-y, self.mouse-y);
-                                let box-w = max-x - min-x;
-                                let box-h = max-y - min-y;
-                                if (box-w >= 6px && box-h >= 6px && self.width > 0px && self.height > 0px) {
-                                    root.ocr-region(
-                                        min-x / self.width,
-                                        min-y / self.height,
-                                        box-w / self.width,
-                                        box-h / self.height
+                            if event.kind == PointerEventKind.move {
+                                root.cursor-hidden = false;
+                                if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
+                                    root.subtitle-hover-changed(false);
+                                }
+                                root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
+                            } else if event.kind == PointerEventKind.down || event.kind == PointerEventKind.up {
+                                root.cursor-hidden = false;
+                                f-scope.focus();
+                                let btn = event.button == PointerEventButton.left ? 1
+                                    : event.button == PointerEventButton.right ? 2
+                                    : event.button == PointerEventButton.middle ? 4
+                                    : event.button == PointerEventButton.back ? 8
+                                    : event.button == PointerEventButton.forward ? 16 : 0;
+                                let had-popup = root.dict-open;
+                                if event.kind == PointerEventKind.down {
+                                    root.dismiss-definition();
+                                }
+                                if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && btn > 0 {
+                                    root.video-pointer-button(
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px,
+                                        btn,
+                                        event.kind == PointerEventKind.down,
+                                        event.modifiers.control,
+                                        event.modifiers.shift,
+                                        event.modifiers.alt,
+                                        event.modifiers.meta
                                     );
                                 }
-                                root.ocr-mode = false;
-                            } else if (event.kind == PointerEventKind.cancel) {
-                                root.ocr-mode = false;
+                            } else if event.kind == PointerEventKind.cancel {
+                                root.video-pointer-button(0.0, 0.0, 0, false, false, false, false, false);
+                            }
+                        }
+                        scroll-event(event) => {
+                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open {
+                                root.video-wheel(
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    event.delta-x / 1px,
+                                    event.delta-y / 1px
+                                );
+                                return accept;
+                            }
+                            reject
+                        }
+                        double-clicked => { root.toggle-fullscreen(); }
+                    }
+
+                    // Empty / Placeholder state
+                    if root.duration <= 0.0 : VerticalLayout {
+                        alignment: center;
+                        spacing: 12px;
+
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                width: 64px;
+                                height: 64px;
+                                source: @image-url("icons/window.svg");
+                                colorize: MementoPalette.icon-muted;
+                            }
+                        }
+                        Text {
+                            text: "Memento";
+                            font-size: 26px;
+                            font-weight: 700;
+                            color: #E2E8F0;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Open a video file (Ctrl+O) or drag and drop media to start";
+                            font-size: 14px;
+                            color: #94A3B8;
+                            horizontal-alignment: center;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 140px;
+                                height: 36px;
+                                border-radius: 6px;
+                                background: MementoPalette.cyan-accent;
+                                Text {
+                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                    text: "Open Media…";
+                                    font-weight: 700;
+                                    color: #000000;
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.open-file(); }
+                                }
                             }
                         }
                     }
-                    if ocr-touch.pressed : Rectangle {
-                        x: min(ocr-touch.pressed-x, ocr-touch.mouse-x);
-                        y: min(ocr-touch.pressed-y, ocr-touch.mouse-y);
-                        width: max(1px, max(ocr-touch.pressed-x, ocr-touch.mouse-x) - self.x);
-                        height: max(1px, max(ocr-touch.pressed-y, ocr-touch.mouse-y) - self.y);
-                        background: #21a5bb33;
-                        border-width: 2px;
-                        border-color: #21a5bb;
+
+                    // Secondary Subtitles cleanly positioned at the top edge of the video viewport
+                    secondary-subtitle-box := Rectangle {
+                        visible: root.secondary-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
+                        x: (parent.width - self.width) / 2;
+                        y: 12px;
+                        width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
+                        height: secondary-subtitle-text.preferred-height + 16px;
+                        background: #00000099;
+                        border-radius: 4px;
+                        secondary-subtitle-text := Text {
+                            x: 16px;
+                            y: 8px;
+                            width: min(parent.width - 72px, self.preferred-width);
+                            text: root.secondary-sub-text;
+                            font-size: video-area.height * root.subtitle-scale;
+                            font-weight: 700;
+                            color: white;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        secondary-hover-area := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            changed has-hover => {
+                                root.subtitle-hover-changed(
+                                    self.has-hover
+                                    || subtitle-hover-area.has-hover
+                                    || root.token-hovered
+                                    || (root.dict-open && !video-motion.has-hover)
+                                );
+                            }
+                        }
+                    }
+
+                    // Clickable primary subtitle tokens supply the search suffix at each token.
+                    subtitle-box := Rectangle {
+                        visible: root.active-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
+                        x: (parent.width - self.width) / 2;
+                        y: max(10px, parent.height - self.height - max(62px, parent.height * root.subtitle-offset));
+                        width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
+                        height: subtitle-lines-layout.preferred-height + 16px;
+                        background: #00000099;
+                        border-radius: 4px;
+                        subtitle-hover-area := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            changed has-hover => {
+                                root.subtitle-hover-changed(
+                                    self.has-hover
+                                    || secondary-hover-area.has-hover
+                                    || root.token-hovered
+                                    || (root.dict-open && !video-motion.has-hover)
+                                );
+                            }
+                        }
+                        subtitle-lines-layout := VerticalLayout {
+                            x: 16px;
+                            y: 8px;
+                            width: self.preferred-width;
+                            height: self.preferred-height;
+                            spacing: 4px;
+                            alignment: center;
+                            for line in root.active-sub-lines : HorizontalLayout {
+                                alignment: center;
+                                spacing: 0px;
+                                for word in line.words : InteractiveSubtitleToken {
+                                    word: word;
+                                    type-size: video-area.height * root.subtitle-scale;
+                                    show-furigana: root.furigana-visible;
+                                    selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
+                                    hover-state(hovering) => {
+                                        root.token-hovered = hovering;
+                                        root.subtitle-hover-changed(
+                                            hovering
+                                            || subtitle-hover-area.has-hover
+                                            || secondary-hover-area.has-hover
+                                            || (root.dict-open && !video-motion.has-hover)
+                                        );
+                                    }
+                                    hovered(query, control, shift, alt, meta) => {
+                                        root.osc-activity();
+                                        if query != "" {
+                                            root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
+                                        }
+                                        root.hover-word(query, word.index, control, shift, alt, meta);
+                                    }
+                                    clicked => {
+                                        root.selected-token-index = word.index;
+                                        root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
+                                        root.hover-word("", word.index, false, false, false, false);
+                                        root.lookup-word(word.query);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Invisible hover bridge between active primary subtitles and YomitanPopup so moving
+                    // the cursor between subtitle-box and yomi-card keeps hover-pause continuously active.
+                    if yomi-card.visible && subtitle-box.visible : TouchArea {
+                        x: min(subtitle-box.x, yomi-card.x);
+                        y: min(subtitle-box.y + subtitle-box.height, yomi-card.y + yomi-card.height);
+                        width: max(subtitle-box.x + subtitle-box.width, yomi-card.x + yomi-card.width) - self.x;
+                        height: 16px;
+                        changed has-hover => {
+                            root.subtitle-hover-changed(
+                                self.has-hover
+                                || subtitle-hover-area.has-hover
+                                || secondary-hover-area.has-hover
+                                || root.token-hovered
+                                || (root.dict-open && !video-motion.has-hover)
+                            );
+                        }
+                    }
+
+                    // Floating Yomitan Dictionary Card
+                    // Anchored horizontally to hovered word (`popup-offset-x`) and clamped above/below
+                    // active primary subtitles so it NEVER covers active subtitles.
+                    yomi-card := YomitanPopup {
+                        property <length> sub-top: subtitle-box.visible ? subtitle-box.y : (parent.height - 62px);
+                        property <length> sub-bottom: subtitle-box.visible ? (subtitle-box.y + subtitle-box.height) : (parent.height - 62px);
+                        property <length> space-above: max(0px, self.sub-top - 22px);
+                        property <length> space-below: max(0px, parent.height - self.sub-bottom - 22px);
+                        property <bool> place-below: subtitle-box.visible && self.space-above < 220px && self.space-below > self.space-above;
+
+                        width: min(root.popup-configured-width, parent.width - 40px);
+                        height: min(
+                            root.popup-configured-height,
+                            subtitle-box.visible
+                                ? max(80px, self.place-below ? self.space-below : self.space-above)
+                                : (parent.height - 80px)
+                        );
+                        x: min(
+                            parent.width - self.width - 20px,
+                            max(20px, subtitle-box.x + (subtitle-box.width - self.width) / 2 + root.popup-offset-x)
+                        );
+                        y: self.place-below
+                            ? min(parent.height - self.height - 10px, self.sub-bottom + 12px)
+                            : max(10px, self.sub-top - self.height - 12px);
+                        is-open: root.dict-open;
+                        anki-enabled: root.anki-enabled;
+                        show-anki-checkbox: root.show-anki-checkbox;
+                        added-note-id: root.anki-added-note-id;
+                        added-result-index: root.anki-added-result-index;
+                        headword: root.dict-query;
+                        reading: root.dict-reading;
+                        pitch-accent: root.dict-pitch-accent;
+                        freq-rank: root.dict-freq-rank;
+                        jpdb-rank: root.dict-jpdb-rank;
+                        results: root.popup-results;
+                        has-more-results: root.popup-loaded-count < root.dict-results.length;
+                        audio-sources: root.popup-audio-sources;
+                        audio-sources-loading: root.popup-audio-sources-loading;
+                        selected-audio-source: root.popup-selected-audio-source;
+                        close-requested => { root.dismiss-definition(); }
+                        add-anki-note(idx) => { root.add-anki-note(idx); }
+                        browse-anki-note(id) => { root.browse-anki-note(id); }
+                        play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
+                        request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
+                        kanji-info(word) => { root.lookup-kanji(word); }
+                        toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
+                        toggle-term-collapse(idx) => { root.toggle-term-collapse(idx); }
+                        load-more-results(force) => { root.load-more-definition-results(force); }
+                        select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
+                        open-rich-link(link) => { root.open-glossary-link(link); }
+                    }
+
+                    // Timeline Hover Preview Card (Thumbnail + Chapter Label + Timestamp)
+                    if osc.visible && osc.timeline-hovered && root.duration > 0.0 : Rectangle {
+                        property <bool> has-thumb: root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0;
+                        width: self.has-thumb ? 212px : max(84px, preview-col.preferred-width + 20px);
+                        height: preview-col.preferred-height + 16px;
+                        x: max(16px, min(parent.width - self.width - 16px, osc.x + osc.hover-x - self.width / 2));
+                        y: max(10px, osc.y - self.height - 8px);
+                        background: MementoPalette.card-bg;
+                        border-width: 1px;
+                        border-color: MementoPalette.border-light;
+                        border-radius: 6px;
+                        drop-shadow-blur: 12px;
+                        drop-shadow-color: #00000099;
+
+                        preview-col := VerticalLayout {
+                            x: 10px;
+                            y: 8px;
+                            width: parent.width - 20px;
+                            height: self.preferred-height;
+                            spacing: 4px;
+                            alignment: center;
+
+                            if root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0 : Image {
+                                width: 192px;
+                                height: 108px;
+                                source: root.thumbnail-frame;
+                                image-fit: contain;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            if root.hover-chapter-title != "" : Text {
+                                text: root.hover-chapter-title;
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: MementoPalette.cyan-accent;
+                                horizontal-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.format-timestamp(osc.hover-time);
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: MementoPalette.text;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    // Bottom OSC Bar (Floating, 50px)
+                    osc := PlayerOscBar {
+                        visible: root.osc-visible && !root.ocr-mode;
+                        x: 16px;
+                        y: parent.height - self.height - 12px;
+                        width: parent.width - 32px;
+                        playing: root.is-playing;
+                        position: root.position;
+                        duration: root.duration;
+                        volume: root.volume;
+                        volume-max: root.volume-max;
+                        is-muted: root.is-muted;
+                        current-time: root.current-time;
+                        duration-time: root.duration-time;
+                        is-fullscreen: root.is-fullscreen;
+                        ocr-enabled: root.ocr-enabled;
+                        chapters: root.chapters;
+                        chapter-marks: root.chapter-marks;
+                        toggle-play => { root.toggle-play(); }
+                        seek(val) => { root.seek-to(val); }
+                        subtitle-seek(dir) => { root.sub-seek(dir); }
+                        playlist-prev => { root.playlist-prev(); }
+                        playlist-next => { root.playlist-next(); }
+                        toggle-mute => { root.toggle-mute(); }
+                        start-ocr => { root.start-ocr(); }
+                        volume-changed(val) => { root.set-volume(val); }
+                        timeline-hover-moved(sec) => { root.timeline-hover-moved(sec); }
+                        toggle-sub-list => {
+                            root.sub-drawer-open = !root.sub-drawer-open;
+                        }
+                        toggle-fullscreen => { root.toggle-fullscreen(); }
+                        activity => { root.osc-activity(); }
+                        interacted => { root.dismiss-definition(); }
+                    }
+
+                    // Drag a rectangle over the current video frame for OCR.
+                    if root.ocr-mode : Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+                        ocr-touch := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            mouse-cursor: crosshair;
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.up) {
+                                    let min-x = min(self.pressed-x, self.mouse-x);
+                                    let min-y = min(self.pressed-y, self.mouse-y);
+                                    let max-x = max(self.pressed-x, self.mouse-x);
+                                    let max-y = max(self.pressed-y, self.mouse-y);
+                                    let box-w = max-x - min-x;
+                                    let box-h = max-y - min-y;
+                                    if (box-w >= 6px && box-h >= 6px && self.width > 0px && self.height > 0px) {
+                                        root.ocr-region(
+                                            min-x / self.width,
+                                            min-y / self.height,
+                                            box-w / self.width,
+                                            box-h / self.height
+                                        );
+                                    }
+                                    root.ocr-mode = false;
+                                } else if (event.kind == PointerEventKind.cancel) {
+                                    root.ocr-mode = false;
+                                }
+                            }
+                        }
+                        if ocr-touch.pressed : Rectangle {
+                            x: min(ocr-touch.pressed-x, ocr-touch.mouse-x);
+                            y: min(ocr-touch.pressed-y, ocr-touch.mouse-y);
+                            width: max(1px, max(ocr-touch.pressed-x, ocr-touch.mouse-x) - self.x);
+                            height: max(1px, max(ocr-touch.pressed-y, ocr-touch.mouse-y) - self.y);
+                            background: #21a5bb33;
+                            border-width: 2px;
+                            border-color: #21a5bb;
+                        }
+                    }
+                }
+
+                // Right Sidebar: Resizable Split Container for DictionarySearchPanel & SubtitleDrawerPanel
+                sidebar-container := Rectangle {
+                    width: (root.dict-search-open || root.sub-drawer-open) ? root.sidebar-width : 0px;
+                    visible: self.width > 0px;
+                    background: MementoPalette.surface-bg;
+
+                    dict-panel := DictionarySearchPanel {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: !root.dict-search-open
+                            ? 0px
+                            : (root.sub-drawer-open
+                                ? max(140px, min(parent.height - 160px, parent.height * root.sidebar-split-ratio))
+                                : parent.height);
+                        visible: root.dict-search-open;
+                        results: root.dict-results;
+                        query <=> root.dict-query;
+                        search-changed(query) => { root.search-dictionary(query); }
+                        lookup(word) => { root.lookup-word(word); }
+                        close => { root.dict-search-open = false; f-scope.focus(); }
+                    }
+
+                    // Resizable horizontal splitter between DictionarySearchPanel and SubtitleDrawerPanel
+                    if root.dict-search-open && root.sub-drawer-open : Rectangle {
+                        x: 0px;
+                        y: dict-panel.height;
+                        width: parent.width;
+                        height: 6px;
+                        background: split-v-touch.pressed || split-v-touch.has-hover
+                            ? MementoPalette.cyan-accent
+                            : MementoPalette.border;
+                        split-v-touch := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            mouse-cursor: ns-resize;
+                            moved => {
+                                if self.pressed && sidebar-container.height > 200px {
+                                    let delta = (self.mouse-y - self.pressed-y) / sidebar-container.height;
+                                    root.sidebar-split-ratio = max(0.2, min(0.8, root.sidebar-split-ratio + delta));
+                                }
+                            }
+                        }
+                    }
+
+                    sub-drawer := SubtitleDrawerPanel {
+                        x: 0px;
+                        y: root.dict-search-open ? (dict-panel.height + 6px) : 0px;
+                        width: parent.width;
+                        height: !root.sub-drawer-open
+                            ? 0px
+                            : (root.dict-search-open
+                                ? max(0px, parent.height - dict-panel.height - 6px)
+                                : parent.height);
+                        visible: root.sub-drawer-open;
+                        entries: root.subtitle-entries;
+                        secondary-entries: root.secondary-subtitle-entries;
+                        has-secondary: root.secondary-sid > 0;
+                        active-tab <=> root.subtitle-drawer-tab;
+                        search-text <=> root.subtitle-search-query;
+                        current-match: root.subtitle-search-current-match;
+                        total-matches: root.subtitle-search-total-matches;
+                        focused-match-row: root.subtitle-search-focused-row;
+                        format-timestamp(sec) => { root.format-timestamp(sec) }
+                        row-clicked(idx, extend-range) => { root.dismiss-definition(); root.select-row(idx, extend-range); f-scope.focus(); }
+                        range-dragged(first, last, begin) => { root.dismiss-definition(); root.select-subtitle-range(first, last, begin); }
+                        row-activated(idx, sec) => { root.dismiss-definition(); root.mark-subtitle-row(idx); root.seek-to(sec); f-scope.focus(); }
+                        search-changed(q) => { root.dismiss-definition(); root.search-subtitles(q); }
+                        next-match => { root.next-subtitle-search-match(); }
+                        prev-match => { root.prev-subtitle-search-match(); }
+                        tab-changed(tab) => { root.subtitle-drawer-tab-changed(tab); }
+                    }
+
+                    // Left-edge draggable width resize handle for sidebar
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 4px;
+                        height: parent.height;
+                        background: split-h-touch.pressed || split-h-touch.has-hover
+                            ? MementoPalette.cyan-accent
+                            : transparent;
+                        split-h-touch := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            mouse-cursor: ew-resize;
+                            moved => {
+                                if self.pressed {
+                                    let delta = self.mouse-x - self.pressed-x;
+                                    root.sidebar-width = max(260px, min(root.width - 360px, root.sidebar-width - delta));
+                                }
+                            }
+                        }
                     }
                 }
             }
+        }
 
-            DictionarySearchPanel {
-                width: root.dict-search-open ? 340px : 0px;
-                visible: self.width > 0px;
-                results: root.dict-results;
-                query <=> root.dict-query;
-                search-changed(query) => { root.search-dictionary(query); }
-                lookup(word) => { root.lookup-word(word); }
-                close => { root.dict-search-open = false; }
-            }
-            SubtitleDrawerPanel {
-                width: (root.sub-drawer-open && !root.dict-search-open) ? 360px : 0px;
-                visible: self.width > 0px;
-                entries: root.subtitle-entries;
-                search-text <=> root.subtitle-search-query;
-                format-timestamp(sec) => { root.format-timestamp(sec) }
-                row-clicked(idx, extend-range) => { root.dismiss-definition(); root.select-row(idx, extend-range); }
-                range-dragged(first, last, begin) => { root.dismiss-definition(); root.select-subtitle-range(first, last, begin); }
-                row-activated(idx, sec) => { root.dismiss-definition(); root.mark-subtitle-row(idx); root.seek-to(sec); }
-                search-changed(q) => { root.dismiss-definition(); root.search-subtitles(q); }
+        // Dismiss overlay when any menu is open (click outside menu bar to close)
+        if menu-bar.open-menu >= 0 : TouchArea {
+            y: 30px;
+            width: 100%;
+            height: parent.height - 30px;
+            clicked => {
+                menu-bar.open-menu = -1;
             }
         }
-    }
 
-    // Dismiss overlay when any menu is open (click outside menu bar to close)
-    if menu-bar.open-menu >= 0 : TouchArea {
-        y: 30px;
-        width: 100%;
-        height: parent.height - 30px;
-        clicked => {
-            menu-bar.open-menu = -1;
+        // Dropdown Menus Overlay
+        menu-drop := MenuDropdown {
+            menu-index: menu-bar.open-menu;
+            audio-tracks: root.audio-tracks;
+            subtitle-tracks: root.subtitle-tracks;
+            recent-files: root.recent-files;
+            recent-file-labels: root.recent-file-labels;
+            anki-profiles: root.anki-profiles;
+            audio-id: root.audio-id;
+            primary-sid: root.primary-sid;
+            secondary-sid: root.secondary-sid;
+            anki-profile: root.anki-profile;
+            anki-enabled: root.anki-enabled;
+            asr-enabled: root.asr-enabled;
+            asr-running: root.asr-running;
+            asr-track-selected: root.asr-track-selected;
+            ocr-enabled: root.ocr-enabled;
+            furigana-enabled: root.furigana-enabled;
+            auto-pause: root.auto-pause;
+            subtitles-visible: root.subtitles-visible;
+            furigana-visible: root.furigana-visible;
+            key-open-file: root.key-open-file;
+            key-open-url: root.key-open-url;
+            key-show-search: root.key-show-search;
+            key-show-sub-list: root.key-show-sub-list;
+            key-start-ocr: root.key-start-ocr;
+            key-sub-auto-pause: root.key-sub-auto-pause;
+            key-sub-show: root.key-sub-show;
+            key-sub-furigana: root.key-sub-furigana;
+            key-sub-increase-size: root.key-sub-increase-size;
+            key-sub-decrease-size: root.key-sub-decrease-size;
+            key-sub-move-up: root.key-sub-move-up;
+            key-sub-move-down: root.key-sub-move-down;
+            open-file => { root.open-file(); }
+            open-url => { root.open-url(); }
+            open-recent(path) => { root.open-recent(path); }
+            clear-recent => { root.clear-recent(); }
+            select-audio-track(id) => { root.select-audio-track(id); }
+            select-subtitle-track(id) => { root.select-subtitle-track(id); }
+            select-secondary-subtitle-track(id) => { root.select-secondary-subtitle-track(id); }
+            select-asr => { root.select-asr(); }
+            select-anki-profile(name) => { root.select-anki-profile(name); }
+            auto-pause-changed(enabled) => { root.auto-pause-changed(enabled); }
+            adjust-subtitle-scale(delta) => { root.adjust-subtitle-scale(delta); }
+            adjust-subtitle-offset(delta) => { root.adjust-subtitle-offset(delta); }
+            subtitles-visible-changed(visible) => { root.subtitles-visible-changed(visible); }
+            furigana-visible-changed(visible) => { root.furigana-visible-changed(visible); }
+            add-subtitle => { root.add-subtitle(); }
+            toggle-search => {
+                root.dict-search-open = !root.dict-search-open;
+            }
+            toggle-sub-drawer => {
+                root.sub-drawer-open = !root.sub-drawer-open;
+            }
+            start-ocr => { root.start-ocr(); }
+            open-options => { root.open-options(); }
+            open-config => { root.open-config(); }
+            check-updates => { root.check-updates(); }
+            show-about => { root.about-open = true; }
+            close-menu => { menu-bar.open-menu = -1; root.osc-activity(); }
         }
-    }
 
-    // Dropdown Menus Overlay
-    menu-drop := MenuDropdown {
-        menu-index: menu-bar.open-menu;
-        audio-tracks: root.audio-tracks;
-        subtitle-tracks: root.subtitle-tracks;
-        recent-files: root.recent-files;
-        anki-profiles: root.anki-profiles;
-        audio-id: root.audio-id;
-        primary-sid: root.primary-sid;
-        secondary-sid: root.secondary-sid;
-        anki-profile: root.anki-profile;
-        anki-enabled: root.anki-enabled;
-        asr-enabled: root.asr-enabled;
-        asr-running: root.asr-running;
-        asr-track-selected: root.asr-track-selected;
-        ocr-enabled: root.ocr-enabled;
-        furigana-enabled: root.furigana-enabled;
-        auto-pause: root.auto-pause;
-        subtitles-visible: root.subtitles-visible;
-        furigana-visible: root.furigana-visible;
-        key-open-file: root.key-open-file;
-        key-open-url: root.key-open-url;
-        key-show-search: root.key-show-search;
-        key-show-sub-list: root.key-show-sub-list;
-        key-start-ocr: root.key-start-ocr;
-        key-sub-auto-pause: root.key-sub-auto-pause;
-        key-sub-show: root.key-sub-show;
-        key-sub-furigana: root.key-sub-furigana;
-        key-sub-increase-size: root.key-sub-increase-size;
-        key-sub-decrease-size: root.key-sub-decrease-size;
-        key-sub-move-up: root.key-sub-move-up;
-        key-sub-move-down: root.key-sub-move-down;
-        open-file => { root.open-file(); }
-        open-url => { root.open-url(); }
-        open-recent(path) => { root.open-recent(path); }
-        clear-recent => { root.clear-recent(); }
-        select-audio-track(id) => { root.select-audio-track(id); }
-        select-subtitle-track(id) => { root.select-subtitle-track(id); }
-        select-secondary-subtitle-track(id) => { root.select-secondary-subtitle-track(id); }
-        select-asr => { root.select-asr(); }
-        select-anki-profile(name) => { root.select-anki-profile(name); }
-        auto-pause-changed(enabled) => { root.auto-pause-changed(enabled); }
-        adjust-subtitle-scale(delta) => { root.adjust-subtitle-scale(delta); }
-        adjust-subtitle-offset(delta) => { root.adjust-subtitle-offset(delta); }
-        subtitles-visible-changed(visible) => { root.subtitles-visible-changed(visible); }
-        furigana-visible-changed(visible) => { root.furigana-visible-changed(visible); }
-        add-subtitle => { root.add-subtitle(); }
-        toggle-search => {
-            root.dict-search-open = !root.dict-search-open;
-            root.sub-drawer-open = false;
-        }
-        toggle-sub-drawer => {
-            root.sub-drawer-open = !root.sub-drawer-open;
-            root.dict-search-open = false;
-        }
-        start-ocr => { root.start-ocr(); }
-        open-options => { root.open-options(); }
-        open-config => { root.open-config(); }
-        check-updates => { root.check-updates(); }
-        show-about => { root.about-open = true; }
-        close-menu => { menu-bar.open-menu = -1; root.osc-activity(); }
-    }
-
-    if root.status-message != "" : Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: parent.height - 112px;
-        width: min(650px, parent.width - 40px);
-        height: 42px;
-        background: #252b2ee8;
-        border-radius: 5px;
-        border-width: 1px;
-        border-color: #48535a;
-        Text {
-            text: root.status-message;
-            color: white;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: parent.width - 16px;
-            height: parent.height;
-            x: 8px;
-            overflow: elide;
-        }
-    }
-
-    if root.about-open : Rectangle {
-        background: #00000099;
-        TouchArea { clicked => { root.about-open = false; } }
-        Rectangle {
-            width: 400px;
-            height: 195px;
+        if root.status-message != "" : Rectangle {
             x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: #30363a;
-            border-color: #48535a;
+            y: parent.height - 112px;
+            width: min(650px, parent.width - 40px);
+            height: 42px;
+            background: #252b2ee8;
+            border-radius: 5px;
             border-width: 1px;
-            border-radius: 7px;
-            VerticalLayout {
-                padding: 18px;
-                spacing: 12px;
-                Text { text: "Memento " + root.app-version; color: white; font-size: 22px; }
-                Text { text: "An mpv-based video player for studying Japanese"; color: #dde4e6; }
-                Text { text: "Copyright © Ripose · GPL-2.0-only"; color: #b6c0c4; }
-                Button { text: "Close"; clicked => { root.about-open = false; } }
+            border-color: #48535a;
+            Text {
+                text: root.status-message;
+                color: white;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width - 16px;
+                height: parent.height;
+                x: 8px;
+                overflow: elide;
+            }
+        }
+
+        // Open Stream URL Clipboard Modal
+        if root.url-dialog-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #00000099;
+            TouchArea {
+                clicked => {
+                    root.url-dialog-open = false;
+                    f-scope.focus();
+                }
+            }
+            Rectangle {
+                width: 440px;
+                height: 165px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: MementoPalette.surface-bg;
+                border-color: MementoPalette.border-light;
+                border-width: 1px;
+                border-radius: 7px;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: #000000AA;
+                // Click-shield so clicking inside the dialog does not close it
+                TouchArea {}
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 12px;
+                    Text {
+                        text: "Open Stream";
+                        color: MementoPalette.text;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    url-line-edit := LineEdit {
+                        placeholder-text: "Enter URL";
+                        text <=> root.url-dialog-text;
+                        accepted(val) => {
+                            root.url-dialog-open = false;
+                            root.open-url-submitted(val);
+                            f-scope.focus();
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        Button {
+                            text: "Cancel";
+                            clicked => {
+                                root.url-dialog-open = false;
+                                f-scope.focus();
+                            }
+                        }
+                        Button {
+                            text: "OK";
+                            clicked => {
+                                let url = root.url-dialog-text;
+                                root.url-dialog-open = false;
+                                root.open-url-submitted(url);
+                                f-scope.focus();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // About Memento Modal (with click-shield, embedded res/memento.svg logo, and non-blocking links)
+        if root.about-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #00000099;
+            TouchArea {
+                clicked => {
+                    root.about-open = false;
+                    f-scope.focus();
+                }
+            }
+            about-card := Rectangle {
+                width: 420px;
+                height: 255px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: MementoPalette.surface-bg;
+                border-color: MementoPalette.border-light;
+                border-width: 1px;
+                border-radius: 8px;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: #000000AA;
+                // Click-shield prevents clicks inside the modal card from dismissing the modal
+                TouchArea {}
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 10px;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 14px;
+                        Image {
+                            width: 56px;
+                            height: 56px;
+                            source: @image-url("../res/memento.svg");
+                            image-fit: contain;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            Text {
+                                text: "Memento";
+                                color: MementoPalette.text;
+                                font-size: 28px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "Version " + root.app-version;
+                                color: MementoPalette.text-secondary;
+                                font-size: 13px;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "An mpv-based video player for studying Japanese";
+                        color: MementoPalette.text;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Copyright © Ripose · GPLv2-Only";
+                        color: MementoPalette.text-secondary;
+                        horizontal-alignment: center;
+                        font-size: 12px;
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 20px;
+                        Rectangle {
+                            width: 90px;
+                            height: 24px;
+                            border-radius: 4px;
+                            background: site-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                            Text {
+                                text: "Project Site";
+                                color: MementoPalette.cyan-accent;
+                                font-size: 13px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            site-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-external-link("https://ripose-jp.github.io/Memento/"); }
+                            }
+                        }
+                        Rectangle {
+                            width: 70px;
+                            height: 24px;
+                            border-radius: 4px;
+                            background: gh-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                            Text {
+                                text: "GitHub";
+                                color: MementoPalette.cyan-accent;
+                                font-size: 13px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            gh-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-external-link("https://github.com/ripose-jp/Memento"); }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        Button {
+                            text: "Close";
+                            clicked => {
+                                root.about-open = false;
+                                f-scope.focus();
+                            }
+                        }
+                    }
+                }
             }
         }
     }

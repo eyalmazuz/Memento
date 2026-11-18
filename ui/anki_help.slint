@@ -1,3 +1,4 @@
+import { MementoPalette } from "palette.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export struct HelpArgument {
@@ -13,14 +14,14 @@ export struct HelpMarker {
 }
 
 component HelpHeading inherits Text {
-    color: #e5e9eb;
+    color: MementoPalette.text;
     font-size: 26px;
     font-weight: 500;
     height: self.preferred-height;
 }
 
 component HelpParagraph inherits Text {
-    color: #dce0e2;
+    color: MementoPalette.text-secondary;
     font-size: 14px;
     wrap: word-wrap;
     height: self.preferred-height;
@@ -32,7 +33,7 @@ component MarkerDescription inherits VerticalLayout {
 
     Text {
         text: "{" + root.marker.name + "}";
-        color: #e5e9eb;
+        color: MementoPalette.text;
         font-family: "monospace";
         font-size: 14px;
         font-weight: 700;
@@ -44,7 +45,7 @@ component MarkerDescription inherits VerticalLayout {
         padding-left: 20px;
         Text {
             text: argument.name;
-            color: #e5e9eb;
+            color: MementoPalette.text;
             font-family: "monospace";
             font-size: 14px;
             font-weight: 700;
@@ -67,7 +68,7 @@ export component AnkiHelpWindow inherits Window {
     preferred-height: 700px;
     min-width: 540px;
     min-height: 420px;
-    background: #282e32;
+    background: MementoPalette.surface-bg;
     default-font-family: "Noto Sans, sans-serif";
 
     in property <[HelpMarker]> term-markers;
