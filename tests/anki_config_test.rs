@@ -863,3 +863,95 @@ fn scope_dictionary_css_handles_media_queries_and_existing_data_dictionary_selec
     assert!(scoped.contains("[data-dictionary=\"Other\"] .x { color: red; }"));
     assert!(scoped.contains("@media (prefers-color-scheme: dark) { [data-dictionary=\"MyDict\"] .a { color: white; } }"));
 }
+
+#[test]
+fn sqlite_selected_occurrences_orders_by_score_desc_and_isolates_rules_for_pitch_categories() {
+    use memento_dict::yomidbbuilder::prepare_db;
+
+    let temp_dir = temp_test_dir("sqlite_anki_score_and_rules");
+    let db_path = temp_dir.join("dictionaries.sqlite");
+    prepare_db(&db_path).unwrap();
+
+    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES \
+         (1, 'DictA', 3, '1', 1), \
+         (2, 'DictB', 3, '1', 1), \
+         (3, 'DictDisabled', 3, '1', 1);",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO dict_disabled (dic_id) VALUES (3);", [])
+        .unwrap();
+
+    // DictA row inserted FIRST (`sequence = 1`, `rowid = 1`) has LOWER score (`10`) and verb rule `"v1"`.
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+         VALUES (1, 'かける', '', '', 'v1', 10, '[\"to hang (verb)\"]', 1, '');",
+        [],
+    )
+    .unwrap();
+    // DictA row inserted SECOND (`sequence = 2`, `rowid = 2`) has HIGHER score (`200`) and NO verb/adj-i rules.
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+         VALUES (1, 'かける', '', '', '', 200, '[\"bet / wager (noun)\"]', 2, '');",
+        [],
+    )
+    .unwrap();
+    // Unselected DictB row has `"v5"` rule; disabled DictDisabled row has `"adj-i"` rule.
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+         VALUES (2, 'かける', '', '', 'v5', 500, '[\"unselected dict verb\"]', 1, '');",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+         VALUES (3, 'かける', '', '', 'adj-i', 999, '[\"disabled dict adj\"]', 1, '');",
+        [],
+    )
+    .unwrap();
+
+    // 3-mora "かける" at pitch position [2]: `"nakadaka"` when noun rules (`""`),
+    // `"kifuku"` ONLY when a `v1`/`v5`/`adj-i`/`vs` rule is active.
+    let pitch_blob = r#"{"reading":"かける","pitches":[{"position":2}]}"#.as_bytes();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (1, 'かける', 'pitch', 4, ?1);",
+        [pitch_blob],
+    )
+    .unwrap();
+    drop(conn);
+
+    let templates = HashMap::from([
+        ("Glossary".into(), "{glossary}".into()),
+        ("PitchCategories".into(), "{pitch-categories}".into()),
+    ]);
+
+    // Occurrence 0 in DictController::search order is the `score = 200` noun entry:
+    // must pick `"bet / wager (noun)"` and must NOT leak `v1`/`v5`/`adj-i` into `{pitch-categories}`.
+    let mut ctx_noun = NoteFieldsContext::new("かける", "かける", "賭けをかける。");
+    populate_note_context_from_sqlite(&mut ctx_noun, &db_path, &[], &[("DictA".into(), 0)]).unwrap();
+    let mapped_noun = map_note_fields(&templates, &ctx_noun);
+    assert!(
+        mapped_noun["Glossary"].contains("bet / wager (noun)"),
+        "expected highest-score occurrence 0, got: {}",
+        mapped_noun["Glossary"]
+    );
+    assert!(!mapped_noun["Glossary"].contains("to hang (verb)"));
+    assert_eq!(mapped_noun["PitchCategories"], "nakadaka");
+
+    // Occurrence 1 is the `score = 10` verb entry (`rules = "v1"`):
+    // must pick `"to hang (verb)"` and include `kifuku` in `{pitch-categories}`.
+    let mut ctx_verb = NoteFieldsContext::new("かける", "かける", "壁にかける。");
+    populate_note_context_from_sqlite(&mut ctx_verb, &db_path, &[], &[("DictA".into(), 1)]).unwrap();
+    let mapped_verb = map_note_fields(&templates, &ctx_verb);
+    assert!(
+        mapped_verb["Glossary"].contains("to hang (verb)"),
+        "expected lower-score occurrence 1, got: {}",
+        mapped_verb["Glossary"]
+    );
+    assert!(!mapped_verb["Glossary"].contains("bet / wager (noun)"));
+    assert_eq!(mapped_verb["PitchCategories"], "kifuku");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

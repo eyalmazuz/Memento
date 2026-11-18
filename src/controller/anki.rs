@@ -1552,7 +1552,7 @@ pub fn populate_note_context_from_sqlite(
         WHERE expression = ?1 \
           AND (reading = ?2 OR (?2 = ?1 AND reading = '')) \
           AND dic_id NOT IN (SELECT dic_id FROM dict_disabled) \
-        ORDER BY dic_id ASC, sequence ASC;";
+        ORDER BY dic_id ASC, score DESC, sequence ASC, rowid ASC;";
 
     let mut occ_counts: HashMap<String, usize> = HashMap::new();
     let mut matched_defs: Vec<(Option<usize>, GlossaryDefinition)> = Vec::new();
@@ -1593,12 +1593,6 @@ pub fn populate_note_context_from_sqlite(
                 continue;
             }
 
-            for rule in raw_rules.split_whitespace() {
-                if !rule.is_empty() {
-                    all_rules.push(rule.to_owned());
-                }
-            }
-
             let occ_idx = *occ_counts.entry(dict_name.clone()).and_modify(|c| *c += 1).or_insert(0);
             let order_pos = if selected_occurrences.is_empty() {
                 Some(matched_defs.len())
@@ -1609,6 +1603,12 @@ pub fn populate_note_context_from_sqlite(
             };
             if order_pos.is_none() {
                 continue;
+            }
+
+            for rule in raw_rules.split_whitespace() {
+                if !rule.is_empty() {
+                    all_rules.push(rule.to_owned());
+                }
             }
 
             let resolved_def_tags = resolve_sorted_tags(&tag_bank, dic_id, &raw_def_tags);

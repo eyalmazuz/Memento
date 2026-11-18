@@ -165,7 +165,9 @@ pub fn prepare_note_media(
                         break;
                     }
                     MarkerEvalKind::EmptyText => {
-                        token_handled_fallback = true;
+                        if token_media_error.is_some() {
+                            token_handled_fallback = true;
+                        }
                         continue;
                     }
                     MarkerEvalKind::Unknown => {
@@ -194,6 +196,7 @@ pub fn prepare_note_media(
                             }
                             Err(error) => {
                                 token_media_error = Some(error.clone());
+                                token_handled_fallback = false;
                             }
                         }
                     }
@@ -206,6 +209,7 @@ pub fn prepare_note_media(
                         let Some(params) = params_opt else {
                             token_media_error =
                                 Some(format!("Invalid {{{name}}} marker in Anki field {field}"));
+                            token_handled_fallback = false;
                             continue;
                         };
                         let idx = if let Some(idx) =
@@ -248,6 +252,7 @@ pub fn prepare_note_media(
                             }
                             Err(error) => {
                                 token_media_error = Some(error.clone());
+                                token_handled_fallback = false;
                             }
                         }
                     }
@@ -255,6 +260,7 @@ pub fn prepare_note_media(
                         let Some(params) = screenshot_params(marker) else {
                             token_media_error =
                                 Some(format!("Invalid {{{name}}} marker in Anki field {field}"));
+                            token_handled_fallback = false;
                             continue;
                         };
                         let is_video_only = name == "screenshot-video";
@@ -288,6 +294,7 @@ pub fn prepare_note_media(
                             }
                             Err(error) => {
                                 token_media_error = Some(error.clone());
+                                token_handled_fallback = false;
                             }
                         }
                     }
@@ -297,6 +304,7 @@ pub fn prepare_note_media(
                         else {
                             token_media_error =
                                 Some(format!("Invalid {{video}} marker in Anki field {field}"));
+                            token_handled_fallback = false;
                             continue;
                         };
                         let idx = if let Some(idx) =
@@ -342,6 +350,7 @@ pub fn prepare_note_media(
                             }
                             Err(error) => {
                                 token_media_error = Some(error.clone());
+                                token_handled_fallback = false;
                             }
                         }
                     }
@@ -737,5 +746,72 @@ mod tests {
         assert_eq!(ctx_ok.audio_attachments.len(), 1);
         let payload_ok = build_note_payload_from_profile(&profile, &ctx_ok).unwrap();
         assert_eq!(payload_ok.fields["Front"], "");
+    }
+
+    #[test]
+    fn empty_text_before_failed_media_returns_error_while_empty_text_after_handles_fallback() {
+        let make_profile = |template: &str| AnkiNoteConfig {
+            enabled: true,
+            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            deck: "Japanese".into(),
+            model: "Basic".into(),
+            field_templates: std::collections::HashMap::from([
+                ("Expression".into(), "{expression}".into()),
+                ("Field".into(), template.into()),
+            ]),
+            tags: Vec::new(),
+            duplicate_policy: 1,
+            screenshot_type: 0,
+            audio_pad_start: 0.0,
+            audio_pad_end: 0.0,
+            audio_normalize: false,
+            audio_db: -20.0,
+            newline_replacer: "<br>".into(),
+        };
+        let empty_input = || NoteMediaInput {
+            media: None,
+            subtitle_start: 0.0,
+            subtitle_end: 0.0,
+            context_start: 0.0,
+            context_end: 0.0,
+            screenshot: None,
+            screenshot_video: None,
+            subtitle_id: 0,
+            audio_sources: Vec::new(),
+        };
+
+        // 1. `{selection | audio}` with empty `selection` and failing `audio` MUST return error.
+        let mut ctx1 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+        let err1 =
+            prepare_note_media(&make_profile("{selection | audio}"), &mut ctx1, empty_input())
+                .expect_err("{selection | audio} must fail when selection is empty and audio fails");
+        assert!(err1.contains("word audio"), "unexpected error: {err1}");
+
+        // 2. `{context-2 | screenshot}` with empty `context-2` and failing `screenshot` MUST return error.
+        let mut ctx2 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+        let err2 = prepare_note_media(
+            &make_profile("{context-2 | screenshot}"),
+            &mut ctx2,
+            empty_input(),
+        )
+        .expect_err("{context-2 | screenshot} must fail when context-2 is empty and screenshot fails");
+        assert!(err2.contains("screenshot"), "unexpected error: {err2}");
+
+        // 3. `{audio | selection}` with failing `audio` followed by empty `selection` handles fallback cleanly.
+        let mut ctx3 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+        prepare_note_media(&make_profile("{audio | selection}"), &mut ctx3, empty_input())
+            .expect("{audio | selection} should fall back to empty selection after audio failure");
+        let payload3 = build_note_payload_from_profile(&make_profile("{audio | selection}"), &ctx3).unwrap();
+        assert_eq!(payload3.fields["Field"], "");
+
+        // 4. `{audio | selection | screenshot}` where final media fallback also fails MUST return error.
+        let mut ctx4 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+        let err4 = prepare_note_media(
+            &make_profile("{audio | selection | screenshot}"),
+            &mut ctx4,
+            empty_input(),
+        )
+        .expect_err("trailing failed screenshot after empty selection must return error");
+        assert!(err4.contains("screenshot"), "unexpected error: {err4}");
     }
 }
