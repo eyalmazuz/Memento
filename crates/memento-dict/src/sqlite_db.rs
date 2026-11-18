@@ -1,74 +1,104 @@
 //! Pure Rust SQLite Yomichan query engine and cache validator.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::collections::HashSet;
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::fmt;
+use std::path::Path;
+use std::time::Duration;
+
+pub use rusqlite;
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, OpenFlags, Row};
+
+pub use rusqlite::ffi::{
+    sqlite3, sqlite3_errmsg, sqlite3_exec, sqlite3_stmt, SQLITE_DONE, SQLITE_OK, SQLITE_ROW,
+};
 
 pub use crate::databasemanager::TermQueryKind;
 
-#[allow(non_camel_case_types)]
-#[repr(C)]
-pub struct sqlite3 {
-    _opaque: [u8; 0],
+const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Closes a raw SQLite handle via `rusqlite::ffi::sqlite3_close`.
+///
+/// # Safety
+/// `db` must be null or a valid SQLite handle opened by `sqlite3_open_v2`.
+pub unsafe fn sqlite3_close_v2(db: *mut sqlite3) -> c_int {
+    unsafe { rusqlite::ffi::sqlite3_close(db) }
 }
 
-#[allow(non_camel_case_types)]
-#[repr(C)]
-pub struct sqlite3_stmt {
-    _opaque: [u8; 0],
+/// Opens a raw SQLite handle via `rusqlite::ffi::sqlite3_open_v2` and applies
+/// busy-timeout and read-friendly PRAGMAs (`temp_store = MEMORY`, `synchronous = NORMAL`).
+///
+/// # Safety
+/// `file`, `db`, and `vfs` must satisfy SQLite's `sqlite3_open_v2` preconditions.
+pub unsafe fn sqlite3_open_v2(
+    file: *const c_char,
+    db: *mut *mut sqlite3,
+    flags: c_int,
+    vfs: *const c_char,
+) -> c_int {
+    let rc = unsafe { rusqlite::ffi::sqlite3_open_v2(file, db, flags, vfs) };
+    if rc == SQLITE_OK && !db.is_null() {
+        let handle = unsafe { *db };
+        if !handle.is_null() {
+            let _ = unsafe { rusqlite::ffi::sqlite3_busy_timeout(handle, 5000) };
+            let _ = unsafe {
+                rusqlite::ffi::sqlite3_exec(
+                    handle,
+                    c"PRAGMA temp_store = MEMORY; PRAGMA synchronous = NORMAL;".as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+    }
+    rc
 }
 
-pub const SQLITE_OK: c_int = 0;
-pub const SQLITE_ROW: c_int = 100;
-pub const SQLITE_DONE: c_int = 101;
-
-#[inline]
-fn sqlite_transient() -> Option<unsafe extern "C" fn(*mut c_void)> {
-    unsafe { std::mem::transmute(-1isize) }
+/// Opens a read-only `rusqlite::Connection` configured with `busy_timeout(5s)`,
+/// `PRAGMA temp_store = MEMORY`, and `PRAGMA synchronous = NORMAL`.
+pub fn open_read_only_connection(path: &Path) -> Result<Connection, DictError> {
+    if path.as_os_str().is_empty() {
+        return Err(DictError::Other("Database path is empty".to_owned()));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+    )?;
+    configure_read_only_connection(&conn)?;
+    Ok(conn)
 }
 
-#[link(name = "sqlite3")]
-extern "C" {
-    pub fn sqlite3_open_v2(
-        file: *const c_char,
-        db: *mut *mut sqlite3,
-        flags: c_int,
-        vfs: *const c_char,
-    ) -> c_int;
-    pub fn sqlite3_close_v2(db: *mut sqlite3) -> c_int;
-    pub fn sqlite3_exec(
-        db: *mut sqlite3,
-        sql: *const c_char,
-        callback: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>,
-        arg: *mut c_void,
-        error: *mut *mut c_char,
-    ) -> c_int;
-    pub fn sqlite3_prepare_v2(
-        db: *mut sqlite3,
-        sql: *const c_char,
-        bytes: c_int,
-        stmt: *mut *mut sqlite3_stmt,
-        tail: *mut *const c_char,
-    ) -> c_int;
-    pub fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int;
-    pub fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> c_int;
-    pub fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_int;
-    pub fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int;
-    pub fn sqlite3_bind_text(
-        stmt: *mut sqlite3_stmt,
-        index: c_int,
-        value: *const c_char,
-        bytes: c_int,
-        destructor: Option<unsafe extern "C" fn(*mut c_void)>,
-    ) -> c_int;
-    pub fn sqlite3_bind_int(stmt: *mut sqlite3_stmt, index: c_int, value: c_int) -> c_int;
-    pub fn sqlite3_bind_int64(stmt: *mut sqlite3_stmt, index: c_int, value: i64) -> c_int;
-    pub fn sqlite3_column_int(stmt: *mut sqlite3_stmt, index: c_int) -> c_int;
-    pub fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, index: c_int) -> i64;
-    pub fn sqlite3_column_double(stmt: *mut sqlite3_stmt, index: c_int) -> f64;
-    pub fn sqlite3_column_text(stmt: *mut sqlite3_stmt, index: c_int) -> *const u8;
-    pub fn sqlite3_column_blob(stmt: *mut sqlite3_stmt, index: c_int) -> *const c_void;
-    pub fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, index: c_int) -> c_int;
-    pub fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char;
+/// Applies busy timeout and in-memory temp store PRAGMAs on a read-only connection.
+pub fn configure_read_only_connection(conn: &Connection) -> Result<(), DictError> {
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
+/// Opens a read-write `rusqlite::Connection` configured with `WAL`,
+/// `synchronous = NORMAL`, `temp_store = MEMORY`, and `busy_timeout(5s)`.
+pub fn open_read_write_connection(path: &Path) -> Result<Connection, DictError> {
+    if path.as_os_str().is_empty() {
+        return Err(DictError::Other("Database path is empty".to_owned()));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    configure_read_write_connection(&conn)?;
+    Ok(conn)
+}
+
+/// Applies WAL, synchronous, temp_store, and busy_timeout PRAGMAs on a writable connection.
+pub fn configure_read_write_connection(conn: &Connection) -> Result<(), DictError> {
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +123,18 @@ impl fmt::Display for DictError {
 }
 
 impl std::error::Error for DictError {}
+
+impl From<rusqlite::Error> for DictError {
+    fn from(err: rusqlite::Error) -> Self {
+        match err {
+            rusqlite::Error::SqliteFailure(ffi_err, msg) => Self::Sqlite {
+                code: ffi_err.extended_code,
+                message: msg.unwrap_or_else(|| ffi_err.to_string()),
+            },
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictMeta {
@@ -183,9 +225,12 @@ pub struct PitchRow {
     pub positions: Vec<i32>,
 }
 
-/// RAII statement handle.
+/// RAII statement handle for callers holding a borrowed `*mut sqlite3`.
 pub struct Statement {
     stmt: *mut sqlite3_stmt,
+    // Keep bound CStrings alive for `SQLITE_STATIC` (`None`) until `reset()` or `drop()`.
+    // Declared after `stmt` and cleared after `sqlite3_finalize` / `sqlite3_clear_bindings`.
+    bound_strings: Vec<CString>,
 }
 
 impl Statement {
@@ -196,9 +241,18 @@ impl Statement {
         let c_sql = CString::new(sql).map_err(|e| DictError::Other(e.to_string()))?;
         let mut stmt: *mut sqlite3_stmt = std::ptr::null_mut();
         let rc = unsafe {
-            sqlite3_prepare_v2(db, c_sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+            rusqlite::ffi::sqlite3_prepare_v2(
+                db,
+                c_sql.as_ptr(),
+                -1,
+                &mut stmt,
+                std::ptr::null_mut(),
+            )
         };
         if rc != SQLITE_OK || stmt.is_null() {
+            if !stmt.is_null() {
+                unsafe { rusqlite::ffi::sqlite3_finalize(stmt) };
+            }
             let msg = unsafe {
                 let err = sqlite3_errmsg(db);
                 if err.is_null() {
@@ -209,13 +263,18 @@ impl Statement {
             };
             return Err(DictError::Sqlite { code: rc, message: msg });
         }
-        Ok(Self { stmt })
+        Ok(Self {
+            stmt,
+            bound_strings: Vec::new(),
+        })
     }
 
     pub fn bind_text(&mut self, index: i32, text: &str) -> Result<(), DictError> {
         let c_str = CString::new(text).map_err(|e| DictError::Other(e.to_string()))?;
+        let len = c_int::try_from(c_str.as_bytes().len())
+            .map_err(|_| DictError::Other("Bound text exceeds c_int::MAX".to_owned()))?;
         let rc = unsafe {
-            sqlite3_bind_text(self.stmt, index, c_str.as_ptr(), -1, sqlite_transient())
+            rusqlite::ffi::sqlite3_bind_text(self.stmt, index, c_str.as_ptr(), len, None)
         };
         if rc != SQLITE_OK {
             return Err(DictError::Sqlite {
@@ -223,6 +282,7 @@ impl Statement {
                 message: format!("bind_text failed at index {index}"),
             });
         }
+        self.bound_strings.push(c_str);
         Ok(())
     }
 
@@ -232,7 +292,7 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<bool, DictError> {
-        let rc = unsafe { sqlite3_step(self.stmt) };
+        let rc = unsafe { rusqlite::ffi::sqlite3_step(self.stmt) };
         if rc == SQLITE_ROW {
             Ok(true)
         } else if rc == SQLITE_DONE {
@@ -246,40 +306,47 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<(), DictError> {
-        let reset = unsafe { sqlite3_reset(self.stmt) };
+        let reset = unsafe { rusqlite::ffi::sqlite3_reset(self.stmt) };
         if reset != SQLITE_OK {
-            return Err(DictError::Sqlite { code: reset, message: "reset failed".into() });
+            return Err(DictError::Sqlite {
+                code: reset,
+                message: "reset failed".into(),
+            });
         }
-        let clear = unsafe { sqlite3_clear_bindings(self.stmt) };
+        let clear = unsafe { rusqlite::ffi::sqlite3_clear_bindings(self.stmt) };
         if clear != SQLITE_OK {
-            return Err(DictError::Sqlite { code: clear, message: "clear bindings failed".into() });
+            return Err(DictError::Sqlite {
+                code: clear,
+                message: "clear bindings failed".into(),
+            });
         }
+        self.bound_strings.clear();
         Ok(())
     }
 
     #[must_use]
     pub fn column_int(&self, index: i32) -> i32 {
-        unsafe { sqlite3_column_int(self.stmt, index) }
+        unsafe { rusqlite::ffi::sqlite3_column_int(self.stmt, index) }
     }
 
     #[must_use]
     pub fn column_int64(&self, index: i32) -> i64 {
-        unsafe { sqlite3_column_int64(self.stmt, index) }
+        unsafe { rusqlite::ffi::sqlite3_column_int64(self.stmt, index) }
     }
 
     #[must_use]
     pub fn column_double(&self, index: i32) -> f64 {
-        unsafe { sqlite3_column_double(self.stmt, index) }
+        unsafe { rusqlite::ffi::sqlite3_column_double(self.stmt, index) }
     }
 
     #[must_use]
     pub fn column_text_string(&self, index: i32) -> String {
         unsafe {
-            let ptr = sqlite3_column_text(self.stmt, index);
+            let ptr = rusqlite::ffi::sqlite3_column_text(self.stmt, index);
             if ptr.is_null() {
                 return String::new();
             }
-            let len = sqlite3_column_bytes(self.stmt, index) as usize;
+            let len = rusqlite::ffi::sqlite3_column_bytes(self.stmt, index).max(0) as usize;
             let slice = std::slice::from_raw_parts(ptr, len);
             String::from_utf8_lossy(slice).into_owned()
         }
@@ -288,11 +355,11 @@ impl Statement {
     #[must_use]
     pub fn column_text_u16(&self, index: i32) -> Vec<u16> {
         unsafe {
-            let ptr = sqlite3_column_text(self.stmt, index);
+            let ptr = rusqlite::ffi::sqlite3_column_text(self.stmt, index);
             if ptr.is_null() {
                 return Vec::new();
             }
-            let len = sqlite3_column_bytes(self.stmt, index) as usize;
+            let len = rusqlite::ffi::sqlite3_column_bytes(self.stmt, index).max(0) as usize;
             let slice = std::slice::from_raw_parts(ptr, len);
             let s = std::str::from_utf8(slice).unwrap_or("");
             s.encode_utf16().collect()
@@ -302,11 +369,11 @@ impl Statement {
     #[must_use]
     pub fn column_blob_bytes(&self, index: i32) -> Vec<u8> {
         unsafe {
-            let ptr = sqlite3_column_blob(self.stmt, index);
+            let ptr = rusqlite::ffi::sqlite3_column_blob(self.stmt, index);
             if ptr.is_null() {
                 return Vec::new();
             }
-            let len = sqlite3_column_bytes(self.stmt, index) as usize;
+            let len = rusqlite::ffi::sqlite3_column_bytes(self.stmt, index).max(0) as usize;
             std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec()
         }
     }
@@ -322,9 +389,10 @@ impl Statement {
 impl Drop for Statement {
     fn drop(&mut self) {
         if !self.stmt.is_null() {
-            unsafe { sqlite3_finalize(self.stmt) };
+            unsafe { rusqlite::ffi::sqlite3_finalize(self.stmt) };
             self.stmt = std::ptr::null_mut();
         }
+        self.bound_strings.clear();
     }
 }
 
@@ -375,19 +443,47 @@ where
     }
 }
 
-/// Validates database schema, reads dictionary meta and table counts.
-pub fn init_cache(db: *mut sqlite3) -> Result<CacheInfo, DictError> {
-    if db.is_null() {
-        return Err(DictError::NullPointer);
+fn row_text_u16(row: &Row<'_>, idx: usize) -> rusqlite::Result<Vec<u16>> {
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(Vec::new()),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            let s = std::str::from_utf8(bytes).unwrap_or("");
+            Ok(s.encode_utf16().collect())
+        }
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            "text".into(),
+            other.data_type(),
+        )),
     }
+}
 
-    // 1. Validate database schema
-    let mut stmt = Statement::prepare(db, "SELECT name FROM sqlite_master WHERE type='table';")?;
-    let mut table_names = std::collections::HashSet::new();
-    for name_res in stmt.query_map(|s| Ok(s.column_text_string(0))) {
+fn row_bytes(row: &Row<'_>, idx: usize) -> rusqlite::Result<Vec<u8>> {
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(Vec::new()),
+        ValueRef::Blob(bytes) | ValueRef::Text(bytes) => Ok(bytes.to_vec()),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            "blob".into(),
+            other.data_type(),
+        )),
+    }
+}
+
+fn query_table_count(conn: &Connection, sql: &str) -> Result<i64, DictError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let count = stmt.query_row([], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Validates database schema, reads dictionary meta and table counts on a `rusqlite::Connection`.
+pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
+    let mut stmt = conn.prepare_cached("SELECT name FROM sqlite_master WHERE type='table';")?;
+    let mut table_names = HashSet::new();
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for name_res in rows {
         table_names.insert(name_res?);
     }
-    drop(stmt);
 
     const REQUIRED_TABLES: [&str; 7] = [
         "directory",
@@ -401,51 +497,113 @@ pub fn init_cache(db: *mut sqlite3) -> Result<CacheInfo, DictError> {
 
     for &tbl in &REQUIRED_TABLES {
         if !table_names.contains(tbl) {
-            return Err(DictError::InvalidSchema(format!("Missing required table '{tbl}'")));
+            return Err(DictError::InvalidSchema(format!(
+                "Missing required table '{tbl}'"
+            )));
         }
     }
 
-    // 2. Read dictionary meta
-    let mut dict_stmt = Statement::prepare(
-        db,
-        "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id == directory.dic_id) AS disabled FROM directory;",
+    let mut dict_stmt = conn.prepare_cached(
+        "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) AS disabled FROM directory;",
     )?;
     let mut dictionaries = Vec::new();
-    for d_res in dict_stmt.query_map(|s| {
+    let dict_rows = dict_stmt.query_map([], |row| {
         Ok(DictMeta {
-            id: s.column_int64(0),
-            title: s.column_text_string(1),
-            disabled: s.column_int(2) != 0,
+            id: row.get(0)?,
+            title: row.get(1)?,
+            disabled: row.get::<_, i64>(2)? != 0,
         })
-    }) {
+    })?;
+    for d_res in dict_rows {
         dictionaries.push(d_res?);
     }
-    drop(dict_stmt);
-
-    // 3. Read table counts
-    let count_table = |tbl: &str| -> Result<i64, DictError> {
-        let sql = format!("SELECT COUNT(*) FROM {tbl};");
-        let mut c_stmt = Statement::prepare(db, &sql)?;
-        if c_stmt.step()? {
-            Ok(c_stmt.column_int64(0))
-        } else {
-            Ok(0)
-        }
-    };
 
     let table_counts = TableCounts {
-        directory: count_table("directory")?,
-        tag_bank: count_table("tag_bank")?,
-        term_bank: count_table("term_bank")?,
-        term_meta_bank: count_table("term_meta_bank")?,
-        kanji_bank: count_table("kanji_bank")?,
-        kanji_meta_bank: count_table("kanji_meta_bank")?,
+        directory: query_table_count(conn, "SELECT COUNT(*) FROM directory;")?,
+        tag_bank: query_table_count(conn, "SELECT COUNT(*) FROM tag_bank;")?,
+        term_bank: query_table_count(conn, "SELECT COUNT(*) FROM term_bank;")?,
+        term_meta_bank: query_table_count(conn, "SELECT COUNT(*) FROM term_meta_bank;")?,
+        kanji_bank: query_table_count(conn, "SELECT COUNT(*) FROM kanji_bank;")?,
+        kanji_meta_bank: query_table_count(conn, "SELECT COUNT(*) FROM kanji_meta_bank;")?,
     };
 
     Ok(CacheInfo {
         dictionaries,
         table_counts,
     })
+}
+
+/// Validates database schema, reads dictionary meta and table counts.
+pub fn init_cache(db: *mut sqlite3) -> Result<CacheInfo, DictError> {
+    if db.is_null() {
+        return Err(DictError::NullPointer);
+    }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    init_cache_conn(&conn)
+}
+
+/// Prepares and executes the `terms` SQL query on a `rusqlite::Connection`.
+pub fn query_terms_conn(
+    conn: &Connection,
+    plan: &TermQueryPlan,
+    results: &mut Vec<TermRow>,
+) -> Result<(), DictError> {
+    let raw_s = String::from_utf16_lossy(&plan.raw);
+    let hira_s = String::from_utf16_lossy(&plan.hiragana);
+    let nfkc_s = String::from_utf16_lossy(&plan.nfkc);
+
+    match plan.query_kind {
+        TermQueryKind::WithHalfwidth => {
+            const SQL: &str = "SELECT DISTINCT expression, reading FROM term_bank \
+                WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
+                (expression = ?1 OR reading = ?2 OR expression = ?3 OR reading = ?4 OR expression = ?5 OR reading = ?6);";
+            let mut stmt = conn.prepare_cached(SQL)?;
+            let rows = stmt.query_map(
+                params![&raw_s, &raw_s, &hira_s, &hira_s, &nfkc_s, &nfkc_s],
+                |row| {
+                    Ok(TermRow {
+                        expression: row_text_u16(row, 0)?,
+                        reading: row_text_u16(row, 1)?,
+                    })
+                },
+            )?;
+            for row_res in rows {
+                results.push(row_res?);
+            }
+        }
+        TermQueryKind::WithKatakana => {
+            const SQL: &str = "SELECT DISTINCT expression, reading FROM term_bank \
+                WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
+                (expression = ?1 OR reading = ?2 OR expression = ?3 OR reading = ?4);";
+            let mut stmt = conn.prepare_cached(SQL)?;
+            let rows = stmt.query_map(params![&raw_s, &raw_s, &hira_s, &hira_s], |row| {
+                Ok(TermRow {
+                    expression: row_text_u16(row, 0)?,
+                    reading: row_text_u16(row, 1)?,
+                })
+            })?;
+            for row_res in rows {
+                results.push(row_res?);
+            }
+        }
+        TermQueryKind::Plain => {
+            const SQL: &str = "SELECT DISTINCT expression, reading FROM term_bank \
+                WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
+                (expression = ?1 OR reading = ?2);";
+            let mut stmt = conn.prepare_cached(SQL)?;
+            let rows = stmt.query_map(params![&raw_s, &raw_s], |row| {
+                Ok(TermRow {
+                    expression: row_text_u16(row, 0)?,
+                    reading: row_text_u16(row, 1)?,
+                })
+            })?;
+            for row_res in rows {
+                results.push(row_res?);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Prepares and executes the `terms` SQL query according to `TermQueryKind`.
@@ -457,50 +615,43 @@ pub fn query_terms(
     if db.is_null() {
         return Err(DictError::NullPointer);
     }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    query_terms_conn(&conn, plan, results)
+}
 
-    let sql = match plan.query_kind {
-        TermQueryKind::WithHalfwidth => {
-            "SELECT DISTINCT expression, reading FROM term_bank \
-             WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
-             (expression = ? OR reading = ? OR expression = ? OR reading = ? OR expression = ? OR reading = ?);"
-        }
-        TermQueryKind::WithKatakana => {
-            "SELECT DISTINCT expression, reading FROM term_bank \
-             WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
-             (expression = ? OR reading = ? OR expression = ? OR reading = ?);"
-        }
-        TermQueryKind::Plain => {
-            "SELECT DISTINCT expression, reading FROM term_bank \
-             WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
-             (expression = ? OR reading = ?);"
-        }
-    };
+/// Executes kanji queries on a `rusqlite::Connection`.
+pub fn query_kanji_conn(
+    conn: &Connection,
+    kanji: &[u16],
+    results: &mut Vec<KanjiRow>,
+) -> Result<(), DictError> {
+    const QUERY: &str =
+        "SELECT dic_id, onyomi, kunyomi, tags, meanings, stats FROM kanji_bank \
+         WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND (char = ?1);";
 
-    let mut stmt = Statement::prepare(db, sql)?;
-
-    // Bind parameters
-    stmt.bind_u16_as_utf8(1, &plan.raw)?;
-    stmt.bind_u16_as_utf8(2, &plan.raw)?;
-
-    if plan.contains_kata {
-        stmt.bind_u16_as_utf8(3, &plan.hiragana)?;
-        stmt.bind_u16_as_utf8(4, &plan.hiragana)?;
-    }
-
-    if plan.contains_half {
-        stmt.bind_u16_as_utf8(5, &plan.nfkc)?;
-        stmt.bind_u16_as_utf8(6, &plan.nfkc)?;
-    }
-
-    for row_res in stmt.query_map(|s| {
-        Ok(TermRow {
-            expression: s.column_text_u16(0),
-            reading: s.column_text_u16(1),
+    let kanji_s = String::from_utf16_lossy(kanji);
+    let mut stmt = conn.prepare_cached(QUERY)?;
+    let rows = stmt.query_map(params![&kanji_s], |row| {
+        let dic_id = row.get(0)?;
+        let onyomi = row_text_u16(row, 1)?;
+        let kunyomi = row_text_u16(row, 2)?;
+        let tags = row_text_u16(row, 3)?;
+        let meanings_blob = row_bytes(row, 4)?;
+        let meanings = crate::databasemanager::json_array_to_strings(&meanings_blob);
+        let stats = row_text_u16(row, 5)?;
+        Ok(KanjiRow {
+            dic_id,
+            onyomi,
+            kunyomi,
+            tags,
+            meanings,
+            stats,
         })
-    }) {
+    })?;
+
+    for row_res in rows {
         results.push(row_res?);
     }
-
     Ok(())
 }
 
@@ -513,35 +664,18 @@ pub fn query_kanji(
     if db.is_null() {
         return Err(DictError::NullPointer);
     }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    query_kanji_conn(&conn, kanji, results)
+}
 
-    const QUERY: &str =
-        "SELECT dic_id, onyomi, kunyomi, tags, meanings, stats FROM kanji_bank \
-         WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND (char = ?);";
-
-    let mut stmt = Statement::prepare(db, QUERY)?;
-    stmt.bind_u16_as_utf8(1, kanji)?;
-
-    for row_res in stmt.query_map(|s| {
-        let dic_id = s.column_int64(0);
-        let onyomi = s.column_text_u16(1);
-        let kunyomi = s.column_text_u16(2);
-        let tags = s.column_text_u16(3);
-        let meanings_blob = s.column_blob_bytes(4);
-        let meanings = crate::databasemanager::json_array_to_strings(&meanings_blob);
-        let stats = s.column_text_u16(5);
-        Ok(KanjiRow {
-            dic_id,
-            onyomi,
-            kunyomi,
-            tags,
-            meanings,
-            stats,
-        })
-    }) {
-        results.push(row_res?);
-    }
-
-    Ok(())
+/// Queries frequency tables and parses frequency objects on a `rusqlite::Connection`.
+pub fn get_frequencies_conn(
+    conn: &Connection,
+    term: &[u16],
+    reading: &[u16],
+    results: &mut Vec<FreqRow>,
+) -> Result<(), DictError> {
+    get_frequencies_with_sql_conn(conn, None, term, reading, results)
 }
 
 /// Queries frequency tables and parses frequency objects.
@@ -552,6 +686,22 @@ pub fn get_frequencies(
     results: &mut Vec<FreqRow>,
 ) -> Result<(), DictError> {
     get_frequencies_with_sql(db, None, term, reading, results)
+}
+
+/// Queries exactly the requested metadata table on a `rusqlite::Connection`.
+pub fn get_frequencies_with_sql_conn(
+    conn: &Connection,
+    custom_sql: Option<&str>,
+    term: &[u16],
+    reading: &[u16],
+    results: &mut Vec<FreqRow>,
+) -> Result<(), DictError> {
+    const DEFAULT_QUERY: &str = "SELECT dic_id, data, type FROM term_meta_bank \
+         WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
+         (expression = ?1 AND mode = 'freq');";
+
+    let sql = custom_sql.unwrap_or(DEFAULT_QUERY);
+    execute_freq_query(conn, sql, term, reading, results)
 }
 
 /// Queries exactly the requested metadata table. Term metadata must not be
@@ -566,134 +716,125 @@ pub fn get_frequencies_with_sql(
     if db.is_null() {
         return Err(DictError::NullPointer);
     }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    get_frequencies_with_sql_conn(&conn, custom_sql, term, reading, results)
+}
 
-    let default_query = "SELECT dic_id, data, type FROM term_meta_bank \
-         WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
-         (expression = ? AND mode = 'freq');";
+fn parse_freq_blob(blob_type: i32, blob: &[u8], reading: &[u16]) -> Option<Vec<u16>> {
+    match blob_type {
+        // YOMI_BLOB_TYPE_INT (1)
+        1 => {
+            if blob.len() >= 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&blob[..8]);
+                let val = u64::from_ne_bytes(arr);
+                Some(val.to_string().encode_utf16().collect())
+            } else {
+                None
+            }
+        }
+        // YOMI_BLOB_TYPE_STRING (2)
+        2 => {
+            let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            let s = std::str::from_utf8(&blob[..null_pos]).unwrap_or("");
+            Some(s.encode_utf16().collect())
+        }
+        // YOMI_BLOB_TYPE_OBJECT (4)
+        4 => {
+            let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            let slice = &blob[..null_pos];
+            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(slice) {
+                let has_reading_key = obj.get("reading").and_then(|v| v.as_str()).is_some();
+                let obj_reading: Vec<u16> = obj
+                    .get("reading")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.encode_utf16().collect())
+                    .unwrap_or_default();
 
-    let sql = custom_sql.unwrap_or(default_query);
+                let mut freq_kind = 0i32;
+                let mut freq_val_str: Vec<u16> = Vec::new();
+                let mut has_nested_display = false;
+                let mut nested_display_str: Vec<u16> = Vec::new();
+                let mut has_nested_value_num = false;
+                let mut nested_value_num_str: Vec<u16> = Vec::new();
 
-    execute_freq_query(db, sql, term, reading, results)
+                if let Some(freq_val) = obj.get("frequency") {
+                    if freq_val.is_number() {
+                        freq_kind = 1;
+                        freq_val_str = format_json_number(freq_val).encode_utf16().collect();
+                    } else if let Some(s) = freq_val.as_str() {
+                        freq_kind = 2;
+                        freq_val_str = s.encode_utf16().collect();
+                    } else if let Some(nested) = freq_val.as_object() {
+                        freq_kind = 3;
+                        if let Some(d) = nested.get("displayValue").and_then(|v| v.as_str()) {
+                            has_nested_display = true;
+                            nested_display_str = d.encode_utf16().collect();
+                        }
+                        if let Some(v) = nested.get("value") {
+                            if v.is_number() {
+                                has_nested_value_num = true;
+                                nested_value_num_str = format_json_number(v).encode_utf16().collect();
+                            }
+                        }
+                    }
+                }
+
+                let has_top_display = obj.get("displayValue").and_then(|v| v.as_str()).is_some();
+                let top_display_str: Vec<u16> = obj
+                    .get("displayValue")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.encode_utf16().collect())
+                    .unwrap_or_default();
+
+                let has_top_value_num = obj.get("value").map(|v| v.is_number()).unwrap_or(false);
+                let top_value_num_str: Vec<u16> = obj
+                    .get("value")
+                    .filter(|v| v.is_number())
+                    .map(|v| format_json_number(v).encode_utf16().collect())
+                    .unwrap_or_default();
+
+                crate::databasemanager::extract_frequency_object(
+                    has_reading_key,
+                    &obj_reading,
+                    reading,
+                    freq_kind,
+                    &freq_val_str,
+                    has_nested_display,
+                    &nested_display_str,
+                    has_nested_value_num,
+                    &nested_value_num_str,
+                    has_top_display,
+                    &top_display_str,
+                    has_top_value_num,
+                    &top_value_num_str,
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn execute_freq_query(
-    db: *mut sqlite3,
+    conn: &Connection,
     sql: &str,
     term: &[u16],
     reading: &[u16],
     results: &mut Vec<FreqRow>,
 ) -> Result<(), DictError> {
-    let mut stmt = Statement::prepare(db, sql)?;
-    stmt.bind_u16_as_utf8(1, term)?;
-
-    while stmt.step()? {
-        let dic_id = stmt.column_int64(0);
-        let blob_type = stmt.column_int(2);
-        let blob = stmt.column_blob_bytes(1);
-
-        let freq_str_opt: Option<Vec<u16>> = match blob_type {
-            // YOMI_BLOB_TYPE_INT (1)
-            1 => {
-                if blob.len() >= 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&blob[..8]);
-                    let val = u64::from_ne_bytes(arr);
-                    Some(val.to_string().encode_utf16().collect())
-                } else {
-                    None
-                }
-            }
-            // YOMI_BLOB_TYPE_STRING (2)
-            2 => {
-                let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-                let s = std::str::from_utf8(&blob[..null_pos]).unwrap_or("");
-                Some(s.encode_utf16().collect())
-            }
-            // YOMI_BLOB_TYPE_OBJECT (4)
-            4 => {
-                let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-                let slice = &blob[..null_pos];
-                if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(slice) {
-                    let has_reading_key = obj.get("reading").and_then(|v| v.as_str()).is_some();
-                    let obj_reading: Vec<u16> = obj
-                        .get("reading")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.encode_utf16().collect())
-                        .unwrap_or_default();
-
-                    let mut freq_kind = 0i32;
-                    let mut freq_val_str: Vec<u16> = Vec::new();
-                    let mut has_nested_display = false;
-                    let mut nested_display_str: Vec<u16> = Vec::new();
-                    let mut has_nested_value_num = false;
-                    let mut nested_value_num_str: Vec<u16> = Vec::new();
-
-                    if let Some(freq_val) = obj.get("frequency") {
-                        if freq_val.is_number() {
-                            freq_kind = 1;
-                            freq_val_str = format_json_number(freq_val).encode_utf16().collect();
-                        } else if let Some(s) = freq_val.as_str() {
-                            freq_kind = 2;
-                            freq_val_str = s.encode_utf16().collect();
-                        } else if let Some(nested) = freq_val.as_object() {
-                            freq_kind = 3;
-                            if let Some(d) = nested.get("displayValue").and_then(|v| v.as_str()) {
-                                has_nested_display = true;
-                                nested_display_str = d.encode_utf16().collect();
-                            }
-                            if let Some(v) = nested.get("value") {
-                                if v.is_number() {
-                                    has_nested_value_num = true;
-                                    nested_value_num_str = format_json_number(v).encode_utf16().collect();
-                                }
-                            }
-                        }
-                    }
-
-                    let has_top_display = obj.get("displayValue").and_then(|v| v.as_str()).is_some();
-                    let top_display_str: Vec<u16> = obj
-                        .get("displayValue")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.encode_utf16().collect())
-                        .unwrap_or_default();
-
-                    let has_top_value_num = obj.get("value").map(|v| v.is_number()).unwrap_or(false);
-                    let top_value_num_str: Vec<u16> = obj
-                        .get("value")
-                        .filter(|v| v.is_number())
-                        .map(|v| format_json_number(v).encode_utf16().collect())
-                        .unwrap_or_default();
-
-                    crate::databasemanager::extract_frequency_object(
-                        has_reading_key,
-                        &obj_reading,
-                        reading,
-                        freq_kind,
-                        &freq_val_str,
-                        has_nested_display,
-                        &nested_display_str,
-                        has_nested_value_num,
-                        &nested_value_num_str,
-                        has_top_display,
-                        &top_display_str,
-                        has_top_value_num,
-                        &top_value_num_str,
-                    )
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-
-        if let Some(freq_str) = freq_str_opt {
-            results.push(FreqRow {
-                dic_id,
-                frequency: freq_str,
-            });
+    let term_s = String::from_utf16_lossy(term);
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut rows = stmt.query(params![&term_s])?;
+    while let Some(row) = rows.next()? {
+        let dic_id: i64 = row.get(0)?;
+        let blob = row_bytes(row, 1)?;
+        let blob_type: i32 = row.get(2)?;
+        if let Some(frequency) = parse_freq_blob(blob_type, &blob, reading) {
+            results.push(FreqRow { dic_id, frequency });
         }
     }
-
     Ok(())
 }
 
@@ -746,29 +887,24 @@ fn format_json_number(val: &serde_json::Value) -> String {
     val.as_f64().map_or_else(String::new, |value| format_g(value, 6))
 }
 
-
-/// Queries pitch tables and parses pitch JSON blobs.
-pub fn add_pitches(
-    db: *mut sqlite3,
+/// Queries pitch tables and parses pitch JSON blobs on a `rusqlite::Connection`.
+pub fn add_pitches_conn(
+    conn: &Connection,
     term: &[u16],
     reading: &[u16],
     results: &mut Vec<PitchRow>,
 ) -> Result<(), DictError> {
-    if db.is_null() {
-        return Err(DictError::NullPointer);
-    }
-
     const QUERY: &str =
         "SELECT dic_id, data FROM term_meta_bank \
          WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
-         (expression = ? AND mode = 'pitch');";
+         (expression = ?1 AND mode = 'pitch');";
 
-    let mut stmt = Statement::prepare(db, QUERY)?;
-    stmt.bind_u16_as_utf8(1, term)?;
-
-    while stmt.step()? {
-        let dic_id = stmt.column_int64(0);
-        let blob = stmt.column_blob_bytes(1);
+    let term_s = String::from_utf16_lossy(term);
+    let mut stmt = conn.prepare_cached(QUERY)?;
+    let mut rows = stmt.query(params![&term_s])?;
+    while let Some(row) = rows.next()? {
+        let dic_id: i64 = row.get(0)?;
+        let blob = row_bytes(row, 1)?;
         let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
         let blob_slice = &blob[..null_pos];
 
@@ -781,37 +917,30 @@ pub fn add_pitches(
             });
         }
     }
-
     Ok(())
+}
+
+/// Queries pitch tables and parses pitch JSON blobs.
+pub fn add_pitches(
+    db: *mut sqlite3,
+    term: &[u16],
+    reading: &[u16],
+    results: &mut Vec<PitchRow>,
+) -> Result<(), DictError> {
+    if db.is_null() {
+        return Err(DictError::NullPointer);
+    }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    add_pitches_conn(&conn, term, reading, results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct TestDb(*mut sqlite3);
-
-    impl Drop for TestDb {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { sqlite3_close_v2(self.0) };
-            }
-        }
-    }
-
-    fn create_test_db() -> TestDb {
-        let mut db: *mut sqlite3 = std::ptr::null_mut();
-        let rc = unsafe {
-            sqlite3_open_v2(
-                c":memory:".as_ptr(),
-                &mut db,
-                0x00000002 | 0x00000004, // SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
-                std::ptr::null(),
-            )
-        };
-        assert_eq!(rc, SQLITE_OK);
-
-        const SCHEMA: &CStr = c"
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        const SCHEMA: &str = "
             CREATE TABLE directory (
                 dic_id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE,
                 format INTEGER NOT NULL, revision TEXT NOT NULL, sequenced INTEGER NOT NULL
@@ -840,10 +969,8 @@ mod tests {
                 type INTEGER NOT NULL, data BLOB
             );
         ";
-        let mut err = std::ptr::null_mut();
-        let rc = unsafe { sqlite3_exec(db, SCHEMA.as_ptr(), None, std::ptr::null_mut(), &mut err) };
-        assert_eq!(rc, SQLITE_OK);
-        TestDb(db)
+        conn.execute_batch(SCHEMA).unwrap();
+        conn
     }
 
     fn to_u16(s: &str) -> Vec<u16> {
@@ -853,7 +980,7 @@ mod tests {
     #[test]
     fn test_init_cache_empty() {
         let db = create_test_db();
-        let cache = init_cache(db.0).unwrap();
+        let cache = init_cache_conn(&db).unwrap();
         assert_eq!(cache.dictionaries.len(), 0);
         assert_eq!(cache.table_counts.directory, 0);
         assert_eq!(cache.table_counts.term_bank, 0);
@@ -862,15 +989,16 @@ mod tests {
     #[test]
     fn test_init_cache_with_dict() {
         let db = create_test_db();
-        let insert = c"
+        db.execute_batch(
+            "
             INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
             INSERT INTO tag_bank VALUES (1, 'v1', 'partOfSpeech', 1, 'verb', 0);
             INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', 'v1', 10, '[\"to eat\"]', 1, '');
-        ";
-        let mut err = std::ptr::null_mut();
-        unsafe { sqlite3_exec(db.0, insert.as_ptr(), None, std::ptr::null_mut(), &mut err) };
+            ",
+        )
+        .unwrap();
 
-        let cache = init_cache(db.0).unwrap();
+        let cache = init_cache_conn(&db).unwrap();
         assert_eq!(cache.dictionaries.len(), 1);
         assert_eq!(cache.dictionaries[0].id, 1);
         assert_eq!(cache.dictionaries[0].title, "JMdict");
@@ -883,19 +1011,20 @@ mod tests {
     #[test]
     fn test_query_terms_scenarios() {
         let db = create_test_db();
-        let insert = c"
+        db.execute_batch(
+            "
             INSERT INTO directory VALUES (1, 'TestDict', 3, 'rev1', 0);
             INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', '', 10, '[\"to eat\"]', 1, '');
             INSERT INTO term_bank VALUES (1, 'カタカナ', 'かたかな', '', '', 5, '[\"katakana\"]', 2, '');
-        ";
-        let mut err = std::ptr::null_mut();
-        unsafe { sqlite3_exec(db.0, insert.as_ptr(), None, std::ptr::null_mut(), &mut err) };
+            ",
+        )
+        .unwrap();
 
         // 1. Plain search
         let raw = to_u16("食べる");
         let plan = TermQueryPlan::new(&raw, &raw);
         let mut results = Vec::new();
-        query_terms(db.0, &plan, &mut results).unwrap();
+        query_terms_conn(&db, &plan, &mut results).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].expression, to_u16("食べる"));
         assert_eq!(results[0].reading, to_u16("たべる"));
@@ -904,7 +1033,7 @@ mod tests {
         let raw_kata = to_u16("かたかな");
         let plan_kata = TermQueryPlan::new(&raw_kata, &raw_kata);
         let mut results_kata = Vec::new();
-        query_terms(db.0, &plan_kata, &mut results_kata).unwrap();
+        query_terms_conn(&db, &plan_kata, &mut results_kata).unwrap();
         assert_eq!(results_kata.len(), 1);
         assert_eq!(results_kata[0].expression, to_u16("カタカナ"));
 
@@ -913,7 +1042,7 @@ mod tests {
         let nfkc_half = to_u16("カタカナ");
         let plan_half = TermQueryPlan::new(&raw_half, &nfkc_half);
         let mut results_half = Vec::new();
-        query_terms(db.0, &plan_half, &mut results_half).unwrap();
+        query_terms_conn(&db, &plan_half, &mut results_half).unwrap();
         assert_eq!(results_half.len(), 1);
         assert_eq!(results_half[0].expression, to_u16("カタカナ"));
     }
@@ -921,46 +1050,50 @@ mod tests {
     #[test]
     fn term_frequencies_never_fall_back_to_kanji_metadata() {
         let db = create_test_db();
-        let mut stmt = Statement::prepare(
-            db.0,
+        db.execute(
             "INSERT INTO kanji_meta_bank (dic_id, expression, mode, type, data) \
              VALUES (1, '字', 'freq', 2, 'kanji rank');",
-        ).unwrap();
-        assert!(!stmt.step().unwrap());
+            [],
+        )
+        .unwrap();
         let mut rows = Vec::new();
-        get_frequencies(db.0, &to_u16("字"), &[], &mut rows).unwrap();
+        get_frequencies_conn(&db, &to_u16("字"), &[], &mut rows).unwrap();
         assert!(rows.is_empty(), "the C++ term query reads only term_meta_bank");
     }
 
     #[test]
     fn json_frequency_numbers_use_qjsonvalue_to_double_and_qstring_number() {
         let db = create_test_db();
-        let mut stmt = Statement::prepare(
-            db.0,
+        db.execute_batch(
             "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) \
              VALUES (1, '語', 'freq', 4, '{\"frequency\":1234567}'), \
                     (2, '語', 'freq', 4, '{\"frequency\":{\"value\":123456789}}'), \
                     (3, '語', 'freq', 4, '{\"value\":1234567}');",
-        ).unwrap();
-        assert!(!stmt.step().unwrap());
+        )
+        .unwrap();
         let mut rows = Vec::new();
-        get_frequencies(db.0, &to_u16("語"), &[], &mut rows).unwrap();
-        assert_eq!(rows.iter().map(|row| String::from_utf16(&row.frequency).unwrap()).collect::<Vec<_>>(),
-                   ["1.23457e+06", "1.23457e+08", "1.23457e+06"]);
+        get_frequencies_conn(&db, &to_u16("語"), &[], &mut rows).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| String::from_utf16(&row.frequency).unwrap())
+                .collect::<Vec<_>>(),
+            ["1.23457e+06", "1.23457e+08", "1.23457e+06"]
+        );
     }
 
     #[test]
     fn test_query_kanji() {
         let db = create_test_db();
-        let insert = c"
+        db.execute_batch(
+            "
             INSERT INTO directory VALUES (1, 'KanjiDict', 3, 'rev1', 0);
             INSERT INTO kanji_bank VALUES (1, '食', 'ショク', 'た.べる', 'grade:2', '[\"eat\", \"food\"]', '{\"strokes\": \"9\"}');
-        ";
-        let mut err = std::ptr::null_mut();
-        unsafe { sqlite3_exec(db.0, insert.as_ptr(), None, std::ptr::null_mut(), &mut err) };
+            ",
+        )
+        .unwrap();
 
         let mut results = Vec::new();
-        query_kanji(db.0, &to_u16("食"), &mut results).unwrap();
+        query_kanji_conn(&db, &to_u16("食"), &mut results).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].dic_id, 1);
         assert_eq!(results[0].onyomi, to_u16("ショク"));
@@ -973,26 +1106,52 @@ mod tests {
     #[test]
     fn test_get_frequencies_and_pitches() {
         let db = create_test_db();
-        let insert = c"
+        db.execute_batch(
+            "
             INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
             INSERT INTO term_meta_bank VALUES (1, '食べる', 'freq', 4, '{\"reading\": \"たべる\", \"frequency\": 120}');
             INSERT INTO term_meta_bank VALUES (1, '食べる', 'pitch', 4, '{\"reading\": \"たべる\", \"pitches\": [{\"position\": 2}]}');
-        ";
-        let mut err = std::ptr::null_mut();
-        unsafe { sqlite3_exec(db.0, insert.as_ptr(), None, std::ptr::null_mut(), &mut err) };
+            ",
+        )
+        .unwrap();
 
         let mut freqs = Vec::new();
-        get_frequencies(db.0, &to_u16("食べる"), &to_u16("たべる"), &mut freqs).unwrap();
+        get_frequencies_conn(&db, &to_u16("食べる"), &to_u16("たべる"), &mut freqs).unwrap();
         assert_eq!(freqs.len(), 1);
         assert_eq!(freqs[0].dic_id, 1);
         assert_eq!(freqs[0].frequency, to_u16("120"));
 
         let mut pitches = Vec::new();
-        add_pitches(db.0, &to_u16("食べる"), &to_u16("たべる"), &mut pitches).unwrap();
+        add_pitches_conn(&db, &to_u16("食べる"), &to_u16("たべる"), &mut pitches).unwrap();
         assert_eq!(pitches.len(), 1);
         assert_eq!(pitches[0].dic_id, 1);
         assert_eq!(pitches[0].mora, vec![to_u16("た"), to_u16("べ"), to_u16("る")]);
         assert_eq!(pitches[0].positions, vec![2]);
+    }
+
+    #[test]
+    fn test_statement_reuse_with_static_bindings() {
+        let db = create_test_db();
+        db.execute_batch(
+            "INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
+             INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', '', 10, '[\"to eat\"]', 1, '');
+             INSERT INTO term_bank VALUES (1, '飲む', 'のむ', '', '', 10, '[\"to drink\"]', 2, '');",
+        )
+        .unwrap();
+
+        let raw = unsafe { db.handle() };
+        let mut stmt =
+            Statement::prepare(raw, "SELECT reading FROM term_bank WHERE expression = ?1;")
+                .unwrap();
+        stmt.bind_text(1, "食べる").unwrap();
+        assert!(stmt.step().unwrap());
+        assert_eq!(stmt.column_text_string(0), "たべる");
+        assert!(!stmt.step().unwrap());
+
+        stmt.reset().unwrap();
+        stmt.bind_text(1, "飲む").unwrap();
+        assert!(stmt.step().unwrap());
+        assert_eq!(stmt.column_text_string(0), "のむ");
     }
 
     #[test]
@@ -1014,4 +1173,3 @@ mod tests {
         assert_eq!(format_json_number(&val_float), "1234.57");
     }
 }
-

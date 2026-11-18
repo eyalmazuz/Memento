@@ -1,11 +1,10 @@
 use std::error::Error;
-use std::ffi::{CStr, CString};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::ptr;
 use std::sync::Mutex;
 
-use memento_dict::{sqlite_db, yomidbbuilder};
+use memento_dict::sqlite_db::{self, rusqlite};
+use memento_dict::yomidbbuilder::{self, YomiError};
 
 /// An installed dictionary row read from Memento's Yomitan database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +23,10 @@ pub enum DictionaryManagerError {
         path: PathBuf,
         source: std::io::Error,
     },
-    Yomi { operation: &'static str, code: i32 },
+    Yomi {
+        operation: &'static str,
+        source: YomiError,
+    },
     Sqlite(sqlite_db::DictError),
     InvalidDictionaryId(i64),
     DictionaryNotFound(i64),
@@ -42,12 +44,12 @@ impl fmt::Display for DictionaryManagerError {
                 path,
                 source,
             } => write!(f, "could not {operation} '{}': {source}", path.display()),
-            Self::Yomi { operation, code } => {
-                write!(f, "could not {operation} (Yomi error {code})")
+            Self::Yomi { operation, source } => {
+                write!(f, "could not {operation}: {source}")
             }
             Self::Sqlite(error) => write!(f, "{error}"),
             Self::InvalidDictionaryId(id) => {
-                write!(f, "dictionary ID {id} cannot be represented by the Yomi API")
+                write!(f, "dictionary ID {id} is invalid")
             }
             Self::DictionaryNotFound(id) => write!(f, "dictionary {id} is not installed"),
             Self::MutationLockPoisoned => write!(f, "dictionary manager mutation lock is poisoned"),
@@ -59,18 +61,9 @@ impl Error for DictionaryManagerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Yomi { source, .. } => Some(source),
             Self::Sqlite(error) => Some(error),
             _ => None,
-        }
-    }
-}
-
-struct ReadOnlyDatabase(*mut sqlite_db::sqlite3);
-
-impl Drop for ReadOnlyDatabase {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sqlite_db::sqlite3_close_v2(self.0) };
         }
     }
 }
@@ -78,8 +71,8 @@ impl Drop for ReadOnlyDatabase {
 /// Owns the Yomi database operations used by the dictionary settings.
 /// Dictionary ordering is deliberately left to the caller's configuration.
 pub struct DictionaryManager {
-    database_path_c: CString,
-    resources_path_c: CString,
+    database_path: PathBuf,
+    resources_path: PathBuf,
     mutation_lock: Mutex<()>,
 }
 
@@ -89,10 +82,8 @@ impl DictionaryManager {
         database_path: impl AsRef<Path>,
         resources_path: impl AsRef<Path>,
     ) -> Result<Self, DictionaryManagerError> {
-        let database_path = database_path.as_ref().to_path_buf();
-        let resources_path = resources_path.as_ref().to_path_buf();
-        let database_path_c = path_to_cstring(&database_path)?;
-        let resources_path_c = path_to_cstring(&resources_path)?;
+        let database_path = validate_path(database_path.as_ref())?;
+        let resources_path = validate_path(resources_path.as_ref())?;
 
         if let Some(parent) = database_path
             .parent()
@@ -110,19 +101,14 @@ impl DictionaryManager {
             source,
         })?;
 
-        let code = unsafe {
-            yomidbbuilder::memento_dict_yomi_prepare_db(database_path_c.as_ptr(), ptr::null_mut())
-        };
-        if code != 0 {
-            return Err(DictionaryManagerError::Yomi {
-                operation: "prepare the dictionary database",
-                code,
-            });
-        }
+        yomidbbuilder::prepare_db(&database_path).map_err(|source| DictionaryManagerError::Yomi {
+            operation: "prepare the dictionary database",
+            source,
+        })?;
 
         Ok(Self {
-            database_path_c,
-            resources_path_c,
+            database_path,
+            resources_path,
             mutation_lock: Mutex::new(()),
         })
     }
@@ -140,24 +126,36 @@ impl DictionaryManager {
     fn list_dictionaries_unlocked(
         &self,
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
-        let database = open_read_only(&self.database_path_c)?;
-        let mut statement = sqlite_db::Statement::prepare(
-            database.0,
-            "SELECT directory.dic_id, directory.title, \
-             EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) \
-             FROM directory ORDER BY directory.dic_id;",
-        )
-        .map_err(DictionaryManagerError::Sqlite)?;
+        let conn = sqlite_db::open_read_only_connection(&self.database_path)
+            .map_err(DictionaryManagerError::Sqlite)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT directory.dic_id, directory.title, \
+                 EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) \
+                 FROM directory ORDER BY directory.dic_id;",
+            )
+            .map_err(|err| DictionaryManagerError::Sqlite(err.into()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })
+            .map_err(|err| DictionaryManagerError::Sqlite(err.into()))?;
+
         let mut dictionaries = Vec::new();
-        while statement.step().map_err(DictionaryManagerError::Sqlite)? {
-            let id = statement.column_int64(0);
-            if id <= 0 || i32::try_from(id).is_err() {
+        for row_res in rows {
+            let (id, title, disabled) =
+                row_res.map_err(|err| DictionaryManagerError::Sqlite(err.into()))?;
+            if id <= 0 {
                 return Err(DictionaryManagerError::InvalidDictionaryId(id));
             }
             dictionaries.push(InstalledDictionary {
                 id,
-                title: statement.column_text_string(1),
-                disabled: statement.column_int(2) != 0,
+                title,
+                disabled,
             });
         }
         Ok(dictionaries)
@@ -168,24 +166,20 @@ impl DictionaryManager {
         &self,
         archive_path: impl AsRef<Path>,
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
-        let archive_path = path_to_cstring(archive_path.as_ref())?;
+        let archive_path = validate_path(archive_path.as_ref())?;
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
-        let code = unsafe {
-            yomidbbuilder::memento_dict_yomi_process_dictionary(
-                archive_path.as_ptr(),
-                self.database_path_c.as_ptr(),
-                self.resources_path_c.as_ptr(),
-            )
-        };
-        if code != 0 {
-            return Err(DictionaryManagerError::Yomi {
-                operation: "add the dictionary archive",
-                code,
-            });
-        }
+        yomidbbuilder::process_dictionary(
+            &archive_path,
+            &self.database_path,
+            &self.resources_path,
+        )
+        .map_err(|source| DictionaryManagerError::Yomi {
+            operation: "add the dictionary archive",
+            source,
+        })?;
         self.list_dictionaries_unlocked()
     }
 
@@ -216,19 +210,12 @@ impl DictionaryManager {
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
         self.require_installed(id)?;
-        let code = unsafe {
-            yomidbbuilder::memento_dict_yomi_delete_dictionary(
-                id,
-                self.database_path_c.as_ptr(),
-                self.resources_path_c.as_ptr(),
-            )
-        };
-        if code != 0 {
-            return Err(DictionaryManagerError::Yomi {
+        yomidbbuilder::delete_dictionary(id, &self.database_path, &self.resources_path).map_err(
+            |source| DictionaryManagerError::Yomi {
                 operation: "delete the dictionary",
-                code,
-            });
-        }
+                source,
+            },
+        )?;
         self.list_dictionaries_unlocked()
     }
 
@@ -242,35 +229,35 @@ impl DictionaryManager {
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
         self.require_installed(id)?;
-        let code = unsafe {
-            if enabled {
-                yomidbbuilder::memento_dict_yomi_enable_dictionary(id, self.database_path_c.as_ptr())
-            } else {
-                yomidbbuilder::memento_dict_yomi_disable_dictionary(id, self.database_path_c.as_ptr())
-            }
+        let result = if enabled {
+            yomidbbuilder::enable_dictionary(id, &self.database_path)
+        } else {
+            yomidbbuilder::disable_dictionary(id, &self.database_path)
         };
-        if code != 0 {
-            return Err(DictionaryManagerError::Yomi {
-                operation: if enabled {
-                    "enable the dictionary"
-                } else {
-                    "disable the dictionary"
-                },
-                code,
-            });
-        }
+        result.map_err(|source| DictionaryManagerError::Yomi {
+            operation: if enabled {
+                "enable the dictionary"
+            } else {
+                "disable the dictionary"
+            },
+            source,
+        })?;
         self.list_dictionaries_unlocked()
     }
 
     fn require_installed(&self, id: i64) -> Result<(), DictionaryManagerError> {
-        if id <= 0 || i32::try_from(id).is_err() {
+        if id <= 0 {
             return Err(DictionaryManagerError::InvalidDictionaryId(id));
         }
-        let database = open_read_only(&self.database_path_c)?;
-        let query = format!("SELECT 1 FROM directory WHERE dic_id = {id} LIMIT 1;");
-        let mut statement = sqlite_db::Statement::prepare(database.0, &query)
+        let conn = sqlite_db::open_read_only_connection(&self.database_path)
             .map_err(DictionaryManagerError::Sqlite)?;
-        if statement.step().map_err(DictionaryManagerError::Sqlite)? {
+        let mut statement = conn
+            .prepare("SELECT 1 FROM directory WHERE dic_id = ?1 LIMIT 1;")
+            .map_err(|err| DictionaryManagerError::Sqlite(err.into()))?;
+        let exists = statement
+            .exists(rusqlite::params![id])
+            .map_err(|err| DictionaryManagerError::Sqlite(err.into()))?;
+        if exists {
             Ok(())
         } else {
             Err(DictionaryManagerError::DictionaryNotFound(id))
@@ -278,67 +265,166 @@ impl DictionaryManager {
     }
 }
 
-fn open_read_only(path: &CString) -> Result<ReadOnlyDatabase, DictionaryManagerError> {
-    const SQLITE_OPEN_READONLY: i32 = 0x0000_0001;
-    const SQLITE_OPEN_FULLMUTEX: i32 = 0x0001_0000;
-    let mut handle = ptr::null_mut();
-    let status = unsafe {
-        sqlite_db::sqlite3_open_v2(
-            path.as_ptr(),
-            &mut handle,
-            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
-            ptr::null(),
-        )
-    };
-    if status != sqlite_db::SQLITE_OK {
-        let message = if handle.is_null() {
-            "could not open database".to_owned()
-        } else {
-            let error = unsafe { sqlite_db::sqlite3_errmsg(handle) };
-            if error.is_null() {
-                "could not open database".to_owned()
-            } else {
-                unsafe { CStr::from_ptr(error) }
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        if !handle.is_null() {
-            unsafe { sqlite_db::sqlite3_close_v2(handle) };
-        }
-        return Err(DictionaryManagerError::Sqlite(
-            sqlite_db::DictError::Sqlite {
-                code: status,
-                message,
-            },
-        ));
-    }
-    Ok(ReadOnlyDatabase(handle))
-}
-
-fn path_to_cstring(path: &Path) -> Result<CString, DictionaryManagerError> {
+fn validate_path(path: &Path) -> Result<PathBuf, DictionaryManagerError> {
     if path.as_os_str().is_empty() {
         return Err(DictionaryManagerError::InvalidPath {
             path: path.to_path_buf(),
             reason: "path is empty".to_owned(),
         });
     }
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes()
-    };
-    #[cfg(not(unix))]
-    let bytes = path
-        .to_str()
-        .ok_or_else(|| DictionaryManagerError::InvalidPath {
-            path: path.to_path_buf(),
-            reason: "path is not valid UTF-8".to_owned(),
-        })?
-        .as_bytes();
+    Ok(path.to_path_buf())
+}
 
-    CString::new(bytes).map_err(|error| DictionaryManagerError::InvalidPath {
-        path: path.to_path_buf(),
-        reason: error.to_string(),
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "memento-dictmanager-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut buf = Vec::new();
+        let mut central = Vec::new();
+        for &(name, data) in entries {
+            let offset = buf.len() as u32;
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            let name_bytes = name.as_bytes();
+            let name_len = name_bytes.len() as u16;
+
+            // Local file header
+            buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            buf.extend_from_slice(&20u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // store
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(data);
+
+            // Central directory header
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&name_len.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = buf.len() as u32;
+        let cd_size = central.len() as u32;
+        let count = entries.len() as u16;
+        buf.extend_from_slice(&central);
+        // End of central directory
+        buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&cd_size.to_le_bytes());
+        buf.extend_from_slice(&cd_offset.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut file = File::create(path).unwrap();
+        file.write_all(&buf).unwrap();
+    }
+
+    #[test]
+    fn dictionary_manager_lifecycle_add_toggle_and_delete() {
+        let tmp = TempDirGuard::new();
+        let db_path = tmp.0.join("dictionaries.sqlite");
+        let res_dir = tmp.0.join("res");
+        let zip_path = tmp.0.join("sample.zip");
+        write_stored_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"SampleMgr","format":3,"revision":"1"}"#,
+                ),
+                (
+                    "term_bank_1.json",
+                    r#"[["水","みず","","",10,["water"],1,""]]"#.as_bytes(),
+                ),
+                ("styles.css", b"body{}"),
+            ],
+        );
+
+        let manager = DictionaryManager::new(&db_path, &res_dir).unwrap();
+        assert!(manager.list_dictionaries().unwrap().is_empty());
+
+        let added = manager.add_dictionary(&zip_path).unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].title, "SampleMgr");
+        assert!(!added[0].disabled);
+        let id = added[0].id;
+
+        let disabled = manager.disable_dictionary(id).unwrap();
+        assert!(disabled[0].disabled);
+
+        let enabled = manager.enable_dictionary(id).unwrap();
+        assert!(!enabled[0].disabled);
+
+        assert!(matches!(
+            manager.delete_dictionary(999_999),
+            Err(DictionaryManagerError::DictionaryNotFound(999_999))
+        ));
+        assert!(matches!(
+            manager.disable_dictionary(0),
+            Err(DictionaryManagerError::InvalidDictionaryId(0))
+        ));
+
+        let after_delete = manager.delete_dictionary(id).unwrap();
+        assert!(after_delete.is_empty());
+        assert!(!res_dir.join(format!("dict-{id}")).exists());
+    }
 }

@@ -13,10 +13,6 @@ impl ExactQuery {
     pub fn surface(&self) -> &[u16] {
         self.surface_override.as_deref().unwrap_or(&self.deconj)
     }
-
-    pub(crate) fn into_parts(self) -> (Vec<u16>, Option<Vec<u16>>) {
-        (self.deconj, self.surface_override)
-    }
 }
 
 fn regex_whitespace(unit: u16) -> bool {
