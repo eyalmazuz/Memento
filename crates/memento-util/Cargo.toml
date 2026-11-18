@@ -11,6 +11,7 @@ unicode-segmentation = "=1.13.3"
 unicode-normalization = "=0.1.25"
 md-5 = "=0.10.6"
 base64 = "=0.22.1"
+libloading = "=0.8.9"
 
 [lib]
 name = "memento_util"

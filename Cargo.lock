@@ -2830,6 +2830,7 @@ name = "memento"
 version = "2.0.2"
 dependencies = [
  "base64 0.22.1",
+ "copypasta",
  "glow",
  "i-slint-backend-testing",
  "i-slint-renderer-femtovg",
@@ -2919,11 +2920,13 @@ dependencies = [
 name = "memento-dict"
 version = "2.0.2"
 dependencies = [
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "unicode-general-category",
+ "unicode-normalization",
  "zip",
 ]
 
@@ -2970,6 +2973,7 @@ name = "memento-util"
 version = "2.0.2"
 dependencies = [
  "base64 0.22.1",
+ "libloading",
  "md-5",
  "unicode-normalization",
  "unicode-segmentation",
