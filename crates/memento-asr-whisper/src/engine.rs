@@ -81,8 +81,7 @@ pub const ERR_MODEL_INIT: &str = "Whisper could not initialize the selected mode
 /// samples branch).
 pub const ERR_EMPTY_AUDIO: &str = "The extracted audio contains no samples.";
 
-/// C ABI status codes, mirrored in `src/asr/rust/asr_whisper_capi.h`
-/// (`AsrWhisperStatus`).
+/// Engine status codes for transcription outcomes.
 pub const STATUS_SUCCESS: i32 = 0;
 pub const STATUS_CANCELED: i32 = 1;
 /// C++ behaviour: `qWarning(message)` then `failureCallback(message)` then
@@ -106,7 +105,7 @@ pub enum EngineStatus {
 }
 
 impl EngineStatus {
-    /// The C ABI status code for this outcome.
+    /// The numeric status code for this outcome.
     pub fn code(&self) -> i32 {
         match self {
             EngineStatus::Success => STATUS_SUCCESS,

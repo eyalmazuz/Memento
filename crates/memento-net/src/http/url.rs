@@ -295,16 +295,28 @@ impl Url
         {
             // Relative reference: merge against the base directory (the
             // path without its last segment), then fold dot segments.
-            let base = if let Some(idx) = self.path_query.rfind('/')
+            let base_path = self.path_query.split('?').next().unwrap_or("/");
+            let base = if let Some(idx) = base_path.rfind('/')
             {
-                &self.path_query[..=idx]
+                &base_path[..=idx]
             }
             else
             {
                 "/"
             };
-            let merged = remove_dot_segments(&format!("{base}{location}"));
-            format!("{}://{}{}", self.scheme_str(), self.authority_url(), merged)
+            let (loc_path, loc_query) = match location.find('?')
+            {
+                Some(idx) => (&location[..idx], &location[idx..]),
+                None => (location, ""),
+            };
+            let merged = remove_dot_segments(&format!("{base}{loc_path}"));
+            format!(
+                "{}://{}{}{}",
+                self.scheme_str(),
+                self.authority_url(),
+                merged,
+                loc_query
+            )
         };
 
         Self::parse(&rebuilt)
@@ -387,5 +399,16 @@ mod tests
                 "expected authority rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_relative_strips_base_query_before_finding_parent_dir()
+    {
+        let base = Url::parse("https://example.com/dir/page?next=/other/sub").unwrap();
+        let resolved = base.resolve_relative("rel.html").unwrap();
+        assert_eq!(resolved.path_query, "/dir/rel.html");
+
+        let resolved_with_query = base.resolve_relative("../item.bin?from=/a/b").unwrap();
+        assert_eq!(resolved_with_query.path_query, "/item.bin?from=/a/b");
     }
 }

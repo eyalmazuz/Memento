@@ -27,6 +27,4 @@ sha2 = "0.10"
 
 [lib]
 name = "memento_asr_whisper"
-# rlib only: see the note in ../memento-asr-onnx/Cargo.toml — the facade
-# staticlib (`memento-asr-engines`) is the single static artifact.
 crate-type = ["lib"]

@@ -18,14 +18,13 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! Sorted subtitle cue book and work-window/seek decisions from
-//! `asr/asrcontroller.cpp`. QObject state, subtitle text and mpv calls remain
-//! with the C++ controller.
+//! Sorted subtitle cue book and work-window/seek decisions ported from
+//! `asr/asrcontroller.cpp`.
 
-const WORK_WINDOW_SECONDS: f64 = 30.0;
+pub const WORK_WINDOW_SECONDS: f64 = 30.0;
 pub const MIN_WORK_WINDOW_SECONDS: f64 = 0.25;
-const SEEK_RESTART_THRESHOLD_SECONDS: f64 = 5.0;
-const SEEK_RESTART_CLOCK_SLOP_SECONDS: f64 = 2.0;
+pub const SEEK_RESTART_THRESHOLD_SECONDS: f64 = 5.0;
+pub const SEEK_RESTART_CLOCK_SLOP_SECONDS: f64 = 2.0;
 pub const SUBTITLE_TIME_DELTA: f64 = 0.0001;
 pub const MAX_TRANSCRIPTION_FAILURES: i32 = 3;
 
@@ -69,16 +68,15 @@ struct Cue {
     end: f64,
 }
 
-/// Opaque to C++; its cue ordering matches `m_subtitleCues`' lower_bound
+/// Sorted subtitle cue book whose ordering matches `m_subtitleCues`' lower_bound
 /// insertion, including inserting *before* existing cues at the same start.
 #[derive(Default)]
 pub struct AsrControllerCore {
     cues: Vec<Cue>,
 }
 
-/// The first branch taken by the C++ work loop. `end` is only used for
-/// `WINDOW_EXTRACT`; for Done/Advance it equals the returned start.
-#[repr(C)]
+/// Work-window decision. `end` is only used for `WINDOW_EXTRACT`; for
+/// Done/Advance it equals the returned start.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AsrWindowDecision {
     pub start: f64,
@@ -88,15 +86,15 @@ pub struct AsrWindowDecision {
 }
 
 impl AsrWindowDecision {
-    pub(crate) fn done(start: f64, rewound: bool) -> Self {
+    pub fn done(start: f64, rewound: bool) -> Self {
         Self { start, end: start, action: WINDOW_DONE, rewound }
     }
 
-    fn advance(start: f64, rewound: bool) -> Self {
+    pub fn advance(start: f64, rewound: bool) -> Self {
         Self { start, end: start, action: WINDOW_ADVANCE, rewound }
     }
 
-    fn extract(start: f64, end: f64, rewound: bool) -> Self {
+    pub fn extract(start: f64, end: f64, rewound: bool) -> Self {
         Self { start, end, action: WINDOW_EXTRACT, rewound }
     }
 }
@@ -122,17 +120,21 @@ pub(crate) fn qt_bound_zero(value: f64, max: f64) -> f64 {
 }
 
 impl AsrControllerCore {
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.cues.len()
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn is_empty(&self) -> bool {
+        self.cues.is_empty()
+    }
+
+    pub fn clear(&mut self) {
         self.cues.clear();
     }
 
     /// Return the first overlapping cue in iteration order, using both of
     /// the strict epsilon comparisons in `AsrController::addSubtitle`.
-    pub(crate) fn first_overlap(&self, start: f64, end: f64) -> Option<i64> {
+    pub fn first_overlap(&self, start: f64, end: f64) -> Option<i64> {
         self.cues.iter().find(|cue| {
             cue.start < end - SUBTITLE_TIME_DELTA &&
                 start + SUBTITLE_TIME_DELTA < cue.end
@@ -140,7 +142,7 @@ impl AsrControllerCore {
     }
 
     /// Erase the first cue with this id; mpv owns and assigns cue ids.
-    pub(crate) fn erase(&mut self, id: i64) -> bool {
+    pub fn erase(&mut self, id: i64) -> bool {
         if let Some(index) = self.cues.iter().position(|cue| cue.id == id) {
             self.cues.remove(index);
             true
@@ -149,14 +151,14 @@ impl AsrControllerCore {
         }
     }
 
-    pub(crate) fn insert(&mut self, id: i64, start: f64, end: f64) {
+    pub fn insert(&mut self, id: i64, start: f64, end: f64) {
         let insertion = self.cues.partition_point(|cue| cue.start < start);
         self.cues.insert(insertion, Cue { id, start, end });
     }
 
     /// Restart at the first cue after each advance, matching the C++ scan
     /// exactly (including its tie ordering and epsilon comparisons).
-    pub(crate) fn skip_covered_position(&self, mut position: f64) -> f64 {
+    pub fn skip_covered_position(&self, mut position: f64) -> f64 {
         loop {
             let Some(cue) = self.cues.iter().find(|cue| {
                 cue.start <= position + SUBTITLE_TIME_DELTA && position < cue.end
@@ -168,7 +170,7 @@ impl AsrControllerCore {
         position
     }
 
-    pub(crate) fn next_subtitle_start(&self, position: f64) -> f64 {
+    pub fn next_subtitle_start(&self, position: f64) -> f64 {
         let mut next = f64::INFINITY;
         for cue in &self.cues {
             if cue.start > position + SUBTITLE_TIME_DELTA && cue.start < next {
@@ -181,7 +183,7 @@ impl AsrControllerCore {
     /// Mirrors the branches of `selectImplAsync`'s work loop: lines 713-735
     /// in the original controller. Advance represents either `continue`
     /// branch (including a single rewind), not an extraction.
-    pub(crate) fn plan_window(&self, start: f64, duration: f64, rewound: bool) -> AsrWindowDecision {
+    pub fn plan_window(&self, start: f64, duration: f64, rewound: bool) -> AsrWindowDecision {
         let start = qt_bound_zero(self.skip_covered_position(start), duration);
         if start >= duration - MIN_WORK_WINDOW_SECONDS {
             if !rewound &&
@@ -204,7 +206,7 @@ impl AsrControllerCore {
         AsrWindowDecision::extract(start, end, rewound)
     }
 
-    pub(crate) fn initial_start(
+    pub fn initial_start(
         &self,
         start_from_beginning: bool,
         has_consumed_restart: bool,
@@ -222,7 +224,7 @@ impl AsrControllerCore {
         )
     }
 
-    pub(crate) fn plan_position_update(
+    pub fn plan_position_update(
         &self,
         position: f64,
         duration: f64,
@@ -247,9 +249,8 @@ impl AsrControllerCore {
     }
 }
 
-/// Seek classification in `handlePositionChanged`: the last-position update
-/// and restart/QObject work remain in C++.
-pub(crate) fn seeked(position: f64, last: f64, elapsed: f64, paused: bool) -> bool {
+/// Seek classification for playback position discontinuities.
+pub fn seeked(position: f64, last: f64, elapsed: f64, paused: bool) -> bool {
     if last < 0.0 {
         return false;
     }
