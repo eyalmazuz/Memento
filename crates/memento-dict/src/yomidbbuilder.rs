@@ -1,167 +1,43 @@
-//! Yomichan/Yomitan ZIP importer. The on-disk schema, json-c formatting and
-//! binary metadata blobs intentionally remain compatible with yomidbbuilder.c.
+//! Pure-Rust safe Yomichan/Yomitan ZIP importer.
+//!
+//! Preserves Memento's SQLite schema and binary metadata BLOB layouts while
+//! eliminating C `libzip`, `libjson-c`, `nftw` deletion, and raw C-ABI FFI.
 
-#[path = "yomidbbuilder_sys.rs"]
-mod sys;
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs::{self, File};
+use std::io::{BufReader, ErrorKind, Read, Seek, Write};
+use std::path::{Component, Path, PathBuf};
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::io::Write;
-use std::ptr;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde_json::Value;
+use zip::ZipArchive;
 
-use sys::*;
+use crate::sqlite_db;
 
-const YOMI_ERR_OPENING_DIC: c_int = 1;
-const YOMI_ERR_DB: c_int = 2;
-const YOMI_ERR_NEWER_VERSION: c_int = 3;
-const YOMI_ERR_ADDING_INDEX: c_int = 4;
-const YOMI_ERR_ADDING_TAGS: c_int = 5;
-const YOMI_ERR_ADDING_TERMS: c_int = 6;
-const YOMI_ERR_ADDING_TERMS_META: c_int = 7;
-const YOMI_ERR_ADDING_KANJI: c_int = 8;
-const YOMI_ERR_ADDING_KANJI_META: c_int = 9;
-const YOMI_ERR_DELETE: c_int = 10;
-const YOMI_ERR_EXTRACTING_RESOURCES: c_int = 11;
-const YOMI_ERR_REMOVING_RESOURCES: c_int = 12;
+/// Maximum uncompressed size allowed for a single ZIP entry (128 MiB).
+pub const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum cumulative uncompressed bytes allowed across an entire dictionary ZIP (2 GiB).
+pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-const STAT_ERR: c_int = -1;
-const INVALID_SIZE_ERR: c_int = -2;
-const MALLOC_FAILURE_ERR: c_int = -3;
-const ZIP_FILE_OPEN_ERR: c_int = -4;
-const ZIP_FILE_READ_ERR: c_int = -5;
-const UNSUPPORTED_FORMAT_ERR: c_int = -6;
-const JSON_WRONG_TYPE_ERR: c_int = -7;
-const JSON_MISSING_KEY_ERR: c_int = -8;
-const STATEMENT_PREPARE_ERR: c_int = -9;
-const STATEMENT_BIND_ERR: c_int = -10;
-const STATEMENT_STEP_ERR: c_int = -11;
-const DB_NEW_VERSION_ERR: c_int = -12;
-const DB_TABLE_DROP_ERR: c_int = -14;
-const DB_CREATE_TABLE_ERR: c_int = -15;
-const TAG_WRONG_SIZE_ERR: c_int = -16;
-const TERM_WRONG_SIZE_ERR: c_int = -17;
-const KANJI_WRONG_SIZE_ERR: c_int = -18;
-const META_WRONG_SIZE_ERR: c_int = -19;
-const PRAGMA_SET_ERR: c_int = -22;
-const TRANSACTION_ERR: c_int = -23;
-const DB_ALTER_TABLE_ERR: c_int = -24;
-const JSON_PARSE_ERROR: c_int = -25;
+#[derive(Clone, Copy)]
+struct SizeLimits {
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+}
 
-struct Database(*mut Sqlite3);
-
-impl Drop for Database {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sqlite3_close_v2(self.0) };
+impl Default for SizeLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_bytes: MAX_ENTRY_BYTES,
+            max_total_bytes: MAX_TOTAL_BYTES,
         }
     }
 }
 
-struct Archive(*mut Zip);
+const CURRENT_SCHEMA_VERSION: i32 = 4;
 
-impl Drop for Archive {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { zip_close(self.0) };
-        }
-    }
-}
-
-struct Statement(*mut SqliteStmt);
-
-impl Drop for Statement {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sqlite3_finalize(self.0) };
-        }
-    }
-}
-
-struct Json(*mut JsonObject);
-
-impl Drop for Json {
-    fn drop(&mut self) {
-        unsafe { json_object_put(self.0) };
-    }
-}
-
-struct ZipEntry(*mut ZipFile);
-
-impl Drop for ZipEntry {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { zip_fclose(self.0) };
-        }
-    }
-}
-
-// sqlite3_exec owns its error string (unlike sqlite3_errmsg).
-unsafe fn exec(db: *mut Sqlite3, query: &CStr) -> bool {
-    let mut error = ptr::null_mut();
-    let status = unsafe { sqlite3_exec(db, query.as_ptr(), None, ptr::null_mut(), &mut error) };
-    if !error.is_null() {
-        unsafe { sqlite3_free(error.cast()) };
-    }
-    status == SQLITE_OK
-}
-
-unsafe fn statement(db: *mut Sqlite3, sql: &CStr) -> Result<Statement, c_int> {
-    let mut result = ptr::null_mut();
-    let code = unsafe { sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut result, ptr::null_mut()) };
-    if code != SQLITE_OK {
-        drop(Statement(result));
-        return Err(STATEMENT_PREPARE_ERR);
-    }
-    Ok(Statement(result))
-}
-
-unsafe fn insert(
-    db: *mut Sqlite3,
-    sql: &CStr,
-    bind: impl FnOnce(*mut SqliteStmt) -> bool,
-) -> Result<(), c_int> {
-    let stmt = unsafe { statement(db, sql)? };
-    if !bind(stmt.0) {
-        return Err(STATEMENT_BIND_ERR);
-    }
-    if unsafe { sqlite3_step(stmt.0) } != SQLITE_DONE {
-        return Err(STATEMENT_STEP_ERR);
-    }
-    Ok(())
-}
-
-unsafe fn text(stmt: *mut SqliteStmt, field: c_int, value: *const c_char) -> bool {
-    unsafe { sqlite3_bind_text(stmt, field, value, -1, None) == SQLITE_OK }
-}
-
-unsafe fn int(stmt: *mut SqliteStmt, field: c_int, value: c_int) -> bool {
-    unsafe { sqlite3_bind_int(stmt, field, value) == SQLITE_OK }
-}
-
-// A failed DROP is deliberately ignored, as in the original callback. SQLite
-// reports errors in the outer SELECT independently of the DROP statements.
-unsafe extern "C" fn drop_table(
-    database: *mut c_void, count: c_int, names: *mut *mut c_char, _: *mut *mut c_char,
-) -> c_int {
-    for index in 0..count {
-        let name = unsafe { *names.add(index as usize) };
-        if name.is_null() || unsafe { CStr::from_ptr(name) }.to_bytes().starts_with(b"sqlite_") {
-            continue;
-        }
-        let sql = unsafe { sqlite3_mprintf(c"DROP TABLE IF EXISTS %Q;".as_ptr(), name) };
-        if sql.is_null() {
-            return MALLOC_FAILURE_ERR;
-        }
-        let mut error = ptr::null_mut();
-        unsafe { sqlite3_exec(database.cast(), sql, None, ptr::null_mut(), &mut error) };
-        unsafe { sqlite3_free(sql.cast()) };
-        if !error.is_null() {
-            unsafe { sqlite3_free(error.cast()) };
-        }
-    }
-    0
-}
-
-const CREATE_SQL: &CStr = c"
+const CREATE_TABLES_SQL: &str = "
 CREATE TABLE directory (
     dic_id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE,
     format INTEGER NOT NULL, revision TEXT NOT NULL, sequenced INTEGER NOT NULL
@@ -180,33 +56,45 @@ CREATE TABLE tag_bank (
     ord INTEGER NOT NULL, notes TEXT NOT NULL, score INTEGER NOT NULL,
     PRIMARY KEY(dic_id, name)
 );
-CREATE INDEX idx_tag_bank_name ON tag_bank(dic_id, name);
 CREATE TABLE term_bank (
     dic_id INTEGER NOT NULL, expression TEXT NOT NULL, reading TEXT NOT NULL,
     def_tags TEXT NOT NULL, rules TEXT NOT NULL, score INTEGER NOT NULL,
     glossary TEXT NOT NULL, sequence INTEGER NOT NULL, term_tags TEXT NOT NULL
 );
-CREATE INDEX idx_term_bank_exp ON term_bank(expression);
-CREATE INDEX idx_term_bank_reading ON term_bank(reading);
-CREATE INDEX idx_term_bank_combo ON term_bank(expression, reading);
 CREATE TABLE term_meta_bank (
     dic_id INTEGER NOT NULL, expression TEXT NOT NULL, mode TEXT NOT NULL,
     type INTEGER NOT NULL, data BLOB
 );
-CREATE INDEX idx_term_meta_exp ON term_meta_bank(expression, mode);
 CREATE TABLE kanji_bank (
     dic_id INTEGER NOT NULL, char TEXT NOT NULL, onyomi TEXT NOT NULL,
     kunyomi TEXT NOT NULL, tags TEXT NOT NULL, meanings TEXT NOT NULL, stats TEXT NOT NULL
 );
-CREATE INDEX idx_kanji_bank_char ON kanji_bank(char);
 CREATE TABLE kanji_meta_bank (
     dic_id INTEGER NOT NULL, expression TEXT NOT NULL, mode TEXT NOT NULL,
     type INTEGER NOT NULL, data BLOB
 );
-CREATE INDEX idx_kanji_meta_exp ON kanji_meta_bank(expression, mode);
 ";
 
-const V1_TO_V2: &CStr = c"
+const CREATE_INDEXES_SQL: &str = "
+CREATE INDEX IF NOT EXISTS idx_term_bank_exp ON term_bank(expression);
+CREATE INDEX IF NOT EXISTS idx_term_bank_reading ON term_bank(reading);
+CREATE INDEX IF NOT EXISTS idx_term_bank_combo ON term_bank(expression, reading);
+CREATE INDEX IF NOT EXISTS idx_term_meta_exp ON term_meta_bank(expression, mode);
+CREATE INDEX IF NOT EXISTS idx_kanji_bank_char ON kanji_bank(char);
+CREATE INDEX IF NOT EXISTS idx_kanji_meta_exp ON kanji_meta_bank(expression, mode);
+";
+
+const DROP_INDEXES_SQL: &str = "
+DROP INDEX IF EXISTS idx_tag_bank_name;
+DROP INDEX IF EXISTS idx_term_bank_exp;
+DROP INDEX IF EXISTS idx_term_bank_reading;
+DROP INDEX IF EXISTS idx_term_bank_combo;
+DROP INDEX IF EXISTS idx_term_meta_exp;
+DROP INDEX IF EXISTS idx_kanji_bank_char;
+DROP INDEX IF EXISTS idx_kanji_meta_exp;
+";
+
+const V1_TO_V2: &str = "
 ALTER TABLE term_meta_bank ADD type INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE kanji_meta_bank ADD type INTEGER NOT NULL DEFAULT 0;
 UPDATE term_meta_bank SET type = 4 WHERE mode = 'pitch';
@@ -216,7 +104,7 @@ UPDATE kanji_meta_bank SET type = 1 WHERE mode = 'freq';
 PRAGMA user_version = 2;
 ";
 
-const V2_TO_V3: &CStr = c"
+const V2_TO_V3: &str = "
 CREATE TABLE dict_disabled (dic_id INTEGER PRIMARY KEY);
 DROP TRIGGER directory_remove;
 CREATE TRIGGER directory_remove AFTER DELETE ON directory BEGIN
@@ -230,373 +118,730 @@ END;
 PRAGMA user_version = 3;
 ";
 
-const V3_TO_V4: &CStr = c"UPDATE term_bank SET reading = '' WHERE expression = reading;
-PRAGMA user_version = 4;";
+const V3_TO_V4: &str = "
+UPDATE term_bank SET reading = '' WHERE expression = reading;
+PRAGMA user_version = 4;
+";
 
-unsafe fn create_db(db: *mut Sqlite3) -> Result<(), c_int> {
-    let mut error = ptr::null_mut();
-    let code = unsafe {
-        sqlite3_exec(db, c"SELECT name FROM sqlite_master WHERE type='table'".as_ptr(),
-                     Some(drop_table), db.cast(), &mut error)
-    };
-    if !error.is_null() {
-        unsafe { sqlite3_free(error.cast()) };
+/// Errors produced by Yomichan/Yomitan dictionary validation, import, and removal.
+#[derive(Debug)]
+pub enum YomiError {
+    InvalidPath { path: PathBuf, reason: &'static str },
+    InvalidDictionaryId(i64),
+    DictionaryNotFound(i64),
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Zip(zip::result::ZipError),
+    Json {
+        entry: String,
+        source: serde_json::Error,
+    },
+    Sqlite(rusqlite::Error),
+    NewerDbVersion(i32),
+    UnsupportedFormat(i64),
+    MalformedIndex(String),
+    MalformedBank {
+        bank: &'static str,
+        detail: String,
+    },
+    UnsafeArchiveEntry {
+        entry: String,
+        reason: &'static str,
+    },
+    EntryTooLarge {
+        entry: String,
+        limit: u64,
+    },
+    ArchiveTooLarge {
+        limit: u64,
+    },
+}
+
+impl fmt::Display for YomiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath { path, reason } => {
+                write!(f, "invalid path '{}': {reason}", path.display())
+            }
+            Self::InvalidDictionaryId(id) => write!(f, "invalid dictionary ID {id}"),
+            Self::DictionaryNotFound(id) => write!(f, "dictionary {id} is not installed"),
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(f, "failed to {operation} '{}': {source}", path.display()),
+            Self::Zip(err) => write!(f, "ZIP archive error: {err}"),
+            Self::Json { entry, source } => write!(f, "invalid JSON in '{entry}': {source}"),
+            Self::Sqlite(err) => write!(f, "SQLite error: {err}"),
+            Self::NewerDbVersion(v) => {
+                write!(f, "dictionary database schema version {v} is newer than supported ({CURRENT_SCHEMA_VERSION})")
+            }
+            Self::UnsupportedFormat(fmt_ver) => {
+                write!(f, "unsupported Yomitan dictionary format {fmt_ver} (expected 3)")
+            }
+            Self::MalformedIndex(msg) => write!(f, "malformed index.json: {msg}"),
+            Self::MalformedBank { bank, detail } => write!(f, "malformed {bank} entry: {detail}"),
+            Self::UnsafeArchiveEntry { entry, reason } => {
+                write!(f, "unsafe archive entry '{entry}': {reason}")
+            }
+            Self::EntryTooLarge { entry, limit } => {
+                write!(f, "archive entry '{entry}' exceeds decompression limit of {limit} bytes")
+            }
+            Self::ArchiveTooLarge { limit } => {
+                write!(f, "archive total uncompressed size exceeds limit of {limit} bytes")
+            }
+        }
     }
-    if code != SQLITE_OK {
-        return Err(DB_TABLE_DROP_ERR);
+}
+
+impl std::error::Error for YomiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Zip(err) => Some(err),
+            Self::Json { source, .. } => Some(source),
+            Self::Sqlite(err) => Some(err),
+            _ => None,
+        }
     }
-    if !unsafe { exec(db, CREATE_SQL) } {
-        return Err(DB_CREATE_TABLE_ERR);
+}
+
+impl From<rusqlite::Error> for YomiError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
     }
-    if !unsafe { exec(db, c"PRAGMA user_version = 4;") } {
-        return Err(DB_CREATE_TABLE_ERR);
+}
+
+impl From<zip::result::ZipError> for YomiError {
+    fn from(err: zip::result::ZipError) -> Self {
+        Self::Zip(err)
+    }
+}
+
+/// Returns the safe resource directory path for `dic_id`: `{res_dir}/dict-{dic_id}`.
+///
+/// Resource paths are keyed strictly by integer database ID rather than
+/// untrusted `index.json` `"title"` strings to prevent path traversal and
+/// arbitrary directory deletion.
+pub fn dictionary_resource_dir(res_dir: &Path, dic_id: i64) -> Result<PathBuf, YomiError> {
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
+    }
+    validate_non_empty_path(res_dir)?;
+    Ok(res_dir.join(format!("dict-{dic_id}")))
+}
+
+fn validate_non_empty_path(path: &Path) -> Result<(), YomiError> {
+    if path.as_os_str().is_empty() {
+        return Err(YomiError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path is empty",
+        });
     }
     Ok(())
 }
 
-unsafe fn prepare_db(db: *mut Sqlite3) -> Result<(), c_int> {
-    let stmt = unsafe { statement(db, c"PRAGMA user_version;")? };
-    if unsafe { sqlite3_step(stmt.0) } != SQLITE_ROW {
-        return Err(STATEMENT_STEP_ERR);
+fn open_writable_db(db_file: &Path) -> Result<Connection, YomiError> {
+    validate_non_empty_path(db_file)?;
+    sqlite_db::open_read_write_connection(db_file).map_err(|err| match err {
+        sqlite_db::DictError::Other(msg) => YomiError::InvalidPath {
+            path: db_file.to_path_buf(),
+            reason: if msg.contains("empty") {
+                "path is empty"
+            } else {
+                "could not open database"
+            },
+        },
+        sqlite_db::DictError::Sqlite { code, message } => YomiError::Sqlite(
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), Some(message)),
+        ),
+        other => YomiError::MalformedIndex(other.to_string()),
+    })
+}
+
+fn drop_user_tables(tx: &Transaction<'_>) -> Result<(), YomiError> {
+    let tables: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type = 'table';")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut collected = Vec::new();
+        for name_res in rows {
+            let name = name_res?;
+            if !name.starts_with("sqlite_") {
+                collected.push(name);
+            }
+        }
+        collected
+    };
+    for name in tables {
+        let escaped = name.replace('"', "\"\"");
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped}\";"))?;
     }
-    let version = unsafe { sqlite3_column_int(stmt.0, 0) };
-    drop(stmt);
-    if version > 4 {
-        return Err(DB_NEW_VERSION_ERR);
+    Ok(())
+}
+
+fn prepare_schema(conn: &mut Connection, defer_indexes_if_empty: bool) -> Result<bool, YomiError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(YomiError::NewerDbVersion(version));
     }
+
+    let mut deferred_indexes = false;
     match version {
-        0 => unsafe { create_db(db)? },
+        0 => {
+            drop_user_tables(&tx)?;
+            tx.execute_batch(CREATE_TABLES_SQL)?;
+            if !defer_indexes_if_empty {
+                tx.execute_batch(CREATE_INDEXES_SQL)?;
+            } else {
+                deferred_indexes = true;
+            }
+            tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        }
         1..=3 => {
-            if version <= 1 && !unsafe { exec(db, V1_TO_V2) } {
-                return Err(DB_ALTER_TABLE_ERR);
+            if version <= 1 {
+                tx.execute_batch(V1_TO_V2)?;
             }
-            if version <= 2 && !unsafe { exec(db, V2_TO_V3) } {
-                return Err(DB_ALTER_TABLE_ERR);
+            if version <= 2 {
+                tx.execute_batch(V2_TO_V3)?;
             }
-            if !unsafe { exec(db, V3_TO_V4) } {
-                return Err(DB_ALTER_TABLE_ERR);
+            tx.execute_batch(V3_TO_V4)?;
+            // Drop legacy redundant idx_tag_bank_name if present and ensure expected indexes exist.
+            tx.execute_batch("DROP INDEX IF EXISTS idx_tag_bank_name;")?;
+            if !defer_indexes_if_empty {
+                tx.execute_batch(CREATE_INDEXES_SQL)?;
             }
         }
         _ => {}
     }
-    if !unsafe { exec(db, c"PRAGMA recursive_triggers = true;") } {
-        return Err(PRAGMA_SET_ERR);
+
+    if defer_indexes_if_empty && !deferred_indexes {
+        let has_dictionaries: bool = tx
+            .prepare("SELECT 1 FROM directory LIMIT 1;")?
+            .exists([])?;
+        if !has_dictionaries {
+            tx.execute_batch(DROP_INDEXES_SQL)?;
+            deferred_indexes = true;
+        }
+    }
+
+    tx.commit()?;
+    conn.pragma_update(None, "recursive_triggers", true)?;
+    Ok(deferred_indexes)
+}
+
+/// Initializes or migrates the Yomitan SQLite schema at `db_file`.
+pub fn prepare_db(db_file: impl AsRef<Path>) -> Result<(), YomiError> {
+    let mut conn = open_writable_db(db_file.as_ref())?;
+    let _ = prepare_schema(&mut conn, false)?;
+    Ok(())
+}
+
+fn sanitize_zip_entry_path(
+    entry_name: &str,
+    enclosed: Option<PathBuf>,
+    is_dir: bool,
+) -> Result<PathBuf, YomiError> {
+    if entry_name.contains('\0') {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: entry_name.to_owned(),
+            reason: "entry path contains NUL byte",
+        });
+    }
+    if entry_name.starts_with('/') || entry_name.starts_with('\\') {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: entry_name.to_owned(),
+            reason: "entry path must be relative",
+        });
+    }
+    if entry_name.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: entry_name.to_owned(),
+            reason: "entry path contains parent traversal",
+        });
+    }
+    let rel = enclosed.ok_or_else(|| YomiError::UnsafeArchiveEntry {
+        entry: entry_name.to_owned(),
+        reason: "entry path escapes archive root",
+    })?;
+    let mut clean = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(YomiError::UnsafeArchiveEntry {
+                    entry: entry_name.to_owned(),
+                    reason: "entry path contains unsafe component",
+                });
+            }
+        }
+    }
+    if !is_dir && clean.as_os_str().is_empty() {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: entry_name.to_owned(),
+            reason: "file entry path is empty",
+        });
+    }
+    Ok(clean)
+}
+
+fn validate_entry_safety<R: Read>(
+    entry: &zip::read::ZipFile<'_, R>,
+    limits: SizeLimits,
+) -> Result<PathBuf, YomiError> {
+    let name = entry.name();
+    if entry.is_symlink() {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: name.to_owned(),
+            reason: "symbolic links are not allowed",
+        });
+    }
+    if let Some(mode) = entry.unix_mode() {
+        let file_type = mode & 0o170000;
+        if file_type != 0 && file_type != 0o100000 && file_type != 0o040000 {
+            return Err(YomiError::UnsafeArchiveEntry {
+                entry: name.to_owned(),
+                reason: "special file entries are not allowed",
+            });
+        }
+    }
+    let rel = sanitize_zip_entry_path(name, entry.enclosed_name(), entry.is_dir())?;
+    if !entry.is_dir() && entry.size() > limits.max_entry_bytes {
+        return Err(YomiError::EntryTooLarge {
+            entry: name.to_owned(),
+            limit: limits.max_entry_bytes,
+        });
+    }
+    Ok(rel)
+}
+
+fn validate_archive_entries<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limits: SizeLimits,
+) -> Result<(), YomiError> {
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let _ = validate_entry_safety(&entry, limits)?;
     }
     Ok(())
 }
 
-unsafe fn open_db(filename: *const c_char) -> Result<Database, c_int> {
-    let mut raw = ptr::null_mut();
-    let status = unsafe {
-        sqlite3_open_v2(filename, &mut raw, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, ptr::null())
+fn read_json_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    filename: &str,
+    total_bytes: &mut u64,
+    limits: SizeLimits,
+) -> Result<Option<Value>, YomiError> {
+    let entry = match archive.by_name(filename) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(YomiError::Zip(err)),
     };
-    let owned = Database(raw);
-    if status != SQLITE_OK {
-        return Err(YOMI_ERR_DB);
+    let _ = validate_entry_safety(&entry, limits)?;
+    if entry.is_dir() {
+        return Err(YomiError::UnsafeArchiveEntry {
+            entry: filename.to_owned(),
+            reason: "expected regular file, found directory",
+        });
     }
-    if let Err(error) = unsafe { prepare_db(owned.0) } {
-        return Err(if error == DB_NEW_VERSION_ERR { YOMI_ERR_NEWER_VERSION } else { YOMI_ERR_DB });
-    }
-    Ok(owned)
-}
 
-unsafe fn get_file_json(archive: *mut Zip, filename: &CStr) -> Result<Json, c_int> {
-    let mut stat = std::mem::MaybeUninit::<ZipStat>::uninit();
-    unsafe { zip_stat_init(stat.as_mut_ptr()) };
-    if unsafe { zip_stat(archive, filename.as_ptr(), 0, stat.as_mut_ptr()) } != 0 {
-        return Err(STAT_ERR);
-    }
-    let stat = unsafe { stat.assume_init() };
-    if stat.valid & ZIP_STAT_SIZE == 0 {
-        return Err(INVALID_SIZE_ERR);
-    }
-    let length = usize::try_from(stat.size).map_err(|_| MALLOC_FAILURE_ERR)?;
-    let buffer_length = length.checked_add(1).ok_or(MALLOC_FAILURE_ERR)?;
-    let mut contents = Vec::new();
-    contents.try_reserve_exact(buffer_length).map_err(|_| MALLOC_FAILURE_ERR)?;
-    contents.resize(buffer_length, 0);
-    let file = ZipEntry(unsafe { zip_fopen(archive, filename.as_ptr(), 0) });
-    if file.0.is_null() {
-        return Err(ZIP_FILE_OPEN_ERR);
-    }
-    // The C importer performs a single read and treats short reads as errors.
-    let read = unsafe { zip_fread(file.0, contents.as_mut_ptr().cast(), stat.size) };
-    if read < 0 || read as u64 != stat.size {
-        return Err(ZIP_FILE_READ_ERR);
-    }
-    let tokener = unsafe { json_tokener_new_ex(256) };
-    if tokener.is_null() {
-        return Err(MALLOC_FAILURE_ERR);
-    }
-    let parsed = unsafe {
-        json_tokener_parse_ex(tokener, contents.as_ptr().cast(), buffer_length as c_int)
-    };
-    let error = unsafe { json_tokener_get_error(tokener) };
-    unsafe { json_tokener_free(tokener) };
-    if error != 0 || parsed.is_null() {
-        if !parsed.is_null() {
-            unsafe { json_object_put(parsed) };
-        }
-        return Err(JSON_PARSE_ERROR);
-    }
-    Ok(Json(parsed))
-}
-
-unsafe fn object_field(parent: *mut JsonObject, key: &CStr, kind: c_int) -> Result<*mut JsonObject, c_int> {
-    let mut value = ptr::null_mut();
-    if unsafe { json_object_object_get_ex(parent, key.as_ptr(), &mut value) } == 0 {
-        return Err(JSON_MISSING_KEY_ERR);
-    }
-    if unsafe { json_object_is_type(value, kind) } == 0 {
-        return Err(JSON_WRONG_TYPE_ERR);
-    }
-    Ok(value)
-}
-
-unsafe fn array_field(parent: *mut JsonObject, index: usize, kind: c_int) -> Result<*mut JsonObject, c_int> {
-    let value = unsafe { json_object_array_get_idx(parent, index) };
-    if unsafe { json_object_is_type(value, kind) } == 0 {
-        return Err(JSON_WRONG_TYPE_ERR);
-    }
-    Ok(value)
-}
-
-unsafe fn string_field(parent: *mut JsonObject, index: usize) -> Result<*const c_char, c_int> {
-    let value = unsafe { array_field(parent, index, JSON_STRING)? };
-    Ok(unsafe { json_object_get_string(value) })
-}
-
-unsafe fn int_field(parent: *mut JsonObject, index: usize) -> Result<c_int, c_int> {
-    let value = unsafe { array_field(parent, index, JSON_INT)? };
-    Ok(unsafe { json_object_get_int(value) })
-}
-
-unsafe fn add_index(archive: *mut Zip, db: *mut Sqlite3) -> Result<i64, c_int> {
-    let index = unsafe { get_file_json(archive, c"index.json")? };
-    if unsafe { json_object_is_type(index.0, JSON_OBJECT) } == 0 {
-        return Err(JSON_WRONG_TYPE_ERR);
-    }
-    let title = unsafe { json_object_get_string(object_field(index.0, c"title", JSON_STRING)?) };
-    let format = unsafe { json_object_get_int(object_field(index.0, c"format", JSON_INT)?) };
-    let revision = unsafe { json_object_get_string(object_field(index.0, c"revision", JSON_STRING)?) };
-    let mut sequenced = ptr::null_mut();
-    let sequenced = if unsafe { json_object_object_get_ex(index.0, c"sequenced".as_ptr(), &mut sequenced) } != 0 {
-        if unsafe { json_object_is_type(sequenced, JSON_BOOLEAN) } == 0 {
-            return Err(JSON_WRONG_TYPE_ERR);
-        }
-        unsafe { json_object_get_boolean(sequenced) }
-    } else {
-        0
-    };
-    if format != 3 {
-        return Err(UNSUPPORTED_FORMAT_ERR);
-    }
-    unsafe {
-        insert(db, c"INSERT OR REPLACE INTO directory (title, format, revision, sequenced) VALUES (?, ?, ?, ?);", |stmt| {
-            text(stmt, 1, title) && int(stmt, 2, format) && text(stmt, 3, revision) && int(stmt, 4, sequenced)
+    let remaining_total = limits.max_total_bytes.saturating_sub(*total_bytes);
+    let entry_cap = limits.max_entry_bytes.min(remaining_total);
+    let mut buf = Vec::new();
+    entry
+        .take(entry_cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|source| YomiError::Io {
+            operation: "read archive entry",
+            path: PathBuf::from(filename),
+            source,
         })?;
-        Ok(sqlite3_last_insert_rowid(db))
+    let bytes_read = buf.len() as u64;
+    if bytes_read > limits.max_entry_bytes {
+        return Err(YomiError::EntryTooLarge {
+            entry: filename.to_owned(),
+            limit: limits.max_entry_bytes,
+        });
     }
+    let new_total = total_bytes
+        .checked_add(bytes_read)
+        .ok_or(YomiError::ArchiveTooLarge {
+            limit: limits.max_total_bytes,
+        })?;
+    if new_total > limits.max_total_bytes {
+        return Err(YomiError::ArchiveTooLarge {
+            limit: limits.max_total_bytes,
+        });
+    }
+    *total_bytes = new_total;
+
+    let value = serde_json::from_slice(&buf).map_err(|source| YomiError::Json {
+        entry: filename.to_owned(),
+        source,
+    })?;
+    Ok(Some(value))
 }
 
-unsafe fn add_tag(db: *mut Sqlite3, item: *mut JsonObject, id: i64) -> Result<(), c_int> {
-    if unsafe { json_object_array_length(item) } != 5 {
-        return Err(TAG_WRONG_SIZE_ERR);
-    }
-    let name = unsafe { string_field(item, 0)? };
-    let category = unsafe { string_field(item, 1)? };
-    let order = unsafe { int_field(item, 2)? };
-    let notes = unsafe { string_field(item, 3)? };
-    let score = unsafe { int_field(item, 4)? };
-    unsafe {
-        insert(db, c"INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) VALUES (?, ?, ?, ?, ?, ?);", |stmt| {
-            int(stmt, 1, id as c_int) && text(stmt, 2, name) && text(stmt, 3, category)
-                && int(stmt, 4, order) && text(stmt, 5, notes) && int(stmt, 6, score)
-        })
-    }
-}
-
-unsafe fn add_term(db: *mut Sqlite3, item: *mut JsonObject, id: i64) -> Result<(), c_int> {
-    if unsafe { json_object_array_length(item) } != 8 {
-        return Err(TERM_WRONG_SIZE_ERR);
-    }
-    let expression = unsafe { string_field(item, 0)? };
-    let reading = unsafe { string_field(item, 1)? };
-    let def_tags_object = unsafe { json_object_array_get_idx(item, 2) };
-    let def_tags = match unsafe { json_object_get_type(def_tags_object) } {
-        JSON_STRING => unsafe { json_object_get_string(def_tags_object) },
-        JSON_NULL => c"".as_ptr(),
-        _ => return Err(JSON_WRONG_TYPE_ERR),
+fn add_index<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    tx: &Transaction<'_>,
+    total_bytes: &mut u64,
+    limits: SizeLimits,
+) -> Result<(i64, Option<i64>), YomiError> {
+    let Some(index_val) = read_json_entry(archive, "index.json", total_bytes, limits)? else {
+        return Err(YomiError::MalformedIndex("missing index.json".to_owned()));
     };
-    let rules = unsafe { string_field(item, 3)? };
-    let score = unsafe { int_field(item, 4)? };
-    let glossary = unsafe { array_field(item, 5, JSON_ARRAY)? };
-    let glossary = unsafe { json_object_to_json_string(glossary) };
-    let sequence = unsafe { int_field(item, 6)? };
-    let term_tags = unsafe { string_field(item, 7)? };
-    let reading = if unsafe { CStr::from_ptr(expression) } == unsafe { CStr::from_ptr(reading) } {
-        c"".as_ptr()
-    } else {
-        reading
-    };
-    unsafe {
-        insert(db, c"INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);", |stmt| {
-            int(stmt, 1, id as c_int) && text(stmt, 2, expression) && text(stmt, 3, reading)
-                && text(stmt, 4, def_tags) && text(stmt, 5, rules) && int(stmt, 6, score)
-                && text(stmt, 7, glossary) && int(stmt, 8, sequence) && text(stmt, 9, term_tags)
-        })
-    }
-}
+    let obj = index_val
+        .as_object()
+        .ok_or_else(|| YomiError::MalformedIndex("index.json must be an object".to_owned()))?;
 
-unsafe fn add_kanji(db: *mut Sqlite3, item: *mut JsonObject, id: i64) -> Result<(), c_int> {
-    if unsafe { json_object_array_length(item) } != 6 {
-        return Err(KANJI_WRONG_SIZE_ERR);
+    let title = obj
+        .get("title")
+        .and_then(Value::as_str)
+        .ok_or_else(|| YomiError::MalformedIndex("missing or non-string 'title'".to_owned()))?;
+    let format = obj
+        .get("format")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| YomiError::MalformedIndex("missing or non-integer 'format'".to_owned()))?;
+    if format != 3 {
+        return Err(YomiError::UnsupportedFormat(format));
     }
-    let character = unsafe { string_field(item, 0)? };
-    let onyomi = unsafe { string_field(item, 1)? };
-    let kunyomi = unsafe { string_field(item, 2)? };
-    let tags = unsafe { string_field(item, 3)? };
-    let meanings = unsafe { json_object_to_json_string(array_field(item, 4, JSON_ARRAY)?) };
-    let stats = unsafe { json_object_to_json_string(array_field(item, 5, JSON_OBJECT)?) };
-    unsafe {
-        insert(db, c"INSERT INTO kanji_bank (dic_id, char, onyomi, kunyomi, tags, meanings, stats) VALUES (?, ?, ?, ?, ?, ?, ?);", |stmt| {
-            int(stmt, 1, id as c_int) && text(stmt, 2, character) && text(stmt, 3, onyomi)
-                && text(stmt, 4, kunyomi) && text(stmt, 5, tags) && text(stmt, 6, meanings)
-                && text(stmt, 7, stats)
-        })
-    }
-}
-
-unsafe fn add_meta(db: *mut Sqlite3, item: *mut JsonObject, id: i64, sql: &CStr) -> Result<(), c_int> {
-    if unsafe { json_object_array_length(item) } != 3 {
-        return Err(META_WRONG_SIZE_ERR);
-    }
-    let expression = unsafe { string_field(item, 0)? };
-    let mode = unsafe { string_field(item, 1)? };
-    let data = unsafe { json_object_array_get_idx(item, 2) };
-    // json-c's spaced serializer and native-endian scalar layouts are part of
-    // the existing metadata BLOB format; don't reserialize through serde_json.
-    let int_data: i64;
-    let bool_data: c_int;
-    let double_data: f64;
-    let mut data_length = 0usize;
-    let (kind, blob): (c_int, *const c_void) = match unsafe { json_object_get_type(data) } {
-        JSON_ARRAY | JSON_OBJECT => {
-            let serialized = unsafe {
-                json_object_to_json_string_length(data, JSON_C_TO_STRING_SPACED, &mut data_length)
-            };
-            data_length += 1; // Include the terminal NUL in the BLOB.
-            (if unsafe { json_object_get_type(data) } == JSON_ARRAY { 5 } else { 4 }, serialized.cast())
-        }
-        JSON_INT => {
-            int_data = unsafe { json_object_get_int64(data) };
-            data_length = std::mem::size_of::<i64>();
-            (1, (&int_data as *const i64).cast())
-        }
-        JSON_BOOLEAN => {
-            bool_data = unsafe { json_object_get_boolean(data) };
-            data_length = std::mem::size_of::<c_int>();
-            (6, (&bool_data as *const c_int).cast())
-        }
-        JSON_DOUBLE => {
-            double_data = unsafe { json_object_get_double(data) };
-            data_length = std::mem::size_of::<f64>();
-            (3, (&double_data as *const f64).cast())
-        }
-        JSON_STRING => {
-            data_length = unsafe { json_object_get_string_len(data) } as usize + 1;
-            (2, unsafe { json_object_get_string(data) }.cast())
-        }
-        JSON_NULL => (0, ptr::null()),
-        _ => return Err(JSON_WRONG_TYPE_ERR),
+    let revision = obj
+        .get("revision")
+        .and_then(Value::as_str)
+        .ok_or_else(|| YomiError::MalformedIndex("missing or non-string 'revision'".to_owned()))?;
+    let sequenced = match obj.get("sequenced") {
+        None => false,
+        Some(val) => val.as_bool().ok_or_else(|| {
+            YomiError::MalformedIndex("'sequenced' must be a boolean".to_owned())
+        })?,
     };
-    unsafe {
-        insert(db, sql, |stmt| {
-            int(stmt, 1, id as c_int) && text(stmt, 2, expression) && text(stmt, 3, mode)
-                && int(stmt, 4, kind)
-                && if kind == 0 {
-                    sqlite3_bind_null(stmt, 5) == SQLITE_OK
-                } else {
-                    // sqlite3_bind_blob takes int; the source implicitly narrows size_t.
-                    sqlite3_bind_blob(stmt, 5, blob, data_length as c_int, None) == SQLITE_OK
-                }
-        })
+
+    let replaced_dic_id: Option<i64> = tx
+        .query_row(
+            "SELECT dic_id FROM directory WHERE title = ?1;",
+            params![title],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO directory (title, format, revision, sequenced) VALUES (?1, ?2, ?3, ?4);",
+        params![title, format, revision, i64::from(sequenced)],
+    )?;
+    let dic_id = tx.last_insert_rowid();
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
     }
+    Ok((dic_id, replaced_dic_id))
 }
 
 #[derive(Clone, Copy)]
-enum Bank { Tag, Term, TermMeta, Kanji, KanjiMeta }
+enum Bank {
+    Tag,
+    Term,
+    TermMeta,
+    Kanji,
+    KanjiMeta,
+}
 
 impl Bank {
-    fn filename(self, mut number: usize, buffer: &mut [u8; 256]) -> &CStr {
-        let prefix: &[u8] = match self {
-            Self::Tag => b"tag_bank_",
-            Self::Term => b"term_bank_",
-            Self::TermMeta => b"term_meta_bank_",
-            Self::Kanji => b"kanji_bank_",
-            Self::KanjiMeta => b"kanji_meta_bank_",
-        };
-        buffer[..prefix.len()].copy_from_slice(prefix);
-        let mut reversed = [0u8; 20]; // decimal digits of any 64-bit usize
-        let mut digits = 0;
-        loop {
-            reversed[digits] = b'0' + (number % 10) as u8;
-            digits += 1;
-            number /= 10;
-            if number == 0 { break; }
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Tag => "tag_bank_",
+            Self::Term => "term_bank_",
+            Self::TermMeta => "term_meta_bank_",
+            Self::Kanji => "kanji_bank_",
+            Self::KanjiMeta => "kanji_meta_bank_",
         }
-        for (index, digit) in reversed[..digits].iter().rev().enumerate() {
-            buffer[prefix.len() + index] = *digit;
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tag => "tag_bank",
+            Self::Term => "term_bank",
+            Self::TermMeta => "term_meta_bank",
+            Self::Kanji => "kanji_bank",
+            Self::KanjiMeta => "kanji_meta_bank",
         }
-        let suffix = prefix.len() + digits;
-        buffer[suffix..suffix + 6].copy_from_slice(b".json\0");
-        CStr::from_bytes_with_nul(&buffer[..suffix + 6]).expect("bank filename has no NUL")
+    }
+
+    fn insert_sql(self) -> &'static str {
+        match self {
+            Self::Tag => {
+                "INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6);"
+            }
+            Self::Term => {
+                "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);"
+            }
+            Self::TermMeta => {
+                "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5);"
+            }
+            Self::Kanji => {
+                "INSERT INTO kanji_bank (dic_id, char, onyomi, kunyomi, tags, meanings, stats) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);"
+            }
+            Self::KanjiMeta => {
+                "INSERT INTO kanji_meta_bank (dic_id, expression, mode, type, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5);"
+            }
+        }
     }
 }
 
-unsafe fn add_bank(archive: *mut Zip, db: *mut Sqlite3, id: i64, bank: Bank) -> Result<(), c_int> {
-    let mut number = 1usize;
-    let mut filename_buffer = [0u8; 256];
-    loop {
-        let filename = bank.filename(number, &mut filename_buffer);
-        if unsafe { zip_name_locate(archive, filename.as_ptr(), 0) } == -1 {
-            break;
-        }
-        let items = unsafe { get_file_json(archive, &filename)? };
-        if unsafe { json_object_is_type(items.0, JSON_ARRAY) } == 0 {
-            return Err(JSON_WRONG_TYPE_ERR);
-        }
-        for index in 0..unsafe { json_object_array_length(items.0) } {
-            let item = unsafe { json_object_array_get_idx(items.0, index) };
-            if unsafe { json_object_is_type(item, JSON_ARRAY) } == 0 {
-                return Err(JSON_WRONG_TYPE_ERR);
+fn array_str<'a>(items: &'a [Value], index: usize, bank: &'static str) -> Result<&'a str, YomiError> {
+    items
+        .get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| YomiError::MalformedBank {
+            bank,
+            detail: format!("element {index} must be a string"),
+        })
+}
+
+fn array_i64(items: &[Value], index: usize, bank: &'static str) -> Result<i64, YomiError> {
+    items
+        .get(index)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| YomiError::MalformedBank {
+            bank,
+            detail: format!("element {index} must be an integer"),
+        })
+}
+
+fn with_nul(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.extend_from_slice(bytes);
+    out.push(0);
+    out
+}
+
+fn encode_meta_blob(data: &Value, entry: &str) -> Result<(i64, Option<Vec<u8>>), YomiError> {
+    match data {
+        Value::Null => Ok((0, None)),
+        Value::Number(num) => {
+            if let Some(i) = num.as_i64() {
+                Ok((1, Some(i.to_ne_bytes().to_vec())))
+            } else if let Some(u) = num.as_u64() {
+                Ok((1, Some(u.to_ne_bytes().to_vec())))
+            } else if let Some(f) = num.as_f64() {
+                Ok((3, Some(f.to_ne_bytes().to_vec())))
+            } else {
+                Err(YomiError::MalformedBank {
+                    bank: "meta_bank",
+                    detail: format!("unsupported JSON number in '{entry}'"),
+                })
             }
-            unsafe {
-                match bank {
-                    Bank::Tag => add_tag(db, item, id)?,
-                    Bank::Term => add_term(db, item, id)?,
-                    Bank::TermMeta => add_meta(db, item, id, c"INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (?, ?, ?, ?, ?);")?,
-                    Bank::Kanji => add_kanji(db, item, id)?,
-                    Bank::KanjiMeta => add_meta(db, item, id, c"INSERT INTO kanji_meta_bank (dic_id, expression, mode, type, data) VALUES (?, ?, ?, ?, ?);")?,
+        }
+        Value::String(s) => Ok((2, Some(with_nul(s.as_bytes())))),
+        Value::Object(_) => {
+            let encoded = serde_json::to_vec(data).map_err(|source| YomiError::Json {
+                entry: entry.to_owned(),
+                source,
+            })?;
+            Ok((4, Some(with_nul(&encoded))))
+        }
+        Value::Array(_) => {
+            let encoded = serde_json::to_vec(data).map_err(|source| YomiError::Json {
+                entry: entry.to_owned(),
+                source,
+            })?;
+            Ok((5, Some(with_nul(&encoded))))
+        }
+        Value::Bool(b) => {
+            let val: i32 = i32::from(*b);
+            Ok((6, Some(val.to_ne_bytes().to_vec())))
+        }
+    }
+}
+
+fn add_bank<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    tx: &Transaction<'_>,
+    dic_id: i64,
+    bank: Bank,
+    total_bytes: &mut u64,
+    limits: SizeLimits,
+) -> Result<(), YomiError> {
+    let mut stmt = tx.prepare(bank.insert_sql())?;
+    let bank_label = bank.label();
+    let prefix = bank.prefix();
+    let mut number = 1usize;
+
+    loop {
+        let filename = format!("{prefix}{number}.json");
+        let Some(root) = read_json_entry(archive, &filename, total_bytes, limits)? else {
+            break;
+        };
+        let items = root.as_array().ok_or_else(|| YomiError::MalformedBank {
+            bank: bank_label,
+            detail: format!("'{filename}' root must be a JSON array"),
+        })?;
+
+        for row_val in items {
+            let row = row_val.as_array().ok_or_else(|| YomiError::MalformedBank {
+                bank: bank_label,
+                detail: format!("row in '{filename}' must be a JSON array"),
+            })?;
+            match bank {
+                Bank::Tag => {
+                    if row.len() != 5 {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: format!("expected 5 elements, got {}", row.len()),
+                        });
+                    }
+                    let name = array_str(row, 0, bank_label)?;
+                    let category = array_str(row, 1, bank_label)?;
+                    let order = array_i64(row, 2, bank_label)?;
+                    let notes = array_str(row, 3, bank_label)?;
+                    let score = array_i64(row, 4, bank_label)?;
+                    stmt.execute(params![dic_id, name, category, order, notes, score])?;
+                }
+                Bank::Term => {
+                    if row.len() != 8 {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: format!("expected 8 elements, got {}", row.len()),
+                        });
+                    }
+                    let expression = array_str(row, 0, bank_label)?;
+                    let raw_reading = array_str(row, 1, bank_label)?;
+                    let reading = if expression == raw_reading { "" } else { raw_reading };
+                    let def_tags = match &row[2] {
+                        Value::String(s) => s.as_str(),
+                        Value::Null => "",
+                        _ => {
+                            return Err(YomiError::MalformedBank {
+                                bank: bank_label,
+                                detail: "element 2 (def_tags) must be string or null".to_owned(),
+                            });
+                        }
+                    };
+                    let rules = array_str(row, 3, bank_label)?;
+                    let score = array_i64(row, 4, bank_label)?;
+                    if !row[5].is_array() {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: "element 5 (glossary) must be an array".to_owned(),
+                        });
+                    }
+                    let glossary = serde_json::to_string(&row[5]).map_err(|source| {
+                        YomiError::Json {
+                            entry: filename.clone(),
+                            source,
+                        }
+                    })?;
+                    let sequence = array_i64(row, 6, bank_label)?;
+                    let term_tags = array_str(row, 7, bank_label)?;
+                    stmt.execute(params![
+                        dic_id,
+                        expression,
+                        reading,
+                        def_tags,
+                        rules,
+                        score,
+                        glossary,
+                        sequence,
+                        term_tags,
+                    ])?;
+                }
+                Bank::Kanji => {
+                    if row.len() != 6 {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: format!("expected 6 elements, got {}", row.len()),
+                        });
+                    }
+                    let character = array_str(row, 0, bank_label)?;
+                    let onyomi = array_str(row, 1, bank_label)?;
+                    let kunyomi = array_str(row, 2, bank_label)?;
+                    let tags = array_str(row, 3, bank_label)?;
+                    if !row[4].is_array() {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: "element 4 (meanings) must be an array".to_owned(),
+                        });
+                    }
+                    if !row[5].is_object() {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: "element 5 (stats) must be an object".to_owned(),
+                        });
+                    }
+                    let meanings = serde_json::to_string(&row[4]).map_err(|source| {
+                        YomiError::Json {
+                            entry: filename.clone(),
+                            source,
+                        }
+                    })?;
+                    let stats = serde_json::to_string(&row[5]).map_err(|source| {
+                        YomiError::Json {
+                            entry: filename.clone(),
+                            source,
+                        }
+                    })?;
+                    stmt.execute(params![
+                        dic_id,
+                        character,
+                        onyomi,
+                        kunyomi,
+                        tags,
+                        meanings,
+                        stats,
+                    ])?;
+                }
+                Bank::TermMeta | Bank::KanjiMeta => {
+                    if row.len() != 3 {
+                        return Err(YomiError::MalformedBank {
+                            bank: bank_label,
+                            detail: format!("expected 3 elements, got {}", row.len()),
+                        });
+                    }
+                    let expression = array_str(row, 0, bank_label)?;
+                    let mode = array_str(row, 1, bank_label)?;
+                    let (kind, blob) = encode_meta_blob(&row[2], &filename)?;
+                    stmt.execute(params![dic_id, expression, mode, kind, blob])?;
                 }
             }
         }
         number += 1;
     }
+
     Ok(())
 }
 
-// POSIX ERE REGEX_SKIP_FILE: the banks' first suffix digit must be nonzero;
-// following digits and the literal parentheses in the C character class are
-// accepted. In particular a bank inside a directory is NOT skipped.
-fn skipped_resource(name: &[u8]) -> bool {
-    if name == b"index.json" {
+fn is_skipped_resource(rel_path: &Path) -> bool {
+    let mut components = rel_path.components();
+    let (Some(Component::Normal(first)), None) = (components.next(), components.next()) else {
+        return false;
+    };
+    let Some(name) = first.to_str() else {
+        return false;
+    };
+    if name == "index.json" {
         return true;
     }
-    for prefix in [b"tag_bank_".as_slice(), b"term_bank_", b"term_meta_bank_", b"kanji_bank_", b"kanji_meta_bank_"] {
-        if let Some(rest) = name.strip_prefix(prefix).and_then(|s| s.strip_suffix(b".json")) {
-            if rest.first().is_some_and(|&first| matches!(first, b'1'..=b'9'))
-                && rest[1..].iter().all(|&c| c.is_ascii_digit() || matches!(c, b'(' | b')' | b'\\'))
+    for prefix in [
+        "tag_bank_",
+        "term_bank_",
+        "term_meta_bank_",
+        "kanji_bank_",
+        "kanji_meta_bank_",
+    ] {
+        if let Some(rest) = name
+            .strip_prefix(prefix)
+            .and_then(|s| s.strip_suffix(".json"))
+        {
+            if rest.starts_with(|c: char| matches!(c, '1'..='9'))
+                && rest[1..].bytes().all(|b| b.is_ascii_digit())
             {
                 return true;
             }
@@ -605,269 +850,714 @@ fn skipped_resource(name: &[u8]) -> bool {
     false
 }
 
-fn combined_path(start: &[u8], end: &[u8]) -> Result<CString, c_int> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve(start.len() + end.len() + 2).map_err(|_| MALLOC_FAILURE_ERR)?;
-    bytes.extend_from_slice(start);
-    if !start.ends_with(b"/") {
-        bytes.push(b'/');
-    }
-    bytes.extend_from_slice(end);
-    CString::new(bytes).map_err(|_| YOMI_ERR_EXTRACTING_RESOURCES)
-}
-
-#[cfg(unix)]
-fn path_from_c(path: &CStr) -> &std::path::Path {
-    use std::os::unix::ffi::OsStrExt;
-    std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))
-}
-
-#[cfg(not(unix))]
-fn path_from_c(path: &CStr) -> &std::path::Path {
-    std::path::Path::new(path.to_str().unwrap_or(""))
-}
-
-#[cfg(unix)]
-fn make_path(path: &CStr) -> Result<(), c_int> {
-    extern "C" {
-        fn mkdir(path: *const c_char, mode: u32) -> c_int;
-    }
-    let bytes = path.to_bytes();
-    let Some(first) = bytes.iter().position(|&c| c == b'/') else {
-        return Ok(());
-    };
-    for end in bytes.iter().enumerate().skip(first + 1).filter_map(|(i, &c)| (c == b'/').then_some(i))
-        .chain(std::iter::once(bytes.len()))
-    {
-        let mut prefix = bytes[..end].to_vec();
-        prefix.push(0);
-        if unsafe { mkdir(prefix.as_ptr().cast(), 0o755) } != 0 {
-            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
-            if code != 17 { // EEXIST, including an existing non-directory as in the C importer
-                return Err(code);
-            }
+fn extract_resources_to_staging<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    staging_dir: &Path,
+    total_bytes: &mut u64,
+    limits: SizeLimits,
+) -> Result<(), YomiError> {
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let entry_name = entry.name().to_owned();
+        let rel_path = validate_entry_safety(&entry, limits)?;
+        if is_skipped_resource(&rel_path) {
+            continue;
         }
+        if entry.is_dir() {
+            if !rel_path.as_os_str().is_empty() {
+                let target_dir = staging_dir.join(&rel_path);
+                fs::create_dir_all(&target_dir).map_err(|source| YomiError::Io {
+                    operation: "create resource directory",
+                    path: target_dir,
+                    source,
+                })?;
+            }
+            continue;
+        }
+
+        let out_path = staging_dir.join(&rel_path);
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| YomiError::Io {
+                operation: "create resource parent directory",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let remaining_total = limits.max_total_bytes.saturating_sub(*total_bytes);
+        let entry_cap = limits.max_entry_bytes.min(remaining_total);
+        let mut limited = entry.take(entry_cap.saturating_add(1));
+        let mut out_file = File::create(&out_path).map_err(|source| YomiError::Io {
+            operation: "create resource file",
+            path: out_path.clone(),
+            source,
+        })?;
+        let bytes_written = std::io::copy(&mut limited, &mut out_file).map_err(|source| {
+            YomiError::Io {
+                operation: "write resource file",
+                path: out_path.clone(),
+                source,
+            }
+        })?;
+        if bytes_written > limits.max_entry_bytes {
+            return Err(YomiError::EntryTooLarge {
+                entry: entry_name,
+                limit: limits.max_entry_bytes,
+            });
+        }
+        let new_total = total_bytes
+            .checked_add(bytes_written)
+            .ok_or(YomiError::ArchiveTooLarge {
+                limit: limits.max_total_bytes,
+            })?;
+        if new_total > limits.max_total_bytes {
+            return Err(YomiError::ArchiveTooLarge {
+                limit: limits.max_total_bytes,
+            });
+        }
+        *total_bytes = new_total;
+        out_file.flush().map_err(|source| YomiError::Io {
+            operation: "flush resource file",
+            path: out_path,
+            source,
+        })?;
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn make_path(path: &CStr) -> Result<(), c_int> {
-    std::fs::create_dir_all(path_from_c(path)).map_err(|e| e.raw_os_error().unwrap_or(1))
-}
-
-#[cfg(unix)]
-unsafe extern "C" fn remove_entry(path: *const c_char, _: *const c_void, _: c_int, _: *const c_void) -> c_int {
-    if unsafe { remove(path) } == 0 {
-        0
-    } else {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+fn safe_remove_dict_resource_dir(canon_res_dir: &Path, dic_id: i64) -> Result<(), YomiError> {
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
     }
-}
-
-#[cfg(unix)]
-fn remove_path(path: &CStr) -> Result<(), c_int> {
-    if unsafe { nftw(path.as_ptr(), remove_entry, 10, 1 | 2 | 8) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(1))
+    let dir_name = format!("dict-{dic_id}");
+    let target = canon_res_dir.join(&dir_name);
+    let meta = match fs::symlink_metadata(&target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(YomiError::Io {
+                operation: "inspect dictionary resource directory",
+                path: target,
+                source,
+            });
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(&target).map_err(|source| YomiError::Io {
+            operation: "remove dictionary resource symlink",
+            path: target,
+            source,
+        });
     }
-}
-
-#[cfg(not(unix))]
-fn remove_path(path: &CStr) -> Result<(), c_int> {
-    let target = path_from_c(path);
-    if target.is_dir() {
-        std::fs::remove_dir_all(target)
-    } else {
-        std::fs::remove_file(target)
-    }.map_err(|e| e.raw_os_error().unwrap_or(1))
-}
-
-fn remove_if_present(path: &CStr) -> Result<(), c_int> {
-    match remove_path(path) {
-        Ok(()) | Err(2) => Ok(()), // ENOENT; matches the POSIX resource cleanup
-        Err(other) => Err(other),
+    if meta.is_dir() {
+        let canon_target = fs::canonicalize(&target).map_err(|source| YomiError::Io {
+            operation: "canonicalize dictionary resource directory",
+            path: target.clone(),
+            source,
+        })?;
+        if canon_target.parent() != Some(canon_res_dir)
+            || canon_target.file_name() != Some(OsStr::new(&dir_name))
+        {
+            return Err(YomiError::InvalidPath {
+                path: canon_target,
+                reason: "target escaped resources directory",
+            });
+        }
+        return fs::remove_dir_all(&canon_target).map_err(|source| YomiError::Io {
+            operation: "remove dictionary resource directory",
+            path: canon_target,
+            source,
+        });
     }
+    fs::remove_file(&target).map_err(|source| YomiError::Io {
+        operation: "remove dictionary resource entry",
+        path: target,
+        source,
+    })
 }
 
-unsafe fn extract_resources(archive: *mut Zip, res_dir: *const c_char) -> Result<(), c_int> {
-    let index = unsafe { get_file_json(archive, c"index.json")? };
-    let title = unsafe { json_object_get_string(object_field(index.0, c"title", JSON_STRING)?) };
-    let base = combined_path(unsafe { CStr::from_ptr(res_dir) }.to_bytes(), unsafe { CStr::from_ptr(title) }.to_bytes())?;
-    remove_if_present(&base)?;
-    make_path(&base)?;
+/// Imports a Yomichan/Yomitan `.zip` dictionary into `db_file` and extracts
+/// non-bank resource files under `{res_dir}/dict-{dic_id}`.
+pub fn process_dictionary(
+    dict_file: impl AsRef<Path>,
+    db_file: impl AsRef<Path>,
+    res_dir: impl AsRef<Path>,
+) -> Result<i64, YomiError> {
+    process_dictionary_with_limits(dict_file.as_ref(), db_file.as_ref(), res_dir.as_ref(), SizeLimits::default())
+}
 
-    let number = unsafe { zip_get_num_entries(archive, 0) };
-    for index in 0..number {
-        let name = unsafe { zip_get_name(archive, index as u64, 0) };
-        if name.is_null() {
-            return Err(YOMI_ERR_EXTRACTING_RESOURCES);
+fn process_dictionary_with_limits(
+    dict_file: &Path,
+    db_file: &Path,
+    res_dir: &Path,
+    limits: SizeLimits,
+) -> Result<i64, YomiError> {
+    validate_non_empty_path(dict_file)?;
+    validate_non_empty_path(db_file)?;
+    validate_non_empty_path(res_dir)?;
+
+    let archive_file = File::open(dict_file).map_err(|source| YomiError::Io {
+        operation: "open dictionary archive",
+        path: dict_file.to_path_buf(),
+        source,
+    })?;
+    let mut archive = ZipArchive::new(BufReader::new(archive_file))?;
+    validate_archive_entries(&mut archive, limits)?;
+
+    fs::create_dir_all(res_dir).map_err(|source| YomiError::Io {
+        operation: "create resources directory",
+        path: res_dir.to_path_buf(),
+        source,
+    })?;
+    let canon_res_dir = fs::canonicalize(res_dir).map_err(|source| YomiError::Io {
+        operation: "canonicalize resources directory",
+        path: res_dir.to_path_buf(),
+        source,
+    })?;
+
+    let mut conn = open_writable_db(db_file)?;
+    let defer_indexes = prepare_schema(&mut conn, true)?;
+
+    let staging = tempfile::Builder::new()
+        .prefix(".memento-import-")
+        .tempdir_in(&canon_res_dir)
+        .map_err(|source| YomiError::Io {
+            operation: "create staging directory",
+            path: canon_res_dir.clone(),
+            source,
+        })?;
+
+    let mut total_bytes = 0u64;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let (dic_id, replaced_dic_id) = add_index(&mut archive, &tx, &mut total_bytes, limits)?;
+    for bank in [
+        Bank::Tag,
+        Bank::Term,
+        Bank::TermMeta,
+        Bank::Kanji,
+        Bank::KanjiMeta,
+    ] {
+        add_bank(&mut archive, &tx, dic_id, bank, &mut total_bytes, limits)?;
+    }
+    if defer_indexes {
+        tx.execute_batch(CREATE_INDEXES_SQL)?;
+    }
+    extract_resources_to_staging(&mut archive, staging.path(), &mut total_bytes, limits)?;
+    tx.commit()?;
+
+    safe_remove_dict_resource_dir(&canon_res_dir, dic_id)?;
+    if let Some(old_id) = replaced_dic_id {
+        if old_id != dic_id {
+            safe_remove_dict_resource_dir(&canon_res_dir, old_id)?;
         }
-        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-        if skipped_resource(name) {
-            continue;
-        }
-        let path = combined_path(base.to_bytes(), name)?;
-        if name.ends_with(b"/") {
-            // Directory entry creation errors are ignored by the C importer.
-            let _ = make_path(&path);
-            continue;
-        }
-        let entry = ZipEntry(unsafe { zip_fopen_index(archive, index as u64, 0) });
-        if entry.0.is_null() {
-            // The original path returns its current (zero) error code here.
-            return Ok(());
-        }
-        let bytes = path.to_bytes();
-        // C truncates at the final slash and calls make_path on that prefix.
-        let parent = CString::new(&bytes[..bytes.iter().rposition(|&byte| byte == b'/').unwrap_or(0)])
-            .map_err(|_| YOMI_ERR_EXTRACTING_RESOURCES)?;
-        make_path(&parent)?;
-        let Ok(mut file) = std::fs::File::create(path_from_c(&path)) else {
-            // fopen failure likewise exits without assigning a new error code.
-            return Ok(());
-        };
-        let mut buffer = [0u8; 8192];
-        loop {
-            let read = unsafe { zip_fread(entry.0, buffer.as_mut_ptr().cast(), buffer.len() as u64) };
-            if read == 0 { break; }
-            if read < 0 { return Err(ZIP_FILE_READ_ERR); }
-            // fwrite failures were not checked in the C implementation.
-            let _ = file.write_all(&buffer[..read as usize]);
-        }
+    }
+
+    let target_dir = dictionary_resource_dir(&canon_res_dir, dic_id)?;
+    let staging_path = staging.keep();
+    if let Err(source) = fs::rename(&staging_path, &target_dir) {
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(YomiError::Io {
+            operation: "install dictionary resource directory",
+            path: target_dir,
+            source,
+        });
+    }
+
+    Ok(dic_id)
+}
+
+/// Deletes an installed dictionary row (triggering cascading row cleanup) and
+/// removes `{res_dir}/dict-{dic_id}` without ever consulting `directory.title`.
+pub fn delete_dictionary(
+    dic_id: i64,
+    db_file: impl AsRef<Path>,
+    res_dir: impl AsRef<Path>,
+) -> Result<(), YomiError> {
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
+    }
+    let db_file = db_file.as_ref();
+    let res_dir = res_dir.as_ref();
+    validate_non_empty_path(db_file)?;
+    validate_non_empty_path(res_dir)?;
+
+    let mut conn = open_writable_db(db_file)?;
+    let _ = prepare_schema(&mut conn, false)?;
+    let deleted = conn.execute("DELETE FROM directory WHERE dic_id = ?1;", params![dic_id])?;
+    if deleted == 0 {
+        return Err(YomiError::DictionaryNotFound(dic_id));
+    }
+
+    if res_dir.exists() {
+        let canon_res_dir = fs::canonicalize(res_dir).map_err(|source| YomiError::Io {
+            operation: "canonicalize resources directory",
+            path: res_dir.to_path_buf(),
+            source,
+        })?;
+        safe_remove_dict_resource_dir(&canon_res_dir, dic_id)?;
     }
     Ok(())
 }
 
-unsafe fn process_dictionary(dict_file: *const c_char, db_file: *const c_char, res_dir: *const c_char) -> c_int {
-    let mut zip_error = 0;
-    let archive = Archive(unsafe { zip_open(dict_file, ZIP_RDONLY, &mut zip_error) });
-    if zip_error != 0 || archive.0.is_null() {
-        return YOMI_ERR_OPENING_DIC;
+/// Marks an installed dictionary as disabled in `dict_disabled`.
+pub fn disable_dictionary(dic_id: i64, db_file: impl AsRef<Path>) -> Result<(), YomiError> {
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
     }
-    let db = match unsafe { open_db(db_file) } {
-        Ok(db) => db,
-        Err(error) => return error,
-    };
-    let result = (|| -> Result<(), c_int> {
-        if !unsafe { exec(db.0, c"BEGIN EXCLUSIVE TRANSACTION;") } {
-            return Err(TRANSACTION_ERR);
-        }
-        let id = unsafe { add_index(archive.0, db.0) }.map_err(|_| YOMI_ERR_ADDING_INDEX)?;
-        for (bank, error) in [
-            (Bank::Tag, YOMI_ERR_ADDING_TAGS),
-            (Bank::Term, YOMI_ERR_ADDING_TERMS),
-            (Bank::TermMeta, YOMI_ERR_ADDING_TERMS_META),
-            (Bank::Kanji, YOMI_ERR_ADDING_KANJI),
-            (Bank::KanjiMeta, YOMI_ERR_ADDING_KANJI_META),
-        ] {
-            unsafe { add_bank(archive.0, db.0, id, bank) }.map_err(|_| error)?;
-        }
-        unsafe { extract_resources(archive.0, res_dir) }.map_err(|_| YOMI_ERR_EXTRACTING_RESOURCES)?;
-        if !unsafe { exec(db.0, c"COMMIT;") } {
-            return Err(TRANSACTION_ERR);
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        unsafe { exec(db.0, c"ROLLBACK;") };
-    }
-    result.err().unwrap_or(0)
+    let mut conn = open_writable_db(db_file.as_ref())?;
+    let _ = prepare_schema(&mut conn, false)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO dict_disabled (dic_id) VALUES (?1);",
+        params![dic_id],
+    )?;
+    Ok(())
 }
 
-unsafe fn delete_dictionary(id: i64, db_file: *const c_char, res_dir: *const c_char) -> c_int {
-    let db = match unsafe { open_db(db_file) } {
-        Ok(db) => db,
-        Err(error) => return error,
-    };
-    let stmt = match unsafe { statement(db.0, c"DELETE FROM directory WHERE (dic_id = ?) RETURNING title;") } {
-        Ok(stmt) => stmt,
-        Err(_) => return YOMI_ERR_DELETE,
-    };
-    if unsafe { sqlite3_bind_int(stmt.0, 1, id as c_int) } != SQLITE_OK {
-        return YOMI_ERR_DELETE;
+/// Removes a dictionary from `dict_disabled`.
+pub fn enable_dictionary(dic_id: i64, db_file: impl AsRef<Path>) -> Result<(), YomiError> {
+    if dic_id <= 0 {
+        return Err(YomiError::InvalidDictionaryId(dic_id));
     }
-    if unsafe { sqlite3_step(stmt.0) } != SQLITE_ROW {
-        return YOMI_ERR_DELETE;
-    }
-    let title = unsafe { sqlite3_column_text(stmt.0, 0) };
-    if title.is_null() { return YOMI_ERR_DELETE; }
-    let path = match combined_path(unsafe { CStr::from_ptr(res_dir) }.to_bytes(), unsafe { CStr::from_ptr(title.cast()) }.to_bytes()) {
-        Ok(path) => path,
-        Err(_) => return YOMI_ERR_REMOVING_RESOURCES,
-    };
-    if remove_if_present(&path).is_err() {
-        return YOMI_ERR_REMOVING_RESOURCES;
-    }
-    if unsafe { sqlite3_step(stmt.0) } != SQLITE_DONE {
-        return YOMI_ERR_DELETE;
-    }
-    0
+    let mut conn = open_writable_db(db_file.as_ref())?;
+    let _ = prepare_schema(&mut conn, false)?;
+    conn.execute(
+        "DELETE FROM dict_disabled WHERE dic_id = ?1;",
+        params![dic_id],
+    )?;
+    Ok(())
 }
 
-unsafe fn modify_dict_disabled(id: i64, db_file: *const c_char, query: &CStr) -> c_int {
-    let db = match unsafe { open_db(db_file) } {
-        Ok(db) => db,
-        Err(error) => return error,
-    };
-    match unsafe { insert(db.0, query, |stmt| int(stmt, 1, id as c_int)) } {
-        Ok(()) => 0,
-        Err(error) => error,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
-/// # Safety
-/// `db_file` must point to a NUL-terminated path; `db` may be null, otherwise
-/// it must be writable. A successful output handle is closed with sqlite3_close_v2.
-#[no_mangle]
-pub unsafe extern "C" fn memento_dict_yomi_prepare_db(db_file: *const c_char, db: *mut *mut Sqlite3) -> c_int {
-    match unsafe { open_db(db_file) } {
-        Ok(owned) => {
-            if !db.is_null() {
-                unsafe { *db = owned.0 };
-                std::mem::forget(owned);
+    fn build_zip(path: &Path, entries: &[(&str, &[u8], Option<u32>)]) {
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        for &(name, contents, mode) in entries {
+            let mut opts = SimpleFileOptions::default();
+            if let Some(m) = mode {
+                opts = opts.unix_permissions(m);
             }
-            0
+            writer.start_file(name, opts).unwrap();
+            writer.write_all(contents).unwrap();
         }
-        Err(error) => {
-            if !db.is_null() {
-                unsafe { *db = ptr::null_mut() };
-            }
-            error
-        }
+        writer.finish().unwrap();
     }
-}
 
-/// # Safety
-/// All paths must point to NUL-terminated strings; the resource directory
-/// must already exist, matching the original C API contract.
-#[no_mangle]
-pub unsafe extern "C" fn memento_dict_yomi_process_dictionary(
-    dict_file: *const c_char, db_file: *const c_char, res_dir: *const c_char,
-) -> c_int {
-    unsafe { process_dictionary(dict_file, db_file, res_dir) }
-}
+    #[test]
+    fn malicious_title_cannot_delete_or_write_outside_res_dir() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        fs::create_dir_all(&res_dir).unwrap();
+        let victim_dir = root.path().join("evil");
+        fs::create_dir_all(&victim_dir).unwrap();
+        let victim_file = victim_dir.join("keep.txt");
+        fs::write(&victim_file, b"precious").unwrap();
 
-/// # Safety
-/// `db_file` and `res_dir` must point to NUL-terminated paths.
-#[no_mangle]
-pub unsafe extern "C" fn memento_dict_yomi_delete_dictionary(
-    dic_id: i64, db_file: *const c_char, res_dir: *const c_char,
-) -> c_int {
-    unsafe { delete_dictionary(dic_id, db_file, res_dir) }
-}
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("malicious_title.zip");
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"../../evil","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                ("styles.css", b"body { color: red; }", None),
+            ],
+        );
 
-/// # Safety
-/// `db_file` must point to a NUL-terminated path.
-#[no_mangle]
-pub unsafe extern "C" fn memento_dict_yomi_disable_dictionary(dic_id: i64, db_file: *const c_char) -> c_int {
-    unsafe { modify_dict_disabled(dic_id, db_file, c"INSERT OR IGNORE INTO dict_disabled (dic_id) VALUES (?);") }
-}
+        let dic_id = process_dictionary(&zip_path, &db_path, &res_dir).unwrap();
+        assert!(dic_id > 0);
+        assert!(victim_file.exists(), "outside directory must never be deleted");
+        assert_eq!(fs::read(&victim_file).unwrap(), b"precious");
 
-/// # Safety
-/// `db_file` must point to a NUL-terminated path.
-#[no_mangle]
-pub unsafe extern "C" fn memento_dict_yomi_enable_dictionary(dic_id: i64, db_file: *const c_char) -> c_int {
-    unsafe { modify_dict_disabled(dic_id, db_file, c"DELETE FROM dict_disabled WHERE dic_id = ?;") }
+        let safe_dir = dictionary_resource_dir(&res_dir, dic_id).unwrap();
+        assert_eq!(
+            fs::read(safe_dir.join("styles.css")).unwrap(),
+            b"body { color: red; }"
+        );
+
+        delete_dictionary(dic_id, &db_path, &res_dir).unwrap();
+        assert!(victim_file.exists(), "delete must not follow untrusted title");
+        assert!(!safe_dir.exists());
+    }
+
+    #[test]
+    fn zip_slip_entry_is_rejected_without_touching_disk_or_db() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("zipslip.zip");
+        let escaped_target = root.path().join(".bashrc");
+
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"SlipDict","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                ("../../.bashrc", b"pwned", None),
+            ],
+        );
+
+        let err = process_dictionary(&zip_path, &db_path, &res_dir).unwrap_err();
+        assert!(
+            matches!(err, YomiError::UnsafeArchiveEntry { .. }),
+            "expected UnsafeArchiveEntry, got {err:?}"
+        );
+        assert!(!escaped_target.exists());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn symlink_entry_is_rejected() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("symlink.zip");
+
+        let file = File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file("index.json", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"title":"SymDict","format":3,"revision":"1"}"#)
+            .unwrap();
+        writer
+            .add_symlink("evil_link", "/etc/passwd", SimpleFileOptions::default())
+            .unwrap();
+        writer.finish().unwrap();
+
+        let err = process_dictionary(&zip_path, &db_path, &res_dir).unwrap_err();
+        assert!(
+            matches!(err, YomiError::UnsafeArchiveEntry { .. }),
+            "expected UnsafeArchiveEntry, got {err:?}"
+        );
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn import_query_disable_enable_and_delete_roundtrip() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("good.zip");
+
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"TestDict","format":3,"revision":"2026","sequenced":true}"#,
+                    None,
+                ),
+                (
+                    "tag_bank_1.json",
+                    br#"[["v1","partOfSpeech",1,"Ichidan verb",50]]"#,
+                    None,
+                ),
+                (
+                    "term_bank_1.json",
+                    r#"[["食べる","たべる","v1","v1",100,["to eat"],1,""],["あ","あ","","",10,["ah"],2,""]]"#.as_bytes(),
+                    None,
+                ),
+                (
+                    "term_meta_bank_1.json",
+                    r#"[["食べる","freq",{"reading":"たべる","frequency":120}],["食べる","pitch",{"reading":"たべる","pitches":[{"position":2}]}]]"#.as_bytes(),
+                    None,
+                ),
+                (
+                    "kanji_bank_1.json",
+                    r#"[["食","ショク","た.べる","v1",["eat","food"],{"strokes":"9"}]]"#.as_bytes(),
+                    None,
+                ),
+                (
+                    "kanji_meta_bank_1.json",
+                    r#"[["食","freq",42]]"#.as_bytes(),
+                    None,
+                ),
+                ("styles.css", b".gloss { margin: 0; }", None),
+            ],
+        );
+
+        let dic_id = process_dictionary(&zip_path, &db_path, &res_dir).unwrap();
+        assert_eq!(dic_id, 1);
+
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        let cache = sqlite_db::init_cache_conn(&conn).unwrap();
+        assert_eq!(cache.dictionaries.len(), 1);
+        assert_eq!(cache.dictionaries[0].title, "TestDict");
+        assert!(!cache.dictionaries[0].disabled);
+        assert_eq!(cache.table_counts.tag_bank, 1);
+        assert_eq!(cache.table_counts.term_bank, 2);
+        assert_eq!(cache.table_counts.term_meta_bank, 2);
+        assert_eq!(cache.table_counts.kanji_bank, 1);
+        assert_eq!(cache.table_counts.kanji_meta_bank, 1);
+
+        // Verify WAL mode is active on the database and redundant idx_tag_bank_name was omitted.
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_tag_bank_name';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 0);
+
+        // Verify query_terms, query_kanji, frequencies, and pitches.
+        let raw: Vec<u16> = "食べる".encode_utf16().collect();
+        let plan = sqlite_db::TermQueryPlan::new(&raw, &raw);
+        let mut terms = Vec::new();
+        sqlite_db::query_terms_conn(&conn, &plan, &mut terms).unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&terms[0].reading), "たべる");
+
+        // Expression == reading was normalized to empty string on insert.
+        let a_u16: Vec<u16> = "あ".encode_utf16().collect();
+        let plan_a = sqlite_db::TermQueryPlan::new(&a_u16, &a_u16);
+        let mut terms_a = Vec::new();
+        sqlite_db::query_terms_conn(&conn, &plan_a, &mut terms_a).unwrap();
+        assert_eq!(terms_a.len(), 1);
+        assert!(terms_a[0].reading.is_empty());
+
+        let mut freqs = Vec::new();
+        sqlite_db::get_frequencies_conn(
+            &conn,
+            &raw,
+            &"たべる".encode_utf16().collect::<Vec<_>>(),
+            &mut freqs,
+        )
+        .unwrap();
+        assert_eq!(freqs.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&freqs[0].frequency), "120");
+
+        let mut pitches = Vec::new();
+        sqlite_db::add_pitches_conn(
+            &conn,
+            &raw,
+            &"たべる".encode_utf16().collect::<Vec<_>>(),
+            &mut pitches,
+        )
+        .unwrap();
+        assert_eq!(pitches.len(), 1);
+        assert_eq!(pitches[0].positions, vec![2]);
+
+        let mut kanji = Vec::new();
+        sqlite_db::query_kanji_conn(&conn, &"食".encode_utf16().collect::<Vec<_>>(), &mut kanji)
+            .unwrap();
+        assert_eq!(kanji.len(), 1);
+
+        // Disable & enable
+        disable_dictionary(dic_id, &db_path).unwrap();
+        let mut disabled_terms = Vec::new();
+        sqlite_db::query_terms_conn(&conn, &plan, &mut disabled_terms).unwrap();
+        assert!(disabled_terms.is_empty());
+
+        enable_dictionary(dic_id, &db_path).unwrap();
+        let mut reenabled_terms = Vec::new();
+        sqlite_db::query_terms_conn(&conn, &plan, &mut reenabled_terms).unwrap();
+        assert_eq!(reenabled_terms.len(), 1);
+
+        drop(conn);
+
+        // Delete dictionary and confirm cascading cleanup + resource removal
+        delete_dictionary(dic_id, &db_path, &res_dir).unwrap();
+        assert!(!dictionary_resource_dir(&res_dir, dic_id).unwrap().exists());
+
+        let conn_after = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        let cache_after = sqlite_db::init_cache_conn(&conn_after).unwrap();
+        assert!(cache_after.dictionaries.is_empty());
+        assert_eq!(cache_after.table_counts.term_bank, 0);
+        assert_eq!(cache_after.table_counts.tag_bank, 0);
+        assert_eq!(cache_after.table_counts.kanji_bank, 0);
+    }
+
+    #[test]
+    fn large_i64_dictionary_id_roundtrips_without_32bit_truncation() {
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("dictionaries.sqlite");
+        let res_dir = root.path().join("res");
+        prepare_db(&db_path).unwrap();
+        fs::create_dir_all(&res_dir).unwrap();
+
+        let big_id: i64 = i64::from(i32::MAX) + 42;
+        let conn = sqlite_db::open_read_write_connection(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (?1, 'BigDict', 3, '1', 0);",
+            params![big_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+             VALUES (?1, '猫', 'ねこ', '', '', 10, '[\"cat\"]', 1, '');",
+            params![big_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        disable_dictionary(big_id, &db_path).unwrap();
+        let ro = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        let cache = sqlite_db::init_cache_conn(&ro).unwrap();
+        assert_eq!(cache.dictionaries.len(), 1);
+        assert_eq!(cache.dictionaries[0].id, big_id);
+        assert!(cache.dictionaries[0].disabled);
+
+        enable_dictionary(big_id, &db_path).unwrap();
+        let cache2 = sqlite_db::init_cache_conn(&ro).unwrap();
+        assert!(!cache2.dictionaries[0].disabled);
+        drop(ro);
+
+        let dict_res = dictionary_resource_dir(&res_dir, big_id).unwrap();
+        fs::create_dir_all(&dict_res).unwrap();
+        fs::write(dict_res.join("styles.css"), b"a{}").unwrap();
+
+        delete_dictionary(big_id, &db_path, &res_dir).unwrap();
+        assert!(!dict_res.exists());
+    }
+
+    #[test]
+    fn additional_zip_traversal_variants_are_rejected() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+
+        for bad_entry in ["/etc/passwd", "foo/../bar.txt", r"..\..\evil.txt"] {
+            let zip_path = root.path().join("bad.zip");
+            build_zip(
+                &zip_path,
+                &[
+                    (
+                        "index.json",
+                        br#"{"title":"BadPathDict","format":3,"revision":"1"}"#,
+                        None,
+                    ),
+                    (bad_entry, b"nope", None),
+                ],
+            );
+            let err = process_dictionary(&zip_path, &db_path, &res_dir).unwrap_err();
+            assert!(
+                matches!(err, YomiError::UnsafeArchiveEntry { .. }),
+                "entry '{bad_entry}' must be rejected, got {err:?}"
+            );
+        }
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn zip_bomb_exceeding_limits_is_rejected() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("bomb.zip");
+
+        let huge_payload = vec![b'a'; 2048];
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"BombDict","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                ("blob.bin", &huge_payload, None),
+            ],
+        );
+
+        let err = process_dictionary_with_limits(
+            &zip_path,
+            &db_path,
+            &res_dir,
+            SizeLimits {
+                max_entry_bytes: 1024,
+                max_total_bytes: 4096,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, YomiError::EntryTooLarge { .. }),
+            "expected EntryTooLarge, got {err:?}"
+        );
+        assert!(!db_path.exists());
+
+        // Now allow single entry of 2048 bytes, but enforce cumulative total limit of 2060 bytes.
+        let err_total = process_dictionary_with_limits(
+            &zip_path,
+            &db_path,
+            &res_dir,
+            SizeLimits {
+                max_entry_bytes: 4096,
+                max_total_bytes: 2060,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err_total, YomiError::ArchiveTooLarge { .. }),
+            "expected ArchiveTooLarge, got {err_total:?}"
+        );
+    }
+
+    #[test]
+    fn reimporting_same_title_replaces_old_resources_and_rows() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip1 = root.path().join("v1.zip");
+        let zip2 = root.path().join("v2.zip");
+
+        build_zip(
+            &zip1,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"SameDict","format":3,"revision":"v1"}"#,
+                    None,
+                ),
+                ("term_bank_1.json", r#"[["古い","ふるい","","",10,["old"],1,""]]"#.as_bytes(), None),
+                ("old.css", b"v1", None),
+            ],
+        );
+        build_zip(
+            &zip2,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"SameDict","format":3,"revision":"v2"}"#,
+                    None,
+                ),
+                ("term_bank_1.json", r#"[["新しい","あたらしい","","",20,["new"],1,""]]"#.as_bytes(), None),
+                ("new.css", b"v2", None),
+            ],
+        );
+
+        let id1 = process_dictionary(&zip1, &db_path, &res_dir).unwrap();
+        let dir1 = dictionary_resource_dir(&res_dir, id1).unwrap();
+        assert!(dir1.join("old.css").exists());
+
+        let id2 = process_dictionary(&zip2, &db_path, &res_dir).unwrap();
+        let dir2 = dictionary_resource_dir(&res_dir, id2).unwrap();
+        assert!(!dir2.join("old.css").exists());
+        assert_eq!(fs::read(dir2.join("new.css")).unwrap(), b"v2");
+        if id1 != id2 {
+            assert!(!dir1.exists());
+        }
+
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        let cache = sqlite_db::init_cache_conn(&conn).unwrap();
+        assert_eq!(cache.dictionaries.len(), 1);
+        assert_eq!(cache.table_counts.term_bank, 1);
+    }
 }

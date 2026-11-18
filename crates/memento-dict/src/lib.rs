@@ -1,6 +1,5 @@
 //! Memento dictionary's pure lookup and stylesheet cores.
 
-mod capi;
 pub mod exactquerygenerator;
 pub mod deconjugator;
 pub mod deconjugationquerygenerator;
