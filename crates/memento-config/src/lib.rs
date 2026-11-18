@@ -48,6 +48,7 @@ pub mod config;
 pub mod error;
 pub mod keys;
 pub mod legacy_ini;
+pub mod ui_types;
 pub mod value;
 
 pub use config::{
@@ -63,4 +64,5 @@ pub use keys::{
     SubtitleListField, WhisperField, WindowField, GENERAL_GROUP, KEYBIND_PROFILES_PREFIX,
 };
 pub use legacy_ini::{parse_legacy_ini, LegacyIni};
+pub use ui_types::{ArgbColor, QtFontSpec};
 pub use value::{FromValue, IntoValue, Value, ValueType};

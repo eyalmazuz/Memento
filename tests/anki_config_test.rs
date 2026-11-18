@@ -11,7 +11,10 @@ use memento_app::controller::anki::{
     secondary_context_for_range, split_cloze, unavailable_profile_markers, validate_json_payload,
     validate_note_payload, AnkiController, GlossaryDefinition, NoteFieldsContext, NotePayload,
 };
-use memento_app::controller::config::{AnkiNoteConfig, ConfigController};
+use memento_app::controller::config::{
+    anki_note_preset_fields, AnkiNoteConfig, AnkiNotePreset, ConfigController,
+};
+use memento_config::{ArgbColor, QtFontSpec, Value};
 use memento_net::anki::AnkiEndpoint;
 
 fn temp_test_dir(sub: &str) -> PathBuf {
@@ -954,4 +957,166 @@ fn sqlite_selected_occurrences_orders_by_score_desc_and_isolates_rules_for_pitch
     assert_eq!(mapped_verb["PitchCategories"], "kifuku");
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn one_click_anki_note_presets_populate_all_five_note_types() {
+    let presets = [
+        ("Lapis", AnkiNotePreset::Lapis),
+        ("Kiku", AnkiNotePreset::Kiku),
+        ("Senren", AnkiNotePreset::Senren),
+        ("Animecards", AnkiNotePreset::Animecards),
+        ("JPMN", AnkiNotePreset::Jpmn),
+    ];
+
+    for (name, variant) in presets {
+        assert_eq!(AnkiNotePreset::from_name(name), Some(variant));
+        let expected_fields = anki_note_preset_fields(variant);
+        assert!(!expected_fields.is_empty(), "{name} preset must define fields");
+
+        let ctrl = ConfigController::new();
+        let applied = ctrl.apply_anki_note_preset(name).unwrap();
+        assert_eq!(applied, expected_fields.len());
+
+        let note = ctrl.anki_profile_note_config().unwrap();
+        for (field, marker) in &expected_fields {
+            assert_eq!(
+                note.field_templates.get(*field).map(String::as_str),
+                Some(*marker),
+                "{name} field {field} mismatch"
+            );
+        }
+    }
+
+    // Verify all required Memento markers are covered across the presets.
+    let all_markers: Vec<&str> = presets
+        .iter()
+        .flat_map(|(_, v)| anki_note_preset_fields(*v).into_iter().map(|(_, m)| m))
+        .collect();
+    for required in [
+        "{expression}",
+        "{furigana-plain}",
+        "{reading}",
+        "{audio | audio-media}",
+        "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
+        "{audio-context}",
+        "{screenshot-video | screenshot}",
+        "{selection | glossary}",
+        "{pitch-positions}",
+        "{pitch-graphs}",
+        "{pitch-categories}",
+        "{frequency-harmonic-rank}",
+        "{frequencies}",
+        "{title}",
+    ] {
+        assert!(
+            all_markers.contains(&required),
+            "missing required preset marker {required}"
+        );
+    }
+
+    // When model fields are already loaded from Anki, applying a preset updates matched
+    // fields in place while preserving extra custom model fields.
+    let ctrl = ConfigController::new();
+    ctrl.edit_setting("anki/profile/term/model", "Lapis").unwrap();
+    ctrl.set_anki_model_fields(
+        "term",
+        &[
+            "Expression".into(),
+            "MainDefinition".into(),
+            "Picture".into(),
+            "CustomUserField".into(),
+        ],
+    )
+    .unwrap();
+    ctrl.edit_setting("anki/profile/term/field/CustomUserField", "{tags}")
+        .unwrap();
+    let count = ctrl.apply_anki_note_preset("Lapis").unwrap();
+    assert_eq!(count, 4);
+    let note = ctrl.anki_profile_note_config().unwrap();
+    assert_eq!(note.field_templates["Expression"], "{expression}");
+    assert_eq!(note.field_templates["MainDefinition"], "{selection | glossary}");
+    assert_eq!(note.field_templates["Picture"], "{screenshot-video | screenshot}");
+    assert_eq!(note.field_templates["CustomUserField"], "{tags}");
+}
+
+#[test]
+fn anki_show_tag_toggle_and_profile_switching_persist() {
+    let dir = temp_test_dir("anki_show_tag");
+    let anki_path = dir.join("anki_connect.json");
+    let ctrl = ConfigController::new();
+
+    assert!(!ctrl.anki_show_tag());
+    ctrl.edit_setting("anki/profile/show-tag", "true").unwrap();
+    assert!(ctrl.anki_show_tag());
+
+    ctrl.add_entry(0, "Mining").unwrap();
+    assert_eq!(ctrl.current_anki_profile(), "Mining");
+    ctrl.edit_setting("anki/profile/show-tag", "false").unwrap();
+    assert!(!ctrl.anki_show_tag());
+
+    ctrl.edit_setting("anki/profile", "Default").unwrap();
+    assert!(ctrl.anki_show_tag());
+
+    ctrl.apply_settings(0, &dir, "memento.conf", &anki_path)
+        .unwrap();
+    let reloaded = ConfigController::new();
+    reloaded.load_anki_profiles(&anki_path).unwrap();
+    assert_eq!(reloaded.current_anki_profile(), "Default");
+    assert!(reloaded.anki_show_tag());
+    reloaded.edit_setting("anki/profile", "Mining").unwrap();
+    assert!(!reloaded.anki_show_tag());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn structured_interface_font_color_keybind_and_osc_limits_work_end_to_end() {
+    let dir = temp_test_dir("structured_settings");
+    let anki_path = dir.join("anki_connect.json");
+    let ctrl = ConfigController::new();
+
+    ctrl.edit_font_setting("interface/sub-font", "Noto Sans CJK JP", "26", true, true)
+        .unwrap();
+    ctrl.edit_color_setting("interface/sub-text-color", 255, 250, 200, 100)
+        .unwrap();
+    ctrl.edit_setting("behavior/osc-min-move", "320").unwrap();
+    ctrl.edit_setting("subtitle-list/ignore-whitespace", "true")
+        .unwrap();
+    ctrl.edit_setting("subtitle-list/auto-seek", "true").unwrap();
+
+    ctrl.apply_settings(3, &dir, "memento.conf", &anki_path).unwrap();
+    ctrl.apply_settings(5, &dir, "memento.conf", &anki_path).unwrap();
+
+    let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+    let font_val = match reloaded.effective_setting("interface", "sub-font") {
+        Some(Value::Text(t)) => t,
+        other => panic!("unexpected font value: {other:?}"),
+    };
+    let parsed_font = QtFontSpec::parse(&font_val).unwrap();
+    assert_eq!(parsed_font, QtFontSpec::new("Noto Sans CJK JP", 26.0, true, true));
+
+    let color_val = match reloaded.effective_setting("interface", "sub-text-color") {
+        Some(Value::Text(t)) => t,
+        other => panic!("unexpected color value: {other:?}"),
+    };
+    assert_eq!(
+        ArgbColor::parse(&color_val).unwrap(),
+        ArgbColor::new(255, 250, 200, 100)
+    );
+
+    assert_eq!(
+        reloaded.effective_setting("behavior", "osc-min-move"),
+        Some(Value::Int(320))
+    );
+    assert_eq!(
+        reloaded.effective_setting("subtitle-list", "ignore-whitespace"),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting("subtitle-list", "auto-seek"),
+        Some(Value::Bool(true))
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
