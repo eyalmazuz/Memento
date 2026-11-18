@@ -301,18 +301,19 @@ impl SubtitleController {
         true
     }
 
-    /// Begin an ASR track, binding to the live libmpv ASR SID when known or
-    /// [`ASR_TRACK_ID`] while track creation is pending / in unit tests.
+    /// Begin an ASR track, using [`ASR_TRACK_ID`] while track creation is
+    /// pending (or in unit tests) until [`Self::bind_asr_sid`] binds the new
+    /// positive libmpv `sid`.
     pub fn start_asr_track(&mut self) {
+        self.asr_mpv_sid = None;
         self.asr_cues.clear();
-        let id = self.asr_mpv_sid.unwrap_or(ASR_TRACK_ID);
         self.tracks
-            .retain(|track| !track.is_asr_track && track.id != ASR_TRACK_ID && track.id != id);
-        let mut model = SubtitleTrackModel::new(id);
+            .retain(|track| !track.is_asr_track && track.id != ASR_TRACK_ID);
+        let mut model = SubtitleTrackModel::new(ASR_TRACK_ID);
         model.is_asr_track = true;
         model.is_memory_track = true;
         self.tracks.push(model);
-        self.primary_sid = id;
+        self.primary_sid = ASR_TRACK_ID;
     }
 
     /// Associate the ASR track model with a real positive libmpv `sid` once

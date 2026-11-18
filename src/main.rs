@@ -2785,7 +2785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     primary_asr_restart.set(false);
                     if let Ok(mut coord_ref) = primary_coord.try_borrow_mut() {
                         if let Some(coord) = coord_ref.as_mut() {
-                            coord.reset_auto_pause();
+                            coord.on_manual_primary_sid(id.into());
                         }
                     }
                     let mut subtitles = primary_subs.borrow_mut();
@@ -3318,8 +3318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lookup_path = dictionary_database_path.clone();
     let worker_app = app.as_weak();
     std::thread::spawn(move || {
-        let mut database_signature = std::fs::metadata(&lookup_path).ok()
-            .map(|metadata| (metadata.len(), metadata.modified().ok()));
+        let mut database_signature = controller::dict::db_file_fingerprint(&lookup_path);
         let mut dictionary = DictController::open(&lookup_path).unwrap_or_else(|error| {
             eprintln!("Dictionary lookup unavailable: {error}");
             DictController::new()
@@ -3329,8 +3328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // busy. Only the most recent query is useful to the popup.
             while let Ok(newer) = lookup_rx.try_recv() { request = newer; }
             if request.0 != worker_epoch.load(Ordering::Acquire) { continue; }
-            let signature = std::fs::metadata(&lookup_path).ok()
-                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            let signature = controller::dict::db_file_fingerprint(&lookup_path);
             if signature != database_signature {
                 dictionary = DictController::open(&lookup_path).unwrap_or_else(|error| {
                     eprintln!("Dictionary lookup unavailable: {error}");

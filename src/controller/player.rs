@@ -743,6 +743,7 @@ pub struct LivePlayerCoordinator {
     previous_video_dimensions: (u32, u32),
     observed_media_generation: u64,
     suppress_next_start_file_increment: bool,
+    tracks_known_for_file: bool,
     seek_pending_asr_notify: bool,
     autopause_seek_in_flight: bool,
     last_ui_pos: f32,
@@ -791,6 +792,7 @@ impl LivePlayerCoordinator {
             previous_video_dimensions: (0, 0),
             observed_media_generation: 0,
             suppress_next_start_file_increment: false,
+            tracks_known_for_file: false,
             seek_pending_asr_notify: false,
             autopause_seek_in_flight: false,
             last_ui_pos: -1.0,
@@ -829,7 +831,12 @@ impl LivePlayerCoordinator {
         if let Some(ctx) = player.capture_encode_context() {
             self.state.file_loaded = true;
             self.state.path = ctx.path;
+            self.tracks_known_for_file = true;
         }
+        self.previous_audio_id = self.state.audio_id;
+        self.previous_primary_sid = self.state.primary_sid;
+        self.previous_sub_delay = self.state.sub_delay;
+        self.previous_sub_speed = self.state.sub_speed;
     }
 
     pub fn playback_state(&self) -> &memento_player::mpv::PlaybackState {
@@ -856,6 +863,17 @@ impl LivePlayerCoordinator {
 
     pub fn reset_auto_pause(&mut self) {
         self.auto_pause = AutoPauseState::default();
+    }
+
+    /// Synchronously update primary `sid` tracking when the user explicitly selects
+    /// a non-ASR subtitle track (or `"None"`) from Memento's UI menu, preventing a
+    /// queued intermediate `track-list` event from suspending a subsequent rapid
+    /// ASR toggle-on.
+    pub fn on_manual_primary_sid(&mut self, sid: i64) {
+        self.state.primary_sid = sid;
+        self.previous_primary_sid = sid;
+        self.auto_pause = AutoPauseState::default();
+        self.previous_sub_times = (0.0, 0.0);
     }
 
     /// Mark that the caller initiated an explicit `loadfile` and already bumped
@@ -909,6 +927,10 @@ impl LivePlayerCoordinator {
             asr.suspend();
             asr_restart_pending.set(false);
             let _ = player.set_sid(0);
+            self.state.primary_sid = 0;
+            self.previous_primary_sid = 0;
+            self.auto_pause = AutoPauseState::default();
+            self.previous_sub_times = (0.0, 0.0);
             app.set_asr_track_selected(false);
             app.set_asr_running(false);
             app.set_primary_sid(0);
@@ -1056,14 +1078,24 @@ impl LivePlayerCoordinator {
     ) {
         let should_restart_asr =
             preserve_asr_selection && app.get_asr_track_selected() && app.get_asr_enabled();
-        asr.cancel();
-        let _ = self.asr_track.remove_track(player);
+        if should_restart_asr {
+            asr.suspend();
+        } else {
+            asr.cancel();
+        }
+        if preserve_asr_selection {
+            self.asr_track = AsrSubtitleTrack::new(player);
+            player.set_asr_stream_cues(&[]);
+        } else {
+            let _ = self.asr_track.remove_track(player);
+        }
         app.set_asr_running(false);
         app.set_asr_track_selected(should_restart_asr);
         asr_restart_pending.set(should_restart_asr);
 
         self.state.file_loaded = false;
         self.state.playback_ready = false;
+        self.tracks_known_for_file = false;
         self.state.audio_id = 0;
         self.state.primary_sid = 0;
         self.state.secondary_sid = 0;
@@ -1159,7 +1191,10 @@ impl LivePlayerCoordinator {
         if auto_pause_enabled != self.previous_auto_pause {
             self.previous_auto_pause = auto_pause_enabled;
             self.auto_pause = AutoPauseState::default();
-            if auto_pause_enabled && self.state.sub_end > self.state.sub_start {
+            if auto_pause_enabled
+                && !self.state.sub_text.is_empty()
+                && self.state.sub_end > self.state.sub_start
+            {
                 let _ = self.auto_pause.step(
                     true,
                     self.state.sub_start,
@@ -1263,6 +1298,7 @@ impl LivePlayerCoordinator {
                 MpvEvent::EndFile { .. } => {
                     self.state.file_loaded = false;
                     self.state.playback_ready = false;
+                    self.tracks_known_for_file = false;
                     self.state.audio_id = 0;
                     self.state.primary_sid = 0;
                     self.state.secondary_sid = 0;
@@ -1301,13 +1337,18 @@ impl LivePlayerCoordinator {
                         saw_title_or_path_event = true;
                     }
                     "time-pos" => {
+                        let (eff_sub_start, eff_sub_end) = if self.state.sub_text.is_empty() {
+                            (0.0, 0.0)
+                        } else {
+                            (self.state.sub_start, self.state.sub_end)
+                        };
                         flush_autopause(
                             &mut self.auto_pause,
                             &mut self.previous_sub_times,
                             &mut self.autopause_seek_in_flight,
                             &mut sub_times_dirty,
-                            self.state.sub_start,
-                            self.state.sub_end,
+                            eff_sub_start,
+                            eff_sub_end,
                             self.state.sub_speed.max(f64::EPSILON),
                             self.state.sub_delay,
                             self.state.paused,
@@ -1412,33 +1453,21 @@ impl LivePlayerCoordinator {
                             _ => String::new(),
                         };
                     }
-                    "aid" => {
-                        match value {
-                            MpvPropertyValue::Int64(v) => self.state.audio_id = *v,
-                            MpvPropertyValue::Flag(false) | MpvPropertyValue::None => {
-                                self.state.audio_id = 0;
-                            }
-                            _ => {}
-                        }
-                    }
-                    "secondary-sid" => {
-                        match value {
-                            MpvPropertyValue::Int64(v) => self.state.secondary_sid = *v,
-                            MpvPropertyValue::Flag(false) | MpvPropertyValue::None => {
-                                self.state.secondary_sid = 0;
-                            }
-                            _ => {}
-                        }
-                    }
-                    "vid" => {
-                        match value {
-                            MpvPropertyValue::Int64(v) => self.state.video_id = *v,
-                            MpvPropertyValue::Flag(false) | MpvPropertyValue::None => {
-                                self.state.video_id = 0;
-                            }
-                            _ => {}
-                        }
-                    }
+                    "aid" => match value {
+                        MpvPropertyValue::Int64(v) => self.state.audio_id = *v,
+                        MpvPropertyValue::Flag(false) => self.state.audio_id = 0,
+                        _ => {}
+                    },
+                    "secondary-sid" => match value {
+                        MpvPropertyValue::Int64(v) => self.state.secondary_sid = *v,
+                        MpvPropertyValue::Flag(false) => self.state.secondary_sid = 0,
+                        _ => {}
+                    },
+                    "vid" => match value {
+                        MpvPropertyValue::Int64(v) => self.state.video_id = *v,
+                        MpvPropertyValue::Flag(false) => self.state.video_id = 0,
+                        _ => {}
+                    },
                     "track-list" => {
                         saw_tracks_event = true;
                         if let MpvPropertyValue::Tracks {
@@ -1447,6 +1476,9 @@ impl LivePlayerCoordinator {
                             all,
                         } = value
                         {
+                            if self.state.file_loaded || !all.is_empty() {
+                                self.tracks_known_for_file = true;
+                            }
                             self.state.audio_tracks = audio.clone();
                             self.state.subtitle_tracks = subtitle.clone();
                             self.state.primary_sid = all
@@ -1473,6 +1505,14 @@ impl LivePlayerCoordinator {
                                         && t.main_selection == 0
                                 })
                                 .map_or(0, |t| t.id);
+                            self.state.video_id = all
+                                .iter()
+                                .find(|t| {
+                                    t.track_type == TrackType::Video
+                                        && t.selected
+                                        && t.main_selection == 0
+                                })
+                                .map_or(0, |t| t.id);
                             self.subtitle_codecs = all
                                 .iter()
                                 .filter(|t| t.track_type == TrackType::Subtitle && t.id > 0)
@@ -1482,26 +1522,10 @@ impl LivePlayerCoordinator {
                                 t.external && t.external_path == ASR_STREAM_URI && t.id > 0
                             }) {
                                 subtitles.bind_asr_sid(stream_track.id);
-                                if app.get_asr_track_selected()
-                                    && !stream_track.selected
-                                    && self.previous_primary_sid == stream_track.id
-                                {
-                                    asr.suspend();
-                                    app.set_asr_running(false);
-                                    app.set_asr_track_selected(false);
-                                    self.previous_primary_sid = self.state.primary_sid;
-                                    self.auto_pause = AutoPauseState::default();
-                                    self.previous_sub_times = (0.0, 0.0);
-                                    clear_primary_subtitle(app);
-                                }
-                            } else if let Some(asr_sid) = self.asr_track.sid() {
-                                if let Some(mem_track) =
-                                    subtitle.iter().find(|t| t.id == asr_sid)
-                                {
-                                    if app.get_asr_track_selected()
-                                        && !mem_track.selected
-                                        && self.previous_primary_sid == asr_sid
-                                    {
+                                if app.get_asr_track_selected() {
+                                    if stream_track.selected {
+                                        self.previous_primary_sid = stream_track.id;
+                                    } else if self.previous_primary_sid == stream_track.id {
                                         asr.suspend();
                                         app.set_asr_running(false);
                                         app.set_asr_track_selected(false);
@@ -1511,6 +1535,24 @@ impl LivePlayerCoordinator {
                                         clear_primary_subtitle(app);
                                     }
                                 }
+                            } else if let Some(asr_sid) = self.asr_track.sid() {
+                                if let Some(mem_track) =
+                                    subtitle.iter().find(|t| t.id == asr_sid)
+                                {
+                                    if app.get_asr_track_selected() {
+                                        if mem_track.selected {
+                                            self.previous_primary_sid = asr_sid;
+                                        } else if self.previous_primary_sid == asr_sid {
+                                            asr.suspend();
+                                            app.set_asr_running(false);
+                                            app.set_asr_track_selected(false);
+                                            self.previous_primary_sid = self.state.primary_sid;
+                                            self.auto_pause = AutoPauseState::default();
+                                            self.previous_sub_times = (0.0, 0.0);
+                                            clear_primary_subtitle(app);
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             self.state.audio_tracks.clear();
@@ -1518,43 +1560,49 @@ impl LivePlayerCoordinator {
                             self.state.primary_sid = 0;
                             self.state.secondary_sid = 0;
                             self.state.audio_id = 0;
+                            self.state.video_id = 0;
                             self.subtitle_codecs.clear();
                         }
                     }
                     "sid" => {
-                        let new_sid = match value {
-                            MpvPropertyValue::Int64(v) => *v,
-                            MpvPropertyValue::Flag(false) | MpvPropertyValue::None => 0,
-                            _ => self.state.primary_sid,
-                        };
-                        self.state.primary_sid = new_sid;
-                        let asr_sid = self.asr_track.sid().or_else(|| subtitles.asr_mpv_sid());
-                        // Ignore transient `sid -> 0` demuxer reopen bounces during `sub-reload`
-                        // while ASR is active; genuine `sid=no` deselection is handled via `track-list`.
-                        let is_transient_asr_reload_zero =
-                            new_sid == 0 && app.get_asr_track_selected() && asr_sid.is_some();
-                        if !is_transient_asr_reload_zero && new_sid != self.previous_primary_sid {
-                            if asr_sid.is_some() && Some(new_sid) == asr_sid {
-                                if !app.get_asr_track_selected() {
-                                    app.set_asr_track_selected(true);
-                                }
-                            } else if new_sid > 0
+                        if let Some(new_sid) = match value {
+                            MpvPropertyValue::Int64(v) => Some(*v),
+                            MpvPropertyValue::Flag(false) => Some(0),
+                            _ => None,
+                        } {
+                            self.state.primary_sid = new_sid;
+                            let asr_sid =
+                                self.asr_track.sid().or_else(|| subtitles.asr_mpv_sid());
+                            // Ignore transient `sid -> 0` demuxer reopen bounces during `sub-reload`
+                            // while ASR is active; genuine `sid=no` deselection is handled via `track-list`.
+                            let is_transient_asr_reload_zero = new_sid == 0
                                 && app.get_asr_track_selected()
-                                && asr_sid.is_some()
-                                && Some(new_sid) != asr_sid
+                                && asr_sid.is_some();
+                            if !is_transient_asr_reload_zero
+                                && new_sid != self.previous_primary_sid
                             {
-                                // User switched to a different subtitle track via mpv keybindings.
-                                asr.suspend();
-                                app.set_asr_running(false);
-                                app.set_asr_track_selected(false);
-                                clear_primary_subtitle(app);
+                                if asr_sid.is_some() && Some(new_sid) == asr_sid {
+                                    if !app.get_asr_track_selected() {
+                                        app.set_asr_track_selected(true);
+                                    }
+                                } else if new_sid > 0
+                                    && app.get_asr_track_selected()
+                                    && asr_sid.is_some()
+                                    && Some(new_sid) != asr_sid
+                                {
+                                    // User switched to a different subtitle track via mpv keybindings.
+                                    asr.suspend();
+                                    app.set_asr_running(false);
+                                    app.set_asr_track_selected(false);
+                                    clear_primary_subtitle(app);
+                                }
+                                self.previous_primary_sid = new_sid;
+                                self.auto_pause = AutoPauseState::default();
+                                self.previous_sub_times = (0.0, 0.0);
+                                self.state.sub_start = 0.0;
+                                self.state.sub_end = 0.0;
+                                sub_times_dirty = false;
                             }
-                            self.previous_primary_sid = new_sid;
-                            self.auto_pause = AutoPauseState::default();
-                            self.previous_sub_times = (0.0, 0.0);
-                            self.state.sub_start = 0.0;
-                            self.state.sub_end = 0.0;
-                            sub_times_dirty = false;
                         }
                     }
                     "sub-delay" => {
@@ -1686,7 +1734,12 @@ impl LivePlayerCoordinator {
         }
 
         // Flush any trailing subtitle transition at the end of the drained event batch.
-        if (self.state.sub_start, self.state.sub_end) != self.previous_sub_times {
+        let (eff_sub_start, eff_sub_end) = if self.state.sub_text.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (self.state.sub_start, self.state.sub_end)
+        };
+        if (eff_sub_start, eff_sub_end) != self.previous_sub_times {
             sub_times_dirty = true;
         }
         flush_autopause(
@@ -1694,8 +1747,8 @@ impl LivePlayerCoordinator {
             &mut self.previous_sub_times,
             &mut self.autopause_seek_in_flight,
             &mut sub_times_dirty,
-            self.state.sub_start,
-            self.state.sub_end,
+            eff_sub_start,
+            eff_sub_end,
             self.state.sub_speed.max(f64::EPSILON),
             self.state.sub_delay,
             self.state.paused,
@@ -1721,26 +1774,39 @@ impl LivePlayerCoordinator {
             }
         }
 
-        // Handle audio track (`aid`) changes for active ASR sessions.
+        // Handle audio track (`aid`) changes for active or selected ASR sessions.
         if self.state.file_loaded && self.state.audio_id != self.previous_audio_id {
             let had_prev_aid = self.previous_audio_id != 0;
             self.previous_audio_id = self.state.audio_id;
-            if asr.is_active() && had_prev_aid {
-                asr.notify_audio_track_changed(self.state.audio_id);
+            if (asr.is_active() || app.get_asr_track_selected() || subtitles.has_asr_track())
+                && had_prev_aid
+            {
                 let _ = self.asr_track.clear(player);
                 subtitles.clear_asr_cues(raw_primary);
-                if app.get_asr_track_selected() {
+                if self.state.audio_id <= 0 {
+                    asr.notify_audio_track_changed(0);
+                    asr_restart_pending.set(false);
+                    let _ = self.asr_track.remove_track(player);
+                    subtitles.clear_asr_track();
                     refresh_subtitle_list(app, sub_model, subtitles);
-                    clear_primary_subtitle(app);
-                    if self.state.audio_id <= 0 {
-                        let _ = self.asr_track.remove_track(player);
-                        subtitles.clear_asr_track();
+                    if app.get_asr_track_selected() {
+                        clear_primary_subtitle(app);
                         app.set_asr_track_selected(false);
-                        app.set_asr_running(false);
                         app.set_status_message("Audio track disabled; ASR stopped".into());
-                    } else {
+                    }
+                    app.set_asr_running(false);
+                } else if asr.is_active() {
+                    asr.notify_audio_track_changed(self.state.audio_id);
+                    if app.get_asr_track_selected() {
+                        refresh_subtitle_list(app, sub_model, subtitles);
+                        clear_primary_subtitle(app);
                         app.set_asr_running(true);
                     }
+                } else if app.get_asr_track_selected() {
+                    refresh_subtitle_list(app, sub_model, subtitles);
+                    clear_primary_subtitle(app);
+                    app.set_asr_running(false);
+                    asr_restart_pending.set(true);
                 }
             }
         }
@@ -1762,7 +1828,9 @@ impl LivePlayerCoordinator {
                         match asr.start(settings, media, duration, pos) {
                             Ok(session) => {
                                 asr_restart_pending.set(false);
-                                if player.primary_sid() > 0 || self.state.primary_sid > 0 {
+                                if self.asr_track.sid().is_none()
+                                    && (player.primary_sid() > 0 || self.state.primary_sid > 0)
+                                {
                                     let _ = player.set_sid(0);
                                 }
                                 let lang = Self::selected_audio_language(player);
@@ -1815,6 +1883,17 @@ impl LivePlayerCoordinator {
                         );
                     }
                 }
+            } else if self.state.file_loaded
+                && duration > 0.0
+                && !self.state.path.is_empty()
+                && self.state.audio_id <= 0
+                && (self.tracks_known_for_file || self.state.playback_ready)
+            {
+                asr_restart_pending.set(false);
+                asr.suspend();
+                app.set_asr_track_selected(false);
+                app.set_asr_running(false);
+                app.set_status_message("No active audio track; ASR paused".into());
             }
         }
 
@@ -1959,7 +2038,7 @@ impl LivePlayerCoordinator {
 
         // Drain background ASR worker events and feed both AsrSubtitleTrack (libmpv)
         // and SubtitleController (sidebar drawer & context selection).
-        {
+        if !asr_restart_pending.get() {
             asr.update_position(pos, duration, paused);
             let mut refreshed_subtitles = false;
             asr.poll_with(|event| {

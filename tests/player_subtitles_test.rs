@@ -1035,6 +1035,239 @@ mod phase2c_live_wire_tests {
         ));
     }
 
+    #[test]
+    fn dual_observer_none_preserves_track_ids_set_sid_no_suspends_asr_and_silent_playlist_clears_restart() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.set_asr_enabled(true);
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let wav1 = temp.path().join("a1.wav");
+        let wav2 = temp.path().join("a2.wav");
+        write_test_wav(&wav1, 440.0, 3.0);
+        write_test_wav(&wav2, 880.0, 3.0);
+        let ext_vtt = temp.path().join("sec.vtt");
+        std::fs::write(
+            &ext_vtt,
+            "WEBVTT\n\n00:00:00.200 --> 00:00:01.000\n   \n\n00:00:01.200 --> 00:00:02.500\nSecondary Line\n\n",
+        )
+        .unwrap();
+
+        let player = make_headless_mpv(temp.path());
+        let mut coord = LivePlayerCoordinator::new(&player);
+        let mut subtitles = SubtitleController::new();
+        let sub_model = VecModel::<SubEntry>::default();
+        let mut asr = AsrController::new();
+        let media_gen = Cell::new(1u64);
+        let current_media = RefCell::new(None);
+        let asr_restart = Cell::new(false);
+        let hover_owned = Cell::new(false);
+
+        // Append a silent video as playlist item 2 to verify `asr_restart_pending` clears on `audio_id == 0`.
+        coord.mark_explicit_media_load(1);
+        player.pause().unwrap();
+        player
+            .load_file_with_options(
+                &wav1.to_string_lossy(),
+                false,
+                &[
+                    "aid=1".to_owned(),
+                    format!("audio-files-append={}", wav2.display()),
+                ],
+            )
+            .unwrap();
+        player
+            .load_file_with_options(
+                "av://lavfi:testsrc=size=64x64:rate=10:duration=2,format=yuv420p",
+                true,
+                &[],
+            )
+            .unwrap();
+
+        assert!(pump_sync_until(
+            &mut coord,
+            &app,
+            &player,
+            &mut subtitles,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &current_media,
+            &asr_restart,
+            &hover_owned,
+            Duration::from_secs(6),
+            |coord, _, _| coord.playback_state().file_loaded
+                && coord.playback_state().audio_tracks.len() >= 2
+                && coord.playback_state().audio_id == 1,
+        ));
+
+        // Add external subtitle track (`sid = 1`) and select it as secondary (`set_secondary_sid(1)`),
+        // then switch `set_aid(2)`. Both dual-observed properties (`MPV_FORMAT_INT64` + `MPV_FORMAT_FLAG`)
+        // must preserve their positive IDs across subsequent `drain_events()` calls!
+        player
+            .command_node_async(&["sub-add", &ext_vtt.to_string_lossy(), "auto", "ExtSub"])
+            .unwrap();
+        assert!(pump_sync_until(
+            &mut coord,
+            &app,
+            &player,
+            &mut subtitles,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &current_media,
+            &asr_restart,
+            &hover_owned,
+            Duration::from_secs(6),
+            |coord, _, _| !coord.playback_state().subtitle_tracks.is_empty(),
+        ));
+        let ext_sid = coord.playback_state().subtitle_tracks[0].id;
+        player.set_secondary_sid(ext_sid).unwrap();
+        player.set_aid(2).unwrap();
+        assert!(pump_sync_until(
+            &mut coord,
+            &app,
+            &player,
+            &mut subtitles,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &current_media,
+            &asr_restart,
+            &hover_owned,
+            Duration::from_secs(6),
+            |coord, app, _| coord.playback_state().secondary_sid == ext_sid
+                && coord.playback_state().audio_id == 2
+                && app.get_secondary_sid() == ext_sid as i32
+                && app.get_audio_id() == 2,
+        ));
+        // Drain several extra ticks (e.g. seek / time-pos) where `track-list` does NOT re-fire,
+        // proving `MpvPropertyValue::None` from `MPV_FORMAT_FLAG` never zeroes `secondary_sid` or `audio_id`!
+        player.command(&["seek", "0.5", "absolute+exact"]).unwrap();
+        for _ in 0..8 {
+            let _ = coord.sync(
+                &app,
+                &player,
+                &mut subtitles,
+                &sub_model,
+                &mut asr,
+                &media_gen,
+                &current_media,
+                &asr_restart,
+                &hover_owned,
+                || Err("unused".into()),
+                |app, text| app.set_active_sub_text(text.into()),
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(coord.playback_state().secondary_sid, ext_sid);
+        assert_eq!(coord.playback_state().audio_id, 2);
+
+        // Start live ASR subtitle track (`sid > 0`) and verify `command_async(&["set", "sid", "no"])`
+        // genuinely suspends ASR (`!app.get_asr_track_selected() && !app.get_asr_running()`).
+        coord.asr_track_mut().start(&player, "ASR Subtitles", "ja").unwrap();
+        subtitles.start_asr_track();
+        app.set_asr_track_selected(true);
+        app.set_asr_running(true);
+        assert!(pump_sync_until(
+            &mut coord,
+            &app,
+            &player,
+            &mut subtitles,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &current_media,
+            &asr_restart,
+            &hover_owned,
+            Duration::from_secs(6),
+            |coord, _, subtitles| coord.asr_track().sid().is_some_and(|sid| sid > 0)
+                && subtitles.asr_mpv_sid() == coord.asr_track().sid()
+                && coord.playback_state().primary_sid == coord.asr_track().sid().unwrap(),
+        ));
+
+        player.command_async(&["set", "sid", "no"]).unwrap();
+        assert!(
+            pump_sync_until(
+                &mut coord,
+                &app,
+                &player,
+                &mut subtitles,
+                &sub_model,
+                &mut asr,
+                &media_gen,
+                &current_media,
+                &asr_restart,
+                &hover_owned,
+                Duration::from_secs(6),
+                |coord, app, _| coord.playback_state().primary_sid == 0
+                    && !app.get_asr_track_selected()
+                    && !app.get_asr_running(),
+            ),
+            "`set sid no` must suspend active ASR instead of being dead code from dual-observer clobber"
+        );
+
+        // Re-select ASR and advance playlist to silent video (item 2: `audio_id == 0`):
+        // `asr_restart_pending` must clear cleanly instead of staying `true` forever!
+        coord.asr_track_mut().select(&player).unwrap();
+        app.set_asr_track_selected(true);
+        assert!(pump_sync_until(
+            &mut coord,
+            &app,
+            &player,
+            &mut subtitles,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &current_media,
+            &asr_restart,
+            &hover_owned,
+            Duration::from_secs(6),
+            |coord, app, _| coord.playback_state().primary_sid > 0 && app.get_asr_track_selected(),
+        ));
+
+        player.playlist_next().unwrap();
+        assert!(
+            pump_sync_until(
+                &mut coord,
+                &app,
+                &player,
+                &mut subtitles,
+                &sub_model,
+                &mut asr,
+                &media_gen,
+                &current_media,
+                &asr_restart,
+                &hover_owned,
+                Duration::from_secs(6),
+                |coord, app, _| media_gen.get() == 2
+                    && coord.playback_state().file_loaded
+                    && !asr_restart.get()
+                    && !app.get_asr_track_selected()
+                    && !app.get_asr_running()
+                    && app.get_status_message().as_str() == "No active audio track; ASR paused",
+            ),
+            "Silent playlist item did not clear asr_restart_pending (restart={}, selected={}, status={:?})",
+            asr_restart.get(),
+            app.get_asr_track_selected(),
+            app.get_status_message()
+        );
+
+        // Also verify `SubtitleController::start_asr_track` resets stale `asr_mpv_sid`:
+        let mut stale_check = SubtitleController::new();
+        stale_check.start_asr_track();
+        stale_check.bind_asr_sid(2);
+        // Simulate new external track reusing sid = 2 before `start_asr_track` is called again:
+        stale_check.clear();
+        stale_check.ensure_track(2);
+        stale_check.start_asr_track();
+        assert_eq!(stale_check.asr_mpv_sid(), None);
+        assert!(
+            stale_check.track(2).is_some(),
+            "start_asr_track must not evict an external subtitle track at a stale previous asr_mpv_sid"
+        );
+    }
+
     #[cfg(feature = "asr-onnx")]
     mod real_onnx_asr_integration {
         use super::*;
@@ -1182,35 +1415,53 @@ mod phase2c_live_wire_tests {
             }
         }
 
-        fn encode_dual_audio_mkv(path: &Path) {
-            // Generate a tiny 2-second MKV with TWO distinct audio tracks (aid=1: 300Hz, aid=2: 3500Hz)
-            // using libmpv's lavfi complex graph (`amerge`? No: `audio-files`! Even simpler: two small WAVs!).
-            fn write_sine_wav(wav_path: &Path, freq: f64, duration_sec: f64) {
-                let sr = 16_000u32;
-                let n = (sr as f64 * duration_sec) as usize;
-                let mut bytes = Vec::with_capacity(44 + n * 2);
-                let data_len = (n * 2) as u32;
-                bytes.extend_from_slice(b"RIFF");
-                bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
-                bytes.extend_from_slice(b"WAVEfmt ");
-                bytes.extend_from_slice(&16u32.to_le_bytes());
-                bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
-                bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
-                bytes.extend_from_slice(&sr.to_le_bytes());
-                bytes.extend_from_slice(&(sr * 2).to_le_bytes());
-                bytes.extend_from_slice(&2u16.to_le_bytes());
-                bytes.extend_from_slice(&16u16.to_le_bytes());
-                bytes.extend_from_slice(b"data");
-                bytes.extend_from_slice(&data_len.to_le_bytes());
-                for i in 0..n {
-                    let t = i as f64 / sr as f64;
-                    let s = (2.0 * std::f64::consts::PI * freq * t).sin() * 0.6;
-                    let pcm = (s * i16::MAX as f64) as i16;
-                    bytes.extend_from_slice(&pcm.to_le_bytes());
-                }
-                std::fs::write(wav_path, bytes).unwrap();
+        fn write_sine_wav(wav_path: &Path, freq: f64, duration_sec: f64) {
+            let sr = 16_000u32;
+            let n = (sr as f64 * duration_sec) as usize;
+            let mut bytes = Vec::with_capacity(44 + n * 2);
+            let data_len = (n * 2) as u32;
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+            bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+            bytes.extend_from_slice(&sr.to_le_bytes());
+            bytes.extend_from_slice(&(sr * 2).to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&data_len.to_le_bytes());
+            for i in 0..n {
+                let t = i as f64 / sr as f64;
+                let s = (2.0 * std::f64::consts::PI * freq * t).sin() * 0.6;
+                let pcm = (s * i16::MAX as f64) as i16;
+                bytes.extend_from_slice(&pcm.to_le_bytes());
             }
-            write_sine_wav(path, 350.0, 4.0);
+            std::fs::write(wav_path, bytes).unwrap();
+        }
+
+        fn mux_dual_audio_mkv(wav1: &Path, wav2: &Path, out_mkv: &Path) {
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    &wav1.to_string_lossy(),
+                    "-i",
+                    &wav2.to_string_lossy(),
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:a",
+                    "-c:a",
+                    "pcm_s16le",
+                    &out_mkv.to_string_lossy(),
+                ])
+                .status()
+                .expect("ffmpeg must be available to mux 2-stream dual.mkv");
+            assert!(status.success(), "ffmpeg muxing dual.mkv failed: {status}");
         }
 
         #[test]
@@ -1346,9 +1597,10 @@ mod phase2c_live_wire_tests {
 
             let wav1 = temp.path().join("track1.wav");
             let wav2 = temp.path().join("track2.wav");
-            encode_dual_audio_mkv(&wav1);
-            // Second external audio track (`audio-files-append`) gives `aid=1` and `aid=2`!
-            encode_dual_audio_mkv(&wav2);
+            let dual_mkv = temp.path().join("dual.mkv");
+            write_sine_wav(&wav1, 350.0, 4.0);
+            write_sine_wav(&wav2, 3500.0, 4.0);
+            mux_dual_audio_mkv(&wav1, &wav2, &dual_mkv);
 
             let player = make_headless_mpv(temp.path());
             let mut coord = LivePlayerCoordinator::new(&player);
@@ -1363,14 +1615,7 @@ mod phase2c_live_wire_tests {
             coord.mark_explicit_media_load(1);
             player.pause().unwrap();
             player
-                .load_file_with_options(
-                    &wav1.to_string_lossy(),
-                    false,
-                    &[
-                        "aid=1".to_owned(),
-                        format!("audio-files-append={}", wav2.display()),
-                    ],
-                )
+                .load_file_with_options(&dual_mkv.to_string_lossy(), false, &["aid=1".to_owned()])
                 .unwrap();
 
             assert!(pump_sync_until(
@@ -1421,13 +1666,24 @@ mod phase2c_live_wire_tests {
                 "Real ONNX ASR did not emit cues for aid=1"
             );
 
-            // (d) Disable audio (`aid = 0`) or switch `aid`: first switch to `aid = 2`!
+            // Plant a sentinel cue on aid=1 (`99.0..100.0`, outside the 4s file) so we deterministically
+            // verify BOTH that aid=1's stale cues were wiped AND that aid=2 transcribed fresh ONNX cues!
+            subtitles.add_asr_cue(
+                memento_app::controller::subtitles::MemorySubtitleCue {
+                    id: 999_999,
+                    text: "STALE_AID1_SENTINEL".encode_utf16().collect(),
+                    start: 99.0,
+                    end: 100.0,
+                },
+                0.0,
+            );
+            assert!(subtitles
+                .primary_entries()
+                .iter()
+                .any(|e| String::from_utf16_lossy(&e.text).contains("STALE_AID1_SENTINEL")));
+
+            // (d) Switch to real embedded container stream `aid = 2`!
             player.set_aid(2).unwrap();
-            // Note: external `audio-files-append` track has `id = 2` in `mpv`, while `extract_pcm_samples`
-            // opens the container `wav1` (which only has 1 embedded audio stream, so `aid=2` fails extraction
-            // or clears cues immediately!). Verify `LivePlayerCoordinator::sync` detected `aid=2`, cleared stale
-            // `aid=1` cues, and notified `AsrController` (`asr_running` stays active on `aid=2`), then disabling
-            // `aid=0` stops ASR cleanly!
             assert!(
                 pump_sync_until(
                     &mut coord,
@@ -1440,12 +1696,16 @@ mod phase2c_live_wire_tests {
                     &current_media,
                     &asr_restart,
                     &hover_owned,
-                    Duration::from_secs(6),
+                    Duration::from_secs(10),
                     |coord, app, subtitles| coord.playback_state().audio_id == 2
                         && app.get_audio_id() == 2
-                        && subtitles.primary_entries().is_empty(),
+                        && !subtitles.primary_entries().is_empty()
+                        && !subtitles
+                            .primary_entries()
+                            .iter()
+                            .any(|e| String::from_utf16_lossy(&e.text).contains("STALE_AID1_SENTINEL")),
                 ),
-                "Switching aid=1 -> aid=2 did not clear stale aid=1 ASR cues"
+                "Switching aid=1 -> aid=2 must clear stale aid=1 cues and transcribe fresh aid=2 cues"
             );
             assert!(asr.is_active(), "ASR session must remain active after switching to aid=2");
 
@@ -1470,6 +1730,7 @@ mod phase2c_live_wire_tests {
                 ),
                 "Disabling audio track (aid=0) did not stop ASR cleanly"
             );
+            assert!(!asr.is_active());
             assert!(asr.current_cues().is_empty());
             asr.shutdown();
         }
