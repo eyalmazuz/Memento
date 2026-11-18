@@ -4,6 +4,7 @@ pub mod exactquerygenerator;
 pub mod deconjugator;
 pub mod deconjugationquerygenerator;
 pub mod mecabquerygenerator;
+pub mod normalize;
 pub mod yomidbbuilder;
 pub mod databasemanager;
 pub mod searchcontroller;
