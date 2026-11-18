@@ -691,6 +691,69 @@ fn gradient_fallback_uses_the_first_color_stop() {
     );
     assert_eq!(renderer.css_gradient_fallback("red"), "");
     assert_eq!(renderer.css_gradient_fallback("linear-gradient(red, blue"), "");
+    // Single-stop gradient must not chop the final character of the color name.
+    assert_eq!(
+        renderer.css_gradient_fallback("linear-gradient(red)"),
+        "#ffff0000"
+    );
+    assert_eq!(
+        renderer.css_gradient_fallback("radial-gradient(#123456)"),
+        "#ff123456"
+    );
+    assert_eq!(renderer.css_gradient_fallback("linear-gradient()"), "");
+    // Multi-byte UTF-8 at the end of gradient arguments must never panic or slice mid-scalar.
+    assert_eq!(
+        renderer.css_gradient_fallback("linear-gradient(red, 日本語)"),
+        "#ffff0000"
+    );
+    assert_eq!(
+        renderer.css_gradient_fallback("linear-gradient(red 25%, \"青色𠮟\")"),
+        "#ffff0000"
+    );
+    assert_eq!(
+        renderer.css_gradient_fallback("linear-gradient(日本語)"),
+        ""
+    );
+}
+
+#[test]
+fn escaped_css_quotes_and_multibyte_utf8_values_survive_token_and_argument_scanners() {
+    let renderer = Renderer::new();
+    assert_eq!(
+        split_css_tokens(r#""日本語 \"引用\" テスト" 12px 'かな \'𠮟\' 字'"#),
+        vec![r#""日本語 \"引用\" テスト""#, "12px", r#"'かな \'𠮟\' 字'"#]
+    );
+    assert_eq!(
+        split_css_tokens(r#""escaped backslash \\" next"#),
+        vec![r#""escaped backslash \\""#, "next"]
+    );
+    assert_eq!(
+        renderer.split_css_arguments(r#"a, "b, \"c, 日本語\"", 'd, \'e, 𠮟\''"#),
+        vec!["a", r#""b, \"c, 日本語\"""#, r#"'d, \'e, 𠮟\''"#]
+    );
+
+    let mut out = decls();
+    renderer.add_css_declaration("content", r#""語彙 \"例\" 𠮟""#, &mut out);
+    assert_eq!(out, map(&[("content", "語彙 \"例\" 𠮟")]));
+
+    let mut out = decls();
+    renderer.add_css_declaration("content", r#"'don\'t — 日本語'"#, &mut out);
+    assert_eq!(out, map(&[("content", "don't — 日本語")]));
+
+    // Unclosed quote ending in an escaped quote must not peel outer delimiters.
+    let mut out = decls();
+    renderer.add_css_declaration("content", r#"'x\'"#, &mut out);
+    assert_eq!(out, map(&[("content", r#"'x\'"#)]));
+
+    let mut ctx = Context::default();
+    assert_eq!(
+        renderer.resolve_css_value(r#"var(--日本語, "値)テスト")"#, &mut ctx),
+        r#""値)テスト""#
+    );
+    assert_eq!(
+        renderer.resolve_css_value(r#"var(--x, "a\")b")"#, &mut ctx),
+        r#""a\")b""#
+    );
 }
 
 #[test]

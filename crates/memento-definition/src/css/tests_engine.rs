@@ -619,3 +619,33 @@ fn sel_tag(tag: &str) -> CssSelectorPart {
     }
 }
 
+#[test]
+fn candidate_rule_indexes_for_child_uses_universal_empty_tag_bucket() {
+    let mut stylesheet = ParsedStylesheet::default();
+    stylesheet.universal_rule_indexes = vec![0, 1, 2];
+    stylesheet
+        .non_nth_rule_indexes_by_target_tag
+        .insert(String::new(), vec![0, 2]);
+    let mut universal_by_child = std::collections::HashMap::new();
+    universal_by_child.insert(2, vec![0, 1, 2]);
+    stylesheet
+        .rule_indexes_by_target_tag_and_child_index
+        .insert(String::new(), universal_by_child);
+
+    // Unindexed tag "div" must consult the universal "" child-index and non-nth maps
+    // rather than returning raw `universal_rule_indexes` with mismatched :nth-child(2) rules.
+    assert_eq!(stylesheet.candidate_rule_indexes_for_child("div", 1), &[0, 2]);
+    assert_eq!(
+        stylesheet.candidate_rule_indexes_for_child("div", 2),
+        &[0, 1, 2]
+    );
+    assert_eq!(
+        crate::css::candidate_rule_indexes_for(&stylesheet, "div", 1),
+        &[0, 2]
+    );
+    assert_eq!(
+        crate::css::candidate_rule_indexes_for(&stylesheet, "div", 2),
+        &[0, 1, 2]
+    );
+}
+

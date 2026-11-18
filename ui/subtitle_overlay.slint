@@ -9,7 +9,38 @@ export struct SubtitleLine {
     words: [SubtitleWord],
 }
 
-export global SubtitleOverlayBridge { }
+export struct SubtitleTokenMetrics {
+    width-px: float,
+    height-px: float,
+    glyph-y-px: float,
+    glyph-height-px: float,
+    sel-x-px: float,
+    sel-width-px: float,
+    has-selection: bool,
+    rendered: image,
+}
+
+export global SubtitleOverlayBridge {
+    in-out property <bool> rich-enabled: false;
+    in-out property <int> style-revision: 0;
+    in-out property <int> highlight-revision: 0;
+    in-out property <int> hovered-token-index: -1;
+    in-out property <int> hovered-char-offset: -1;
+    in-out property <int> hovered-global-char-index: -1;
+    in-out property <string> hovered-query: "";
+    in-out property <bool> middle-mouse-scan-enabled: false;
+
+    pure callback render-token(SubtitleWord, float, bool, bool, int, int) -> SubtitleTokenMetrics;
+    pure callback cluster-char-offset(SubtitleWord, float, bool, float, float) -> int;
+    pure callback should-capture-hover-focus() -> bool;
+
+    callback pointer-hovered(SubtitleWord, float, bool, float, float, bool, bool, bool, bool);
+    callback pointer-left(int);
+    callback token-left-clicked(SubtitleWord, float, bool, float, float);
+    callback token-middle-clicked(SubtitleWord, float, bool, float, float);
+    callback hover-key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback stationary-modifier-changed(bool, bool, bool, bool);
+}
 
 export component InteractiveSubtitleToken inherits Rectangle {
     in property <SubtitleWord> word;
@@ -19,15 +50,49 @@ export component InteractiveSubtitleToken inherits Rectangle {
     callback clicked();
     callback hovered(string, bool, bool, bool, bool);
     callback hover-state(bool);
-    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
 
-    preferred-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
-    min-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
-    preferred-height: glyph.preferred-height + root.ruby-space;
-    min-height: glyph.preferred-height + root.ruby-space;
+    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
+    private property <SubtitleTokenMetrics> rich-metrics: SubtitleOverlayBridge.rich-enabled
+        ? SubtitleOverlayBridge.render-token(
+            root.word,
+            root.type-size / 1px,
+            root.show-furigana,
+            root.selected,
+            SubtitleOverlayBridge.style-revision,
+            SubtitleOverlayBridge.highlight-revision
+        )
+        : {
+            width-px: 0.0,
+            height-px: 0.0,
+            glyph-y-px: 0.0,
+            glyph-height-px: 0.0,
+            sel-x-px: 0.0,
+            sel-width-px: 0.0,
+            has-selection: false,
+        };
+    private property <bool> use-rich: SubtitleOverlayBridge.rich-enabled && root.rich-metrics.width-px > 0.0;
+
+    preferred-width: root.use-rich
+        ? root.rich-metrics.width-px * 1px
+        : max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
+    min-width: root.preferred-width;
+    preferred-height: root.use-rich
+        ? root.rich-metrics.height-px * 1px
+        : glyph.preferred-height + root.ruby-space;
+    min-height: root.preferred-height;
     background: transparent;
 
-    if root.selected && root.word.query != "" : Rectangle {
+    // Selection highlight behind vector-stroked or plain glyph run
+    if root.use-rich && root.rich-metrics.has-selection && root.word.query != "" : Rectangle {
+        x: root.rich-metrics.sel-x-px * 1px;
+        y: root.rich-metrics.glyph-y-px * 1px;
+        width: root.rich-metrics.sel-width-px * 1px;
+        height: root.rich-metrics.glyph-height-px * 1px;
+        border-radius: 2px;
+        background: #38a6d6;
+    }
+
+    if !root.use-rich && root.selected && root.word.query != "" : Rectangle {
         x: glyph.x;
         y: glyph.y;
         width: glyph.width;
@@ -35,8 +100,17 @@ export component InteractiveSubtitleToken inherits Rectangle {
         background: #38a6d6;
     }
 
+    if root.use-rich : Image {
+        x: 0px;
+        y: 0px;
+        width: root.rich-metrics.width-px * 1px;
+        height: root.rich-metrics.height-px * 1px;
+        source: root.rich-metrics.rendered;
+        image-fit: fill;
+    }
+
     ruby := Text {
-        visible: root.show-furigana && root.word.reading != "";
+        visible: !root.use-rich && root.show-furigana && root.word.reading != "";
         text: root.word.reading;
         width: self.preferred-width;
         height: self.preferred-height;
@@ -49,6 +123,7 @@ export component InteractiveSubtitleToken inherits Rectangle {
     }
 
     glyph := Text {
+        visible: !root.use-rich;
         text: root.word.text;
         width: self.preferred-width;
         height: self.preferred-height;
@@ -60,30 +135,106 @@ export component InteractiveSubtitleToken inherits Rectangle {
         font-family: "Noto Sans CJK JP";
         color: white;
     }
+
+    token-focus := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: SubtitleOverlayBridge.rich-enabled;
+        key-pressed(event) => {
+            if (SubtitleOverlayBridge.hover-key-pressed(
+                event.text,
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta
+            )) {
+                return accept;
+            }
+            reject
+        }
+        key-released(event) => {
+            SubtitleOverlayBridge.stationary-modifier-changed(
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta
+            );
+            reject
+        }
+    }
+
     touch := TouchArea {
-        x: glyph.x;
-        y: glyph.y;
-        width: glyph.width;
-        height: glyph.height;
+        x: root.use-rich ? 0px : glyph.x;
+        y: root.use-rich ? 0px : glyph.y;
+        width: root.use-rich ? parent.width : glyph.width;
+        height: root.use-rich ? parent.height : glyph.height;
         enabled: root.word.query != "";
         mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
-                root.hovered(
-                    root.word.query,
-                    event.modifiers.control,
-                    event.modifiers.shift,
-                    event.modifiers.alt,
-                    event.modifiers.meta
+        clicked => {
+            if (SubtitleOverlayBridge.rich-enabled) {
+                SubtitleOverlayBridge.token-left-clicked(
+                    root.word,
+                    root.type-size / 1px,
+                    root.show-furigana,
+                    self.mouse-x / 1px,
+                    self.mouse-y / 1px
                 );
-            } else if (event.kind == PointerEventKind.cancel) {
-                root.hovered("", false, false, false, false);
+            } else {
+                root.clicked();
+            }
+        }
+        pointer-event(event) => {
+            if (SubtitleOverlayBridge.rich-enabled) {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                    SubtitleOverlayBridge.token-middle-clicked(
+                        root.word,
+                        root.type-size / 1px,
+                        root.show-furigana,
+                        self.mouse-x / 1px,
+                        self.mouse-y / 1px
+                    );
+                } else if (event.kind == PointerEventKind.move
+                    || (event.kind == PointerEventKind.down && event.button == PointerEventButton.left))
+                {
+                    SubtitleOverlayBridge.pointer-hovered(
+                        root.word,
+                        root.type-size / 1px,
+                        root.show-furigana,
+                        self.mouse-x / 1px,
+                        self.mouse-y / 1px,
+                        event.modifiers.control,
+                        event.modifiers.shift,
+                        event.modifiers.alt,
+                        event.modifiers.meta
+                    );
+                } else if (event.kind == PointerEventKind.cancel) {
+                    SubtitleOverlayBridge.pointer-left(root.word.index);
+                    root.hovered("", false, false, false, false);
+                }
+            } else {
+                if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                    root.hovered(
+                        root.word.query,
+                        event.modifiers.control,
+                        event.modifiers.shift,
+                        event.modifiers.alt,
+                        event.modifiers.meta
+                    );
+                } else if (event.kind == PointerEventKind.cancel) {
+                    root.hovered("", false, false, false, false);
+                }
             }
         }
         changed has-hover => {
             root.hover-state(self.has-hover);
-            if !self.has-hover {
+            if self.has-hover {
+                if (SubtitleOverlayBridge.rich-enabled && SubtitleOverlayBridge.should-capture-hover-focus()) {
+                    token-focus.focus();
+                }
+            } else {
+                if (SubtitleOverlayBridge.rich-enabled) {
+                    SubtitleOverlayBridge.pointer-left(root.word.index);
+                }
                 root.hovered("", false, false, false, false);
             }
         }

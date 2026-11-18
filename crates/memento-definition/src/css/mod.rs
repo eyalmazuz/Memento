@@ -96,14 +96,25 @@ pub fn split_css_tokens(value: &str) -> Vec<String> {
     let mut current = String::new();
     let mut quote = '\0';
     let mut in_quote = false;
+    let mut escaped = false;
     let mut parenthesis_depth = 0i32;
 
     for ch in trimmed(value).chars() {
         if in_quote {
             current.push(ch);
-            if ch == quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
                 in_quote = false;
             }
+        } else if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            current.push(ch);
+            escaped = true;
         } else if ch == '"' || ch == '\'' {
             in_quote = true;
             quote = ch;
@@ -326,13 +337,13 @@ impl Renderer {
         declarations: &mut CssDeclarations,
     ) {
         let name = to_lower(trimmed(property));
-        let css_value = trimmed(value).to_string();
+        let raw_trimmed = trimmed(value);
 
-        if name.is_empty() || css_value.is_empty() {
+        if name.is_empty() || raw_trimmed.is_empty() {
             return;
         }
 
-        let mut css_value = css_value.replace('"', "'");
+        let css_value = raw_trimmed.replace('"', "'");
 
         if name == "margin" {
             /* Maximum component count permitted by the CSS margin shorthand */
@@ -343,15 +354,26 @@ impl Renderer {
             let mut values: Vec<String> = Vec::new();
             let mut current = String::new();
             let mut in_quote = false;
+            let mut escaped = false;
             let mut quote = '\0';
             let mut paren_depth = 0i32;
 
-            for ch in css_value.chars() {
+            for ch in raw_trimmed.chars() {
                 if in_quote {
                     current.push(ch);
-                    if ch == quote {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote {
                         in_quote = false;
                     }
+                } else if escaped {
+                    current.push(ch);
+                    escaped = false;
+                } else if ch == '\\' {
+                    current.push(ch);
+                    escaped = true;
                 } else if ch == '"' || ch == '\'' {
                     in_quote = true;
                     quote = ch;
@@ -409,30 +431,16 @@ impl Renderer {
         if name == "text-decoration-line" {
             declarations.insert(String::from("text-decoration"), css_value);
         } else if name == "content" {
-            /* Remove quotes before injecting text. */
-            //
-            // PORT-NOTE (utf16 peeling, L391-396): the C++ guards on
-            // `size() >= 2` UTF-16 code units and peels with
-            // `sliced(1, size() - 2)`, matching when the front/back code units
-            // are a BMP quote. `String` carries UTF-8; both quote marks are
-            // single BMP code units and a non-BMP char can never equal one, so
-            // peeling one leading/trailing `char` is equivalent to one
-            // leading/trailing code unit here (a lone surrogate at either edge
-            // cannot exist in Rust string data).
-            let chars: Vec<char> = css_value.chars().collect();
-            if chars.len() >= 2
-                && ((chars[0] == '"' && chars[chars.len() - 1] == '"')
-                    || (chars[0] == '\'' && chars[chars.len() - 1] == '\''))
-            {
-                css_value = chars[1..chars.len() - 1].iter().collect();
-            }
-            declarations.insert(name, css_value);
+            /* Remove outer quotes and unescape inner CSS quotes before injecting text. */
+            let content_value = crate::helpers::unquote_css_string(raw_trimmed)
+                .unwrap_or(css_value);
+            declarations.insert(name, content_value);
         } else if name == "background" {
             if !css_value.contains(' ') && !css_value.contains("url(") {
                 declarations.insert(String::from("background-color"), css_value);
             }
         } else if name == "list-style" {
-            for token in split_css_tokens(&css_value) {
+            for token in split_css_tokens(raw_trimmed) {
                 let marker = normalize_list_marker(&token);
                 if marker == "none" || is_built_in_list_marker(&marker) {
                     declarations.insert(String::from("list-style-type"), marker);
@@ -530,14 +538,31 @@ impl Renderer {
 
             let mut end: Option<usize> = None;
             let mut depth = 1i32;
-            let bytes = value.as_bytes();
-            for i in start + CSS_VARIABLE_PREFIX_LENGTH..bytes.len() {
-                if bytes[i] == b'(' {
+            let mut in_quote = false;
+            let mut escaped = false;
+            let mut quote = '\0';
+            for (offset, ch) in value[start + CSS_VARIABLE_PREFIX_LENGTH..].char_indices() {
+                if in_quote {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote {
+                        in_quote = false;
+                    }
+                } else if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' || ch == '\'' {
+                    in_quote = true;
+                    quote = ch;
+                } else if ch == '(' {
                     depth += 1;
-                } else if bytes[i] == b')' {
+                } else if ch == ')' {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(i);
+                        end = Some(start + CSS_VARIABLE_PREFIX_LENGTH + offset);
                         break;
                     }
                 }
@@ -765,13 +790,13 @@ impl Renderer {
             return String::new();
         }
 
-        /* value.sliced(open + 1, value.size() - open - 2); the guard mirrors
-         * the QString::sliced assert precondition (always satisfied by
-         * reachable inputs, which end in ')' after an explicit '('). */
-        if open + 1 > value.len().saturating_sub(2) {
+        /* value.sliced(open + 1, value.size() - open - 2); in UTF-8 byte
+         * indices, start + len = (open + 1) + (len - open - 2) = len - 1,
+         * stopping cleanly before the closing ASCII ')'. */
+        if open + 1 > value.len().saturating_sub(1) {
             return String::new();
         }
-        let arguments = self.split_css_arguments(&value[open + 1..value.len() - 2]);
+        let arguments = self.split_css_arguments(&value[open + 1..value.len() - 1]);
         let Some(first) = arguments.first() else {
             return String::new();
         };
@@ -796,15 +821,26 @@ impl Renderer {
         let mut result = Vec::new();
         let mut current = String::new();
         let mut in_quote = false;
+        let mut escaped = false;
         let mut quote = '\0';
         let mut paren_depth = 0i32;
 
         for ch in arguments.chars() {
             if in_quote {
                 current.push(ch);
-                if ch == quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
                     in_quote = false;
                 }
+            } else if escaped {
+                current.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                current.push(ch);
+                escaped = true;
             } else if ch == '"' || ch == '\'' {
                 in_quote = true;
                 quote = ch;
