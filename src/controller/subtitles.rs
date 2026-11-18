@@ -994,13 +994,29 @@ pub fn subtitle_furigana_parts(text: &str) -> Result<Vec<(String, String)>, Stri
 }
 
 fn find_mecab_surface_in_remaining(remaining: &str, raw_surface: &str) -> Option<(usize, usize)> {
-    if let Some(gap) = remaining.find(raw_surface) {
-        return Some((gap, raw_surface.len()));
+    if !raw_surface.contains('叱') || !remaining.contains('𠮟') {
+        return remaining
+            .find(raw_surface)
+            .map(|gap| (gap, raw_surface.len()));
     }
-    if raw_surface.contains('叱') && remaining.contains('𠮟') {
-        let alt = raw_surface.replace('叱', "𠮟");
-        if let Some(gap) = remaining.find(alt.as_str()) {
-            return Some((gap, alt.len()));
+    let raw_chars: Vec<char> = raw_surface.chars().collect();
+    for (byte_start, _) in remaining.char_indices() {
+        let mut tail_chars = remaining[byte_start..].chars();
+        let mut matched_bytes = 0;
+        let mut ok = true;
+        for &rc in &raw_chars {
+            match tail_chars.next() {
+                Some(tc) if tc == rc || (rc == '叱' && tc == '𠮟') => {
+                    matched_bytes += tc.len_utf8();
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some((byte_start, matched_bytes));
         }
     }
     None
@@ -1350,6 +1366,15 @@ mod furigana_tests {
         assert_eq!(
             subtitle_furigana_parts("𠮟る").unwrap(),
             vec![("𠮟".into(), "しか".into()), ("る".into(), "".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("𠮟る叱る").unwrap(),
+            vec![
+                ("𠮟".into(), "しか".into()),
+                ("る".into(), "".into()),
+                ("叱".into(), "しか".into()),
+                ("る".into(), "".into()),
+            ]
         );
 
         prewarm_subtitle_furigana(vec!["時々".into(), "様々".into()]);
