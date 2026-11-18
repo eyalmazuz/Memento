@@ -2848,16 +2848,21 @@ dependencies = [
  "memento-definition",
  "memento-dict",
  "memento-net",
+ "memento-os",
  "memento-player",
  "memento-setting",
  "memento-subtitle",
  "memento-util",
+ "parley",
  "raw-window-handle",
+ "resvg",
  "serde_json",
  "slint",
  "slint-build",
  "tempfile",
  "url",
+ "webbrowser",
+ "zbus 4.4.0",
 ]
 
 [[package]]
@@ -2913,6 +2918,7 @@ dependencies = [
 name = "memento-definition"
 version = "2.0.2"
 dependencies = [
+ "serde_json",
  "unicode-general-category",
 ]
 

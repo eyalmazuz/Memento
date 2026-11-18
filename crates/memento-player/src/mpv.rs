@@ -5432,7 +5432,10 @@ mod tests {
 
         let mut emitted_sids = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while (asr.sid() != Some(2) || asr.reload_in_flight.is_some() || asr.reload_dirty)
+        while (asr.sid() != Some(2)
+            || player.primary_sid() != 2
+            || asr.reload_in_flight.is_some()
+            || asr.reload_dirty)
             && std::time::Instant::now() < deadline
         {
             let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));

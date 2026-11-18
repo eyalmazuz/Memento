@@ -482,3 +482,12 @@ pub fn apply_subtitle_furigana(app: &MementoApp, text: &str, parts: Vec<(String,
     app.set_selected_token_count(selected_count);
     app.set_subtitle_furigana_pending(false);
 }
+
+/// Extension hook for rich definition/subtitle UI bridges.
+pub fn install_rich_ui_bridges(
+    _app: &MementoApp,
+    _dictionary_db_path: &std::path::Path,
+    _config_dir: &std::path::Path,
+    _config: &crate::controller::config::ConfigController,
+) {
+}

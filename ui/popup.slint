@@ -1,0 +1,613 @@
+import { MementoPalette } from "palette.slint";
+import { ListView, LineEdit, Button, ScrollView } from "std-widgets.slint";
+
+export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
+export struct PitchGraph { dictionary: string, position: int, mora: [PitchMora] }
+export struct PopupFrequency { dictionary: string, value: string }
+export struct PopupFrequencyLine { entries: [PopupFrequency] }
+export struct PopupGlossaryBlock { text: string, kind: int, href: string }
+export struct PopupAudioSource { name: string, index: int }
+
+export struct DictResult {
+    index: int,
+    expression: string,
+    reading: string,
+    pos_tags: string,
+    dict_name: string,
+    glossary: string,
+    glossary-blocks: [PopupGlossaryBlock],
+    notes: string,
+    example_ja: string,
+    example_en: string,
+    selected: bool,
+    score: int,
+    is_kanji: bool,
+    has_kanji: bool,
+    term_start: bool,
+    term_end: bool,
+    collapsed: bool,
+    pitch_graphs: [PitchGraph],
+    frequencies: [PopupFrequency],
+}
+
+// ── Floating Yomitan Dictionary Card ────────────────────────────────────
+// Japanese text uses one family; Slint accepts a single name, not a CSS list.
+export component DictionaryText inherits Text {
+    font-family: "Noto Sans CJK JP";
+}
+
+export global PopupLayout {
+    pure callback frequency-lines([PopupFrequency], float) -> [PopupFrequencyLine];
+}
+
+export global PopupBridge {
+    in-out property <string> selected-glossary-text: "";
+}
+
+export component YomitanPopup inherits Rectangle {
+    in property <string> headword: "";
+    in property <string> reading: "";
+    in property <string> pitch-accent: "";
+    in property <string> freq-rank: "";
+    in property <string> jpdb-rank: "";
+    in property <[DictResult]> results;
+    in property <bool> has-more-results: false;
+    in property <[PopupAudioSource]> audio-sources;
+    in property <bool> audio-sources-loading: false;
+    in-out property <int> selected-audio-source: -1;
+    in-out property <bool> audio-menu-open: false;
+    in-out property <string> audio-menu-expression: "";
+    in-out property <string> audio-menu-reading: "";
+    in property <bool> is-open: false;
+    in property <bool> anki-enabled: false;
+    in property <bool> show-anki-checkbox: true;
+    in property <string> added-note-id: "";
+    in property <int> added-result-index: -1;
+    callback close-requested();
+    callback add-anki-note(int);
+    callback browse-anki-note(string);
+    callback play-audio(string, string);
+    callback request-audio-sources(string, string);
+    callback kanji-info(string);
+    callback toggle-select-definition(int);
+    callback toggle-term-collapse(int);
+    callback select-audio-source(int);
+    callback open-rich-link(string);
+    callback reset-scroll();
+    callback load-more-results(bool);
+    out property <bool> needs-more: root.is-open && root.has-more-results
+        && definition-list.height > 0px
+        && definition-list.viewport-height + definition-list.viewport-y <= definition-list.height + 180px;
+
+    visible: root.is-open && root.results.length > 0;
+    width: 480px;
+    height: 500px;
+    background: #1C2024;
+    border-width: 1px;
+    border-color: #384046;
+    border-radius: 8px;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: #000000DD;
+
+    changed is-open => {
+        root.audio-menu-open = false;
+        if root.is-open {
+            definition-list.viewport-y = 0px;
+            definition-list.fill-viewport();
+        }
+    }
+    reset-scroll => { definition-list.viewport-y = 0px; root.audio-menu-open = false; }
+
+    // Keep clicks on the card's padding from reaching the video underneath.
+    TouchArea { }
+
+    popup-content := VerticalLayout {
+        cache-rendering-hint: true;
+        padding: 12px;
+        spacing: 0px;
+
+        // Definitions List
+        definition-list := ScrollView {
+            vertical-stretch: 1;
+            callback fill-viewport();
+            fill-viewport => {
+                if root.needs-more {
+                    root.load-more-results(false);
+                }
+            }
+            changed viewport-y => { self.fill-viewport(); }
+            changed viewport-height => { self.fill-viewport(); }
+            changed height => { self.fill-viewport(); }
+            definition-content := VerticalLayout {
+                width: parent.width;
+                height: self.preferred-height;
+                spacing: 0px;
+                for res[idx] in root.results : Rectangle {
+                width: parent.width - 6px;
+                height: res.collapsed && !res.term-start ? 0px : term-segment.height + ((res.term-end || (res.collapsed && res.term-start)) ? 10px : 0px);
+                visible: !res.collapsed || res.term-start;
+                background: transparent;
+                term-segment := Rectangle {
+                    width: parent.width;
+                    height: card-content.preferred-height + 16px;
+                    background: transparent;
+                    if res.term-start && res.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: #52616B; }
+                    if !res.term-end && !res.collapsed : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #30373D; }
+                    card-content := VerticalLayout {
+                    x: 0px;
+                    y: 6px;
+                    width: parent.width;
+                    height: self.preferred-height;
+                    spacing: 6px;
+
+                    if res.term-start : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 6px;
+                        min-height: 34px;
+                        term-title := VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 0px;
+                            if res.reading != "" && res.reading != res.expression : DictionaryText {
+                                text: res.reading;
+                                height: self.preferred-height;
+                                wrap: word-wrap;
+                                font-size: 12px;
+                                color: #94A3B8;
+                            }
+                            DictionaryText {
+                                text: res.expression;
+                                height: self.preferred-height;
+                                wrap: word-wrap;
+                                font-size: 23px;
+                                font-weight: 700;
+                                font-family: "Noto Sans CJK JP";
+                                color: #FFFFFF;
+                            }
+                        }
+                        if root.added-note-id != "" && root.added-result-index == res.index - 1 : Rectangle {
+                            width: 62px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: browse-touch.has-hover ? #385D75 : #24465C;
+                            DictionaryText {
+                                text: "Browse";
+                                color: #BAE6FD;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            browse-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.browse-anki-note(root.added-note-id); }
+                            }
+                        }
+                        if !res.is-kanji && res.has-kanji : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: kanji-touch.has-hover ? #384046 : transparent;
+                            DictionaryText { text: "字"; color: #CBD5E1; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
+                            kanji-touch := TouchArea { mouse-cursor: pointer; clicked => { root.kanji-info(res.expression); } }
+                        }
+                        if !res.is-kanji : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: row-audio-touch.has-hover ? #384046 : #2B3238;
+                            Image {
+                                x: 6px;
+                                y: 6px;
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("icons/volume-on.svg");
+                                colorize: #CBD5E1;
+                            }
+                            row-audio-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { if (!root.audio-menu-open) { root.play-audio(res.expression, res.reading); } }
+                                pointer-event(event) => {
+                                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                        root.audio-menu-expression = res.expression;
+                                        root.audio-menu-reading = res.reading;
+                                        root.audio-menu-open = true;
+                                        root.request-audio-sources(res.expression, res.reading);
+                                    }
+                                }
+                            }
+                        }
+                        if root.anki-enabled : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: row-anki-touch.has-hover ? #2D624D : #20503E;
+                            DictionaryText {
+                                text: "+";
+                                color: #A7F3D0;
+                                font-size: 20px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            row-anki-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.add-anki-note(res.index - 1); }
+                            }
+                        }
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: collapse-touch.has-hover ? #384046 : #2B3238;
+                            DictionaryText { text: res.collapsed ? "›" : "⌄"; color: #CBD5E1; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; }
+                            collapse-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-term-collapse(res.index - 1); } }
+                        }
+                        // Leave room for the close control pinned above the list.
+                        if res.index == 1 : Rectangle { width: 28px; height: 28px; }
+                    }
+
+                    if !res.collapsed && res.index == 1 && res.frequencies.length == 0 && (root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "") : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 6px;
+                        alignment: start;
+                        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: #6EE7B7; font-size: 11px; }
+                        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: #6EE7B7; font-size: 11px; }
+                        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: #C4B5FD; font-size: 11px; }
+                    }
+
+                    if !res.collapsed && res.term-start && res.frequencies.length > 0 : VerticalLayout {
+                        width: parent.width;
+                        spacing: 3px;
+                        for line in PopupLayout.frequency-lines(res.frequencies, self.width / 1px) : HorizontalLayout {
+                            width: parent.width;
+                            alignment: start;
+                            spacing: 4px;
+                            for frequency in line.entries : Rectangle {
+                                width: min(frequency-label.preferred-width + 10px, parent.width);
+                                height: max(18px, frequency-label.preferred-height + 2px);
+                                background: #07513E;
+                                border-radius: 3px;
+                                frequency-label := DictionaryText {
+                                    x: 5px;
+                                    width: parent.width - 10px;
+                                    height: parent.height;
+                                    text: frequency.dictionary + " " + frequency.value;
+                                    font-size: 10px;
+                                    color: #9CE5C7;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+
+                    if !res.collapsed && res.term-start : VerticalLayout {
+                        spacing: 4px;
+                        for pitch in res.pitch-graphs : Rectangle {
+                            width: parent.width;
+                            height: 28px;
+                            background: transparent;
+                            HorizontalLayout {
+                                width: parent.width;
+                                height: 28px;
+                                spacing: 8px;
+                                alignment: start;
+                                DictionaryText {
+                                    text: pitch.dictionary + " [" + pitch.position + "]";
+                                    width: min(self.preferred-width, parent.width * 0.4);
+                                    horizontal-stretch: 0;
+                                    font-size: 11px;
+                                    color: #C4B5FD;
+                                    vertical-alignment: center;
+                                }
+                                HorizontalLayout {
+                                    width: self.preferred-width;
+                                    height: 28px;
+                                    horizontal-stretch: 0;
+                                    spacing: 0px;
+                                    for mora in pitch.mora : Rectangle {
+                                        width: max(18px, mora-label.preferred-width + 3px);
+                                        height: 28px;
+                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1px; background: #B9A1E8; }
+                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: #B9A1E8; }
+                                        mora-label := DictionaryText { text: mora.text; y: 13px; horizontal-alignment: center; width: parent.width; font-size: 10px; color: #D9CFF0; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Header row: POS tags, Dictionary tag
+                    if !res.collapsed : HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        if root.show-anki-checkbox : Rectangle {
+                            width: 17px;
+                            height: 17px;
+                            border-width: 1px;
+                            border-color: res.selected ? #34D399 : #94A3B8;
+                            border-radius: 3px;
+                            background: res.selected ? #047857 : transparent;
+                            DictionaryText {
+                                text: res.selected ? "✓" : "";
+                                color: white;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                font-size: 13px;
+                            }
+                            select-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.toggle-select-definition(res.index - 1); }
+                            }
+                        }
+
+                        // Part of Speech badge(s)
+                        if res.pos-tags != "" : Rectangle {
+                            height: 18px;
+                            background: #2b3238;
+                            border-radius: 3px;
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                DictionaryText {
+                                    text: res.pos-tags;
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: #cbd5e1;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Dictionary Source Badge
+                        if res.dict-name != "" : Rectangle {
+                            height: 18px;
+                            background: #6D28D9;
+                            border-radius: 3px;
+                            HorizontalLayout {
+                                padding-left: 7px;
+                                padding-right: 7px;
+                                DictionaryText {
+                                    text: res.dict-name;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: #EDE9FE;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                    }
+
+                    // Definition Meaning Text
+                    if !res.collapsed && res.glossary-blocks.length > 0 : VerticalLayout {
+                        width: parent.width;
+                        spacing: 4px;
+                        for block in res.glossary-blocks : Rectangle {
+                            width: parent.width;
+                            height: rich-text.preferred-height + 2px;
+                            rich-text := DictionaryText {
+                                width: parent.width;
+                                height: self.preferred-height;
+                                text: block.kind == 2 ? "◦  " + block.text : block.text;
+                                wrap: word-wrap;
+                                font-size: block.kind == 1 ? 13px : 15px;
+                                font-weight: block.kind == 1 ? 700 : 400;
+                                color: !res.selected ? #87929C : block.kind == 3 ? #93C5FD : block.kind == 1 ? #D8C9FC : #FFFFFF;
+                            }
+                            if block.href != "" : TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-rich-link(block.href); }
+                            }
+                        }
+                    }
+                    if !res.collapsed && res.glossary-blocks.length == 0 : DictionaryText {
+                        width: parent.width;
+                        text: res.glossary;
+                        font-size: 15px;
+                        font-weight: 400;
+                        color: res.selected ? #FFFFFF : #87929C;
+                        wrap: word-wrap;
+                        height: self.preferred-height;
+                    }
+
+                    // Japanese Example Sentence
+                    if !res.collapsed && res.example-ja != "" : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 5px;
+                        Rectangle {
+                            width: 16px;
+                            Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-jp.svg"); }
+                        }
+                        DictionaryText {
+                            text: res.example-ja;
+                            font-size: 13px;
+                            color: #E2E8F0;
+                            wrap: word-wrap;
+                            height: self.preferred-height;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    // English Example Translation
+                    if !res.collapsed && res.example-en != "" : HorizontalLayout {
+                        width: parent.width;
+                        spacing: 5px;
+                        Rectangle {
+                            width: 16px;
+                            Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-gb.svg"); }
+                        }
+                        DictionaryText {
+                            text: res.example-en;
+                            font-size: 12px;
+                            color: #94A3B8;
+                            wrap: word-wrap;
+                            height: self.preferred-height;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    // Notes / Explanations
+                    if !res.collapsed && res.notes != "" : DictionaryText {
+                        width: parent.width;
+                        text: "Note: " + res.notes;
+                        font-size: 12px;
+                        color: #94A3B8;
+                        wrap: word-wrap;
+                        height: self.preferred-height;
+                    }
+
+                    }
+                }
+                }
+                if root.has-more-results : Rectangle {
+                    width: parent.width - 6px;
+                    height: 28px;
+                    background: more-touch.has-hover ? #2A3238 : transparent;
+                    DictionaryText {
+                        text: "Show more results ↓";
+                        font-size: 11px;
+                        color: #84939E;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    more-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.load-more-results(true); }
+                    }
+                }
+            }
+        }
+    }
+    Rectangle {
+        x: parent.width - 46px;
+        y: 18px;
+        width: 28px;
+        height: 28px;
+        border-radius: 3px;
+        background: close-touch.has-hover ? #384046 : #1C2024;
+        DictionaryText { text: "×"; font-size: 18px; color: #CBD5E1; horizontal-alignment: center; vertical-alignment: center; }
+        close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-requested(); } }
+    }
+    if root.audio-menu-open : TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.audio-menu-open = false; }
+    }
+    if root.audio-menu-open : Rectangle {
+        x: parent.width - self.width - 40px;
+        y: 62px;
+        width: 230px;
+        height: min(source-items.preferred-height + 12px, parent.height - 75px);
+        background: #252A2F;
+        border-width: 1px;
+        border-color: #52616B;
+        border-radius: 4px;
+        source-scroll := ScrollView {
+            x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+            source-items := VerticalLayout {
+            x: 0px; y: 0px; width: parent.width - 6px; height: self.preferred-height;
+            alignment: start;
+            if root.audio-sources-loading : DictionaryText {
+                text: "Loading recordings…";
+                height: 24px;
+                color: #94A3B8;
+                vertical-alignment: center;
+            }
+            if !root.audio-sources-loading && root.audio-sources.length == 0 : DictionaryText {
+                text: "No audio sources available";
+                height: 30px;
+                color: #94A3B8;
+                vertical-alignment: center;
+            }
+            for source in root.audio-sources : Rectangle {
+                height: 30px;
+                background: source-touch.has-hover ? #384046 : transparent;
+                DictionaryText { text: (root.selected-audio-source == source.index ? "✓  " : "   ") + source.name; color: #E2E8F0; vertical-alignment: center; x: 7px; }
+                source-touch := TouchArea { mouse-cursor: pointer; clicked => {
+                    root.select-audio-source(source.index);
+                    root.audio-menu-open = false;
+                    root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+                } }
+            }
+            }
+        }
+    }
+}
+
+// ── Manual Dictionary Search ───────────────────────────────────────────────
+export component DictionarySearchPanel inherits Rectangle {
+    in property <[DictResult]> results;
+    in-out property <string> query: "";
+    callback search-changed(string);
+    callback lookup(string);
+    callback close();
+
+    background: MementoPalette.surface-bg;
+    border-color: MementoPalette.border;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            Text {
+                text: "Search";
+                font-size: 16px;
+                font-weight: 700;
+                color: #F1F5F9;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button { text: "×"; clicked => { root.close(); } }
+        }
+        LineEdit {
+            placeholder-text: "Search Japanese…";
+            text <=> root.query;
+            edited(value) => { root.search-changed(value); }
+        }
+        ListView {
+            for hit[index] in root.results : Rectangle {
+                height: 124px;
+                border-radius: 5px;
+                background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
+                VerticalLayout {
+                    padding: 7px;
+                    spacing: 3px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: hit.expression;
+                            font-size: 18px;
+                            font-weight: 700;
+                            color: #F8FAFC;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: hit.reading;
+                            font-size: 12px;
+                            color: #94A3B8;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: hit.dict-name;
+                        font-size: 11px;
+                        color: #72C9B9;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: hit.glossary;
+                        font-size: 12px;
+                        color: #E2E8F0;
+                        wrap: word-wrap;
+                        vertical-alignment: top;
+                    }
+                }
+                result-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.lookup(hit.expression); }
+                }
+            }
+        }
+    }
+}

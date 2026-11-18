@@ -1,0 +1,91 @@
+export struct SubtitleWord {
+    text: string,
+    reading: string,
+    query: string,
+    index: int,
+}
+
+export struct SubtitleLine {
+    words: [SubtitleWord],
+}
+
+export global SubtitleOverlayBridge { }
+
+export component InteractiveSubtitleToken inherits Rectangle {
+    in property <SubtitleWord> word;
+    in property <length> type-size;
+    in property <bool> selected;
+    in property <bool> show-furigana: false;
+    callback clicked();
+    callback hovered(string, bool, bool, bool, bool);
+    callback hover-state(bool);
+    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
+
+    preferred-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
+    min-width: max(glyph.preferred-width, ruby.visible ? ruby.preferred-width : 0px);
+    preferred-height: glyph.preferred-height + root.ruby-space;
+    min-height: glyph.preferred-height + root.ruby-space;
+    background: transparent;
+
+    if root.selected && root.word.query != "" : Rectangle {
+        x: glyph.x;
+        y: glyph.y;
+        width: glyph.width;
+        height: glyph.height;
+        background: #38a6d6;
+    }
+
+    ruby := Text {
+        visible: root.show-furigana && root.word.reading != "";
+        text: root.word.reading;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        wrap: no-wrap;
+        font-size: root.type-size * 0.5;
+        font-family: "Noto Sans CJK JP";
+        color: #E2E8F0;
+        x: (parent.width - self.preferred-width) / 2;
+        y: max(0px, root.ruby-space - self.preferred-height);
+    }
+
+    glyph := Text {
+        text: root.word.text;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        wrap: no-wrap;
+        x: (parent.width - self.preferred-width) / 2;
+        y: root.ruby-space;
+        font-size: root.type-size;
+        font-weight: 700;
+        font-family: "Noto Sans CJK JP";
+        color: white;
+    }
+    touch := TouchArea {
+        x: glyph.x;
+        y: glyph.y;
+        width: glyph.width;
+        height: glyph.height;
+        enabled: root.word.query != "";
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.hovered(
+                    root.word.query,
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.meta
+                );
+            } else if (event.kind == PointerEventKind.cancel) {
+                root.hovered("", false, false, false, false);
+            }
+        }
+        changed has-hover => {
+            root.hover-state(self.has-hover);
+            if !self.has-hover {
+                root.hovered("", false, false, false, false);
+            }
+        }
+    }
+}

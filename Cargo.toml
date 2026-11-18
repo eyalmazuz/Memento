@@ -38,6 +38,10 @@ serde_json = "=1.0.154"
 url = "=2.5.8"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 copypasta = "=0.10.2"
+parley = "=0.8.0"
+resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
+webbrowser = "=1.2.4"
+zbus = "=4.4.0"
 
 memento-config = { path = "crates/memento-config" }
 memento-setting = { path = "crates/memento-setting" }
@@ -49,6 +53,7 @@ memento-anki = { path = "crates/memento-anki" }
 memento-net = { path = "crates/memento-net" }
 memento-audio = { path = "crates/memento-audio" }
 memento-util = { path = "crates/memento-util" }
+memento-os = { path = "crates/memento-os" }
 memento-asr = { path = "crates/memento-asr" }
 memento-asr-onnx = { path = "crates/memento-asr-onnx", optional = true }
 memento-asr-whisper = { path = "crates/memento-asr-whisper", optional = true }
