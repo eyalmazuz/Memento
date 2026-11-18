@@ -660,6 +660,34 @@ impl Config {
         self.dirty = !self.pending.is_empty();
     }
 
+    /// Synchronizes revision/changelog metadata from `persisted` and clears
+    /// entries from `pending` that were either explicitly included by
+    /// `is_persisted` or already match `persisted`'s stored raw value.
+    pub fn mark_persisted_against(
+        &mut self,
+        persisted: &Config,
+        is_persisted: impl Fn(&KeyPath) -> bool,
+    ) {
+        let map = &self.map;
+        let matches_persisted = |path: &KeyPath| {
+            let self_raw = map
+                .get(&path.group)
+                .and_then(|section| section.get(&path.key))
+                .map(String::as_str);
+            self_raw == persisted.raw_at(path)
+        };
+        if persisted.changelog.len() > MAX_CHANGELOG_ENTRIES {
+            let excess = persisted.changelog.len() - MAX_CHANGELOG_ENTRIES;
+            self.changelog = persisted.changelog[excess..].to_vec();
+        } else {
+            self.changelog = persisted.changelog.clone();
+        }
+        self.revision = persisted.revision;
+        self.pending
+            .retain(|change| !is_persisted(&change.path) && !matches_persisted(&change.path));
+        self.dirty = !self.pending.is_empty();
+    }
+
     /// Loads the canonical store file, and when missing falls back to the
     /// legacy QSettings INI `legacy_file_name`, converted in memory into
     /// the canonical representation (the migration path off Qt).

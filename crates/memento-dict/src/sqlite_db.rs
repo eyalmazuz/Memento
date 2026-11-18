@@ -18,12 +18,38 @@ pub use crate::databasemanager::TermQueryKind;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Closes a raw SQLite handle via `rusqlite::ffi::sqlite3_close`.
+/// Closes a raw SQLite handle via `sqlite3_close_v2`.
 ///
 /// # Safety
 /// `db` must be null or a valid SQLite handle opened by `sqlite3_open_v2`.
 pub unsafe fn sqlite3_close_v2(db: *mut sqlite3) -> c_int {
-    unsafe { rusqlite::ffi::sqlite3_close(db) }
+    unsafe extern "C" {
+        fn sqlite3_close_v2(db: *mut sqlite3) -> c_int;
+    }
+    unsafe { sqlite3_close_v2(db) }
+}
+
+/// File length and modification timestamp snapshot used to detect external changes.
+pub type FileMetaStamp = Option<(u64, Option<std::time::SystemTime>)>;
+
+/// Combined `(main_db, wal_file)` metadata fingerprint for WAL-aware change detection.
+pub type DbFileFingerprint = (FileMetaStamp, FileMetaStamp);
+
+/// Returns the `(len, modified)` metadata for both `path` and `<path>-wal`.
+///
+/// Under SQLite WAL mode, commits from other connections may only update
+/// `<path>-wal` without changing the main database file's size or mtime.
+#[must_use]
+pub fn db_file_fingerprint(path: &Path) -> DbFileFingerprint {
+    fn stamp(target: &Path) -> FileMetaStamp {
+        std::fs::metadata(target)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+    }
+    let mut wal_os = path.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal_path = std::path::PathBuf::from(wal_os);
+    (stamp(path), stamp(&wal_path))
 }
 
 /// Opens a raw SQLite handle via `rusqlite::ffi::sqlite3_open_v2` and applies
@@ -727,8 +753,8 @@ fn parse_freq_blob(blob_type: i32, blob: &[u8], reading: &[u16]) -> Option<Vec<u
             if blob.len() >= 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&blob[..8]);
-                let val = u64::from_ne_bytes(arr);
-                Some(val.to_string().encode_utf16().collect())
+                let val = i64::from_ne_bytes(arr);
+                (val >= 0).then(|| val.to_string().encode_utf16().collect())
             } else {
                 None
             }
@@ -738,6 +764,18 @@ fn parse_freq_blob(blob_type: i32, blob: &[u8], reading: &[u16]) -> Option<Vec<u
             let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
             let s = std::str::from_utf8(&blob[..null_pos]).unwrap_or("");
             Some(s.encode_utf16().collect())
+        }
+        // YOMI_BLOB_TYPE_DOUBLE (3)
+        3 => {
+            if blob.len() >= 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&blob[..8]);
+                let val = f64::from_ne_bytes(arr);
+                (val.is_finite() && val >= 0.0)
+                    .then(|| format_g(val, 6).encode_utf16().collect())
+            } else {
+                None
+            }
         }
         // YOMI_BLOB_TYPE_OBJECT (4)
         4 => {
@@ -1171,5 +1209,36 @@ mod tests {
 
         let val_float = serde_json::json!(1234.5678);
         assert_eq!(format_json_number(&val_float), "1234.57");
+    }
+
+    #[test]
+    fn freq_blob_supports_signed_int_and_float_tags() {
+        let db = create_test_db();
+        db.execute(
+            "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (1, '語', 'freq', 1, ?1);",
+            params![420i64.to_ne_bytes().to_vec()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (2, '語', 'freq', 1, ?1);",
+            params![(-5i64).to_ne_bytes().to_vec()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (3, '語', 'freq', 3, ?1);",
+            params![123.45f64.to_ne_bytes().to_vec()],
+        )
+        .unwrap();
+
+        let mut rows = Vec::new();
+        get_frequencies_conn(&db, &to_u16("語"), &[], &mut rows).unwrap();
+        let formatted: Vec<(i64, String)> = rows
+            .into_iter()
+            .map(|r| (r.dic_id, String::from_utf16(&r.frequency).unwrap()))
+            .collect();
+        assert_eq!(
+            formatted,
+            vec![(1, "420".to_string()), (3, "123.45".to_string())]
+        );
     }
 }

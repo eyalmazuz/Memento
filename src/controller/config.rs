@@ -433,13 +433,15 @@ impl ConfigController {
 
         let snapshot = category_snapshot(&self.store.borrow(), category);
         let mut persisted = load_config_store(config_dir, settings_file)?;
+        ensure_default_audio_source(&mut persisted);
+        ensure_default_keybind_profile(&mut persisted);
+        normalize_loaded_asr_values(&mut persisted);
         restore_category(&mut persisted, &snapshot);
         persisted
             .save(config_dir, settings_file)
             .map_err(|error| format!("{error:?}"))?;
-        self.store.borrow_mut().mark_persisted_with(
-            persisted.revision(),
-            persisted.changelog().to_vec(),
+        self.store.borrow_mut().mark_persisted_against(
+            &persisted,
             |path| path_in_category(category, path),
         );
         Ok(())
@@ -3440,6 +3442,7 @@ mod tests {
     fn legacy_ini_runs_memento_setting_migration() {
         let dir = temp_dir("legacy-migrate");
         let conf_path = dir.join("memento.conf");
+        let anki_path = dir.join("anki_connect.json");
         fs::write(&conf_path, "version=2\n[search]\nlist-result=false\n").unwrap();
 
         let loaded = ConfigController::load(&dir, "memento.conf").unwrap();
@@ -3448,6 +3451,16 @@ mod tests {
             Some(Value::Int(1))
         );
         assert_eq!(loaded.store().version().unwrap(), 6);
+
+        // Applying an unrelated category (e.g. category 1 Application) persists
+        // the migrated legacy INI keys to disk and clears them from `pending`.
+        loaded.apply_settings(1, &dir, "memento.conf", &anki_path).unwrap();
+        assert!(
+            !loaded.store().is_dirty(),
+            "migrated legacy INI keys persisted to disk must not remain pending after apply_settings"
+        );
+        assert_eq!(loaded.store().revision(), 1);
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

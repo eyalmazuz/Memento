@@ -34,6 +34,11 @@ fn structured_glossary_keeps_heading_list_and_link_blocks() {
 impl Drop for TemporaryDictionaryDatabase {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+        for suffix in ["-wal", "-shm"] {
+            let mut p = self.0.as_os_str().to_os_string();
+            p.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(p));
+        }
     }
 }
 
@@ -508,4 +513,196 @@ fn test_cloze_span_generation_and_formatting() {
     // Non-existent term returns None
     assert!(format_cloze_for_term(sentence, "映画").is_none());
     assert!(format_cloze_for_term(sentence, "").is_none());
+}
+
+#[test]
+fn open_dict_controller_refreshes_names_and_tags_across_wal_commits() {
+    use memento_app::controller::dict::db_file_fingerprint;
+    use memento_dict::yomidbbuilder;
+    use std::io::Write;
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn write_yomi_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let mut buf = Vec::new();
+        let mut central = Vec::new();
+        for &(name, data) in entries {
+            let offset = buf.len() as u32;
+            let crc = crc32(data);
+            let size = data.len() as u32;
+            let name_bytes = name.as_bytes();
+            let name_len = name_bytes.len() as u16;
+
+            buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            buf.extend_from_slice(&20u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&name_len.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let cd_offset = buf.len() as u32;
+        let cd_size = central.len() as u32;
+        let count = entries.len() as u16;
+        buf.extend_from_slice(&central);
+        buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&cd_size.to_le_bytes());
+        buf.extend_from_slice(&cd_offset.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&buf).unwrap();
+    }
+
+    let db = TemporaryDictionaryDatabase(temporary_dictionary_path());
+    let work_dir = std::env::temp_dir().join(format!(
+        "memento-dict-wal-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let res_dir = work_dir.join("res");
+    fs::create_dir_all(&res_dir).unwrap();
+
+    let zip1 = work_dir.join("dict1.zip");
+    write_yomi_zip(
+        &zip1,
+        &[
+            (
+                "index.json",
+                br#"{"title":"FirstDict","format":3,"revision":"1"}"#,
+            ),
+            (
+                "term_bank_1.json",
+                r#"[["食べる","たべる","","v1",10,["to eat"],1,""]]"#.as_bytes(),
+            ),
+        ],
+    );
+    yomidbbuilder::process_dictionary(&zip1, &db.0, &res_dir).unwrap();
+
+    // Open DictController BEFORE importing the second dictionary.
+    let mut controller = DictController::open(&db.0).expect("should open WAL database");
+    let fp_before = db_file_fingerprint(&db.0);
+    assert_eq!(controller.dictionary_id_for_name("FirstDict"), Some(1));
+    assert_eq!(controller.dictionary_id_for_name("SecondDict"), None);
+    assert!(controller.search("飲む").is_empty());
+
+    // Import SecondDict while `controller` holds its read-only SQLite handle open.
+    let zip2 = work_dir.join("dict2.zip");
+    write_yomi_zip(
+        &zip2,
+        &[
+            (
+                "index.json",
+                br#"{"title":"SecondDict","format":3,"revision":"1"}"#,
+            ),
+            (
+                "tag_bank_1.json",
+                r#"[["v5m","partOfSpeech",1,"Godan verb",20],["jouyou","frequent",-5,"regular-use kanji",10],["strokes","misc",1,"stroke count",0]]"#
+                    .as_bytes(),
+            ),
+            (
+                "term_bank_1.json",
+                r#"[["飲む","のむ","v5m","v5",80,["to drink"],1,""]]"#.as_bytes(),
+            ),
+            (
+                "kanji_bank_1.json",
+                r#"[["飲","イン","の.む","jouyou",["drink"],{"strokes":"12"}]]"#.as_bytes(),
+            ),
+            (
+                "term_meta_bank_1.json",
+                r#"[["飲む","freq",{"reading":"のむ","frequency":45}],["飲む","pitch",{"reading":"のむ","pitches":[{"position":1}]}]]"#
+                    .as_bytes(),
+            ),
+        ],
+    );
+    let dic2_id = yomidbbuilder::process_dictionary(&zip2, &db.0, &res_dir).unwrap();
+    let fp_after = db_file_fingerprint(&db.0);
+    assert_ne!(
+        fp_before, fp_after,
+        "db_file_fingerprint must detect WAL commits even while a read-only handle is open"
+    );
+
+    // Without reopening `controller`, verify newly imported metadata, terms, tags, kanji, pitches, and frequencies:
+    assert_eq!(controller.dictionary_id_for_name("SecondDict"), Some(dic2_id));
+
+    let term_hits = controller.search("飲む");
+    assert_eq!(term_hits.len(), 1);
+    assert_eq!(term_hits[0].dict_name, "SecondDict");
+    assert_eq!(term_hits[0].tags, "v5m");
+    assert_eq!(term_hits[0].glossary, "◦ to drink");
+
+    let kanji_hits = controller.search_kanji("飲");
+    assert_eq!(kanji_hits.len(), 1);
+    assert_eq!(kanji_hits[0].dict_name, "SecondDict");
+    assert_eq!(kanji_hits[0].tags, "jouyou");
+    assert_eq!(kanji_hits[0].notes, "strokes: 12");
+
+    let pitches = controller.get_pitch_graphs("飲む", "のむ");
+    assert_eq!(pitches.len(), 1);
+    assert_eq!(pitches[0].dictionary, "SecondDict");
+    assert_eq!(pitches[0].position, 1);
+
+    let freqs = controller.get_frequencies("飲む", "のむ");
+    assert_eq!(freqs.len(), 1);
+    assert_eq!(freqs[0].dictionary, "SecondDict");
+    assert_eq!(freqs[0].value, "45");
+
+    let (pitch_str, freq_str, _) = controller.get_term_meta("飲む", "のむ");
+    assert_eq!(pitch_str, "のむ [1]");
+    assert_eq!(freq_str, "SecondDict 45");
+
+    let anki_meta = controller.get_anki_term_metadata("飲む", "のむ", &["v5".into()]);
+    assert!(anki_meta.frequencies.contains("SecondDict: 45"));
+
+    // Deleting SecondDict while `controller` stays open also refreshes immediately.
+    yomidbbuilder::delete_dictionary(dic2_id, &db.0, &res_dir).unwrap();
+    assert_eq!(controller.dictionary_id_for_name("SecondDict"), None);
+    assert!(controller.search("飲む").is_empty());
+    assert!(controller.search_kanji("飲").is_empty());
+    assert!(controller.get_pitch_graphs("飲む", "のむ").is_empty());
+    assert!(controller.get_frequencies("飲む", "のむ").is_empty());
+
+    let _ = fs::remove_dir_all(&work_dir);
 }
