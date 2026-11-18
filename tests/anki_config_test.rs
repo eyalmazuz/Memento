@@ -5,9 +5,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use memento_app::controller::anki::{
-    build_note_payload_from_profile, create_cloze_sentence, default_note_fields, format_cloze, format_cloze_with_hint,
-    format_glossary, map_note_fields, split_cloze, validate_json_payload, validate_note_payload,
-    unavailable_profile_markers, AnkiController, GlossaryDefinition, NoteFieldsContext, NotePayload,
+    apply_subtitle_cloze, build_note_payload_from_profile, create_cloze_sentence,
+    default_note_fields, format_cloze, format_cloze_with_hint, format_expression_furigana,
+    format_glossary, map_note_fields, populate_note_context_from_sqlite, scope_dictionary_css,
+    secondary_context_for_range, split_cloze, unavailable_profile_markers, validate_json_payload,
+    validate_note_payload, AnkiController, GlossaryDefinition, NoteFieldsContext, NotePayload,
 };
 use memento_app::controller::config::{AnkiNoteConfig, ConfigController};
 use memento_net::anki::AnkiEndpoint;
@@ -335,8 +337,16 @@ fn test_anki_note_payload_validation() {
     blank_fields.fields.insert("Back".to_string(), "".to_string());
     assert!(validate_note_payload(&blank_fields).is_err());
 
-    // Validate raw JSON string
+    // Validate raw JSON string (including video-only attachments)
     assert!(validate_json_payload(r#"{"deckName":"D","modelName":"M","fields":{"F":"V"}}"#).is_ok());
+    assert!(validate_json_payload(
+        r#"{"deckName":"D","modelName":"M","fields":{"Video":""},"video":[{"filename":"clip.mp4","data":"AAAA","fields":["Video"]}]}"#
+    )
+    .is_ok());
+    assert!(validate_json_payload(
+        r#"{"deckName":"D","modelName":"M","fields":{"Video":""},"video":[]}"#
+    )
+    .is_err());
     assert!(validate_json_payload(r#"{"modelName":"M","fields":{"F":"V"}}"#).is_err());
     assert!(validate_json_payload(r#"{"deckName":"D","fields":{"F":"V"}}"#).is_err());
     assert!(validate_json_payload(r#"{"deckName":"D","modelName":"M"}"#).is_err());
@@ -354,9 +364,10 @@ fn test_anki_note_field_mapping_and_payload_generation() {
         .with_tag("JLPT-N5")
         .with_cloze_index(1);
 
-    // Verify context split
+    // Verify context split and clean empty selection default
     assert_eq!(ctx.expression, "食べる");
     assert_eq!(ctx.reading, "たべる");
+    assert_eq!(ctx.selection, "");
     assert_eq!(ctx.cloze_prefix, "毎朝パンを");
     assert_eq!(ctx.cloze_body, "食べる");
     assert_eq!(ctx.cloze_suffix, "。");
@@ -385,7 +396,7 @@ fn test_anki_note_field_mapping_and_payload_generation() {
     assert_eq!(mapped.get("Reading").unwrap(), "たべる");
     assert_eq!(mapped.get("Expression").unwrap(), "食べる");
     assert_eq!(mapped.get("Sentence").unwrap(), "毎朝パンを食べる。");
-    assert_eq!(mapped.get("Tags").unwrap(), "JLPT-N5");
+    assert_eq!(mapped.get("Tags").unwrap(), "<ul><li>JLPT-N5</li></ul>");
     assert!(mapped.get("Back").unwrap().contains("JMdict"));
 
     // Payload generation via controller
@@ -405,4 +416,450 @@ fn test_anki_note_field_mapping_and_payload_generation() {
     // Payload metadata integration with memento-anki
     let metadata = payload.to_anki_metadata();
     assert_eq!(metadata.len(), 5); // deckName, modelName, tags, options, fields
+}
+
+#[test]
+fn selection_stays_empty_and_falls_through_clipboard_to_glossary() {
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            (
+                "MainDef".into(),
+                "{selection | clipboard | glossary}".into(),
+            ),
+        ]),
+        tags: vec![],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+
+    // 1. Default context has empty selection; empty clipboard falls through to glossary (#262).
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "パンを食べました。")
+        .with_dictionary("JMdict")
+        .with_glossary_item("to eat");
+    ctx.clipboard = Some(String::new());
+    apply_subtitle_cloze(&mut ctx, &[], None, "食べました", Some(9));
+    assert_eq!(ctx.selection, "", "scanned subtitle word must never taint selection");
+    assert_eq!(ctx.cloze_prefix, "パンを");
+    assert_eq!(ctx.cloze_body, "食べました");
+    assert_eq!(ctx.cloze_suffix, "。");
+
+    let p1 = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert!(p1.fields["MainDef"].contains("to eat"));
+
+    // 2. Non-empty clipboard wins when selection is empty.
+    ctx.clipboard = Some("clipboard line 1\nline 2".into());
+    let p2 = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert_eq!(p2.fields["MainDef"], "clipboard line 1<br>line 2");
+
+    // 3. Explicit glossary selection wins over clipboard and glossary.
+    ctx.selection = "selected glossary text".into();
+    let p3 = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert_eq!(p3.fields["MainDef"], "selected glossary text");
+}
+
+#[test]
+fn multi_subtitle_cloze_and_secondary_context_match_active_cue() {
+    use memento_app::controller::subtitles::create_cue;
+
+    // Three marked cues, each containing "食べました"; active cue is index 1 (#173).
+    let cues = vec![
+        "昨日もパンを食べました。".to_owned(),
+        "今日もパンを食べました。".to_owned(),
+        "明日もパンを食べました。".to_owned(),
+    ];
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "今日もパンを食べました。");
+    apply_subtitle_cloze(&mut ctx, &cues, Some(1), "食べました", None);
+
+    assert_eq!(ctx.selection, "");
+    assert_eq!(ctx.context, cues.join("\n"));
+    assert_eq!(ctx.cloze_prefix, "昨日もパンを食べました。\n今日もパンを");
+    assert_eq!(ctx.cloze_body, "食べました");
+    assert_eq!(ctx.cloze_suffix, "。\n明日もパンを食べました。");
+
+    // Secondary context overlaps `[1.0, 5.0]` and excludes non-overlapping cues.
+    let secondary = vec![
+        create_cue("Too early", 0.0, 0.8),
+        create_cue("First EN line", 1.2, 2.5),
+        create_cue("Second EN line", 3.0, 4.8),
+        create_cue("Too late", 5.2, 6.0),
+    ];
+    ctx.secondary_subtitle = "Second EN line".into();
+    ctx.secondary_context =
+        secondary_context_for_range(&secondary, 1.0, 5.0, &ctx.secondary_subtitle);
+    assert_eq!(ctx.secondary_context, "First EN line\nSecond EN line");
+
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese".into(),
+        model: "Sentence".into(),
+        field_templates: HashMap::from([
+            ("Cloze".into(), "{cloze-prefix}[{cloze-body}]{cloze-suffix}".into()),
+            ("Sub2".into(), "{subtitle-2}".into()),
+            ("Ctx2".into(), "{context-2}".into()),
+        ]),
+        tags: vec![],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+    let payload = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert_eq!(
+        payload.fields["Cloze"],
+        "昨日もパンを食べました。<br>今日もパンを[食べました]。<br>明日もパンを食べました。"
+    );
+    assert_eq!(payload.fields["Sub2"], "Second EN line");
+    assert_eq!(payload.fields["Ctx2"], "First EN line<br>Second EN line");
+
+    // Fallback when no secondary cue overlaps
+    assert_eq!(
+        secondary_context_for_range(&secondary, 10.0, 12.0, "Fallback EN"),
+        "Fallback EN"
+    );
+}
+
+#[test]
+fn furigana_simplifies_okurigana_and_leaves_kana_plain() {
+    assert_eq!(
+        format_expression_furigana("食べる", "たべる"),
+        ("<ruby>食<rt>た</rt></ruby>べる".into(), "食[た]べる".into())
+    );
+    assert_eq!(
+        format_expression_furigana("食べ物", "たべもの"),
+        (
+            "<ruby>食<rt>た</rt></ruby>べ<ruby>物<rt>もの</rt></ruby>".into(),
+            "食[た]べ物[もの]".into()
+        )
+    );
+    assert_eq!(
+        format_expression_furigana("テレビ", "てれび"),
+        ("テレビ".into(), "テレビ".into())
+    );
+    assert_eq!(
+        format_expression_furigana("やはり", ""),
+        ("やはり".into(), "やはり".into())
+    );
+    assert_eq!(
+        format_expression_furigana("は", "わ"),
+        ("は".into(), "は".into())
+    );
+    assert_eq!(
+        format_expression_furigana("ヴァイオリン", "ばいおりん"),
+        ("ヴァイオリン".into(), "ヴァイオリン".into())
+    );
+}
+
+#[test]
+fn invalid_glossary_dict_id_emits_error_string() {
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+    ctx.glossary_definitions = vec![GlossaryDefinition {
+        dictionary_id: 9,
+        dictionary_name: "JMdict".into(),
+        glossary: "to eat".into(),
+        ..Default::default()
+    }];
+    let templates = HashMap::from([
+        ("BadFull".into(), "{glossary:dict=not-a-number}".into()),
+        ("BadBrief".into(), "{glossary-brief:dict=abc}".into()),
+        ("BadCompact".into(), "{glossary-compact:dict=}".into()),
+        ("Valid".into(), "{glossary:dict=9}".into()),
+    ]);
+    let mapped = map_note_fields(&templates, &ctx);
+    assert_eq!(mapped["BadFull"], "ERROR: Invalid dic-id value");
+    assert_eq!(mapped["BadBrief"], "ERROR: Invalid dic-id value");
+    assert_eq!(mapped["BadCompact"], "ERROR: Invalid dic-id value");
+    assert!(mapped["Valid"].contains("to eat"));
+}
+
+#[test]
+fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequencies() {
+    use memento_dict::yomidbbuilder::{dictionary_resource_dir, prepare_db};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp_dir = temp_test_dir("sqlite_anki_full");
+    let db_path = temp_dir.join("dictionaries.sqlite");
+    let config_dict_res = temp_dir.join("config_dict_resources");
+    fs::create_dir_all(&config_dict_res).unwrap();
+    prepare_db(&db_path).unwrap();
+
+    // Populate SQLite directly using read-write connection
+    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (7, 'Jitendex', 3, '1', 1);",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (8, 'FreqDict2', 3, '1', 0);",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) VALUES (7, 'v1', 'partOfSpeech', 1, 'Ichidan verb', 50);",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) VALUES (7, 'P', 'popular', 2, 'Common word', 10);",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) VALUES (7, 'strokes', 'misc', 1, 'Stroke count', 0);",
+        [],
+    )
+    .unwrap();
+
+    let structured_glossary = serde_json::json!([
+        {
+            "type": "structured-content",
+            "content": {
+                "tag": "div",
+                "data": {"content": "glossary"},
+                "content": [
+                    "to eat",
+                    {"tag": "img", "path": "img/diagram.png", "width": 32, "height": 32, "collapsible": false}
+                ]
+            }
+        }
+    ])
+    .to_string();
+
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) \
+         VALUES (7, '食べる', 'たべる', 'v1', 'v1', 100, ?1, 1, 'P');",
+        [&structured_glossary],
+    )
+    .unwrap();
+
+    // Pitch position 2 on 3-mora "たべる" with rule "v1" -> kifuku!
+    let pitch_blob = r#"{"reading":"たべる","pitches":[{"position":2}]}"#.as_bytes();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (7, '食べる', 'pitch', 4, ?1);",
+        [pitch_blob],
+    )
+    .unwrap();
+
+    // Two frequency dictionaries: 100 and 300 -> harmonic = floor(2 / (1/100 + 1/300)) = 150, average = 200
+    let freq1 = r#"{"reading":"たべる","frequency":100}"#.as_bytes();
+    let freq2 = r#"{"reading":"たべる","frequency":300}"#.as_bytes();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (7, '食べる', 'freq', 4, ?1);",
+        [freq1],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (8, '食べる', 'freq', 4, ?1);",
+        [freq2],
+    )
+    .unwrap();
+
+    // Kanji entry for 食
+    conn.execute(
+        "INSERT INTO kanji_bank (dic_id, char, onyomi, kunyomi, tags, meanings, stats) \
+         VALUES (7, '食', 'ショク ジキ', 'た.べる く.う', 'P', '[\"eat\",\"food\"]', '{\"strokes\":\"9\"}');",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Create <config_dir>/dict_resources/dict-7/styles.css and img/diagram.png
+    let dict7_dir = dictionary_resource_dir(&config_dict_res, 7).unwrap();
+    fs::create_dir_all(dict7_dir.join("img")).unwrap();
+    fs::write(
+        dict7_dir.join("styles.css"),
+        ".gloss { color: red; } :root { --accent: blue; }",
+    )
+    .unwrap();
+    let png_bytes = b"\x89PNG\r\n\x1a\nfake-png-payload";
+    fs::write(dict7_dir.join("img/diagram.png"), png_bytes).unwrap();
+
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "朝ご飯を食べる。");
+    populate_note_context_from_sqlite(
+        &mut ctx,
+        &db_path,
+        std::slice::from_ref(&config_dict_res),
+        &[("Jitendex".into(), 0)],
+    )
+    .unwrap();
+
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            ("Furigana".into(), "{furigana}".into()),
+            ("FuriganaPlain".into(), "{furigana-plain}".into()),
+            ("Glossary".into(), "{glossary}".into()),
+            ("Tags".into(), "{tags}".into()),
+            ("TagsBrief".into(), "{tags-brief}".into()),
+            ("POS".into(), "{part-of-speech}".into()),
+            ("PitchGraphs".into(), "{pitch-graphs}".into()),
+            ("PitchCategories".into(), "{pitch-categories}".into()),
+            ("FreqAll".into(), "{frequencies}".into()),
+            ("FreqMinVal".into(), "{frequencies:min-value=true,value-only=true}".into()),
+            ("HarmonicRank".into(), "{frequency-harmonic-rank}".into()),
+            ("HarmonicOcc".into(), "{frequency-harmonic-occurrence}".into()),
+            ("AverageRank".into(), "{frequency-average-rank}".into()),
+            ("AverageOcc".into(), "{frequency-average-occurrence}".into()),
+            ("Clipboard".into(), "{clipboard}".into()),
+        ]),
+        tags: vec!["memento".into()],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+    ctx.clipboard = Some(String::new());
+
+    // No false warnings from unavailable_profile_markers!
+    assert!(unavailable_profile_markers(&profile).is_empty());
+
+    let payload = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert_eq!(payload.fields["Furigana"], "<ruby>食<rt>た</rt></ruby>べる");
+    assert_eq!(payload.fields["FuriganaPlain"], "食[た]べる");
+    assert!(payload.fields["Glossary"].contains("<li data-dictionary=\"Jitendex\">"));
+    assert!(payload.fields["Glossary"]
+        .contains("[data-dictionary=\"Jitendex\"] .gloss { color: red; }"));
+    assert!(payload.fields["Glossary"]
+        .contains("[data-dictionary=\"Jitendex\"] { --accent: blue; }"));
+    assert!(payload.fields["Glossary"].contains("<img src=\""));
+    assert_eq!(payload.fields["Tags"], "<ul><li>P: Common word</li></ul>");
+    assert_eq!(payload.fields["TagsBrief"], "<ul><li>P</li></ul>");
+    assert_eq!(payload.fields["POS"], "v1");
+    assert!(payload.fields["PitchGraphs"].contains("<span class=\"memento-pitch-graph\"><svg"));
+    assert_eq!(payload.fields["PitchCategories"], "kifuku");
+    assert!(payload.fields["FreqAll"].contains("Jitendex: 100"));
+    assert!(payload.fields["FreqAll"].contains("FreqDict2: 300"));
+    assert_eq!(payload.fields["FreqMinVal"], "100");
+    assert_eq!(payload.fields["HarmonicRank"], "150");
+    assert_eq!(payload.fields["HarmonicOcc"], "150");
+    assert_eq!(payload.fields["AverageRank"], "200");
+    assert_eq!(payload.fields["AverageOcc"], "200");
+
+    // Verify default rank=9999999 and occurrence=0 when absent
+    let empty_freq_ctx = NoteFieldsContext::new("未知語", "みちご", "未知語。");
+    let default_freq_fields = map_note_fields(
+        &HashMap::from([
+            ("HR".into(), "{frequency-harmonic-rank}".into()),
+            ("HO".into(), "{frequency-harmonic-occurrence}".into()),
+            ("AR".into(), "{frequency-average-rank}".into()),
+            ("AO".into(), "{frequency-average-occurrence}".into()),
+        ]),
+        &empty_freq_ctx,
+    );
+    assert_eq!(default_freq_fields["HR"], "9999999");
+    assert_eq!(default_freq_fields["HO"], "0");
+    assert_eq!(default_freq_fields["AR"], "9999999");
+    assert_eq!(default_freq_fields["AO"], "0");
+
+    // Verify Kanji enrichment
+    let mut kanji_ctx = NoteFieldsContext::new("食", "", "食事をする。");
+    kanji_ctx.is_kanji = true;
+    populate_note_context_from_sqlite(
+        &mut kanji_ctx,
+        &db_path,
+        std::slice::from_ref(&config_dict_res),
+        &[("Jitendex".into(), 0)],
+    )
+    .unwrap();
+    let kanji_mapped = map_note_fields(
+        &HashMap::from([
+            ("Character".into(), "{character}".into()),
+            ("Onyomi".into(), "{onyomi}".into()),
+            ("Kunyomi".into(), "{kunyomi}".into()),
+            ("StrokeCount".into(), "{stroke-count}".into()),
+            ("Glossary".into(), "{glossary}".into()),
+        ]),
+        &kanji_ctx,
+    );
+    assert_eq!(kanji_mapped["Character"], "食");
+    assert_eq!(kanji_mapped["Onyomi"], "ショク, ジキ");
+    assert_eq!(kanji_mapped["Kunyomi"], "た.べる, く.う");
+    assert_eq!(kanji_mapped["StrokeCount"], "9");
+    assert!(kanji_mapped["Glossary"].contains("<ol><li><i>(P, Jitendex)</i></li><ol><li>eat</li><li>food</li></ol></ol>"));
+
+    // Wire test: verify `can_add_note_from_profile` (#340) AND that `add_note_from_profile`
+    // uploads dictionary media via `multi`/`storeMediaFile` BEFORE `addNote`!
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = std::thread::spawn(move || {
+        let mut actions = Vec::new();
+        for idx in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let req_text = String::from_utf8_lossy(&buf[..n]);
+            let body_str = req_text.split("\r\n\r\n").nth(1).unwrap_or("");
+            let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            actions.push(body["action"].as_str().unwrap().to_owned());
+            let reply_json = match idx {
+                0 => serde_json::json!({"error": null, "result": [true]}).to_string(),
+                1 => {
+                    let store_action = &body["params"]["actions"][0];
+                    assert_eq!(store_action["action"], "storeMediaFile");
+                    let fname = store_action["params"]["filename"].as_str().unwrap();
+                    assert!(fname.ends_with(".png"));
+                    assert!(fname.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+                    serde_json::json!({"error": null, "result": [fname]}).to_string()
+                }
+                _ => serde_json::json!({"error": null, "result": 1669909161234_i64}).to_string(),
+            };
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                reply_json.len(),
+                reply_json
+            );
+            stream.write_all(http_resp.as_bytes()).unwrap();
+        }
+        actions
+    });
+
+    let mut live_profile = profile.clone();
+    live_profile.endpoint = AnkiEndpoint {
+        hostname: "http://127.0.0.1".into(),
+        port: addr.port(),
+        api_key: None,
+        timeout: Some(std::time::Duration::from_secs(2)),
+        use_api_key: false,
+    };
+    let live_ctrl = AnkiController::new(live_profile.endpoint());
+    assert!(live_ctrl.can_add_note_from_profile(&live_profile, &ctx).unwrap());
+    let added_id = live_ctrl.add_note_from_profile(&live_profile, &ctx).unwrap();
+    assert_eq!(added_id, 1669909161234);
+
+    let recorded_actions = server_handle.join().unwrap();
+    assert_eq!(recorded_actions, vec!["canAddNotes", "multi", "addNote"]);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn scope_dictionary_css_handles_media_queries_and_existing_data_dictionary_selectors() {
+    let raw = "/* comment */ @import url('evil.css'); .a, .b { color: green; } [data-dictionary=\"Other\"] .x { color: red; } @media (prefers-color-scheme: dark) { .a { color: white; } }";
+    let scoped = scope_dictionary_css(raw, "MyDict");
+    assert!(!scoped.contains("@import"));
+    assert!(scoped.contains("[data-dictionary=\"MyDict\"] .a, [data-dictionary=\"MyDict\"] .b { color: green; }"));
+    assert!(scoped.contains("[data-dictionary=\"Other\"] .x { color: red; }"));
+    assert!(scoped.contains("@media (prefers-color-scheme: dark) { [data-dictionary=\"MyDict\"] .a { color: white; } }"));
 }

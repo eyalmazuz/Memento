@@ -274,14 +274,14 @@ fn gui_browse_body_and_int_list_reply()
                 "params": { "query": "(Front:引き)" }
             })
         );
-        Action::Respond(reply_of(json!([1669909161234.0, 1669909161239.0])))
+        Action::Respond(reply_of(json!([1669909161234_i64, 1669909161239_i64])))
     });
 
     let client = AnkiClient::new(endpoint_for(&server));
     assert_eq!(
         client.open_browse("(Front:引き)").unwrap(),
-        vec![0, 0],
-        "QJsonValue::toInt() returns its default for IDs outside the C++ int range"
+        vec![1669909161234, 1669909161239],
+        "open_browse must preserve 64-bit Anki note IDs"
     );
 }
 
@@ -289,9 +289,12 @@ fn gui_browse_body_and_int_list_reply()
 fn gui_browse_coerces_only_whole_in_range_integer_ids()
 {
     let server = TestServer::start();
-    server.spawn(move |_, _| Action::Respond(reply_of(json!([1.5, 42, 2147483648_i64]))));
+    server.spawn(move |_, _| Action::Respond(reply_of(json!([1.5, 42, 2147483648_i64, 1669909161234.0]))));
     let client = AnkiClient::new(endpoint_for(&server));
-    assert_eq!(client.open_browse("query").unwrap(), vec![0, 42, 0]);
+    assert_eq!(
+        client.open_browse("query").unwrap(),
+        vec![0, 42, 2147483648, 1669909161234]
+    );
 }
 
 // ---- reply taxonomy -----------------------------------------------------

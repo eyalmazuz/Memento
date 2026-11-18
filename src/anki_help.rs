@@ -11,9 +11,9 @@ const TERM_MARKERS: &[&str] = &[
     "cloze-suffix", "context", "context-2", "expression", "frequencies",
     "frequency-average-occurrence", "frequency-average-rank", "frequency-harmonic-occurrence",
     "frequency-harmonic-rank", "furigana", "furigana-plain", "glossary", "glossary-brief",
-    "glossary-compact", "pitch", "pitch-categories", "pitch-graphs", "pitch-positions",
-    "reading", "screenshot", "screenshot-video", "selection", "subtitle", "subtitle-2",
-    "tags", "tags-brief", "title", "video",
+    "glossary-compact", "part-of-speech", "pitch", "pitch-categories", "pitch-graphs",
+    "pitch-positions", "reading", "screenshot", "screenshot-video", "selection", "subtitle",
+    "subtitle-2", "tags", "tags-brief", "title", "video",
 ];
 
 const KANJI_MARKERS: &[&str] = &[
@@ -49,6 +49,7 @@ fn description(name: &str) -> &'static str {
         "glossary-compact" => "Dictionary definitions of the expression in compact form.",
         "kunyomi" => "A comma separated list of kunyomi (Japanese) readings written in katakana.",
         "onyomi" => "A comma separated list of onyomi (Chinese) readings written in hiragana.",
+        "part-of-speech" => "Part-of-speech tags for the expression.",
         "pitch" => "Pitch accents for the reading of the expression.",
         "pitch-categories" => "A comma separated list of pitch accent categories for the expression: heiban, kifuku, atamadaka, nakadaka, odaka.",
         "pitch-graphs" => "Pitch graphs for the reading of the expression.",
