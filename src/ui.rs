@@ -6081,3 +6081,32 @@ pub fn install_rich_ui_bridges(
         false
     });
 }
+
+/// Immediately propagate updated settings from `ConfigController` into the active rich UI bridge.
+pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    let bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .cloned()
+    });
+    let Some(bridge) = bridge else {
+        return;
+    };
+    let middle_mouse = {
+        let mut st = bridge.state.borrow_mut();
+        st.settings.apply_controller(config);
+        let order = st.settings.dict_order.clone();
+        st.dict_ctrl.set_order(&order);
+        st.settings.middle_mouse_scan
+    };
+    let sb = app.global::<SubtitleOverlayBridge>();
+    sb.set_middle_mouse_scan_enabled(middle_mouse);
+    sb.set_style_revision(sb.get_style_revision().wrapping_add(1));
+    let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
+    if !words.is_empty() {
+        let lines = subtitle_lines_for_app(app, words);
+        app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
+    }
+}

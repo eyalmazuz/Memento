@@ -19,7 +19,7 @@ mod graphics_device;
 pub use ui::{
     ChapterMark, DictResult, InstalledDictionaryRow, MementoApp, MementoPalette, PlayerTrack,
     PitchGraph, PitchMora, PopupAudioSource, PopupBridge, PopupFrequency, PopupGlossaryBlock,
-    AnkiHelpWindow, SettingsWindow, SubEntry, SubtitleLine, SubtitleWord,
+    AnkiHelpWindow, SettingsWindow, SubEntry, SubtitleLine, SubtitleOverlayBridge, SubtitleWord,
 };
 use ui::{publish_active_subtitle, dictionary_result_rows, set_dictionary_rows, popup_pitch_graphs, subtitle_lines_for_app};
 #[cfg(test)]
@@ -1570,6 +1570,16 @@ fn is_bare_modifier_key(key: &str) -> bool {
     )
 }
 
+fn bare_modifier_flags(key: &str) -> (bool, bool, bool, bool) {
+    match key {
+        "\u{0010}" | "\u{0011}" | "Shift" => (false, true, false, false),
+        "\u{0012}" | "\u{0013}" | "Control" | "Ctrl" => (true, false, false, false),
+        "\u{0014}" | "\u{0015}" | "Alt" => (false, false, true, false),
+        "\u{0016}" | "\u{0017}" | "Meta" | "Super" => (false, false, false, true),
+        _ => (false, false, false, false),
+    }
+}
+
 fn translate_slint_key_name(key: &str) -> Option<&'static str> {
     match key {
         "\u{F700}" => Some("Up"),
@@ -1790,6 +1800,7 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
     app.set_key_sub_list_find(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND));
     app.set_key_sub_list_find_next(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_NEXT));
     app.set_key_sub_list_find_prev(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_PREVIOUS));
+    ui::refresh_rich_ui_bridges(app, config);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2059,7 +2070,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bare modifiers (Shift/Ctrl/Alt/Super) must never dismiss YomitanPopup,
         // and pressing a lookup modifier while hovering a token triggers lookup.
         if is_bare_modifier_key(&text) {
-            if control || shift || alt || meta {
+            if app.global::<SubtitleOverlayBridge>().get_rich_enabled() {
+                let (mc, ms, ma, mm) = bare_modifier_flags(&text);
+                app.global::<SubtitleOverlayBridge>()
+                    .invoke_stationary_modifier_changed(
+                        control || mc,
+                        shift || ms,
+                        alt || ma,
+                        meta || mm,
+                    );
+            } else if control || shift || alt || meta {
                 let hovered = key_hover_cursor.borrow().clone();
                 if let Some((word, index)) = hovered {
                     app.invoke_hover_word(word.into(), index, control, shift, alt, meta);
@@ -2227,6 +2247,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return false;
         }
         true
+    });
+    let key_rel_app = app.as_weak();
+    let key_rel_closing = closing.clone();
+    app.on_key_released(move |control, shift, alt, meta| {
+        if key_rel_closing.get() { return; }
+        let Some(app) = key_rel_app.upgrade() else { return };
+        if app.global::<SubtitleOverlayBridge>().get_rich_enabled() {
+            app.global::<SubtitleOverlayBridge>()
+                .invoke_stationary_modifier_changed(control, shift, alt, meta);
+        }
     });
 
     // The video surface is a Slint window, so mpv's fullscreen key cannot

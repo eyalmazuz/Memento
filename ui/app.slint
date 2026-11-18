@@ -1542,6 +1542,7 @@ export component MementoApp inherits Window {
     callback play-audio-for-word(string, string);
     callback popup-audio-sources-requested(string, string);
     callback key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback key-released(bool, bool, bool, bool);
     callback dismiss-definition();
 
     dismiss-definition => {
@@ -1661,12 +1662,12 @@ export component MementoApp inherits Window {
         }
     }
     changed active-sub-lines => {
-        if !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
     changed active-sub-text => {
-        if !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
@@ -1771,6 +1772,15 @@ export component MementoApp inherits Window {
                 if (root.sub-drawer-open) { root.sub-drawer-open = false; return accept; }
                 if (root.is-fullscreen) { root.toggle-fullscreen(); return accept; }
             }
+            reject
+        }
+        key-released(event) => {
+            root.key-released(
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta,
+            );
             reject
         }
 
@@ -1986,22 +1996,21 @@ export component MementoApp inherits Window {
                                     type-size: video-area.height * root.subtitle-scale;
                                     show-furigana: root.furigana-visible;
                                     selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
+                                    popup-anchor-requested(local-x) => {
+                                        root.popup-offset-x = (16px + self.x + local-x) - subtitle-box.width / 2;
+                                    }
                                     hover-state(hovering) => {
                                         root.token-hovered = hovering;
-                                        if hovering && word.query != "" {
+                                        if hovering && word.query != "" && !SubtitleOverlayBridge.rich-enabled {
                                             root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
                                         }
                                     }
                                     hovered(query, control, shift, alt, meta) => {
                                         root.osc-activity();
-                                        if query != "" {
-                                            root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
-                                        }
                                         root.hover-word(query, word.index, control, shift, alt, meta);
                                     }
                                     clicked => {
                                         root.selected-token-index = word.index;
-                                        root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
                                         root.hover-word("", word.index, false, false, false, false);
                                         root.lookup-word(word.query);
                                     }
