@@ -531,4 +531,115 @@ mod rich_subtitle_phase4_tests {
         assert_eq!(looked_up.borrow().len(), count_before);
         app.hide().unwrap();
     }
+
+    #[test]
+    fn custom_subtitle_style_rewraps_lines_and_preserves_focus_and_single_key_dispatch() {
+        i_slint_backend_testing::init_no_event_loop();
+        let fixture = TempSubConfig::new();
+        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        // Configure heavy stroke (`24.0`),Modifier mode (`Shift`), and save
+        config
+            .edit_setting(
+                &format!("{}/{}", raw::interface::GROUP, raw::interface::subtitle::STROKE),
+                "24.0",
+            )
+            .unwrap();
+        config
+            .edit_setting(&format!("{}/{}", raw::search::GROUP, raw::search::METHOD), "1")
+            .unwrap();
+        config
+            .edit_setting(
+                &format!("{}/{}", raw::search::GROUP, raw::search::MODIFIER),
+                "2",
+            )
+            .unwrap();
+        config.save(&fixture.dir, "memento.conf").unwrap();
+
+        let db_path = fixture.dir.join("dictionaries.sqlite");
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(360., 720.));
+        app.set_duration(120.);
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &fixture.dir, &config);
+        app.show().unwrap();
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        let pb = app.global::<memento_app::PopupBridge>();
+
+        let text = "世界中を旅行する物語";
+        let (requests, _worker) = mpsc::channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        publish_active_subtitle(&app, text, &requests, &epoch);
+
+        // 1. `subtitle_token_width` must match `render_token.width_px` using the bridge's custom stroke style!
+        let font_px = app.get_video_height() as f32 * app.get_subtitle_scale();
+        let word0 = app.get_active_sub_words().row_data(0).unwrap();
+        let rendered0 = sb.invoke_render_token(word0.clone(), font_px, false, false, 0, 0);
+        let measured0 = memento_app::subtitle_token_width(&word0, font_px, false);
+        assert!(
+            (rendered0.width_px - measured0).abs() < 0.01,
+            "subtitle_token_width ({measured0}) must use active custom SubtitleRenderStyle ({})",
+            rendered0.width_px
+        );
+
+        // 2. Verify `should_capture_hover_focus` respects menus, OCR, about, drawers, and active glossary text selection!
+        assert!(sb.invoke_should_capture_hover_focus());
+        app.set_ocr_mode(true);
+        assert!(!sb.invoke_should_capture_hover_focus());
+        app.set_ocr_mode(false);
+        app.set_about_open(true);
+        assert!(!sb.invoke_should_capture_hover_focus());
+        app.set_about_open(false);
+        app.set_dict_open(true);
+        pb.set_selected_glossary_text("selected meaning".into());
+        assert!(
+            !sb.invoke_should_capture_hover_focus(),
+            "active glossary text selection must keep focus for Ctrl+C"
+        );
+        pb.set_selected_glossary_text("".into());
+        app.set_dict_open(false);
+        assert!(sb.invoke_should_capture_hover_focus());
+
+        // 3. Verify `popup_key_pressed` forwards stationary Shift to `SubtitleOverlayBridge` AND
+        //    `hover_key_pressed` / `popup_key_pressed` reject non-modifiers (including `CapsLock` and `"a"`)
+        //    without calling `app.key_pressed` directly (preventing double dispatch!).
+        let key_calls = Rc::new(std::cell::Cell::new(0));
+        let key_calls_cb = key_calls.clone();
+        app.on_key_pressed(move |_, _, _, _, _| {
+            key_calls_cb.set(key_calls_cb.get() + 1);
+            false
+        });
+        assert!(!sb.invoke_hover_key_pressed(Key::CapsLock.into(), false, false, false, false));
+        assert!(!sb.invoke_hover_key_pressed("a".into(), false, false, false, false));
+        assert!(!pb.invoke_popup_key_pressed("a".into(), false, false, false, false));
+        assert_eq!(
+            key_calls.get(),
+            0,
+            "child FocusScopes must reject non-modifiers without invoking app.key_pressed directly"
+        );
+
+        // Hover a token, then simulate `glossary-focus` receiving `Shift` via `popup_key_pressed` -> stationary Shift still scans!
+        let looked_up: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let looked_up_cb = looked_up.clone();
+        app.on_lookup_word(move |q| looked_up_cb.borrow_mut().push(q.to_string()));
+        sb.invoke_pointer_hovered(
+            word0,
+            font_px,
+            false,
+            rendered0.width_px * 0.25,
+            rendered0.glyph_y_px + 4.0,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(looked_up.borrow().is_empty());
+        assert!(pb.invoke_popup_key_pressed(Key::Shift.into(), false, true, false, false));
+        assert_eq!(
+            looked_up.borrow().last().map(String::as_str),
+            Some("世界中を旅行する物語"),
+            "Shift pressed while glossary-focus holds focus must forward to stationary_modifier_changed"
+        );
+        app.hide().unwrap();
+    }
 }

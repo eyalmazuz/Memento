@@ -50,6 +50,7 @@ export component InteractiveSubtitleToken inherits Rectangle {
     callback clicked();
     callback hovered(string, bool, bool, bool, bool);
     callback hover-state(bool);
+    callback popup-anchor-requested(length);
 
     private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
     private property <SubtitleTokenMetrics> rich-metrics: SubtitleOverlayBridge.rich-enabled
@@ -171,6 +172,9 @@ export component InteractiveSubtitleToken inherits Rectangle {
         enabled: root.word.query != "";
         mouse-cursor: pointer;
         clicked => {
+            if (root.word.query != "") {
+                root.popup-anchor-requested(self.mouse-x);
+            }
             if (SubtitleOverlayBridge.rich-enabled) {
                 SubtitleOverlayBridge.token-left-clicked(
                     root.word,
@@ -185,7 +189,16 @@ export component InteractiveSubtitleToken inherits Rectangle {
         }
         pointer-event(event) => {
             if (SubtitleOverlayBridge.rich-enabled) {
+                if (event.kind == PointerEventKind.move
+                    && !token-focus.has-focus
+                    && SubtitleOverlayBridge.should-capture-hover-focus())
+                {
+                    token-focus.focus();
+                }
                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                    if (root.word.query != "") {
+                        root.popup-anchor-requested(self.mouse-x);
+                    }
                     SubtitleOverlayBridge.token-middle-clicked(
                         root.word,
                         root.type-size / 1px,
@@ -196,6 +209,9 @@ export component InteractiveSubtitleToken inherits Rectangle {
                 } else if (event.kind == PointerEventKind.move
                     || (event.kind == PointerEventKind.down && event.button == PointerEventButton.left))
                 {
+                    if (root.word.query != "") {
+                        root.popup-anchor-requested(self.mouse-x);
+                    }
                     SubtitleOverlayBridge.pointer-hovered(
                         root.word,
                         root.type-size / 1px,
@@ -213,6 +229,9 @@ export component InteractiveSubtitleToken inherits Rectangle {
                 }
             } else {
                 if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                    if (root.word.query != "") {
+                        root.popup-anchor-requested(self.mouse-x);
+                    }
                     root.hovered(
                         root.word.query,
                         event.modifiers.control,

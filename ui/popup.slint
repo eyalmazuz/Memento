@@ -36,6 +36,10 @@ export struct RichHeadwordChar {
     char_index: int,
 }
 
+export struct RichHeadwordLine {
+    chars: [RichHeadwordChar],
+}
+
 export struct RichTagPill {
     name: string,
     category: string,
@@ -135,6 +139,7 @@ export global PopupBridge {
 
     // Rich query callbacks
     pure callback headword-chars(string) -> [RichHeadwordChar];
+    pure callback headword-lines(string, float) -> [RichHeadwordLine];
     pure callback term-tag-pills(int, int) -> [RichTagPill];
     pure callback def-tag-pills(int, int) -> [RichTagPill];
     pure callback derivation-steps(int, int) -> [RichDerivationStep];
@@ -160,6 +165,7 @@ export global PopupBridge {
     callback glossary-double-clicked(int, float, float);
     callback copy-selected-glossary();
     callback popup-key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback popup-key-released(bool, bool, bool, bool);
 
     // Independent search panel actions
     callback panel-search-requested(string);
@@ -285,6 +291,15 @@ export component YomitanPopup inherits Rectangle {
             }
             reject
         }
+        key-released(event) => {
+            PopupBridge.popup-key-released(
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta
+            );
+            reject
+        }
     }
 
     popup-content := VerticalLayout {
@@ -385,8 +400,19 @@ export component YomitanPopup inherits Rectangle {
                         width: parent.width;
                         spacing: 6px;
                         min-height: 34px;
+                        property <length> buttons-reserved-w:
+                            (root.added-note-id != "" && root.added-result-index == res.index - 1 ? 68px : 0px)
+                            + (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
+                            + (!res.is-kanji && res.has-kanji ? 34px : 0px)
+                            + (!res.is-kanji ? 34px : 0px)
+                            + (root.anki-enabled ? 34px : 0px)
+                            + 34px
+                            + (res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) ? 34px : 0px);
+                        property <length> avail-title-w: max(96px, card-content.width - self.buttons-reserved-w);
                         term-title := VerticalLayout {
                             horizontal-stretch: 1;
+                            min-width: 0px;
+                            preferred-width: 0px;
                             spacing: 2px;
                             if !res.is-kanji && res.reading != "" && res.reading != res.expression : DictionaryText {
                                 text: res.reading;
@@ -395,25 +421,28 @@ export component YomitanPopup inherits Rectangle {
                                 font-size: 12px;
                                 color: #94A3B8;
                             }
-                            if PopupBridge.rich-enabled && !res.is-kanji : HorizontalLayout {
-                                alignment: start;
-                                spacing: 0px;
-                                for ch in PopupBridge.headword-chars(res.expression) : Rectangle {
-                                    width: ch-text.preferred-width;
-                                    height: ch-text.preferred-height;
-                                    background: ch.is-kanji && ch-touch.has-hover ? #283442 : transparent;
-                                    border-radius: 3px;
-                                    ch-text := DictionaryText {
-                                        text: ch.text;
-                                        font-size: 23px;
-                                        font-weight: 700;
-                                        color: ch.is-kanji && ch-touch.has-hover ? #93C5FD : #FFFFFF;
-                                    }
-                                    ch-touch := TouchArea {
-                                        enabled: ch.is-kanji;
-                                        mouse-cursor: ch.is-kanji ? pointer : default;
-                                        clicked => {
-                                            PopupBridge.lookup-kanji-char(res.expression, ch.text);
+                            if PopupBridge.rich-enabled && !res.is-kanji : VerticalLayout {
+                                spacing: 1px;
+                                for hw-line in PopupBridge.headword-lines(res.expression, avail-title-w / 1px) : HorizontalLayout {
+                                    alignment: start;
+                                    spacing: 0px;
+                                    for ch in hw-line.chars : Rectangle {
+                                        width: ch-text.preferred-width;
+                                        height: ch-text.preferred-height;
+                                        background: ch.is-kanji && ch-touch.has-hover ? #283442 : transparent;
+                                        border-radius: 3px;
+                                        ch-text := DictionaryText {
+                                            text: ch.text;
+                                            font-size: 23px;
+                                            font-weight: 700;
+                                            color: ch.is-kanji && ch-touch.has-hover ? #93C5FD : #FFFFFF;
+                                        }
+                                        ch-touch := TouchArea {
+                                            enabled: ch.is-kanji;
+                                            mouse-cursor: ch.is-kanji ? pointer : default;
+                                            clicked => {
+                                                PopupBridge.lookup-kanji-char(res.expression, ch.text);
+                                            }
                                         }
                                     }
                                 }
@@ -1310,9 +1339,11 @@ export component DictionarySearchPanel inherits Rectangle {
         ListView {
             for hit[index] in root.active-results : Rectangle {
                 height: 124px;
+                clip: true;
                 border-radius: 5px;
                 background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
                 VerticalLayout {
+                    height: parent.height;
                     padding: 7px;
                     spacing: 3px;
                     HorizontalLayout {
@@ -1323,12 +1354,14 @@ export component DictionarySearchPanel inherits Rectangle {
                             font-weight: 700;
                             color: #F8FAFC;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                         DictionaryText {
                             text: hit.reading;
                             font-size: 12px;
                             color: #94A3B8;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                     DictionaryText {
@@ -1342,6 +1375,8 @@ export component DictionarySearchPanel inherits Rectangle {
                         font-size: 12px;
                         color: #E2E8F0;
                         wrap: word-wrap;
+                        overflow: elide;
+                        vertical-stretch: 1;
                         vertical-alignment: top;
                     }
                 }

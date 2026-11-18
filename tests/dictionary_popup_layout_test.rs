@@ -1073,4 +1073,195 @@ mod rich_popup_phase4_tests {
             "subtitle hover popup must never overwrite DictionarySearchPanel results"
         );
     }
+
+    #[test]
+    fn data_dir_res_root_latest_cached_doc_width_and_long_headword_lines() {
+        init_no_event_loop();
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "memento-p4-data-res-{}-{seq}-{nanos}",
+            std::process::id()
+        ));
+        let config_dir = root.join("config");
+        let data_dir = root.join("data");
+        let data_res_dir = data_dir.join("res");
+        fs::create_dir_all(config_dir.join("dict_resources")).unwrap();
+        fs::create_dir_all(&data_res_dir).unwrap();
+        let db_path = data_dir.join("dictionaries.sqlite");
+
+        // Extract dictionary into `data_dir/res` (leaving `config_dir/dict_resources` empty!)
+        let styles_css = br#"span[data-sc-tag="resroot"] { color: #38BDF8; font-weight: bold; }"#;
+        let mono_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" fill="#000000"/></svg>"##;
+        let structured = serde_json::json!({
+            "type": "structured-content",
+            "content": [
+                {
+                    "tag": "div",
+                    "content": [
+                        { "tag": "span", "data": { "tag": "resroot" }, "content": "DataDirResBadge" },
+                        " long wrapping text for width cache testing across wide and narrow viewports ",
+                        {
+                            "tag": "img",
+                            "path": "icons/box.svg",
+                            "width": 20,
+                            "height": 20,
+                            "sizeUnits": "px",
+                            "appearance": "monochrome",
+                            "title": "DataResIconTip"
+                        },
+                        " ",
+                        {
+                            "tag": "a",
+                            "href": "?query=世界",
+                            "content": "NarrowTargetLink"
+                        }
+                    ]
+                }
+            ]
+        });
+        let term_bank = serde_json::json!([
+            ["寿限無寿限無五劫のすりきれ海砂利水魚の水行末", "じゅげむ", "n", "", 100, [structured], 1, ""],
+            ["世界", "せかい", "n", "", 90, ["world"], 2, ""]
+        ]);
+        let kanji_bank = serde_json::json!([
+            ["寿", "ジュ", "ことぶき", "", ["longevity"], {}]
+        ]);
+        let zip_path = root.join("data_res_dict.zip");
+        write_yomi_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"DataResDict","format":3,"revision":"1"}"#,
+                ),
+                ("styles.css", styles_css),
+                ("icons/box.svg", mono_svg),
+                ("term_bank_1.json", term_bank.to_string().as_bytes()),
+                ("kanji_bank_1.json", kanji_bank.to_string().as_bytes()),
+            ],
+        );
+        let dic_id = yomidbbuilder::process_dictionary(&zip_path, &db_path, &data_res_dir).unwrap();
+        assert!(!config_dir
+            .join("dict_resources")
+            .join(format!("dict-{dic_id}"))
+            .exists());
+        assert!(data_res_dir
+            .join(format!("dict-{dic_id}"))
+            .join("styles.css")
+            .is_file());
+
+        let dirs = memento_app::collect_dictionary_resource_dirs(&config_dir, &db_path);
+        assert_eq!(dirs, vec![config_dir.join("dict_resources"), data_res_dir.clone()]);
+        assert!(
+            memento_app::resolve_dictionary_asset_path_in_dirs(
+                &dirs,
+                dic_id,
+                "DataResDict",
+                "icons/box.svg"
+            )
+            .is_some()
+        );
+
+        let config = ConfigController::load(&config_dir, "memento.conf").unwrap();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &config);
+
+        let mut dict_ctrl = DictController::open(&db_path).unwrap();
+        let hits = dict_ctrl
+            .search("寿限無寿限無五劫のすりきれ海砂利水魚の水行末")
+            .to_vec();
+        assert_eq!(hits.len(), 1);
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        app.set_dict_query("寿限無寿限無五劫のすりきれ海砂利水魚の水行末".into());
+        app.set_anki_added_note_id("12345".into());
+        app.set_anki_added_result_index(0);
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+
+        // 1. Verify long headword wraps cleanly across multiple lines without dropping any characters
+        let hw_lines = pb.invoke_headword_lines(
+            "寿限無寿限無五劫のすりきれ海砂利水魚の水行末".into(),
+            220.0,
+        );
+        assert!(
+            hw_lines.row_count() >= 3,
+            "22-char headword must wrap into >= 3 lines within 220px"
+        );
+        let rejoined: String = hw_lines
+            .iter()
+            .flat_map(|line| line.chars.iter().map(|c| c.text.to_string()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(rejoined, "寿限無寿限無五劫のすりきれ海砂利水魚の水行末");
+
+        // 2. Verify `data_dir/res` `styles.css` + SVG `icons/box.svg` render AND `latest_cached_doc` tracks exact latest width!
+        let wide_render = pb.invoke_render_glossary(
+            1,
+            460.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        let narrow_render = pb.invoke_render_glossary(
+            1,
+            180.0,
+            false,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(wide_render.has_rich && narrow_render.has_rich);
+        assert!(
+            narrow_render.height_px > wide_render.height_px,
+            "narrow 180px layout must wrap taller than 460px layout ({} vs {})",
+            narrow_render.height_px,
+            wide_render.height_px
+        );
+        // Obtain exact hit-zone coordinates at narrow 180px width and verify `PopupBridge` hits the 180px doc (not stale 460px)!
+        let narrow_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            &hits[0].raw_glossary,
+            &hits[0].glossary,
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &dirs,
+            dic_id,
+            "DataResDict",
+            180.0,
+            false,
+        )
+        .unwrap();
+        let icon_tip_zone = narrow_doc
+            .hit_zones
+            .iter()
+            .find(|z| z.tooltip.as_deref() == Some("DataResIconTip"))
+            .expect("SVG image in data_dir/res must produce tooltip hit zone");
+        pb.invoke_glossary_pointer_hover(
+            1,
+            icon_tip_zone.x + 2.0,
+            icon_tip_zone.y + 2.0,
+            40.0,
+            80.0,
+        );
+        assert!(pb.get_tooltip_visible());
+        assert_eq!(pb.get_tooltip_text().as_str(), "DataResIconTip");
+
+        // 3. Verify in-popup navigation clears stale `anki_added_note_id` / `anki_added_result_index`!
+        pb.invoke_lookup_kanji_char(
+            "寿限無寿限無五劫のすりきれ海砂利水魚の水行末".into(),
+            "寿".into(),
+        );
+        assert_eq!(app.get_dict_query().as_str(), "寿");
+        assert_eq!(app.get_anki_added_note_id().as_str(), "");
+        assert_eq!(app.get_anki_added_result_index(), -1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

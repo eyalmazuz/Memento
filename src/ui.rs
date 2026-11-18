@@ -463,26 +463,68 @@ fn estimated_subtitle_text_width(text: &str, font_px: f32) -> f32 {
         * font_px
 }
 
-pub fn subtitle_token_width(word: &SubtitleWord, font_px: f32, furigana: bool) -> f32 {
-    if let Some(shaped_width) =
-        SHARED_TEXT_ENGINE.with(|engine| engine.borrow_mut().measure_subtitle_token_width(word, font_px, furigana))
-    {
+fn active_subtitle_render_style() -> SubtitleRenderStyle {
+    ACTIVE_RICH_BRIDGES.with(|slot| {
+        let Ok(bridges) = slot.try_borrow() else {
+            return SubtitleRenderStyle::default();
+        };
+        bridges
+            .iter()
+            .rev()
+            .find(|b| b.app_weak.upgrade().is_some())
+            .and_then(|b| b.state.try_borrow().ok().map(|st| st.settings.subtitle_style.clone()))
+            .unwrap_or_default()
+    })
+}
+
+fn subtitle_style_for_app(app: &MementoApp) -> SubtitleRenderStyle {
+    let bridge_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    if bridge_id > 0 {
+        if let Some(style) = ACTIVE_RICH_BRIDGES.with(|slot| {
+            let bridges = slot.try_borrow().ok()?;
+            let bridge = bridges.iter().find(|b| b.instance_id == bridge_id)?;
+            let st = bridge.state.try_borrow().ok()?;
+            Some(st.settings.subtitle_style.clone())
+        }) {
+            return style;
+        }
+    }
+    active_subtitle_render_style()
+}
+
+pub fn subtitle_token_width_with_style(
+    word: &SubtitleWord,
+    font_px: f32,
+    furigana: bool,
+    style: &SubtitleRenderStyle,
+) -> f32 {
+    if let Some(shaped_width) = SHARED_TEXT_ENGINE.with(|engine| {
+        engine
+            .borrow_mut()
+            .measure_subtitle_token_width(word, font_px, furigana, style)
+    }) {
         return shaped_width;
     }
     let base_width = estimated_subtitle_text_width(word.text.as_str(), font_px);
     let reading_width = if furigana && !word.reading.is_empty() {
-        estimated_subtitle_text_width(word.reading.as_str(), font_px * 0.5)
+        estimated_subtitle_text_width(word.reading.as_str(), font_px * style.furigana_ratio)
     } else {
         0.0
     };
     base_width.max(reading_width) + 2.0
 }
 
-pub fn subtitle_lines_from_words(
+pub fn subtitle_token_width(word: &SubtitleWord, font_px: f32, furigana: bool) -> f32 {
+    let style = active_subtitle_render_style();
+    subtitle_token_width_with_style(word, font_px, furigana, &style)
+}
+
+pub fn subtitle_lines_from_words_with_style(
     all_words: Vec<SubtitleWord>,
     max_width_px: f32,
     font_px: f32,
     furigana: bool,
+    style: &SubtitleRenderStyle,
 ) -> Vec<SubtitleLine> {
     let mut lines = Vec::new();
     let mut current_line: Vec<SubtitleWord> = Vec::new();
@@ -499,7 +541,7 @@ pub fn subtitle_lines_from_words(
             }
             continue;
         }
-        let token_width = subtitle_token_width(&word, font_px, furigana);
+        let token_width = subtitle_token_width_with_style(&word, font_px, furigana, style);
         if current_width + token_width > max_width_px && !current_line.is_empty() {
             lines.push(SubtitleLine {
                 words: Rc::new(VecModel::from(std::mem::take(&mut current_line))).into(),
@@ -520,10 +562,21 @@ pub fn subtitle_lines_from_words(
     lines
 }
 
+pub fn subtitle_lines_from_words(
+    all_words: Vec<SubtitleWord>,
+    max_width_px: f32,
+    font_px: f32,
+    furigana: bool,
+) -> Vec<SubtitleLine> {
+    let style = active_subtitle_render_style();
+    subtitle_lines_from_words_with_style(all_words, max_width_px, font_px, furigana, &style)
+}
+
 pub fn subtitle_lines_for_app(app: &MementoApp, words: Vec<SubtitleWord>) -> Vec<SubtitleLine> {
     let max_width_px = (app.get_video_width() as f32 - 72.0).max(120.0);
     let font_px = (app.get_video_height() as f32 * app.get_subtitle_scale()).max(8.0);
-    subtitle_lines_from_words(words, max_width_px, font_px, app.get_furigana_visible())
+    let style = subtitle_style_for_app(app);
+    subtitle_lines_from_words_with_style(words, max_width_px, font_px, app.get_furigana_visible(), &style)
 }
 
 pub fn publish_active_subtitle(
@@ -769,12 +822,12 @@ impl TextEngine {
         word: &SubtitleWord,
         font_px: f32,
         furigana: bool,
+        style: &SubtitleRenderStyle,
     ) -> Option<f32> {
         if word.text.is_empty() {
             return Some(0.0);
         }
-        let style = SubtitleRenderStyle::default();
-        let shaped = self.shape_and_render_subtitle_token(word, font_px, furigana, &style);
+        let shaped = self.shape_and_render_subtitle_token(word, font_px, furigana, style);
         (shaped.width_px > 0.0).then_some(shaped.width_px)
     }
 
@@ -1177,12 +1230,13 @@ fn append_svg_text_items(
     }
 }
 
-/// Exact per-glyph cluster hit-testing on a subtitle token using `parley::Cluster::from_point`.
-/// Returns `(byte_offset_in_token, char_offset_in_token)` for `(local_x, local_y)`.
-pub fn subtitle_cluster_at_point(
+/// Exact per-glyph cluster hit-testing on a subtitle token using `parley::Cluster::from_point`
+/// and an explicit `SubtitleRenderStyle`.
+pub fn subtitle_cluster_at_point_with_style(
     word: &SubtitleWord,
     font_px: f32,
     show_furigana: bool,
+    style: &SubtitleRenderStyle,
     local_x: f32,
     local_y: f32,
 ) -> Option<(usize, usize)> {
@@ -1191,8 +1245,7 @@ pub fn subtitle_cluster_at_point(
     }
     SHARED_TEXT_ENGINE.with(|engine| {
         let mut engine = engine.borrow_mut();
-        let style = SubtitleRenderStyle::default();
-        let shaped = engine.shape_and_render_subtitle_token(word, font_px, show_furigana, &style);
+        let shaped = engine.shape_and_render_subtitle_token(word, font_px, show_furigana, style);
         let text_x = local_x - shaped.glyph_x_px;
         let layout = engine.shape_single_line(
             word.text.as_str(),
@@ -1214,6 +1267,19 @@ pub fn subtitle_cluster_at_point(
         }
         Some((0, 0))
     })
+}
+
+/// Exact per-glyph cluster hit-testing on a subtitle token using `parley::Cluster::from_point`.
+/// Returns `(byte_offset_in_token, char_offset_in_token)` for `(local_x, local_y)`.
+pub fn subtitle_cluster_at_point(
+    word: &SubtitleWord,
+    font_px: f32,
+    show_furigana: bool,
+    local_x: f32,
+    local_y: f32,
+) -> Option<(usize, usize)> {
+    let style = active_subtitle_render_style();
+    subtitle_cluster_at_point_with_style(word, font_px, show_furigana, &style, local_x, local_y)
 }
 
 // ── Tag Colors & Redundant Tag Suppression (#220) ───────────────────────────
@@ -1492,6 +1558,20 @@ pub fn parse_dictionary_css_str(css: &str) -> Arc<ParsedStylesheet> {
     Arc::new(convert_parsed_stylesheet(parsed))
 }
 
+pub fn collect_dictionary_resource_dirs(
+    config_dir: &Path,
+    dictionary_db_path: &Path,
+) -> Vec<PathBuf> {
+    let mut dirs = vec![config_dir.join("dict_resources")];
+    if let Some(parent) = dictionary_db_path.parent() {
+        let res = parent.join("res");
+        if !dirs.iter().any(|d| d == &res) {
+            dirs.push(res);
+        }
+    }
+    dirs
+}
+
 #[derive(Default)]
 struct StylesheetCache {
     entries: HashMap<PathBuf, (Option<SystemTime>, Arc<ParsedStylesheet>)>,
@@ -1500,15 +1580,13 @@ struct StylesheetCache {
 impl StylesheetCache {
     fn get_for_dictionary(
         &mut self,
-        dict_resources_dir: &Path,
+        dict_resource_dirs: &[PathBuf],
         dic_id: i64,
         dict_name: &str,
     ) -> Option<Arc<ParsedStylesheet>> {
-        let style_path = memento_dict::databasemanager::resolve_dictionary_style_path(
-            dict_resources_dir,
-            dic_id,
-            dict_name,
-        )?;
+        let style_path = dict_resource_dirs.iter().find_map(|dir| {
+            memento_dict::databasemanager::resolve_dictionary_style_path(dir, dic_id, dict_name)
+        })?;
         let mtime = std::fs::metadata(&style_path)
             .ok()
             .and_then(|m| m.modified().ok());
@@ -1571,6 +1649,17 @@ pub fn resolve_dictionary_asset_path(
         }
     }
     None
+}
+
+pub fn resolve_dictionary_asset_path_in_dirs(
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    rel_path: &str,
+) -> Option<PathBuf> {
+    dict_resource_dirs
+        .iter()
+        .find_map(|dir| resolve_dictionary_asset_path(dir, dic_id, dict_name, rel_path))
 }
 
 /// Rasterizes a local dictionary image or SVG (supporting `appearance: "monochrome"` tinting via `resvg`)
@@ -1924,7 +2013,7 @@ fn extract_ruby_pairs(ruby_content: &DefJson) -> Vec<(String, String)> {
 struct GlossaryBuilder<'a> {
     renderer: DefRenderer,
     ctx: DefContext,
-    dict_resources_dir: &'a Path,
+    dict_resource_dirs: &'a [PathBuf],
     dic_id: i64,
     dict_name: &'a str,
 }
@@ -2085,8 +2174,8 @@ impl<'a> GlossaryBuilder<'a> {
 
         self.ctx.elements.pop();
 
-        let asset_path = resolve_dictionary_asset_path(
-            self.dict_resources_dir,
+        let asset_path = resolve_dictionary_asset_path_in_dirs(
+            self.dict_resource_dirs,
             self.dic_id,
             self.dict_name,
             rel_path,
@@ -3526,15 +3615,14 @@ fn layout_table_block(
 }
 
 /// Build and rasterize a rich structured-content glossary entry into a `RenderedGlossaryDoc`
-/// with full `memento-definition` CSS styling, tables, ruby, details, links, images/SVGs, and
-/// per-character selection hit-boxes.
-pub fn render_structured_glossary_entry(
+/// searching an ordered slice of dictionary resource directories (`config_dir/dict_resources`, `data_dir/res`).
+pub fn render_structured_glossary_entry_in_dirs(
     raw_glossary: &str,
     fallback_glossary: &str,
     stylesheet: Option<Arc<ParsedStylesheet>>,
     detail_states: &HashMap<String, bool>,
     legacy_style: LegacyGlossaryStyle,
-    dict_resources_dir: &Path,
+    dict_resource_dirs: &[PathBuf],
     dic_id: i64,
     dict_name: &str,
     avail_width_px: f32,
@@ -3598,7 +3686,7 @@ pub fn render_structured_glossary_entry(
     let mut builder = GlossaryBuilder {
         renderer,
         ctx,
-        dict_resources_dir,
+        dict_resource_dirs,
         dic_id,
         dict_name,
     };
@@ -3759,6 +3847,36 @@ pub fn render_structured_glossary_entry(
             plain_text,
         })
     })
+}
+
+/// Build and rasterize a rich structured-content glossary entry into a `RenderedGlossaryDoc`
+/// with full `memento-definition` CSS styling, tables, ruby, details, links, images/SVGs, and
+/// per-character selection hit-boxes.
+pub fn render_structured_glossary_entry(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resources_dir: &Path,
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+) -> Option<RenderedGlossaryDoc> {
+    let dirs = [dict_resources_dir.to_path_buf()];
+    render_structured_glossary_entry_in_dirs(
+        raw_glossary,
+        fallback_glossary,
+        stylesheet,
+        detail_states,
+        legacy_style,
+        &dirs,
+        dic_id,
+        dict_name,
+        avail_width_px,
+        selected,
+    )
 }
 
 // ── SQLite Helper Queries for Rich Tag Metadata & 3-Column Kanji Details ────
@@ -4141,7 +4259,7 @@ struct GlossaryDocCacheKey {
 
 struct RichUiMutable {
     config_dir: PathBuf,
-    dict_resources_dir: PathBuf,
+    dict_resource_dirs: Vec<PathBuf>,
     settings: CachedConfigSettings,
     dict_ctrl: DictController,
     db_sig: crate::controller::dict::DbFileFingerprint,
@@ -4152,6 +4270,7 @@ struct RichUiMutable {
     row_extras: HashMap<i32, RichRowExtras>,
     current_hits: Vec<SearchHit>,
     glossary_cache: HashMap<GlossaryDocCacheKey, RenderedGlossaryDoc>,
+    last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
     selection: Option<GlossarySelectionState>,
 
     suppress_history_reset: bool,
@@ -4210,23 +4329,34 @@ struct RichUiBridge {
 
 impl RichUiBridge {
     fn ensure_fresh_db_and_config(&self, app: &MementoApp) {
-        let mut st = self.state.borrow_mut();
-        let config_dir = st.config_dir.clone();
-        if st.settings.reload_if_changed_on_disk(&config_dir) {
-            app.global::<SubtitleOverlayBridge>()
-                .set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
-            let rev = app.global::<SubtitleOverlayBridge>().get_style_revision();
-            app.global::<SubtitleOverlayBridge>()
-                .set_style_revision(rev.wrapping_add(1));
+        let mut reloaded_config = false;
+        {
+            let mut st = self.state.borrow_mut();
+            let config_dir = st.config_dir.clone();
+            if st.settings.reload_if_changed_on_disk(&config_dir) {
+                reloaded_config = true;
+                app.global::<SubtitleOverlayBridge>()
+                    .set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
+                let rev = app.global::<SubtitleOverlayBridge>().get_style_revision();
+                app.global::<SubtitleOverlayBridge>()
+                    .set_style_revision(rev.wrapping_add(1));
+            }
+            let sig = crate::controller::dict::db_file_fingerprint(&self.db_path);
+            if sig != st.db_sig {
+                st.db_sig = sig;
+                st.dict_ctrl = DictController::open(&self.db_path).unwrap_or_default();
+            }
+            let order = st.settings.dict_order.clone();
+            st.dict_ctrl.set_order(&order);
+            st.db_helper.refresh_if_needed();
         }
-        let sig = crate::controller::dict::db_file_fingerprint(&self.db_path);
-        if sig != st.db_sig {
-            st.db_sig = sig;
-            st.dict_ctrl = DictController::open(&self.db_path).unwrap_or_default();
+        if reloaded_config {
+            let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
+            if !words.is_empty() {
+                let lines = subtitle_lines_for_app(app, words);
+                app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
+            }
         }
-        let order = st.settings.dict_order.clone();
-        st.dict_ctrl.set_order(&order);
-        st.db_helper.refresh_if_needed();
     }
 
     fn clear_subtitle_scan_state(&self, app: &MementoApp) {
@@ -4263,6 +4393,7 @@ impl RichUiBridge {
         st.rich_epoch = st.rich_epoch.wrapping_add(1);
         st.row_extras.clear();
         st.glossary_cache.clear();
+        st.last_rendered_key.clear();
         st.selection = None;
 
         if matches_hits {
@@ -4501,6 +4632,8 @@ impl RichUiBridge {
         pb.set_kana_reading_active(entry.kana_reading_active);
         pb.set_active_kana_reading(entry.active_kana_reading.into());
 
+        app.set_anki_added_note_id("".into());
+        app.set_anki_added_result_index(-1);
         set_dictionary_rows(app, entry.rows);
         let full = app.get_dict_results();
         let loaded = entry.loaded_count.max(1) as usize;
@@ -4623,6 +4756,8 @@ impl RichUiBridge {
             }
         }
         let _ = &mut hits;
+        app.set_anki_added_note_id("".into());
+        app.set_anki_added_result_index(-1);
         set_dictionary_rows(app, rows);
         app.set_dict_query(headword.into());
         app.set_dict_reading(reading.into());
@@ -4669,6 +4804,8 @@ impl RichUiBridge {
         pb.set_active_kana_reading("".into());
 
         let rows = dictionary_result_rows(&hits, &excluded);
+        app.set_anki_added_note_id("".into());
+        app.set_anki_added_result_index(-1);
         set_dictionary_rows(app, rows);
         app.set_dict_query(query.into());
         app.set_dict_reading(
@@ -4706,29 +4843,32 @@ impl RichUiBridge {
             details_sig,
             rich_epoch: st.rich_epoch,
         };
-        if let Some(doc) = st.glossary_cache.get(&cache_key) {
-            return Some(doc.clone());
+        if let Some(doc) = st.glossary_cache.get(&cache_key).cloned() {
+            st.last_rendered_key.insert(row_index, cache_key);
+            return Some(doc);
         }
         if st.glossary_cache.len() > 128 {
             st.glossary_cache.clear();
+            st.last_rendered_key.clear();
         }
-        let res_dir = st.dict_resources_dir.clone();
+        let res_dirs = st.dict_resource_dirs.clone();
         let sheet = st
             .stylesheets
-            .get_for_dictionary(&res_dir, hit.dictionary_id, &hit.dict_name);
+            .get_for_dictionary(&res_dirs, hit.dictionary_id, &hit.dict_name);
         let legacy_style = st.settings.glossary_style;
-        let doc = render_structured_glossary_entry(
+        let doc = render_structured_glossary_entry_in_dirs(
             &hit.raw_glossary,
             &hit.glossary,
             sheet,
             &extras.detail_states,
             legacy_style,
-            &res_dir,
+            &res_dirs,
             hit.dictionary_id,
             &hit.dict_name,
             bucket_w as f32,
             selected,
         )?;
+        st.last_rendered_key.insert(row_index, cache_key.clone());
         st.glossary_cache.insert(cache_key, doc.clone());
         Some(doc)
     }
@@ -4736,6 +4876,13 @@ impl RichUiBridge {
     fn latest_cached_doc(&self, row_index: i32) -> Option<RenderedGlossaryDoc> {
         let st = self.state.borrow();
         let epoch = st.rich_epoch;
+        if let Some(key) = st.last_rendered_key.get(&row_index) {
+            if key.rich_epoch == epoch {
+                if let Some(doc) = st.glossary_cache.get(key) {
+                    return Some(doc.clone());
+                }
+            }
+        }
         st.glossary_cache
             .iter()
             .find(|(k, _)| k.row_index == row_index && k.rich_epoch == epoch)
@@ -4849,8 +4996,15 @@ impl RichUiBridge {
         local_x: f32,
         local_y: f32,
     ) -> Option<HoveredSubtitleCluster> {
-        let (byte_offset, char_offset) =
-            subtitle_cluster_at_point(word, font_px, show_furigana, local_x, local_y)?;
+        let style = self.state.borrow().settings.subtitle_style.clone();
+        let (byte_offset, char_offset) = subtitle_cluster_at_point_with_style(
+            word,
+            font_px,
+            show_furigana,
+            &style,
+            local_x,
+            local_y,
+        )?;
         let sub_query = word.query.as_str().get(byte_offset..)?.to_owned();
         let first_ch = sub_query.chars().next()?;
         if !first_ch.is_alphanumeric() && !is_japanese_lookup_char(first_ch) {
@@ -4909,8 +5063,6 @@ fn is_modifier_only_key_text(text: &str) -> Option<(bool, bool, bool, bool)> {
         Some((false, false, true, false))
     } else if ch == char::from(Key::Meta) || ch == char::from(Key::MetaR) {
         Some((false, false, false, true))
-    } else if ch == char::from(Key::CapsLock) {
-        Some((false, false, false, false))
     } else {
         None
     }
@@ -4968,7 +5120,7 @@ pub fn install_rich_ui_bridges(
 ) {
     let settings = CachedConfigSettings::from_controller(config, config_dir);
     let middle_mouse_default = settings.middle_mouse_scan;
-    let dict_resources_dir = config_dir.join("dict_resources");
+    let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
     let db_sig = crate::controller::dict::db_file_fingerprint(dictionary_db_path);
     let mut dict_ctrl = DictController::open(dictionary_db_path).unwrap_or_default();
     dict_ctrl.set_order(&settings.dict_order);
@@ -5048,7 +5200,7 @@ pub fn install_rich_ui_bridges(
         db_path: dictionary_db_path.to_path_buf(),
         state: RefCell::new(RichUiMutable {
             config_dir: config_dir.to_path_buf(),
-            dict_resources_dir,
+            dict_resource_dirs,
             settings,
             dict_ctrl,
             db_sig,
@@ -5058,6 +5210,7 @@ pub fn install_rich_ui_bridges(
             row_extras: HashMap::new(),
             current_hits: Vec::new(),
             glossary_cache: HashMap::new(),
+            last_rendered_key: HashMap::new(),
             selection: None,
             suppress_history_reset: false,
             back_stack: Vec::new(),
@@ -5095,6 +5248,34 @@ pub fn install_rich_ui_bridges(
             })
             .collect();
         Rc::new(VecModel::from(chars)).into()
+    });
+
+    pb.on_headword_lines(|expr, avail_w| {
+        let max_w = avail_w.max(96.0);
+        let mut lines: Vec<RichHeadwordLine> = Vec::new();
+        let mut cur_line: Vec<RichHeadwordChar> = Vec::new();
+        let mut cur_w = 0.0f32;
+        for (i, ch) in expr.chars().enumerate() {
+            let cw = if ch.is_ascii() { 14.0 } else { 24.0 };
+            if !cur_line.is_empty() && cur_w + cw > max_w {
+                lines.push(RichHeadwordLine {
+                    chars: Rc::new(VecModel::from(std::mem::take(&mut cur_line))).into(),
+                });
+                cur_w = 0.0;
+            }
+            cur_w += cw;
+            cur_line.push(RichHeadwordChar {
+                text: ch.to_string().into(),
+                is_kanji: is_kanji_char(ch),
+                char_index: i as i32,
+            });
+        }
+        if !cur_line.is_empty() {
+            lines.push(RichHeadwordLine {
+                chars: Rc::new(VecModel::from(cur_line)).into(),
+            });
+        }
+        Rc::new(VecModel::from(lines)).into()
     });
 
     let b_term_pills = bridge.clone();
@@ -5309,6 +5490,7 @@ pub fn install_rich_ui_bridges(
                     .insert(detail_id.to_string(), !current);
             }
             st.glossary_cache.retain(|k, _| k.row_index != row_idx);
+            st.last_rendered_key.remove(&row_idx);
         }
         let pb = app.global::<PopupBridge>();
         pb.set_tooltip_visible(false);
@@ -5500,13 +5682,27 @@ pub fn install_rich_ui_bridges(
 
     let b_pkey = bridge.clone();
     pb.on_popup_key_pressed(move |text, control, shift, alt, meta| {
-        if is_modifier_only_key_text(text.as_str()).is_some() {
+        if let Some((mc, ms, ma, mm)) = is_modifier_only_key_text(text.as_str()) {
+            if let Some(app) = b_pkey.app_weak.upgrade() {
+                app.global::<SubtitleOverlayBridge>()
+                    .invoke_stationary_modifier_changed(
+                        control || mc,
+                        shift || ms,
+                        alt || ma,
+                        meta || mm,
+                    );
+            }
             return true;
         }
-        let Some(app) = b_pkey.app_weak.upgrade() else {
-            return false;
-        };
-        app.invoke_key_pressed(text, control, shift, alt, meta)
+        false
+    });
+
+    let b_prel = bridge.clone();
+    pb.on_popup_key_released(move |control, shift, alt, meta| {
+        if let Some(app) = b_prel.app_weak.upgrade() {
+            app.global::<SubtitleOverlayBridge>()
+                .invoke_stationary_modifier_changed(control, shift, alt, meta);
+        }
     });
 
     // Independent DictionarySearchPanel callbacks
@@ -5684,8 +5880,10 @@ pub fn install_rich_ui_bridges(
         },
     );
 
-    sb.on_cluster_char_offset(|word, font_px, show_furigana, local_x, local_y| {
-        subtitle_cluster_at_point(&word, font_px, show_furigana, local_x, local_y)
+    let b_cluster_off = bridge.clone();
+    sb.on_cluster_char_offset(move |word, font_px, show_furigana, local_x, local_y| {
+        let style = b_cluster_off.state.borrow().settings.subtitle_style.clone();
+        subtitle_cluster_at_point_with_style(&word, font_px, show_furigana, &style, local_x, local_y)
             .map_or(-1, |(_, char_off)| char_off as i32)
     });
 
@@ -5694,7 +5892,15 @@ pub fn install_rich_ui_bridges(
         let Some(app) = b_can_focus.app_weak.upgrade() else {
             return false;
         };
-        !app.get_dict_search_open() && !app.get_sub_drawer_open()
+        let pb = app.global::<PopupBridge>();
+        let has_glossary_selection =
+            app.get_dict_open() && !pb.get_selected_glossary_text().is_empty();
+        !app.get_dict_search_open()
+            && !app.get_sub_drawer_open()
+            && !app.get_menu_open()
+            && !app.get_ocr_mode()
+            && !app.get_about_open()
+            && !has_glossary_selection
     });
 
     let b_ptr_hover = bridge.clone();
@@ -5872,6 +6078,6 @@ pub fn install_rich_ui_bridges(
                 );
             return true;
         }
-        app.invoke_key_pressed(text, control, shift, alt, meta)
+        false
     });
 }
