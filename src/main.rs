@@ -17,7 +17,7 @@ mod video_gl;
 mod graphics_device;
 
 pub use ui::{
-    DictResult, InstalledDictionaryRow, MementoApp, MementoPalette, PlayerTrack,
+    ChapterMark, DictResult, InstalledDictionaryRow, MementoApp, MementoPalette, PlayerTrack,
     PitchGraph, PitchMora, PopupAudioSource, PopupBridge, PopupFrequency, PopupGlossaryBlock,
     AnkiHelpWindow, SettingsWindow, SubEntry, SubtitleLine, SubtitleWord,
 };
@@ -35,7 +35,8 @@ use controller::config::ConfigController;
 use controller::dict::DictController;
 use controller::player::{
     clear_primary_subtitle, compute_video_render_size, effective_media_title,
-    refresh_subtitle_list, refresh_subtitle_marks, LivePlayerCoordinator, MouseInputForwarder,
+    refresh_subtitle_list as base_refresh_subtitle_list, refresh_subtitle_marks,
+    LivePlayerCoordinator, MouseInputForwarder,
 };
 #[cfg(test)]
 use controller::player::{
@@ -423,6 +424,8 @@ fn load_playlist_into(
     let title = effective_media_title("", &first_path);
     app.set_media_title(title.into());
     app.set_secondary_sub_text("".into());
+    app.set_thumbnail_frame(slint::Image::default());
+    app.set_hover_chapter_title("".into());
     clear_primary_subtitle(app);
     Ok(Some(first_path))
 }
@@ -451,12 +454,41 @@ fn load_media_into(
     Ok(())
 }
 
+static RECENT_TITLES: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn recent_titles_map() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    RECENT_TITLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+pub fn record_recent_media_title(path: &str, media_title: &str) {
+    if path.trim().is_empty() {
+        return;
+    }
+    let effective = effective_media_title(media_title, path);
+    if !effective.is_empty() {
+        if let Ok(mut map) = recent_titles_map().lock() {
+            map.insert(path.to_owned(), effective);
+        }
+    }
+}
+
+pub fn format_recent_file_label(media_title: &str, path: &str) -> String {
+    let title = effective_media_title(media_title, path);
+    if title.is_empty() || title == path {
+        path.to_owned()
+    } else {
+        format!("{title} — {path}")
+    }
+}
+
 fn record_recent_media(
     app: &MementoApp,
     config: &ConfigController,
     cache_dir: &Path,
     path: &str,
 ) -> Result<(), String> {
+    record_recent_media_title(path, app.get_media_title().as_str());
     config.add_recent_file(path)?;
     config.save(cache_dir, "memento.conf")?;
     refresh_recent_files(app, config);
@@ -861,11 +893,199 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
 }
 
 
+fn estimate_drawer_row_height(text: &str, available_text_width: f32) -> f32 {
+    let usable_w = available_text_width.max(120.0);
+    let mut visual_lines = 0usize;
+    for raw_line in text.split('\n') {
+        let line_px: f32 = raw_line
+            .chars()
+            .map(|ch| if ch.is_ascii() { 7.5 } else { 13.5 })
+            .sum();
+        let wrapped = ((line_px / usable_w).ceil() as usize).max(1);
+        visual_lines += wrapped;
+    }
+    let visual_lines = visual_lines.max(1);
+    if visual_lines <= 1 {
+        36.0
+    } else {
+        (visual_lines as f32 * 18.0 + 14.0).max(36.0)
+    }
+}
+
+pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
+    let entries = if app.get_subtitle_drawer_tab() == 1 {
+        app.get_secondary_subtitle_entries()
+    } else {
+        app.get_subtitle_entries()
+    };
+    let count = entries.row_count();
+    if count == 0 || row_idx >= count {
+        return;
+    }
+    let text_width = (app.get_sidebar_width() - 104.0).max(120.0);
+    let mut row_y = 0.0f32;
+    let mut target_h = 36.0f32;
+    let mut total_h = 0.0f32;
+    for idx in 0..count {
+        let h = entries
+            .row_data(idx)
+            .map(|entry| estimate_drawer_row_height(entry.text.as_str(), text_width))
+            .unwrap_or(36.0);
+        if idx < row_idx {
+            row_y += h;
+        } else if idx == row_idx {
+            target_h = h;
+        }
+        total_h += h;
+    }
+    app.invoke_scroll_subtitle_drawer_to_offset(row_y, target_h, total_h);
+}
+
+pub fn auto_scroll_subtitle_drawer_if_needed(
+    app: &MementoApp,
+    subtitles: &SubtitleController,
+) {
+    if !app.get_sub_drawer_open() || app.get_subtitle_drawer_user_scrolling() {
+        return;
+    }
+    let active_idx = if app.get_subtitle_drawer_tab() == 1 {
+        subtitles
+            .active_indices(subtitles.secondary_sid())
+            .first()
+            .copied()
+    } else {
+        subtitles
+            .active_indices(subtitles.primary_sid())
+            .first()
+            .copied()
+    };
+    if let Some(row) = active_idx {
+        scroll_drawer_to_row_accurate(app, row);
+    }
+}
+
+pub fn refresh_subtitle_list(
+    app: &MementoApp,
+    model: &VecModel<SubEntry>,
+    subtitles: &SubtitleController,
+) {
+    base_refresh_subtitle_list(app, model, subtitles);
+    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+}
+
+pub fn refresh_secondary_subtitle_list(
+    app: &MementoApp,
+    model: &VecModel<SubEntry>,
+    subtitles: &SubtitleController,
+) {
+    let query = app.get_subtitle_search_query();
+    let active_tab = app.get_subtitle_drawer_tab();
+    let matching = if active_tab == 1 && !query.trim().is_empty() {
+        search_entries(subtitles.secondary_entries(), &query, true)
+    } else {
+        Vec::new()
+    };
+    let active = subtitles.active_indices(subtitles.secondary_sid());
+    let rows: Vec<SubEntry> = subtitles
+        .secondary_entries()
+        .iter()
+        .enumerate()
+        .map(|(index, cue)| SubEntry {
+            id: (index + 1) as i32,
+            start: cue.start as f32,
+            end: cue.end as f32,
+            text: String::from_utf16_lossy(&cue.text).into(),
+            selected: false,
+            is_active: active.contains(&index),
+            search_match: matching.contains(&index),
+        })
+        .collect();
+    model.set_vec(rows);
+    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+}
+
+fn search_entries(
+    entries: &[memento_subtitle::SubtitleEntry],
+    query: &str,
+    ignore_whitespace: bool,
+) -> Vec<usize> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let normalized_query: String = if ignore_whitespace {
+        trimmed
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    } else {
+        trimmed.chars().flat_map(char::to_lowercase).collect()
+    };
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cue)| {
+            let text = String::from_utf16_lossy(&cue.text);
+            let haystack: String = if ignore_whitespace {
+                text.chars()
+                    .filter(|c| !c.is_whitespace())
+                    .flat_map(char::to_lowercase)
+                    .collect()
+            } else {
+                text.chars().flat_map(char::to_lowercase).collect()
+            };
+            haystack.contains(&normalized_query).then_some(idx)
+        })
+        .collect()
+}
+
+static CLIPBOARD_HOLDER: std::sync::OnceLock<Mutex<Option<copypasta::ClipboardContext>>> =
+    std::sync::OnceLock::new();
+static FALLBACK_CLIPBOARD: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+
+pub fn copy_text_to_clipboard(text: &str) {
+    if let Ok(mut fallback) = FALLBACK_CLIPBOARD
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+    {
+        *fallback = text.to_owned();
+    }
+    use copypasta::ClipboardProvider;
+    let _ = std::panic::catch_unwind(|| {
+        let holder = CLIPBOARD_HOLDER.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = holder.lock() {
+            if guard.is_none() {
+                *guard = copypasta::ClipboardContext::new().ok();
+            }
+            if let Some(ctx) = guard.as_mut() {
+                let _ = ctx.set_contents(text.to_owned());
+            }
+        }
+    });
+}
+
+pub fn read_copied_text_or_clipboard() -> String {
+    let clip = controller::anki::read_clipboard_text();
+    if !clip.is_empty() {
+        return clip;
+    }
+    FALLBACK_CLIPBOARD
+        .get()
+        .and_then(|m| m.lock().ok().map(|s| s.clone()))
+        .unwrap_or_default()
+}
+
 fn install_subtitle_selection(
     app: &MementoApp,
     subtitles: Rc<RefCell<SubtitleController>>,
     rows: Rc<VecModel<SubEntry>>,
 ) {
+    let search_matches: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+
     let controller = subtitles.clone();
     let model = rows.clone();
     app.on_select_row(move |row, extend_range| {
@@ -894,19 +1114,170 @@ fn install_subtitle_selection(
         subtitles.set_selected(index, true);
         refresh_subtitle_marks(&model, &subtitles);
     });
+
+    let search_subs = subtitles.clone();
+    let search_rows = rows.clone();
+    let search_matches_rc = search_matches.clone();
     let weak = app.as_weak();
     app.on_search_subtitles(move |query| {
         let Some(app) = weak.upgrade() else { return; };
         app.set_subtitle_search_query(query.clone());
-        let matching = if query.trim().is_empty() { Vec::new() } else { subtitles.borrow().search(&query, true) };
-        for index in 0..rows.row_count() {
-            if let Some(mut row) = rows.row_data(index) {
-                let is_match = matching.contains(&index);
-                if row.search_match != is_match {
-                    row.search_match = is_match;
-                    rows.set_row_data(index, row);
+        let active_tab = app.get_subtitle_drawer_tab();
+        let matching = if query.trim().is_empty() {
+            Vec::new()
+        } else if active_tab == 1 {
+            let subs = search_subs.borrow();
+            let sec_matches = search_entries(subs.secondary_entries(), &query, true);
+            if !sec_matches.is_empty() {
+                sec_matches
+            } else {
+                let sec_model = app.get_secondary_subtitle_entries();
+                let q_norm: String = query.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+                (0..sec_model.row_count())
+                    .filter(|&i| {
+                        sec_model.row_data(i).is_some_and(|r| {
+                            let h: String = r.text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+                            h.contains(&q_norm)
+                        })
+                    })
+                    .collect()
+            }
+        } else {
+            search_subs.borrow().search(&query, true)
+        };
+
+        if active_tab == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            for index in 0..sec_model.row_count() {
+                if let Some(mut row) = sec_model.row_data(index) {
+                    let is_match = matching.contains(&index);
+                    if row.search_match != is_match {
+                        row.search_match = is_match;
+                        sec_model.set_row_data(index, row);
+                    }
                 }
             }
+            for index in 0..search_rows.row_count() {
+                if let Some(mut row) = search_rows.row_data(index) {
+                    if row.search_match {
+                        row.search_match = false;
+                        search_rows.set_row_data(index, row);
+                    }
+                }
+            }
+        } else {
+            for index in 0..search_rows.row_count() {
+                if let Some(mut row) = search_rows.row_data(index) {
+                    let is_match = matching.contains(&index);
+                    if row.search_match != is_match {
+                        row.search_match = is_match;
+                        search_rows.set_row_data(index, row);
+                    }
+                }
+            }
+        }
+
+        let total = matching.len() as i32;
+        app.set_subtitle_search_total_matches(total);
+        if let Some(&first_row) = matching.first() {
+            app.set_subtitle_search_current_match(1);
+            app.set_subtitle_search_focused_row(first_row as i32);
+            scroll_drawer_to_row_accurate(&app, first_row);
+        } else {
+            app.set_subtitle_search_current_match(0);
+            app.set_subtitle_search_focused_row(-1);
+        }
+        *search_matches_rc.borrow_mut() = matching;
+    });
+
+    let next_matches = search_matches.clone();
+    let next_weak = app.as_weak();
+    app.on_next_subtitle_search_match(move || {
+        let Some(app) = next_weak.upgrade() else { return; };
+        let matches = next_matches.borrow();
+        if matches.is_empty() {
+            return;
+        }
+        let len = matches.len();
+        let current = app.get_subtitle_search_current_match().max(1) as usize;
+        let next_idx = current % len;
+        let row = matches[next_idx];
+        app.set_subtitle_search_current_match((next_idx + 1) as i32);
+        app.set_subtitle_search_focused_row(row as i32);
+        scroll_drawer_to_row_accurate(&app, row);
+    });
+
+    let prev_matches = search_matches.clone();
+    let prev_weak = app.as_weak();
+    app.on_prev_subtitle_search_match(move || {
+        let Some(app) = prev_weak.upgrade() else { return; };
+        let matches = prev_matches.borrow();
+        if matches.is_empty() {
+            return;
+        }
+        let len = matches.len();
+        let current = app.get_subtitle_search_current_match().max(1) as usize;
+        let prev_idx = (current + len - 2) % len;
+        let row = matches[prev_idx];
+        app.set_subtitle_search_current_match((prev_idx + 1) as i32);
+        app.set_subtitle_search_focused_row(row as i32);
+        scroll_drawer_to_row_accurate(&app, row);
+    });
+
+    let tab_weak = app.as_weak();
+    let tab_subs = subtitles.clone();
+    app.on_subtitle_drawer_tab_changed(move |_tab| {
+        let Some(app) = tab_weak.upgrade() else { return; };
+        let q = app.get_subtitle_search_query();
+        app.invoke_search_subtitles(q.clone());
+        if q.trim().is_empty() {
+            if let Ok(subs) = tab_subs.try_borrow() {
+                auto_scroll_subtitle_drawer_if_needed(&app, &subs);
+            }
+        }
+    });
+
+    let user_scroll_timer = Rc::new(slint::Timer::default());
+    let scroll_timer_handle = user_scroll_timer.clone();
+    let scroll_weak = app.as_weak();
+    app.on_subtitle_drawer_user_scrolled(move || {
+        let weak = scroll_weak.clone();
+        scroll_timer_handle.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(2500),
+            move || {
+                if let Some(app) = weak.upgrade() {
+                    app.set_subtitle_drawer_user_scrolling(false);
+                }
+            },
+        );
+    });
+
+    let copy_subs = subtitles.clone();
+    let copy_weak = app.as_weak();
+    app.on_copy_selected_subtitles(move || {
+        let Some(app) = copy_weak.upgrade() else { return; };
+        let subs = copy_subs.borrow();
+        let selected_cues = subs.selected_cues();
+        let text = if !selected_cues.is_empty() {
+            selected_cues
+                .iter()
+                .map(|c| String::from_utf16_lossy(&c.text))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            let active = app.get_active_sub_text().to_string();
+            if !active.is_empty() {
+                active
+            } else {
+                subs.active_cue_text().unwrap_or_default()
+            }
+        };
+        if !text.is_empty() {
+            copy_text_to_clipboard(&text);
+            app.set_copied_subtitle_text(text.into());
+            app.set_status_message("Copied subtitle to clipboard".into());
         }
     });
 }
@@ -1177,6 +1548,56 @@ mod subtitle_layout_tests {
     }
 }
 
+fn is_bare_modifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        ""
+            | "\u{0010}"
+            | "\u{0011}"
+            | "\u{0012}"
+            | "\u{0013}"
+            | "\u{0014}"
+            | "\u{0015}"
+            | "\u{0016}"
+            | "\u{0017}"
+            | "\u{0018}"
+            | "Shift"
+            | "Control"
+            | "Ctrl"
+            | "Alt"
+            | "Meta"
+            | "Super"
+    )
+}
+
+fn translate_slint_key_name(key: &str) -> Option<&'static str> {
+    match key {
+        "\u{F700}" => Some("Up"),
+        "\u{F701}" => Some("Down"),
+        "\u{F702}" => Some("Left"),
+        "\u{F703}" => Some("Right"),
+        "\u{F704}" => Some("F1"),
+        "\u{F705}" => Some("F2"),
+        "\u{F706}" => Some("F3"),
+        "\u{F707}" => Some("F4"),
+        "\u{F708}" => Some("F5"),
+        "\u{F709}" => Some("F6"),
+        "\u{F70A}" => Some("F7"),
+        "\u{F70B}" => Some("F8"),
+        "\u{F70C}" => Some("F9"),
+        "\u{F70D}" => Some("F10"),
+        "\u{F70E}" => Some("F11"),
+        "\u{F70F}" => Some("F12"),
+        "\u{007f}" | "\u{F728}" => Some("Delete"),
+        "\u{001b}" => Some("Escape"),
+        "\u{0008}" => Some("Backspace"),
+        "\u{0009}" | "\u{0019}" => Some("Tab"),
+        "\u{000a}" | "\r" => Some("Return"),
+        " " => Some("Space"),
+        _ => None,
+    }
+}
+
 fn keyboard_chord(
     key: &str,
     control: bool,
@@ -1184,36 +1605,67 @@ fn keyboard_chord(
     alt: bool,
     meta: bool,
 ) -> String {
+    if is_bare_modifier_key(key) {
+        return String::new();
+    }
     let mut chord = String::new();
     if control { chord.push_str("Ctrl+"); }
     if alt { chord.push_str("Alt+"); }
     if shift { chord.push_str("Shift+"); }
     if meta { chord.push_str("Meta+"); }
-    chord.push_str(&key.to_uppercase());
+    if let Some(named) = translate_slint_key_name(key) {
+        chord.push_str(named);
+    } else {
+        chord.push_str(&key.to_uppercase());
+    }
     chord
 }
 
+fn chapter_marks_for_duration(chapters: &[f64], duration: f64) -> Vec<ChapterMark> {
+    if duration <= 0.0 {
+        return Vec::new();
+    }
+    chapters
+        .iter()
+        .enumerate()
+        .filter(|(_, &time)| time >= 0.0 && time <= duration)
+        .map(|(index, &time)| ChapterMark {
+            time: time as f32,
+            title: format!("Chapter {}", index + 1).into(),
+        })
+        .collect()
+}
 
-/// Opens native zenity file picker.
-fn pick_file_with_zenity() -> Option<PathBuf> {
-    let output = Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--title=Select Media or Subtitle File",
-            "--file-filter=Media Files | *.mkv *.mp4 *.webm *.avi *.mp3 *.flac *.wav *.ogg *.m4a *.ts *.mov *.ogv *.srt *.ass *.vtt",
-            "--file-filter=All Files | *",
-        ])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path_str.is_empty() {
-            return Some(PathBuf::from(path_str));
+fn chapter_title_at_time(app: &MementoApp, time_sec: f32) -> String {
+    let marks = app.get_chapter_marks();
+    let mut best_title = String::new();
+    let mut best_time = -1.0f32;
+    for i in 0..marks.row_count() {
+        if let Some(mark) = marks.row_data(i) {
+            if mark.time <= time_sec + 0.05 && mark.time >= best_time {
+                best_time = mark.time;
+                best_title = if mark.title.is_empty() {
+                    format!("Chapter {}", i + 1)
+                } else {
+                    mark.title.to_string()
+                };
+            }
         }
     }
-    None
+    if !best_title.is_empty() {
+        return best_title;
+    }
+    let chapters = app.get_chapters();
+    for i in (0..chapters.row_count()).rev() {
+        if let Some(ch_time) = chapters.row_data(i) {
+            if ch_time <= time_sec + 0.05 {
+                return format!("Chapter {}", i + 1);
+            }
+        }
+    }
+    String::new()
 }
+
 fn setting_number(config: &ConfigController, group: &str, key: &str, default: f64) -> f32 {
     match config.effective_setting(group, key) {
         Some(Value::Real(value)) => value as f32,
@@ -1231,8 +1683,18 @@ fn setting_enabled(config: &ConfigController, group: &str, key: &str, default: b
 }
 
 fn refresh_recent_files(app: &MementoApp, config: &ConfigController) {
-    let files: Vec<slint::SharedString> = config.recent_files().into_iter().map(Into::into).collect();
+    let raw_files = config.recent_files();
+    let titles = recent_titles_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let files: Vec<slint::SharedString> = raw_files.iter().cloned().map(Into::into).collect();
+    let labels: Vec<slint::SharedString> = raw_files
+        .iter()
+        .map(|path| format_recent_file_label(titles.get(path).map_or("", String::as_str), path).into())
+        .collect();
+    drop(titles);
     app.set_recent_files(Rc::new(VecModel::from(files)).into());
+    app.set_recent_file_labels(Rc::new(VecModel::from(labels)).into());
 }
 
 fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
@@ -1261,6 +1723,24 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
         config, raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE,
         raw::behavior::OSC_MIN_MOVE_DEFAULT as f64,
     ).round().max(0.0) as i32);
+    app.set_preview_thumbnails_enabled(setting_enabled(
+        config,
+        raw::behavior::GROUP,
+        raw::behavior::OSC_PREVIEW_THUMBNAILS,
+        raw::behavior::OSC_PREVIEW_THUMBNAILS_DEFAULT,
+    ));
+    app.set_popup_configured_width((setting_number(
+        config,
+        raw::interface::GROUP,
+        raw::interface::POPUP_WIDTH,
+        raw::interface::POPUP_WIDTH_DEFAULT as f64,
+    ).round().clamp(240.0, 960.0)) as f32);
+    app.set_popup_configured_height((setting_number(
+        config,
+        raw::interface::GROUP,
+        raw::interface::POPUP_HEIGHT,
+        raw::interface::POPUP_HEIGHT_DEFAULT as f64,
+    ).round().clamp(180.0, 720.0)) as f32);
     app.set_subtitle_scale(setting_number(
         config, raw::interface::GROUP, raw::interface::subtitle::SCALE,
         raw::interface::subtitle::SCALE_DEFAULT,
@@ -1302,6 +1782,14 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
     app.set_key_sub_decrease_size(shortcut(raw::keybind::profile::SUBTITLE_DECREASE_SIZE));
     app.set_key_sub_move_up(shortcut(raw::keybind::profile::SUBTITLE_MOVE_UP));
     app.set_key_sub_move_down(shortcut(raw::keybind::profile::SUBTITLE_MOVE_DOWN));
+    app.set_key_card_add(shortcut(raw::keybind::profile::CARD_ADD));
+    app.set_key_card_next(shortcut(raw::keybind::profile::CARD_NEXT));
+    app.set_key_card_prev(shortcut(raw::keybind::profile::CARD_PREVIOUS));
+    app.set_key_osc_visibility(shortcut(raw::keybind::profile::OSC_VISIBILITY));
+    app.set_key_sub_list_copy(shortcut(raw::keybind::profile::SUBTITLE_LIST_COPY_SELECTED));
+    app.set_key_sub_list_find(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND));
+    app.set_key_sub_list_find_next(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_NEXT));
+    app.set_key_sub_list_find_prev(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_PREVIOUS));
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1336,6 +1824,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("SLINT_BACKEND").is_none() {
         slint::BackendSelector::new().require_opengl().select()?;
     }
+    let _ = slint::set_xdg_app_id(memento_os::WAYLAND_APP_ID);
     let app = MementoApp::new()?;
     ui::prepare_text_fonts();
 
@@ -1391,6 +1880,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)))
         }
     };
+    let screensaver = Rc::new(RefCell::new(memento_os::Screensaver::new()));
     let video_timings = Rc::new(RefCell::new(VideoTimings::default()));
     let pending_playback_frame = Rc::new(Cell::new(None::<i32>));
     let current_render_size = Rc::new(Cell::new((0u32, 0u32)));
@@ -1409,10 +1899,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Subtitle model
+    // Subtitle models (primary & secondary)
     let sub_model = Rc::new(slint::VecModel::<SubEntry>::default());
     app.set_subtitle_entries(sub_model.clone().into());
+    let secondary_sub_model = Rc::new(slint::VecModel::<SubEntry>::default());
+    app.set_secondary_subtitle_entries(secondary_sub_model.clone().into());
     app.set_volume(100.0);
+    app.set_volume_max(100.0);
+    app.set_is_muted(false);
     app.set_current_time("00:00".into());
     app.set_duration_time("00:00".into());
     app.set_app_version(env!("CARGO_PKG_VERSION").into());
@@ -1556,28 +2050,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lookup_epoch = Arc::new(AtomicU64::new(0));
     let key_mpv = mpv.clone();
     let key_closing = closing.clone();
+    let key_hover_cursor = hover_cursor.clone();
     let shortcut_app = app.as_weak();
+    app.set_custom_key_handler_installed(true);
     app.on_key_pressed(move |text, control, shift, alt, meta| {
         if key_closing.get() { return true; }
         let Some(app) = shortcut_app.upgrade() else { return false };
-        // Any keyboard input dismisses a definition, even when the key is
-        // handled by the player or a child widget.
-        let had_dict_open = app.get_dict_open();
-        app.invoke_dismiss_definition();
+        // Bare modifiers (Shift/Ctrl/Alt/Super) must never dismiss YomitanPopup,
+        // and pressing a lookup modifier while hovering a token triggers lookup.
+        if is_bare_modifier_key(&text) {
+            if control || shift || alt || meta {
+                let hovered = key_hover_cursor.borrow().clone();
+                if let Some((word, index)) = hovered {
+                    app.invoke_hover_word(word.into(), index, control, shift, alt, meta);
+                }
+            }
+            return false;
+        }
         let chord = keyboard_chord(&text, control, shift, alt, meta);
         let assigned = |binding: &slint::SharedString| {
             !binding.is_empty() && chord.eq_ignore_ascii_case(binding.as_str())
         };
+        // Popup navigation and Anki card-add shortcuts operate on the open
+        // YomitanPopup and must NOT dismiss it.
+        if app.get_dict_open() {
+            if assigned(&app.get_key_card_next()) {
+                app.invoke_navigate_popup(1);
+                return true;
+            }
+            if assigned(&app.get_key_card_prev()) {
+                app.invoke_navigate_popup(-1);
+                return true;
+            }
+            if assigned(&app.get_key_card_add()) && app.get_anki_enabled() {
+                let idx = app.get_popup_focused_index().max(0);
+                app.invoke_add_anki_note(idx);
+                return true;
+            }
+        }
+        // Any other keyboard input dismisses a definition, even when the key is
+        // handled by the player or a child widget.
+        let had_dict_open = app.get_dict_open();
+        app.invoke_dismiss_definition();
         if assigned(&app.get_key_open_file()) {
             app.invoke_open_file();
         } else if assigned(&app.get_key_open_url()) {
             app.invoke_open_url();
-        } else if assigned(&app.get_key_show_search()) {
+        } else if assigned(&app.get_key_show_search()) || assigned(&app.get_key_card_add()) {
             app.set_dict_search_open(!app.get_dict_search_open());
-            app.set_sub_drawer_open(false);
         } else if assigned(&app.get_key_show_sub_list()) {
             app.set_sub_drawer_open(!app.get_sub_drawer_open());
-            app.set_dict_search_open(false);
+        } else if assigned(&app.get_key_sub_list_find()) {
+            app.set_sub_drawer_open(true);
+            app.invoke_focus_subtitle_search();
+        } else if assigned(&app.get_key_sub_list_find_next()) {
+            app.set_sub_drawer_open(true);
+            app.invoke_next_subtitle_search_match();
+        } else if assigned(&app.get_key_sub_list_find_prev()) {
+            app.set_sub_drawer_open(true);
+            app.invoke_prev_subtitle_search_match();
+        } else if assigned(&app.get_key_sub_list_copy()) {
+            app.invoke_copy_selected_subtitles();
+        } else if assigned(&app.get_key_osc_visibility()) {
+            let next_mode = (app.get_osc_visibility_mode() + 1).rem_euclid(3);
+            app.set_osc_visibility_mode(next_mode);
+            match next_mode {
+                0 => {
+                    app.set_osc_visible(true);
+                    app.set_status_message("OSC Visibility: Auto".into());
+                }
+                1 => {
+                    app.set_osc_visible(true);
+                    app.set_status_message("OSC Visibility: Visible".into());
+                }
+                _ => {
+                    app.set_osc_visible(false);
+                    app.set_status_message("OSC Visibility: Hidden".into());
+                }
+            }
         } else if assigned(&app.get_key_start_ocr()) {
             app.invoke_start_ocr();
         } else if assigned(&app.get_key_sub_auto_pause()) {
@@ -1601,7 +2151,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if text == " " && !(control || shift || alt || meta) {
             app.invoke_toggle_play();
         } else if text == "\u{001b}" || text == "Escape" {
-            if app.get_ocr_mode() {
+            if app.get_url_dialog_open() {
+                app.set_url_dialog_open(false);
+            } else if app.get_about_open() {
+                app.set_about_open(false);
+            } else if app.get_ocr_mode() {
                 app.set_ocr_mode(false);
             } else if had_dict_open {
             } else if app.get_dict_search_open() {
@@ -1625,8 +2179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "\u{F703}" => Some("RIGHT"),
                 "\u{0008}" => Some("BS"),
                 "\u{000a}" | "\r" => Some("ENTER"),
-                "\u{0009}" => Some("TAB"),
-                "\u{007f}" => Some("DEL"),
+                "\u{0009}" | "\u{0019}" => Some("TAB"),
+                "\u{007f}" | "\u{F728}" => Some("DEL"),
                 "\u{F704}" => Some("F1"),
                 "\u{F705}" => Some("F2"),
                 "\u{F706}" => Some("F3"),
@@ -1676,7 +2230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // The video surface is a Slint window, so mpv's fullscreen key cannot
-    // fullscreen it. Keep the OSC timer in the UI layer as well.
+    // fullscreen it. Keep the OSC timer and fullscreen cursor auto-hide in the UI layer.
     let osc_timer = Rc::new(slint::Timer::default());
     let osc_timer_app = app.as_weak();
     osc_timer.start(
@@ -1684,12 +2238,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_millis(app.get_osc_duration_ms() as u64),
         move || {
             let Some(app) = osc_timer_app.upgrade() else { return };
-            let fullscreen = app.window().is_fullscreen();
-            if app.get_is_fullscreen() != fullscreen {
-                app.set_is_fullscreen(fullscreen);
+            let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
+            if app.window().is_fullscreen() && !app.get_is_fullscreen() {
+                app.set_is_fullscreen(true);
             }
-            if app.get_duration() > 0.0 && !app.get_menu_open() && !app.get_dict_open() {
+            let mode = app.get_osc_visibility_mode();
+            if mode == 1 {
+                app.set_osc_visible(true);
+            } else if mode == 2 {
                 app.set_osc_visible(false);
+            } else if app.get_duration() > 0.0
+                && !app.get_menu_open()
+                && !app.get_dict_open()
+                && !app.get_osc_hovered()
+            {
+                app.set_osc_visible(false);
+            }
+            if fullscreen
+                && !app.get_menu_open()
+                && !app.get_dict_open()
+                && !app.get_osc_hovered()
+                && !app.get_ocr_mode()
+                && !app.get_about_open()
+                && !app.get_url_dialog_open()
+            {
+                app.set_cursor_hidden(true);
             }
         },
     );
@@ -1701,7 +2274,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_pointer = Rc::new(Cell::new(None::<(f32, f32)>));
     app.on_pointer_moved(move |x, y| {
         let Some(app) = pointer_app.upgrade() else { return };
-        if !app.get_dict_open() && !app.get_menu_open() && !app.get_ocr_mode() && !app.get_about_open() {
+        if !app.get_dict_open()
+            && !app.get_menu_open()
+            && !app.get_ocr_mode()
+            && !app.get_about_open()
+            && !app.get_url_dialog_open()
+        {
             if let (Ok(player_ref), Ok(mut coord_ref)) =
                 (pointer_mpv.try_borrow(), pointer_coord.try_borrow_mut())
             {
@@ -1726,7 +2304,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         last_pointer.set(Some((x, y)));
-        app.set_osc_visible(true);
+        if app.get_cursor_hidden() {
+            app.set_cursor_hidden(false);
+        }
+        if app.get_osc_visibility_mode() != 2 {
+            app.set_osc_visible(true);
+        }
         pointer_osc_timer.set_interval(std::time::Duration::from_millis(app.get_osc_duration_ms() as u64));
         pointer_osc_timer.restart();
     });
@@ -1789,7 +2372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let activity_osc_timer = osc_timer.clone();
     app.on_osc_activity(move || {
         let Some(app) = activity_app.upgrade() else { return };
-        app.set_osc_visible(true);
+        if app.get_cursor_hidden() {
+            app.set_cursor_hidden(false);
+        }
+        if app.get_osc_visibility_mode() != 2 {
+            app.set_osc_visible(true);
+        }
         activity_osc_timer.set_interval(std::time::Duration::from_millis(app.get_osc_duration_ms() as u64));
         activity_osc_timer.restart();
     });
@@ -1854,51 +2442,193 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let weak_app = app.as_weak();
-    let open_mpv = mpv.clone();
-    let open_coord = coordinator.clone();
-    let open_sub_ctrl = sub_ctrl.clone();
-    let open_sub_model = sub_model.clone();
-    let open_current_media = current_media.clone();
-    let open_config = config_ctrl.clone();
-    let open_generation = media_generation.clone();
-    let open_shared_gen = shared_media_generation.clone();
-    let open_cache = config_dir.clone();
+    thread_local! {
+        static OPEN_PATHS_SINK: RefCell<Option<Rc<dyn Fn(Vec<PathBuf>)>>> = const { RefCell::new(None) };
+    }
 
-    app.on_open_file(move || {
-        let Some(file_path) = pick_file_with_zenity() else { return };
-        let file_str = file_path.to_string_lossy().into_owned();
-        let Some(app) = weak_app.upgrade() else { return };
-        let player = open_mpv.borrow();
-        let Some(player) = player.as_ref() else {
-            app.set_status_message("Playback backend unavailable".into());
-            return;
-        };
-        if controller::player::is_subtitle_file(file_path.as_path()) {
-            if let Err(error) = player.command(&["sub-add", &file_str]) {
-                app.set_status_message(format!("Could not add subtitles: {error}").into());
+    let handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)> = {
+        let weak_app = app.as_weak();
+        let open_mpv = mpv.clone();
+        let open_coord = coordinator.clone();
+        let open_sub_ctrl = sub_ctrl.clone();
+        let open_sub_model = sub_model.clone();
+        let open_sec_sub_model = secondary_sub_model.clone();
+        let open_current_media = current_media.clone();
+        let open_config = config_ctrl.clone();
+        let open_generation = media_generation.clone();
+        let open_shared_gen = shared_media_generation.clone();
+        let open_cache = config_dir.clone();
+        Rc::new(move |paths: Vec<PathBuf>| {
+            if paths.is_empty() {
+                return;
             }
-            return;
-        }
-        match load_media_into(
-            &app,
-            player,
-            &file_str,
-            &open_generation,
-            &open_shared_gen,
-            Some(&open_coord),
-        ) {
-            Ok(()) => {
-                *open_current_media.borrow_mut() = Some(file_str.clone());
-                open_sub_ctrl.borrow_mut().clear();
-                open_sub_model.set_vec(Vec::new());
-                if let Err(error) =
-                    record_recent_media(&app, &open_config, &open_cache, &file_str)
-                {
-                    app.set_status_message(format!("Cannot save recent media: {error}").into());
+            let Some(app) = weak_app.upgrade() else { return };
+            let mut media_paths = Vec::new();
+            let mut subtitle_paths = Vec::new();
+            for path in paths {
+                if controller::player::is_subtitle_file(path.as_path()) {
+                    subtitle_paths.push(path);
+                } else {
+                    media_paths.push(path);
                 }
             }
-            Err(error) => app.set_status_message(format!("Cannot open media: {error}").into()),
+            let player_ref = open_mpv.borrow();
+            if !media_paths.is_empty() {
+                let Some(player) = player_ref.as_ref() else {
+                    app.set_status_message("Playback backend unavailable".into());
+                    return;
+                };
+                if media_paths.len() == 1 {
+                    let file_str = media_paths[0].to_string_lossy().into_owned();
+                    match load_media_into(
+                        &app,
+                        player,
+                        &file_str,
+                        &open_generation,
+                        &open_shared_gen,
+                        Some(&open_coord),
+                    ) {
+                        Ok(()) => {
+                            *open_current_media.borrow_mut() = Some(file_str.clone());
+                            open_sub_ctrl.borrow_mut().clear();
+                            open_sub_model.set_vec(Vec::new());
+                            open_sec_sub_model.set_vec(Vec::new());
+                            if let Err(error) =
+                                record_recent_media(&app, &open_config, &open_cache, &file_str)
+                            {
+                                app.set_status_message(
+                                    format!("Cannot save recent media: {error}").into(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            app.set_status_message(format!("Cannot open media: {error}").into());
+                        }
+                    }
+                } else {
+                    let loads: Vec<PlaylistLoad> = media_paths
+                        .iter()
+                        .map(|path| PlaylistLoad {
+                            path: path.to_string_lossy().into_owned(),
+                            options: Vec::new(),
+                        })
+                        .collect();
+                    match load_playlist_into(
+                        &app,
+                        player,
+                        &loads,
+                        &open_generation,
+                        &open_shared_gen,
+                        Some(&open_coord),
+                        false,
+                    ) {
+                        Ok(Some(first_path)) => {
+                            *open_current_media.borrow_mut() = Some(first_path.clone());
+                            open_sub_ctrl.borrow_mut().clear();
+                            open_sub_model.set_vec(Vec::new());
+                            open_sec_sub_model.set_vec(Vec::new());
+                            if let Err(error) =
+                                record_recent_media(&app, &open_config, &open_cache, &first_path)
+                            {
+                                app.set_status_message(
+                                    format!("Cannot save recent media: {error}").into(),
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            app.set_status_message(format!("Cannot open playlist: {error}").into());
+                        }
+                    }
+                }
+            }
+            for sub_path in subtitle_paths {
+                let sub_str = sub_path.to_string_lossy().into_owned();
+                let mut added_to_mpv = false;
+                if let Some(player) = player_ref.as_ref() {
+                    if app.get_duration() > 0.0 || !media_paths.is_empty() {
+                        match player.command(&["sub-add", &sub_str]) {
+                            Ok(()) => {
+                                added_to_mpv = true;
+                            }
+                            Err(error) => {
+                                app.set_status_message(
+                                    format!("Could not add subtitles: {error}").into(),
+                                );
+                            }
+                        }
+                    }
+                }
+                if !added_to_mpv && sub_path.is_file() {
+                    match parse_external_subtitles(&sub_path) {
+                        Ok(cues) => {
+                            let mut subtitles = open_sub_ctrl.borrow_mut();
+                            let sid = if subtitles.primary_sid() > 0 {
+                                subtitles.primary_sid()
+                            } else {
+                                subtitles.set_primary_sid(1);
+                                app.set_primary_sid(1);
+                                1
+                            };
+                            subtitles.set_external_cues(sid, &sub_str, cues);
+                            refresh_subtitle_list(&app, &open_sub_model, &subtitles);
+                        }
+                        Err(error) => {
+                            app.set_status_message(
+                                format!("Could not add subtitles: {error}").into(),
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    OPEN_PATHS_SINK.with(|slot| {
+        *slot.borrow_mut() = Some(handle_open_or_drop_paths.clone());
+    });
+
+    app.on_open_file(move || {
+        memento_os::open_files_async(
+            memento_os::FileDialogOptions::media_and_subtitles(None),
+            move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                let _ = slint::invoke_from_event_loop(move || {
+                    OPEN_PATHS_SINK.with(|slot| {
+                        let cb = slot.borrow().clone();
+                        if let Some(apply) = cb {
+                            apply(paths);
+                        }
+                    });
+                });
+            },
+        );
+    });
+
+    let drop_single = handle_open_or_drop_paths.clone();
+    app.on_file_dropped(move |uri_or_path| {
+        let paths = memento_os::parse_uri_list(uri_or_path.as_str());
+        if !paths.is_empty() {
+            drop_single(paths);
+        }
+    });
+
+    let drop_multi = handle_open_or_drop_paths.clone();
+    app.on_files_dropped(move |uris| {
+        let mut paths = Vec::new();
+        for i in 0..uris.row_count() {
+            if let Some(entry) = uris.row_data(i) {
+                for parsed in memento_os::parse_uri_list(entry.as_str()) {
+                    if !paths.contains(&parsed) {
+                        paths.push(parsed);
+                    }
+                }
+            }
+        }
+        if !paths.is_empty() {
+            drop_multi(paths);
         }
     });
 
@@ -1907,6 +2637,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recent_coord = coordinator.clone();
     let recent_subs = sub_ctrl.clone();
     let recent_model = sub_model.clone();
+    let recent_sec_model = secondary_sub_model.clone();
     let recent_current = current_media.clone();
     let recent_generation = media_generation.clone();
     let recent_shared_gen = shared_media_generation.clone();
@@ -1928,6 +2659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 *recent_current.borrow_mut() = Some(path.to_string());
                 recent_subs.borrow_mut().clear();
                 recent_model.set_vec(Vec::new());
+                recent_sec_model.set_vec(Vec::new());
                 if let Err(error) =
                     record_recent_media(&app, &recent_config, &recent_cache, &path)
                 {
@@ -1941,6 +2673,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clear_config = config_ctrl.clone();
     let clear_cache = config_dir.clone();
     app.on_clear_recent(move || {
+        recent_titles_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let result = clear_config.clear_recent_files()
             .and_then(|_| clear_config.save(&clear_cache, "memento.conf"));
         if let Some(app) = clear_app.upgrade() {
@@ -2089,17 +2825,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let secondary_mpv = mpv.clone();
     let secondary_subs = sub_ctrl.clone();
+    let secondary_sec_model = secondary_sub_model.clone();
     let secondary_app = app.as_weak();
     app.on_select_secondary_subtitle_track(move |id| {
         if let Some(player) = &*secondary_mpv.borrow() {
             match player.set_secondary_sid(id.into()) {
                 Ok(()) => {
-                    secondary_subs.borrow_mut().set_secondary_sid(id.into());
+                    let mut subtitles = secondary_subs.borrow_mut();
+                    subtitles.set_secondary_sid(id.into());
                     if let Some(app) = secondary_app.upgrade() {
                         app.set_secondary_sid(id);
+                        refresh_secondary_subtitle_list(&app, &secondary_sec_model, &subtitles);
+                        if id <= 0 && app.get_subtitle_drawer_tab() == 1 {
+                            app.set_subtitle_drawer_tab(0);
+                        }
                     }
                 }
                 Err(error) => eprintln!("Cannot select secondary subtitle track {id}: {error}"),
+            }
+        } else {
+            let mut subtitles = secondary_subs.borrow_mut();
+            subtitles.set_secondary_sid(id.into());
+            if let Some(app) = secondary_app.upgrade() {
+                app.set_secondary_sid(id);
+                refresh_secondary_subtitle_list(&app, &secondary_sec_model, &subtitles);
+                if id <= 0 && app.get_subtitle_drawer_tab() == 1 {
+                    app.set_subtitle_drawer_tab(0);
+                }
             }
         }
     });
@@ -2212,11 +2964,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let vol_app = app.as_weak();
     let vol_mpv = mpv.clone();
     app.on_set_volume(move |vol| {
+        let max_vol = vol_app
+            .upgrade()
+            .map(|app| app.get_volume_max().max(100.0))
+            .unwrap_or(100.0);
+        let clamped = vol.clamp(0.0, max_vol);
+        if let Some(app) = vol_app.upgrade() {
+            app.set_volume(clamped);
+            if clamped > 0.0 && app.get_is_muted() {
+                app.set_is_muted(false);
+            }
+        }
         if let Some(mpv_inst) = &*vol_mpv.borrow() {
-            let _ = mpv_inst.set_volume(vol as f64);
-            if vol > 0.0 {
+            let _ = mpv_inst.set_volume(clamped as f64);
+            if clamped > 0.0 {
                 let _ = mpv_inst.command_async(&["set", "mute", "no"]);
             }
         }
@@ -2226,11 +2990,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak_mute = app.as_weak();
     let mute_mpv = mpv.clone();
     app.on_toggle_mute(move || {
-        if let Some(mpv_inst) = &*mute_mpv.borrow() {
-            let _ = mpv_inst.command_async(&["cycle", "mute"]);
-        } else if let Some(app) = weak_mute.upgrade() {
-            let vol = app.get_volume();
-            app.set_volume(if vol > 0.0 { 0.0 } else { 100.0 });
+        if let Some(app) = weak_mute.upgrade() {
+            let next_muted = !app.get_is_muted();
+            app.set_is_muted(next_muted);
+            if let Some(mpv_inst) = &*mute_mpv.borrow() {
+                let _ = mpv_inst.command_async(&[
+                    "set",
+                    "mute",
+                    if next_muted { "yes" } else { "no" },
+                ]);
+            }
         }
     });
 
@@ -2238,8 +3007,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vup_mpv = mpv.clone();
     app.on_volume_up(move || {
         if let Some(app) = weak_vup.upgrade() {
-            let new_vol = (app.get_volume() + 5.0).min(100.0);
+            let max_vol = app.get_volume_max().max(100.0);
+            let new_vol = (app.get_volume() + 5.0).clamp(0.0, max_vol);
             app.set_volume(new_vol);
+            if app.get_is_muted() {
+                app.set_is_muted(false);
+            }
             if let Some(mpv_inst) = &*vup_mpv.borrow() {
                 let _ = mpv_inst.command_async(&["set", "mute", "no"]);
                 let _ = mpv_inst.set_volume(new_vol as f64);
@@ -2251,7 +3024,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vdown_mpv = mpv.clone();
     app.on_volume_down(move || {
         if let Some(app) = weak_vdown.upgrade() {
-            let new_vol = (app.get_volume() - 5.0).max(0.0);
+            let max_vol = app.get_volume_max().max(100.0);
+            let new_vol = (app.get_volume() - 5.0).clamp(0.0, max_vol);
             app.set_volume(new_vol);
             if let Some(mpv_inst) = &*vdown_mpv.borrow() {
                 let _ = mpv_inst.set_volume(new_vol as f64);
@@ -2260,6 +3034,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_url = app.as_weak();
+    app.on_open_url(move || {
+        let Some(app) = weak_url.upgrade() else { return };
+        let clip = read_copied_text_or_clipboard();
+        let trimmed = clip.trim();
+        if trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+            || trimmed.starts_with("rtsp://")
+            || trimmed.starts_with("rtmp://")
+            || trimmed.starts_with("mms://")
+            || trimmed.starts_with("file://")
+        {
+            app.set_url_dialog_text(trimmed.into());
+        }
+        app.set_url_dialog_open(true);
+    });
+
+    let submit_url_app = app.as_weak();
     let url_mpv = mpv.clone();
     let url_coord = coordinator.clone();
     let url_current = current_media.clone();
@@ -2267,21 +3058,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url_generation = media_generation.clone();
     let url_shared_gen = shared_media_generation.clone();
     let url_model = sub_model.clone();
-    app.on_open_url(move || {
-        let Some(app) = weak_url.upgrade() else { return };
-        let output = match Command::new("zenity")
-            .args(["--entry", "--title=Open Stream URL", "--text=Enter video URL:"])
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                app.set_status_message(format!("Cannot open URL dialog: {error}").into());
-                return;
-            }
-        };
-        if !output.status.success() { return }
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if url.is_empty() { return }
+    let url_sec_model = secondary_sub_model.clone();
+    app.on_open_url_submitted(move |raw_url| {
+        let Some(app) = submit_url_app.upgrade() else { return };
+        app.set_url_dialog_open(false);
+        let url = raw_url.trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
         if let Some(player) = &*url_mpv.borrow() {
             match load_media_into(
                 &app,
@@ -2295,9 +3079,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *url_current.borrow_mut() = Some(url);
                     url_subs.borrow_mut().clear();
                     url_model.set_vec(Vec::new());
+                    url_sec_model.set_vec(Vec::new());
                 }
                 Err(error) => app.set_status_message(format!("Cannot open URL: {error}").into()),
             }
+        } else {
+            *url_current.borrow_mut() = Some(url.clone());
+            app.set_media_title(url.into());
         }
     });
 
@@ -2309,6 +3097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reload_generation = media_generation.clone();
     let reload_shared_gen = shared_media_generation.clone();
     let reload_model = sub_model.clone();
+    let reload_sec_model = secondary_sub_model.clone();
     app.on_reload_media(move || {
         let Some(app) = reload_app.upgrade() else { return };
         let current = reload_current.borrow().clone();
@@ -2325,6 +3114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {
                     reload_subs.borrow_mut().clear();
                     reload_model.set_vec(Vec::new());
+                    reload_sec_model.set_vec(Vec::new());
                 }
                 Err(error) => app.set_status_message(format!("Cannot reload media: {error}").into()),
             }
@@ -2336,10 +3126,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let close_coord = coordinator.clone();
     let close_sub_ctrl = sub_ctrl.clone();
     let close_sub_model = sub_model.clone();
+    let close_sec_sub_model = secondary_sub_model.clone();
     let close_current = current_media.clone();
     let close_generation = media_generation.clone();
     let close_shared_gen = shared_media_generation.clone();
     let close_asr = asr_session.clone();
+    let close_screensaver = screensaver.clone();
     app.on_close_media(move || {
         {
             let player_ref = close_mpv.borrow();
@@ -2352,6 +3144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = mpv_inst.command(&["stop"]);
             }
         }
+        close_screensaver.borrow_mut().uninhibit();
         close_asr.borrow_mut().cancel();
         let next_gen = close_generation.get().wrapping_add(1);
         close_generation.set(next_gen);
@@ -2359,6 +3152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *close_current.borrow_mut() = None;
         close_sub_ctrl.borrow_mut().clear();
         close_sub_model.set_vec(Vec::new());
+        close_sec_sub_model.set_vec(Vec::new());
         if let Some(app) = weak_close.upgrade() {
             app.set_pending_playback_generation(-1);
             app.set_asr_track_selected(false);
@@ -2371,6 +3165,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_secondary_sub_text("".into());
             app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
             app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
+            app.set_chapters(Rc::new(VecModel::from(Vec::new())).into());
+            app.set_chapter_marks(Rc::new(VecModel::from(Vec::new())).into());
+            app.set_thumbnail_frame(slint::Image::default());
+            app.set_hover_chapter_title("".into());
             app.set_selected_token_index(-1);
             app.set_current_time("00:00".into());
             app.set_duration_time("00:00".into());
@@ -2385,9 +3183,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quit_player = mpv.clone();
     let quit_hover_resume = hover_resume_timer.clone();
     let quit_hover_owned = hover_pause_owned.clone();
+    let quit_screensaver = screensaver.clone();
     let quit_app = app.as_weak();
     app.on_quit_app(move || {
         if quit_closing.replace(true) { return; }
+        quit_screensaver.borrow_mut().uninhibit();
         quit_restart.set(false);
         quit_hover_resume.stop();
         quit_hover_owned.set(false);
@@ -2430,15 +3230,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let add_sub_mpv = mpv.clone();
-    let add_sub_app = app.as_weak();
     app.on_add_subtitle(move || {
-        let Some(file_path) = pick_file_with_zenity() else { return };
-        let Some(app) = add_sub_app.upgrade() else { return };
-        let Some(player) = &*add_sub_mpv.borrow() else { return };
-        if let Err(error) = player.command(&["sub-add", &file_path.to_string_lossy()]) {
-            app.set_status_message(format!("Cannot add subtitles: {error}").into());
-        }
+        memento_os::open_files_async(
+            memento_os::FileDialogOptions::subtitles_only(None),
+            move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                let _ = slint::invoke_from_event_loop(move || {
+                    OPEN_PATHS_SINK.with(|slot| {
+                        let cb = slot.borrow().clone();
+                        if let Some(apply) = cb {
+                            apply(paths);
+                        }
+                    });
+                });
+            },
+        );
     });
 
     let delay_mpv = mpv.clone();
@@ -2529,7 +3337,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.invoke_dismiss_definition();
                                 app.set_dict_query(text.into());
                                 app.set_dict_search_open(true);
-                                app.set_sub_drawer_open(false);
                                 app.invoke_search_dictionary(text.into());
                                 app.set_status_message(format!("OCR: {text}").into());
                             } else {
@@ -2582,14 +3389,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let ext_link_app = app.as_weak();
+    app.on_open_external_link(move |url| {
+        let url_str = url.trim().to_owned();
+        if url_str.is_empty() {
+            return;
+        }
+        let weak = ext_link_app.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = webbrowser::open(&url_str) {
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    app.set_status_message(format!("Could not open link: {error}").into());
+                });
+            }
+        });
+    });
+
+    // ── Timeline Hover Preview (Chapter Label + Background MpvThumbnail Worker) ──
+    let (thumb_tx, thumb_rx) = std::sync::mpsc::channel::<(String, f64)>();
+    let thumb_worker_app = app.as_weak();
+    std::thread::spawn(move || {
+        let mut thumb_mpv: Option<(MpvInstance, memento_player::mpv::MpvSoftwareRenderer)> = None;
+        let mut loaded_path = String::new();
+        while let Ok(mut req) = thumb_rx.recv() {
+            while let Ok(newer) = thumb_rx.try_recv() {
+                req = newer;
+            }
+            let (path, time_sec) = req;
+            if path.is_empty() || !Path::new(&path).is_file() {
+                continue;
+            }
+            if thumb_mpv.is_none() {
+                let opts = [
+                    memento_player::CliOption { name: "config".into(), value: "no".into() },
+                    memento_player::CliOption { name: "aid".into(), value: "no".into() },
+                    memento_player::CliOption { name: "sid".into(), value: "no".into() },
+                    memento_player::CliOption { name: "secondary-sid".into(), value: "no".into() },
+                    memento_player::CliOption { name: "osc".into(), value: "no".into() },
+                    memento_player::CliOption { name: "pause".into(), value: "yes".into() },
+                    memento_player::CliOption { name: "ytdl".into(), value: "no".into() },
+                    memento_player::CliOption { name: "terminal".into(), value: "no".into() },
+                    memento_player::CliOption { name: "hwdec".into(), value: "no".into() },
+                    memento_player::CliOption { name: "hr-seek".into(), value: "no".into() },
+                    memento_player::CliOption { name: "load-scripts".into(), value: "no".into() },
+                ];
+                if let Ok(inst) = MpvInstance::new_with_options(None, &opts) {
+                    let renderer = inst.software_renderer();
+                    thumb_mpv = Some((inst, renderer));
+                }
+            }
+            let Some((inst, renderer)) = thumb_mpv.as_ref() else {
+                continue;
+            };
+            if loaded_path != path {
+                if inst.load_file(&path).is_err() {
+                    continue;
+                }
+                loaded_path = path.clone();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(160);
+                while std::time::Instant::now() < deadline {
+                    if inst.take_render_update() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let _ = inst.command(&["seek", &format!("{:.3}", time_sec.max(0.0)), "absolute+keyframes"]);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(80);
+            while std::time::Instant::now() < deadline {
+                if inst.take_render_update() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(160, 90);
+            if unsafe { renderer.render_rgba(160, 90, buffer.make_mut_bytes()) }.is_ok() {
+                let _ = thumb_worker_app.upgrade_in_event_loop(move |app| {
+                    app.set_thumbnail_frame(slint::Image::from_rgba8(buffer));
+                });
+            }
+        }
+    });
+
+    let hover_timeline_app = app.as_weak();
+    let hover_timeline_media = current_media.clone();
+    let hover_thumb_tx = thumb_tx.clone();
+    app.on_timeline_hover_moved(move |time_sec| {
+        let Some(app) = hover_timeline_app.upgrade() else { return };
+        let chapter_title = chapter_title_at_time(&app, time_sec);
+        if app.get_hover_chapter_title().as_str() != chapter_title {
+            app.set_hover_chapter_title(chapter_title.into());
+        }
+        if app.get_preview_thumbnails_enabled() {
+            if let Some(path) = hover_timeline_media.borrow().clone() {
+                let _ = hover_thumb_tx.send((path, time_sec as f64));
+            }
+        }
+    });
 
     let weak_fs = app.as_weak();
     app.on_toggle_fullscreen(move || {
         if let Some(app) = weak_fs.upgrade() {
-            let next = !app.window().is_fullscreen();
+            let next = !(app.window().is_fullscreen() || app.get_is_fullscreen());
             app.window().set_fullscreen(next);
             app.set_is_fullscreen(next);
-            app.set_osc_visible(true);
+            app.set_cursor_hidden(false);
+            if app.get_osc_visibility_mode() != 2 {
+                app.set_osc_visible(true);
+            }
             app.invoke_osc_activity();
         }
     });
@@ -2705,9 +3612,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.invoke_lookup_word(query.into_owned().into());
             }
         } else if url::Url::parse(href.as_str()).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
-            if let Err(error) = Command::new("xdg-open").arg(href.as_str()).spawn() {
-                app.set_status_message(format!("Could not open dictionary link: {error}").into());
-            }
+            let link = href.to_string();
+            let weak = glossary_link_app.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = webbrowser::open(&link) {
+                    let _ = weak.upgrade_in_event_loop(move |app| {
+                        app.set_status_message(format!("Could not open dictionary link: {error}").into());
+                    });
+                }
+            });
         }
     });
     let hover_app = app.as_weak();
@@ -3271,6 +4184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui_gen = ext_sub_ui_gen.clone();
         let subs_rc = ext_sub_ctrl.clone();
         let model_rc = ext_sub_model.clone();
+        let sec_model_rc = secondary_sub_model.clone();
         let coord_rc = ext_sub_coord.clone();
         *slot.borrow_mut() = Some(Rc::new(move || {
             while let Ok((generation, track_id, path_str, result)) = ext_parsed_rx.try_recv() {
@@ -3310,6 +4224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 refresh_subtitle_list(&app, &model_rc, &subtitles);
+                refresh_secondary_subtitle_list(&app, &sec_model_rc, &subtitles);
             }
         }));
     });
@@ -3321,6 +4236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sync_coord = coordinator.clone();
         let sync_sub_ctrl = sub_ctrl.clone();
         let sync_sub_model = sub_model.clone();
+        let sync_sec_sub_model = secondary_sub_model.clone();
         let sync_media_generation = media_generation.clone();
         let sync_shared_gen = shared_media_generation.clone();
         let sync_current_media = current_media.clone();
@@ -3335,9 +4251,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sync_video_timings = video_timings.clone();
         let sync_pending_frame = pending_playback_frame.clone();
         let sync_ext_sub_tx = ext_sub_sender.clone();
+        let sync_screensaver = screensaver.clone();
         let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
         let previous_furigana_visible = Cell::new(app.get_furigana_visible());
         let previous_subtitle_layout: Cell<Option<(i32, i32, u32, bool)>> = Cell::new(None);
+        let previous_chapters: RefCell<Vec<f64>> = RefCell::new(Vec::new());
+        let previous_chapters_dur = Cell::new(0.0f64);
+        let previous_title_pair: RefCell<(String, String)> = RefCell::new((String::new(), String::new()));
+        let previous_sec_state: Cell<(i64, usize, Option<usize>)> = Cell::new((0, 0, None));
+        let previous_playback_active: Cell<Option<bool>> = Cell::new(None);
+        let previous_active_scroll: Cell<(bool, i32, Option<usize>, Option<usize>)> =
+            Cell::new((false, 0, None, None));
         let last_video_report = Cell::new(std::time::Instant::now());
         let previous_drops = Cell::new((0i64, 0i64));
         let last_sync = Cell::new(std::time::Instant::now());
@@ -3411,6 +4335,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let state = coord.playback_state();
+            if app.get_is_muted() != state.mute {
+                app.set_is_muted(state.mute);
+            }
+            let effective_vol_max = (state.volume_max.max(100) as f32).clamp(100.0, 1000.0);
+            if (app.get_volume_max() - effective_vol_max).abs() > 0.5 {
+                app.set_volume_max(effective_vol_max);
+            }
+            let playback_active = state.file_loaded && !state.paused;
+            if previous_playback_active.replace(Some(playback_active)) != Some(playback_active) {
+                if let Ok(mut ss) = sync_screensaver.try_borrow_mut() {
+                    ss.sync_playback(state.file_loaded, state.paused, "Playing media");
+                }
+            }
+            let prim_active = subtitles
+                .active_indices(subtitles.primary_sid())
+                .first()
+                .copied();
+            let sec_sid = subtitles.secondary_sid();
+            let sec_count = subtitles.secondary_entries().len();
+            let sec_active = subtitles.active_indices(sec_sid).first().copied();
+            if previous_sec_state.replace((sec_sid, sec_count, sec_active))
+                != (sec_sid, sec_count, sec_active)
+            {
+                refresh_secondary_subtitle_list(&app, &sync_sec_sub_model, &subtitles);
+            }
+            let scroll_state = (
+                app.get_sub_drawer_open(),
+                app.get_subtitle_drawer_tab(),
+                prim_active,
+                sec_active,
+            );
+            if previous_active_scroll.replace(scroll_state) != scroll_state {
+                auto_scroll_subtitle_drawer_if_needed(&app, &subtitles);
+            }
+            if !state.path.is_empty() && !state.media_title.is_empty() {
+                let mut prev_pair = previous_title_pair.borrow_mut();
+                if prev_pair.0 != state.path || prev_pair.1 != state.media_title {
+                    *prev_pair = (state.path.clone(), state.media_title.clone());
+                    drop(prev_pair);
+                    record_recent_media_title(&state.path, &state.media_title);
+                    refresh_recent_files(&app, &sync_asr_config);
+                }
+            }
+            {
+                let mut prev_ch = previous_chapters.borrow_mut();
+                if *prev_ch != state.chapters
+                    || (previous_chapters_dur.get() - state.duration).abs() > 0.5
+                {
+                    *prev_ch = state.chapters.clone();
+                    previous_chapters_dur.set(state.duration);
+                    let raw_ch: Vec<f32> = state.chapters.iter().map(|&t| t as f32).collect();
+                    let marks = chapter_marks_for_duration(&state.chapters, state.duration);
+                    app.set_chapters(Rc::new(VecModel::from(raw_ch)).into());
+                    app.set_chapter_marks(Rc::new(VecModel::from(marks)).into());
+                }
+            }
+
             if app.get_pending_playback_generation() >= 0 && state.playback_ready {
                 if player.is_opengl_active() {
                     sync_pending_frame.set(Some(app.get_pending_playback_generation()));
@@ -3856,9 +4837,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_result = app.run();
     timer.stop();
     quit_timer.stop();
+    screensaver.borrow_mut().uninhibit();
     MPV_EVENT_SYNC.with(|slot| *slot.borrow_mut() = None);
     EXTERNAL_SUBTITLE_SINK.with(|slot| *slot.borrow_mut() = None);
+    OPEN_PATHS_SINK.with(|slot| *slot.borrow_mut() = None);
     drop(ext_sub_sender);
+    drop(thumb_tx);
     // Also cover an event-loop error or any exit that bypasses the close callback.
     asr_session.borrow_mut().shutdown();
     drop(render_worker);
@@ -3890,6 +4874,478 @@ mod xdg_migration_tests {
         assert_eq!(
             std::fs::read_to_string(config_dir.join("memento.conf")).unwrap(),
             "existing=2\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_ux_tests {
+    use super::*;
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
+    #[test]
+    fn slint_pua_keys_and_bare_modifiers_translate_cleanly_in_keyboard_chord() {
+        assert_eq!(keyboard_chord("\u{F700}", true, false, false, false), "Ctrl+Up");
+        assert_eq!(keyboard_chord("\u{F701}", true, false, false, false), "Ctrl+Down");
+        assert_eq!(keyboard_chord("\u{F702}", false, false, true, false), "Alt+Left");
+        assert_eq!(keyboard_chord("\u{F703}", false, false, true, false), "Alt+Right");
+        assert_eq!(keyboard_chord("\u{F704}", false, false, false, false), "F1");
+        assert_eq!(keyboard_chord("\u{F706}", false, false, false, false), "F3");
+        assert_eq!(keyboard_chord("\u{F706}", false, true, false, false), "Shift+F3");
+        assert_eq!(keyboard_chord("\u{F70F}", false, false, false, false), "F12");
+        assert_eq!(keyboard_chord("\u{007f}", false, false, false, false), "Delete");
+        assert_eq!(keyboard_chord("\u{F728}", false, false, false, false), "Delete");
+        assert_eq!(keyboard_chord("\u{001b}", false, false, false, false), "Escape");
+        assert_eq!(keyboard_chord("\u{0008}", false, false, false, false), "Backspace");
+        assert_eq!(keyboard_chord("\u{0009}", false, false, false, false), "Tab");
+        assert_eq!(keyboard_chord("\u{000a}", false, false, false, false), "Return");
+        assert_eq!(keyboard_chord("c", true, true, false, false), "Ctrl+Shift+C");
+        assert_eq!(keyboard_chord("d", true, false, false, false), "Ctrl+D");
+
+        for bare_mod in [
+            "",
+            "\u{0010}",
+            "\u{0011}",
+            "\u{0012}",
+            "\u{0013}",
+            "\u{0014}",
+            "\u{0015}",
+            "\u{0016}",
+            "\u{0017}",
+            "\u{0018}",
+            "Shift",
+            "Control",
+            "Ctrl",
+            "Alt",
+            "Meta",
+            "Super",
+        ] {
+            assert!(is_bare_modifier_key(bare_mod));
+            assert_eq!(keyboard_chord(bare_mod, true, true, true, true), "");
+        }
+    }
+
+    #[test]
+    fn bare_modifiers_and_popup_shortcuts_preserve_yomitan_popup_and_all_eight_keybinds_work() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        subtitles.borrow_mut().load_cues(vec![
+            controller::subtitles::create_cue("First match line", 1., 2.),
+            controller::subtitles::create_cue("Second middle line", 3., 4.),
+            controller::subtitles::create_cue("Third match line", 5., 6.),
+        ]);
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(rows.clone().into());
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+        app.show().unwrap();
+
+        // Open YomitanPopup with two results and verify bare modifiers never dismiss it.
+        set_dictionary_rows(
+            &app,
+            vec![
+                DictResult {
+                    index: 0,
+                    expression: "一話".into(),
+                    reading: "いちわ".into(),
+                    glossary: "episode one".into(),
+                    dict_name: "JMdict".into(),
+                    selected: true,
+                    term_start: true,
+                    term_end: true,
+                    ..Default::default()
+                },
+                DictResult {
+                    index: 1,
+                    expression: "旅立ち".into(),
+                    reading: "たびだち".into(),
+                    glossary: "setting off on a journey".into(),
+                    dict_name: "JMdict".into(),
+                    selected: true,
+                    term_start: true,
+                    term_end: true,
+                    ..Default::default()
+                },
+            ],
+        );
+        app.set_dict_open(true);
+        for key in [Key::Shift, Key::Control, Key::Alt, Key::Meta] {
+            app.window().dispatch_event(WindowEvent::KeyPressed { text: key.into() });
+            app.window().dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+            assert!(app.get_dict_open(), "bare modifier {key:?} must not dismiss YomitanPopup");
+        }
+
+        // Ctrl+Down / Ctrl+Up navigate popup without dismissing YomitanPopup.
+        let navigated = Rc::new(Cell::new(0));
+        let nav_sink = navigated.clone();
+        app.on_navigate_popup(move |dir| nav_sink.set(dir));
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::DownArrow.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::DownArrow.into() });
+        assert!(app.get_dict_open(), "Ctrl+Down must keep YomitanPopup open");
+        assert_eq!(navigated.get(), 1);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::UpArrow.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::UpArrow.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert!(app.get_dict_open(), "Ctrl+Up must keep YomitanPopup open");
+        assert_eq!(navigated.get(), -1);
+
+        // When Anki is enabled and popup is open, Ctrl+D triggers add-anki-note without dismissing popup.
+        app.set_anki_enabled(true);
+        let added_note = Rc::new(Cell::new(-1));
+        let added_sink = added_note.clone();
+        app.on_add_anki_note(move |idx| added_sink.set(idx));
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: "d".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: "d".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert!(app.get_dict_open());
+        assert_eq!(added_note.get(), 0);
+
+        // When popup is closed, Ctrl+D toggles DictionarySearchPanel.
+        app.invoke_dismiss_definition();
+        assert!(!app.get_dict_open());
+        assert!(!app.get_dict_search_open());
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: "d".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: "d".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert!(app.get_dict_search_open(), "Ctrl+D must toggle dictionary search panel");
+
+        // Delete cycles OSC visibility mode (0 -> 1 -> 2 -> 0).
+        assert_eq!(app.get_osc_visibility_mode(), 0);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Delete.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Delete.into() });
+        assert_eq!(app.get_osc_visibility_mode(), 1);
+        assert!(app.get_osc_visible());
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Delete.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Delete.into() });
+        assert_eq!(app.get_osc_visibility_mode(), 2);
+        assert!(!app.get_osc_visible());
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Delete.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Delete.into() });
+        assert_eq!(app.get_osc_visibility_mode(), 0);
+
+        // Ctrl+F opens SubtitleDrawerPanel and focuses search.
+        app.set_sub_drawer_open(false);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: "f".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: "f".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert!(app.get_sub_drawer_open(), "Ctrl+F must open SubtitleDrawerPanel");
+
+        // F3 / Shift+F3 step forward and backward through subtitle search matches.
+        app.invoke_search_subtitles("match".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 2);
+        assert_eq!(app.get_subtitle_search_current_match(), 1);
+        assert_eq!(app.get_subtitle_search_focused_row(), 0);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::F3.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::F3.into() });
+        assert_eq!(app.get_subtitle_search_current_match(), 2);
+        assert_eq!(app.get_subtitle_search_focused_row(), 2);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Shift.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::F3.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::F3.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Shift.into() });
+        assert_eq!(app.get_subtitle_search_current_match(), 1);
+        assert_eq!(app.get_subtitle_search_focused_row(), 0);
+
+        // Ctrl+Shift+C copies selected subtitle cues to clipboard.
+        subtitles.borrow_mut().select_row(1, false);
+        refresh_subtitle_marks(&rows, &subtitles.borrow());
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Control.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: Key::Shift.into() });
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: "C".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: "C".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Shift.into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: Key::Control.into() });
+        assert_eq!(app.get_copied_subtitle_text().as_str(), "Second middle line");
+    }
+
+    #[test]
+    fn yomitan_popup_anchors_to_hovered_word_clamps_above_or_below_primary_subtitles_and_secondary_stays_at_top() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_subtitles_visible(true);
+        app.set_active_sub_text("生前に世界中を旅行して集めた遺品が".into());
+        app.set_secondary_sub_text("Top secondary subtitle line".into());
+        let words = vec![
+            SubtitleWord { text: "生前".into(), reading: "せいぜん".into(), query: "生前".into(), index: 0 },
+            SubtitleWord { text: "に".into(), reading: "".into(), query: "に".into(), index: 1 },
+            SubtitleWord { text: "世界".into(), reading: "せかい".into(), query: "世界".into(), index: 2 },
+        ];
+        let lines = subtitle_lines_for_app(&app, words.clone());
+        app.set_active_sub_words(Rc::new(VecModel::from(words)).into());
+        app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        // Secondary subtitles must sit at the top edge of the video viewport and not wrap short text.
+        assert_eq!(app.get_secondary_subtitle_y(), 12.0);
+        let short_sec_h = app.get_secondary_subtitle_height();
+        app.set_secondary_sub_text("Hi".into());
+        assert!(
+            (app.get_secondary_subtitle_height() - short_sec_h).abs() <= 4.0,
+            "Short secondary subtitle must stay single-line without wrapping (short_sec_h={short_sec_h}, two_char_h={})",
+            app.get_secondary_subtitle_height()
+        );
+
+        // With default bottom subtitles (subtitle_offset = 0.045), YomitanPopup must sit ABOVE primary subtitles.
+        let sub_top = app.get_primary_subtitle_y();
+        let sub_bottom = sub_top + app.get_primary_subtitle_height();
+        let popup_top = app.get_popup_y();
+        let popup_bottom = popup_top + app.get_popup_height();
+        assert!(
+            popup_bottom <= sub_top,
+            "popup above subtitles must not overlap primary subtitles (popup_bottom={popup_bottom}, sub_top={sub_top})"
+        );
+
+        // Horizontal anchoring shifts popup x when popup_offset_x changes, while clamping within viewport margins.
+        let default_x = app.get_popup_x();
+        app.set_popup_offset_x(180.0);
+        assert!(app.get_popup_x() > default_x);
+        app.set_popup_offset_x(5000.0);
+        assert!(app.get_popup_x() + app.get_popup_width() <= 1280.0 - 20.0 + 0.5);
+        app.set_popup_offset_x(-5000.0);
+        assert!(app.get_popup_x() >= 20.0 - 0.5);
+        app.set_popup_offset_x(0.0);
+
+        // When primary subtitles are moved near the top of the video (e.g. subtitle_offset = 0.85),
+        // YomitanPopup must flip BELOW primary subtitles so it NEVER covers active subtitles!
+        app.set_subtitle_offset(0.85);
+        let top_sub_y = app.get_primary_subtitle_y();
+        let top_sub_bottom = top_sub_y + app.get_primary_subtitle_height();
+        let flipped_popup_y = app.get_popup_y();
+        assert!(
+            flipped_popup_y >= top_sub_bottom,
+            "popup must flip below top-positioned primary subtitles (flipped_popup_y={flipped_popup_y}, top_sub_bottom={top_sub_bottom})"
+        );
+        let _ = sub_bottom;
+    }
+
+    #[test]
+    fn subtitle_drawer_search_match_counter_navigation_tabs_copy_and_resizable_split() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_sub_drawer_open(true);
+        app.set_dict_search_open(true);
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        subtitles.borrow_mut().load_cues(vec![
+            controller::subtitles::create_cue("Alpha one", 1., 2.),
+            controller::subtitles::create_cue("Beta two", 3., 4.),
+            controller::subtitles::create_cue("Alpha three", 5., 6.),
+        ]);
+        subtitles.borrow_mut().ensure_track(2);
+        subtitles.borrow_mut().set_track_cues(
+            2,
+            vec![
+                controller::subtitles::create_cue("Secondary cue A", 1., 2.),
+                controller::subtitles::create_cue("Secondary cue B", 3., 4.),
+            ],
+        );
+        subtitles.borrow_mut().set_secondary_sid(2);
+        app.set_secondary_sid(2);
+
+        let primary_rows = Rc::new(VecModel::<SubEntry>::default());
+        let secondary_rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(primary_rows.clone().into());
+        app.set_secondary_subtitle_entries(secondary_rows.clone().into());
+        refresh_subtitle_list(&app, &primary_rows, &subtitles.borrow());
+        refresh_secondary_subtitle_list(&app, &secondary_rows, &subtitles.borrow());
+        install_subtitle_selection(&app, subtitles.clone(), primary_rows.clone());
+        app.show().unwrap();
+
+        // Both DictionarySearchPanel and SubtitleDrawerPanel stay open in a resizable split.
+        assert!(app.get_dict_search_open() && app.get_sub_drawer_open());
+        app.set_sidebar_width(400.0);
+        app.set_sidebar_split_ratio(0.35);
+        assert_eq!(app.get_sidebar_width(), 400.0);
+        assert!((app.get_sidebar_split_ratio() - 0.35).abs() < 1e-4);
+
+        // Search on Primary tab (tab 0) counts matches and navigates with wrap-around.
+        app.invoke_search_subtitles("Alpha".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 2);
+        assert_eq!(app.get_subtitle_search_current_match(), 1);
+        assert_eq!(app.get_subtitle_search_focused_row(), 0);
+        app.invoke_next_subtitle_search_match();
+        assert_eq!(app.get_subtitle_search_current_match(), 2);
+        assert_eq!(app.get_subtitle_search_focused_row(), 2);
+        app.invoke_next_subtitle_search_match();
+        assert_eq!(app.get_subtitle_search_current_match(), 1);
+        assert_eq!(app.get_subtitle_search_focused_row(), 0);
+
+        // Switching to Secondary tab (tab 1) re-evaluates search against secondary cues.
+        app.set_subtitle_drawer_tab(1);
+        app.invoke_subtitle_drawer_tab_changed(1);
+        assert_eq!(app.get_subtitle_search_total_matches(), 0);
+        app.invoke_search_subtitles("Secondary".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 2);
+        assert_eq!(app.get_subtitle_search_current_match(), 1);
+        assert_eq!(app.get_subtitle_search_focused_row(), 0);
+        app.invoke_prev_subtitle_search_match();
+        assert_eq!(app.get_subtitle_search_current_match(), 2);
+        assert_eq!(app.get_subtitle_search_focused_row(), 1);
+    }
+
+    #[test]
+    fn about_modal_click_shield_url_modal_volume_max_mute_chapters_and_recent_titles() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_about_open(true);
+        app.show().unwrap();
+
+        let click = |x, y| {
+            let position = slint::LogicalPosition::new(x, y);
+            app.window().dispatch_event(WindowEvent::PointerPressed {
+                position,
+                button: PointerEventButton::Left,
+            });
+            app.window().dispatch_event(WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            });
+        };
+
+        // Clicking inside the About dialog card (center of 1280x720) must NOT dismiss it.
+        click(640., 360.);
+        assert!(app.get_about_open(), "About modal click-shield must prevent inner clicks from closing");
+        // Clicking the backdrop outside the card closes About modal.
+        click(50., 50.);
+        assert!(!app.get_about_open(), "Clicking outside About card must close modal");
+
+        // Volume boost (>100% volume-max) and mute state.
+        app.set_volume_max(150.0);
+        app.set_volume(135.0);
+        app.set_is_muted(true);
+        assert_eq!(app.get_volume_max(), 150.0);
+        assert_eq!(app.get_volume(), 135.0);
+        assert!(app.get_is_muted());
+
+        // Chapter marks & timeline hover chapter lookup.
+        let marks = chapter_marks_for_duration(&[0.0, 90.0, 300.0], 600.0);
+        assert_eq!(marks.len(), 3);
+        assert_eq!(marks[1].title.as_str(), "Chapter 2");
+        app.set_chapter_marks(Rc::new(VecModel::from(marks)).into());
+        assert_eq!(chapter_title_at_time(&app, 45.0), "Chapter 1");
+        assert_eq!(chapter_title_at_time(&app, 120.0), "Chapter 2");
+        assert_eq!(chapter_title_at_time(&app, 450.0), "Chapter 3");
+
+        // Recent file label includes media-title alongside path (#338).
+        assert_eq!(
+            format_recent_file_label("Frieren Episode 1", "/home/user/Videos/ep01.mkv"),
+            "Frieren Episode 1 — /home/user/Videos/ep01.mkv"
+        );
+        assert_eq!(
+            format_recent_file_label("", "/home/user/Videos/ep01.mkv"),
+            "ep01.mkv — /home/user/Videos/ep01.mkv"
+        );
+    }
+
+    #[test]
+    fn subtitle_drawer_auto_scrolls_on_active_cue_advance_and_respects_user_scrolling_and_hover_pause_release() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_sub_drawer_open(true);
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        let mut cues = Vec::new();
+        for i in 0..30 {
+            let start = (i * 2 + 1) as f64;
+            let text = if i < 5 {
+                format!("Multi-line wrapped subtitle cue #{i} with extra long text that wraps across multiple lines in the subtitle drawer panel")
+            } else {
+                format!("Cue line #{i}")
+            };
+            cues.push(controller::subtitles::create_cue(&text, start, start + 1.5));
+        }
+        subtitles.borrow_mut().load_cues(cues);
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(rows.clone().into());
+        install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+        app.show().unwrap();
+
+        assert_eq!(app.get_subtitle_drawer_viewport_y(), 0.0);
+
+        // Advancing active playback cue to row 22 while user is NOT scrolling auto-scrolls the drawer.
+        subtitles.borrow_mut().update_position(45.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        let scrolled_y = app.get_subtitle_drawer_viewport_y();
+        assert!(
+            scrolled_y < -100.0,
+            "Active cue advance must auto-scroll SubtitleDrawerPanel (viewport_y={scrolled_y})"
+        );
+
+        // When user-scrolling is active, advancing the playback cue must NOT overwrite the user's scroll position.
+        app.set_subtitle_drawer_user_scrolling(true);
+        subtitles.borrow_mut().update_position(1.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        assert_eq!(
+            app.get_subtitle_drawer_viewport_y(),
+            scrolled_y,
+            "Auto-scroll must not fight the user while user_scrolling is active"
+        );
+
+        // Clearing user_scrolling allows active-cue auto-scroll to resume.
+        app.set_subtitle_drawer_user_scrolling(false);
+        subtitles.borrow_mut().update_position(1.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        assert_eq!(app.get_subtitle_drawer_viewport_y(), 0.0);
+
+        // Hover-pause latches across subtitle -> YomitanPopup and releases when moving onto OSC / menu bar / sidebar.
+        let hover_state = Rc::new(Cell::new(false));
+        let hover_sink = hover_state.clone();
+        app.on_subtitle_hover_changed(move |hovering| hover_sink.set(hovering));
+        app.set_subtitles_visible(true);
+        app.set_active_sub_text("生前に世界中".into());
+        let words = vec![
+            SubtitleWord { text: "生前".into(), reading: "せいぜん".into(), query: "生前".into(), index: 0 },
+        ];
+        let lines = subtitle_lines_for_app(&app, words.clone());
+        app.set_active_sub_words(Rc::new(VecModel::from(words)).into());
+        app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
+        set_dictionary_rows(
+            &app,
+            vec![DictResult {
+                index: 0,
+                expression: "生前".into(),
+                reading: "せいぜん".into(),
+                glossary: "during one's lifetime".into(),
+                dict_name: "JMdict".into(),
+                selected: true,
+                term_start: true,
+                term_end: true,
+                ..Default::default()
+            }],
+        );
+        app.set_dict_open(true);
+
+        // Move pointer over primary subtitle box -> hover-pause activates.
+        let sub_y = 30.0 + app.get_primary_subtitle_y() + 10.0;
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(470., sub_y),
+        });
+        assert!(hover_state.get(), "Hovering primary subtitle must activate hover-pause");
+
+        // Move pointer into YomitanPopup -> hover-pause stays active.
+        let popup_y = 30.0 + app.get_popup_y() + 40.0;
+        let popup_x = app.get_popup_x() + 40.0;
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(popup_x, popup_y),
+        });
+        assert!(hover_state.get(), "Hovering YomitanPopup must keep hover-pause active");
+
+        // Move pointer directly from YomitanPopup onto the top menu bar (or sidebar/OSC) -> hover-pause releases!
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(30., 12.),
+        });
+        assert!(
+            !hover_state.get(),
+            "Moving pointer from YomitanPopup onto menu bar / OSC / sidebar must release hover-pause"
         );
     }
 }

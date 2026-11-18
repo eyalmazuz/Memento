@@ -1736,3 +1736,70 @@ mod phase2c_live_wire_tests {
         }
     }
 }
+
+#[test]
+fn test_secondary_subtitle_entries_and_active_tracking() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.ensure_track(1);
+    ctrl.set_track_cues(
+        1,
+        vec![
+            create_cue("Primary line 1", 1.0, 3.0),
+            create_cue("Primary line 2", 4.0, 6.0),
+        ],
+    );
+    ctrl.ensure_track(2);
+    ctrl.set_track_cues(
+        2,
+        vec![
+            create_cue("Secondary English 1", 1.0, 3.0),
+            create_cue("Secondary English 2", 4.0, 6.0),
+        ],
+    );
+    ctrl.set_primary_sid(1);
+    ctrl.set_secondary_sid(2);
+    ctrl.update_positions(4.5, 4.5);
+
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.secondary_entries().len(), 2);
+    assert_eq!(ctrl.active_indices(1), &[1]);
+    assert_eq!(ctrl.active_indices(2), &[1]);
+
+    ctrl.set_secondary_sid(0);
+    assert!(ctrl.secondary_entries().is_empty());
+}
+
+#[test]
+fn test_drag_and_drop_uri_list_partitioning_for_playlists_and_subtitles() {
+    let uri_list = "\
+# Dropped playlist and external subtitles\r\n\
+file:///home/user/Videos/Episode%2001.mkv\r\n\
+file:///home/user/Videos/Episode%2002.mp4\r\n\
+file:///home/user/Videos/Episode%2001.ja.srt\r\n\
+file:///home/user/Videos/Episode%2001.en.ass\r\n\
+file:///home/user/Videos/Episode%2001.vtt\r\n\
+file:///home/user/Videos/Episode%2001.sub\r\n";
+
+    let paths = memento_os::parse_uri_list(uri_list);
+    assert_eq!(paths.len(), 6);
+    let (subtitles, media): (Vec<_>, Vec<_>) = paths
+        .into_iter()
+        .partition(|path| is_subtitle_file(path.as_path()));
+    assert_eq!(media.len(), 2);
+    assert_eq!(subtitles.len(), 4);
+    assert_eq!(media[0].to_string_lossy(), "/home/user/Videos/Episode 01.mkv");
+    assert_eq!(media[1].to_string_lossy(), "/home/user/Videos/Episode 02.mp4");
+}
+
+#[test]
+fn test_screensaver_playback_inhibition_lifecycle() {
+    let mut ss = memento_os::Screensaver::new();
+    assert!(!ss.is_inhibited());
+    // Paused or unloaded media must never leave screensaver inhibited.
+    ss.sync_playback(false, false, "Playing media");
+    assert!(!ss.is_inhibited());
+    ss.sync_playback(true, true, "Playing media");
+    assert!(!ss.is_inhibited());
+    ss.uninhibit();
+    assert!(!ss.is_inhibited());
+}
