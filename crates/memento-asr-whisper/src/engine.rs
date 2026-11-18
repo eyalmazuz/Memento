@@ -231,20 +231,24 @@ pub fn read_whisper_wav(path: &Path) -> Result<Vec<f32>, String> {
     let mut pcm_data: Option<&[u8]> = None;
 
     let mut offset = WAV_HEADER_SIZE;
-    while offset + WAV_CHUNK_HEADER_SIZE <= bytes.len() {
+    while offset
+        .checked_add(WAV_CHUNK_HEADER_SIZE)
+        .is_some_and(|end| end <= bytes.len())
+    {
         let chunk = &bytes[offset..];
         let id = &chunk[0..4];
-        // C++ compares `offset + size` (qsizetype) against
-        // `static_cast<quint32>(bytes.size())`; replicate the truncation.
-        let size = read_u32(&chunk[4..8]);
+        let size = read_u32(&chunk[4..8]) as usize;
         offset += WAV_CHUNK_HEADER_SIZE;
 
-        if offset + size as usize > (bytes.len() as u32) as usize {
+        let Some(chunk_end) = offset.checked_add(size) else {
+            return Err("The extracted WAV file is truncated.".to_string());
+        };
+        if chunk_end > bytes.len() {
             return Err("The extracted WAV file is truncated.".to_string());
         }
 
         if id == b"fmt " && size >= 16 {
-            let fmt = &bytes[offset..];
+            let fmt = &bytes[offset..chunk_end];
             format = read_u16(&fmt[0..2]);
             channels = read_u16(&fmt[2..4]);
             sample_rate = read_u32(&fmt[4..8]);
@@ -252,10 +256,13 @@ pub fn read_whisper_wav(path: &Path) -> Result<Vec<f32>, String> {
             bits_per_sample = read_u16(&fmt[14..16]);
         } else if id == b"data" {
             // Last "data" chunk wins, mirroring `pcmData = bytes.mid(...)`.
-            pcm_data = Some(&bytes[offset..offset + size as usize]);
+            pcm_data = Some(&bytes[offset..chunk_end]);
         }
 
-        offset += size as usize + (size % 2) as usize;
+        let Some(next_offset) = chunk_end.checked_add(size % 2) else {
+            break;
+        };
+        offset = next_offset;
     }
 
     const EXPECTED_SAMPLE_RATE: u32 = sys::WHISPER_SAMPLE_RATE;
@@ -294,11 +301,14 @@ pub fn timestamp_to_seconds(timestamp: i64) -> f64 {
 
 /// C++: `handle_abort` — forwards to the C++ poll (null userData => false).
 unsafe extern "C" fn abort_trampoline(user_data: *mut c_void) -> bool {
-    if user_data.is_null() {
-        return false;
-    }
-    let bridge = &*(user_data as *const AbortBridge);
-    (bridge.poll)(bridge.user_data)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if user_data.is_null() {
+            return false;
+        }
+        let bridge = &*(user_data as *const AbortBridge);
+        (bridge.poll)(bridge.user_data)
+    }))
+    .unwrap_or(true)
 }
 
 /// C++: `handle_new_segment` — walks the newly appended segments and forwards
@@ -309,31 +319,33 @@ unsafe extern "C" fn segment_trampoline(
     n_new: c_int,
     user_data: *mut c_void,
 ) {
-    if user_data.is_null() {
-        return;
-    }
-    let bridge = &*(user_data as *const SegmentBridge);
-    let Some(callback) = bridge.callback else {
-        // C++: `if (context == nullptr || !context->callback) return;`
-        return;
-    };
-
-    let count = sys::whisper_full_n_segments(ctx);
-    let start = max(0, count - n_new);
-    let mut i = start;
-    while i < count {
-        let text = sys::whisper_full_get_segment_text(ctx, i);
-        let (text_ptr, text_len) = if text.is_null() {
-            (std::ptr::null(), 0usize)
-        } else {
-            let bytes = std::ffi::CStr::from_ptr(text).to_bytes();
-            (bytes.as_ptr(), bytes.len())
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ctx.is_null() || user_data.is_null() {
+            return;
+        }
+        let bridge = &*(user_data as *const SegmentBridge);
+        let Some(callback) = bridge.callback else {
+            // C++: `if (context == nullptr || !context->callback) return;`
+            return;
         };
-        let t0 = sys::whisper_full_get_segment_t0(ctx, i);
-        let t1 = sys::whisper_full_get_segment_t1(ctx, i);
-        callback(text_ptr, text_len, t0, t1, bridge.user_data);
-        i += 1;
-    }
+
+        let count = sys::whisper_full_n_segments(ctx);
+        let start = max(0, count.saturating_sub(max(0, n_new)));
+        let mut i = start;
+        while i < count {
+            let text = sys::whisper_full_get_segment_text(ctx, i);
+            let (text_ptr, text_len) = if text.is_null() {
+                (std::ptr::null(), 0usize)
+            } else {
+                let bytes = std::ffi::CStr::from_ptr(text).to_bytes();
+                (bytes.as_ptr(), bytes.len())
+            };
+            let t0 = sys::whisper_full_get_segment_t0(ctx, i);
+            let t1 = sys::whisper_full_get_segment_t1(ctx, i);
+            callback(text_ptr, text_len, t0, t1, bridge.user_data);
+            i += 1;
+        }
+    }));
 }
 
 /// Emit a `qWarning` through the shim (no-op when absent).
@@ -528,7 +540,12 @@ pub unsafe fn transcribe(
         params.suppress_regex = suppress_regex.as_ptr();
     }
 
-    let n_samples = samples.len() as c_int;
+    let Ok(n_samples) = c_int::try_from(samples.len()) else {
+        return EngineStatus::Failed {
+            message: "The extracted audio exceeds Whisper's maximum sample count.".to_string(),
+            warn: true,
+        };
+    };
     let ret = sys::whisper_full(model, params, samples.as_ptr(), n_samples);
 
     if ret == 0 {
@@ -659,5 +676,23 @@ mod tests {
             .code(),
             3
         );
+    }
+
+    #[test]
+    fn read_whisper_wav_rejects_overflowing_chunk_size() {
+        let dir = std::env::temp_dir().join("memento-whisper-engine-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("overflow-chunk.wav");
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&100u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&u32::MAX.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 16]);
+        std::fs::write(&path, &wav).expect("write fixture");
+        let error = read_whisper_wav(&path).expect_err("overflowing chunk size must fail");
+        assert_eq!(error, "The extracted WAV file is truncated.");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -128,7 +128,9 @@ pub fn resolve_word_audio(
                 })();
                 let Ok(body) = body else { continue };
                 let Ok(urls) = parse_json_audio_sources(&body) else { continue };
-                let Some(url) = urls.into_iter().next() else { continue };
+                let Some(url) = urls.into_iter().find(|candidate| is_remote_http_audio_url(candidate)) else {
+                    continue;
+                };
                 url
             }
             None => continue,
@@ -140,7 +142,15 @@ pub fn resolve_word_audio(
             &reading.encode_utf16().collect::<Vec<_>>(),
             false,
         );
-        return Ok((String::from_utf16_lossy(&url_units), String::from_utf16_lossy(&name_units), source.md5.clone()));
+        let resolved_url = String::from_utf16_lossy(&url_units);
+        if matches!(
+            i32::try_from(source.kind).ok().and_then(|kind| AudioSourceType::try_from(kind).ok()),
+            Some(AudioSourceType::AudioSourceTypeJson)
+        ) && !is_remote_http_audio_url(&resolved_url)
+        {
+            continue;
+        }
+        return Ok((resolved_url, String::from_utf16_lossy(&name_units), source.md5.clone()));
     }
     Err("configured audio sources returned no audio files".into())
 }
@@ -177,10 +187,17 @@ pub fn enumerate_word_audio_sources(
                 };
                 if let Some(body) = body {
                     if let Ok(files) = parse_json_audio_entries(&body) {
-                        available.extend(files.into_iter().map(|(name, url)| AudioSourceEntry {
-                            name, url, kind: AudioSourceType::AudioSourceTypeFile as i64,
-                            md5: source.md5.clone(),
-                        }));
+                        available.extend(
+                            files
+                                .into_iter()
+                                .filter(|(_, url)| is_remote_http_audio_url(url))
+                                .map(|(name, url)| AudioSourceEntry {
+                                    name,
+                                    url,
+                                    kind: AudioSourceType::AudioSourceTypeFile as i64,
+                                    md5: source.md5.clone(),
+                                }),
+                        );
                     }
                 }
             }
@@ -293,7 +310,12 @@ impl AudioWorker {
             .cache
             .iter()
             .find(|entry| entry.url == url)
-            .map(|entry| (Arc::clone(&entry.file), entry.md5 == skip_hash))
+            .map(|entry| {
+                (
+                    Arc::clone(&entry.file),
+                    !skip_hash.is_empty() && entry.md5.eq_ignore_ascii_case(skip_hash),
+                )
+            })
         {
             if hash_matches {
                 return Err(skip_hash_message());
@@ -304,7 +326,7 @@ impl AudioWorker {
         }
 
         let (file, md5) = self.download_audio(url)?;
-        let hash_matches = md5 == skip_hash;
+        let hash_matches = !skip_hash.is_empty() && md5.eq_ignore_ascii_case(skip_hash);
         if self.cache.len() >= AUDIO_CACHE_CAPACITY {
             self.cache.clear();
         }
@@ -334,7 +356,7 @@ impl AudioWorker {
             SourceLocation::Http(url) => {
                 let mut response = self.http_get(&url, "audio source JSON")?;
                 response
-                    .read_all(u64::MAX)
+                    .read_all(8 * 1024 * 1024)
                     .map_err(|error| format!("could not read audio source JSON response: {error}"))
             }
         }
@@ -413,7 +435,7 @@ fn first_audio_candidate(
             }
             Ok(AudioSourceType::AudioSourceTypeJson) => {
                 if let Ok(urls) = load_json(&source_url) {
-                    if let Some(url) = urls.into_iter().next() {
+                    if let Some(url) = urls.into_iter().find(|candidate| is_remote_http_audio_url(candidate)) {
                         return Ok((url, source.md5.clone()));
                     }
                 }
@@ -505,7 +527,26 @@ enum SourceLocation {
     Http(String),
 }
 
+fn is_remote_http_audio_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && HttpUrl::parse(parsed.as_str()).is_ok()
+}
+
 fn classify_url(value: &str) -> Result<SourceLocation, String> {
+    if value.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || value.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        let parsed = Url::parse(value).map_err(|error| {
+            format!("audio URL must be HTTP(S), a file URL, or an existing local path: {error}")
+        })?;
+        return Ok(SourceLocation::Http(parsed.to_string()));
+    }
     let path = Path::new(value);
     if path.is_file() {
         return Ok(SourceLocation::File(path.to_owned()));
@@ -722,5 +763,69 @@ mod tests {
                 "https://source.test/ready/食べる".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn remote_json_audio_source_rejects_file_urls_and_local_paths() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = r#"{"type":"audioSourceList","audioSources":[{"name":"evil_file","url":"file:///etc/passwd"},{"name":"evil_path","url":"/etc/passwd"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let endpoint = format!("http://{}:{}/audio.json", addr.ip(), addr.port());
+        let sources = vec![source(
+            "remote json",
+            &endpoint,
+            AudioSourceType::AudioSourceTypeJson,
+            "",
+        )];
+
+        let err = resolve_word_audio("猫", "ねこ", &sources).unwrap_err();
+        assert!(err.contains("no audio files"), "unexpected error: {err}");
+        let listed = enumerate_word_audio_sources("猫", "ねこ", &sources);
+        assert!(listed.is_empty(), "file:///etc/passwd must be filtered out: {listed:?}");
+
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn remote_json_candidate_rejects_file_url_even_when_mixed_with_http() {
+        let sources = vec![source(
+            "remote json",
+            "https://source.test/audio.json",
+            AudioSourceType::AudioSourceTypeJson,
+            "DEADBEEF",
+        )];
+        let candidate = first_audio_candidate("猫", "ねこ", &sources, |_| {
+            Ok(vec![
+                "file:///etc/passwd".to_owned(),
+                "/etc/passwd".to_owned(),
+                "https://audio.test/neko.mp3".to_owned(),
+            ])
+        })
+        .unwrap();
+        assert_eq!(candidate.0, "https://audio.test/neko.mp3");
+        assert!(candidate.1.eq_ignore_ascii_case("deadbeef"));
+
+        let err = first_audio_candidate("猫", "ねこ", &sources, |_| {
+            Ok(vec!["file:///etc/passwd".to_owned()])
+        })
+        .unwrap_err();
+        assert!(err.contains("no audio files"));
     }
 }

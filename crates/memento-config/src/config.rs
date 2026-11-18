@@ -40,8 +40,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const MAX_CHANGELOG_ENTRIES: usize = 20;
+static NEXT_CONFIG_TMP_ID: AtomicU64 = AtomicU64::new(0);
 
 use crate::canonical::{
     encode_value, percent_decode_component, percent_encode_component,
@@ -631,7 +635,29 @@ impl Config {
                 cfg.changelog.push(entry);
             }
         }
+        if cfg.changelog.len() > MAX_CHANGELOG_ENTRIES {
+            let excess = cfg.changelog.len() - MAX_CHANGELOG_ENTRIES;
+            cfg.changelog.drain(..excess);
+        }
         cfg
+    }
+
+    /// Synchronizes revision/changelog metadata and clears persisted entries
+    /// from `pending` after an external partial save (e.g. per-category Apply).
+    pub fn mark_persisted_with(
+        &mut self,
+        revision: u64,
+        mut changelog: Vec<ChangelogEntry>,
+        is_persisted: impl Fn(&KeyPath) -> bool,
+    ) {
+        if changelog.len() > MAX_CHANGELOG_ENTRIES {
+            let excess = changelog.len() - MAX_CHANGELOG_ENTRIES;
+            changelog.drain(..excess);
+        }
+        self.revision = revision;
+        self.changelog = changelog;
+        self.pending.retain(|change| !is_persisted(&change.path));
+        self.dirty = !self.pending.is_empty();
     }
 
     /// Loads the canonical store file, and when missing falls back to the
@@ -694,17 +720,20 @@ impl Config {
             self.revision += 1;
             let entry = summarize(&self.pending, self.revision);
             self.changelog.push(entry);
+            if self.changelog.len() > MAX_CHANGELOG_ENTRIES {
+                let excess = self.changelog.len() - MAX_CHANGELOG_ENTRIES;
+                self.changelog.drain(..excess);
+            }
             self.pending.clear();
             self.dirty = false;
         }
 
         let document = self.render_document();
         let target = config_dir.join(file_name);
-        let temp = config_dir.join(format!("{file_name}.tmp"));
-        let mut file = fs::File::create(&temp).map_err(|source| ConfigError::Io {
-            context: "creating temporary configuration file",
-            source,
-        })?;
+        let (temp, mut file) = create_unique_temp_config_file(config_dir, file_name)?;
+        let mut cleanup = TempFileGuard {
+            path: Some(temp.clone()),
+        };
         {
             use std::io::Write;
             file.write_all(document.as_bytes())
@@ -718,13 +747,11 @@ impl Config {
             })?;
         }
         drop(file);
-        fs::rename(&temp, &target).map_err(|source| {
-            let _ = fs::remove_file(&temp);
-            ConfigError::Io {
-                context: "atomic rename of configuration file",
-                source,
-            }
+        fs::rename(&temp, &target).map_err(|source| ConfigError::Io {
+            context: "atomic rename of configuration file",
+            source,
         })?;
+        cleanup.path = None;
         Ok(())
     }
 
@@ -814,16 +841,131 @@ impl ChangelogEntry {
     #[must_use]
     pub fn parse_row(row: &str) -> Option<ChangelogEntry> {
         let rest = row.trim().strip_prefix("rev ")?;
-        let (rev, _) = rest.split_once(':')?;
+        let (rev, after_colon) = rest.split_once(':')?;
         let revision: u64 = rev.trim().parse().ok()?;
-        // paths are informational; only the revision is authoritative
+        let after_colon = after_colon.trim();
+
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut removed = Vec::new();
+
+        if let Some(list_start) = find_changelog_list_start(after_colon) {
+            if let Some(inner) = after_colon[list_start + 1..].strip_suffix(']') {
+                for item in split_changelog_items(inner) {
+                    if let Some(path) = item.strip_prefix("+ ") {
+                        added.push(path.to_owned());
+                    } else if let Some(path) = item.strip_prefix("~ ") {
+                        modified.push(path.to_owned());
+                    } else if let Some(path) = item.strip_prefix("- ") {
+                        removed.push(path.to_owned());
+                    }
+                }
+            }
+        }
+
         Some(ChangelogEntry {
             revision,
-            added: Vec::new(),
-            modified: Vec::new(),
-            removed: Vec::new(),
+            added,
+            modified,
+            removed,
         })
     }
+}
+
+fn find_changelog_list_start(after_colon: &str) -> Option<usize> {
+    let bytes = after_colon.as_bytes();
+    let mut i = 0usize;
+    for prefix in [b'+', b'~', b'-'] {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != prefix {
+            return None;
+        }
+        i += 1;
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start {
+            return None;
+        }
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    (i < bytes.len() && bytes[i] == b'[').then_some(i)
+}
+
+fn split_changelog_items(inner: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0usize;
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] == b','
+            && bytes[i + 1] == b' '
+            && matches!(bytes[i + 2], b'+' | b'~' | b'-')
+            && bytes[i + 3] == b' '
+        {
+            items.push(&inner[start..i]);
+            start = i + 2;
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    if start < inner.len() {
+        items.push(&inner[start..]);
+    }
+    items
+}
+
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn create_unique_temp_config_file(
+    config_dir: &Path,
+    file_name: &str,
+) -> ConfigResult<(PathBuf, fs::File)> {
+    let pid = std::process::id();
+    for _ in 0..128 {
+        let seq = NEXT_CONFIG_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp = config_dir.join(format!(".{file_name}.{pid}.{seq}.tmp"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    context: "creating temporary configuration file",
+                    source,
+                });
+            }
+        }
+    }
+    Err(ConfigError::Io {
+        context: "creating temporary configuration file",
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique temporary configuration file",
+        ),
+    })
 }
 
 // ------------------------------------------------------------ document I/O
@@ -1328,6 +1470,42 @@ mod tests {
         let reloaded = Config::load(&dir, "memento.conf").expect("load");
         assert_eq!(reloaded.revision(), 2);
         assert_eq!(reloaded.changelog().len(), 2);
+        assert_eq!(reloaded.changelog()[0].added, entries[0].added);
+        assert_eq!(reloaded.changelog()[0].modified, entries[0].modified);
+        assert_eq!(reloaded.changelog()[1].modified, entries[1].modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changelog_parse_row_round_trips_and_caps_at_20() {
+        let entry = ChangelogEntry {
+            revision: 7,
+            added: vec!["search/delay".to_owned()],
+            modified: vec!["keybind/profiles/My [1], +x/card-add".to_owned()],
+            removed: vec!["general/old".to_owned()],
+        };
+        let row = entry.to_row();
+        let parsed = ChangelogEntry::parse_row(&row).expect("valid row");
+        assert_eq!(parsed, entry);
+        assert_eq!(parsed.to_row(), row);
+
+        assert!(ChangelogEntry::parse_row("garbage").is_none());
+
+        let dir = scratch("memento-config-cap");
+        let mut cfg = Config::new(test_ctx());
+        for i in 1..=25 {
+            cfg.set(&Key::Search(SearchField::Delay), i).expect("set");
+            cfg.save(&dir, "memento.conf").expect("save");
+        }
+        assert_eq!(cfg.revision(), 25);
+        assert_eq!(cfg.changelog().len(), 20);
+        assert_eq!(cfg.changelog()[0].revision, 6);
+        assert_eq!(cfg.changelog()[19].revision, 25);
+
+        let reloaded = Config::load(&dir, "memento.conf").expect("load");
+        assert_eq!(reloaded.changelog().len(), 20);
+        assert_eq!(reloaded.changelog()[0].revision, 6);
+        assert_eq!(reloaded.changelog()[19].revision, 25);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

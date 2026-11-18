@@ -8,9 +8,10 @@ use std::rc::Rc;
 use memento_config::canonical::FORMAT_MAGIC;
 use memento_config::config::{Config, RawDocument};
 use memento_config::keys::lookup;
-use memento_config::{parse_legacy_ini, Value};
+use memento_config::{parse_legacy_ini, KeyPath, Value};
 use memento_net::anki::AnkiEndpoint;
 use memento_setting::keys as raw;
+use memento_setting::migration::{migrate_2_to_3_list_result, migration_plan};
 use serde_json::{json, Map, Value as JsonValue};
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -160,13 +161,36 @@ impl ConfigController {
 
     pub fn save_anki_profiles<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("could not create Anki config directory: {error}"))?;
-        }
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create Anki config directory: {error}"))?;
         let text = serde_json::to_string_pretty(&*self.anki_profiles.borrow())
             .map_err(|error| format!("could not encode Anki profiles: {error}"))?;
-        fs::write(path, text).map_err(|error| format!("could not write Anki profiles: {error}"))
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".anki_connect.").suffix(".tmp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o600));
+        }
+        let mut temp = builder
+            .tempfile_in(parent)
+            .map_err(|error| format!("could not create temporary Anki profiles file: {error}"))?;
+        {
+            use std::io::Write;
+            temp.as_file_mut()
+                .write_all(text.as_bytes())
+                .map_err(|error| format!("could not write Anki profiles: {error}"))?;
+            temp.as_file()
+                .sync_all()
+                .map_err(|error| format!("could not flush Anki profiles: {error}"))?;
+        }
+        temp.persist(path)
+            .map_err(|error| format!("could not save Anki profiles: {}", error.error))?;
+        Ok(())
     }
 
     pub fn store(&self) -> std::cell::Ref<'_, Config> {
@@ -412,7 +436,13 @@ impl ConfigController {
         restore_category(&mut persisted, &snapshot);
         persisted
             .save(config_dir, settings_file)
-            .map_err(|error| format!("{error:?}"))
+            .map_err(|error| format!("{error:?}"))?;
+        self.store.borrow_mut().mark_persisted_with(
+            persisted.revision(),
+            persisted.changelog().to_vec(),
+            |path| path_in_category(category, path),
+        );
+        Ok(())
     }
 
     pub fn reset_settings(
@@ -429,7 +459,15 @@ impl ConfigController {
 
         let persisted = load_config_store(config_dir, settings_file)?;
         let snapshot = category_snapshot(&persisted, category);
-        restore_category(&mut self.store.borrow_mut(), &snapshot);
+        {
+            let mut store = self.store.borrow_mut();
+            restore_category(&mut store, &snapshot);
+            store.mark_persisted_with(
+                persisted.revision(),
+                persisted.changelog().to_vec(),
+                |path| path_in_category(category, path),
+            );
+        }
         if category == 2 && audio_sources(&self.store.borrow()).is_empty() {
             self.defaults_settings(category)?;
         } else if category == 6 && keybind_profile_names(&self.store.borrow()).is_empty() {
@@ -598,11 +636,64 @@ fn load_config_store(config_dir: &Path, file_name: &str) -> Result<Config, Strin
         return Config::load(config_dir, file_name).map_err(|error| format!("{error:?}"));
     }
     let legacy = parse_legacy_ini(&text).map_err(|error| format!("{error:?}"))?;
-    Ok(Config::from_document(RawDocument {
+    let mut config = Config::from_document(RawDocument {
         revision: Some(0),
         changelog_rows: Vec::new(),
         sections: legacy.sections,
-    }))
+    });
+    migrate_legacy_config(&mut config);
+    Ok(config)
+}
+
+fn migrate_legacy_config(config: &mut Config) {
+    let raw_version = config.version().unwrap_or(0);
+    let version = u32::try_from(raw_version).unwrap_or(0);
+    let plan = migration_plan(version);
+    if plan.already_current {
+        return;
+    }
+    if plan.newer_version_warning {
+        eprintln!(
+            "Warning: configuration version {version} is newer than supported version {}.",
+            plan.target_version
+        );
+        return;
+    }
+    if plan.run_2_to_3 {
+        let legacy_bool = match config.get_at(raw::search::GROUP, raw::search::GLOSSARY_STYLE) {
+            Some(Value::Bool(list)) => Some(list),
+            Some(Value::Text(ref text)) if text.eq_ignore_ascii_case("true") => Some(true),
+            Some(Value::Text(ref text)) if text.eq_ignore_ascii_case("false") => Some(false),
+            _ => None,
+        };
+        if let Some(list) = legacy_bool {
+            let migrated = migrate_2_to_3_list_result(list);
+            let _ = config.put_at(
+                raw::search::GROUP,
+                raw::search::GLOSSARY_STYLE,
+                &Value::Int(i64::from(migrated)),
+            );
+        }
+    }
+    if version >= 1 && version < plan.target_version {
+        let _ = config.set_version(i64::from(plan.target_version));
+    }
+}
+
+fn path_in_category(category: i32, path: &KeyPath) -> bool {
+    if category == 2 {
+        return path.group == raw::audio_source::GROUP
+            || path.group.starts_with(&format!("{}/", raw::audio_source::GROUP));
+    }
+    if category == 6 {
+        return (path.group == raw::keybind::GROUP && path.key == raw::keybind::CURRENT_PROFILE)
+            || path
+                .group
+                .starts_with(&format!("{}/{}/", raw::keybind::GROUP, raw::keybind::profile::GROUP));
+    }
+    category_paths(category)
+        .iter()
+        .any(|(group, key)| *group == path.group && *key == path.key)
 }
 
 fn validate_settings_category(category: i32) -> Result<(), String> {
@@ -1140,6 +1231,9 @@ fn add_keybind_profile(config: &mut Config, requested_name: &str) -> Result<(), 
     let name = requested_name.trim();
     if name.is_empty() {
         return Err("profile name cannot be empty".to_owned());
+    }
+    if name.contains('/') {
+        return Err("profile name cannot contain '/'".to_owned());
     }
     let names = keybind_profile_names(config);
     if names.iter().any(|existing| existing == name) {
@@ -3259,4 +3353,101 @@ fn integer_choice(group: &str, key: &str, value: &str) -> Option<i64> {
         _ => return None,
     };
     Some(choice)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "memento-ctrl-cfg-{label}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn keybind_profile_rejects_slash() {
+        let ctrl = ConfigController::new();
+        let err = ctrl.add_entry(6, "bad/profile").unwrap_err();
+        assert!(err.contains("'/'"), "unexpected error: {err}");
+        ctrl.add_entry(6, "ValidProfile").unwrap();
+        assert_eq!(ctrl.current_keybind_profile(), "ValidProfile");
+    }
+
+    #[test]
+    fn save_anki_profiles_writes_atomically_with_private_permissions() {
+        let dir = temp_dir("anki-atomic");
+        let path = dir.join("anki_connect.json");
+        let ctrl = ConfigController::new();
+        ctrl.edit_setting("anki/profile/api-key", "super-secret").unwrap();
+        ctrl.save_anki_profiles(&path).unwrap();
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let reloaded = ConfigController::new();
+        reloaded.load_anki_profiles(&path).unwrap();
+        assert_eq!(reloaded.anki_endpoint().api_key.as_deref(), None); // use_api_key is false
+        ctrl.edit_setting("anki/profile/use-api-key", "true").unwrap();
+        ctrl.save_anki_profiles(&path).unwrap();
+        reloaded.load_anki_profiles(&path).unwrap();
+        assert_eq!(reloaded.anki_endpoint().api_key.as_deref(), Some("super-secret"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_settings_and_save_do_not_split_brain_revision_or_changelog() {
+        let dir = temp_dir("split-brain");
+        let anki = dir.join("anki_connect.json");
+        let ctrl = ConfigController::new();
+        // Establish initial persisted config (clears bootstrap audio/keybind pending defaults).
+        ctrl.save(&dir, "memento.conf").unwrap();
+        assert_eq!(ctrl.store().revision(), 1);
+        assert!(!ctrl.store().is_dirty());
+
+        ctrl.edit_setting("behavior/autofit", "false").unwrap();
+        ctrl.apply_settings(3, &dir, "memento.conf", &anki).unwrap();
+        assert_eq!(ctrl.store().revision(), 2);
+        assert!(!ctrl.store().is_dirty());
+
+        ctrl.recent_files_add("/tmp/video.mkv").unwrap();
+        ctrl.save(&dir, "memento.conf").unwrap();
+        assert_eq!(ctrl.store().revision(), 3);
+
+        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(reloaded.store().revision(), 3);
+        assert_eq!(reloaded.store().changelog().len(), 3);
+        assert_eq!(
+            reloaded.effective_setting(raw::behavior::GROUP, raw::behavior::AUTO_FIT),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(reloaded.recent_files(), vec!["/tmp/video.mkv"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_ini_runs_memento_setting_migration() {
+        let dir = temp_dir("legacy-migrate");
+        let conf_path = dir.join("memento.conf");
+        fs::write(&conf_path, "version=2\n[search]\nlist-result=false\n").unwrap();
+
+        let loaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(
+            loaded.effective_setting(raw::search::GROUP, raw::search::GLOSSARY_STYLE),
+            Some(Value::Int(1))
+        );
+        assert_eq!(loaded.store().version().unwrap(), 6);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

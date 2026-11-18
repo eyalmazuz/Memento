@@ -2801,6 +2801,7 @@ dependencies = [
  "i-slint-renderer-femtovg",
  "icu_provider",
  "image",
+ "libc",
  "libloading",
  "log",
  "memento-anki",
@@ -2819,6 +2820,7 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
+ "tempfile",
  "url",
 ]
 

@@ -111,7 +111,7 @@ impl Url
         {
             target.to_owned()
         };
-        if path_query.bytes().any(|b| b.is_ascii_control() || b == b' ')
+        if path_query.chars().any(|c| c.is_control() || c.is_whitespace())
         {
             return Err(HttpError::Url("URL contains spaces or control bytes".into()));
         }
@@ -132,6 +132,12 @@ impl Url
         if authority.is_empty()
         {
             return Err(HttpError::Url("empty host".into()));
+        }
+        if authority.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(HttpError::Url(
+                "URL authority contains whitespace or control bytes".into(),
+            ));
         }
         if authority.contains('@')
         {
@@ -171,6 +177,20 @@ impl Url
         if host_part.is_empty()
         {
             return Err(HttpError::Url("empty host".into()));
+        }
+        if host_part.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(HttpError::Url(
+                "URL host contains whitespace or control bytes".into(),
+            ));
+        }
+        if !ipv6 && (host_part.contains('[') || host_part.contains(']') || host_part.contains(':'))
+        {
+            return Err(HttpError::Url("invalid character in URL host".into()));
+        }
+        if ipv6 && host_part.parse::<std::net::Ipv6Addr>().is_err()
+        {
+            return Err(HttpError::Url("invalid IPv6 literal in URL".into()));
         }
 
         let port = match port_part
@@ -245,6 +265,10 @@ impl Url
     /// `?x`, and relative `x`/`../x` references.
     pub fn resolve_relative(&self, location: &str) -> HttpResult<Self>
     {
+        if location.chars().any(|c| c.is_control())
+        {
+            return Err(HttpError::Url("redirect location contains control bytes".into()));
+        }
         let location = location.trim();
 
         if location.starts_with("http://") || location.starts_with("https://")
@@ -338,4 +362,30 @@ fn remove_dot_segments(path: &str) -> String
         return "/".to_owned();
     }
     segments.join("/")
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn authority_rejects_control_chars_nul_and_whitespace()
+    {
+        for bad in [
+            "http://example.com\r\nX-Injected: yes/path",
+            "https://example.com\n/path",
+            "http://example.com\0/path",
+            "http://example.com\t/path",
+            "http://example .com/path",
+            "http://[::1\r\n]/path",
+            "http://[not-ipv6]/path",
+        ]
+        {
+            assert!(
+                Url::parse(bad).is_err(),
+                "expected authority rejection for {bad:?}"
+            );
+        }
+    }
 }

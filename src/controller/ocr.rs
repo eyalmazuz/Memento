@@ -24,12 +24,15 @@ struct MocrContextOpaque {
 type MocrInit = unsafe extern "C" fn(*const c_char, c_int) -> *mut MocrContextOpaque;
 type MocrDestroy = unsafe extern "C" fn(*mut MocrContextOpaque) -> c_int;
 type MocrRead =
-    unsafe extern "C" fn(*mut MocrContextOpaque, *mut c_void, usize, usize, c_int) -> *mut c_char;
+    unsafe extern "C" fn(*mut MocrContextOpaque, *const c_void, usize, usize, c_int) -> *mut c_char;
 type MocrFree = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 struct MocrApi {
-    // Keep the library loaded until every context and returned text is released.
+    // Keep libmocr loaded until every context and returned text is released,
+    // and drop it before any explicitly retained libpython handle.
     _library: Library,
+    #[cfg(unix)]
+    _python_library: Option<libloading::os::unix::Library>,
     init: MocrInit,
     destroy: MocrDestroy,
     read: MocrRead,
@@ -47,10 +50,14 @@ impl MocrApi {
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         let candidates = ["libmocr.so"];
 
+        // On Unix, embedded Python C-extensions (e.g. `unicodedata.so`) often do
+        // not link directly against `libpython` and expect its C API symbols
+        // (such as `PyModule_Type`) to already be globally visible. Retain the
+        // first matching `libpython` handle in `MocrApi` with `RTLD_GLOBAL`,
+        // while keeping `libmocr` itself `RTLD_LOCAL`.
         #[cfg(unix)]
-        {
-            // On Unix, ensure libpython symbols are exported with RTLD_GLOBAL so that
-            // dynamic C-extensions like `unicodedata.so` loaded by Python can resolve PyModule_Type.
+        let python_library = {
+            let mut loaded = None;
             for py_name in [
                 "libpython3.14.so.1.0",
                 "libpython3.14.so",
@@ -58,33 +65,25 @@ impl MocrApi {
                 "libpython3.13.so",
                 "libpython3.so",
             ] {
-                unsafe {
-                    let _ = libloading::os::unix::Library::open(
+                if let Ok(lib) = unsafe {
+                    libloading::os::unix::Library::open(
                         Some(py_name),
                         libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
-                    );
+                    )
+                } {
+                    loaded = Some(lib);
+                    break;
                 }
             }
-        }
+            loaded
+        };
 
         let mut errors = Vec::new();
         for candidate in candidates {
-            // SAFETY: We load only known library names/absolute install paths with RTLD_GLOBAL,
-            // then validate every required symbol before exposing the API.
-            let library = match (|| unsafe {
-                #[cfg(unix)]
-                {
-                    libloading::os::unix::Library::open(
-                        Some(candidate),
-                        libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
-                    )
-                    .map(Library::from)
-                }
-                #[cfg(not(unix))]
-                {
-                    Library::new(candidate)
-                }
-            })() {
+            // SAFETY: We load only known library names/absolute install paths
+            // with RTLD_LOCAL (default `Library::new`), then validate every
+            // required symbol before exposing the API.
+            let library = match unsafe { Library::new(candidate) } {
                 Ok(library) => library,
                 Err(error) => {
                     errors.push(format!("{candidate}: {error}"));
@@ -102,7 +101,15 @@ impl MocrApi {
             })();
             match symbols {
                 Ok((init, destroy, read, free)) => {
-                    return Ok(Self { _library: library, init, destroy, read, free });
+                    return Ok(Self {
+                        _library: library,
+                        #[cfg(unix)]
+                        _python_library: python_library,
+                        init,
+                        destroy,
+                        read,
+                        free,
+                    });
                 }
                 Err(error) => errors.push(format!("{candidate}: missing/incompatible libmocr symbol: {error}")),
             }
@@ -362,11 +369,11 @@ impl OcrWorker {
         if !settings.enabled {
             return Err(OcrError::Disabled);
         }
-        let (mut pixels, width, height) = crop_frame(&frame, region, viewport)?;
+        let (pixels, width, height) = crop_frame(&frame, region, viewport)?;
         let read = self.api.read;
         let free = self.api.free;
         let model = self.model_for(&settings)?;
-        let text = model.context.read_rgba(read, free, &mut pixels, width, height)?;
+        let text = model.context.read_rgba(read, free, &pixels, width, height)?;
         let text = text.trim();
         if text.is_empty() {
             return Err(OcrError::NoTextDetected);
@@ -385,7 +392,6 @@ impl OcrWorker {
             if let Some(previous) = self.model.take() {
                 previous.context.destroy()?;
             }
-            prepare_python_executable();
             let context = MocrContext::new(&self.api, &settings.model, settings.use_gpu)?;
             self.model = Some(LoadedModel {
                 name: settings.model.clone(),
@@ -409,14 +415,6 @@ impl MocrContext {
         } else {
             model.trim()
         };
-        if std::env::var_os("PYTHONEXECUTABLE").is_none() {
-            if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
-                let py = std::path::Path::new(&venv).join("bin/python");
-                if py.is_file() {
-                    std::env::set_var("PYTHONEXECUTABLE", py);
-                }
-            }
-        }
         let model_name = CString::new(model_str).map_err(|_| OcrError::InvalidModelName)?;
         let mut pointer = unsafe { (api.init)(model_name.as_ptr(), if use_gpu { 0 } else { 1 }) };
         if pointer.is_null() && use_gpu {
@@ -432,15 +430,23 @@ impl MocrContext {
         &mut self,
         read: MocrRead,
         free: MocrFree,
-        pixels: &mut [u8],
+        pixels: &[u8],
         width: usize,
         height: usize,
     ) -> Result<String, OcrError> {
+        let expected_bytes = width
+            .checked_mul(height)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or(OcrError::InvalidFrameDimensions)?;
+        if width == 0 || height == 0 || pixels.len() != expected_bytes {
+            return Err(OcrError::InvalidFrameBuffer);
+        }
         let context = self.pointer.expect("live OCR context");
-        // SAFETY: the context is live, pixels is mutable and contains exactly
-        // width * height RGBA bytes, and libmocr accepts mocr_mode_RGBA (4).
+        // SAFETY: the context is live, `pixels` stays borrowed and alive for the
+        // entire synchronous `mocr_read` call and contains `width * height * 4`
+        // RGBA bytes (`MOCR_MODE_RGBA`). `mocr_read` takes a read-only image buffer.
         let output = unsafe {
-            (read)(context.as_ptr(), pixels.as_mut_ptr().cast(), width, height, MOCR_MODE_RGBA)
+            (read)(context.as_ptr(), pixels.as_ptr().cast(), width, height, MOCR_MODE_RGBA)
         };
         let output = NonNull::new(output).ok_or(OcrError::InferenceFailed)?;
         MocrText::new(output, free).into_string(free)
@@ -583,30 +589,38 @@ fn crop_frame(
     Ok((crop, width, height))
 }
 
-fn prepare_python_executable() {
-    const PYTHON_EXECUTABLE: &str = "PYTHONEXECUTABLE";
-    const VIRTUAL_ENV: &str = "VIRTUAL_ENV";
+/// Probes `VIRTUAL_ENV` and sets `PYTHONEXECUTABLE` once if unset.
+///
+/// Must be called on the main thread during startup before any worker threads
+/// (libmpv, GUI, ASR, or OCR) are spawned because mutating process environment
+/// variables from a multi-threaded process is undefined behavior on Unix.
+pub fn prepare_python_executable() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        const PYTHON_EXECUTABLE: &str = "PYTHONEXECUTABLE";
+        const VIRTUAL_ENV: &str = "VIRTUAL_ENV";
 
-    if std::env::var_os(PYTHON_EXECUTABLE).is_some() {
-        return;
-    }
-    let Some(virtual_env) = std::env::var_os(VIRTUAL_ENV) else {
-        return;
-    };
-    let virtual_env: Vec<u16> = virtual_env.to_string_lossy().encode_utf16().collect();
-    let Some(path) = memento_util::ocrutils::resolve_venv_python(
-        false,
-        &virtual_env,
-        cfg!(windows),
-    ) else {
-        return;
-    };
-    let Ok(path) = String::from_utf16(&path) else {
-        return;
-    };
-    if Path::new(&path).is_file() {
-        std::env::set_var(PYTHON_EXECUTABLE, path);
-    }
+        if std::env::var_os(PYTHON_EXECUTABLE).is_some() {
+            return;
+        }
+        let Some(virtual_env) = std::env::var_os(VIRTUAL_ENV) else {
+            return;
+        };
+        let virtual_env: Vec<u16> = virtual_env.to_string_lossy().encode_utf16().collect();
+        let Some(path) = memento_util::ocrutils::resolve_venv_python(
+            false,
+            &virtual_env,
+            cfg!(windows),
+        ) else {
+            return;
+        };
+        let Ok(path) = String::from_utf16(&path) else {
+            return;
+        };
+        if Path::new(&path).is_file() {
+            std::env::set_var(PYTHON_EXECUTABLE, path);
+        }
+    });
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ pub fn whisper_gpu_device_count() -> usize {
     (0..unsafe { ggml_backend_dev_count() })
         .filter(|index| {
             let device = unsafe { ggml_backend_dev_get(*index) };
-            matches!(unsafe { ggml_backend_dev_type(device) }, 1 | 2)
+            !device.is_null() && matches!(unsafe { ggml_backend_dev_type(device) }, 1 | 2)
         })
         .count()
 }

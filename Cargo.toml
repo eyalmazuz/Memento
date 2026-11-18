@@ -26,6 +26,8 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "unstable-fontique-08",
 ] }
 libloading = { version = "=0.8.9", optional = true }
+libc = "=0.2.190"
+tempfile = "=3.27.0"
 glow = "=0.17.0"
 log = "=0.4.34"
 icu_provider = { version = "=2.3.1", features = ["logging"] }
