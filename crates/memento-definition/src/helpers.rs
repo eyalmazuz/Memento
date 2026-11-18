@@ -68,18 +68,44 @@ pub fn format_pixel_size(size: f64) -> String {
 /// non-BMP single character only through its first code unit being a
 /// surrogate (never equal to a quote), which `chars()` handles identically.
 pub fn normalize_list_marker(marker: &str) -> String {
-    let trimmed = crate::qstring::trimmed(marker).replace('"', "'");
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() >= 2
-        && ((chars[0] == '\'' && chars[chars.len() - 1] == '\'')
-            || (chars[0] == '"' && chars[chars.len() - 1] == '"'))
-    {
-        // The front/back checks already exclude a lone non-BMP character from
-        // taking this branch, so char slicing matches the code-unit slicing.
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed
+    let raw = crate::qstring::trimmed(marker);
+    if let Some(unquoted) = unquote_css_string(raw) {
+        return unquoted.replace('"', "'");
     }
+    raw.replace('"', "'")
+}
+
+pub(crate) fn unquote_css_string(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut out = String::with_capacity(value.len().saturating_sub(2));
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            match ch {
+                '"' | '\'' | '\\' => out.push(ch),
+                _ => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            // Only peel when this closing quote terminates the entire value.
+            if chars.next().is_none() {
+                return Some(out);
+            }
+            return None;
+        } else {
+            out.push(ch);
+        }
+    }
+    None
 }
 
 /// `Renderer::isBuiltInListMarker` (structuredrichtext_layout.cpp

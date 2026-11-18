@@ -556,23 +556,20 @@ impl ParsedStylesheet {
     /// returned list keeps stylesheet source order.
     pub fn candidate_rule_indexes_for_child(&self, tag: &str, child_index: i64) -> &[usize] {
         // candidateTagKey (dictionarystyles.cpp L37-42): the tag itself when
-        // indexed, otherwise the shared universal key.
+        // indexed, otherwise the shared universal "" key.
         let key = if self.rule_indexes_by_target_tag.contains_key(tag) {
-            Some(tag)
+            tag
         } else {
-            None
+            ""
         };
-        if let Some(tag_key) = key {
-            if let Some(by_child) = self.rule_indexes_by_target_tag_and_child_index.get(tag_key) {
-                if let Some(indexes) = by_child.get(&child_index) {
-                    return indexes;
-                }
+        if let Some(by_child) = self.rule_indexes_by_target_tag_and_child_index.get(key) {
+            if let Some(indexes) = by_child.get(&child_index) {
+                return indexes;
             }
         }
-        match key.and_then(|tag_key| self.non_nth_rule_indexes_by_target_tag.get(tag_key)) {
-            Some(indexes) => indexes,
-            None => &self.universal_rule_indexes,
-        }
+        self.non_nth_rule_indexes_by_target_tag
+            .get(key)
+            .unwrap_or(&self.universal_rule_indexes)
     }
 
     /// True when a tag can need a total sibling element count

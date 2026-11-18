@@ -30,6 +30,76 @@ export struct DictResult {
     frequencies: [PopupFrequency],
 }
 
+export struct RichHeadwordChar {
+    text: string,
+    is_kanji: bool,
+    char_index: int,
+}
+
+export struct RichHeadwordLine {
+    chars: [RichHeadwordChar],
+}
+
+export struct RichTagPill {
+    name: string,
+    category: string,
+    notes: string,
+    bg_color: brush,
+}
+
+export struct RichDerivationStep {
+    label: string,
+    description: string,
+    has_arrow: bool,
+}
+
+export struct RichPitchMora {
+    text: string,
+    high: bool,
+    rises_after: bool,
+    falls_after: bool,
+    nasal: bool,
+    devoice: bool,
+}
+
+export struct RichPitchGraph {
+    dictionary: string,
+    position: int,
+    mora: [RichPitchMora],
+    tags: string,
+}
+
+export struct RichKanjiStat {
+    label: string,
+    value: string,
+}
+
+export struct RichKanjiDetail {
+    valid: bool,
+    character: string,
+    meanings: [string],
+    readings: [string],
+    stats: [RichKanjiStat],
+    classifications: [RichKanjiStat],
+    codepoints: [RichKanjiStat],
+    indices: [RichKanjiStat],
+}
+
+export struct RichSelectionRect {
+    x_px: float,
+    y_px: float,
+    w_px: float,
+    h_px: float,
+}
+
+export struct RichGlossaryRender {
+    has_rich: bool,
+    width_px: float,
+    height_px: float,
+    rendered: image,
+    selection_rects: [RichSelectionRect],
+}
+
 // ── Floating Yomitan Dictionary Card ────────────────────────────────────
 // Japanese text uses one family; Slint accepts a single name, not a CSS list.
 export component DictionaryText inherits Text {
@@ -41,7 +111,96 @@ export global PopupLayout {
 }
 
 export global PopupBridge {
+    in-out property <int> bridge-instance-id: 0;
     in-out property <string> selected-glossary-text: "";
+    in-out property <string> last-copied-glossary-text: "";
+    in-out property <bool> rich-enabled: false;
+    in-out property <int> rich-revision: 0;
+    in-out property <int> selection-revision: 0;
+
+    // Navigation history stack (Back / Forward)
+    in-out property <bool> can-go-back: false;
+    in-out property <bool> can-go-forward: false;
+    in-out property <string> nav-breadcrumb: "";
+    in-out property <bool> kana-reading-active: false;
+    in-out property <string> active-kana-reading: "";
+
+    // Floating tooltip overlay state
+    in-out property <bool> tooltip-visible: false;
+    in-out property <string> tooltip-text: "";
+    in-out property <float> tooltip-x: 0.0;
+    in-out property <float> tooltip-y: 0.0;
+
+    // Independent DictionarySearchPanel state
+    in-out property <string> panel-query: "";
+    in-out property <[DictResult]> panel-results: [];
+    in-out property <bool> panel-kana-only: false;
+    in-out property <bool> panel-searching: false;
+
+    // Rich query callbacks
+    pure callback headword-chars(string) -> [RichHeadwordChar];
+    pure callback headword-lines(string, float) -> [RichHeadwordLine];
+    pure callback term-tag-pills(int, int) -> [RichTagPill];
+    pure callback def-tag-pills(int, int) -> [RichTagPill];
+    pure callback derivation-steps(int, int) -> [RichDerivationStep];
+    pure callback rich-pitch-graphs(int, int) -> [RichPitchGraph];
+    pure callback devoice-circle-image() -> image;
+    pure callback kanji-detail(int, int) -> RichKanjiDetail;
+    pure callback render-glossary(int, float, bool, int, int) -> RichGlossaryRender;
+    pure callback glossary-cursor-is-pointer(int, float, float) -> bool;
+
+    // Interactive actions
+    callback nav-back();
+    callback nav-forward();
+    callback lookup-kanji-char(string, string);
+    callback toggle-kana-reading-search(string, string);
+    callback activate-glossary-link(string) -> bool;
+    callback toggle-glossary-details(int, string);
+    callback show-tooltip(string, float, float);
+    callback hide-tooltip();
+    callback glossary-pointer-down(int, float, float);
+    callback glossary-pointer-drag(int, float, float);
+    callback glossary-pointer-up(int, float, float);
+    callback glossary-pointer-hover(int, float, float, float, float);
+    callback glossary-double-clicked(int, float, float);
+    callback copy-selected-glossary();
+    callback popup-key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback popup-key-released(bool, bool, bool, bool);
+
+    // Independent search panel actions
+    callback panel-search-requested(string);
+    callback panel-toggle-kana-only();
+    callback panel-lookup-requested(string);
+}
+
+component RichTagPillBadge inherits Rectangle {
+    in property <RichTagPill> pill;
+    in property <length> anchor-x: 0px;
+    in property <length> anchor-y: 0px;
+    height: 18px;
+    width: label.preferred-width + 12px;
+    background: root.pill.bg-color;
+    border-radius: 3px;
+    label := DictionaryText {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        text: root.pill.name;
+        font-size: 11px;
+        font-weight: 700;
+        color: #FFFFFF;
+        vertical-alignment: center;
+    }
+    pill-touch := TouchArea {
+        mouse-cursor: root.pill.notes != "" ? help : default;
+        changed has-hover => {
+            if self.has-hover && root.pill.notes != "" {
+                PopupBridge.show-tooltip(root.pill.notes, root.anchor-x / 1px, root.anchor-y / 1px);
+            } else if !self.has-hover {
+                PopupBridge.hide-tooltip();
+            }
+        }
+    }
 }
 
 export component YomitanPopup inherits Rectangle {
@@ -58,6 +217,8 @@ export component YomitanPopup inherits Rectangle {
     in-out property <bool> audio-menu-open: false;
     in-out property <string> audio-menu-expression: "";
     in-out property <string> audio-menu-reading: "";
+    in-out property <length> audio-menu-x: 210px;
+    in-out property <length> audio-menu-y: 62px;
     in property <bool> is-open: false;
     in property <bool> anki-enabled: false;
     in property <bool> show-anki-checkbox: true;
@@ -91,20 +252,115 @@ export component YomitanPopup inherits Rectangle {
 
     changed is-open => {
         root.audio-menu-open = false;
+        PopupBridge.hide-tooltip();
         if root.is-open {
             definition-list.viewport-y = 0px;
             definition-list.fill-viewport();
         }
     }
-    reset-scroll => { definition-list.viewport-y = 0px; root.audio-menu-open = false; }
+    reset-scroll => {
+        definition-list.viewport-y = 0px;
+        root.audio-menu-open = false;
+        PopupBridge.hide-tooltip();
+    }
 
     // Keep clicks on the card's padding from reaching the video underneath.
     TouchArea { }
 
+    glossary-focus := FocusScope {
+        width: 0px;
+        height: 0px;
+        enabled: PopupBridge.rich-enabled;
+        key-pressed(event) => {
+            if ((event.modifiers.control || event.modifiers.meta)
+                && !event.modifiers.alt
+                && (event.text == "c" || event.text == "C")
+                && PopupBridge.selected-glossary-text != "")
+            {
+                PopupBridge.copy-selected-glossary();
+                return accept;
+            }
+            if (PopupBridge.popup-key-pressed(
+                event.text,
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta
+            )) {
+                return accept;
+            }
+            reject
+        }
+        key-released(event) => {
+            PopupBridge.popup-key-released(
+                event.modifiers.control,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.meta
+            );
+            reject
+        }
+    }
+
     popup-content := VerticalLayout {
         cache-rendering-hint: true;
         padding: 12px;
-        spacing: 0px;
+        spacing: 4px;
+
+        // Back / Forward Navigation History Bar (shown when internal navigation occurred)
+        if PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward) : HorizontalLayout {
+            height: 26px;
+            spacing: 4px;
+            alignment: start;
+            padding-right: 34px;
+
+            Rectangle {
+                width: 26px;
+                height: 24px;
+                border-radius: 3px;
+                background: !PopupBridge.can-go-back ? #1F2429 : (nav-back-touch.has-hover ? #384046 : #2B3238);
+                DictionaryText {
+                    text: "←";
+                    font-size: 14px;
+                    color: PopupBridge.can-go-back ? #E2E8F0 : #52616B;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                nav-back-touch := TouchArea {
+                    enabled: PopupBridge.can-go-back;
+                    mouse-cursor: PopupBridge.can-go-back ? pointer : default;
+                    clicked => { PopupBridge.nav-back(); }
+                }
+            }
+
+            Rectangle {
+                width: 26px;
+                height: 24px;
+                border-radius: 3px;
+                background: !PopupBridge.can-go-forward ? #1F2429 : (nav-fwd-touch.has-hover ? #384046 : #2B3238);
+                DictionaryText {
+                    text: "→";
+                    font-size: 14px;
+                    color: PopupBridge.can-go-forward ? #E2E8F0 : #52616B;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                nav-fwd-touch := TouchArea {
+                    enabled: PopupBridge.can-go-forward;
+                    mouse-cursor: PopupBridge.can-go-forward ? pointer : default;
+                    clicked => { PopupBridge.nav-forward(); }
+                }
+            }
+
+            if PopupBridge.nav-breadcrumb != "" : DictionaryText {
+                text: PopupBridge.nav-breadcrumb;
+                font-size: 11px;
+                color: #94A3B8;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
 
         // Definitions List
         definition-list := ScrollView {
@@ -115,14 +371,14 @@ export component YomitanPopup inherits Rectangle {
                     root.load-more-results(false);
                 }
             }
-            changed viewport-y => { self.fill-viewport(); }
+            changed viewport-y => { self.fill-viewport(); PopupBridge.hide-tooltip(); }
             changed viewport-height => { self.fill-viewport(); }
             changed height => { self.fill-viewport(); }
             definition-content := VerticalLayout {
                 width: parent.width;
                 height: self.preferred-height;
                 spacing: 0px;
-                for res[idx] in root.results : Rectangle {
+                for res[idx] in root.results : row-wrapper := Rectangle {
                 width: parent.width - 6px;
                 height: res.collapsed && !res.term-start ? 0px : term-segment.height + ((res.term-end || (res.collapsed && res.term-start)) ? 10px : 0px);
                 visible: !res.collapsed || res.term-start;
@@ -144,26 +400,113 @@ export component YomitanPopup inherits Rectangle {
                         width: parent.width;
                         spacing: 6px;
                         min-height: 34px;
+                        property <length> buttons-reserved-w:
+                            (root.added-note-id != "" && root.added-result-index == res.index - 1 ? 68px : 0px)
+                            + (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
+                            + (!res.is-kanji && res.has-kanji ? 34px : 0px)
+                            + (!res.is-kanji ? 34px : 0px)
+                            + (root.anki-enabled ? 34px : 0px)
+                            + 34px
+                            + (res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) ? 34px : 0px);
+                        property <length> avail-title-w: max(96px, card-content.width - self.buttons-reserved-w);
                         term-title := VerticalLayout {
                             horizontal-stretch: 1;
-                            spacing: 0px;
-                            if res.reading != "" && res.reading != res.expression : DictionaryText {
+                            min-width: 0px;
+                            preferred-width: 0px;
+                            spacing: 2px;
+                            if !res.is-kanji && res.reading != "" && res.reading != res.expression : DictionaryText {
                                 text: res.reading;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
                                 font-size: 12px;
                                 color: #94A3B8;
                             }
-                            DictionaryText {
+                            if PopupBridge.rich-enabled && !res.is-kanji : VerticalLayout {
+                                spacing: 1px;
+                                for hw-line in PopupBridge.headword-lines(res.expression, avail-title-w / 1px) : HorizontalLayout {
+                                    alignment: start;
+                                    spacing: 0px;
+                                    for ch in hw-line.chars : Rectangle {
+                                        width: ch-text.preferred-width;
+                                        height: ch-text.preferred-height;
+                                        background: ch.is-kanji && ch-touch.has-hover ? #283442 : transparent;
+                                        border-radius: 3px;
+                                        ch-text := DictionaryText {
+                                            text: ch.text;
+                                            font-size: 23px;
+                                            font-weight: 700;
+                                            color: ch.is-kanji && ch-touch.has-hover ? #93C5FD : #FFFFFF;
+                                        }
+                                        ch-touch := TouchArea {
+                                            enabled: ch.is-kanji;
+                                            mouse-cursor: ch.is-kanji ? pointer : default;
+                                            clicked => {
+                                                PopupBridge.lookup-kanji-char(res.expression, ch.text);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !PopupBridge.rich-enabled || res.is-kanji : DictionaryText {
                                 text: res.expression;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
-                                font-size: 23px;
+                                font-size: res.is-kanji ? 36px : 23px;
                                 font-weight: 700;
                                 font-family: "Noto Sans CJK JP";
                                 color: #FFFFFF;
                             }
+
+                            // Conjugation derivation steps (#279)
+                            if PopupBridge.rich-enabled && !res.is-kanji : HorizontalLayout {
+                                alignment: start;
+                                spacing: 2px;
+                                for step[step-idx] in PopupBridge.derivation-steps(res.index, PopupBridge.rich-revision) : HorizontalLayout {
+                                    spacing: 2px;
+                                    if step-idx == 0 : DictionaryText {
+                                        text: "« ";
+                                        font-size: 11px;
+                                        color: #94A3B8;
+                                        vertical-alignment: center;
+                                    }
+                                    step-box := Rectangle {
+                                        width: step-lbl.preferred-width + 6px;
+                                        height: 17px;
+                                        border-radius: 3px;
+                                        background: step-touch.has-hover ? #334155 : #252D35;
+                                        step-lbl := DictionaryText {
+                                            x: 3px;
+                                            height: parent.height;
+                                            text: step.label;
+                                            font-size: 11px;
+                                            color: #CBD5E1;
+                                            vertical-alignment: center;
+                                        }
+                                        step-touch := TouchArea {
+                                            mouse-cursor: step.description != "" ? help : default;
+                                            changed has-hover => {
+                                                if self.has-hover && step.description != "" {
+                                                    PopupBridge.show-tooltip(
+                                                        step.label + ": " + step.description,
+                                                        24.0,
+                                                        (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 48px) / 1px
+                                                    );
+                                                } else if !self.has-hover {
+                                                    PopupBridge.hide-tooltip();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if step.has-arrow : DictionaryText {
+                                        text: "←";
+                                        font-size: 11px;
+                                        color: #64748B;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
                         }
+
                         if root.added-note-id != "" && root.added-result-index == res.index - 1 : Rectangle {
                             width: 62px;
                             height: 28px;
@@ -181,15 +524,50 @@ export component YomitanPopup inherits Rectangle {
                                 clicked => { root.browse-anki-note(root.added-note-id); }
                             }
                         }
+
+                        // `かな` reading-search toggle button
+                        if PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression : Rectangle {
+                            width: 34px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: (PopupBridge.kana-reading-active && PopupBridge.active-kana-reading == res.reading)
+                                ? (kana-touch.has-hover ? #0D9488 : #0F766E)
+                                : (kana-touch.has-hover ? #384046 : #2B3238);
+                            DictionaryText {
+                                text: "かな";
+                                color: #E2E8F0;
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            kana-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    PopupBridge.toggle-kana-reading-search(res.expression, res.reading);
+                                }
+                            }
+                        }
+
                         if !res.is-kanji && res.has-kanji : Rectangle {
                             width: 28px;
                             height: 28px;
                             border-radius: 3px;
                             background: kanji-touch.has-hover ? #384046 : transparent;
                             DictionaryText { text: "字"; color: #CBD5E1; font-size: 16px; horizontal-alignment: center; vertical-alignment: center; }
-                            kanji-touch := TouchArea { mouse-cursor: pointer; clicked => { root.kanji-info(res.expression); } }
+                            kanji-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if PopupBridge.rich-enabled {
+                                        PopupBridge.lookup-kanji-char(res.expression, "");
+                                    } else {
+                                        root.kanji-info(res.expression);
+                                    }
+                                }
+                            }
                         }
-                        if !res.is-kanji : Rectangle {
+
+                        if !res.is-kanji : audio-btn-box := Rectangle {
                             width: 28px;
                             height: 28px;
                             border-radius: 3px;
@@ -209,12 +587,15 @@ export component YomitanPopup inherits Rectangle {
                                     if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
                                         root.audio-menu-expression = res.expression;
                                         root.audio-menu-reading = res.reading;
+                                        root.audio-menu-x = max(8px, min(root.width - 238px, 12px + audio-btn-box.x - 190px));
+                                        root.audio-menu-y = max(36px, min(root.height - 140px, 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px));
                                         root.audio-menu-open = true;
                                         root.request-audio-sources(res.expression, res.reading);
                                     }
                                 }
                             }
                         }
+
                         if root.anki-enabled : Rectangle {
                             width: 28px;
                             height: 28px;
@@ -232,6 +613,7 @@ export component YomitanPopup inherits Rectangle {
                                 clicked => { root.add-anki-note(res.index - 1); }
                             }
                         }
+
                         Rectangle {
                             width: 28px;
                             height: 28px;
@@ -240,8 +622,23 @@ export component YomitanPopup inherits Rectangle {
                             DictionaryText { text: res.collapsed ? "›" : "⌄"; color: #CBD5E1; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; }
                             collapse-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-term-collapse(res.index - 1); } }
                         }
-                        // Leave room for the close control pinned above the list.
-                        if res.index == 1 : Rectangle { width: 28px; height: 28px; }
+
+                        // Leave room for the close control pinned above the list when no nav bar is above row 1.
+                        if res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                        }
+                    }
+
+                    // Term-level deduplicated category-colored tag pills (#220)
+                    if !res.collapsed && res.term-start && PopupBridge.rich-enabled : HorizontalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        for pill in PopupBridge.term-tag-pills(res.index, PopupBridge.rich-revision) : RichTagPillBadge {
+                            pill: pill;
+                            anchor-x: 20px;
+                            anchor-y: 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 44px;
+                        }
                     }
 
                     if !res.collapsed && res.index == 1 && res.frequencies.length == 0 && (root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "") : HorizontalLayout {
@@ -279,7 +676,95 @@ export component YomitanPopup inherits Rectangle {
                         }
                     }
 
-                    if !res.collapsed && res.term-start : VerticalLayout {
+                    // Rich pitch graphs with nasal (`゜`/ring) & devoice (dotted circle) markers
+                    if !res.collapsed && res.term-start && PopupBridge.rich-enabled : VerticalLayout {
+                        spacing: 4px;
+                        for pitch in PopupBridge.rich-pitch-graphs(res.index, PopupBridge.rich-revision) : Rectangle {
+                            width: parent.width;
+                            height: 30px;
+                            background: transparent;
+                            HorizontalLayout {
+                                width: parent.width;
+                                height: 30px;
+                                spacing: 8px;
+                                alignment: start;
+                                Rectangle {
+                                    height: 20px;
+                                    y: 5px;
+                                    width: min(pitch-dict-lbl.preferred-width + 10px, parent.width * 0.42);
+                                    background: #6640be;
+                                    border-radius: 3px;
+                                    pitch-dict-lbl := DictionaryText {
+                                        x: 5px;
+                                        width: parent.width - 10px;
+                                        height: parent.height;
+                                        text: pitch.dictionary + " [" + pitch.position + "]";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #FFFFFF;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                                HorizontalLayout {
+                                    width: self.preferred-width;
+                                    height: 30px;
+                                    horizontal-stretch: 0;
+                                    spacing: 0px;
+                                    for mora in pitch.mora : Rectangle {
+                                        width: max(20px, rich-mora-lbl.preferred-width + 6px);
+                                        height: 30px;
+                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1.5px; background: #B9A1E8; }
+                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1.5px; y: 3px; width: 1.5px; height: 9.5px; background: #B9A1E8; }
+                                        if mora.devoice : Image {
+                                            x: (parent.width - 18px) / 2;
+                                            y: 11px;
+                                            width: 18px;
+                                            height: 18px;
+                                            source: PopupBridge.devoice-circle-image();
+                                        }
+                                        rich-mora-lbl := DictionaryText {
+                                            text: mora.text;
+                                            y: 13px;
+                                            horizontal-alignment: center;
+                                            width: parent.width;
+                                            font-size: 11px;
+                                            color: mora.devoice ? #FCA5A5 : #E2E8F0;
+                                        }
+                                        if mora.nasal : Rectangle {
+                                            x: parent.width - 6px;
+                                            y: 11px;
+                                            width: 5px;
+                                            height: 5px;
+                                            border-radius: 2.5px;
+                                            border-width: 1.2px;
+                                            border-color: #FBBF24;
+                                            background: #1C2024;
+                                        }
+                                        if mora.nasal || mora.devoice : TouchArea {
+                                            mouse-cursor: help;
+                                            changed has-hover => {
+                                                if self.has-hover {
+                                                    PopupBridge.show-tooltip(
+                                                        mora.nasal && mora.devoice
+                                                            ? "Nasalized & devoiced mora (鼻濁音・母音無声化)"
+                                                            : (mora.nasal ? "Nasalized mora (鼻濁音 ゜)" : "Devoiced mora (母音無声化)"),
+                                                        30.0,
+                                                        (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 64px) / 1px
+                                                    );
+                                                } else {
+                                                    PopupBridge.hide-tooltip();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback pitch graphs when rich bridge has none or is disabled
+                    if !res.collapsed && res.term-start && (!PopupBridge.rich-enabled || PopupBridge.rich-pitch-graphs(res.index, PopupBridge.rich-revision).length == 0) : VerticalLayout {
                         spacing: 4px;
                         for pitch in res.pitch-graphs : Rectangle {
                             width: parent.width;
@@ -315,9 +800,9 @@ export component YomitanPopup inherits Rectangle {
                         }
                     }
 
-                    // Header row: POS tags, Dictionary tag
+                    // Header row: Checkbox, Category-colored POS tags (#220), Dictionary tag
                     if !res.collapsed : HorizontalLayout {
-                        spacing: 8px;
+                        spacing: 6px;
                         alignment: start;
 
                         if root.show-anki-checkbox : Rectangle {
@@ -340,8 +825,17 @@ export component YomitanPopup inherits Rectangle {
                             }
                         }
 
-                        // Part of Speech badge(s)
-                        if res.pos-tags != "" : Rectangle {
+                        if PopupBridge.rich-enabled : HorizontalLayout {
+                            spacing: 4px;
+                            for pill in PopupBridge.def-tag-pills(res.index, PopupBridge.rich-revision) : RichTagPillBadge {
+                                pill: pill;
+                                anchor-x: 24px;
+                                anchor-y: 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
+                            }
+                        }
+
+                        // Fallback Part of Speech badge(s) when rich bridge is not active
+                        if !PopupBridge.rich-enabled && res.pos-tags != "" : Rectangle {
                             height: 18px;
                             background: #2b3238;
                             border-radius: 3px;
@@ -375,11 +869,213 @@ export component YomitanPopup inherits Rectangle {
                                 }
                             }
                         }
-
                     }
 
-                    // Definition Meaning Text
-                    if !res.collapsed && res.glossary-blocks.length > 0 : VerticalLayout {
+                    // 3-Column Kanji Detail View (Glossary | Reading | Statistics + Classifications/Codepoints/Indices)
+                    if !res.collapsed && res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid : VerticalLayout {
+                        width: parent.width;
+                        spacing: 6px;
+                        property <RichKanjiDetail> kdetail: PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision);
+
+                        Rectangle { height: 1px; width: parent.width; background: #384046; }
+
+                        HorizontalLayout {
+                            width: parent.width;
+                            spacing: 8px;
+                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Glossary"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
+                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Reading"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
+                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Statistics"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
+                        }
+
+                        Rectangle { height: 1px; width: parent.width; background: #384046; }
+
+                        HorizontalLayout {
+                            width: parent.width;
+                            spacing: 8px;
+                            // Column 1: Meanings
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                width: 0px;
+                                spacing: 2px;
+                                alignment: start;
+                                for meaning[m-idx] in kdetail.meanings : DictionaryText {
+                                    width: parent.width;
+                                    text: (m-idx + 1) + ". " + meaning;
+                                    font-size: 13px;
+                                    color: res.selected ? #F8FAFC : #94A3B8;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            // Column 2: Onyomi & Kunyomi Readings
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                width: 0px;
+                                spacing: 2px;
+                                alignment: start;
+                                for r-line in kdetail.readings : DictionaryText {
+                                    width: parent.width;
+                                    text: r-line;
+                                    font-size: 13px;
+                                    color: #E2E8F0;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            // Column 3: Statistics (strokes, grade, JLPT, freq)
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                width: 0px;
+                                spacing: 3px;
+                                alignment: start;
+                                for stat in kdetail.stats : HorizontalLayout {
+                                    width: parent.width;
+                                    spacing: 4px;
+                                    DictionaryText {
+                                        horizontal-stretch: 1;
+                                        text: stat.label;
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: #CBD5E1;
+                                        wrap: word-wrap;
+                                    }
+                                    DictionaryText {
+                                        text: stat.value;
+                                        font-size: 11px;
+                                        color: #9CE5C7;
+                                    }
+                                }
+                            }
+                        }
+
+                        if kdetail.classifications.length > 0 : VerticalLayout {
+                            spacing: 3px;
+                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
+                            DictionaryText { text: "Classifications"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
+                            for item in kdetail.classifications : HorizontalLayout {
+                                spacing: 6px;
+                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
+                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
+                            }
+                        }
+
+                        if kdetail.codepoints.length > 0 : VerticalLayout {
+                            spacing: 3px;
+                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
+                            DictionaryText { text: "Codepoints"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
+                            for item in kdetail.codepoints : HorizontalLayout {
+                                spacing: 6px;
+                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
+                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
+                            }
+                        }
+
+                        if kdetail.indices.length > 0 : VerticalLayout {
+                            spacing: 3px;
+                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
+                            DictionaryText { text: "Dictionary Indices"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
+                            for item in kdetail.indices : HorizontalLayout {
+                                spacing: 6px;
+                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
+                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
+                            }
+                        }
+                    }
+
+                    // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs, mouse selection)
+                    if !res.collapsed && !res.is-kanji && PopupBridge.rich-enabled : rich-surface := Rectangle {
+                        property <RichGlossaryRender> rich-doc: PopupBridge.render-glossary(
+                            res.index,
+                            parent.width / 1px,
+                            res.selected,
+                            PopupBridge.rich-revision,
+                            PopupBridge.selection-revision
+                        );
+                        visible: self.rich-doc.has-rich;
+                        width: parent.width;
+                        height: self.rich-doc.has-rich ? self.rich-doc.height-px * 1px : 0px;
+                        background: transparent;
+
+                        for sel-rect in self.rich-doc.selection-rects : Rectangle {
+                            x: sel-rect.x-px * 1px;
+                            y: sel-rect.y-px * 1px;
+                            width: sel-rect.w-px * 1px;
+                            height: sel-rect.h-px * 1px;
+                            background: #38a6d666;
+                            border-radius: 2px;
+                        }
+
+                        if self.rich-doc.has-rich : Image {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.rich-doc.width-px * 1px;
+                            height: parent.rich-doc.height-px * 1px;
+                            source: parent.rich-doc.rendered;
+                            image-fit: fill;
+                        }
+
+                        if self.rich-doc.has-rich : rich-touch := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            mouse-cursor: PopupBridge.glossary-cursor-is-pointer(
+                                res.index,
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px
+                            ) ? pointer : text;
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                    glossary-focus.focus();
+                                    PopupBridge.glossary-pointer-down(
+                                        res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else if (event.kind == PointerEventKind.move) {
+                                    if (self.pressed) {
+                                        PopupBridge.glossary-pointer-drag(
+                                            res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    } else {
+                                        PopupBridge.glossary-pointer-hover(
+                                            res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px,
+                                            (12px + self.mouse-x) / 1px,
+                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + rich-surface.y + self.mouse-y) / 1px
+                                        );
+                                    }
+                                } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                    PopupBridge.glossary-pointer-up(
+                                        res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else if (event.kind == PointerEventKind.cancel) {
+                                    PopupBridge.hide-tooltip();
+                                }
+                            }
+                            double-clicked => {
+                                glossary-focus.focus();
+                                PopupBridge.glossary-double-clicked(
+                                    res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px
+                                );
+                            }
+                            changed has-hover => {
+                                if !self.has-hover {
+                                    PopupBridge.hide-tooltip();
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback Definition Meaning Text (when rich surface is not rendered for this row)
+                    if !res.collapsed
+                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
+                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
+                        && res.glossary-blocks.length > 0 : VerticalLayout
+                    {
                         width: parent.width;
                         spacing: 4px;
                         for block in res.glossary-blocks : Rectangle {
@@ -396,11 +1092,20 @@ export component YomitanPopup inherits Rectangle {
                             }
                             if block.href != "" : TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.open-rich-link(block.href); }
+                                clicked => {
+                                    if !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
+                                        root.open-rich-link(block.href);
+                                    }
+                                }
                             }
                         }
                     }
-                    if !res.collapsed && res.glossary-blocks.length == 0 : DictionaryText {
+
+                    if !res.collapsed
+                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
+                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
+                        && res.glossary-blocks.length == 0 : DictionaryText
+                    {
                         width: parent.width;
                         text: res.glossary;
                         font-size: 15px;
@@ -410,8 +1115,11 @@ export component YomitanPopup inherits Rectangle {
                         height: self.preferred-height;
                     }
 
-                    // Japanese Example Sentence
-                    if !res.collapsed && res.example-ja != "" : HorizontalLayout {
+                    // Japanese Example Sentence (shown only when rich structured-content did not already render it)
+                    if !res.collapsed
+                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
+                        && res.example-ja != "" : HorizontalLayout
+                    {
                         width: parent.width;
                         spacing: 5px;
                         Rectangle {
@@ -429,7 +1137,10 @@ export component YomitanPopup inherits Rectangle {
                     }
 
                     // English Example Translation
-                    if !res.collapsed && res.example-en != "" : HorizontalLayout {
+                    if !res.collapsed
+                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
+                        && res.example-en != "" : HorizontalLayout
+                    {
                         width: parent.width;
                         spacing: 5px;
                         Rectangle {
@@ -447,7 +1158,10 @@ export component YomitanPopup inherits Rectangle {
                     }
 
                     // Notes / Explanations
-                    if !res.collapsed && res.notes != "" : DictionaryText {
+                    if !res.collapsed
+                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
+                        && res.notes != "" : DictionaryText
+                    {
                         width: parent.width;
                         text: "Note: " + res.notes;
                         font-size: 12px;
@@ -478,6 +1192,32 @@ export component YomitanPopup inherits Rectangle {
             }
         }
     }
+
+    // Floating Tooltip Overlay (for title attributes, <ruby> readings, tag notes, conjugation derivations #279)
+    if PopupBridge.tooltip-visible && PopupBridge.tooltip-text != "" : Rectangle {
+        property <length> tip-w: min(root.width - 16px, tip-label.preferred-width + 16px);
+        property <length> tip-h: tip-label.preferred-height + 10px;
+        x: max(8px, min(root.width - self.tip-w - 8px, PopupBridge.tooltip-x * 1px));
+        y: max(8px, min(root.height - self.tip-h - 8px, PopupBridge.tooltip-y * 1px - self.tip-h - 6px));
+        width: self.tip-w;
+        height: self.tip-h;
+        background: #0F172AEE;
+        border-width: 1px;
+        border-color: #475569;
+        border-radius: 4px;
+        drop-shadow-blur: 10px;
+        drop-shadow-color: #000000AA;
+        tip-label := DictionaryText {
+            x: 8px;
+            y: 5px;
+            width: parent.width - 16px;
+            text: PopupBridge.tooltip-text;
+            font-size: 12px;
+            color: #F8FAFC;
+            wrap: word-wrap;
+        }
+    }
+
     Rectangle {
         x: parent.width - 46px;
         y: 18px;
@@ -488,14 +1228,16 @@ export component YomitanPopup inherits Rectangle {
         DictionaryText { text: "×"; font-size: 18px; color: #CBD5E1; horizontal-alignment: center; vertical-alignment: center; }
         close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-requested(); } }
     }
+
     if root.audio-menu-open : TouchArea {
         width: parent.width;
         height: parent.height;
         clicked => { root.audio-menu-open = false; }
     }
+
     if root.audio-menu-open : Rectangle {
-        x: parent.width - self.width - 40px;
-        y: 62px;
+        x: max(8px, min(parent.width - self.width - 8px, root.audio-menu-x));
+        y: max(36px, min(parent.height - self.height - 8px, root.audio-menu-y));
         width: 230px;
         height: min(source-items.preferred-height + 12px, parent.height - 75px);
         background: #252A2F;
@@ -505,30 +1247,30 @@ export component YomitanPopup inherits Rectangle {
         source-scroll := ScrollView {
             x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
             source-items := VerticalLayout {
-            x: 0px; y: 0px; width: parent.width - 6px; height: self.preferred-height;
-            alignment: start;
-            if root.audio-sources-loading : DictionaryText {
-                text: "Loading recordings…";
-                height: 24px;
-                color: #94A3B8;
-                vertical-alignment: center;
-            }
-            if !root.audio-sources-loading && root.audio-sources.length == 0 : DictionaryText {
-                text: "No audio sources available";
-                height: 30px;
-                color: #94A3B8;
-                vertical-alignment: center;
-            }
-            for source in root.audio-sources : Rectangle {
-                height: 30px;
-                background: source-touch.has-hover ? #384046 : transparent;
-                DictionaryText { text: (root.selected-audio-source == source.index ? "✓  " : "   ") + source.name; color: #E2E8F0; vertical-alignment: center; x: 7px; }
-                source-touch := TouchArea { mouse-cursor: pointer; clicked => {
-                    root.select-audio-source(source.index);
-                    root.audio-menu-open = false;
-                    root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
-                } }
-            }
+                x: 0px; y: 0px; width: parent.width - 6px; height: self.preferred-height;
+                alignment: start;
+                if root.audio-sources-loading : DictionaryText {
+                    text: "Loading recordings…";
+                    height: 24px;
+                    color: #94A3B8;
+                    vertical-alignment: center;
+                }
+                if !root.audio-sources-loading && root.audio-sources.length == 0 : DictionaryText {
+                    text: "No audio sources available";
+                    height: 30px;
+                    color: #94A3B8;
+                    vertical-alignment: center;
+                }
+                for source in root.audio-sources : Rectangle {
+                    height: 30px;
+                    background: source-touch.has-hover ? #384046 : transparent;
+                    DictionaryText { text: (root.selected-audio-source == source.index ? "✓  " : "   ") + source.name; color: #E2E8F0; vertical-alignment: center; x: 7px; }
+                    source-touch := TouchArea { mouse-cursor: pointer; clicked => {
+                        root.select-audio-source(source.index);
+                        root.audio-menu-open = false;
+                        root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+                    } }
+                }
             }
         }
     }
@@ -542,6 +1284,8 @@ export component DictionarySearchPanel inherits Rectangle {
     callback lookup(string);
     callback close();
 
+    private property <[DictResult]> active-results: PopupBridge.rich-enabled ? PopupBridge.panel-results : root.results;
+
     background: MementoPalette.surface-bg;
     border-color: MementoPalette.border;
 
@@ -549,6 +1293,7 @@ export component DictionarySearchPanel inherits Rectangle {
         padding: 10px;
         spacing: 8px;
         HorizontalLayout {
+            spacing: 6px;
             Text {
                 text: "Search";
                 font-size: 16px;
@@ -557,55 +1302,95 @@ export component DictionarySearchPanel inherits Rectangle {
                 vertical-alignment: center;
                 horizontal-stretch: 1;
             }
+            if PopupBridge.rich-enabled : Rectangle {
+                width: 38px;
+                height: 26px;
+                border-radius: 4px;
+                background: PopupBridge.panel-kana-only
+                    ? (panel-kana-touch.has-hover ? #0D9488 : #0F766E)
+                    : (panel-kana-touch.has-hover ? #384046 : #252A30);
+                DictionaryText {
+                    text: "かな";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: #F1F5F9;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                panel-kana-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { PopupBridge.panel-toggle-kana-only(); }
+                }
+            }
             Button { text: "×"; clicked => { root.close(); } }
         }
-        LineEdit {
+
+        if PopupBridge.rich-enabled : LineEdit {
+            placeholder-text: PopupBridge.panel-kana-only ? "Search by reading (かな)…" : "Search Japanese…";
+            text <=> PopupBridge.panel-query;
+            edited(value) => { PopupBridge.panel-search-requested(value); }
+        }
+        if !PopupBridge.rich-enabled : LineEdit {
             placeholder-text: "Search Japanese…";
             text <=> root.query;
             edited(value) => { root.search-changed(value); }
         }
+
         ListView {
-            for hit[index] in root.results : Rectangle {
+            for hit[index] in root.active-results : Rectangle {
                 height: 124px;
+                clip: true;
                 border-radius: 5px;
                 background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
                 VerticalLayout {
+                    height: parent.height;
                     padding: 7px;
                     spacing: 3px;
                     HorizontalLayout {
                         spacing: 8px;
-                        Text {
+                        DictionaryText {
                             text: hit.expression;
                             font-size: 18px;
                             font-weight: 700;
                             color: #F8FAFC;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
-                        Text {
+                        DictionaryText {
                             text: hit.reading;
                             font-size: 12px;
                             color: #94A3B8;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
-                    Text {
+                    DictionaryText {
                         text: hit.dict-name;
                         font-size: 11px;
                         color: #72C9B9;
                         overflow: elide;
                     }
-                    Text {
+                    DictionaryText {
                         text: hit.glossary;
                         font-size: 12px;
                         color: #E2E8F0;
                         wrap: word-wrap;
+                        overflow: elide;
+                        vertical-stretch: 1;
                         vertical-alignment: top;
                     }
                 }
                 result-touch := TouchArea {
                     width: 100%;
                     height: 100%;
-                    clicked => { root.lookup(hit.expression); }
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if PopupBridge.rich-enabled {
+                            PopupBridge.panel-lookup-requested(hit.expression);
+                        } else {
+                            root.lookup(hit.expression);
+                        }
+                    }
                 }
             }
         }

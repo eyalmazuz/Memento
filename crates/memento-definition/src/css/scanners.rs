@@ -350,14 +350,6 @@ fn scan_pcre_number(bytes: &[u8], mut pos: usize) -> Option<(f64, usize)> {
 /// Candidates for `DictionaryStyles::candidateRuleIndexes(tag, childIndex)`
 /// (dictionarystyles.cpp L81-104).
 ///
-/// PORT-NOTE: `element.rs`'s `candidate_rule_indexes_for_child` returns
-/// `universal_rule_indexes` when the tag is not indexed, but the C++ looks
-/// up the parser-seeded universal key `""` in `nonNthRuleIndexesByTargetTag`
-/// and `ruleIndexesByTargetTagAndChildIndex` (dictionarystyles.cpp L37-42;
-/// dictionarystyles_parser.cpp L481, L500-540), which excludes exact-target
-/// `:nth-child()` rules from the universal fallback and adds them per exact
-/// child index. This mirrors the exact C++ lookup chain.
-///
 /// SEAM: stylesheet producers must seed the `""` key entries exactly the way
 /// dictionarystyles_parser.cpp does.
 pub fn candidate_rule_indexes_for<'a>(
@@ -365,25 +357,7 @@ pub fn candidate_rule_indexes_for<'a>(
     tag: &'a str,
     child_index: i64,
 ) -> &'a [usize] {
-    /* candidateTagKey (dictionarystyles.cpp L37-42): the tag itself when
-     * indexed, otherwise the shared universal "" key. */
-    let key = if stylesheet.rule_indexes_by_target_tag.contains_key(tag) {
-        tag
-    } else {
-        ""
-    };
-    if let Some(by_tag) = stylesheet
-        .rule_indexes_by_target_tag_and_child_index
-        .get(&key.to_string())
-    {
-        if let Some(indexes) = by_tag.get(&child_index) {
-            return indexes;
-        }
-    }
-    stylesheet
-        .non_nth_rule_indexes_by_target_tag
-        .get(&key.to_string())
-        .unwrap_or(&stylesheet.universal_rule_indexes)
+    stylesheet.candidate_rule_indexes_for_child(tag, child_index)
 }
 
 /// Referenced to keep `HashMap` listed for the ParsedStylesheet maps layout:
