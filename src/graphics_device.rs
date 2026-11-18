@@ -115,6 +115,10 @@ pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
             configured = Some("no".to_owned());
             continue;
         }
+        if option == "hwdec" {
+            configured = Some("yes".to_owned());
+            continue;
+        }
         if let Some((key, value)) = option.split_once('=') {
             if key.trim() == "hwdec" {
                 let parsed = unquote_conf_value(value);
@@ -135,12 +139,15 @@ pub fn configured_hwdec_from_mpv_conf(config_dir: &Path) -> Option<String> {
     parse_hwdec_from_mpv_conf_str(&contents)
 }
 
-/// Extract global `--hwdec=...` / `--no-hwdec` CLI overrides outside `--{ ... --}`.
+/// Extract global `--hwdec=...` / `--hwdec` / `--no-hwdec` CLI overrides outside `--{ ... --}`.
 #[allow(dead_code)]
 pub fn configured_hwdec_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let mut depth = 0usize;
     let mut configured = None;
     for arg in args.into_iter().skip(1) {
+        if arg == "--" && depth == 0 {
+            break;
+        }
         if arg == "--{" {
             depth += 1;
             continue;
@@ -154,6 +161,8 @@ pub fn configured_hwdec_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -
         }
         if arg == "--no-hwdec" {
             configured = Some("no".to_owned());
+        } else if arg == "--hwdec" {
+            configured = Some("yes".to_owned());
         } else if let Some(val) = arg.strip_prefix("--hwdec=") {
             let unquoted = unquote_conf_value(val);
             if !unquoted.is_empty() {
@@ -290,6 +299,19 @@ mod tests {
         assert_eq!(
             configured_hwdec_from_args(["memento", "--hwdec=nvdec", "--no-hwdec"]).as_deref(),
             Some("no")
+        );
+        assert_eq!(
+            configured_hwdec_from_args(["memento", "--hwdec", "a.mkv"]).as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            configured_hwdec_from_args(["memento", "--hwdec=vaapi", "--", "--hwdec=nvdec"])
+                .as_deref(),
+            Some("vaapi")
+        );
+        assert_eq!(
+            configured_hwdec_from_args(["memento", "--", "--hwdec=nvdec"]),
+            None
         );
     }
 
