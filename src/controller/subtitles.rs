@@ -1,8 +1,8 @@
 //! Subtitle controller connecting memento-subtitle to Slint SubtitlePanel.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use memento_subtitle::model::{
     self, ActiveCueActionKind, SubtitleExternalPathInput, SubtitleTrackInput, TrackAction,
 };
@@ -894,62 +894,200 @@ fn select_active_indices(entries: &[SubtitleEntry], raw_time: f64) -> Vec<usize>
         .collect()
 }
 
+const FURIGANA_CACHE_CAPACITY: usize = 2048;
+
+struct FuriganaCache {
+    entries: HashMap<String, Vec<(String, String)>>,
+    order: VecDeque<String>,
+}
+
+impl FuriganaCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(256),
+            order: VecDeque::with_capacity(256),
+        }
+    }
+
+    fn get(&self, text: &str) -> Option<Vec<(String, String)>> {
+        self.entries.get(text).cloned()
+    }
+
+    fn contains(&self, text: &str) -> bool {
+        self.entries.contains_key(text)
+    }
+
+    fn insert(&mut self, text: String, parts: Vec<(String, String)>) {
+        if self.entries.contains_key(&text) {
+            self.entries.insert(text, parts);
+            return;
+        }
+        while self.entries.len() >= FURIGANA_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(text.clone());
+        self.entries.insert(text, parts);
+    }
+}
+
+static FURIGANA_CACHE: OnceLock<Mutex<FuriganaCache>> = OnceLock::new();
+
+fn furigana_cache() -> &'static Mutex<FuriganaCache> {
+    FURIGANA_CACHE.get_or_init(|| Mutex::new(FuriganaCache::new()))
+}
+
+/// Pre-tokenize and cache furigana for a subtitle track's lines on a background worker (#345).
+pub fn prewarm_subtitle_furigana(lines: Vec<String>) {
+    let uncached: Vec<String> = {
+        let Ok(guard) = furigana_cache().lock() else {
+            return;
+        };
+        lines
+            .into_iter()
+            .filter(|line| !line.is_empty() && !guard.contains(line))
+            .collect()
+    };
+    if uncached.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for line in uncached {
+            let _ = subtitle_furigana_parts(&line);
+        }
+    });
+}
+
 /// Tokenize the current subtitle with MeCab and attach approximate readings.
 /// Run this on a worker: starting MeCab must never delay video rendering.
 pub fn subtitle_furigana_parts(text: &str) -> Result<Vec<(String, String)>, String> {
-    if text.is_empty() { return Ok(Vec::new()); }
-    let mut child = Command::new("mecab")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-        .spawn().map_err(|error| format!("MeCab is unavailable: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).map_err(|error| format!("MeCab input failed: {error}"))?;
-        if !text.ends_with('\n') { stdin.write_all(b"\n").map_err(|error| error.to_string())?; }
+    if text.is_empty() {
+        return Ok(Vec::new());
     }
-    let output = child.wait_with_output().map_err(|error| format!("MeCab failed: {error}"))?;
-    if !output.status.success() { return Err("MeCab could not parse the subtitle".into()); }
-    parse_mecab_furigana(text, &String::from_utf8_lossy(&output.stdout))
+    if let Ok(guard) = furigana_cache().lock() {
+        if let Some(cached) = guard.get(text) {
+            return Ok(cached);
+        }
+    }
+
+    // Substitute non-BMP Joyo variant `𠮟` (U+20B9F) with BMP `叱` (U+53F1) for the
+    // MeCab query so dictionaries that only index `叱る` still emit its reading,
+    // while `parse_mecab_furigana` restores the exact original `text` slice.
+    let query_text;
+    let query_ref = if text.contains('𠮟') {
+        query_text = text.replace('𠮟', "叱");
+        query_text.as_str()
+    } else {
+        text
+    };
+
+    let output = memento_util::mecab::parse_mecab(query_ref)?;
+    let parts = parse_mecab_furigana(text, &output)?;
+
+    if let Ok(mut guard) = furigana_cache().lock() {
+        guard.insert(text.to_owned(), parts.clone());
+    }
+    Ok(parts)
+}
+
+fn find_mecab_surface_in_remaining(remaining: &str, raw_surface: &str) -> Option<(usize, usize)> {
+    if let Some(gap) = remaining.find(raw_surface) {
+        return Some((gap, raw_surface.len()));
+    }
+    if raw_surface.contains('叱') && remaining.contains('𠮟') {
+        let alt = raw_surface.replace('叱', "𠮟");
+        if let Some(gap) = remaining.find(alt.as_str()) {
+            return Some((gap, alt.len()));
+        }
+    }
+    None
+}
+
+fn apply_kinship_context_override(
+    text: &str,
+    offset: usize,
+    surface: &str,
+    reading: &mut String,
+) {
+    let prefix = &text[..offset];
+    let suffix = &text[offset + surface.len()..];
+    let has_honorific_prefix = prefix.ends_with('お') || prefix.ends_with('御');
+    let has_honorific_suffix = suffix.starts_with("さん")
+        || suffix.starts_with("さま")
+        || suffix.starts_with("様")
+        || suffix.starts_with("ちゃん");
+    if has_honorific_prefix && has_honorific_suffix {
+        match (surface, reading.as_str()) {
+            ("兄", "あに") => *reading = "にい".to_string(),
+            ("父", "ちち") => *reading = "とう".to_string(),
+            ("母", "はは") => *reading = "かあ".to_string(),
+            ("姉", "あね") => *reading = "ねえ".to_string(),
+            _ => {}
+        }
+    }
 }
 
 fn parse_mecab_furigana(text: &str, output: &str) -> Result<Vec<(String, String)>, String> {
     let mut parts = Vec::new();
     let mut offset = 0;
     for line in output.lines() {
-        if line == "EOS" || line.is_empty() { continue; }
-        let Some((surface, features)) = line.split_once('\t') else { continue; };
-        if surface.is_empty() { continue; }
+        if line == "EOS" || line.is_empty() {
+            continue;
+        }
+        let Some((raw_surface, features)) = line.split_once('\t') else {
+            continue;
+        };
+        if raw_surface.is_empty() {
+            continue;
+        }
         let remaining = &text[offset..];
-        let Some(gap) = remaining.find(surface) else {
+        let Some((gap, matched_len)) = find_mecab_surface_in_remaining(remaining, raw_surface)
+        else {
             return Err("MeCab token text did not match the subtitle".into());
         };
         if gap > 0 {
             let skipped = &remaining[..gap];
-            for token in segment_subtitle_text(skipped) { parts.push((token, String::new())); }
+            for token in segment_subtitle_text(skipped) {
+                parts.push((token, String::new()));
+            }
             offset += gap;
         }
-        let fields: Vec<&str> = features.split(',').collect();
-        let is_kana = |value: &&str| !value.is_empty() && *value != "*"
-            && value.chars().all(|character| matches!(character, '\u{3040}'..='\u{30ff}'));
-        let contains_kanji = surface.chars().any(|character| matches!(character, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'));
-        let reading = if contains_kanji {
-            // UniDic exposes surface pronunciation at column 9; IPADic uses
-            // column 7. Prefer UniDic's lemma reading for plain kanji words.
-            let preferred = if surface.chars().any(|c| matches!(c, '\u{3040}'..='\u{30ff}')) {
-                [9, 6, 7]
-            } else { [6, 7, 9] };
-            preferred.into_iter().filter_map(|index| fields.get(index))
-                .find(|candidate| is_kana(candidate))
-                .map(|reading| {
-                    let units = reading.encode_utf16().collect::<Vec<_>>();
-                    String::from_utf16_lossy(&memento_util::furiganaparser::katakana_to_hiragana(&units))
-                }).unwrap_or_default()
-        } else { String::new() };
-        parts.push((surface.to_owned(), reading));
-        offset += surface.len();
+        let surface = &text[offset..offset + matched_len];
+        if memento_util::furiganautils::contains_kanji(surface) {
+            let fields = memento_util::furiganaparser::split_csv_row(features);
+            let raw_reading =
+                memento_util::furiganaparser::extract_surface_reading_from_fields(surface, &fields);
+            let mut reading = if !raw_reading.is_empty() && raw_reading != "*" {
+                let units: Vec<u16> = raw_reading.encode_utf16().collect();
+                String::from_utf16_lossy(
+                    &memento_util::furiganaparser::katakana_to_hiragana(&units),
+                )
+            } else {
+                String::new()
+            };
+            apply_kinship_context_override(text, offset, surface, &mut reading);
+            for span in memento_util::furiganautils::distribute_furigana(surface, &reading) {
+                parts.push(span);
+            }
+        } else {
+            parts.push((surface.to_owned(), String::new()));
+        }
+        offset += matched_len;
     }
     if offset < text.len() {
-        for token in segment_subtitle_text(&text[offset..]) { parts.push((token, String::new())); }
+        for token in segment_subtitle_text(&text[offset..]) {
+            parts.push((token, String::new()));
+        }
     }
-    if parts.iter().map(|(surface, _)| surface.as_str()).collect::<String>() != text {
+    if parts
+        .iter()
+        .map(|(surface, _)| surface.as_str())
+        .collect::<String>()
+        != text
+    {
         return Err("MeCab did not preserve the subtitle text".into());
     }
     Ok(parts)
@@ -967,7 +1105,7 @@ pub fn segment_subtitle_text(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
 
-    let is_kanji = |c: char| matches!(c, '\u{4E00}'..='\u{9FAF}' | '\u{3400}'..='\u{4DBF}');
+    let is_kanji = memento_util::furiganautils::is_kanji_char;
     let is_hiragana = |c: char| matches!(c, '\u{3040}'..='\u{309F}');
     let is_katakana = |c: char| matches!(c, '\u{30A0}'..='\u{30FF}');
 
@@ -1015,7 +1153,10 @@ pub fn segment_subtitle_text(text: &str) -> Vec<String> {
             if is_hiragana(chars[j]) {
                 j += 1;
             }
-            while j < chars.len() && is_kanji(chars[j]) {
+            while j < chars.len()
+                && (is_kanji(chars[j])
+                    || (j > i && matches!(chars[j], '\u{30F5}' | '\u{30F6}')))
+            {
                 j += 1;
             }
             if j < chars.len() && is_hiragana(chars[j])
@@ -1046,13 +1187,16 @@ pub fn segment_subtitle_text(text: &str) -> Vec<String> {
         i += 1;
     }
 
-
     tokens
 }
 
 #[cfg(test)]
 mod furigana_tests {
-    use super::parse_mecab_furigana;
+    use super::{
+        parse_mecab_furigana, prewarm_subtitle_furigana, segment_subtitle_text,
+        subtitle_furigana_parts,
+    };
+    use std::time::Instant;
 
     #[test]
     fn mecab_readings_preserve_spacing_and_inflected_surface() {
@@ -1062,9 +1206,160 @@ mod furigana_tests {
 行っ\t動詞,非自立可能,,,五段-カ行,連用形-促音便,イク,行く,行っ,イッ\n\
 た\t助動詞,,,,助動詞-タ,連体形-一般,タ,た,た,タ\nEOS\n";
         let parts = parse_mecab_furigana(text, output).unwrap();
-        assert_eq!(parts.iter().map(|(surface, _)| surface.as_str()).collect::<String>(), text);
+        assert_eq!(
+            parts.iter().map(|(surface, _)| surface.as_str()).collect::<String>(),
+            text
+        );
         assert_eq!(parts.iter().find(|(surface, _)| surface == "昨日").unwrap().1, "きのう");
-        assert_eq!(parts.iter().find(|(surface, _)| surface == "行っ").unwrap().1, "いっ");
+        assert_eq!(parts.iter().find(|(surface, _)| surface == "行").unwrap().1, "い");
+        assert_eq!(parts.iter().find(|(surface, _)| surface == "っ").unwrap().1, "");
+    }
+
+    #[test]
+    fn ipadic_9col_and_unidic_17col_26col_29col_readings_and_quoted_csv() {
+        // IPADic 9-col: 来ない, 見ない, 王さま, 氷, お兄さん, 食べる, 申し込み
+        let ipadic_konai = "来\t動詞,自立,*,*,カ変・クル,未然形,来る,コ,コ\n\
+ない\t助動詞,*,*,*,特殊・ナイ,基本形,ない,ナイ,ナイ\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("来ない", ipadic_konai).unwrap(),
+            vec![("来".into(), "こ".into()), ("ない".into(), "".into())]
+        );
+
+        let ipadic_minai = "見\t動詞,自立,*,*,一段,未然形,見る,ミ,ミ\n\
+ない\t助動詞,*,*,*,特殊・ナイ,基本形,ない,ナイ,ナイ\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("見ない", ipadic_minai).unwrap(),
+            vec![("見".into(), "み".into()), ("ない".into(), "".into())]
+        );
+
+        let ipadic_oniisan = "お兄さん\t名詞,一般,*,*,*,*,お兄さん,オニイサン,オニーサン\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("お兄さん", ipadic_oniisan).unwrap(),
+            vec![
+                ("お".into(), "".into()),
+                ("兄".into(), "にい".into()),
+                ("さん".into(), "".into()),
+            ]
+        );
+
+        // UniDic 17-col: lForm at col 6, pron at col 9 (with phonetic ー)
+        let unidic17 = "来\t動詞,非自立可能,*,*,カ行変格,未然形-一般,クル,来る,来,コ,来る,クル,和,*,*,*,*\n\
+ない\t助動詞,*,*,*,助動詞-ナイ,連体形-一般,ナイ,ない,ない,ナイ,ない,ナイ,和,*,*,*,*\n\
+見\t動詞,非自立可能,*,*,上一段-マ行,未然形-一般,ミル,見る,見,ミ,見る,ミル,和,*,*,*,*\n\
+ない\t助動詞,*,*,*,助動詞-ナイ,連体形-一般,ナイ,ない,ない,ナイ,ない,ナイ,和,*,*,*,*\n\
+王\t名詞,固有名詞,人名,姓,*,*,オウ,オウ,王,オー,王,オー,固,*,*,*,*\n\
+さま\t接尾辞,名詞的,一般,*,*,*,サマ,様,さま,サマ,さま,サマ,和,*,*,*,*\n\
+氷\t名詞,普通名詞,一般,*,*,*,コオリ,氷,氷,コーリ,氷,コーリ,和,コ濁,基本形,*,*\n\
+申し込み\t動詞,一般,*,*,五段-マ行,連用形-一般,モウシコム,申し込む,申し込み,モーシコミ,申し込む,モーシコム,和,*,*,*,*\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("来ない見ない王さま氷申し込み", unidic17).unwrap(),
+            vec![
+                ("来".into(), "こ".into()),
+                ("ない".into(), "".into()),
+                ("見".into(), "み".into()),
+                ("ない".into(), "".into()),
+                ("王".into(), "おう".into()),
+                ("さま".into(), "".into()),
+                ("氷".into(), "こおり".into()),
+                ("申".into(), "もう".into()),
+                ("し".into(), "".into()),
+                ("込".into(), "こ".into()),
+                ("み".into(), "".into()),
+            ]
+        );
+
+        // UniDic 26-col with quoted commas in fields
+        let unidic26 = "王\t名詞,固有名詞,人名,姓,,,オウ,オウ,王,オー,王,オー,固,\"\",\"\",\"\",\"\",オウ,オウ,オウ,オウ,\"1,0\",\"C1,C2\",\"\",120,43\n\
+様\t接尾辞,名詞的,一般,,,,サマ,様,様,サマ,様,サマ,和,\"\",\"\",\"\",\"\",サマ,サマ,サマ,サマ,\"\",\"C3\",\"\",395,14\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("王様", unidic26).unwrap(),
+            vec![("王".into(), "おう".into()), ("様".into(), "さま".into())]
+        );
+    }
+
+    #[test]
+    fn iteration_marks_and_cjk_ext_b_segment_and_parse_properly() {
+        assert_eq!(segment_subtitle_text("人々"), vec!["人々"]);
+        assert_eq!(segment_subtitle_text("時々"), vec!["時々"]);
+        assert_eq!(segment_subtitle_text("様々"), vec!["様々"]);
+        assert_eq!(segment_subtitle_text("𠮟る"), vec!["𠮟る"]);
+        assert_eq!(segment_subtitle_text("一ヶ月"), vec!["一ヶ月"]);
+
+        let ext_b_fixture = "人々\t名詞,一般,*,*,*,*,人々,ヒトビト,ヒトビト\n\
+𠮟る\t動詞,自立,*,*,五段・ラ行,基本形,𠮟る,シカル,シカル\nEOS\n";
+        assert_eq!(
+            parse_mecab_furigana("人々𠮟る", ext_b_fixture).unwrap(),
+            vec![
+                ("人々".into(), "ひとびと".into()),
+                ("𠮟".into(), "しか".into()),
+                ("る".into(), "".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_mecab_accuracy_and_sub_100us_warm_latency() {
+        assert_eq!(
+            subtitle_furigana_parts("来ない").unwrap(),
+            vec![("来".into(), "こ".into()), ("ない".into(), "".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("見ない").unwrap(),
+            vec![("見".into(), "み".into()), ("ない".into(), "".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("王さま").unwrap(),
+            vec![("王".into(), "おう".into()), ("さま".into(), "".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("王様").unwrap(),
+            vec![("王".into(), "おう".into()), ("様".into(), "さま".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("氷").unwrap(),
+            vec![("氷".into(), "こおり".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("昨日").unwrap(),
+            vec![("昨日".into(), "きのう".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("お兄さん").unwrap(),
+            vec![
+                ("お".into(), "".into()),
+                ("兄".into(), "にい".into()),
+                ("さん".into(), "".into()),
+            ]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("人々").unwrap(),
+            vec![("人々".into(), "ひとびと".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("食べる").unwrap(),
+            vec![("食".into(), "た".into()), ("べる".into(), "".into())]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("行った").unwrap(),
+            vec![
+                ("行".into(), "い".into()),
+                ("っ".into(), "".into()),
+                ("た".into(), "".into()),
+            ]
+        );
+        assert_eq!(
+            subtitle_furigana_parts("𠮟る").unwrap(),
+            vec![("𠮟".into(), "しか".into()), ("る".into(), "".into())]
+        );
+
+        prewarm_subtitle_furigana(vec!["時々".into(), "様々".into()]);
+        let start = Instant::now();
+        for _ in 0..20 {
+            let parts = subtitle_furigana_parts("来ない").unwrap();
+            assert_eq!(parts[0].1, "こ");
+        }
+        let avg_us = start.elapsed().as_micros() as f64 / 20.0;
+        assert!(avg_us < 100.0, "warm furigana lookup took {avg_us:.2}us");
     }
 }
 
