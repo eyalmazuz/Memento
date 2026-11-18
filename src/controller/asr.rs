@@ -254,6 +254,10 @@ pub enum AsrEvent {
         generation: u64,
         cue: AsrCue,
     },
+    CuesSnapshot {
+        generation: u64,
+        cues: Vec<AsrCue>,
+    },
     Completed {
         generation: u64,
         cue_count: usize,
@@ -279,6 +283,7 @@ impl AsrEvent {
             | Self::WindowStarted { generation, .. }
             | Self::CueRemoved { generation, .. }
             | Self::CueAdded { generation, .. }
+            | Self::CuesSnapshot { generation, .. }
             | Self::Completed { generation, .. }
             | Self::Paused { generation, .. }
             | Self::Failed { generation, .. }
@@ -317,6 +322,11 @@ impl AsrController {
     pub fn try_finish_shutdown(&mut self) -> bool { true }
     pub fn shutdown(&mut self) {}
     pub fn update_position(&mut self, _: f64, _: f64, _: bool) {}
+    pub fn notify_seek(&mut self, _: f64, _: f64) {}
+    pub fn notify_audio_track_changed(&mut self, _: i64) {}
+    pub fn current_cues(&self) -> Vec<AsrCue> {
+        Vec::new()
+    }
     pub fn poll_with(&mut self, _: impl FnMut(AsrEvent)) {}
     pub fn poll(&mut self) -> Vec<AsrEvent> {
         Vec::new()

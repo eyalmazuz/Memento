@@ -95,45 +95,27 @@ const WAV_READ_FAILED: &str = "Could not read extracted WAV audio.";
 const NOT_LOADED: &str = "ONNX ASR model is not loaded.";
 const UNSUPPORTED_ARCHITECTURE: &str = "Unsupported ONNX ASR model architecture.";
 
-/// Function-pointer callbacks handed in across the C ABI (see
-/// `src/asr/rust/asr_onnx_capi.h`). Null function pointers mean "no callback",
-/// mirroring the optional `std::function` / `shared_ptr` members of the C++
-/// `AsrTranscriptionOptions`.
-#[derive(Clone, Copy)]
-pub struct Callbacks {
-    /// C++ `options.abort && options.abort->load()`.
-    pub abort: Option<unsafe extern "C" fn(ctx: *mut c_void) -> bool>,
-    pub abort_ctx: *mut c_void,
-    /// C++ `options.failureCallback`.
-    pub fail: Option<unsafe extern "C" fn(ctx: *mut c_void, message: *const c_char)>,
-    pub fail_ctx: *mut c_void,
-    /// C++ `options.segmentCallback`.
-    pub segment:
-        Option<unsafe extern "C" fn(ctx: *mut c_void, text: *const c_char, start: f64, end: f64)>,
-    pub segment_ctx: *mut c_void,
+/// Pure-Rust callbacks for ONNX ASR transcription progress and cancellation.
+pub struct Callbacks<'a> {
+    /// Polled before each stage and decoder step; returning `true` cancels.
+    pub should_abort: &'a dyn Fn() -> bool,
+    /// Invoked for each decoded segment `(start_sec, end_sec, text)`.
+    /// Returning `false` requests cancellation.
+    pub on_segment: &'a mut dyn FnMut(f64, f64, &str) -> bool,
+    /// Invoked with a diagnostic message when transcription fails.
+    pub on_failure: &'a mut dyn FnMut(&str),
 }
 
-impl Callbacks {
-    fn aborted(&self) -> bool {
-        match self.abort {
-            Some(check) => unsafe { check(self.abort_ctx) },
-            None => false,
-        }
-    }
-
-    fn fail(&self, message: &str) {
-        if let Some(fail) = self.fail {
-            if let Ok(c_message) = CString::new(message) {
-                unsafe { fail(self.fail_ctx, c_message.as_ptr()) };
-            }
-        }
-    }
-
-    fn segment(&self, text: &str, start: f64, end: f64) {
-        if let Some(segment) = self.segment {
-            if let Ok(c_text) = CString::new(text) {
-                unsafe { segment(self.segment_ctx, c_text.as_ptr(), start, end) };
-            }
+impl<'a> Callbacks<'a> {
+    pub fn new(
+        should_abort: &'a dyn Fn() -> bool,
+        on_segment: &'a mut dyn FnMut(f64, f64, &str) -> bool,
+        on_failure: &'a mut dyn FnMut(&str),
+    ) -> Self {
+        Self {
+            should_abort,
+            on_segment,
+            on_failure,
         }
     }
 }
@@ -287,15 +269,15 @@ impl Engine {
     }
 
     /// C++ `transcribeSync(audioPath, options)`.
-    pub fn transcribe(&self, audio_path: &Path, language: &str, callbacks: &Callbacks) -> i32 {
-        if callbacks.aborted() {
+    pub fn transcribe(&self, audio_path: &Path, language: &str, callbacks: &mut Callbacks<'_>) -> i32 {
+        if (callbacks.should_abort)() {
             return RESULT_CANCELED;
         }
 
         let samples = match wavreader::read_pcm16_wav_path(audio_path, self.sample_rate as u32) {
             Ok(samples) if !samples.is_empty() => samples,
             Ok(_) => {
-                callbacks.fail(WAV_READ_FAILED);
+                (callbacks.on_failure)(WAV_READ_FAILED);
                 return RESULT_FAILED;
             }
             Err(message) => {
@@ -304,13 +286,43 @@ impl Engine {
                 } else {
                     message
                 };
-                callbacks.fail(&message);
+                (callbacks.on_failure)(&message);
                 return RESULT_FAILED;
             }
         };
 
-        if callbacks.aborted() {
-            return RESULT_CANCELED;
+        match self.transcribe_samples(
+            &samples,
+            language,
+            callbacks.should_abort,
+            callbacks.on_segment,
+        ) {
+            Ok(true) => RESULT_SUCCESS,
+            Ok(false) => RESULT_CANCELED,
+            Err(message) => {
+                (callbacks.on_failure)(&message);
+                RESULT_FAILED
+            }
+        }
+    }
+
+    /// Transcribe already-decoded mono `f32` PCM samples in memory.
+    ///
+    /// Returns `Ok(true)` on completion, `Ok(false)` on cancellation (either via
+    /// `should_abort` or `on_segment` returning `false`), or `Err(message)` on
+    /// configuration/inference failure.
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        language: &str,
+        should_abort: &dyn Fn() -> bool,
+        on_segment: &mut dyn FnMut(f64, f64, &str) -> bool,
+    ) -> Result<bool, String> {
+        if should_abort() {
+            return Ok(false);
+        }
+        if samples.is_empty() {
+            return Err(WAV_READ_FAILED.to_string());
         }
 
         // C++ `if (m_initFuture.isValid()) m_initFuture.waitForFinished();` —
@@ -328,8 +340,8 @@ impl Engine {
             }
         }
 
-        if callbacks.aborted() {
-            return RESULT_CANCELED;
+        if should_abort() {
+            return Ok(false);
         }
 
         let Some(initialized) = self.initialized.get() else {
@@ -343,13 +355,11 @@ impl Engine {
             } else {
                 state.load_error.clone()
             };
-            drop(state);
-            callbacks.fail(&message);
-            return RESULT_FAILED;
+            return Err(message);
         };
 
-        if callbacks.aborted() {
-            return RESULT_CANCELED;
+        if should_abort() {
+            return Ok(false);
         }
 
         // C++ `std::scoped_lock lock(m_mutex);` — serializes inference.
@@ -361,26 +371,20 @@ impl Engine {
         let result = match initialized.config.architecture {
             OnnxAsrArchitecture::EncoderDecoder => self.transcribe_encoder_decoder(
                 initialized,
-                &samples,
+                samples,
                 language,
-                callbacks,
+                should_abort,
+                on_segment,
             ),
-            OnnxAsrArchitecture::Ctc => self.transcribe_ctc(initialized, &samples, callbacks),
+            OnnxAsrArchitecture::Ctc => {
+                self.transcribe_ctc(initialized, samples, should_abort, on_segment)
+            }
             OnnxAsrArchitecture::Unknown => {
-                callbacks.fail(UNSUPPORTED_ARCHITECTURE);
-                return RESULT_FAILED;
+                return Err(UNSUPPORTED_ARCHITECTURE.to_string());
             }
         };
 
-        match result {
-            Ok(code) => code,
-            Err(message) => {
-                // C++ `catch (const std::exception &ex)`: fail("ONNX
-                // inference error: %1") then Failed.
-                callbacks.fail(&format!("ONNX inference error: {message}"));
-                RESULT_FAILED
-            }
-        }
+        result.map_err(|message| format!("ONNX inference error: {message}"))
     }
 
     /// C++ `OnnxSession::initializeSessions()`.
@@ -548,8 +552,9 @@ impl Engine {
         initialized: &Initialized,
         samples: &[f32],
         language: &str,
-        callbacks: &Callbacks,
-    ) -> Result<i32, String> {
+        should_abort: &dyn Fn() -> bool,
+        on_segment: &mut dyn FnMut(f64, f64, &str) -> bool,
+    ) -> Result<bool, String> {
         // Segment the audio window into speech utterances so untimed seq2seq
         // models emit accurately timed subtitle cues.
         let utterances = MelFrontend::segment_speech_utterances(
@@ -559,7 +564,7 @@ impl Engine {
         );
         if utterances.is_empty() {
             // Silence clip — nothing to emit, return Success.
-            return Ok(RESULT_SUCCESS);
+            return Ok(true);
         }
 
         let mem_info = MemoryInfoHandle::create_cpu()?;
@@ -615,8 +620,8 @@ impl Engine {
         let encoder_input_ptrs = cstring_ptrs(&encoder_input_names);
 
         for utterance in &utterances {
-            if callbacks.aborted() {
-                return Ok(RESULT_CANCELED);
+            if should_abort() {
+                return Ok(false);
             }
 
             let utterance_samples = &samples[utterance.start_sample..utterance.end_sample];
@@ -663,8 +668,8 @@ impl Engine {
                 &encoder_output_ptrs,
             )?;
 
-            if callbacks.aborted() {
-                return Ok(RESULT_CANCELED);
+            if should_abort() {
+                return Ok(false);
             }
 
             // Initialize the empty self-attention KV cache [1, heads, 0, headDim].
@@ -704,8 +709,8 @@ impl Engine {
             let mut generated_tokens: Vec<i64> = Vec::with_capacity(max_new_tokens as usize);
 
             for _step in 0..max_new_tokens {
-                if callbacks.aborted() {
-                    return Ok(RESULT_CANCELED);
+                if should_abort() {
+                    return Ok(false);
                 }
 
                 let ids_shape = [1i64, step_ids.len() as i64];
@@ -825,13 +830,13 @@ impl Engine {
                     .decode(&generated_tokens, true)
                     .trim()
                     .to_string();
-                if !text.is_empty() && callbacks.segment.is_some() {
-                    callbacks.segment(&text, utterance.start_sec, utterance.end_sec);
+                if !text.is_empty() && !on_segment(utterance.start_sec, utterance.end_sec, &text) {
+                    return Ok(false);
                 }
             }
         }
 
-        Ok(RESULT_SUCCESS)
+        Ok(true)
     }
 
     /// C++ `OnnxSession::transcribeCtc(samples, options)`.
@@ -839,11 +844,12 @@ impl Engine {
         &self,
         initialized: &Initialized,
         samples: &[f32],
-        callbacks: &Callbacks,
-    ) -> Result<i32, String> {
+        should_abort: &dyn Fn() -> bool,
+        on_segment: &mut dyn FnMut(f64, f64, &str) -> bool,
+    ) -> Result<bool, String> {
         let mel = initialized.frontend.extract(samples);
         if mel.num_frames <= 0 || mel.valid_frames <= 0 {
-            return Ok(RESULT_SUCCESS);
+            return Ok(true);
         }
 
         let mem_info = MemoryInfoHandle::create_cpu()?;
@@ -899,8 +905,8 @@ impl Engine {
             ctc_inputs.iter().map(ValueHandle::as_ptr).collect();
         let ctc_outputs = run(ctc, &ctc_input_ptrs, &ctc_input_ptrs_slice, &ctc_output_ptrs)?;
 
-        if callbacks.aborted() {
-            return Ok(RESULT_CANCELED);
+        if should_abort() {
+            return Ok(false);
         }
 
         let logits = ctc_outputs
@@ -953,7 +959,7 @@ impl Engine {
         };
 
         if out_frames == 0 {
-            return Ok(RESULT_SUCCESS);
+            return Ok(true);
         }
 
         // Duration of one subsampled CTC output frame (8 * 160 / 16000 = 0.08 s).
@@ -987,15 +993,17 @@ impl Engine {
 
             if best_id == blank_id {
                 if cue_start_frame >= 0 && (frame - last_non_blank_frame) >= SILENCE_SPLIT_FRAMES {
-                    flush_ctc_cue(
+                    if !flush_ctc_cue(
                         initialized,
-                        callbacks,
+                        on_segment,
                         &mut current_tokens,
                         &mut cue_start_frame,
                         last_non_blank_frame,
                         frame_sec,
                         total_clip_sec,
-                    );
+                    ) {
+                        return Ok(false);
+                    }
                 }
                 prev_token = blank_id;
                 continue;
@@ -1012,15 +1020,17 @@ impl Engine {
                 let current_duration = (frame - cue_start_frame + 1) as f64 * frame_sec;
                 if current_duration >= 1.0 && ends_with_japanese_sentence_punctuation(&token_string)
                 {
-                    flush_ctc_cue(
+                    if !flush_ctc_cue(
                         initialized,
-                        callbacks,
+                        on_segment,
                         &mut current_tokens,
                         &mut cue_start_frame,
                         last_non_blank_frame,
                         frame_sec,
                         total_clip_sec,
-                    );
+                    ) {
+                        return Ok(false);
+                    }
                 }
             } else {
                 last_non_blank_frame = frame;
@@ -1028,48 +1038,53 @@ impl Engine {
             prev_token = best_id;
         }
 
-        flush_ctc_cue(
+        if !flush_ctc_cue(
             initialized,
-            callbacks,
+            on_segment,
             &mut current_tokens,
             &mut cue_start_frame,
             last_non_blank_frame,
             frame_sec,
             total_clip_sec,
-        );
-        Ok(RESULT_SUCCESS)
+        ) {
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
-/// C++ `flushCue` lambda inside `transcribeCtc`.
+/// C++ `flushCue` lambda inside `transcribeCtc`. Returns `false` if the segment
+/// callback requested cancellation.
 fn flush_ctc_cue(
     initialized: &Initialized,
-    callbacks: &Callbacks,
+    on_segment: &mut dyn FnMut(f64, f64, &str) -> bool,
     current_tokens: &mut Vec<i64>,
     cue_start_frame: &mut i64,
     last_non_blank_frame: i64,
     frame_sec: f64,
     total_clip_sec: f64,
-) {
+) -> bool {
     if current_tokens.is_empty() || *cue_start_frame < 0 || last_non_blank_frame < *cue_start_frame {
         current_tokens.clear();
         *cue_start_frame = -1;
-        return;
+        return true;
     }
     let text = initialized
         .tokenizer
         .decode(current_tokens, true)
         .trim()
         .to_string();
-    if !text.is_empty() && callbacks.segment.is_some() {
+    let mut keep_going = true;
+    if !text.is_empty() {
         let start_sec = 0.0f64.max(*cue_start_frame as f64 * frame_sec - 0.04);
         let end_sec = total_clip_sec.min(
             (start_sec + 0.16).max((last_non_blank_frame + 1) as f64 * frame_sec + 0.08),
         );
-        callbacks.segment(&text, start_sec, end_sec);
+        keep_going = on_segment(start_sec, end_sec, &text);
     }
     current_tokens.clear();
     *cue_start_frame = -1;
+    keep_going
 }
 
 /// C++ `hasPeriodicRepetition24(tokens)`.
@@ -1895,5 +1910,50 @@ mod tests {
             )
         };
         assert!(bad_type.is_err());
+    }
+
+    #[test]
+    fn transcribe_samples_uses_safe_callbacks_for_abort_and_errors() {
+        let engine = Engine::create(
+            Path::new("/nonexistent/onnx-asr-model"),
+            Options {
+                use_gpu: false,
+                gpu_device: 0,
+                threads: 1,
+                punctuation: true,
+            },
+        );
+        assert!(!engine.is_loaded());
+
+        // Abort before inference returns Ok(false) (canceled).
+        let mut segments = Vec::new();
+        let canceled = engine
+            .transcribe_samples(
+                &[0.1f32, -0.1],
+                "ja",
+                &|| true,
+                &mut |start, end, text| {
+                    segments.push((start, end, text.to_owned()));
+                    true
+                },
+            )
+            .expect("abort should not error");
+        assert!(!canceled);
+        assert!(segments.is_empty());
+
+        // Empty samples return Err without touching ORT.
+        let err = engine
+            .transcribe_samples(&[], "ja", &|| false, &mut |_, _, _| true)
+            .expect_err("empty samples must fail");
+        assert_eq!(err, WAV_READ_FAILED);
+
+        // Unloaded model reports failure via Callbacks::on_failure.
+        let mut failures = Vec::new();
+        let mut on_segment = |_: f64, _: f64, _: &str| true;
+        let mut on_failure = |msg: &str| failures.push(msg.to_owned());
+        let mut callbacks = Callbacks::new(&|| false, &mut on_segment, &mut on_failure);
+        let status = engine.transcribe(Path::new("/nonexistent/audio.wav"), "ja", &mut callbacks);
+        assert_eq!(status, RESULT_FAILED);
+        assert_eq!(failures.len(), 1);
     }
 }

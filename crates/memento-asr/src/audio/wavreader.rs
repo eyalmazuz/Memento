@@ -98,28 +98,37 @@ pub fn read_pcm16_wav_bytes(bytes: &[u8], expected_sample_rate: u32) -> Result<V
     let mut pcm_data: Option<&[u8]> = None;
 
     let mut offset = WAV_HEADER_SIZE;
-    while offset + WAV_CHUNK_HEADER_SIZE <= bytes.len() {
+    while offset
+        .checked_add(WAV_CHUNK_HEADER_SIZE)
+        .is_some_and(|end| end <= bytes.len())
+    {
         let chunk = &bytes[offset..];
         let id = &chunk[0..4];
         let size = read_u32(&chunk[4..8]) as usize;
         offset += WAV_CHUNK_HEADER_SIZE;
 
-        if offset + size > bytes.len() {
+        let Some(chunk_end) = offset.checked_add(size) else {
+            return Err(ERR_TRUNCATED.to_string());
+        };
+        if chunk_end > bytes.len() {
             return Err(ERR_TRUNCATED.to_string());
         }
 
         if id == b"fmt " && size >= 16 {
-            let fmt = &bytes[offset..];
+            let fmt = &bytes[offset..chunk_end];
             format = read_u16(&fmt[0..2]);
             channels = read_u16(&fmt[2..4]);
             sample_rate = read_u32(&fmt[4..8]);
             block_align = read_u16(&fmt[12..14]);
             bits_per_sample = read_u16(&fmt[14..16]);
         } else if id == b"data" {
-            pcm_data = Some(&bytes[offset..offset + size]);
+            pcm_data = Some(&bytes[offset..chunk_end]);
         }
 
-        offset += size + (size % 2);
+        let Some(next_offset) = chunk_end.checked_add(size % 2) else {
+            break;
+        };
+        offset = next_offset;
     }
 
     if format != WAV_FORMAT_PCM

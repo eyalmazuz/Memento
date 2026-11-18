@@ -1,15 +1,14 @@
 //! Optional background transcription worker.
 use super::*;
-use crate::controller::media::extract_audio;
-use std::ffi::c_void;
-#[cfg(feature = "asr-onnx")]
-use std::ffi::{c_char, CStr};
-use std::path::{Path, PathBuf};
+use crate::controller::media::extract_audio_samples;
+#[cfg(feature = "asr-whisper")]
+use std::ffi::CString;
+#[cfg(feature = "asr-whisper")]
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-#[cfg(feature = "asr-whisper")]
-use std::ffi::CString;
+use std::time::Instant;
 
 use memento_asr::asrcontroller::{adjust_segment, is_cue_valid};
 #[cfg(feature = "asr-onnx")]
@@ -23,6 +22,7 @@ use memento_asr_whisper::{engine as whisper_engine, whisper_sys};
 
 const WORK_WINDOW_SECONDS: f64 = 30.0;
 const MIN_WORK_WINDOW_SECONDS: f64 = 0.25;
+const SEEK_JUMP_THRESHOLD_SECONDS: f64 = 2.5;
 const SUBTITLE_TIME_DELTA: f64 = 0.0001;
 const MAX_TRANSCRIPTION_FAILURES: u32 = 3;
 // The app targets the same ONNX Runtime 1.22.0 C API as the Rust engine port.
@@ -34,15 +34,26 @@ struct Control {
     stop: bool,
     active: bool,
     suspended: bool,
+    paused_on_errors: bool,
+    done: bool,
+    reset_cues: bool,
+    emit_snapshot: bool,
+    audio_id: i64,
     generation: u64,
     duration: f64,
     position: f64,
+    last_position: Option<f64>,
+    last_position_at: Option<Instant>,
+    last_paused: bool,
+    suspended_at_position: Option<f64>,
+    current_window: Option<(f64, f64)>,
     restart_position: Option<f64>,
     current_abort: Option<Arc<AtomicBool>>,
 }
 
 struct Shared {
     control: Mutex<Control>,
+    latest_cues: Mutex<Vec<AsrCue>>,
     wake: Condvar,
     running: AtomicBool,
 }
@@ -69,6 +80,7 @@ impl AsrController {
         Self {
             shared: Arc::new(Shared {
                 control: Mutex::new(Control::default()),
+                latest_cues: Mutex::new(Vec::new()),
                 wake: Condvar::new(),
                 running: AtomicBool::new(false),
             }),
@@ -98,23 +110,53 @@ impl AsrController {
         if !settings.enabled {
             return Err("ASR subtitles are disabled in the current settings.".into());
         }
-        if media.path.is_empty() || media.audio_id < 0 {
-            return Err("The loaded media has no selected audio track. Select an audio track and try again.".into());
+        if media.path.is_empty() {
+            return Err("No media is loaded.".into());
+        }
+        if media.audio_id <= 0 {
+            return Err("No active audio track".into());
         }
         if !duration.is_finite() || duration <= 0.0 || !position.is_finite() {
             return Err("The active media has no usable duration or playback position.".into());
         }
-        if self.session.as_ref().is_some_and(|(loaded, source)| loaded == &settings && source == &media) {
+        let clamped_pos = position.clamp(0.0, duration);
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(loaded, source)| loaded == &settings && source == &media)
+        {
             let mut control = lock(&self.shared.control);
             if control.active && !control.stop {
-                control.position = position;
+                let baseline = control.suspended_at_position.unwrap_or(control.position);
+                let jumped = (clamped_pos - baseline).abs() > SEEK_JUMP_THRESHOLD_SECONDS;
+                let outside_window = is_outside_window(control.current_window, clamped_pos);
+                let worker_paused_or_done = control.paused_on_errors || control.done;
+                if jumped || worker_paused_or_done {
+                    control.generation += 1;
+                    control.restart_position = Some(clamped_pos);
+                    control.paused_on_errors = false;
+                    control.done = false;
+                    if outside_window {
+                        if let Some(abort) = &control.current_abort {
+                            abort.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                control.position = clamped_pos;
                 control.duration = duration;
+                control.last_position = Some(clamped_pos);
+                control.last_position_at = Some(Instant::now());
+                control.last_paused = false;
                 control.suspended = false;
+                control.suspended_at_position = None;
+                control.emit_snapshot = true;
                 self.shared.wake.notify_all();
                 return Ok(SessionStart::Resumed);
             }
         }
-        if self.is_active() { self.cancel(); }
+        if self.is_active() {
+            self.cancel();
+        }
         if let Some(worker) = self.worker.take() {
             if !worker.is_finished() {
                 self.worker = Some(worker);
@@ -129,19 +171,30 @@ impl AsrController {
         let initial_position = if settings.start_from_beginning {
             0.0
         } else {
-            position.max(0.0).min(duration)
+            clamped_pos
         };
         let shared = Arc::new(Shared {
             control: Mutex::new(Control {
                 stop: false,
                 active: true,
                 suspended: false,
+                paused_on_errors: false,
+                done: false,
+                reset_cues: false,
+                emit_snapshot: false,
+                audio_id: media.audio_id,
                 generation: 0,
                 duration,
-                position,
+                position: clamped_pos,
+                last_position: Some(clamped_pos),
+                last_position_at: Some(Instant::now()),
+                last_paused: false,
+                suspended_at_position: None,
+                current_window: None,
                 restart_position: None,
                 current_abort: None,
             }),
+            latest_cues: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             running: AtomicBool::new(true),
         });
@@ -161,19 +214,62 @@ impl AsrController {
     }
 
     pub fn matches_settings(&self, settings: &AsrSettings) -> bool {
-        self.is_active() && self.session.as_ref().is_some_and(|(loaded, _)| loaded == settings)
+        self.is_active()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|(loaded, _)| loaded == settings)
     }
 
     /// Hide ASR without discarding its model, cues or completed VAD intervals.
     /// Finish an in-flight window so returning never has to transcribe it again.
     pub fn suspend(&mut self) {
         let mut control = lock(&self.shared.control);
-        if control.active && !control.stop { control.suspended = true; }
+        if control.active && !control.stop {
+            control.suspended = true;
+            if control.suspended_at_position.is_none() {
+                control.suspended_at_position = Some(control.position);
+            }
+        }
     }
 
-    /// Update playback position without restarting VAD or Whisper on seeks.
-    /// The worker transcribes each media interval once, then reuses its cues.
-    pub fn update_position(&mut self, position: f64, duration: f64, _paused: bool) {
+    /// Explicitly reprioritize transcription when the player emits a seek event.
+    /// Aborts out-of-range in-flight extraction/transcription while keeping all
+    /// completed windows and cues in `CueBook`, and wakes a worker parked after
+    /// repeated failures or completion.
+    pub fn notify_seek(&mut self, position: f64, duration: f64) {
+        if !position.is_finite() {
+            return;
+        }
+        let mut control = lock(&self.shared.control);
+        if !control.active || control.stop {
+            return;
+        }
+        if duration.is_finite() && duration > 0.0 {
+            control.duration = duration;
+        }
+        if !control.duration.is_finite() || control.duration <= 0.0 {
+            return;
+        }
+        let clamped_pos = position.clamp(0.0, control.duration);
+        control.position = clamped_pos;
+        control.last_position = Some(clamped_pos);
+        control.last_position_at = Some(Instant::now());
+        if control.suspended {
+            return;
+        }
+        if control.paused_on_errors
+            || control.done
+            || is_outside_window(control.current_window, clamped_pos)
+        {
+            trigger_seek_restart(&mut control, &self.shared.wake, clamped_pos);
+        }
+    }
+
+    /// Update playback position and automatically reprioritize when playback jumps
+    /// beyond 2.5s outside the currently active transcription window (or while
+    /// parked on errors / completion).
+    pub fn update_position(&mut self, position: f64, duration: f64, paused: bool) {
         if !position.is_finite() || !duration.is_finite() || duration <= 0.0 {
             return;
         }
@@ -181,8 +277,72 @@ impl AsrController {
         if !control.active || control.stop {
             return;
         }
-        control.position = position;
+        let now = Instant::now();
+        let clamped_pos = position.clamp(0.0, duration);
+        let expected = match (control.last_position, control.last_position_at) {
+            (Some(prev_pos), Some(prev_at)) => {
+                if paused || control.last_paused {
+                    prev_pos
+                } else {
+                    prev_pos + now.saturating_duration_since(prev_at).as_secs_f64()
+                }
+            }
+            _ => control.position,
+        };
+        let jumped = (clamped_pos - expected).abs() > SEEK_JUMP_THRESHOLD_SECONDS;
+        control.position = clamped_pos;
         control.duration = duration;
+        control.last_position = Some(clamped_pos);
+        control.last_position_at = Some(now);
+        control.last_paused = paused;
+
+        if control.suspended || !jumped {
+            return;
+        }
+        if control.paused_on_errors
+            || control.done
+            || is_outside_window(control.current_window, clamped_pos)
+        {
+            trigger_seek_restart(&mut control, &self.shared.wake, clamped_pos);
+        }
+    }
+
+    /// Switch the active audio track (`aid`) on a retained ASR session without
+    /// reloading the model. Clears `CueBook` for the old track and restarts
+    /// transcription from the current playback position, or cancels if `new_audio_id <= 0`.
+    pub fn notify_audio_track_changed(&mut self, new_audio_id: i64) {
+        let Some((_, media)) = self.session.as_mut() else {
+            return;
+        };
+        if media.audio_id == new_audio_id {
+            return;
+        }
+        if new_audio_id <= 0 {
+            self.cancel();
+            return;
+        }
+        media.audio_id = new_audio_id;
+        let mut control = lock(&self.shared.control);
+        if !control.active || control.stop {
+            return;
+        }
+        control.audio_id = new_audio_id;
+        control.reset_cues = true;
+        control.generation += 1;
+        control.paused_on_errors = false;
+        control.done = false;
+        control.restart_position = Some(control.position);
+        if let Some(abort) = &control.current_abort {
+            abort.store(true, Ordering::Release);
+        }
+        if !control.suspended {
+            self.shared.wake.notify_all();
+        }
+    }
+
+    /// Return a sorted snapshot of the cues currently retained in `CueBook`.
+    pub fn current_cues(&self) -> Vec<AsrCue> {
+        lock(&self.shared.latest_cues).clone()
     }
 
     pub fn is_running(&self) -> bool {
@@ -200,11 +360,13 @@ impl AsrController {
         let generation = lock(&self.shared.control).generation;
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
-            // CueBook keeps cues across seeks. Its queued deltas remain valid
-            // even if the playback generation changed before the UI polled.
+            // CueBook keeps cues across seeks. Its queued deltas and snapshots
+            // remain valid even if the playback generation changed before the UI polled.
             if matches!(
                 event,
-                AsrEvent::CueAdded { .. } | AsrEvent::CueRemoved { .. }
+                AsrEvent::CueAdded { .. }
+                    | AsrEvent::CueRemoved { .. }
+                    | AsrEvent::CuesSnapshot { .. }
             ) || event.generation() == generation
             {
                 events.push(event);
@@ -225,6 +387,7 @@ impl AsrController {
     /// cancellation during audio extraction or Whisper inference and exits.
     pub fn cancel(&mut self) {
         self.session = None;
+        *lock(&self.shared.latest_cues) = Vec::new();
         let mut control = lock(&self.shared.control);
         if !control.active && control.stop {
             return;
@@ -279,6 +442,24 @@ impl Drop for AsrController {
         // unload CUDA while a detached worker is still using/freeing buffers.
         self.shutdown();
     }
+}
+
+fn is_outside_window(current_window: Option<(f64, f64)>, position: f64) -> bool {
+    match current_window {
+        Some((start, end)) => position < start - SUBTITLE_TIME_DELTA || position >= end,
+        None => true,
+    }
+}
+
+fn trigger_seek_restart(control: &mut Control, wake: &Condvar, position: f64) {
+    control.generation += 1;
+    control.restart_position = Some(position);
+    control.paused_on_errors = false;
+    control.done = false;
+    if let Some(abort) = &control.current_abort {
+        abort.store(true, Ordering::Release);
+    }
+    wake.notify_all();
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -497,6 +678,20 @@ impl CueBook {
         self.cues.insert(insertion, cue.clone());
         let _ = sender.send(AsrEvent::CueAdded { generation, cue });
     }
+
+    fn clear_all(&mut self, generation: u64, sender: &mpsc::Sender<AsrEvent>) {
+        for cue in self.cues.drain(..) {
+            let _ = sender.send(AsrEvent::CueRemoved {
+                generation,
+                cue_id: cue.id,
+            });
+        }
+        self.processed.clear();
+        let _ = sender.send(AsrEvent::CuesSnapshot {
+            generation,
+            cues: Vec::new(),
+        });
+    }
 }
 
 struct SegmentContext<'a> {
@@ -505,102 +700,34 @@ struct SegmentContext<'a> {
     window_end: f64,
     abort: &'a AtomicBool,
     cues: &'a mut CueBook,
+    latest_cues: &'a Mutex<Vec<AsrCue>>,
     sender: &'a mpsc::Sender<AsrEvent>,
 }
 
-unsafe extern "C" fn abort_poll(user_data: *mut c_void) -> bool {
-    if user_data.is_null() {
-        return false;
+impl SegmentContext<'_> {
+    fn emit_segment(&mut self, text: &str, seg_start: f64, seg_end: f64) -> bool {
+        if self.abort.load(Ordering::Acquire) {
+            return false;
+        }
+        let text = text.trim().to_owned();
+        let adjusted = adjust_segment(seg_start, seg_end, self.window_start, self.window_end);
+        if is_cue_valid(!text.is_empty(), adjusted.start, adjusted.end) {
+            self.cues.add(
+                text,
+                adjusted.start,
+                adjusted.end,
+                self.generation,
+                self.sender,
+            );
+            let snapshot = self.cues.cues.clone();
+            *lock(self.latest_cues) = snapshot.clone();
+            let _ = self.sender.send(AsrEvent::CuesSnapshot {
+                generation: self.generation,
+                cues: snapshot,
+            });
+        }
+        true
     }
-    unsafe { &*(user_data as *const AtomicBool) }.load(Ordering::Acquire)
-}
-
-#[cfg(feature = "asr-whisper")]
-unsafe extern "C" fn whisper_segment(
-    text: *const u8,
-    text_len: usize,
-    start: i64,
-    end: i64,
-    user_data: *mut c_void,
-) {
-    if user_data.is_null() || (text_len != 0 && text.is_null()) {
-        return;
-    }
-    let context = unsafe { &mut *(user_data as *mut SegmentContext<'_>) };
-    if context.abort.load(Ordering::Acquire) || text_len == 0 {
-        return;
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(text, text_len) };
-    let text = String::from_utf8_lossy(bytes).trim().to_owned();
-    let adjusted = adjust_segment(
-        whisper_engine::timestamp_to_seconds(start),
-        whisper_engine::timestamp_to_seconds(end),
-        context.window_start,
-        context.window_end,
-    );
-    if is_cue_valid(!text.is_empty(), adjusted.start, adjusted.end) {
-        context.cues.add(
-            text,
-            adjusted.start,
-            adjusted.end,
-            context.generation,
-            context.sender,
-        );
-    }
-}
-
-#[cfg(feature = "asr-onnx")]
-struct OnnxCallContext<'a> {
-    segments: SegmentContext<'a>,
-    failure: Option<String>,
-}
-
-#[cfg(feature = "asr-onnx")]
-unsafe extern "C" fn onnx_segment(
-    user_data: *mut c_void,
-    text: *const c_char,
-    start: f64,
-    end: f64,
-) {
-    if user_data.is_null() || text.is_null() {
-        return;
-    }
-    let context = unsafe { &mut *(user_data as *mut OnnxCallContext<'_>) };
-    if context.segments.abort.load(Ordering::Acquire) {
-        return;
-    }
-    let text = unsafe { CStr::from_ptr(text) }
-        .to_string_lossy()
-        .trim()
-        .to_owned();
-    let adjusted = adjust_segment(
-        start,
-        end,
-        context.segments.window_start,
-        context.segments.window_end,
-    );
-    if is_cue_valid(!text.is_empty(), adjusted.start, adjusted.end) {
-        context.segments.cues.add(
-            text,
-            adjusted.start,
-            adjusted.end,
-            context.segments.generation,
-            context.segments.sender,
-        );
-    }
-}
-
-#[cfg(feature = "asr-onnx")]
-unsafe extern "C" fn onnx_failure(user_data: *mut c_void, message: *const c_char) {
-    if user_data.is_null() || message.is_null() {
-        return;
-    }
-    let context = unsafe { &mut *(user_data as *mut OnnxCallContext<'_>) };
-    context.failure = Some(
-        unsafe { CStr::from_ptr(message) }
-            .to_string_lossy()
-            .into_owned(),
-    );
 }
 
 #[cfg(feature = "asr-whisper")]
@@ -631,8 +758,7 @@ impl Drop for WhisperVad {
 impl WhisperVad {
     // Preserve the VAD state as the worker advances through the media. Whisper's
     // built-in VAD path resets it on every whisper_full call (each 30s window).
-    fn contains_speech(&self, wav_path: &Path, rewind: bool) -> Result<bool, String> {
-        let samples = whisper_engine::read_whisper_wav(wav_path)?;
+    fn contains_speech_samples(&self, samples: &[f32], rewind: bool) -> Result<bool, String> {
         if samples.is_empty() {
             return Ok(false);
         }
@@ -775,10 +901,13 @@ fn run_session(
     resolved: ResolvedModel,
     initial_position: f64,
 ) {
-    let generation = lock(&shared.control).generation;
-    if is_stale_or_stopped(&shared, generation) {
-        return;
-    }
+    let generation = {
+        let control = lock(&shared.control);
+        if control.stop || !control.active {
+            return;
+        }
+        control.generation
+    };
     let _ = sender.send(AsrEvent::Started { generation });
     let model = match load_runtime_model(&settings, &resolved) {
         Ok(model) => model,
@@ -787,15 +916,59 @@ fn run_session(
             return;
         }
     };
+    run_session_loop(
+        shared,
+        sender,
+        media,
+        initial_position,
+        generation,
+        |current_media, window, abort, seg_ctx| {
+            let samples = extract_audio_samples(current_media, window.start, window.end, abort)?;
+            if abort.load(Ordering::Acquire) {
+                return Ok(Transcription::Canceled);
+            }
+            Ok(transcribe_window(
+                &model,
+                &samples,
+                &settings,
+                abort,
+                seg_ctx,
+                window,
+            ))
+        },
+    );
+}
+
+fn run_session_loop<F>(
+    shared: Arc<Shared>,
+    sender: mpsc::Sender<AsrEvent>,
+    mut media: AsrMedia,
+    initial_position: f64,
+    initial_generation: u64,
+    mut process_window: F,
+) where
+    F: FnMut(&AsrMedia, &Window, &Arc<AtomicBool>, &mut SegmentContext<'_>) -> Result<Transcription, String>,
+{
     let mut cues = CueBook::default();
-    let mut seen_generation = generation;
+    let mut seen_generation = initial_generation;
     let mut start = initial_position;
     let mut rewound = false;
     let mut failures = 0;
 
     loop {
-        if !wait_for_selection(&shared) { break; }
-        let (stop, active_generation, duration, position, restart_position) = {
+        if !wait_for_selection(&shared) {
+            break;
+        }
+        let (
+            stop,
+            active_generation,
+            duration,
+            position,
+            restart_position,
+            reset_cues,
+            new_audio_id,
+            emit_snapshot,
+        ) = {
             let mut control = lock(&shared.control);
             if control.stop || !control.active {
                 break;
@@ -806,20 +979,35 @@ fn run_session(
             } else {
                 None
             };
+            let reset_cues = std::mem::replace(&mut control.reset_cues, false);
+            let emit_snapshot = std::mem::replace(&mut control.emit_snapshot, false);
             (
                 control.stop,
                 generation,
                 control.duration,
                 control.position,
                 restart,
+                reset_cues,
+                control.audio_id,
+                emit_snapshot,
             )
         };
         if stop {
             break;
         }
+        if reset_cues {
+            media.audio_id = new_audio_id;
+            cues.clear_all(active_generation, &sender);
+            *lock(&shared.latest_cues) = Vec::new();
+        } else if emit_snapshot {
+            let _ = sender.send(AsrEvent::CuesSnapshot {
+                generation: active_generation,
+                cues: cues.cues.clone(),
+            });
+        }
         if active_generation != seen_generation {
             seen_generation = active_generation;
-            start = restart_position.unwrap_or(position).max(0.0).min(duration);
+            start = restart_position.unwrap_or(position).clamp(0.0, duration);
             rewound = false;
             failures = 0;
             let _ = sender.send(AsrEvent::Started {
@@ -831,17 +1019,22 @@ fn run_session(
         match plan {
             WindowPlan::Done => {
                 shared.running.store(false, Ordering::Release);
+                let mut control = lock(&shared.control);
+                if control.stop || !control.active || control.generation != seen_generation {
+                    continue;
+                }
                 let _ = sender.send(AsrEvent::Completed {
                     generation: seen_generation,
                     cue_count: cues.cues.len(),
                 });
-                let mut control = lock(&shared.control);
+                control.done = true;
                 while !control.stop && control.active && control.generation == seen_generation {
                     control = shared
                         .wake
                         .wait(control)
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
+                control.done = false;
                 continue;
             }
             WindowPlan::Advance {
@@ -867,10 +1060,20 @@ fn run_session(
                     if control.stop || control.suspended || control.generation != seen_generation {
                         continue;
                     }
+                    control.current_window = Some((window.start, window.end));
                     control.current_abort = Some(abort.clone());
                 }
-                let wav = match extract_audio(&media, window.start, window.end, &abort, None) {
-                    Ok(wav) => wav,
+                let mut seg_ctx = SegmentContext {
+                    generation: seen_generation,
+                    window_start: window.start,
+                    window_end: window.end,
+                    abort: &abort,
+                    cues: &mut cues,
+                    latest_cues: &shared.latest_cues,
+                    sender: &sender,
+                };
+                let status = match process_window(&media, &window, &abort, &mut seg_ctx) {
+                    Ok(status) => status,
                     Err(message) => {
                         clear_attempt(&shared, &abort);
                         if is_stale_or_stopped(&shared, seen_generation) {
@@ -880,52 +1083,48 @@ fn run_session(
                         return;
                     }
                 };
-                if is_stale_or_stopped(&shared, seen_generation) {
-                    clear_attempt(&shared, &abort);
-                    drop(wav);
-                    continue;
-                }
-
-                let status = transcribe_window(
-                    &model,
-                    &wav.path,
-                    &settings,
-                    &abort,
-                    &mut cues,
-                    &sender,
-                    seen_generation,
-                    &window,
-                );
                 clear_attempt(&shared, &abort);
-                drop(wav);
-                if is_stale_or_stopped(&shared, seen_generation) {
-                    continue;
-                }
                 match status {
                     Transcription::Success => {
                         failures = 0;
                         // Record silent windows too: they have no cues, but VAD
                         // must never run on them a second time this session.
                         cues.processed.push((window.start, window.end));
+                        if is_stale_or_stopped(&shared, seen_generation) {
+                            continue;
+                        }
                         start = window.end;
                     }
                     Transcription::Canceled => {
+                        if is_stale_or_stopped(&shared, seen_generation) {
+                            continue;
+                        }
                         let control = lock(&shared.control);
                         if control.generation == seen_generation && !control.stop {
-                            start = control.position.max(0.0).min(control.duration);
+                            start = control.position.clamp(0.0, control.duration);
                         }
                     }
                     Transcription::Failed(message) => {
+                        if is_stale_or_stopped(&shared, seen_generation) {
+                            continue;
+                        }
                         failures += 1;
                         if failures >= MAX_TRANSCRIPTION_FAILURES {
                             shared.running.store(false, Ordering::Release);
+                            let mut control = lock(&shared.control);
+                            if control.stop
+                                || !control.active
+                                || control.generation != seen_generation
+                            {
+                                continue;
+                            }
                             let _ = sender.send(AsrEvent::Paused {
                                 generation: seen_generation,
                                 message: format!(
                                     "ASR paused after repeated transcription failures: {message}. Seek or change ASR settings to retry."
                                 ),
                             });
-                            let mut control = lock(&shared.control);
+                            control.paused_on_errors = true;
                             while !control.stop
                                 && control.active
                                 && control.generation == seen_generation
@@ -935,10 +1134,11 @@ fn run_session(
                                     .wait(control)
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                             }
+                            control.paused_on_errors = false;
                         } else {
                             start = {
                                 let control = lock(&shared.control);
-                                control.position.max(0.0).min(control.duration)
+                                control.position.clamp(0.0, control.duration)
                             };
                         }
                     }
@@ -952,6 +1152,7 @@ fn run_session(
     let mut control = lock(&shared.control);
     control.active = false;
     control.current_abort = None;
+    control.current_window = None;
 }
 
 /// Wait between windows, retaining the worker's model and CueBook on its stack.
@@ -959,7 +1160,10 @@ fn wait_for_selection(shared: &Shared) -> bool {
     let mut control = lock(&shared.control);
     while control.active && !control.stop && control.suspended {
         shared.running.store(false, Ordering::Release);
-        control = shared.wake.wait(control).unwrap_or_else(|error| error.into_inner());
+        control = shared
+            .wake
+            .wait(control)
+            .unwrap_or_else(|error| error.into_inner());
     }
     control.active && !control.stop
 }
@@ -978,6 +1182,7 @@ fn finish_with_error(
     let mut control = lock(&shared.control);
     control.active = false;
     control.current_abort = None;
+    control.current_window = None;
 }
 
 fn is_stale_or_stopped(shared: &Shared, generation: u64) -> bool {
@@ -993,6 +1198,7 @@ fn clear_attempt(shared: &Shared, abort: &Arc<AtomicBool>) {
         .is_some_and(|current| Arc::ptr_eq(current, abort))
     {
         control.current_abort = None;
+        control.current_window = None;
     }
 }
 
@@ -1004,13 +1210,11 @@ enum Transcription {
 
 fn transcribe_window(
     model: &RuntimeModel,
-    wav_path: &Path,
+    samples: &[f32],
     _settings: &AsrSettings,
     abort: &Arc<AtomicBool>,
-    cues: &mut CueBook,
-    sender: &mpsc::Sender<AsrEvent>,
-    generation: u64,
-    window: &Window,
+    seg_ctx: &mut SegmentContext<'_>,
+    #[cfg_attr(not(feature = "asr-whisper"), allow(unused_variables))] window: &Window,
 ) -> Transcription {
     match model {
         #[cfg(feature = "asr-whisper")]
@@ -1019,8 +1223,8 @@ fn transcribe_window(
                 if abort.load(Ordering::Acquire) {
                     return Transcription::Canceled;
                 }
-                match vad.contains_speech(
-                    wav_path,
+                match vad.contains_speech_samples(
+                    samples,
                     window.rewound && window.start < SUBTITLE_TIME_DELTA,
                 ) {
                     Ok(false) => return Transcription::Success,
@@ -1028,33 +1232,23 @@ fn transcribe_window(
                     Err(message) => return Transcription::Failed(message),
                 }
             }
-            let abort_bridge = whisper_engine::AbortBridge {
-                poll: abort_poll,
-                user_data: Arc::as_ptr(abort).cast_mut().cast(),
-            };
-            let mut context = SegmentContext {
-                generation,
-                window_start: window.start,
-                window_end: window.end,
-                abort,
-                cues,
-                sender,
-            };
-            let segment_bridge = whisper_engine::SegmentBridge {
-                callback: Some(whisper_segment),
-                user_data: (&mut context as *mut SegmentContext<'_>).cast(),
-            };
             let mut options = options.clone();
             options.threads = _settings.whisper.threads;
+            let should_abort = || abort.load(Ordering::Acquire);
+            let mut on_segment = |text: &str, start_cs: i64, end_cs: i64| {
+                seg_ctx.emit_segment(
+                    text,
+                    whisper_engine::timestamp_to_seconds(start_cs),
+                    whisper_engine::timestamp_to_seconds(end_cs),
+                );
+            };
             match unsafe {
-                whisper_engine::transcribe(
+                whisper_engine::transcribe_samples_safe(
                     model.0,
-                    wav_path,
+                    samples,
                     &options,
-                    Some(&abort_bridge),
-                    Some(&segment_bridge),
-                    None,
-                    None,
+                    &should_abort,
+                    &mut on_segment,
                 )
             } {
                 whisper_engine::EngineStatus::Success => Transcription::Success,
@@ -1066,33 +1260,15 @@ fn transcribe_window(
         }
         #[cfg(feature = "asr-onnx")]
         RuntimeModel::Onnx(engine) => {
-            let mut context = OnnxCallContext {
-                segments: SegmentContext {
-                    generation,
-                    window_start: window.start,
-                    window_end: window.end,
-                    abort,
-                    cues,
-                    sender,
-                },
-                failure: None,
+            let should_abort = || abort.load(Ordering::Acquire);
+            let mut on_segment = |start_sec: f64, end_sec: f64, text: &str| {
+                seg_ctx.emit_segment(text, start_sec, end_sec)
             };
-            let context_ptr = (&mut context as *mut OnnxCallContext<'_>).cast::<c_void>();
-            let callbacks = onnx_engine::Callbacks {
-                abort: Some(abort_poll),
-                abort_ctx: Arc::as_ptr(abort).cast_mut().cast(),
-                fail: Some(onnx_failure),
-                fail_ctx: context_ptr,
-                segment: Some(onnx_segment),
-                segment_ctx: context_ptr,
-            };
-            match engine.transcribe(wav_path, "ja", &callbacks) {
-                onnx_engine::RESULT_SUCCESS => Transcription::Success,
-                onnx_engine::RESULT_CANCELED => Transcription::Canceled,
-                _ if abort.load(Ordering::Acquire) => Transcription::Canceled,
-                _ => Transcription::Failed(context.failure.unwrap_or_else(|| {
-                    "ONNX transcription failed without a diagnostic message.".into()
-                })),
+            match engine.transcribe_samples(samples, "ja", &should_abort, &mut on_segment) {
+                Ok(true) => Transcription::Success,
+                Ok(false) => Transcription::Canceled,
+                Err(_) if abort.load(Ordering::Acquire) => Transcription::Canceled,
+                Err(message) => Transcription::Failed(message),
             }
         }
     }
@@ -1113,8 +1289,27 @@ mod tests {
             let mut control = lock(&controller.shared.control);
             control.active = true;
             control.duration = 90.0;
+            control.audio_id = media.audio_id;
         }
         (controller, settings, media)
+    }
+
+    #[test]
+    fn start_rejects_non_positive_audio_id_fast() {
+        let mut controller = AsrController::new();
+        let mut settings = AsrSettings::from_config("/unused", &Config::default_empty()).unwrap();
+        settings.enabled = true;
+        for bad_aid in [0, -1, -42] {
+            let err = controller
+                .start(
+                    settings.clone(),
+                    AsrMedia::new("/unused/video.mkv", bad_aid),
+                    90.0,
+                    0.0,
+                )
+                .unwrap_err();
+            assert_eq!(err, "No active audio track");
+        }
     }
 
     #[test]
@@ -1124,7 +1319,10 @@ mod tests {
         let abort = Arc::new(AtomicBool::new(false));
         lock(&shared.control).current_abort = Some(abort.clone());
         controller.suspend();
-        assert!(!abort.load(Ordering::Acquire), "finish the current window instead of redoing VAD");
+        assert!(
+            !abort.load(Ordering::Acquire),
+            "finish the current window instead of redoing VAD"
+        );
         let (sender, receiver) = mpsc::channel();
         controller.receiver = receiver;
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1134,7 +1332,9 @@ mod tests {
         controller.worker = Some(thread::spawn(move || {
             struct ModelLifetime(Arc<AtomicBool>);
             impl Drop for ModelLifetime {
-                fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
             }
             let _model = ModelLifetime(worker_freed);
             let mut cues = CueBook::default();
@@ -1143,27 +1343,94 @@ mod tests {
             entered_tx.send(()).unwrap();
             assert!(wait_for_selection(&shared));
             assert_eq!(cues.cues.len(), 1);
-            assert!(matches!(cues.plan_window(0.0, 90.0, false),
-                WindowPlan::Extract(Window { start: 30.0, .. })));
+            assert!(matches!(
+                cues.plan_window(0.0, 90.0, false),
+                WindowPlan::Extract(Window { start: 30.0, .. })
+            ));
             resumed_tx.send(()).unwrap();
             let mut control = lock(&shared.control);
-            while !control.stop { control = shared.wake.wait(control).unwrap(); }
+            while !control.stop {
+                control = shared.wake.wait(control).unwrap();
+            }
         }));
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(controller.is_active());
         assert!(!freed.load(Ordering::Acquire));
-        assert!(matches!(controller.poll().as_slice(), [AsrEvent::CueAdded { .. }]));
-        controller.update_position(75.0, 90.0, false);
+        assert!(matches!(
+            controller.poll().as_slice(),
+            [AsrEvent::CueAdded { .. }]
+        ));
+        controller.update_position(1.5, 90.0, false);
         assert!(controller.matches_settings(&settings));
         // No model exists at the fixture path: this can only succeed by reusing
         // the original worker, rather than resolving/loading a model again.
-        assert_eq!(controller.start(settings, media, 90.0, 75.0).unwrap(), SessionStart::Resumed);
+        assert_eq!(
+            controller.start(settings, media, 90.0, 1.5).unwrap(),
+            SessionStart::Resumed
+        );
         resumed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(lock(&controller.shared.control).generation, 0);
-        assert_eq!(lock(&controller.shared.control).position, 75.0);
+        assert_eq!(lock(&controller.shared.control).position, 1.5);
         assert!(!freed.load(Ordering::Acquire));
         controller.shutdown();
         assert!(freed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn resuming_suspended_session_at_new_position_jumps_generation() {
+        let (mut controller, settings, media) = cached_session();
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        {
+            let mut control = lock(&shared.control);
+            control.position = 5.0;
+        }
+        controller.suspend();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        controller.worker = Some(thread::spawn(move || {
+            let shared_ref = shared.clone();
+            entered_tx.send(()).unwrap();
+            run_session_loop(shared_ref, sender, media.clone(), 5.0, 0, |_m, window, _abort, seg_ctx| {
+                seg_ctx.emit_segment(
+                    &format!("at-{:.0}", window.start),
+                    0.5,
+                    2.0,
+                );
+                Ok(Transcription::Success)
+            });
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Playback moved significantly while suspended.
+        controller.update_position(75.0, 90.0, false);
+        assert_eq!(
+            controller
+                .start(settings, AsrMedia::new("/unused/video.mkv", 1), 90.0, 75.0)
+                .unwrap(),
+            SessionStart::Resumed
+        );
+
+        let control = lock(&controller.shared.control);
+        assert_eq!(control.generation, 1);
+        drop(control);
+
+        // Wait until worker processes window starting at 75.0.
+        let mut saw_75 = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !saw_75 {
+            for event in controller.poll() {
+                if let AsrEvent::WindowStarted { generation: 1, start, .. } = event {
+                    if (start - 75.0).abs() < 0.01 {
+                        saw_75 = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_75, "resumed worker did not jump to 75.0");
+        controller.shutdown();
     }
 
     #[test]
@@ -1185,8 +1452,11 @@ mod tests {
         for change_source in [false, true] {
             let (mut controller, mut settings, mut media) = cached_session();
             controller.suspend();
-            if change_source { media.audio_id = 2; }
-            else { settings.whisper.threads += 1; }
+            if change_source {
+                media.audio_id = 2;
+            } else {
+                settings.whisper.threads += 1;
+            }
             // The new session's deliberately missing model must be validated.
             assert!(controller.start(settings, media, 90.0, 30.0).is_err());
             assert!(!controller.is_active());
@@ -1223,7 +1493,10 @@ mod tests {
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(abort.load(Ordering::Acquire));
         assert!(!controller.is_running());
-        assert!(!controller.try_finish_shutdown(), "cancel is not worker completion");
+        assert!(
+            !controller.try_finish_shutdown(),
+            "cancel is not worker completion"
+        );
         assert!(!cleaned.load(Ordering::Acquire));
         release_tx.send(()).unwrap();
         controller.shutdown();
@@ -1256,6 +1529,7 @@ mod tests {
     #[test]
     #[ignore = "requires MEMENTO_ASR_TEST_MODEL pointing to a local Whisper model"]
     fn shutdown_during_native_whisper_inference_releases_model() {
+        use std::ffi::c_void;
         struct AbortContext {
             abort: Arc<AtomicBool>,
             entered: mpsc::Sender<()>,
@@ -1285,30 +1559,47 @@ mod tests {
         controller.worker = Some(thread::spawn(move || unsafe {
             let mut params = whisper_sys::whisper_context_default_params();
             params.use_gpu = use_gpu;
-            let model = WhisperModel(whisper_sys::whisper_init_from_file_with_params(path.as_ptr(), params));
+            let model =
+                WhisperModel(whisper_sys::whisper_init_from_file_with_params(path.as_ptr(), params));
             assert!(!model.0.is_null(), "test model could not be loaded");
-            let mut context = AbortContext { abort, entered, signaled: false };
+            let mut context = AbortContext {
+                abort,
+                entered,
+                signaled: false,
+            };
             let mut params = whisper_sys::whisper_full_default_params(
                 whisper_sys::whisper_sampling_strategy_WHISPER_SAMPLING_GREEDY,
             );
             params.language = c"ja".as_ptr();
-            params.n_threads = thread::available_parallelism().map_or(1, |count| count.get().min(4)) as i32;
+            params.n_threads =
+                thread::available_parallelism().map_or(1, |count| count.get().min(4)) as i32;
             params.print_progress = false;
             params.print_realtime = false;
             params.print_timestamps = false;
             params.abort_callback = Some(signal_inference);
             params.abort_callback_user_data = (&mut context as *mut AbortContext).cast();
-            let samples: Vec<f32> = (0..30 * 16000).map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
-            let result = whisper_sys::whisper_full(model.0, params, samples.as_ptr(), samples.len() as i32);
-            assert!(context.abort.load(Ordering::Acquire), "inference exited before cancellation");
+            let samples: Vec<f32> = (0..30 * 16000)
+                .map(|i| (i as f32 * 0.1).sin() * 0.1)
+                .collect();
+            let result =
+                whisper_sys::whisper_full(model.0, params, samples.as_ptr(), samples.len() as i32);
+            assert!(
+                context.abort.load(Ordering::Acquire),
+                "inference exited before cancellation"
+            );
             assert_ne!(result, 0, "native inference should report cancellation");
             drop(model);
             worker_released.store(true, Ordering::Release);
         }));
-        receiver.recv_timeout(Duration::from_secs(60)).expect("native inference did not begin");
+        receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("native inference did not begin");
         controller.begin_shutdown();
         controller.shutdown();
-        assert!(released.load(Ordering::Acquire), "model must be freed before shutdown returns");
+        assert!(
+            released.load(Ordering::Acquire),
+            "model must be freed before shutdown returns"
+        );
     }
 
     #[test]
@@ -1319,12 +1610,18 @@ mod tests {
         cues.add("replacement".into(), 5.0, 7.0, 0, &sender);
         assert_eq!(cues.cues.len(), 1);
         assert_eq!(cues.cues[0].text, "replacement");
-        assert!(matches!(receiver.try_recv(), Ok(AsrEvent::CueAdded { .. })));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AsrEvent::CueAdded { .. })
+        ));
         assert!(matches!(
             receiver.try_recv(),
             Ok(AsrEvent::CueRemoved { .. })
         ));
-        assert!(matches!(receiver.try_recv(), Ok(AsrEvent::CueAdded { .. })));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AsrEvent::CueAdded { .. })
+        ));
         assert!(matches!(
             cues.plan_window(0.0, 70.0, false),
             WindowPlan::Extract(Window {
@@ -1355,20 +1652,265 @@ mod tests {
     }
 
     #[test]
-    fn seeking_does_not_restart_vad_or_abort_the_active_window() {
+    fn seeking_inside_active_window_does_not_abort_or_bump_generation() {
         let mut controller = AsrController::new();
         let abort = Arc::new(AtomicBool::new(false));
         {
             let mut control = lock(&controller.shared.control);
             control.active = true;
             control.duration = 120.0;
+            control.position = 2.0;
+            control.current_window = Some((0.0, 30.0));
             control.current_abort = Some(abort.clone());
         }
-        controller.update_position(75.0, 120.0, false);
+        controller.update_position(15.0, 120.0, false);
         let control = lock(&controller.shared.control);
         assert_eq!(control.generation, 0);
-        assert_eq!(control.position, 75.0);
+        assert_eq!(control.position, 15.0);
+        assert!(control.restart_position.is_none());
         assert!(!abort.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn seeking_forward_and_backward_outside_window_aborts_and_preserves_cue_book() {
+        let (mut controller, _, media) = cached_session();
+        {
+            let mut control = lock(&controller.shared.control);
+            control.duration = 120.0;
+            control.position = 0.0;
+        }
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        let (in_window_tx, in_window_rx) = mpsc::channel();
+        let (allow_abort_tx, allow_abort_rx) = mpsc::channel::<()>();
+
+        controller.worker = Some(thread::spawn(move || {
+            let mut first_window_done = false;
+            let mut gated_30_once = false;
+            run_session_loop(shared, sender, media, 0.0, 0, |_m, window, abort, seg_ctx| {
+                if (window.start - 0.0).abs() < 0.01 && !first_window_done {
+                    first_window_done = true;
+                    seg_ctx.emit_segment("window-0", 1.0, 3.0);
+                    return Ok(Transcription::Success);
+                }
+                if (window.start - 30.0).abs() < 0.01 && !gated_30_once {
+                    gated_30_once = true;
+                    let _ = in_window_tx.send(());
+                    let _ = allow_abort_rx.recv_timeout(Duration::from_secs(5));
+                    while !abort.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    return Ok(Transcription::Canceled);
+                }
+                seg_ctx.emit_segment(
+                    &format!("win-{:.0}", window.start),
+                    0.5,
+                    2.0,
+                );
+                Ok(Transcription::Success)
+            });
+        }));
+
+        // Wait until worker is in window [30, 60] (having completed [0, 30]).
+        in_window_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Seek forward to 95.0 (outside [30, 60]) via update_position discontinuity.
+        controller.update_position(95.0, 120.0, false);
+        let _ = allow_abort_tx.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_95 = false;
+        while Instant::now() < deadline && !saw_95 {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { cue, .. } = ev {
+                    if cue.text == "win-95" {
+                        saw_95 = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_95, "seek forward did not transcribe window at 95.0");
+        assert_eq!(lock(&controller.shared.control).generation, 1);
+
+        // Seek backward to 10.0 via notify_seek: completed [0, 30] cue must still exist.
+        controller.notify_seek(10.0, 120.0);
+        assert_eq!(lock(&controller.shared.control).generation, 2);
+        let cues = controller.current_cues();
+        assert!(
+            cues.iter().any(|c| c.text == "window-0"),
+            "completed CueBook window should be preserved across seeks: {cues:?}"
+        );
+        controller.shutdown();
+    }
+
+    #[test]
+    fn seeking_wakes_worker_paused_after_three_failures() {
+        let (mut controller, _, media) = cached_session();
+        {
+            let mut control = lock(&controller.shared.control);
+            control.duration = 120.0;
+            control.position = 0.0;
+        }
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+
+        controller.worker = Some(thread::spawn(move || {
+            run_session_loop(shared, sender, media, 0.0, 0, |_m, window, _abort, seg_ctx| {
+                if window.start < 50.0 {
+                    Ok(Transcription::Failed("synthetic failure".into()))
+                } else {
+                    seg_ctx.emit_segment("recovered", 0.5, 2.0);
+                    Ok(Transcription::Success)
+                }
+            });
+        }));
+
+        // Wait until worker hits Paused after MAX_TRANSCRIPTION_FAILURES.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut paused = false;
+        while Instant::now() < deadline && !paused {
+            for ev in controller.poll() {
+                if matches!(ev, AsrEvent::Paused { .. }) {
+                    paused = true;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(paused, "worker did not pause after 3 failures");
+        assert!(lock(&controller.shared.control).paused_on_errors);
+
+        // Seek forward past 50.0 -> must wake worker and succeed!
+        controller.update_position(65.0, 120.0, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut recovered = false;
+        while Instant::now() < deadline && !recovered {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { cue, .. } = ev {
+                    if cue.text == "recovered" {
+                        recovered = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(recovered, "seek did not wake worker from Paused");
+        assert_eq!(lock(&controller.shared.control).generation, 1);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn seeking_wakes_worker_from_done_state() {
+        let (mut controller, _, media) = cached_session();
+        {
+            let mut control = lock(&controller.shared.control);
+            control.duration = 25.0;
+            control.position = 0.0;
+        }
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+
+        controller.worker = Some(thread::spawn(move || {
+            run_session_loop(shared, sender, media, 0.0, 0, |_m, window, _abort, seg_ctx| {
+                seg_ctx.emit_segment(&format!("cue-{:.0}", window.start), 0.5, 2.0);
+                Ok(Transcription::Success)
+            });
+        }));
+
+        // Wait until initial 25s media completes -> Done state.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = false;
+        while Instant::now() < deadline && !completed {
+            for ev in controller.poll() {
+                if matches!(ev, AsrEvent::Completed { generation: 0, .. }) {
+                    completed = true;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(completed, "worker did not reach Done state");
+
+        // Duration grows (e.g. progressive stream) and user seeks to 40.0.
+        controller.notify_seek(40.0, 80.0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut woke_with_new_gen = false;
+        while Instant::now() < deadline && !woke_with_new_gen {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { generation: 1, cue } = ev {
+                    if cue.text == "cue-40" {
+                        woke_with_new_gen = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(woke_with_new_gen, "seek did not wake worker from Done state");
+        controller.shutdown();
+    }
+
+    #[test]
+    fn audio_track_switch_clears_cue_book_and_uses_new_audio_id() {
+        let (mut controller, _, media) = cached_session();
+        {
+            let mut control = lock(&controller.shared.control);
+            control.duration = 30.0;
+            control.position = 0.0;
+        }
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+
+        controller.worker = Some(thread::spawn(move || {
+            run_session_loop(shared, sender, media, 0.0, 0, |m, _window, _abort, seg_ctx| {
+                seg_ctx.emit_segment(&format!("aid-{}", m.audio_id), 0.5, 2.0);
+                Ok(Transcription::Success)
+            });
+        }));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_aid1 = false;
+        while Instant::now() < deadline && !saw_aid1 {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { cue, .. } = ev {
+                    if cue.text == "aid-1" {
+                        saw_aid1 = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_aid1);
+
+        // Switch audio track to aid = 2.
+        controller.notify_audio_track_changed(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_removed = false;
+        let mut saw_snapshot = false;
+        let mut saw_aid2 = false;
+        while Instant::now() < deadline && !(saw_removed && saw_snapshot && saw_aid2) {
+            for ev in controller.poll() {
+                match ev {
+                    AsrEvent::CueRemoved { .. } => saw_removed = true,
+                    AsrEvent::CuesSnapshot { cues, .. } if cues.iter().any(|c| c.text == "aid-2") => {
+                        saw_snapshot = true;
+                    }
+                    AsrEvent::CueAdded { cue, .. } if cue.text == "aid-2" => saw_aid2 = true,
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_removed && saw_snapshot && saw_aid2);
+        assert_eq!(controller.current_cues().len(), 1);
+        assert_eq!(controller.current_cues()[0].text, "aid-2");
+
+        // Switching to audio_id <= 0 cancels the session.
+        controller.notify_audio_track_changed(0);
+        assert!(!controller.is_active());
+        assert!(controller.current_cues().is_empty());
+        controller.shutdown();
     }
 
     #[test]
@@ -1389,13 +1931,25 @@ mod tests {
             })
             .unwrap();
         sender
+            .send(AsrEvent::CuesSnapshot {
+                generation: 0,
+                cues: vec![AsrCue {
+                    id: 1,
+                    text: "before seek".into(),
+                    start: 1.0,
+                    end: 2.0,
+                }],
+            })
+            .unwrap();
+        sender
             .send(AsrEvent::Completed {
                 generation: 0,
                 cue_count: 1,
             })
             .unwrap();
         let events = controller.poll();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], AsrEvent::CueAdded { cue, .. } if cue.text == "before seek"));
+        assert!(matches!(&events[1], AsrEvent::CuesSnapshot { cues, .. } if cues.len() == 1));
     }
 }
