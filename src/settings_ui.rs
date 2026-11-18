@@ -13,7 +13,7 @@ use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
 use memento_asr::onnx::onnxcontroller;
 use memento_asr::whisper::whispercontroller;
-use memento_config::Value;
+use memento_config::{ArgbColor, Value};
 use memento_net::download::Downloader;
 use memento_player::MpvInstance;
 use memento_setting::keys as raw;
@@ -769,6 +769,45 @@ pub(crate) fn create_settings_session(
                 Err(error) => window.set_settings_status(error.into()),
             }
         }
+    });
+
+    let color_hex_window = settings.as_weak();
+    let color_hex_config = config_ctrl.clone();
+    settings.on_color_hex_committed(move |key, value| {
+        if let Some(window) = color_hex_window.upgrade() {
+            match color_hex_config.edit_setting(&key, &value) {
+                Ok(()) => {
+                    refresh_settings(&window, &color_hex_config);
+                    window.set_settings_status("Unsaved changes — click Apply".into());
+                }
+                Err(error) => window.set_settings_status(error.into()),
+            }
+        }
+    });
+
+    let open_picker_window = settings.as_weak();
+    let open_picker_config = config_ctrl.clone();
+    settings.on_open_color_picker_requested(move |key, label| {
+        let Some(window) = open_picker_window.upgrade() else {
+            return;
+        };
+        let hex = key
+            .rsplit_once('/')
+            .and_then(|(group, leaf)| open_picker_config.effective_setting(group, leaf))
+            .and_then(|v| match v {
+                Value::Text(t) => Some(t),
+                _ => None,
+            })
+            .unwrap_or_else(|| "#FFFFFFFF".to_owned());
+        let parsed = ArgbColor::parse(&hex).unwrap_or_else(|_| ArgbColor::new(255, 255, 255, 255));
+        window.set_color_picker_key(key);
+        window.set_color_picker_label(label);
+        window.set_color_picker_a(i32::from(parsed.a));
+        window.set_color_picker_r(i32::from(parsed.r));
+        window.set_color_picker_g(i32::from(parsed.g));
+        window.set_color_picker_b(i32::from(parsed.b));
+        window.set_color_picker_hex(parsed.to_argb_hex().into());
+        window.set_color_picker_open(true);
     });
 
     let keybind_window = settings.as_weak();
@@ -1669,8 +1708,11 @@ mod tests {
             format_key_chord("\u{007f}", false, false, false, false),
             Some("Delete".to_owned())
         );
-        // Standalone modifier key must be ignored
+        // Standalone left and right modifier keys must be ignored
         assert_eq!(format_key_chord("\u{0011}", true, false, false, false), None);
+        assert_eq!(format_key_chord("\u{0015}", false, false, true, false), None);
+        assert_eq!(format_key_chord("\u{0016}", true, false, false, false), None);
+        assert_eq!(format_key_chord("\u{0018}", false, false, false, true), None);
         assert_eq!(format_key_chord("", false, false, false, false), None);
     }
 }

@@ -163,10 +163,16 @@ component FontPickerControl inherits HorizontalLayout {
     in property <SettingsField> field;
     in property <[string]> font-families;
     property <bool> custom-family: false;
+    property <string> custom-family-text: root.field.font-family;
+    property <string> synced-family: root.field.font-family;
     callback font-edited(string, string, string, bool, bool);
     callback font-size-typed(string, string, string, bool, bool);
     spacing: 6px;
     alignment: end;
+
+    changed synced-family => {
+        root.custom-family-text = root.synced-family;
+    }
 
     if !root.custom-family : ComboBox {
         width: 190px;
@@ -174,6 +180,7 @@ component FontPickerControl inherits HorizontalLayout {
         model: root.font-families;
         current-value: root.field.font-family;
         selected(value) => {
+            root.custom-family-text = value;
             root.font-edited(
                 root.field.key,
                 value,
@@ -186,9 +193,10 @@ component FontPickerControl inherits HorizontalLayout {
     if root.custom-family : LineEdit {
         width: 190px;
         enabled: root.field.enabled;
-        text: root.field.font-family;
+        text: root.custom-family-text;
         placeholder-text: "Font family";
         edited(value) => {
+            root.custom-family-text = value;
             root.font-size-typed(
                 root.field.key,
                 value,
@@ -202,7 +210,12 @@ component FontPickerControl inherits HorizontalLayout {
         text: "✎";
         active: root.custom-family;
         enabled: root.field.enabled;
-        clicked => { root.custom-family = !root.custom-family; }
+        clicked => {
+            root.custom-family = !root.custom-family;
+            if root.custom-family {
+                root.custom-family-text = root.field.font-family;
+            }
+        }
     }
     Button {
         text: "-";
@@ -211,7 +224,7 @@ component FontPickerControl inherits HorizontalLayout {
             let next = max(1, Math.round(size-edit.text.to-float()) - 1);
             root.font-edited(
                 root.field.key,
-                root.field.font-family,
+                root.custom-family ? root.custom-family-text : root.field.font-family,
                 next + "",
                 root.field.font-bold,
                 root.field.font-italic,
@@ -225,7 +238,7 @@ component FontPickerControl inherits HorizontalLayout {
         edited(value) => {
             root.font-size-typed(
                 root.field.key,
-                root.field.font-family,
+                root.custom-family ? root.custom-family-text : root.field.font-family,
                 value,
                 root.field.font-bold,
                 root.field.font-italic,
@@ -239,7 +252,7 @@ component FontPickerControl inherits HorizontalLayout {
             let next = min(500, max(1, Math.round(size-edit.text.to-float()) + 1));
             root.font-edited(
                 root.field.key,
-                root.field.font-family,
+                root.custom-family ? root.custom-family-text : root.field.font-family,
                 next + "",
                 root.field.font-bold,
                 root.field.font-italic,
@@ -254,7 +267,7 @@ component FontPickerControl inherits HorizontalLayout {
         clicked => {
             root.font-edited(
                 root.field.key,
-                root.field.font-family,
+                root.custom-family ? root.custom-family-text : root.field.font-family,
                 size-edit.text,
                 !root.field.font-bold,
                 root.field.font-italic,
@@ -269,7 +282,7 @@ component FontPickerControl inherits HorizontalLayout {
         clicked => {
             root.font-edited(
                 root.field.key,
-                root.field.font-family,
+                root.custom-family ? root.custom-family-text : root.field.font-family,
                 size-edit.text,
                 root.field.font-bold,
                 !root.field.font-italic,
@@ -281,6 +294,7 @@ component FontPickerControl inherits HorizontalLayout {
 component ColorSwatchControl inherits HorizontalLayout {
     in property <SettingsField> field;
     callback edited(string, string);
+    callback color-hex-committed(string, string);
     callback open-color-picker(SettingsField);
     spacing: 8px;
     alignment: end;
@@ -326,6 +340,7 @@ component ColorSwatchControl inherits HorizontalLayout {
         enabled: root.field.enabled;
         text: root.field.value;
         edited(value) => { root.edited(root.field.key, value); }
+        accepted(value) => { root.color-hex-committed(root.field.key, value); }
     }
     Button {
         text: "Pick…";
@@ -363,7 +378,10 @@ component KeybindCaptureControl inherits VerticalLayout {
                     || event.text == Key.Alt
                     || event.text == Key.Meta
                     || event.text == Key.AltGr
-                    || event.text == Key.CapsLock {
+                    || event.text == Key.CapsLock
+                    || event.text == "\u{0015}"
+                    || event.text == "\u{0016}"
+                    || event.text == "\u{0018}" {
                     return accept;
                 }
                 if event.text == Key.Escape
@@ -447,6 +465,7 @@ component FieldRow inherits VerticalLayout {
     property <bool> use-anki-decks: (root.field.key == "anki/profile/term/deck" || root.field.key == "anki/profile/kanji/deck") && root.anki-decks.length > 0;
     property <bool> use-anki-models: (root.field.key == "anki/profile/term/model" || root.field.key == "anki/profile/kanji/model") && root.anki-models.length > 0;
     callback edited(string, string);
+    callback color-hex-committed(string, string);
     callback font-edited(string, string, string, bool, bool);
     callback font-size-typed(string, string, string, bool, bool);
     callback open-color-picker(SettingsField);
@@ -504,6 +523,7 @@ component FieldRow inherits VerticalLayout {
             ColorSwatchControl {
                 field: root.field;
                 edited(key, value) => { root.edited(key, value); }
+                color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                 open-color-picker(f) => { root.open-color-picker(f); }
             }
         }
@@ -547,6 +567,7 @@ component SettingsSection inherits VerticalLayout {
     in property <int> keybind-conflict-count: 0;
     in-out property <bool> show-advanced: false;
     callback edited(string, string);
+    callback color-hex-committed(string, string);
     callback font-edited(string, string, string, bool, bool);
     callback font-size-typed(string, string, string, bool, bool);
     callback open-color-picker(SettingsField);
@@ -625,6 +646,7 @@ component SettingsSection inherits VerticalLayout {
                     anki-models: root.anki-models;
                     font-families: root.font-families;
                     edited(key, value) => { root.edited(key, value); }
+                    color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                     font-edited(key, family, size, bold, italic) => {
                         root.font-edited(key, family, size, bold, italic);
                     }
@@ -784,6 +806,8 @@ export component SettingsWindow inherits Window {
     callback anki-help-requested();
     callback category-changed(int);
     callback setting-edited(string, string);
+    callback color-hex-committed(string, string);
+    callback open-color-picker-requested(string, string);
     callback font-edited(string, string, string, bool, bool);
     callback font-size-typed(string, string, string, bool, bool);
     callback color-edited(string, int, int, int, int);
@@ -952,6 +976,7 @@ export component SettingsWindow inherits Window {
                             keybind-conflict-count: root.keybind-conflict-count;
                             show-advanced: root.showing-advanced;
                             edited(key, value) => { root.setting-edited(key, value); }
+                            color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                             font-edited(key, family, size, bold, italic) => {
                                 root.font-edited(key, family, size, bold, italic);
                             }
@@ -959,14 +984,7 @@ export component SettingsWindow inherits Window {
                                 root.font-size-typed(key, family, size, bold, italic);
                             }
                             open-color-picker(f) => {
-                                root.color-picker-key = f.key;
-                                root.color-picker-label = f.label;
-                                root.color-picker-a = f.color-a;
-                                root.color-picker-r = f.color-r;
-                                root.color-picker-g = f.color-g;
-                                root.color-picker-b = f.color-b;
-                                root.color-picker-hex = f.value;
-                                root.color-picker-open = true;
+                                root.open-color-picker-requested(f.key, f.label);
                             }
                             keybind-captured(key, text, ctrl, alt, shift, meta) => {
                                 root.keybind-captured(key, text, ctrl, alt, shift, meta);
@@ -1074,7 +1092,11 @@ export component SettingsWindow inherits Window {
                                             HorizontalLayout {
                                                 spacing: 6px;
                                                 Text {
-                                                    text: (model.backend == "whisper" ? "Whisper: " : "ONNX: ") + model.name;
+                                                    text: (model.backend == "whisper"
+                                                        ? "Whisper: "
+                                                        : (model.backend == "whisper-vad"
+                                                            ? "Whisper VAD: "
+                                                            : "ONNX: ")) + model.name;
                                                     color: #dce0e2;
                                                     font-size: 13px;
                                                     font-weight: model.selected ? 700 : 500;
