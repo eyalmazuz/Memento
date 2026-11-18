@@ -3,10 +3,186 @@
 //! Strings remain UTF-16 code units throughout: Qt's `QString` comparisons,
 //! `startsWith`, `mid`, and `insert` do not repair unpaired surrogates.
 
+use crate::controller::CliOption;
+
 const OPEN_GROUP: &[u16] = &[b'-' as u16, b'-' as u16, b'{' as u16];
 const CLOSE_GROUP: &[u16] = &[b'-' as u16, b'-' as u16, b'}' as u16];
 const OPTION_PREFIX: &[u16] = &[b'-' as u16, b'-' as u16];
 const MAX_TREE_DEPTH: usize = 64;
+
+/// One media/playlist load entry parsed from UTF-8 CLI arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistLoad {
+    pub path: String,
+    pub options: Vec<String>,
+}
+
+/// Complete parsed command-line invocation for Memento.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedArgs {
+    pub show_help: bool,
+    pub show_version: bool,
+    pub global_options: Vec<CliOption>,
+    pub loads: Vec<PlaylistLoad>,
+}
+
+pub const HELP_TEXT: &str = "\
+Usage: memento [options] [url|path]
+
+For more information about commandline arguments, see https://mpv.io/manual/
+";
+
+pub fn help_text() -> &'static str {
+    HELP_TEXT
+}
+
+pub fn version_text(version: &str) -> String {
+    format!("memento {version}")
+}
+
+/// Parse full CLI arguments (including `argv[0]`), extracting `--help`/`-h`,
+/// `--version`/`-v`, global `--<mpv-opt>=...` / `--no-<opt>` / `--<flag>`
+/// options, and ordered playlist entries with optional nested `--{` / `--}`
+/// per-file options.
+pub fn parse_args<I, S>(args: I) -> Result<ParsedArgs, ParseArgsError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    if raw.len() <= 1 {
+        return Ok(ParsedArgs::default());
+    }
+
+    let mut out = ParsedArgs::default();
+    let mut u16_args: Vec<Vec<u16>> = Vec::with_capacity(raw.len());
+    u16_args.push(raw[0].encode_utf16().collect());
+
+    let mut depth = 0usize;
+    let mut end_of_options = false;
+    for arg in raw.iter().skip(1) {
+        if end_of_options {
+            u16_args.push(arg.encode_utf16().collect());
+            continue;
+        }
+        if arg == "--" && depth == 0 {
+            end_of_options = true;
+            continue;
+        }
+        if arg == "--{" {
+            depth += 1;
+            u16_args.push(arg.encode_utf16().collect());
+            continue;
+        }
+        if arg == "--}" {
+            if depth == 0 {
+                return Err(ParseArgsError::InvalidBrackets);
+            }
+            depth -= 1;
+            u16_args.push(arg.encode_utf16().collect());
+            continue;
+        }
+        if depth > 0 {
+            // Preserve per-file options and paths inside `--{ ... --}` for tree flattening.
+            u16_args.push(arg.encode_utf16().collect());
+            continue;
+        }
+
+        if arg == "--help" || arg == "-h" {
+            out.show_help = true;
+        } else if arg == "--version" || arg == "-v" || arg == "-V" {
+            out.show_version = true;
+        } else if let Some(rest) = arg.strip_prefix("--") {
+            if let Some(negated) = rest.strip_prefix("no-") {
+                if let Some((name, val)) = negated.split_once('=') {
+                    out.global_options.push(CliOption {
+                        name: name.to_owned(),
+                        value: format!("{val}=no"),
+                    });
+                } else {
+                    out.global_options.push(CliOption {
+                        name: negated.to_owned(),
+                        value: "no".to_owned(),
+                    });
+                }
+            } else if let Some((name, val)) = rest.split_once('=') {
+                out.global_options.push(CliOption {
+                    name: name.to_owned(),
+                    value: val.to_owned(),
+                });
+            } else if !rest.is_empty() {
+                out.global_options.push(CliOption {
+                    name: rest.to_owned(),
+                    value: "yes".to_owned(),
+                });
+            }
+        } else {
+            u16_args.push(arg.encode_utf16().collect());
+        }
+    }
+
+    if depth != 0 {
+        return Err(ParseArgsError::InvalidBrackets);
+    }
+
+    if end_of_options {
+        // When `--` ended options, reconstruct remaining args verbatim as file loads
+        // alongside any earlier grouped loads without misinterpreting `--foo` files.
+        let mut split_idx = 1usize;
+        let mut g_depth = 0usize;
+        for arg in raw.iter().skip(1) {
+            if arg == "--" && g_depth == 0 {
+                break;
+            }
+            if arg == "--{" {
+                g_depth += 1;
+                split_idx += 1;
+            } else if arg == "--}" {
+                g_depth = g_depth.saturating_sub(1);
+                split_idx += 1;
+            } else if g_depth > 0
+                || (arg != "--help"
+                    && arg != "-h"
+                    && arg != "--version"
+                    && arg != "-v"
+                    && arg != "-V"
+                    && !arg.starts_with("--"))
+            {
+                split_idx += 1;
+            }
+        }
+        let before_loads = parse_load_args(&u16_args[..split_idx])?;
+        out.loads.extend(before_loads.into_iter().map(|entry| PlaylistLoad {
+            path: String::from_utf16_lossy(&entry.filename),
+            options: entry
+                .options
+                .into_iter()
+                .map(|opt| String::from_utf16_lossy(&opt))
+                .collect(),
+        }));
+        for path_u16 in &u16_args[split_idx..] {
+            out.loads.push(PlaylistLoad {
+                path: String::from_utf16_lossy(path_u16),
+                options: Vec::new(),
+            });
+        }
+        return Ok(out);
+    }
+
+    let loads = parse_load_args(&u16_args)?;
+    out.loads = loads
+        .into_iter()
+        .map(|entry| PlaylistLoad {
+            path: String::from_utf16_lossy(&entry.filename),
+            options: entry
+                .options
+                .into_iter()
+                .map(|opt| String::from_utf16_lossy(&opt))
+                .collect(),
+        })
+        .collect();
+    Ok(out)
+}
 
 /// One call to `loadFile(filename, true, options)`, in invocation order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,5 +454,56 @@ mod tests {
             ])
         );
         assert_eq!(parse_load_args(&args(&["program"])), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_args_handles_help_version_mpv_options_and_playlists() {
+        let parsed = parse_args([
+            "memento",
+            "--help",
+            "--version",
+            "--hwdec=vaapi",
+            "--no-sub-visibility",
+            "--pause",
+            "ep1.mkv",
+            "--{",
+            "--start=12.5",
+            "ep2.mkv",
+            "--}",
+            "ep3.mkv",
+        ])
+        .unwrap();
+        assert!(parsed.show_help);
+        assert!(parsed.show_version);
+        assert_eq!(
+            parsed.global_options,
+            vec![
+                CliOption { name: "hwdec".into(), value: "vaapi".into() },
+                CliOption { name: "sub-visibility".into(), value: "no".into() },
+                CliOption { name: "pause".into(), value: "yes".into() },
+            ]
+        );
+        assert_eq!(
+            parsed.loads,
+            vec![
+                PlaylistLoad { path: "ep1.mkv".into(), options: vec![] },
+                PlaylistLoad { path: "ep2.mkv".into(), options: vec!["start=\"12.5\"".into()] },
+                PlaylistLoad { path: "ep3.mkv".into(), options: vec![] },
+            ]
+        );
+
+        let short = parse_args(["memento", "-h", "-v", "--", "--not-an-option.mkv"]).unwrap();
+        assert!(short.show_help);
+        assert!(short.show_version);
+        assert!(short.global_options.is_empty());
+        assert_eq!(
+            short.loads,
+            vec![PlaylistLoad { path: "--not-an-option.mkv".into(), options: vec![] }]
+        );
+
+        assert_eq!(
+            parse_args(["memento", "--{", "a.mkv"]),
+            Err(ParseArgsError::InvalidBrackets)
+        );
     }
 }

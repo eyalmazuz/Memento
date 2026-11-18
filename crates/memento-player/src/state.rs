@@ -244,6 +244,7 @@ pub enum Signal {
     SubtitleTracksChanged,
     VolumeChanged(i64),
     MaxVolumeChanged(i64),
+    MuteChanged(bool),
     AidChanged(i64),
     SidChanged(i64),
     SecondarySidChanged(i64),
@@ -786,6 +787,11 @@ impl MpvStateCore {
             PropertyChange::TrackList(tracks) => self.set_tracks(tracks),
             PropertyChange::Volume(value) => self.set_volume(value).into_iter().collect(),
             PropertyChange::VolumeMax(value) => self.set_max_volume(value).into_iter().collect(),
+            PropertyChange::Mute(value) => self
+                .set_mute(value)
+                .then_some(Signal::MuteChanged(value))
+                .into_iter()
+                .collect(),
             PropertyChange::VideoWidth(value) => {
                 self.set_video_width(value).into_iter().collect()
             }

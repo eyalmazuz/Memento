@@ -19,6 +19,7 @@ pub mod machine;
 pub mod mpv;
 pub mod state;
 
+pub use args::{help_text, parse_args, version_text, ParsedArgs, PlaylistLoad};
 pub use autopause::{
     subtitle_playback_time, subtitle_raw_time, subtitle_valid_speed, AutoPauseState,
 };
@@ -28,15 +29,17 @@ pub use controller::{
     ScreenshotValidationError, WheelButton,
 };
 pub use mpv::{
-    memento_player_command, memento_player_command_async, memento_player_command_ret_i64,
-    memento_player_command_ret_raw, memento_player_cue_valid,
-    memento_player_decode_cursor_autohide, memento_player_extract_chapter_times,
-    memento_player_extract_sub_lines, memento_player_extract_tracks,
-    memento_player_f64_list_free, memento_player_id_valid,
+    format_webvtt_cues, format_webvtt_timestamp, memento_player_command,
+    memento_player_command_async, memento_player_command_ret_i64, memento_player_command_ret_raw,
+    memento_player_cue_valid, memento_player_decode_cursor_autohide,
+    memento_player_extract_chapter_times, memento_player_extract_sub_lines,
+    memento_player_extract_tracks, memento_player_f64_list_free, memento_player_id_valid,
     memento_player_sub_lines_free, memento_player_supports_memory_subtitles,
-    memento_player_tracks_free, AudioInstance, AudioTrack, CursorAutohide, EncodeContext, ExtractedSubLine,
+    memento_player_tracks_free, AsrCue, AsrSubtitleTrack, AsrTrackMode, AudioInstance, AudioTrack,
+    CommandReplyResult, CursorAutohide, EncodeContext, EndFileReason, ExtractedSubLine,
     ExtractedTrack, MementoF64ListC, MementoSubLineC, MementoSubLineListC, MementoTrackC,
-    MementoTrackListC, MpvInstance, RawFrame, SubtitleTrack, TrackType,
+    MementoTrackListC, MpvEvent, MpvInstance, MpvPropertyValue, RawFrame, SubtitleTrack, TrackType,
+    ASR_STREAM_PROTOCOL, ASR_STREAM_URI,
 };
 pub use state::{
     q_bound, AutoHideType, MpvStateCore, Signal, Subtitle, SubtitleChange, VideoParams,

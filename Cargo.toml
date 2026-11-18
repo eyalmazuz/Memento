@@ -20,11 +20,14 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "accessibility",
     "compat-1-2",
     "backend-winit",
+    "backend-winit-wayland",
     "backend-winit-x11",
+    "raw-window-handle-06",
     "renderer-femtovg",
     "renderer-software",
     "unstable-fontique-08",
 ] }
+raw-window-handle = "=0.6.2"
 libloading = { version = "=0.8.9", optional = true }
 libc = "=0.2.190"
 tempfile = "=3.27.0"
