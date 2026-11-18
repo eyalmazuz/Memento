@@ -751,7 +751,9 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
 }
 
 
-fn refresh_subtitle_list(model: &VecModel<SubEntry>, subtitles: &SubtitleController) {
+fn refresh_subtitle_list(app: &MementoApp, model: &VecModel<SubEntry>, subtitles: &SubtitleController) {
+    let query = app.get_subtitle_search_query();
+    let matching = if query.trim().is_empty() { Vec::new() } else { subtitles.search(&query, true) };
     let active = subtitles.active_indices(subtitles.primary_sid());
     let rows: Vec<SubEntry> = subtitles.primary_entries().iter().enumerate().map(|(index, cue)| SubEntry {
         id: (index + 1) as i32,
@@ -760,8 +762,89 @@ fn refresh_subtitle_list(model: &VecModel<SubEntry>, subtitles: &SubtitleControl
         text: String::from_utf16_lossy(&cue.text).into(),
         selected: subtitles.is_selected(index),
         is_active: active.contains(&index),
+        search_match: matching.contains(&index),
     }).collect();
     model.set_vec(rows);
+}
+
+fn refresh_subtitle_marks(model: &VecModel<SubEntry>, subtitles: &SubtitleController) {
+    for index in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(index) {
+            let selected = subtitles.is_selected(index);
+            if row.selected != selected {
+                row.selected = selected;
+                model.set_row_data(index, row);
+            }
+        }
+    }
+}
+
+fn clear_subtitle_marks_on_advance(
+    model: &VecModel<SubEntry>, subtitles: &mut SubtitleController,
+    previous: &mut Option<(i64, f64)>, paused: bool,
+) {
+    let sid = subtitles.primary_sid();
+    if previous.is_some_and(|(previous_sid, _)| previous_sid != sid) { *previous = None; }
+    // Keep the last cue across gaps. Cue times, rather than row indices or
+    // text, distinguish repeated lines without reacting to ASR insertions.
+    if let Some(current) = subtitles.active_cue().map(|cue| (sid, cue.start)) {
+        let advanced = previous.is_some_and(|previous| previous != current);
+        *previous = Some(current);
+        if advanced && !paused && !subtitles.selected_indices().is_empty() {
+            subtitles.clear_selection();
+            refresh_subtitle_marks(model, subtitles);
+        }
+    }
+}
+
+fn install_subtitle_selection(
+    app: &MementoApp,
+    subtitles: Rc<RefCell<SubtitleController>>,
+    rows: Rc<VecModel<SubEntry>>,
+) {
+    let controller = subtitles.clone();
+    let model = rows.clone();
+    app.on_select_row(move |row, extend_range| {
+        let Ok(index) = usize::try_from(row) else { return; };
+        let mut subtitles = controller.borrow_mut();
+        subtitles.select_row(index, extend_range);
+        refresh_subtitle_marks(&model, &subtitles);
+    });
+    let controller = subtitles.clone();
+    let model = rows.clone();
+    let drag_marks = RefCell::new((0, Vec::new()));
+    app.on_select_subtitle_range(move |first, last, begin| {
+        let (Ok(first), Ok(last)) = (usize::try_from(first), usize::try_from(last)) else { return; };
+        let mut subtitles = controller.borrow_mut();
+        let mut previous = drag_marks.borrow_mut();
+        if begin { *previous = (subtitles.primary_sid(), subtitles.selected_indices().to_vec()); }
+        if previous.0 != subtitles.primary_sid() { return; }
+        subtitles.select_range(first, last, &previous.1);
+        refresh_subtitle_marks(&model, &subtitles);
+    });
+    let controller = subtitles.clone();
+    let model = rows.clone();
+    app.on_mark_subtitle_row(move |row| {
+        let Ok(index) = usize::try_from(row) else { return; };
+        let mut subtitles = controller.borrow_mut();
+        subtitles.set_selected(index, true);
+        refresh_subtitle_marks(&model, &subtitles);
+    });
+    let weak = app.as_weak();
+    app.on_search_subtitles(move |query| {
+        let Some(app) = weak.upgrade() else { return; };
+        app.set_subtitle_search_query(query.clone());
+        let matching = if query.trim().is_empty() { Vec::new() } else { subtitles.borrow().search(&query, true) };
+        for index in 0..rows.row_count() {
+            if let Some(mut row) = rows.row_data(index) {
+                let is_match = matching.contains(&index);
+                if row.search_match != is_match {
+                    row.search_match = is_match;
+                    rows.set_row_data(index, row);
+                }
+            }
+        }
+    });
 }
 
 fn refresh_active_rows(
@@ -783,6 +866,157 @@ fn refresh_active_rows(
 #[cfg(test)]
 mod subtitle_layout_tests {
     use super::*;
+
+    #[test]
+    fn context_marks_clear_when_playback_reaches_the_next_subtitle() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let rows = VecModel::<SubEntry>::default();
+        let mut subtitles = SubtitleController::new();
+        let mut previous = None;
+        subtitles.load_cues(vec![
+            controller::subtitles::create_cue("Repeated line", 1., 2.),
+            controller::subtitles::create_cue("Repeated line", 3., 4.),
+            controller::subtitles::create_cue("Last", 5., 6.),
+        ]);
+        subtitles.update_position(1.5);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, true);
+        subtitles.select_range(0, 2, &[]);
+        refresh_subtitle_list(&app, &rows, &subtitles);
+        for position in [1.8, 2.5] {
+            subtitles.update_position(position);
+            clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, false);
+            assert_eq!(subtitles.selected_indices(), &[0, 1, 2], "resuming and the gap retain marks until the next cue");
+        }
+        subtitles.update_position(3.5);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, false);
+        assert!(subtitles.selected_indices().is_empty());
+        assert!(rows.iter().all(|row| !row.selected));
+        subtitles.select_all();
+        subtitles.update_position(5.5);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, true);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, false);
+        assert_eq!(subtitles.selected_indices(), &[0, 1, 2], "a paused seek and resume on the same cue retain marks");
+
+        subtitles.start_asr_track();
+        let cue = |id, start| MemorySubtitleCue {
+            id, text: "ASR".encode_utf16().collect(), start, end: start + 1.,
+        };
+        subtitles.add_asr_cue(cue(1, 3.), 3.5);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, true);
+        subtitles.select_all();
+        // Background ASR arrivals may shift row indices, but don't mean
+        // playback has moved to another subtitle.
+        subtitles.add_asr_cue(cue(2, 1.), 3.5);
+        subtitles.add_asr_cue(cue(3, 5.), 3.5);
+        refresh_subtitle_list(&app, &rows, &subtitles);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, false);
+        assert_eq!(subtitles.selected_indices(), &[1]);
+        subtitles.update_position(5.5);
+        clear_subtitle_marks_on_advance(&rows, &mut subtitles, &mut previous, false);
+        assert!(subtitles.selected_indices().is_empty());
+        assert!(rows.iter().all(|row| !row.selected));
+    }
+
+    #[test]
+    fn drawer_marks_multiple_cues_without_search_or_playback_overwriting_them() {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_duration(120.);
+        app.set_sub_drawer_open(true);
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        subtitles.borrow_mut().load_cues(vec![
+            controller::subtitles::create_cue("First", 1., 2.),
+            controller::subtitles::create_cue("Middle", 3., 4.),
+            controller::subtitles::create_cue("Last", 5., 6.),
+        ]);
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(rows.clone().into());
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+        app.show().unwrap();
+        let click = |x, y| {
+            let position = slint::LogicalPosition::new(x, y);
+            app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
+            app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        };
+        click(950., 94.);
+        assert_eq!(subtitles.borrow().selected_indices(), &[0]);
+        app.window().dispatch_event(WindowEvent::KeyPressed { text: slint::platform::Key::Shift.into() });
+        click(950., 166.);
+        app.window().dispatch_event(WindowEvent::KeyReleased { text: slint::platform::Key::Shift.into() });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        click(1100., 130.);
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
+        app.invoke_search_subtitles("Middle".into());
+        assert!(rows.row_data(1).unwrap().search_match);
+        assert!(!rows.row_data(1).unwrap().selected, "search matches are not Anki marks");
+        subtitles.borrow_mut().update_position(3.5);
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        assert!(rows.row_data(1).unwrap().is_active);
+        assert!(!rows.row_data(1).unwrap().selected);
+        assert!(rows.row_data(0).unwrap().selected && rows.row_data(2).unwrap().selected);
+        app.invoke_search_subtitles("".into());
+        assert!(rows.iter().all(|row| !row.search_match));
+        // A double-click seeks and keeps the destination marked.
+        let seek = Rc::new(Cell::new(0.));
+        let result = seek.clone();
+        app.on_seek_to(move |position| result.set(position));
+        click(1100., 166.);
+        click(1100., 166.);
+        assert_eq!(seek.get(), 5.);
+        assert!(subtitles.borrow().is_selected(2));
+        subtitles.borrow_mut().clear_selection();
+        refresh_subtitle_marks(&rows, &subtitles.borrow());
+        assert!(rows.iter().all(|row| !row.selected));
+        // Hold and drag across rows; updates happen before releasing. Reversing
+        // the drag shrinks its range and preserves marks from earlier clicks.
+        app.invoke_mark_subtitle_row(2);
+        let position = slint::LogicalPosition::new(1100., 94.);
+        app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 166.) });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        app.window().dispatch_event(WindowEvent::PointerMoved { position });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
+        app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 2], "release must not toggle the start row");
+        subtitles.borrow_mut().clear_selection();
+        refresh_subtitle_marks(&rows, &subtitles.borrow());
+        let position = slint::LogicalPosition::new(1100., 166.);
+        app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
+        let position = slint::LogicalPosition::new(1100., 94.);
+        app.window().dispatch_event(WindowEvent::PointerMoved { position });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2], "upward drag must also mark a range");
+        app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        // Hovering after release does not change marks, and an ordinary click
+        // can still unmark one row after a completed drag.
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 130.) });
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        click(1100., 130.);
+        assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
+        // A long press after scrolling must use the actual cue indices,
+        // rather than treating the first visible row as cue zero.
+        subtitles.borrow_mut().load_cues((0..100).map(|index| {
+            controller::subtitles::create_cue(&format!("Cue {index}"), index as f64 * 2., index as f64 * 2. + 1.)
+        }).collect::<Vec<_>>());
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        let position = slint::LogicalPosition::new(1100., 94.);
+        app.window().dispatch_event(WindowEvent::PointerScrolled { position, delta_x: 0., delta_y: -360. });
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
+        app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
+        i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(600));
+        let position = slint::LogicalPosition::new(1100., 166.);
+        app.window().dispatch_event(WindowEvent::PointerMoved { position });
+        app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        let selection = subtitles.borrow().selected_indices().to_vec();
+        assert_eq!(selection.len(), 3);
+        assert!(selection[0] > 0, "wheel scrolling must still work before dragging");
+        assert_eq!(selection, (selection[0]..=selection[0] + 2).collect::<Vec<_>>());
+        app.hide().unwrap();
+    }
 
     #[test]
     fn mpv_track_sync_preserves_asr_and_settings_reset_only_clears_its_cache() {
@@ -907,13 +1141,13 @@ fn sync_player_tracks(
             }
         }
         previous_subtitles.clone_from(tracks);
-        refresh_subtitle_list(subtitle_rows, subtitles);
+        refresh_subtitle_list(app, subtitle_rows, subtitles);
     }
     let primary = if app.get_asr_running() { ASR_TRACK_ID } else { state.primary_sid };
     if subtitles.primary_sid() != primary {
         if primary == ASR_TRACK_ID { subtitles.resume_asr_track(state.position); }
         else { subtitles.set_primary_sid(primary); }
-        refresh_subtitle_list(subtitle_rows, subtitles);
+        refresh_subtitle_list(app, subtitle_rows, subtitles);
     }
     let secondary = state.secondary_sid;
     if subtitles.secondary_sid() != secondary {
@@ -1110,7 +1344,7 @@ fn clear_asr_for_settings(
     asr.borrow_mut().cancel();
     let mut subtitles = subtitles.borrow_mut();
     subtitles.clear_asr_track();
-    refresh_subtitle_list(subtitle_model, &subtitles);
+    refresh_subtitle_list(app, subtitle_model, &subtitles);
     app.set_asr_running(false);
     restart_pending.set(restart);
     if selected { clear_primary_subtitle(app); }
@@ -2192,8 +2426,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     primary_asr_restart.set(false);
                     let mut subtitles = primary_subs.borrow_mut();
                     subtitles.set_primary_sid(id.into());
-                    refresh_subtitle_list(&primary_sub_model, &subtitles);
                     if let Some(app) = primary_app.upgrade() {
+                        refresh_subtitle_list(&app, &primary_sub_model, &subtitles);
                         app.set_asr_running(false);
                         app.set_primary_sid(id);
                         clear_primary_subtitle(&app);
@@ -2236,7 +2470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_asr_running(false);
             let mut subtitles = select_asr_sub_ctrl.borrow_mut();
             subtitles.set_primary_sid(0);
-            refresh_subtitle_list(&select_asr_sub_model, &subtitles);
+            refresh_subtitle_list(&app, &select_asr_sub_model, &subtitles);
             clear_primary_subtitle(&app);
             app.set_status_message("ASR paused; subtitles and model kept in memory".into());
             return;
@@ -2280,7 +2514,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 select_asr_restart.set(false);
                 clear_primary_subtitle(&app);
-                refresh_subtitle_list(&select_asr_sub_model, &subtitles);
+                refresh_subtitle_list(&app, &select_asr_sub_model, &subtitles);
                 app.set_primary_sid(0);
                 app.set_asr_running(true);
                 app.set_status_message(if session == controller::asr::SessionStart::Resumed {
@@ -2293,7 +2527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(err) if err.contains("still stopping") => {
                 select_asr_sub_ctrl.borrow_mut().clear_asr_track();
-                refresh_subtitle_list(&select_asr_sub_model, &select_asr_sub_ctrl.borrow());
+                refresh_subtitle_list(&app, &select_asr_sub_model, &select_asr_sub_ctrl.borrow());
                 select_asr_restart.set(true);
                 app.set_status_message("Reloading ASR for the current media and settings…".into());
             }
@@ -2724,29 +2958,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ── Subtitle Drawer Row Selection ───────────────────────────────────────
-    let sm = sub_model.clone();
-    let sc = sub_ctrl.clone();
-    app.on_select_row(move |row| {
-        if row >= 0 && (row as usize) < sm.row_count() {
-            sc.borrow_mut().toggle_select(row as usize);
-            if let Some(mut entry) = sm.row_data(row as usize) {
-                entry.selected = !entry.selected;
-                sm.set_row_data(row as usize, entry);
-            }
-        }
-    });
-    let search_sub_ctrl = sub_ctrl.clone();
-    let search_sub_model = sub_model.clone();
-    app.on_search_subtitles(move |query| {
-        let matching = search_sub_ctrl.borrow().search(&query, true);
-        for idx in 0..search_sub_model.row_count() {
-            if let Some(mut entry) = search_sub_model.row_data(idx) {
-                entry.selected = matching.contains(&idx);
-                search_sub_model.set_row_data(idx, entry);
-            }
-        }
-    });
+    install_subtitle_selection(&app, sub_ctrl.clone(), sub_model.clone());
 
     // ── Dictionary Lookup ──────────────────────────────────────────────────
     let popup_audio_cache: Arc<Mutex<PopupAudioState>> = Arc::new(Mutex::new(PopupAudioState::default()));
@@ -3189,11 +3401,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (active_start, active_end, context_start, context_end) = {
             let subtitles = note_subtitles.borrow();
             let active = subtitles.active_cue();
-            let selected = subtitles.selected_cues();
             let start = active.map(|cue| cue.start).unwrap_or(0.0);
             let end = active.map(|cue| cue.end).unwrap_or(0.0);
-            let context_start = selected.iter().map(|cue| cue.start).reduce(f64::min).unwrap_or(start);
-            let context_end = selected.iter().map(|cue| cue.end).reduce(f64::max).unwrap_or(end);
+            let (context_start, context_end) = subtitles.selected_time_range().unwrap_or((start, end));
             (start, end, context_start, context_end)
         };
         let (wants_screenshot, wants_video_screenshot) =
@@ -3367,6 +3577,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut previous_audio = Vec::new();
     let mut previous_tracks = Vec::new();
     let mut previous_lines = Vec::new();
+    let mut previous_context_cue = None;
     let mut previous_primary_text = String::new();
     let mut previous_secondary_text = String::new();
     let mut previous_sub_times = (0.0, 0.0);
@@ -3432,6 +3643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 previous_audio.clear();
                 previous_tracks.clear();
                 previous_lines.clear();
+                previous_context_cue = None;
                 previous_primary_text.clear();
                 previous_secondary_text.clear();
                 previous_sub_times = (0.0, 0.0);
@@ -3443,6 +3655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 timer_sub_ctrl.borrow_mut().clear();
                 timer_sub_model.set_vec(Vec::new());
+                app.set_subtitle_search_query("".into());
                 app.set_audio_tracks(Rc::new(VecModel::<PlayerTrack>::default()).into());
                 app.set_subtitle_tracks(Rc::new(VecModel::<PlayerTrack>::default()).into());
                 app.set_audio_id(0);
@@ -3488,7 +3701,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             controller::asr::SessionStart::New => subtitles.start_asr_track(),
                                             controller::asr::SessionStart::Resumed => { subtitles.resume_asr_track(pos); }
                                         }
-                                        refresh_subtitle_list(&timer_sub_model, &subtitles);
+                                        refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
                                         app.set_primary_sid(0);
                                         app.set_asr_running(true);
                                         app.set_status_message("ASR model reloaded; transcribing subtitles…".into());
@@ -3580,7 +3793,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }).collect();
                 if subtitles.update_memory_cues(primary_sid, &cues, raw_primary) {
-                    refresh_subtitle_list(&timer_sub_model, &subtitles);
+                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
                 }
                 previous_lines.clone_from(current_lines);
             }
@@ -3599,7 +3812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 subtitles.update_active_cue(primary_sid, cue.as_ref(), raw_primary);
                 if subtitles.primary_entries().len() != previous_count {
-                    refresh_subtitle_list(&timer_sub_model, &subtitles);
+                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
                 }
                 publish_active_subtitle(&app, &primary_text, &timer_furigana_sender, &timer_furigana_epoch);
                 previous_primary_text = primary_text;
@@ -3657,12 +3870,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 });
                 if refreshed_subtitles && app.get_asr_running() {
-                    refresh_subtitle_list(&timer_sub_model, &subtitles);
+                    refresh_subtitle_list(&app, &timer_sub_model, &subtitles);
                 }
             }
             let selected_sid = subtitles.primary_sid();
             let before_active = subtitles.active_indices(selected_sid).to_vec();
             subtitles.update_positions(if app.get_asr_running() { pos } else { raw_primary }, raw_secondary);
+            clear_subtitle_marks_on_advance(&timer_sub_model, &mut subtitles, &mut previous_context_cue, paused);
             refresh_active_rows(
                 &timer_sub_model, &before_active, subtitles.active_indices(selected_sid),
             );

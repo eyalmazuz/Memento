@@ -12,6 +12,7 @@ export struct SubEntry {
     text: string,
     selected: bool,
     is_active: bool,
+    search_match: bool,
 }
 
 export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
@@ -946,11 +947,14 @@ component PlayerOscBar inherits Rectangle {
 
 // ── Subtitle Drawer Panel ───────────────────────────────────────────────
 component SubtitleDrawerPanel inherits Rectangle {
+    // A hidden drawer must not reserve space in the window layout.
+    min-height: 0px;
     in property <[SubEntry]> entries;
     in-out property <string> search-text: "";
     pure callback format-timestamp(float) -> string;
-    callback row-clicked(int);
-    callback row-activated(float);
+    callback row-clicked(int, bool);
+    callback range-dragged(int, int, bool);
+    callback row-activated(int, float);
     callback search-changed(string);
 
     background: #181A1D;
@@ -973,9 +977,13 @@ component SubtitleDrawerPanel inherits Rectangle {
 
         // Subtitle Cues List
         ListView {
+            // Mouse dragging marks subtitles; scrolling uses the wheel or bar.
+            mouse-drag-pan-enabled: false;
             for entry[idx] in root.entries : Rectangle {
                 height: 36px;
                 border-radius: 4px;
+                border-width: entry.search-match ? 1px : 0px;
+                border-color: #C29D4B;
                 background: entry.selected
                     ? (d-touch.has-hover ? #2A3B4C : #1E2D3D)
                     : (entry.is_active
@@ -1026,11 +1034,38 @@ component SubtitleDrawerPanel inherits Rectangle {
                 d-touch := TouchArea {
                     width: 100%;
                     height: 100%;
-                    clicked => { root.row-clicked(idx); }
-                    double-clicked => { root.row-activated(entry.start); }
+                    mouse-cursor: pointer;
+                    property <bool> extend-range: false;
+                    property <bool> dragging-range: false;
+                    property <int> drag-end: -1;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            self.extend-range = event.modifiers.shift;
+                            self.dragging-range = false;
+                            self.drag-end = idx;
+                        }
+                    }
+                    moved => {
+                        if self.pressed {
+                            // TouchArea keeps the pointer grab outside its row.
+                            let end = min(root.entries.length - 1, max(0, idx + floor(self.mouse-y / self.height)));
+                            if end != self.drag-end {
+                                root.range-dragged(idx, end, !self.dragging-range);
+                                self.dragging-range = true;
+                                self.drag-end = end;
+                            }
+                        }
+                    }
+                    clicked => {
+                        if !self.dragging-range { root.row-clicked(idx, self.extend-range); }
+                    }
+                    double-clicked => {
+                        if !self.dragging-range { root.row-activated(idx, entry.start); }
+                    }
                 }
             }
         }
+
     }
 }
 
@@ -1749,6 +1784,7 @@ export component MementoApp inherits Window {
 
     // Subtitle Entries & Interactive Words
     in-out property <[SubEntry]> subtitle-entries: [];
+    in-out property <string> subtitle-search-query: "";
     in-out property <[SubtitleWord]> active-sub-words: [];
     in-out property <[SubtitleLine]> active-sub-lines: [];
     in-out property <length> popup-offset-x: 0px;
@@ -1791,7 +1827,9 @@ export component MementoApp inherits Window {
     callback toggle-fullscreen();
     callback pointer-moved(float, float);
     callback osc-activity();
-    callback select-row(int);
+    callback select-row(int, bool);
+    callback select-subtitle-range(int, int, bool);
+    callback mark-subtitle-row(int);
     callback search-subtitles(string);
     callback search-dictionary(string);
     callback lookup-word(string);
@@ -2124,9 +2162,11 @@ export component MementoApp inherits Window {
                 width: (root.sub-drawer-open && !root.dict-search-open) ? 360px : 0px;
                 visible: self.width > 0px;
                 entries: root.subtitle-entries;
+                search-text <=> root.subtitle-search-query;
                 format-timestamp(sec) => { root.format-timestamp(sec) }
-                row-clicked(idx) => { root.dismiss-definition(); root.select-row(idx); }
-                row-activated(sec) => { root.dismiss-definition(); root.seek-to(sec); }
+                row-clicked(idx, extend-range) => { root.dismiss-definition(); root.select-row(idx, extend-range); }
+                range-dragged(first, last, begin) => { root.dismiss-definition(); root.select-subtitle-range(first, last, begin); }
+                row-activated(idx, sec) => { root.dismiss-definition(); root.mark-subtitle-row(idx); root.seek-to(sec); }
                 search-changed(q) => { root.dismiss-definition(); root.search-subtitles(q); }
             }
         }

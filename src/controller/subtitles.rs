@@ -37,8 +37,8 @@ pub fn create_cue(text: &str, start: f64, end: f64) -> SubtitleEntry {
     }
 }
 
-/// A subtitle track reported by mpv. Positive IDs are mpv SIDs; zero is
-/// reserved by this controller for the application's ASR subtitles.
+/// A subtitle track reported by mpv. Positive IDs are mpv SIDs; zero
+/// means no track; ASR uses [`ASR_TRACK_ID`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubtitleTrackInfo {
     pub id: i64,
@@ -70,6 +70,7 @@ pub struct SubtitleTrackModel {
     external_path: Option<String>,
     entries: Vec<SubtitleEntry>,
     selected_indices: Vec<usize>,
+    selection_anchor: Option<usize>,
     active_indices: Vec<usize>,
     is_memory_track: bool,
 }
@@ -82,6 +83,7 @@ impl SubtitleTrackModel {
             external_path: None,
             entries: Vec::new(),
             selected_indices: Vec::new(),
+            selection_anchor: None,
             active_indices: Vec::new(),
             is_memory_track: false,
         }
@@ -113,6 +115,16 @@ impl SubtitleTrackModel {
 
     pub fn is_memory_track(&self) -> bool {
         self.is_memory_track
+    }
+
+    fn replace_memory_entries(&mut self, entries: Vec<SubtitleEntry>) {
+        let selected: Vec<_> = self.selected_indices.iter()
+            .filter_map(|&index| self.entries.get(index)).collect();
+        let anchor = self.selection_anchor.and_then(|index| self.entries.get(index));
+        self.selected_indices = entries.iter().enumerate()
+            .filter_map(|(index, cue)| selected.contains(&cue).then_some(index)).collect();
+        self.selection_anchor = anchor.and_then(|cue| entries.iter().position(|entry| entry == cue));
+        self.entries = entries;
     }
 }
 
@@ -196,6 +208,7 @@ impl SubtitleController {
                         track.external_path = Some(path.clone());
                         track.entries.clear();
                         track.selected_indices.clear();
+                        track.selection_anchor = None;
                         track.active_indices.clear();
                         track.is_memory_track = false;
                         if read_file && !path.is_empty() {
@@ -212,6 +225,7 @@ impl SubtitleController {
                         track.external_path = None;
                         track.entries.clear();
                         track.selected_indices.clear();
+                        track.selection_anchor = None;
                         track.active_indices.clear();
                         track.is_memory_track = false;
                     }
@@ -287,31 +301,33 @@ impl SubtitleController {
         if self.track(ASR_TRACK_ID).is_none() {
             return false;
         }
-        let selected_ids = self.selected_asr_ids();
+        let (selected_ids, anchor_id) = self.asr_selection();
         self.asr_cues.retain(|existing| existing.id != cue.id);
         self.asr_cues.push(cue);
-        self.rebuild_asr_track(position, &selected_ids);
+        self.rebuild_asr_track(position, &selected_ids, anchor_id);
         true
     }
 
     pub fn remove_asr_cue(&mut self, cue_id: i64, position: f64) -> bool {
-        let selected_ids = self.selected_asr_ids();
+        let (selected_ids, anchor_id) = self.asr_selection();
         let before = self.asr_cues.len();
         self.asr_cues.retain(|cue| cue.id != cue_id);
         if self.asr_cues.len() == before {
             return false;
         }
-        self.rebuild_asr_track(position, &selected_ids);
+        self.rebuild_asr_track(position, &selected_ids, anchor_id);
         true
     }
 
-    fn selected_asr_ids(&self) -> Vec<i64> {
-        self.track(ASR_TRACK_ID).map(|track| track.selected_indices.iter()
-            .filter_map(|index| self.asr_cues.get(*index).map(|cue| cue.id))
-            .collect()).unwrap_or_default()
+    fn asr_selection(&self) -> (Vec<i64>, Option<i64>) {
+        self.track(ASR_TRACK_ID).map(|track| (
+            track.selected_indices.iter()
+                .filter_map(|index| self.asr_cues.get(*index).map(|cue| cue.id)).collect(),
+            track.selection_anchor.and_then(|index| self.asr_cues.get(index)).map(|cue| cue.id),
+        )).unwrap_or_default()
     }
 
-    fn rebuild_asr_track(&mut self, position: f64, selected_ids: &[i64]) {
+    fn rebuild_asr_track(&mut self, position: f64, selected_ids: &[i64], anchor_id: Option<i64>) {
         self.asr_cues.sort_by(|a, b| a.start.total_cmp(&b.start));
         let selected_indices = self.asr_cues.iter().enumerate()
             .filter_map(|(index, cue)| selected_ids.contains(&cue.id).then_some(index))
@@ -319,10 +335,12 @@ impl SubtitleController {
         let entries: Vec<_> = self.asr_cues.iter().map(|cue| SubtitleEntry {
             text: cue.text.clone(), start: cue.start, end: cue.end,
         }).collect();
+        let anchor = anchor_id.and_then(|id| self.asr_cues.iter().position(|cue| cue.id == id));
         if let Some(track) = self.track_mut(ASR_TRACK_ID) {
             track.entries = entries;
             track.is_memory_track = true;
             track.selected_indices = selected_indices;
+            track.selection_anchor = anchor;
             track.active_indices = select_active_indices(&track.entries, position);
         }
     }
@@ -351,6 +369,7 @@ impl SubtitleController {
         if let Some(track) = self.track_mut(sid) {
             track.entries = entries;
             track.selected_indices.clear();
+            track.selection_anchor = None;
             track.active_indices.clear();
             track.is_memory_track = false;
         }
@@ -380,6 +399,7 @@ impl SubtitleController {
         };
         track.entries = filter_and_sort_cues(cues);
         track.selected_indices.clear();
+        track.selection_anchor = None;
         track.active_indices.clear();
         track.is_memory_track = false;
         true
@@ -402,6 +422,7 @@ impl SubtitleController {
         }
         track.entries = filter_and_sort_cues(cues);
         track.selected_indices.clear();
+        track.selection_anchor = None;
         track.active_indices.clear();
         track.is_memory_track = false;
         true
@@ -447,17 +468,15 @@ impl SubtitleController {
             .collect();
         let sorted_indices = model::filter_and_sort_cues(&candidates);
         let track = &mut self.tracks[index];
-        track.entries.clear();
-        track.entries.reserve(sorted_indices.len());
-        for cue_index in sorted_indices {
+        let entries = sorted_indices.into_iter().map(|cue_index| {
             let cue = &cues[cue_index];
-            track.entries.push(SubtitleEntry {
+            SubtitleEntry {
                 text: cue.text.clone(),
                 start: cue.start,
                 end: cue.end,
-            });
-        }
-        track.selected_indices.clear();
+            }
+        }).collect();
+        track.replace_memory_entries(entries);
         track.active_indices = select_active_indices(&track.entries, raw_position);
         true
     }
@@ -494,6 +513,12 @@ impl SubtitleController {
             if add_plan.action == model::AddAction::Insert {
                 let insert_at = (add_plan.index as usize).min(track.entries.len());
                 track.entries.insert(insert_at, cue.clone());
+                for index in &mut track.selected_indices {
+                    if *index >= insert_at { *index += 1; }
+                }
+                if let Some(anchor) = &mut track.selection_anchor {
+                    if *anchor >= insert_at { *anchor += 1; }
+                }
             }
             track.is_memory_track = true;
             track.active_indices = select_active_indices(&track.entries, action.raw_position);
@@ -576,26 +601,59 @@ impl SubtitleController {
     }
 
     pub fn toggle_select(&mut self, index: usize) {
+        self.set_selected(index, !self.is_selected(index));
+    }
+
+    pub fn set_selected(&mut self, index: usize, selected: bool) {
         let Some(track) = self.track_mut(self.primary_sid) else {
             return;
         };
+        if index >= track.entries.len() { return; }
+        track.selection_anchor = Some(index);
         if let Some(pos) = track.selected_indices.iter().position(|&i| i == index) {
-            track.selected_indices.remove(pos);
-        } else if index < track.entries.len() {
+            if !selected { track.selected_indices.remove(pos); }
+        } else if selected {
             track.selected_indices.push(index);
             track.selected_indices.sort_unstable();
         }
     }
 
+    /// Ordinary clicks toggle a mark; Shift-click adds the inclusive range
+    /// from the last clicked cue without losing previously marked subtitles.
+    pub fn select_row(&mut self, index: usize, extend_range: bool) {
+        if !extend_range { self.toggle_select(index); return; }
+        let Some(track) = self.track_mut(self.primary_sid) else { return; };
+        if index >= track.entries.len() { return; }
+        let anchor = *track.selection_anchor.get_or_insert(index);
+        track.selected_indices.extend(anchor.min(index)..=anchor.max(index));
+        track.selected_indices.sort_unstable();
+        track.selected_indices.dedup();
+    }
+
+    /// Rebuild the dragged range from the marks present before the gesture,
+    /// so reversing direction shrinks it without discarding earlier marks.
+    pub fn select_range(&mut self, first: usize, last: usize, previous: &[usize]) {
+        let Some(track) = self.track_mut(self.primary_sid) else { return; };
+        if first >= track.entries.len() || last >= track.entries.len() { return; }
+        track.selection_anchor = Some(first);
+        track.selected_indices = previous.iter().copied()
+            .filter(|index| *index < track.entries.len()).collect();
+        track.selected_indices.extend(first.min(last)..=first.max(last));
+        track.selected_indices.sort_unstable();
+        track.selected_indices.dedup();
+    }
+
     pub fn select_all(&mut self) {
         if let Some(track) = self.track_mut(self.primary_sid) {
             track.selected_indices = (0..track.entries.len()).collect();
+            track.selection_anchor = (!track.entries.is_empty()).then_some(0);
         }
     }
 
     pub fn clear_selection(&mut self) {
         if let Some(track) = self.track_mut(self.primary_sid) {
             track.selected_indices.clear();
+            track.selection_anchor = None;
         }
     }
 
@@ -615,6 +673,12 @@ impl SubtitleController {
             .iter()
             .filter_map(|&index| self.primary_entries().get(index))
             .collect()
+    }
+
+    /// One continuous context clip, including gaps between marked cues.
+    pub fn selected_time_range(&self) -> Option<(f64, f64)> {
+        self.selected_cues().into_iter().map(|cue| (cue.start, cue.end))
+            .reduce(|(start, end), (next_start, next_end)| (start.min(next_start), end.max(next_end)))
     }
 
     pub fn active_cue(&self) -> Option<&SubtitleEntry> {

@@ -48,6 +48,7 @@ memento-asr-onnx = { path = "crates/memento-asr-onnx", optional = true }
 memento-asr-whisper = { path = "crates/memento-asr-whisper", optional = true }
 
 [dev-dependencies]
+base64 = "=0.22.1"
 libloading = "=0.8.9"
 i-slint-backend-testing = "=1.16.1"
 i-slint-renderer-femtovg = { version = "=1.16.1", features = ["opengl"] }

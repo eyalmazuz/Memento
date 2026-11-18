@@ -27,7 +27,7 @@ const KANJI_MARKERS: &[&str] = &[
 fn description(name: &str) -> &'static str {
     match name {
         "audio" => "Audio of the word if found and the skip hash is not matched.",
-        "audio-context" => "Audio of the subtitle list selection.",
+        "audio-context" => "Audio from the first marked subtitle's start to the last marked subtitle's end, including gaps. Click or drag across rows in the subtitle list to mark them, or Shift-click a range. If none are marked, uses the current subtitle.",
         "audio-media" => "Audio of the current subtitle.",
         "character" => "The kanji character.",
         "clipboard" => "The current text in the clipboard.",

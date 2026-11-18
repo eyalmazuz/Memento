@@ -14,6 +14,8 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     app.set_duration(120.);
     app.show().unwrap();
+    assert_eq!(app.get_video_width(), 1280, "closed drawers must not reserve video space");
+    assert_eq!(app.get_video_height(), 690, "closed drawers must not enlarge the window");
     let cancelled = Rc::new(Cell::new(0));
     let fullscreen = Rc::new(Cell::new(0));
     let toggles = fullscreen.clone();
@@ -55,7 +57,7 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     app.set_selected_token_index(0);
     // A click on its padding must preserve the term for audio and Anki.
     click(403., 200.);
-    assert!(app.get_dict_open());
+    assert!(app.get_dict_open(), "popup padding click; video size={}x{}", app.get_video_width(), app.get_video_height());
     assert_eq!(app.get_selected_token_index(), 0);
     // The close button must clear the selection as well as hide the popup.
     click(848., 178.);

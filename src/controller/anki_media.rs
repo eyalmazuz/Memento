@@ -213,6 +213,68 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires libmpv WAV encoding"]
+    fn audio_context_attachment_covers_all_marked_subtitles() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use crate::controller::subtitles::{create_cue, SubtitleController};
+        // Each second has a distinct sample value, so verify the clip's
+        // contents and duration, not just the calculated start/end numbers.
+        let samples: Vec<i16> = (0..8 * 16000).map(|i| (1000 + (i / 16000) * 1000) as i16).collect();
+        let mut wave = Vec::new();
+        wave.extend_from_slice(b"RIFF");
+        wave.extend_from_slice(&(36u32 + samples.len() as u32 * 2).to_le_bytes());
+        wave.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        wave.extend_from_slice(&16000u32.to_le_bytes());
+        wave.extend_from_slice(&32000u32.to_le_bytes());
+        wave.extend_from_slice(b"\x02\0\x10\0data");
+        wave.extend_from_slice(&(samples.len() as u32 * 2).to_le_bytes());
+        for sample in samples { wave.extend_from_slice(&sample.to_le_bytes()); }
+        let path = std::env::temp_dir().join(format!("memento-context-{}.wav", std::process::id()));
+        std::fs::write(&path, wave).unwrap();
+        let mut subtitles = SubtitleController::new();
+        subtitles.load_cues(vec![
+            create_cue("First", 1., 2.), create_cue("Current word", 3., 4.), create_cue("Last", 5., 6.),
+        ]);
+        subtitles.select_row(0, false);
+        subtitles.select_row(2, false);
+        subtitles.update_position(3.5);
+        let active = subtitles.active_cue().unwrap();
+        let (context_start, context_end) = subtitles.selected_time_range().unwrap();
+        let profile = AnkiNoteConfig {
+            enabled: true, endpoint: memento_net::anki::AnkiEndpoint::default(),
+            deck: "Japanese".into(), model: "Basic".into(),
+            field_templates: [("ContextAudio".into(), "{audio-context}".into()),
+                ("SentenceAudio".into(), "{audio-media}".into())].into(),
+            tags: Vec::new(), duplicate_policy: 1, screenshot_type: 0,
+            audio_pad_start: 0.0, audio_pad_end: 0.0, audio_normalize: false,
+            audio_db: -20.0, newline_replacer: "<br>".into(),
+        };
+        let input = NoteMediaInput {
+            media: Some(MediaContext::new(path.to_string_lossy().into_owned(), 1)),
+            subtitle_start: active.start, subtitle_end: active.end, context_start, context_end,
+            screenshot: None, screenshot_video: None, subtitle_id: 0, audio_sources: Vec::new(),
+        };
+        let mut context = NoteFieldsContext::new("word", "word", "Current word");
+        let result = prepare_note_media(&profile, &mut context, input);
+        let _ = std::fs::remove_file(path);
+        result.unwrap();
+        assert_eq!(context.audio_attachments.len(), 2);
+        for (field, duration, first, last) in [
+            ("ContextAudio", 5., 2000., 6000.), ("SentenceAudio", 1., 4000., 4000.),
+        ] {
+            let attachment = context.audio_attachments.iter()
+                .find(|audio| audio["fields"][0] == field).unwrap();
+            let data = STANDARD.decode(attachment["data"].as_str().unwrap()).unwrap();
+            let pcm = memento_asr::audio::wavreader::read_pcm16_wav_bytes(&data, 16000).unwrap();
+            // mpv's WAV encoder rounds its final packet (up to 128 ms).
+            assert!((pcm.len() as f64 / 16000. - duration).abs() < 0.15,
+                "wrong duration for {field}: {}s, expected {duration}s", pcm.len() as f64 / 16000.);
+            assert!((pcm[8000] * 32768. - first).abs() < 2., "wrong start for {field}");
+            assert!((pcm[pcm.len() - 8000] * 32768. - last).abs() < 2., "wrong end for {field}");
+        }
+    }
+
+    #[test]
     fn screenshot_profile_formats_produce_real_images() {
         let frame = RawFrame {
             width: 2,

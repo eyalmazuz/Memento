@@ -8,6 +8,50 @@ use memento_app::controller::player::{
 use memento_app::controller::subtitles::{create_cue, filter_and_sort_cues, MemorySubtitleCue, SubtitleController, SubtitleTrackInfo};
 
 #[test]
+fn context_marks_and_range_anchor_follow_live_cues() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.load_cues(vec![create_cue("Middle", 3.0, 4.0), create_cue("Last", 5.0, 6.0)]);
+    ctrl.select_row(1, false);
+    ctrl.update_active_cue(1, Some(&create_cue("First", 1.0, 2.0)), 1.5);
+    assert_eq!(ctrl.selected_indices(), &[2], "insertion must not move the mark onto another cue");
+    ctrl.select_row(0, true);
+    assert_eq!(ctrl.selected_indices(), &[0, 1, 2]);
+    assert_eq!(ctrl.selected_time_range(), Some((1.0, 6.0)));
+    ctrl.update_position(5.5);
+    assert_eq!(ctrl.selected_indices(), &[0, 1, 2], "playback must not replace context selection");
+
+    let cue = |id, text: &str, start, end| MemorySubtitleCue {
+        id, text: text.encode_utf16().collect(), start, end,
+    };
+    ctrl.update_memory_cues(1, &[
+        cue(4, "Earlier", 0.0, 0.5), cue(1, "First", 1.0, 2.0),
+        cue(2, "Middle", 3.0, 4.0), cue(3, "Last", 5.0, 6.0),
+    ], 5.5);
+    assert_eq!(ctrl.selected_indices(), &[1, 2, 3]);
+    ctrl.toggle_select(2);
+    assert_eq!(ctrl.selected_time_range(), Some((1.0, 6.0)), "non-adjacent marks include the intervening audio");
+    ctrl.clear_selection();
+    ctrl.select_row(0, true);
+    assert_eq!(ctrl.selected_indices(), &[0], "Clear must also reset the range anchor");
+
+    ctrl.start_asr_track();
+    ctrl.add_asr_cue(cue(10, "Middle", 3.0, 4.0), 3.5);
+    ctrl.add_asr_cue(cue(11, "Last", 5.0, 6.0), 3.5);
+    ctrl.select_row(1, false);
+    ctrl.add_asr_cue(cue(9, "First", 1.0, 2.0), 3.5);
+    ctrl.select_row(0, true);
+    assert_eq!(ctrl.selected_indices(), &[0, 1, 2], "ASR insertion must preserve the range anchor");
+    ctrl.set_primary_sid(1);
+    assert_eq!(ctrl.selected_indices(), &[0], "marks belong to their subtitle track");
+    ctrl.resume_asr_track(5.5);
+    assert_eq!(ctrl.selected_indices(), &[0, 1, 2]);
+    ctrl.remove_asr_cue(10, 5.5);
+    assert_eq!(ctrl.selected_indices(), &[0, 1]);
+    ctrl.select_row(99, true);
+    assert_eq!(ctrl.selected_indices(), &[0, 1]);
+}
+
+#[test]
 fn asr_cues_accumulate_survive_mpv_sync_and_follow_playback() {
     let mut ctrl = SubtitleController::new();
     ctrl.start_asr_track();
