@@ -459,6 +459,116 @@ pub unsafe fn transcribe(
             return EngineStatus::Failed { message, warn: true };
         }
     };
+    transcribe_samples(
+        model,
+        &samples,
+        options,
+        abort,
+        segment,
+        warning,
+        regex_validate,
+    )
+}
+
+/// Transcribe already-decoded 16 kHz mono `f32` PCM samples using safe Rust
+/// closures without intermediate WAV serialization or C callback structs.
+///
+/// # Safety
+/// `model` must be null or a live `whisper_context` for the duration of the
+/// call (and must not be used concurrently — the caller holds the model lock).
+pub unsafe fn transcribe_samples_safe(
+    model: *mut sys::whisper_context,
+    samples: &[f32],
+    options: &TranscribeOptions,
+    should_abort: &dyn Fn() -> bool,
+    on_segment: &mut dyn FnMut(&str, i64, i64),
+) -> EngineStatus {
+    struct AbortCtx<'a> {
+        f: &'a dyn Fn() -> bool,
+    }
+    struct SegmentCtx<'a> {
+        f: &'a mut dyn FnMut(&str, i64, i64),
+    }
+
+    unsafe extern "C" fn poll_abort(data: *mut c_void) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if data.is_null() {
+                return false;
+            }
+            let ctx = &*(data as *const AbortCtx<'_>);
+            (ctx.f)()
+        }))
+        .unwrap_or(true)
+    }
+
+    unsafe extern "C" fn forward_segment(
+        text: *const u8,
+        text_len: usize,
+        t0: i64,
+        t1: i64,
+        data: *mut c_void,
+    ) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if data.is_null() || (text_len != 0 && text.is_null()) {
+                return;
+            }
+            let ctx = &mut *(data as *mut SegmentCtx<'_>);
+            let bytes = if text_len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(text, text_len)
+            };
+            let text = String::from_utf8_lossy(bytes);
+            (ctx.f)(text.as_ref(), t0, t1);
+        }));
+    }
+
+    let abort_ctx = AbortCtx { f: should_abort };
+    let mut seg_ctx = SegmentCtx { f: on_segment };
+    let abort_bridge = AbortBridge {
+        poll: poll_abort,
+        user_data: (&abort_ctx as *const AbortCtx<'_>).cast_mut().cast(),
+    };
+    let segment_bridge = SegmentBridge {
+        callback: Some(forward_segment),
+        user_data: (&mut seg_ctx as *mut SegmentCtx<'_>).cast(),
+    };
+    transcribe_samples(
+        model,
+        samples,
+        options,
+        Some(&abort_bridge),
+        Some(&segment_bridge),
+        None,
+        None,
+    )
+}
+
+/// One transcription attempt over pre-decoded 16 kHz mono `f32` PCM samples.
+///
+/// `model` may be null: empty-sample checks happen first, then the model pointer
+/// check, mirroring [`transcribe`].
+///
+/// # Safety
+/// `model` must be null or a live `whisper_context` for the duration of the
+/// call (and must not be used concurrently — the caller holds the model
+/// lock); the bridges must reference valid pointers/callbacks for the
+/// duration of the call.
+pub unsafe fn transcribe_samples(
+    model: *mut sys::whisper_context,
+    samples: &[f32],
+    options: &TranscribeOptions,
+    abort: Option<&AbortBridge>,
+    segment: Option<&SegmentBridge>,
+    warning: Option<&WarningBridge>,
+    regex_validate: Option<&RegexValidateBridge>,
+) -> EngineStatus {
+    if samples.is_empty() {
+        return EngineStatus::Failed {
+            message: ERR_EMPTY_AUDIO.to_string(),
+            warn: false,
+        };
+    }
 
     if model.is_null() {
         return EngineStatus::Failed {
@@ -694,5 +804,43 @@ mod tests {
         let error = read_whisper_wav(&path).expect_err("overflowing chunk size must fail");
         assert_eq!(error, "The extracted WAV file is truncated.");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transcribe_samples_validates_empty_samples_and_null_model() {
+        let options = TranscribeOptions::default();
+        let empty_status = unsafe {
+            transcribe_samples_safe(
+                std::ptr::null_mut(),
+                &[],
+                &options,
+                &|| false,
+                &mut |_, _, _| {},
+            )
+        };
+        assert_eq!(
+            empty_status,
+            EngineStatus::Failed {
+                message: ERR_EMPTY_AUDIO.to_string(),
+                warn: false,
+            }
+        );
+
+        let null_model_status = unsafe {
+            transcribe_samples_safe(
+                std::ptr::null_mut(),
+                &[0.0f32; 160],
+                &options,
+                &|| false,
+                &mut |_, _, _| {},
+            )
+        };
+        assert_eq!(
+            null_model_status,
+            EngineStatus::Failed {
+                message: ERR_MODEL_INIT.to_string(),
+                warn: true,
+            }
+        );
     }
 }

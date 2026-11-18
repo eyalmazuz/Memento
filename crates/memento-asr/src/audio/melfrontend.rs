@@ -163,46 +163,87 @@ fn mel_to_hz_slaney(mel: f64) -> f64 {
     F_MIN + F_SP * mel
 }
 
-/// C++: `radix2FftInPlace`
-fn radix2_fft_in_place(a: &mut [Complex32]) {
-    let n = a.len();
+/// Precomputed radix-2 FFT bit-reversal swaps and twiddle tables for a fixed
+/// `n_fft`. Twiddle factors are accumulated by the same repeated `f32` complex
+/// multiplication as the C++ reference so STFT outputs remain bit-identical.
+#[derive(Debug, Clone)]
+struct FftPlan {
+    n: usize,
+    bit_reversal_swaps: Vec<(usize, usize)>,
+    twiddles: Vec<Complex32>,
+}
 
-    // Bit-reversal permutation
-    let mut i = 1usize;
-    let mut j = 0usize;
-    while i < n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+impl FftPlan {
+    fn new(n_fft: i32) -> Self {
+        let n = n_fft.max(0) as usize;
+        let mut bit_reversal_swaps = Vec::new();
+        if n > 1 {
+            let mut i = 1usize;
+            let mut j = 0usize;
+            while i < n {
+                let mut bit = n >> 1;
+                while j & bit != 0 {
+                    j ^= bit;
+                    bit >>= 1;
+                }
+                j ^= bit;
+                if i < j {
+                    bit_reversal_swaps.push((i, j));
+                }
+                i += 1;
+            }
         }
-        j ^= bit;
-        if i < j {
-            a.swap(i, j);
-        }
-        i += 1;
-    }
 
-    // Iterative radix-2 butterfly passes; twiddle factors are accumulated by
-    // repeated f32 complex multiplication exactly like the C++ original.
-    let mut len = 2usize;
-    while len <= n {
-        let ang = -2.0 * PI / (len as f64);
-        let wlen = Complex32::new(ang.cos() as f32, ang.sin() as f32);
-        let mut i = 0usize;
-        while i < n {
-            let mut w = Complex32::new(1.0, 0.0);
+        let mut twiddles = Vec::with_capacity(n);
+        let mut len = 2usize;
+        while len <= n {
+            let ang = -2.0 * PI / (len as f64);
+            let wlen = Complex32::new(ang.cos() as f32, ang.sin() as f32);
             let half = len >> 1;
-            for j in 0..half {
-                let u = a[i + j];
-                let v = a[i + j + half].mul(w);
-                a[i + j] = u.add(v);
-                a[i + j + half] = u.sub(v);
+            let mut w = Complex32::new(1.0, 0.0);
+            for _ in 0..half {
+                twiddles.push(w);
                 w = w.mul(wlen);
             }
-            i += len;
+            len <<= 1;
         }
-        len <<= 1;
+
+        Self {
+            n,
+            bit_reversal_swaps,
+            twiddles,
+        }
+    }
+
+    #[inline]
+    fn fft_in_place(&self, a: &mut [Complex32]) {
+        let n = self.n;
+        if a.len() != n {
+            return;
+        }
+
+        for &(i, j) in &self.bit_reversal_swaps {
+            a.swap(i, j);
+        }
+
+        let mut twiddle_offset = 0usize;
+        let mut len = 2usize;
+        while len <= n {
+            let half = len >> 1;
+            let stage_twiddles = &self.twiddles[twiddle_offset..twiddle_offset + half];
+            twiddle_offset += half;
+            let mut i = 0usize;
+            while i < n {
+                for (j, &w) in stage_twiddles.iter().enumerate() {
+                    let u = a[i + j];
+                    let v = a[i + j + half].mul(w);
+                    a[i + j] = u.add(v);
+                    a[i + j + half] = u.sub(v);
+                }
+                i += len;
+            }
+            len <<= 1;
+        }
     }
 }
 
@@ -213,6 +254,7 @@ pub struct MelFrontend {
     padded_window: Vec<f32>,
     /// Row-major [nMels, numFreqBins] where numFreqBins = nFft / 2 + 1
     mel_filters: Vec<f32>,
+    fft_plan: FftPlan,
 }
 
 impl MelFrontend {
@@ -222,6 +264,7 @@ impl MelFrontend {
             config,
             padded_window: Vec::new(),
             mel_filters: Vec::new(),
+            fft_plan: FftPlan::new(config.n_fft),
         };
         this.init_window();
         this.init_mel_filterbank();
@@ -366,7 +409,7 @@ impl MelFrontend {
                     Complex32::new(padded[frame_start + i] * self.padded_window[i], 0.0);
             }
 
-            radix2_fft_in_place(&mut fft_buf);
+            self.fft_plan.fft_in_place(&mut fft_buf);
 
             for k in 0..num_bins as usize {
                 let re = fft_buf[k].re;
@@ -575,5 +618,29 @@ impl MelFrontend {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fft_plan_precomputes_twiddles_and_bit_reversal_for_power_of_two() {
+        let frontend = MelFrontend::new(MelFrontendConfig::default());
+        assert_eq!(frontend.fft_plan.n, 512);
+        // Sum of 1 + 2 + 4 + ... + 256 = 511 twiddles across all stages.
+        assert_eq!(frontend.fft_plan.twiddles.len(), 511);
+        assert!(!frontend.fft_plan.bit_reversal_swaps.is_empty());
+
+        let mut buf: Vec<Complex32> = (0..512)
+            .map(|i| Complex32::new((i as f32 * 0.05).sin(), 0.0))
+            .collect();
+        let original = buf.clone();
+        frontend.fft_plan.fft_in_place(&mut buf);
+        // DC bin equals sum of real inputs.
+        let dc_expected: f32 = original.iter().map(|c| c.re).sum();
+        assert!((buf[0].re - dc_expected).abs() < 1e-4);
+        assert!(buf[0].im.abs() < 1e-4);
     }
 }
