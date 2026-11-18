@@ -903,8 +903,10 @@ pub fn format_audio_url_and_filename(
 
     let mut formatted_url = url.to_vec();
     let replace_expression = key("{expression}");
+    let replace_term = key("{term}");
     let replace_reading = key("{reading}");
     replace_all(&mut formatted_url, &replace_expression, expression_val);
+    replace_all(&mut formatted_url, &replace_term, expression_val);
     replace_all(&mut formatted_url, &replace_reading, reading_val);
 
     let mut filename = key("memento_");
@@ -2057,6 +2059,11 @@ mod tests
         let (out_url3, out_fn3) = format_audio_url_and_filename(&url, &src, &expr, &empty_read, false);
         assert_eq!(out_url3, u("http://example.com/食べる/食べる.mp3"));
         assert_eq!(out_fn3, u("memento_Forvo_Audio__食べる.mp3"));
+
+        // {term} alias is supported alongside {expression}
+        let term_url = u("https://example.com/?term={term}&reading={reading}");
+        let (out_url4, _) = format_audio_url_and_filename(&term_url, &src, &expr, &read, false);
+        assert_eq!(out_url4, u("https://example.com/?term=食べる&reading=たべる"));
     }
 
     #[test]

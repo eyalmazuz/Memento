@@ -518,7 +518,7 @@ impl AnkiClient
             .map(|values| {
                 values
                     .iter()
-                    .map(|value| as_qint32(value) as i64)
+                    .map(as_qint64)
                     .collect()
             })
     }
@@ -723,6 +723,29 @@ fn as_qint32(value: &Value) -> i32
         && number <= i32::MAX as f64
     {
         number as i32
+    }
+    else
+    {
+        0
+    }
+}
+
+fn as_qint64(value: &Value) -> i64
+{
+    if let Some(integer) = value.as_i64()
+    {
+        return integer;
+    }
+    if let Some(integer) = value.as_u64()
+    {
+        return i64::try_from(integer).unwrap_or(0);
+    }
+    let Some(number) = value.as_f64() else { return 0 };
+    if number.is_finite()
+        && number.fract() == 0.0
+        && (-(1_i64 << 53) as f64..=(1_i64 << 53) as f64).contains(&number)
+    {
+        number as i64
     }
     else
     {

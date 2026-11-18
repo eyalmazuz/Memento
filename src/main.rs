@@ -3658,6 +3658,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let note_subtitles = sub_ctrl.clone();
     let note_mpv = mpv.clone();
     let note_database_path = dictionary_database_path.clone();
+    let note_resources_path = dictionary_resources_path.clone();
+    let note_config_dir = config_dir.clone();
     let note_lookup_epoch = lookup_epoch.clone();
     app.on_add_anki_note(move |index| {
         let Some(app) = note_app.upgrade() else { return };
@@ -3683,37 +3685,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hit.expression.to_string(), hit.reading.to_string(),
             app.get_active_sub_text().to_string(),
         );
+        context.is_kanji = hit.is_kanji;
+        // Never assign the scanned subtitle token into `context.selection` (#262);
+        // use it purely to locate `cloze_prefix` / `cloze_body` / `cloze_suffix`.
         let start = app.get_selected_token_index();
-        if start >= 0 {
+        let (scanned_surface, token_offset_in_sentence) = if start >= 0 {
             let words = app.get_active_sub_words();
+            let start_idx = start as usize;
             let count = app.get_selected_token_count().max(1) as usize;
-            let selection: String = ((start as usize)..(start as usize).saturating_add(count))
+            let byte_offset: usize = (0..start_idx)
+                .filter_map(|i| words.row_data(i))
+                .map(|word| word.text.len())
+                .sum();
+            let surface: String = (start_idx..start_idx.saturating_add(count))
                 .filter_map(|i| words.row_data(i))
                 .map(|word| word.text.to_string())
                 .collect();
-            if !selection.is_empty() {
-                context.selection = selection;
-            }
-        }
-        if context.sentence.contains(&context.selection) {
-            let (prefix, body, suffix) = controller::anki::split_cloze(&context.sentence, &context.selection);
-            context.cloze_prefix = prefix.to_owned();
-            context.cloze_body = body.to_owned();
-            context.cloze_suffix = suffix.to_owned();
-        }
-        let selected_cues = note_subtitles.borrow().selected_cues()
-            .iter().map(|cue| String::from_utf16_lossy(&cue.text)).collect::<Vec<_>>();
-        if !selected_cues.is_empty() {
-            context.context = selected_cues.join("\n");
-        }
+            (surface, Some(byte_offset))
+        } else {
+            (String::new(), None)
+        };
+        let (active_start, active_end, context_start, context_end, selected_cues, active_pos_in_selected) = {
+            let subtitles = note_subtitles.borrow();
+            let selected_indices = subtitles.selected_indices();
+            let active_indices = subtitles.active_indices(subtitles.primary_sid());
+            let active_pos = selected_indices.iter().position(|idx| active_indices.contains(idx));
+            let cues = subtitles.selected_cues()
+                .iter().map(|cue| String::from_utf16_lossy(&cue.text)).collect::<Vec<_>>();
+            let active = subtitles.active_cue();
+            let start = active.map(|cue| cue.start).unwrap_or(0.0);
+            let end = active.map(|cue| cue.end).unwrap_or(0.0);
+            let (ctx_start, ctx_end) = subtitles.selected_time_range().unwrap_or((start, end));
+            (start, end, ctx_start, ctx_end, cues, active_pos)
+        };
+        controller::anki::apply_subtitle_cloze(
+            &mut context,
+            &selected_cues,
+            active_pos_in_selected,
+            &scanned_surface,
+            token_offset_in_sentence,
+        );
         context.secondary_subtitle = app.get_secondary_sub_text().to_string();
         context.title = app.get_media_title().to_string();
         context.dictionary_name = hit.dict_name.to_string();
-        let selected: Vec<_> = (0..definitions.row_count())
-            .filter_map(|row| definitions.row_data(row))
-            .filter(|row| row.selected && row.expression == hit.expression && row.reading == hit.reading
-                && row.is_kanji == hit.is_kanji)
-            .collect();
+        let mut occ_by_dict: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut selected = Vec::new();
+        let mut selected_occurrences = Vec::new();
+        for row in (0..definitions.row_count()).filter_map(|r| definitions.row_data(r)) {
+            if row.expression == hit.expression && row.reading == hit.reading
+                && row.is_kanji == hit.is_kanji
+            {
+                let dict_name = row.dict_name.to_string();
+                let occ = *occ_by_dict.entry(dict_name.clone()).and_modify(|c| *c += 1).or_insert(0);
+                if row.selected {
+                    selected_occurrences.push((dict_name, occ));
+                    selected.push(row);
+                }
+            }
+        }
         if selected.is_empty() {
             app.set_status_message("Select at least one dictionary entry for this term".into());
             return;
@@ -3727,6 +3756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             notes: row.notes.to_string(),
             example_ja: row.example_ja.to_string(),
             example_en: row.example_en.to_string(),
+            ..Default::default()
         }).collect();
         context.glossary_items = selected.iter().map(|row| row.glossary.to_string()).collect();
         context.tags = selected.iter().flat_map(|row| row.pos_tags.split(|character: char| {
@@ -3747,14 +3777,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .then(|| value.trim().to_owned())
             }).next().unwrap_or_default();
         }
-        let (active_start, active_end, context_start, context_end) = {
-            let subtitles = note_subtitles.borrow();
-            let active = subtitles.active_cue();
-            let start = active.map(|cue| cue.start).unwrap_or(0.0);
-            let end = active.map(|cue| cue.end).unwrap_or(0.0);
-            let (context_start, context_end) = subtitles.selected_time_range().unwrap_or((start, end));
-            (start, end, context_start, context_end)
-        };
         let (wants_screenshot, wants_video_screenshot) =
             controller::anki_media::requested_screenshots(&profile);
         let mut screenshot_request = None;
@@ -3800,38 +3822,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             }
         };
+        context.secondary_context = controller::anki::secondary_context_for_range(
+            note_subtitles.borrow().secondary_entries(),
+            media_input.context_start,
+            media_input.context_end,
+            &context.secondary_subtitle,
+        );
         let unavailable = controller::anki::unavailable_profile_markers(&profile);
         app.set_status_message("Adding note to Anki…".into());
         let response_app = note_app.clone();
         let response_epoch = note_lookup_epoch.clone();
         let request_epoch = response_epoch.load(Ordering::Acquire);
         let metadata_path = note_database_path.clone();
+        let res_dir = note_resources_path.clone();
+        let cfg_dir = note_config_dir.clone();
         std::thread::spawn(move || {
-            // Receive captures before any dictionary/audio/network work. The
-            // commands were queued at the click and the UI keeps rendering.
-            let captures = (|| -> Result<(), String> {
-                media_input.screenshot = screenshot_request
-                    .map(|request| request.and_then(|request| request.wait())).transpose()
-                    .map_err(|error| format!("Could not capture {{screenshot}} for Anki: {error}"))?;
-                media_input.screenshot_video = video_screenshot_request
-                    .map(|request| request.and_then(|request| request.wait())).transpose()
-                    .map_err(|error| format!("Could not capture {{screenshot-video}} for Anki: {error}"))?;
-                Ok(())
-            })();
+            media_input.screenshot = screenshot_request
+                .and_then(|request| request.ok())
+                .and_then(|request| request.wait().ok());
+            media_input.screenshot_video = video_screenshot_request
+                .and_then(|request| request.ok())
+                .and_then(|request| request.wait().ok());
             let controller = AnkiController::new(profile.endpoint());
-            if let Ok(dictionary) = DictController::open(&metadata_path) {
-                for definition in &mut context.glossary_definitions {
-                    definition.dictionary_id = dictionary.dictionary_id_for_name(&definition.dictionary_name).unwrap_or(0);
-                }
-                let meta = dictionary.get_anki_term_metadata(&context.expression, &context.reading, &context.tags);
-                context.pitch = meta.pitch;
-                context.pitch_positions = meta.pitch_positions;
-                context.pitch_categories = meta.pitch_categories;
-                context.frequencies = meta.frequencies;
-                context.frequency_harmonic_rank = meta.frequency_harmonic_rank;
-                context.frequency_average_rank = meta.frequency_average_rank;
-            }
-            let result = captures.and_then(|()| controller::anki_media::prepare_note_media(&profile, &mut context, media_input))
+            let resource_roots = vec![cfg_dir.join("dict_resources"), res_dir];
+            let _ = controller::anki::populate_note_context_from_sqlite(
+                &mut context,
+                &metadata_path,
+                &resource_roots,
+                &selected_occurrences,
+            );
+            let result = controller::anki_media::prepare_note_media(&profile, &mut context, media_input)
                 .and_then(|()| controller.add_note_from_profile(&profile, &context));
             let expire_app = response_app.clone();
             let _ = response_app.upgrade_in_event_loop(move |app| {
