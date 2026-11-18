@@ -1287,13 +1287,6 @@ pub enum MpvPropertyValue {
     Int64(i64),
     Double(f64),
     String(String),
-    /// Subtitle text paired with the `(start, end)` cue times snapshotted at
-    /// the exact instant the event was decoded in `drain_events`.
-    SubText {
-        text: String,
-        start: f64,
-        end: f64,
-    },
     Chapters(Vec<f64>),
     Tracks {
         audio: Vec<AudioTrack>,
@@ -1306,10 +1299,10 @@ pub enum MpvPropertyValue {
 }
 
 impl MpvPropertyValue {
-    /// Borrow the string payload for `String` or `SubText` property values.
+    /// Borrow the string payload when this property value is [`Self::String`].
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Self::String(s) | Self::SubText { text: s, .. } => Some(s.as_str()),
+            Self::String(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -1345,8 +1338,76 @@ pub enum MpvEvent {
 }
 
 impl MpvEvent {
+    /// Convert an ordered batch of [`MpvEvent`]s into [`EngineEvent`]s while
+    /// tracking rolling `(sub_start, sub_end)` and `(secondary_sub_start, secondary_sub_end)`
+    /// across each transition so `PropertyChange::SubText` / `SecondarySubText`
+    /// never reads end-of-batch overwritten cue times from `PlaybackState`.
+    pub fn to_engine_events(events: &[Self], initial: &PlaybackState) -> Vec<EngineEvent> {
+        let mut sub_start = initial.sub_start;
+        let mut sub_end = initial.sub_end;
+        let mut sec_start = initial.secondary_sub_start;
+        let mut sec_end = initial.secondary_sub_end;
+        let mut out = Vec::with_capacity(events.len());
+
+        for event in events {
+            match event {
+                Self::StartFile { .. } | Self::EndFile { .. } => {
+                    sub_start = 0.0;
+                    sub_end = 0.0;
+                    sec_start = 0.0;
+                    sec_end = 0.0;
+                }
+                Self::PropertyChange { name, value } => match (name.as_str(), value) {
+                    ("sub-start", MpvPropertyValue::Double(v)) => sub_start = *v,
+                    ("sub-start", MpvPropertyValue::Int64(v)) => sub_start = *v as f64,
+                    ("sub-start", MpvPropertyValue::None) => sub_start = 0.0,
+                    ("sub-end", MpvPropertyValue::Double(v)) => sub_end = *v,
+                    ("sub-end", MpvPropertyValue::Int64(v)) => sub_end = *v as f64,
+                    ("sub-end", MpvPropertyValue::None) => sub_end = 0.0,
+                    ("secondary-sub-start", MpvPropertyValue::Double(v)) => sec_start = *v,
+                    ("secondary-sub-start", MpvPropertyValue::Int64(v)) => sec_start = *v as f64,
+                    ("secondary-sub-start", MpvPropertyValue::None) => sec_start = 0.0,
+                    ("secondary-sub-end", MpvPropertyValue::Double(v)) => sec_end = *v,
+                    ("secondary-sub-end", MpvPropertyValue::Int64(v)) => sec_end = *v as f64,
+                    ("secondary-sub-end", MpvPropertyValue::None) => sec_end = 0.0,
+                    ("sid", MpvPropertyValue::Flag(false)) => {
+                        sub_start = 0.0;
+                        sub_end = 0.0;
+                    }
+                    ("secondary-sid", MpvPropertyValue::Flag(false)) => {
+                        sec_start = 0.0;
+                        sec_end = 0.0;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            if let Some(engine_ev) =
+                event.to_engine_event_with_times(sub_start, sub_end, sec_start, sec_end)
+            {
+                out.push(engine_ev);
+            }
+        }
+        out
+    }
+
     /// Convert to [`crate::events::EngineEvent`] for driving `machine::PlayerCore`.
     pub fn to_engine_event(&self, playback: &PlaybackState) -> Option<EngineEvent> {
+        self.to_engine_event_with_times(
+            playback.sub_start,
+            playback.sub_end,
+            playback.secondary_sub_start,
+            playback.secondary_sub_end,
+        )
+    }
+
+    fn to_engine_event_with_times(
+        &self,
+        sub_start: f64,
+        sub_end: f64,
+        secondary_sub_start: f64,
+        secondary_sub_end: f64,
+    ) -> Option<EngineEvent> {
         match self {
             Self::StartFile { .. } => Some(EngineEvent::StartFile),
             Self::FileLoaded {
@@ -1465,33 +1526,19 @@ impl MpvEvent {
                     ("secondary-sub-delay", MpvPropertyValue::None) => {
                         PropertyChange::Unavailable(PropertyName::SecondarySubDelay)
                     }
-                    ("sub-text", MpvPropertyValue::SubText { text, start, end }) => {
-                        PropertyChange::SubText {
-                            text: text.clone(),
-                            start: Some(*start),
-                            end: Some(*end),
-                        }
-                    }
                     ("sub-text", MpvPropertyValue::String(text)) => PropertyChange::SubText {
                         text: text.clone(),
-                        start: Some(playback.sub_start),
-                        end: Some(playback.sub_end),
+                        start: Some(sub_start),
+                        end: Some(sub_end),
                     },
                     ("sub-text", MpvPropertyValue::None) => {
                         PropertyChange::Unavailable(PropertyName::SubText)
                     }
-                    ("secondary-sub-text", MpvPropertyValue::SubText { text, start, end }) => {
-                        PropertyChange::SecondarySubText {
-                            text: text.clone(),
-                            start: Some(*start),
-                            end: Some(*end),
-                        }
-                    }
                     ("secondary-sub-text", MpvPropertyValue::String(text)) => {
                         PropertyChange::SecondarySubText {
                             text: text.clone(),
-                            start: Some(playback.secondary_sub_start),
-                            end: Some(playback.secondary_sub_end),
+                            start: Some(secondary_sub_start),
+                            end: Some(secondary_sub_end),
                         }
                     }
                     ("secondary-sub-text", MpvPropertyValue::None) => {
@@ -2593,24 +2640,6 @@ impl MpvInstance {
                             MpvPropertyValue::None
                         }
                     }
-                    "sub-text" => match property.format {
-                        ffi::MPV_FORMAT_NONE => MpvPropertyValue::None,
-                        ffi::MPV_FORMAT_STRING if !data.is_null() => MpvPropertyValue::SubText {
-                            text: copy_mpv_string(unsafe { *data.cast::<*const c_char>() }),
-                            start: state.sub_start,
-                            end: state.sub_end,
-                        },
-                        _ => MpvPropertyValue::Other,
-                    },
-                    "secondary-sub-text" => match property.format {
-                        ffi::MPV_FORMAT_NONE => MpvPropertyValue::None,
-                        ffi::MPV_FORMAT_STRING if !data.is_null() => MpvPropertyValue::SubText {
-                            text: copy_mpv_string(unsafe { *data.cast::<*const c_char>() }),
-                            start: state.secondary_sub_start,
-                            end: state.secondary_sub_end,
-                        },
-                        _ => MpvPropertyValue::Other,
-                    },
                     "cursor-autohide" => {
                         let int64_val =
                             if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
@@ -2700,6 +2729,23 @@ impl MpvInstance {
             }
         }
         events
+    }
+
+    /// Drain all queued libmpv events and convert them into [`EngineEvent`]s
+    /// using rolling per-event subtitle cue times (`MpvEvent::to_engine_events`).
+    pub fn drain_engine_events(&self) -> Vec<EngineEvent> {
+        let initial = {
+            let s = self.playback.borrow();
+            PlaybackState {
+                sub_start: s.sub_start,
+                sub_end: s.sub_end,
+                secondary_sub_start: s.secondary_sub_start,
+                secondary_sub_end: s.secondary_sub_end,
+                ..Default::default()
+            }
+        };
+        let events = self.drain_events();
+        MpvEvent::to_engine_events(&events, &initial)
     }
 
     /// Drain asynchronous events into [`PlaybackState`] without waiting for mpv's core,
@@ -5504,17 +5550,9 @@ mod tests {
         }
         assert!(saw_cue2, "did not observe Cue Two: {sub_events:?}");
 
-        // Overwrite playback state to prove `to_engine_event` uses per-event snapshotted times!
-        let dummy_overwritten = PlaybackState {
-            sub_start: 99.0,
-            sub_end: 199.0,
-            ..Default::default()
-        };
-
-        let mut autopause = AutoPauseState::default();
-        let mut triggered_seeks = Vec::new();
         let mut cur_start = 0.0f64;
         let mut cur_end = 0.0f64;
+        let mut saw_cue1_string = false;
 
         for ev in &sub_events {
             if let MpvEvent::PropertyChange { name, value } = ev {
@@ -5532,13 +5570,17 @@ mod tests {
                         };
                     }
                     "sub-text" => {
-                        let text = value.as_str().unwrap_or("");
+                        // Must decode as `MpvPropertyValue::String` for downstream player consumers.
+                        let MpvPropertyValue::String(text) = value else {
+                            panic!("expected MpvPropertyValue::String on sub-text, got {value:?}");
+                        };
                         if text == "Cue One" {
+                            saw_cue1_string = true;
                             assert!(
                                 (cur_start - 0.4).abs() < 0.05 && (cur_end - 1.0).abs() < 0.05,
                                 "sub-start/sub-end must arrive BEFORE Cue One sub-text: got ({cur_start}, {cur_end})"
                             );
-                        } else if text.is_empty() && autopause.end_time > 0.0 {
+                        } else if text.is_empty() && cur_end == 0.0 {
                             assert!(
                                 cur_start == 0.0 && cur_end == 0.0,
                                 "sub-start/sub-end must clear to 0.0 BEFORE empty sub-text: got ({cur_start}, {cur_end})"
@@ -5549,22 +5591,35 @@ mod tests {
                                 "sub-start/sub-end must arrive BEFORE Cue Two sub-text: got ({cur_start}, {cur_end})"
                             );
                         }
-
-                        if let Some(EngineEvent::Property(PropertyChange::SubText {
-                            start: Some(snap_s),
-                            end: Some(snap_e),
-                            ..
-                        })) = ev.to_engine_event(&dummy_overwritten)
-                        {
-                            assert_eq!((snap_s, snap_e), (cur_start, cur_end));
-                            if let Some(seek_target) =
-                                autopause.step(true, snap_s, snap_e, 1.0, 0.0, false, 4.0)
-                            {
-                                triggered_seeks.push(seek_target);
-                            }
-                        }
                     }
                     _ => {}
+                }
+            }
+        }
+        assert!(saw_cue1_string);
+
+        // Convert the entire multi-cue batch at once via `MpvEvent::to_engine_events` (even when
+        // `player.playback_state()` now holds Cue Two's end-of-batch `[1.6, 2.2]`!) and verify
+        // rolling `(start, end)` drives `AutoPauseState::step` accurately across Cue 1 -> gap -> Cue 2.
+        let engine_events = MpvEvent::to_engine_events(&sub_events, &PlaybackState::default());
+        let mut autopause = AutoPauseState::default();
+        let mut triggered_seeks = Vec::new();
+        for eng_ev in &engine_events {
+            if let EngineEvent::Property(PropertyChange::SubText {
+                text,
+                start: Some(snap_s),
+                end: Some(snap_e),
+            }) = eng_ev
+            {
+                if text == "Cue One" {
+                    assert!((*snap_s - 0.4).abs() < 0.05 && (*snap_e - 1.0).abs() < 0.05);
+                } else if text == "Cue Two" {
+                    assert!((*snap_s - 1.6).abs() < 0.05 && (*snap_e - 2.2).abs() < 0.05);
+                }
+                if let Some(seek_target) =
+                    autopause.step(true, *snap_s, *snap_e, 1.0, 0.0, false, 4.0)
+                {
+                    triggered_seeks.push(seek_target);
                 }
             }
         }

@@ -216,13 +216,14 @@ impl AsrController {
                 }
                 drop(control);
                 *lock(&self.shared.latest_cues) = (next_gen, Vec::new());
+                self.shared.running.store(true, Ordering::Release);
                 self.shared.wake.notify_all();
                 self.session = Some((settings, media));
                 return Ok(SessionStart::New);
             }
         }
 
-        if self.is_active() {
+        if lock(&self.shared.control).active {
             self.cancel();
         }
         let model = resolve_model(&settings)?;
@@ -289,7 +290,7 @@ impl AsrController {
     }
 
     pub fn matches_settings(&self, settings: &AsrSettings) -> bool {
-        self.is_active()
+        lock(&self.shared.control).active
             && self
                 .session
                 .as_ref()
@@ -418,10 +419,14 @@ impl AsrController {
             self.shared.running.store(false, Ordering::Release);
             self.shared.wake.notify_all();
         } else {
+            let was_suspended = control.suspended;
             control.parked_no_audio = false;
             control.restart_position = Some(control.position);
             drop(control);
             *lock(&self.shared.latest_cues) = (next_gen, Vec::new());
+            if !was_suspended {
+                self.shared.running.store(true, Ordering::Release);
+            }
             self.shared.wake.notify_all();
         }
     }
@@ -435,10 +440,13 @@ impl AsrController {
         self.shared.running.load(Ordering::Acquire)
     }
 
-    /// True while a session is retained, including when another subtitle track
-    /// is selected or all media intervals have already been transcribed.
+    /// True while an active audio track session is retained, including when
+    /// another subtitle track is selected or all media intervals have already
+    /// been transcribed. Reports `false` while parked on `aid <= 0` even though
+    /// the background worker keeps the loaded model warm in RAM.
     pub fn is_active(&self) -> bool {
-        lock(&self.shared.control).active
+        let control = lock(&self.shared.control);
+        control.active && !control.parked_no_audio
     }
 
     /// Drain worker notifications on the UI thread.
@@ -2050,15 +2058,22 @@ mod tests {
         assert_eq!(controller.current_cues().len(), 1);
         assert_eq!(controller.current_cues()[0].text, "aid-2");
 
-        // Switching to audio_id <= 0 parks the worker while keeping the model warm
-        // and clears `latest_cues` synchronously.
+        // Switching to audio_id <= 0 parks the worker while keeping the model warm,
+        // reports `!is_active()` for disabled audio, and clears `latest_cues` synchronously.
         controller.notify_audio_track_changed(0);
-        assert!(controller.is_active(), "session/model must stay warm when aid <= 0");
+        assert!(!controller.is_active(), "is_active() must be false when aid <= 0");
+        assert!(
+            lock(&controller.shared.control).active,
+            "underlying worker/model must stay warm when aid <= 0"
+        );
         assert!(!controller.is_running());
         assert!(controller.current_cues().is_empty());
 
-        // Cycling back to audio_id = 1 resumes transcription immediately without model reload.
+        // Cycling back to audio_id = 1 restores `is_active()` & `is_running()` synchronously
+        // and resumes transcription immediately without model reload.
         controller.notify_audio_track_changed(1);
+        assert!(controller.is_active());
+        assert!(controller.is_running());
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut resumed_aid1 = false;
         while Instant::now() < deadline && !resumed_aid1 {
