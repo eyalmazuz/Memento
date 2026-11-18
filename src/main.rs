@@ -3995,6 +3995,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match result {
                     Ok(cues) => {
+                        if app.get_furigana_visible() {
+                            let lines: Vec<String> = cues
+                                .iter()
+                                .take(2048)
+                                .map(|cue| String::from_utf16_lossy(&cue.text))
+                                .collect();
+                            controller::subtitles::prewarm_subtitle_furigana(lines);
+                        }
                         subtitles.set_external_cues(track_id, &path_str, cues);
                     }
                     Err(error) => {
