@@ -417,9 +417,176 @@ fn simplify_surface_valid(
     align_segments(&segments, &reading_data, surface_len, reading_len)
 }
 
+/// Returns `true` if `c` is a kanji or ideographic iteration/closing mark:
+/// - `々` (`\u{3005}`), `〆` (`\u{3006}`), `〇` (`\u{3007}`)
+/// - CJK Unified Ideographs + Extension A (`\u{3400}..=\u{9FFF}`)
+/// - CJK Compatibility Ideographs (`\u{F900}..=\u{FAFF}`)
+/// - CJK Unified Ideographs Extensions B–I (`\u{20000}..=\u{323AF}`)
+pub fn is_kanji_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3005}'
+            | '\u{3006}'
+            | '\u{3007}'
+            | '\u{3400}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{323AF}'
+    )
+}
+
+/// Returns `true` if `text` contains any kanji, `々`/`〆`, or kanji-adjacent `ヶ`/`ヵ`.
+pub fn contains_kanji(text: &str) -> bool {
+    if text.chars().any(is_kanji_char) {
+        return true;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for (idx, &c) in chars.iter().enumerate() {
+        if matches!(c, '\u{30F5}' | '\u{30F6}')
+            && (chars.get(idx + 1).is_some_and(|&next| is_kanji_char(next))
+                || (idx > 0 && chars.get(idx - 1).is_some_and(|&prev| is_kanji_char(prev))))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Distribute a reading across `surface` so furigana attaches strictly over kanji
+/// stems while okurigana and kana affixes receive empty readings `""`.
+///
+/// Preserves the exact surface concatenation invariant:
+/// `distribute_furigana(surface, reading).iter().map(|(s, _)| s.as_str()).collect::<String>() == surface`.
+pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)> {
+    if surface.is_empty() {
+        return Vec::new();
+    }
+    if reading.is_empty() || reading == "*" || !contains_kanji(surface) {
+        return vec![(surface.to_string(), String::new())];
+    }
+
+    let surface_u16: Vec<u16> = surface.encode_utf16().collect();
+    let reading_raw_u16: Vec<u16> = reading.encode_utf16().collect();
+    let reading_u16 = crate::furiganaparser::katakana_to_hiragana(&reading_raw_u16);
+    let reading_hira = String::from_utf16_lossy(&reading_u16);
+
+    if normalize_text(surface) == normalize_text(&reading_hira) {
+        return vec![(surface.to_string(), String::new())];
+    }
+
+    let spans = simplify_surface(&surface_u16, &reading_u16);
+
+    // If `simplify_surface` fell back to a single full span despite leading/trailing
+    // kana affixes (e.g. due to an ambiguous internal anchor), peel off exact matching
+    // leading and trailing kana affixes so okurigana never receives furigana.
+    if spans.len() == 1
+        && spans[0].surface_start == 0
+        && spans[0].surface_end == surface_u16.len() as u64
+        && spans[0].reading_start == 0
+        && spans[0].reading_end == reading_u16.len() as u64
+    {
+        if let Some(peeled) = peel_kana_affixes(surface, &reading_hira) {
+            return peeled;
+        }
+    }
+
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let s_start = span.surface_start as usize;
+        let s_end = span.surface_end as usize;
+        let span_surf = surface_u16
+            .get(s_start..s_end)
+            .map(String::from_utf16_lossy)
+            .unwrap_or_default();
+        if span_surf.is_empty() {
+            continue;
+        }
+        let span_read = if span.reading_start < span.reading_end && contains_kanji(&span_surf) {
+            let r_start = span.reading_start as usize;
+            let r_end = span.reading_end as usize;
+            let r = reading_u16
+                .get(r_start..r_end)
+                .map(String::from_utf16_lossy)
+                .unwrap_or_default();
+            if normalize_text(&span_surf) == normalize_text(&r) {
+                String::new()
+            } else {
+                r
+            }
+        } else {
+            String::new()
+        };
+        out.push((span_surf, span_read));
+    }
+
+    out
+}
+
+fn peel_kana_affixes(surface: &str, reading_hira: &str) -> Option<Vec<(String, String)>> {
+    let surf_chars: Vec<char> = surface.chars().collect();
+    let read_chars: Vec<char> = reading_hira.chars().collect();
+
+    let mut prefix_len = 0;
+    while prefix_len < surf_chars.len()
+        && prefix_len < read_chars.len()
+        && !is_kanji_char(surf_chars[prefix_len])
+        && !matches!(surf_chars[prefix_len], '\u{30F5}' | '\u{30F6}')
+        && kata_to_hira(surf_chars[prefix_len]) == kata_to_hira(read_chars[prefix_len])
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < (surf_chars.len() - prefix_len)
+        && suffix_len < (read_chars.len() - prefix_len)
+        && !is_kanji_char(surf_chars[surf_chars.len() - 1 - suffix_len])
+        && !matches!(
+            surf_chars[surf_chars.len() - 1 - suffix_len],
+            '\u{30F5}' | '\u{30F6}'
+        )
+        && kata_to_hira(surf_chars[surf_chars.len() - 1 - suffix_len])
+            == kata_to_hira(read_chars[read_chars.len() - 1 - suffix_len])
+    {
+        suffix_len += 1;
+    }
+
+    if prefix_len == 0 && suffix_len == 0 {
+        return None;
+    }
+
+    let stem_surf: String = surf_chars[prefix_len..surf_chars.len() - suffix_len]
+        .iter()
+        .collect();
+    let stem_read: String = read_chars[prefix_len..read_chars.len() - suffix_len]
+        .iter()
+        .collect();
+    if stem_surf.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if prefix_len > 0 {
+        parts.push((surf_chars[..prefix_len].iter().collect(), String::new()));
+    }
+    parts.push((
+        stem_surf.clone(),
+        if contains_kanji(&stem_surf) {
+            stem_read
+        } else {
+            String::new()
+        },
+    ));
+    if suffix_len > 0 {
+        parts.push((
+            surf_chars[surf_chars.len() - suffix_len..].iter().collect(),
+            String::new(),
+        ));
+    }
+    Some(parts)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{simplify_surface, FuriganaSpan};
+    use super::{contains_kanji, distribute_furigana, is_kanji_char, simplify_surface, FuriganaSpan};
 
     fn span(surface_start: u64, surface_end: u64, reading_start: u64, reading_end: u64) -> FuriganaSpan {
         FuriganaSpan {
@@ -542,6 +709,58 @@ mod tests {
                 &[0x304b, 0x3093, 0xd800, 0xdc00, 0xd800, 0x3058]
             ),
             vec![span(0, 1, 0, 2), span(1, 4, 0, 0), span(4, 5, 5, 6)]
+        );
+    }
+
+    #[test]
+    fn kanji_detection_covers_iteration_marks_and_cjk_extensions() {
+        assert!(is_kanji_char('々'));
+        assert!(is_kanji_char('〆'));
+        assert!(is_kanji_char('𠮟')); // U+20B9F CJK Extension B
+        assert!(contains_kanji("人々"));
+        assert!(contains_kanji("時々"));
+        assert!(contains_kanji("様々"));
+        assert!(contains_kanji("𠮟る"));
+        assert!(contains_kanji("一ヶ月"));
+        assert!(contains_kanji("ヶ月"));
+        assert!(!contains_kanji("カタカナ"));
+        assert!(!contains_kanji("ひらがな"));
+    }
+
+    #[test]
+    fn distribute_furigana_aligns_stems_only() {
+        assert_eq!(
+            distribute_furigana("食べる", "タベル"),
+            vec![("食".into(), "た".into()), ("べる".into(), "".into())]
+        );
+        assert_eq!(
+            distribute_furigana("申し込み", "モウシコミ"),
+            vec![
+                ("申".into(), "もう".into()),
+                ("し".into(), "".into()),
+                ("込".into(), "こ".into()),
+                ("み".into(), "".into()),
+            ]
+        );
+        assert_eq!(
+            distribute_furigana("お兄さん", "オニイサン"),
+            vec![
+                ("お".into(), "".into()),
+                ("兄".into(), "にい".into()),
+                ("さん".into(), "".into()),
+            ]
+        );
+        assert_eq!(
+            distribute_furigana("行った", "イッタ"),
+            vec![("行".into(), "い".into()), ("った".into(), "".into())]
+        );
+        assert_eq!(
+            distribute_furigana("𠮟る", "シカル"),
+            vec![("𠮟".into(), "しか".into()), ("る".into(), "".into())]
+        );
+        assert_eq!(
+            distribute_furigana("人々", "ヒトビト"),
+            vec![("人々".into(), "ひとびと".into())]
         );
     }
 }

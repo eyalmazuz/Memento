@@ -119,13 +119,251 @@ fn utf8_to_utf16(bytes: &[u8]) -> Vec<u16> {
     String::from_utf8_lossy(bytes).encode_utf16().collect()
 }
 
-fn extract_reading(feature_bytes: &[u8]) -> Vec<u16> {
-    let feature_str = String::from_utf8_lossy(feature_bytes);
-    let mut parts = feature_str.split(',');
-    match parts.nth(7) {
-        Some(reading) => reading.encode_utf16().collect(),
-        None => Vec::new(),
+/// Split a MeCab CSV feature row respecting double-quoted fields (`"1,2"`) and
+/// escaped quotes (`""`).
+pub fn split_csv_row(row: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = row.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
     }
+    fields.push(current);
+    fields
+}
+
+/// Returns `true` if `s` is a non-empty kana string (hiragana, katakana, or prolonged sound mark).
+pub fn is_kana_field(s: &str) -> bool {
+    !s.is_empty()
+        && s != "*"
+        && s.chars().all(|c| {
+            matches!(
+                c,
+                '\u{3040}'..='\u{309F}'
+                    | '\u{30A0}'..='\u{30FF}'
+                    | '\u{FF65}'..='\u{FF9F}'
+            )
+        })
+}
+
+fn is_kata_vowel(c: char) -> bool {
+    matches!(
+        c,
+        'ア' | 'イ' | 'ウ' | 'エ' | 'オ' | 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ'
+            | 'あ' | 'い' | 'う' | 'え' | 'お' | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ'
+    )
+}
+
+fn infer_long_vowel_from_prev(prev: char) -> char {
+    match prev {
+        'ア' | 'カ' | 'サ' | 'タ' | 'ナ' | 'ハ' | 'マ' | 'ヤ' | 'ラ' | 'ワ' | 'ガ' | 'ザ'
+        | 'ダ' | 'バ' | 'パ' | 'ァ' | 'ャ' | 'あ' | 'か' | 'さ' | 'た' | 'な' | 'は' | 'ま'
+        | 'や' | 'ら' | 'わ' | 'が' | 'ざ' | 'だ' | 'ば' | 'ぱ' | 'ぁ' | 'ゃ' => 'ア',
+        'イ' | 'キ' | 'シ' | 'チ' | 'ニ' | 'ヒ' | 'ミ' | 'リ' | 'ギ' | 'ジ' | 'ヂ' | 'ビ'
+        | 'ピ' | 'ィ' | 'い' | 'き' | 'し' | 'ち' | 'に' | 'ひ' | 'み' | 'り' | 'ぎ' | 'じ'
+        | 'ぢ' | 'び' | 'ぴ' | 'ぃ' => 'イ',
+        'ウ' | 'ク' | 'ス' | 'ツ' | 'ヌ' | 'フ' | 'ム' | 'ユ' | 'ル' | 'グ' | 'ズ' | 'ヅ'
+        | 'ブ' | 'プ' | 'ゥ' | 'ュ' | 'ヴ' | 'う' | 'く' | 'す' | 'つ' | 'ぬ' | 'ふ' | 'む'
+        | 'ゆ' | 'る' | 'ぐ' | 'ず' | 'づ' | 'ぶ' | 'ぷ' | 'ぅ' | 'ゅ' | 'ゔ' => 'ウ',
+        'エ' | 'ケ' | 'セ' | 'テ' | 'ネ' | 'ヘ' | 'メ' | 'レ' | 'ゲ' | 'ゼ' | 'デ' | 'ベ'
+        | 'ペ' | 'ェ' | 'え' | 'け' | 'せ' | 'て' | 'ね' | 'へ' | 'め' | 'れ' | 'げ' | 'ぜ'
+        | 'で' | 'べ' | 'ぺ' | 'ぇ' => 'イ',
+        'オ' | 'コ' | 'ソ' | 'ト' | 'ノ' | 'ホ' | 'モ' | 'ヨ' | 'ロ' | 'ゴ' | 'ゾ' | 'ド'
+        | 'ボ' | 'ポ' | 'ォ' | 'ョ' | 'お' | 'こ' | 'そ' | 'と' | 'の' | 'ほ' | 'も' | 'よ'
+        | 'ろ' | 'ご' | 'ぞ' | 'ど' | 'ぼ' | 'ぽ' | 'ぉ' | 'ょ' => 'ウ',
+        _ => 'ー',
+    }
+}
+
+/// Reconciles a phonetic katakana reading (`pron`, which uses `ー` for long vowels)
+/// with the orthographic lemma reading (`l_form`, which uses `ウ`/`オ`/`イ`/`エ`).
+pub fn reconcile_phonetic_with_orthographic(
+    surface: &str,
+    pron: &str,
+    l_form: Option<&str>,
+) -> String {
+    let p_chars: Vec<char> = pron.chars().collect();
+    let l_chars: Vec<char> = l_form
+        .filter(|s| is_kana_field(s))
+        .map(|s| s.chars().collect())
+        .unwrap_or_default();
+    let surface_has_choon = surface.contains('ー');
+
+    let mut out = Vec::with_capacity(p_chars.len());
+    for (i, &pc) in p_chars.iter().enumerate() {
+        if pc == 'ー' && !surface_has_choon {
+            if let Some(&lc) = l_chars.get(i) {
+                if is_kata_vowel(lc) {
+                    out.push(lc);
+                    continue;
+                }
+            }
+            if i > 0 {
+                let prev = p_chars[i - 1];
+                if let Some(pos) = l_chars.iter().position(|&c| c == prev) {
+                    if let Some(&lc) = l_chars.get(pos + 1) {
+                        if is_kata_vowel(lc) {
+                            out.push(lc);
+                            continue;
+                        }
+                    }
+                }
+                out.push(infer_long_vowel_from_prev(prev));
+            } else {
+                out.push(pc);
+            }
+        } else if let Some(&lc) = l_chars.get(i) {
+            match (pc, lc) {
+                ('ズ', 'ヅ') => out.push('ヅ'),
+                ('ジ', 'ヂ') => out.push('ヂ'),
+                ('ワ', 'ハ') => out.push('ハ'),
+                ('オ', 'ヲ') => out.push('ヲ'),
+                ('エ', 'ヘ') => out.push('ヘ'),
+                _ => out.push(pc),
+            }
+        } else {
+            out.push(pc);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn derive_inflected_from_lemma(
+    surface: &str,
+    c_form: Option<&str>,
+    l_form: &str,
+    lemma: Option<&str>,
+) -> String {
+    if surface == "来" && lemma == Some("来る") {
+        if let Some(cf) = c_form {
+            if cf.starts_with("未然形") {
+                return "コ".to_string();
+            }
+            if cf.starts_with("連用形") || cf.starts_with("命令形") {
+                return "キ".to_string();
+            }
+        }
+    }
+    if let Some(lem) = lemma {
+        let lem_chars: Vec<char> = lem.chars().collect();
+        let surf_chars: Vec<char> = surface.chars().collect();
+        let lform_chars: Vec<char> = l_form.chars().collect();
+        // Count trailing non-kanji okurigana on lemma
+        let mut lem_oku = 0;
+        while lem_oku < lem_chars.len()
+            && !crate::furiganautils::is_kanji_char(lem_chars[lem_chars.len() - 1 - lem_oku])
+        {
+            lem_oku += 1;
+        }
+        let mut surf_oku = 0;
+        while surf_oku < surf_chars.len()
+            && !crate::furiganautils::is_kanji_char(surf_chars[surf_chars.len() - 1 - surf_oku])
+        {
+            surf_oku += 1;
+        }
+        if lem_oku > 0 && lform_chars.len() > lem_oku {
+            let mut base: String = lform_chars[..lform_chars.len() - lem_oku].iter().collect();
+            if surf_oku > 0 {
+                let oku_str: String = surf_chars[surf_chars.len() - surf_oku..].iter().collect();
+                base.push_str(&oku_str);
+            }
+            return base;
+        }
+    }
+    l_form.to_string()
+}
+
+/// Extract the best orthographic surface reading from a parsed MeCab CSV feature row,
+/// supporting IPADic (9 columns) as well as UniDic (10, 17, 26, and 29+ columns).
+pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> String {
+    if fields.len() <= 9 {
+        // IPADic (pos1..4, cType, cForm, baseForm, reading, pron):
+        // Column 7 is the surface reading (Column 6 is the dictionary base form!).
+        if let Some(r) = fields.get(7).map(String::as_str) {
+            if is_kana_field(r) {
+                return reconcile_phonetic_with_orthographic(surface, r, None);
+            }
+            if r == "*" {
+                return "*".to_string();
+            }
+        }
+        if let Some(p) = fields.get(8).map(String::as_str).filter(|s| is_kana_field(s)) {
+            return reconcile_phonetic_with_orthographic(surface, p, None);
+        }
+        return String::new();
+    }
+
+    // UniDic (>= 10 columns):
+    // 0..3: pos1..4, 4: cType, 5: cForm, 6: lForm, 7: lemma, 8: orth, 9: pron
+    let c_form = fields.get(5).map(String::as_str);
+    let l_form = fields.get(6).map(String::as_str).filter(|s| is_kana_field(s));
+    let lemma = fields.get(7).map(String::as_str);
+    let pron = fields.get(9).map(String::as_str).filter(|s| is_kana_field(s));
+
+    // In 29-col UniDic, column 20 is `kana` (inflected orthographic kana).
+    // In 26-col UniDic, column 17 is `kana` (inflected orthographic kana).
+    let orth_kana_indices: &[usize] = if fields.len() >= 28 {
+        &[20, 17, 18]
+    } else if fields.len() >= 18 {
+        &[17, 20, 18]
+    } else {
+        &[]
+    };
+
+    for &idx in orth_kana_indices {
+        if let Some(k) = fields.get(idx).map(String::as_str).filter(|s| is_kana_field(s)) {
+            // Only accept uninflected fallback columns (18, or 20 in 26-col) if `pron` is absent
+            // or has the same char count as `k`.
+            let is_primary_kana_col =
+                (fields.len() >= 28 && idx == 20) || (fields.len() < 28 && idx == 17);
+            if is_primary_kana_col
+                || pron.is_none_or(|p| p.chars().count() == k.chars().count())
+            {
+                return reconcile_phonetic_with_orthographic(surface, k, l_form);
+            }
+        }
+    }
+
+    // 10-col / 17-col UniDic: reconcile inflected `pron` (col 9) with orthographic `lForm` (col 6).
+    if let Some(p) = pron {
+        return reconcile_phonetic_with_orthographic(surface, p, l_form);
+    }
+
+    if let Some(lf) = l_form {
+        return derive_inflected_from_lemma(surface, c_form, lf, lemma);
+    }
+
+    if let Some(r) = fields.get(7).map(String::as_str).filter(|s| is_kana_field(s)) {
+        return reconcile_phonetic_with_orthographic(surface, r, None);
+    }
+
+    String::new()
+}
+
+fn extract_reading_for_node(surface_bytes: &[u8], feature_bytes: &[u8]) -> Vec<u16> {
+    let surface_str = String::from_utf8_lossy(surface_bytes);
+    let feature_str = String::from_utf8_lossy(feature_bytes);
+    let fields = split_csv_row(&feature_str);
+    let reading = extract_surface_reading_from_fields(&surface_str, &fields);
+    reading.encode_utf16().collect()
 }
 
 /// Full `FuriganaParser::parse` token-chain processing over a sequence of MeCab nodes.
@@ -141,7 +379,7 @@ pub fn parse_nodes(nodes: &[FuriganaNodeSlice<'_>]) -> Vec<ParsedToken> {
         }
 
         let surface_u16 = utf8_to_utf16(node.surface);
-        let reading_u16 = extract_reading(node.feature);
+        let reading_u16 = extract_reading_for_node(node.surface, node.feature);
 
         let surface_hiragana = katakana_to_hiragana(&surface_u16);
         let reading_hiragana = katakana_to_hiragana(&reading_u16);

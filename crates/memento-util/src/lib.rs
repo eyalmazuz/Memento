@@ -21,9 +21,13 @@
 //! Rust ports of Memento utility, furigana, and OCR algorithms.
 
 pub mod furiganautils;
-pub use furiganautils::{simplify_surface, FuriganaSpan};
+pub use furiganautils::{
+    contains_kanji, distribute_furigana, is_kanji_char, simplify_surface, FuriganaSpan,
+};
 
 pub mod furiganaparser;
+
+pub mod mecab;
 
 pub mod ocrutils;
 
