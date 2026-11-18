@@ -1,17 +1,23 @@
 //! Dictionary controller connecting memento-dict and memento-util.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::ptr;
+use std::sync::Mutex;
 
-use memento_dict::exactquerygenerator;
+use memento_dict::databasemanager;
 use memento_dict::deconjugationquerygenerator;
+use memento_dict::exactquerygenerator;
+use memento_dict::normalize::{self, Regex};
 use memento_dict::searchcontroller::{self, TagSortItem};
 use memento_dict::sqlite_db;
-use memento_util::furiganaparser;
 
+pub use memento_dict::databasemanager::{
+    build_dict_id_style_path, build_style_path, resolve_dictionary_style_path,
+};
+pub use memento_dict::normalize::{
+    apply_remove_regex, apply_replace_lines, preprocess_search_text,
+};
 pub use memento_dict::searchcontroller::ClozeSpans;
 pub use memento_dict::sqlite_db::{db_file_fingerprint, DbFileFingerprint, FileMetaStamp};
 
@@ -29,6 +35,13 @@ pub struct SearchHit {
     pub example_en: String,
     pub dict_name: String,
     pub rich_glossary: Vec<GlossaryBlock>,
+    pub derivation: String,
+    pub derivation_descriptions: Vec<(String, String)>,
+    pub dictionary_id: i64,
+    pub rules: String,
+    pub raw_glossary: String,
+    pub term_tags: String,
+    pub def_tags: String,
 }
 
 /// A display block retained from Yomitan's structured glossary data.
@@ -40,7 +53,7 @@ pub struct GlossaryBlock {
     pub href: String,
 }
 
-/// Values used by Anki note field markers for a selected term.
+/// Values used by Anki note field markers for a selected term or kanji.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AnkiTermMetadata {
     pub pitch: String,
@@ -49,13 +62,27 @@ pub struct AnkiTermMetadata {
     pub frequencies: String,
     pub frequency_harmonic_rank: String,
     pub frequency_average_rank: String,
+    pub frequency_harmonic_occurrence: String,
+    pub frequency_average_occurrence: String,
 }
 
+/// Compact pitch graph entry (fields kept strictly intact for UI callers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermPitchGraph {
     pub dictionary: String,
     pub mora: Vec<String>,
     pub position: i32,
+}
+
+/// Full pitch accent entry including nasalized/devoiced mora indices and tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermPitchDetail {
+    pub dictionary: String,
+    pub mora: Vec<String>,
+    pub position: i32,
+    pub nasal: Vec<usize>,
+    pub devoice: Vec<usize>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,9 +112,17 @@ impl SearchHit {
             example_en: String::new(),
             dict_name: String::new(),
             rich_glossary: Vec::new(),
+            derivation: String::new(),
+            derivation_descriptions: Vec::new(),
+            dictionary_id: 0,
+            rules: String::new(),
+            raw_glossary: String::new(),
+            term_tags: String::new(),
+            def_tags: String::new(),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_details(
         expression: impl Into<String>,
         reading: impl Into<String>,
@@ -112,6 +147,13 @@ impl SearchHit {
             example_en: example_en.into(),
             dict_name: dict_name.into(),
             rich_glossary: Vec::new(),
+            derivation: String::new(),
+            derivation_descriptions: Vec::new(),
+            dictionary_id: 0,
+            rules: String::new(),
+            raw_glossary: String::new(),
+            term_tags: String::new(),
+            def_tags: String::new(),
         }
     }
 }
@@ -237,65 +279,16 @@ impl ClozeSentence {
     }
 }
 
-/// Reading normalization using `memento_util::furiganaparser::katakana_to_hiragana`.
+/// Reading normalization using full Unicode NFKC + katakana-to-hiragana folding.
 pub fn normalize_reading(text: &str) -> String {
-    let u16_text: Vec<u16> = text.encode_utf16().collect();
-    let normalized = furiganaparser::katakana_to_hiragana(&u16_text);
-    String::from_utf16_lossy(&normalized)
+    normalize::normalize_reading_str(text)
 }
 
-/// Produces the NFKC form used by `DatabaseManager::queryTerms`.
-///
-/// The shared furigana normalizer also shifts katakana to hiragana. Restore
-/// katakana only for katakana runs so mixed-script queries retain their form.
-fn normalize_nfkc_query(text: &str) -> String {
-    fn is_combining_mark(character: char) -> bool {
-        matches!(
-            character,
-            '\u{0300}'..='\u{036f}' | '\u{3099}'..='\u{309c}' | '\u{ff9e}'..='\u{ff9f}'
-        )
-    }
-
-    fn kana_script(character: char) -> Option<bool> {
-        match character {
-            '\u{3040}'..='\u{309f}' => Some(false),
-            '\u{30a0}'..='\u{30ff}' | '\u{ff61}'..='\u{ff9f}' => Some(true),
-            _ => None,
-        }
-    }
-
-    let mut characters = text.chars().peekable();
-    let mut chunk = Vec::with_capacity(text.len());
-    let mut normalized = Vec::with_capacity(text.len());
-    while let Some(first) = characters.next() {
-        let script = kana_script(first);
-        chunk.clear();
-        let mut units = [0; 2];
-        chunk.extend_from_slice(first.encode_utf16(&mut units));
-        while let Some(&next) = characters.peek() {
-            if is_combining_mark(next) || kana_script(next) == script {
-                let mut units = [0; 2];
-                chunk.extend_from_slice(next.encode_utf16(&mut units));
-                characters.next();
-            } else {
-                break;
-            }
-        }
-
-        let katakana_run = script != Some(false);
-        let nfkc_chunk = furiganaparser::katakana_to_hiragana(&chunk);
-        normalized.extend(nfkc_chunk.into_iter().map(|unit| {
-            if katakana_run && (0x3041..=0x3096).contains(&unit) {
-                unit + 0x60
-            } else {
-                unit
-            }
-        }));
-    }
-    String::from_utf16_lossy(&normalized)
+/// Produces the full Unicode NFKC form of `text` (converting halfwidth katakana,
+/// fullwidth ASCII/alphanumeric/punctuation, and combining voiced marks).
+pub fn normalize_nfkc_query(text: &str) -> String {
+    normalize::normalize_nfkc(text)
 }
-
-
 
 /// Generates prefix queries from text using `memento_dict::exactquerygenerator::generate_queries`.
 pub fn generate_prefix_queries(text: &str) -> Vec<String> {
@@ -484,17 +477,23 @@ struct DictionaryMetadataCache {
     fingerprint: sqlite_db::DbFileFingerprint,
     tags: HashMap<(i64, String), DictTag>,
     names: HashMap<i64, String>,
+    disabled: HashSet<i64>,
+    recent_term_meta: HashMap<String, Vec<sqlite_db::RawTermMetaRow>>,
 }
 
 struct ReadOnlyDictionaryDb {
     path: PathBuf,
-    handle: *mut sqlite_db::sqlite3,
-    cache: std::sync::Mutex<DictionaryMetadataCache>,
+    conn: Mutex<sqlite_db::rusqlite::Connection>,
+    cache: Mutex<DictionaryMetadataCache>,
 }
 
 impl ReadOnlyDictionaryDb {
     fn refresh_metadata_if_needed(&self) -> Result<(), sqlite_db::DictError> {
-        let current_version = query_data_version(self.handle).ok();
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_version = sqlite_db::query_data_version_conn(&conn).ok();
         let current_fingerprint = sqlite_db::db_file_fingerprint(&self.path);
         let mut cache = self
             .cache
@@ -503,8 +502,11 @@ impl ReadOnlyDictionaryDb {
         if cache.data_version == current_version && cache.fingerprint == current_fingerprint {
             return Ok(());
         }
-        cache.tags = load_dictionary_tags(self.handle)?;
-        cache.names = load_dictionary_names(self.handle)?;
+        cache.tags = load_dictionary_tags_conn(&conn)?;
+        let (names, disabled) = load_dictionary_names_and_disabled_conn(&conn)?;
+        cache.names = names;
+        cache.disabled = disabled;
+        cache.recent_term_meta.clear();
         cache.data_version = current_version;
         cache.fingerprint = current_fingerprint;
         Ok(())
@@ -518,13 +520,82 @@ impl ReadOnlyDictionaryDb {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&cache)
     }
-}
 
-impl Drop for ReadOnlyDictionaryDb {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { sqlite_db::sqlite3_close_v2(self.handle) };
+    fn preload_term_meta(&self, expressions: &[String]) {
+        if expressions.is_empty() {
+            return;
         }
+        if self.refresh_metadata_if_needed().is_err() {
+            return;
+        }
+        let missing: Vec<String> = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            expressions
+                .iter()
+                .filter(|expr| !cache.recent_term_meta.contains_key(expr.as_str()))
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+        let fetched = {
+            let conn = self
+                .conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sqlite_db::query_term_meta_batch_conn(&conn, &missing)
+        };
+        let Ok(rows) = fetched else {
+            return;
+        };
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bound cache size so long sessions never accumulate unbounded RAM.
+        if cache.recent_term_meta.len() > 2048 {
+            cache.recent_term_meta.clear();
+        }
+        for expr in &missing {
+            cache.recent_term_meta.entry(expr.clone()).or_default();
+        }
+        for row in rows {
+            cache
+                .recent_term_meta
+                .entry(row.expression.clone())
+                .or_default()
+                .push(row);
+        }
+    }
+
+    fn term_meta_rows_for(&self, expression: &str) -> Vec<sqlite_db::RawTermMetaRow> {
+        if expression.is_empty() || self.refresh_metadata_if_needed().is_err() {
+            return Vec::new();
+        }
+        {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = cache.recent_term_meta.get(expression) {
+                return cached.clone();
+            }
+        }
+        let expr_owned = expression.to_owned();
+        self.preload_term_meta(std::slice::from_ref(&expr_owned));
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .recent_term_meta
+            .get(expression)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -536,6 +607,10 @@ pub struct DictController {
     last_search_error: Option<String>,
     last_match_units: usize,
     dictionary_order: HashMap<i64, i64>,
+    remove_regex_pattern: String,
+    remove_regex: Option<Regex>,
+    replace_lines: bool,
+    replace_lines_with: String,
 }
 
 impl Default for DictController {
@@ -543,7 +618,6 @@ impl Default for DictController {
         Self::new()
     }
 }
-
 
 impl DictController {
     pub fn new() -> Self {
@@ -554,6 +628,10 @@ impl DictController {
             last_search_error: None,
             last_match_units: 0,
             dictionary_order: HashMap::new(),
+            remove_regex_pattern: String::new(),
+            remove_regex: None,
+            replace_lines: false,
+            replace_lines_with: String::new(),
         }
     }
 
@@ -564,63 +642,31 @@ impl DictController {
         if !path.is_file() {
             return Err(DictControllerError::MissingDatabase(path.to_path_buf()));
         }
-        let path_text = path.to_string_lossy();
-        let c_path = CString::new(path_text.as_bytes())
-            .map_err(|error| DictControllerError::InvalidPath(error.to_string()))?;
-        let mut handle = ptr::null_mut();
-        const SQLITE_OPEN_READONLY: i32 = 0x0000_0001;
-        const SQLITE_OPEN_FULLMUTEX: i32 = 0x0001_0000;
-        let status = unsafe {
-            sqlite_db::sqlite3_open_v2(
-                c_path.as_ptr(),
-                &mut handle,
-                SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
-                ptr::null(),
-            )
-        };
-        if status != sqlite_db::SQLITE_OK {
-            let message = if handle.is_null() {
-                "could not open database".to_string()
-            } else {
-                unsafe { std::ffi::CStr::from_ptr(sqlite_db::sqlite3_errmsg(handle)) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            if !handle.is_null() {
-                unsafe { sqlite_db::sqlite3_close_v2(handle) };
-            }
-            return Err(DictControllerError::Sqlite(sqlite_db::DictError::Sqlite {
-                code: status,
-                message,
-            }));
+        if path.to_str().is_some_and(|s| s.contains('\0')) {
+            return Err(DictControllerError::InvalidPath(
+                "database path contains interior NUL byte".to_owned(),
+            ));
         }
 
-        if let Err(error) = validate_dictionary_schema(handle) {
-            unsafe { sqlite_db::sqlite3_close_v2(handle) };
-            return Err(DictControllerError::Sqlite(error));
-        }
-        let tags = match load_dictionary_tags(handle) {
-            Ok(tags) => tags,
-            Err(error) => {
-                unsafe { sqlite_db::sqlite3_close_v2(handle) };
-                return Err(DictControllerError::Sqlite(error));
-            }
-        };
-        let names = match load_dictionary_names(handle) {
-            Ok(names) => names,
-            Err(error) => {
-                unsafe { sqlite_db::sqlite3_close_v2(handle) };
-                return Err(DictControllerError::Sqlite(error));
-            }
-        };
+        let conn =
+            sqlite_db::open_read_only_connection(path).map_err(DictControllerError::Sqlite)?;
+        sqlite_db::validate_schema_conn(&conn).map_err(DictControllerError::Sqlite)?;
+        let tags = load_dictionary_tags_conn(&conn).map_err(DictControllerError::Sqlite)?;
+        let (names, disabled) =
+            load_dictionary_names_and_disabled_conn(&conn).map_err(DictControllerError::Sqlite)?;
+        let data_version = sqlite_db::query_data_version_conn(&conn).ok();
+        let fingerprint = sqlite_db::db_file_fingerprint(path);
+
         let database = ReadOnlyDictionaryDb {
             path: path.to_path_buf(),
-            handle,
-            cache: std::sync::Mutex::new(DictionaryMetadataCache {
-                data_version: query_data_version(handle).ok(),
-                fingerprint: sqlite_db::db_file_fingerprint(path),
+            conn: Mutex::new(conn),
+            cache: Mutex::new(DictionaryMetadataCache {
+                data_version,
+                fingerprint,
                 tags,
                 names,
+                disabled,
+                recent_term_meta: HashMap::new(),
             }),
         };
         Ok(Self {
@@ -630,6 +676,10 @@ impl DictController {
             last_search_error: None,
             last_match_units: 0,
             dictionary_order: HashMap::new(),
+            remove_regex_pattern: String::new(),
+            remove_regex: None,
+            replace_lines: false,
+            replace_lines_with: String::new(),
         })
     }
 
@@ -642,7 +692,7 @@ impl DictController {
     }
 
     /// Apply the configured dictionary IDs in search-priority order.
-    /// Unlisted IDs use priority zero, matching the C++ dictionary-order map.
+    /// Unlisted IDs receive `i64::MAX` so configured dictionaries always precede unlisted ones.
     pub fn set_order(&mut self, order: &[i64]) {
         self.dictionary_order.clear();
         self.dictionary_order.reserve(order.len());
@@ -651,6 +701,51 @@ impl DictController {
                 .entry(dictionary_id)
                 .or_insert(priority as i64);
         }
+    }
+
+    /// Configures `search/remove-regex` filtering applied before query lookup.
+    pub fn set_remove_regex(&mut self, pattern: &str) {
+        if self.remove_regex_pattern == pattern {
+            return;
+        }
+        self.remove_regex_pattern = pattern.to_owned();
+        self.remove_regex = normalize::compile_remove_regex(pattern);
+    }
+
+    /// Configures `search/replace-lines` and `search/replace-with` filtering applied before query lookup.
+    pub fn set_replace_lines(&mut self, enabled: bool, replace_with: &str) {
+        self.replace_lines = enabled;
+        self.replace_lines_with = replace_with.to_owned();
+    }
+
+    /// Configures both `search/remove-regex` and `search/replace-lines` text filters.
+    pub fn set_search_text_filters(
+        &mut self,
+        remove_regex: &str,
+        replace_lines: bool,
+        replace_with: &str,
+    ) {
+        self.set_remove_regex(remove_regex);
+        self.set_replace_lines(replace_lines, replace_with);
+    }
+
+    #[inline]
+    fn dict_priority(&self, dic_id: i64) -> i64 {
+        self.dictionary_order
+            .get(&dic_id)
+            .copied()
+            .unwrap_or(i64::MAX)
+    }
+
+    /// Resolves `styles.css` for `dic_id` under `res_dir`, preferring `dict-{dic_id}/styles.css`
+    /// and falling back to `{dict_name}/styles.css`.
+    pub fn dictionary_style_path(&self, res_dir: &Path, dic_id: i64) -> Option<PathBuf> {
+        let dict_name = self
+            .database
+            .as_ref()
+            .and_then(|db| db.with_cache(|cache| cache.names.get(&dic_id).cloned()))
+            .unwrap_or_default();
+        resolve_dictionary_style_path(res_dir, dic_id, &dict_name)
     }
 
     /// Add an in-memory dictionary.
@@ -731,35 +826,28 @@ impl DictController {
         self.recent_hits.clear();
         self.last_match_units = 0;
         self.last_search_error = None;
-        let trimmed = query.trim();
+
+        let after_regex = normalize::apply_compiled_remove_regex(query, self.remove_regex.as_ref());
+        let preprocessed = if self.replace_lines {
+            normalize::apply_replace_lines(&after_regex, true, &self.replace_lines_with)
+        } else {
+            after_regex.into_owned()
+        };
+        let trimmed = preprocessed.trim();
         if trimmed.is_empty() {
             return &self.recent_hits;
         }
 
         let norm_query = normalize_reading(trimmed);
-        let u16_query: Vec<u16> = trimmed.encode_utf16().collect();
-        let exact_queries = exactquerygenerator::generate_queries(&u16_query);
-        // Prefix queries plus deconjugated base forms (e.g. 残されていた -> 残す).
-        // Longest matched surface first so the most specific entries win ties.
-        let mut lookups: Vec<LookupQuery> = exact_queries
-            .iter()
-            .map(|query| LookupQuery { key: query.deconj.clone(), surface_len: query.deconj.len() })
-            .collect();
-        for query in deconjugationquerygenerator::generate_queries(&u16_query) {
-            lookups.push(LookupQuery { key: query.deconj, surface_len: query.surface.len() });
-        }
-        lookups.sort_by(|a, b| b.surface_len.cmp(&a.surface_len));
-        // Exact and deconjugation generators can produce the same lookup key
-        // many times. The SQL result is identical; keep the longest surface
-        // so ranking and subtitle selection remain stable.
-        let mut seen_lookups = HashSet::new();
-        lookups.retain(|lookup| seen_lookups.insert(lookup.key.clone()));
+        let full_u16_len = trimmed.encode_utf16().count();
+        let lookups = build_lookup_queries(trimmed);
 
         struct Candidate {
             hit: SearchHit,
             is_exact: bool,
             prefix_len: usize,
             dict_priority: i64,
+            dic_id_tiebreak: i64,
             original_index: usize,
         }
 
@@ -767,7 +855,7 @@ impl DictController {
         let mut seen_database_rows = HashSet::new();
 
         let database_candidates = self.database.as_ref().map(|database| {
-            database_search_candidates(database, trimmed, &norm_query, &lookups)
+            database_search_candidates(database, trimmed, &norm_query, full_u16_len, &lookups)
         });
         if let Some(Err(error)) = database_candidates.as_ref() {
             self.last_search_error = Some(error.to_string());
@@ -775,20 +863,17 @@ impl DictController {
         if let Some(Ok(database_candidates)) = database_candidates {
             for candidate in database_candidates {
                 if let Some(source_row_id) = candidate.source_row_id {
-                    if !seen_database_rows.insert((candidate.dict_priority, source_row_id)) {
+                    if !seen_database_rows.insert((candidate.dic_id, source_row_id)) {
                         continue;
                     }
                 }
-                let dict_priority = self
-                    .dictionary_order
-                    .get(&candidate.dict_priority)
-                    .copied()
-                    .unwrap_or(0);
+                let dict_priority = self.dict_priority(candidate.dic_id);
                 candidates.push(Candidate {
                     hit: candidate.hit,
                     is_exact: candidate.is_exact,
                     prefix_len: candidate.prefix_len,
                     dict_priority,
+                    dic_id_tiebreak: candidate.dic_id,
                     original_index: candidates.len(),
                 });
             }
@@ -796,7 +881,7 @@ impl DictController {
 
         let database_kanji_candidates = if trimmed.chars().count() == 1 {
             self.database.as_ref().map(|database| {
-                database_kanji_candidates(database, trimmed, u16_query.len())
+                database_kanji_candidates(database, trimmed, full_u16_len, &self.dictionary_order)
             })
         } else {
             None
@@ -805,66 +890,92 @@ impl DictController {
             self.last_search_error = Some(error.to_string());
         }
         if let Some(Ok(database_kanji_candidates)) = database_kanji_candidates {
-            // This lookup runs once per character; retain repeated rows from a dictionary.
             for candidate in database_kanji_candidates {
-                let dict_priority = self
-                    .dictionary_order
-                    .get(&candidate.dict_priority)
-                    .copied()
-                    .unwrap_or(0);
+                let dict_priority = self.dict_priority(candidate.dic_id);
                 candidates.push(Candidate {
                     hit: candidate.hit,
                     is_exact: candidate.is_exact,
                     prefix_len: candidate.prefix_len,
                     dict_priority,
+                    dic_id_tiebreak: candidate.dic_id,
                     original_index: candidates.len(),
                 });
             }
         }
 
-        let mut seen_memory_entries = HashSet::new();
-        for eq in &lookups {
-            if eq.key.is_empty() {
-                continue;
-            }
-            let prefix_str = String::from_utf16_lossy(&eq.key);
-            let prefix_trimmed = prefix_str.trim();
-            if prefix_trimmed.is_empty() {
-                continue;
-            }
-            let norm_prefix = normalize_reading(prefix_trimmed);
-            let prefix_len = eq.surface_len;
+        if !self.dictionaries.is_empty() {
+            let mut seen_memory_entries = HashSet::new();
+            for lookup in &lookups {
+                let prefix_trimmed = lookup.key.trim();
+                if prefix_trimmed.is_empty() {
+                    continue;
+                }
+                let norm_prefix = normalize_reading(prefix_trimmed);
+                let prefix_len = lookup.surface_len;
 
-            for (dictionary_index, dict) in self.dictionaries.iter().enumerate() {
-                for (entry_index, entry) in dict.entries.iter().enumerate() {
-                    let entry_key = (dictionary_index, entry_index);
-                    if seen_memory_entries.contains(&entry_key) {
-                        continue;
-                    }
-
-                    let norm_entry_reading = normalize_reading(&entry.reading);
-                    let norm_entry_expr = normalize_reading(&entry.expression);
-
-                    let matches = entry.expression == prefix_trimmed
-                        || norm_entry_expr == norm_prefix
-                        || (!norm_entry_reading.is_empty() && norm_entry_reading == norm_prefix);
-
-                    if matches {
-                        seen_memory_entries.insert(entry_key);
-                        let is_exact = entry.expression == trimmed
-                            || norm_entry_expr == norm_query
-                            || (!norm_entry_reading.is_empty() && norm_entry_reading == norm_query);
-                        let mut hit = entry.clone();
-                        if hit.dict_name.is_empty() {
-                            hit.dict_name = dict.name.clone();
+                for (dictionary_index, dict) in self.dictionaries.iter().enumerate() {
+                    for (entry_index, entry) in dict.entries.iter().enumerate() {
+                        let entry_key = (dictionary_index, entry_index);
+                        if seen_memory_entries.contains(&entry_key) {
+                            continue;
                         }
-                        candidates.push(Candidate {
-                            hit,
-                            is_exact,
-                            prefix_len,
-                            dict_priority: dict.priority,
-                            original_index: candidates.len(),
-                        });
+                        if lookup.rule_mask != 0 {
+                            let entry_rules_src = if !entry.rules.is_empty() {
+                                entry.rules.as_str()
+                            } else {
+                                entry.tags.as_str()
+                            };
+                            let entry_mask =
+                                deconjugationquerygenerator::parse_rule_mask(entry_rules_src);
+                            if !deconjugationquerygenerator::rule_matches_entry(
+                                lookup.rule_mask,
+                                entry_mask,
+                            ) {
+                                continue;
+                            }
+                        }
+
+                        let norm_entry_reading = normalize_reading(&entry.reading);
+                        let norm_entry_expr = normalize_reading(&entry.expression);
+
+                        let matches = entry.expression == prefix_trimmed
+                            || norm_entry_expr == norm_prefix
+                            || (!norm_entry_reading.is_empty()
+                                && norm_entry_reading == norm_prefix);
+
+                        if matches {
+                            seen_memory_entries.insert(entry_key);
+                            let is_exact = lookup.rule_mask == 0
+                                && (lookup.surface_len == full_u16_len
+                                    || entry.expression == trimmed
+                                    || norm_entry_expr == norm_query
+                                    || (!norm_entry_reading.is_empty()
+                                        && norm_entry_reading == norm_query));
+                            let mut hit = entry.clone();
+                            if hit.dict_name.is_empty() {
+                                hit.dict_name = dict.name.clone();
+                            }
+                            if lookup.rule_mask != 0 && hit.derivation.is_empty() {
+                                let entry_rules_src = if !entry.rules.is_empty() {
+                                    entry.rules.as_str()
+                                } else {
+                                    entry.tags.as_str()
+                                };
+                                let entry_mask =
+                                    deconjugationquerygenerator::parse_rule_mask(entry_rules_src);
+                                let (chain, descs) = lookup.derivation_for_entry(entry_mask);
+                                hit.derivation = chain;
+                                hit.derivation_descriptions = descs;
+                            }
+                            candidates.push(Candidate {
+                                hit,
+                                is_exact,
+                                prefix_len,
+                                dict_priority: dict.priority,
+                                dic_id_tiebreak: dictionary_index as i64,
+                                original_index: candidates.len(),
+                            });
+                        }
                     }
                 }
             }
@@ -880,11 +991,25 @@ impl DictController {
                 .then_with(|| a.hit.is_kanji.cmp(&b.hit.is_kanji))
                 .then_with(|| a.dict_priority.cmp(&b.dict_priority))
                 .then_with(|| b.hit.score.cmp(&a.hit.score))
+                .then_with(|| a.dic_id_tiebreak.cmp(&b.dic_id_tiebreak))
                 .then_with(|| a.original_index.cmp(&b.original_index))
         });
 
         self.last_match_units = candidates.first().map_or(0, |candidate| candidate.prefix_len);
         self.recent_hits = candidates.into_iter().map(|candidate| candidate.hit).collect();
+
+        // Batch-preload `term_meta_bank` rows for the matched term expressions so
+        // immediate hover metadata/pitch/frequency queries complete with zero extra SQL round-trips.
+        if let Some(database) = self.database.as_ref() {
+            let mut exprs: Vec<String> = Vec::new();
+            for hit in &self.recent_hits {
+                if !hit.is_kanji && !exprs.iter().any(|e| e == &hit.expression) {
+                    exprs.push(hit.expression.clone());
+                }
+            }
+            database.preload_term_meta(&exprs);
+        }
+
         &self.recent_hits
     }
 
@@ -894,7 +1019,8 @@ impl DictController {
     }
 
     /// Search exact kanji definitions from the persisted dictionaries.
-    /// Kanji rows have no score column, so results use configured dictionary priority.
+    /// Kanji rows have no score column, so results use configured dictionary priority
+    /// (with unlisted dictionaries receiving `i64::MAX`).
     pub fn search_kanji(&mut self, query: &str) -> &[SearchHit] {
         self.recent_hits.clear();
         self.last_search_error = None;
@@ -905,13 +1031,15 @@ impl DictController {
             return &self.recent_hits;
         };
 
-        match database_kanji_candidates(database, query, query.encode_utf16().count()) {
+        match database_kanji_candidates(
+            database,
+            query,
+            query.encode_utf16().count(),
+            &self.dictionary_order,
+        ) {
             Ok(mut candidates) => {
                 candidates.sort_by_key(|candidate| {
-                    self.dictionary_order
-                        .get(&candidate.dict_priority)
-                        .copied()
-                        .unwrap_or(0)
+                    (self.dict_priority(candidate.dic_id), candidate.dic_id)
                 });
                 self.recent_hits = candidates.into_iter().map(|candidate| candidate.hit).collect();
             }
@@ -939,304 +1067,699 @@ impl DictController {
         })
     }
 
-    /// Fetches pitch accent, general frequency rank, and JPDB frequency rank for the term.
+    /// Fetches pitch accent, general frequency rank, and JPDB frequency rank for the term,
+    /// sorted by `dictionary_order` and guarded against homograph reading collisions.
     pub fn get_term_meta(&self, expression: &str, reading: &str) -> (String, String, String) {
         let Some(database) = self.database.as_ref() else {
             return (String::new(), String::new(), String::new());
         };
-        let _ = database.refresh_metadata_if_needed();
-        const QUERY: &str =
-            "SELECT directory.title, term_meta_bank.mode, term_meta_bank.data, term_meta_bank.type \
-             FROM term_meta_bank \
-             JOIN directory ON directory.dic_id = term_meta_bank.dic_id \
-             WHERE term_meta_bank.expression = ?1 \
-               AND NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = term_meta_bank.dic_id);";
-
-        let Ok(mut statement) = sqlite_db::Statement::prepare(database.handle, QUERY) else {
-            return (String::new(), String::new(), String::new());
-        };
-        let u16_expr: Vec<u16> = expression.encode_utf16().collect();
-        if statement.bind_u16_as_utf8(1, &u16_expr).is_err() {
+        let raw_rows = database.term_meta_rows_for(expression);
+        if raw_rows.is_empty() {
             return (String::new(), String::new(), String::new());
         }
 
-        let mut pitch_accent = String::new();
+        let freqs = select_term_frequencies(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        );
+        let pitches = select_term_pitches(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        );
+
         let mut freq_rank = String::new();
         let mut jpdb_rank = String::new();
-
-        while let Ok(true) = statement.step() {
-            let title = statement.column_text_string(0);
-            let mode = statement.column_text_string(1);
-            let blob = statement.column_blob_bytes(2);
-            let blob_type = statement.column_int(3);
-
-            if mode == "freq" {
-                let rank_val = match blob_type {
-                    1 if blob.len() >= 8 => {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&blob[..8]);
-                        let val = i64::from_ne_bytes(arr);
-                        (val >= 0).then(|| val.to_string())
-                    }
-                    2 => {
-                        let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-                        std::str::from_utf8(&blob[..null_pos])
-                            .ok()
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned)
-                    }
-                    3 if blob.len() >= 8 => {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&blob[..8]);
-                        let val = f64::from_ne_bytes(arr);
-                        (val.is_finite() && val >= 0.0).then(|| sqlite_db::format_g(val, 6))
-                    }
-                    _ => {
-                        let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-                        let blob_slice = &blob[..null_pos];
-                        let Ok(text) = std::str::from_utf8(blob_slice) else { continue };
-                        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { continue };
-                        let reading_match = json.get("reading").and_then(serde_json::Value::as_str)
-                            .map_or(true, |r| r == reading || reading.is_empty());
-                        if !reading_match { continue; }
-
-                        if let Some(obj) = json.get("frequency").and_then(serde_json::Value::as_object) {
-                            obj.get("displayValue").and_then(serde_json::Value::as_str).map(str::to_owned)
-                                .or_else(|| obj.get("value").map(|v| v.to_string()))
-                        } else if let Some(num) = json.get("frequency") {
-                            Some(num.to_string())
-                        } else {
-                            None
-                        }
-                    }
-                };
-
-                if let Some(val) = rank_val {
-                    if title.to_uppercase().contains("JPDB") && jpdb_rank.is_empty() {
-                        jpdb_rank = val;
-                    } else if freq_rank.is_empty() {
-                        freq_rank = format!("{title} {val}");
-                    }
-                }
-            } else if mode == "pitch" && pitch_accent.is_empty() {
-                let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-                let blob_slice = &blob[..null_pos];
-                let Ok(text) = std::str::from_utf8(blob_slice) else { continue };
-                let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { continue };
-                let reading_match = json.get("reading").and_then(serde_json::Value::as_str)
-                    .map_or(true, |r| r == reading || reading.is_empty());
-                if !reading_match { continue; }
-
-                if let Some(pitches) = json.get("pitches").and_then(serde_json::Value::as_array) {
-                    if let Some(first) = pitches.first() {
-                        if let Some(pos) = first.get("position").and_then(serde_json::Value::as_i64) {
-                            pitch_accent = if reading.is_empty() {
-                                format!("[{pos}]")
-                            } else {
-                                format!("{reading} [{pos}]")
-                            };
-                        }
-                    }
-                }
+        for item in freqs {
+            if item.parsed.display.is_empty() {
+                continue;
+            }
+            if item.dictionary.to_ascii_uppercase().contains("JPDB") && jpdb_rank.is_empty() {
+                jpdb_rank = item.parsed.display;
+            } else if freq_rank.is_empty() {
+                freq_rank = format!("{} {}", item.dictionary, item.parsed.display);
+            }
+            if !freq_rank.is_empty() && !jpdb_rank.is_empty() {
+                break;
             }
         }
+
+        let pitch_accent = pitches
+            .first()
+            .map(|p| {
+                if reading.is_empty() {
+                    format!("[{}]", p.position)
+                } else {
+                    format!("{reading} [{}]", p.position)
+                }
+            })
+            .unwrap_or_default();
 
         (pitch_accent, freq_rank, jpdb_rank)
     }
 
-    /// Return every pitch accent supplied by enabled dictionaries for the popup.
-    pub fn get_pitch_graphs(&self, expression: &str, reading: &str) -> Vec<TermPitchGraph> {
-        let Some(database) = self.database.as_ref() else { return Vec::new() };
-        let _ = database.refresh_metadata_if_needed();
-        let mut rows = Vec::new();
-        if sqlite_db::add_pitches(
-            database.handle,
-            &expression.encode_utf16().collect::<Vec<_>>(),
-            &reading.encode_utf16().collect::<Vec<_>>(),
-            &mut rows,
-        ).is_err() { return Vec::new() }
-        rows.sort_by_key(|row| row.dic_id);
-        database.with_cache(|cache| {
-            let mut result = Vec::new();
-            for row in rows {
-                let Some(dictionary) = cache.names.get(&row.dic_id) else { continue };
-                let mora: Vec<String> = row.mora.iter().map(|unit| String::from_utf16_lossy(unit)).collect();
-                for position in row.positions {
-                    if position < 0 || position as usize > mora.len() { continue }
-                    result.push(TermPitchGraph { dictionary: dictionary.clone(), mora: mora.clone(), position });
+    /// Batched `get_term_meta` across multiple `(expression, reading)` pairs in a single SQL query.
+    pub fn get_term_meta_batch(&self, terms: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        if let Some(database) = self.database.as_ref() {
+            let mut exprs: Vec<String> = Vec::with_capacity(terms.len());
+            for &(expr, _) in terms {
+                if !expr.is_empty() && !exprs.iter().any(|e| e == expr) {
+                    exprs.push(expr.to_owned());
                 }
             }
-            result
-        })
+            database.preload_term_meta(&exprs);
+        }
+        terms
+            .iter()
+            .map(|&(expr, reading)| self.get_term_meta(expr, reading))
+            .collect()
     }
 
+    /// Returns detailed pitch accents (including `nasal`, `devoice`, and `tags`) sorted by
+    /// `dictionary_order` (`i64::MAX` for unlisted dictionaries) with homograph reading filtering.
+    pub fn get_pitch_details(&self, expression: &str, reading: &str) -> Vec<TermPitchDetail> {
+        let Some(database) = self.database.as_ref() else {
+            return Vec::new();
+        };
+        let raw_rows = database.term_meta_rows_for(expression);
+        select_term_pitches(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        )
+    }
+
+    /// Return every pitch accent supplied by enabled dictionaries for the popup,
+    /// sorted by `dictionary_order` (`i64::MAX` for unlisted dictionaries).
+    pub fn get_pitch_graphs(&self, expression: &str, reading: &str) -> Vec<TermPitchGraph> {
+        self.get_pitch_details(expression, reading)
+            .into_iter()
+            .map(|detail| TermPitchGraph {
+                dictionary: detail.dictionary,
+                mora: detail.mora,
+                position: detail.position,
+            })
+            .collect()
+    }
+
+    /// Returns term frequencies sorted by `dictionary_order` (`i64::MAX` for unlisted dictionaries)
+    /// with homograph reading filtering.
     pub fn get_frequencies(&self, expression: &str, reading: &str) -> Vec<TermFrequency> {
-        let Some(database) = self.database.as_ref() else { return Vec::new() };
-        let _ = database.refresh_metadata_if_needed();
-        let mut rows = Vec::new();
-        if sqlite_db::get_frequencies(
-            database.handle,
-            &expression.encode_utf16().collect::<Vec<_>>(),
-            &reading.encode_utf16().collect::<Vec<_>>(),
-            &mut rows,
-        ).is_err() { return Vec::new() }
-        rows.sort_by_key(|row| row.dic_id);
-        database.with_cache(|cache| {
-            rows.into_iter().filter_map(|row| {
-                cache.names.get(&row.dic_id).map(|dictionary| TermFrequency {
-                    dictionary: dictionary.clone(),
-                    value: String::from_utf16_lossy(&row.frequency),
-                })
-            }).collect()
+        let Some(database) = self.database.as_ref() else {
+            return Vec::new();
+        };
+        let raw_rows = database.term_meta_rows_for(expression);
+        select_term_frequencies(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        )
+        .into_iter()
+        .map(|item| TermFrequency {
+            dictionary: item.dictionary,
+            value: item.parsed.display,
         })
+        .collect()
     }
 
-    /// Gather all enabled frequency and pitch entries for Anki, using the
-    /// shared note formatter so field values match Memento's card format.
-    pub fn get_anki_term_metadata(&self, expression: &str, reading: &str, tags: &[String]) -> AnkiTermMetadata {
-        let Some(database) = self.database.as_ref() else { return AnkiTermMetadata::default() };
-        let _ = database.refresh_metadata_if_needed();
-        let expression_units: Vec<u16> = expression.encode_utf16().collect();
-        let reading_units: Vec<u16> = reading.encode_utf16().collect();
-        let mut frequency_rows = Vec::new();
-        let mut pitch_rows = Vec::new();
-        if sqlite_db::get_frequencies(database.handle, &expression_units, &reading_units, &mut frequency_rows).is_err()
-            || sqlite_db::add_pitches(database.handle, &expression_units, &reading_units, &mut pitch_rows).is_err() {
+    /// Returns Kanji frequencies from `kanji_meta_bank` sorted by `dictionary_order`.
+    pub fn get_kanji_frequencies(&self, character: &str) -> Vec<TermFrequency> {
+        let Some(database) = self.database.as_ref() else {
+            return Vec::new();
+        };
+        if character.is_empty() || database.refresh_metadata_if_needed().is_err() {
+            return Vec::new();
+        }
+        let raw_rows = {
+            let conn = database
+                .conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sqlite_db::query_kanji_meta_freq_utf8_conn(&conn, character).unwrap_or_default()
+        };
+        select_term_frequencies(database, &self.dictionary_order, &raw_rows, character, "")
+            .into_iter()
+            .map(|item| TermFrequency {
+                dictionary: item.dictionary,
+                value: item.parsed.display,
+            })
+            .collect()
+    }
+
+    /// Gather all enabled frequency and pitch entries for Anki, querying `term_bank.rules`
+    /// for `(expression, reading)` (falling back to `tags` only if no DB row exists) and
+    /// computing true Yomitan harmonic (`N / sum(1/r_i)`) and arithmetic means.
+    pub fn get_anki_term_metadata(
+        &self,
+        expression: &str,
+        reading: &str,
+        tags: &[String],
+    ) -> AnkiTermMetadata {
+        let Some(database) = self.database.as_ref() else {
+            return AnkiTermMetadata::default();
+        };
+        if database.refresh_metadata_if_needed().is_err() {
             return AnkiTermMetadata::default();
         }
 
-        let mut titles = HashMap::new();
-        if let Ok(mut statement) = sqlite_db::Statement::prepare(database.handle, "SELECT dic_id, title FROM directory") {
-            while let Ok(true) = statement.step() {
-                titles.insert(statement.column_int64(0), statement.column_text_string(1).encode_utf16().collect::<Vec<_>>());
+        let raw_rows = database.term_meta_rows_for(expression);
+        let freq_items = select_term_frequencies(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        );
+        let pitch_details = select_term_pitches(
+            database,
+            &self.dictionary_order,
+            &raw_rows,
+            expression,
+            reading,
+        );
+
+        let (frequencies_html, harmonic, average) = compute_anki_frequency_summary(&freq_items);
+
+        // Group consecutive pitch entries from the same dictionary/mora so `format_pitch`
+        // and `format_pitch_positions` match Memento's multi-position grouping.
+        let mut grouped_pitches: Vec<(Vec<u16>, Vec<u8>, Vec<Vec<u16>>)> = Vec::new();
+        for detail in &pitch_details {
+            let Ok(pos_u8) = u8::try_from(detail.position) else {
+                continue;
+            };
+            if detail.mora.is_empty() {
+                continue;
             }
+            let dict_u16: Vec<u16> = detail.dictionary.encode_utf16().collect();
+            let mora_u16: Vec<Vec<u16>> = detail
+                .mora
+                .iter()
+                .map(|m| m.encode_utf16().collect())
+                .collect();
+            if let Some(last) = grouped_pitches.last_mut() {
+                if last.0 == dict_u16 && last.2 == mora_u16 {
+                    last.1.push(pos_u8);
+                    continue;
+                }
+            }
+            grouped_pitches.push((dict_u16, vec![pos_u8], mora_u16));
         }
 
-        frequency_rows.sort_by_key(|row| row.dic_id);
-        let frequencies_owned: Vec<_> = frequency_rows.iter().map(|row| {
-            (titles.get(&row.dic_id).cloned().unwrap_or_default(), row.frequency.clone())
-        }).collect();
-        let frequencies: Vec<_> = frequencies_owned.iter().map(|(name, value)| memento_anki::note::FrequencyEntry {
-            dictionary: name,
-            freq: value,
-        }).collect();
-        let (_, harmonic, average) = memento_anki::note::frequency_stats(&frequencies);
-
-        let pitches_owned: Vec<_> = pitch_rows.iter().filter_map(|row| {
-            let positions: Vec<u8> = row.positions.iter().filter_map(|position| u8::try_from(*position).ok()).collect();
-            (!positions.is_empty() && !row.mora.is_empty()).then(|| {
-                (titles.get(&row.dic_id).cloned().unwrap_or_default(), positions, row.mora.clone())
+        let mora_refs: Vec<Vec<&[u16]>> = grouped_pitches
+            .iter()
+            .map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect())
+            .collect();
+        let pitches: Vec<_> = grouped_pitches
+            .iter()
+            .enumerate()
+            .map(|(index, (name, positions, _))| memento_anki::note::PitchEntry {
+                dictionary_name: name,
+                positions,
+                mora: &mora_refs[index],
             })
-        }).collect();
-        let mora_refs: Vec<Vec<&[u16]>> = pitches_owned.iter().map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect()).collect();
-        let pitches: Vec<_> = pitches_owned.iter().enumerate().map(|(index, (name, positions, _))| memento_anki::note::PitchEntry {
-            dictionary_name: name,
-            positions,
-            mora: &mora_refs[index],
-        }).collect();
-        let categories: Vec<_> = pitches_owned.iter().map(|(_, positions, mora)| memento_anki::note::PitchCategoryInput {
-            mora_len: mora.len(),
-            positions,
-        }).collect();
-        let rule_units: Vec<Vec<u16>> = tags.iter().map(|tag| tag.encode_utf16().collect()).collect();
+            .collect();
+        let categories: Vec<_> = grouped_pitches
+            .iter()
+            .map(|(_, positions, mora)| memento_anki::note::PitchCategoryInput {
+                mora_len: mora.len(),
+                positions,
+            })
+            .collect();
+
+        let db_rules = {
+            let conn = database
+                .conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sqlite_db::query_term_rules_conn(&conn, expression, reading)
+                .ok()
+                .flatten()
+        };
+        let rule_strings: Vec<String> = match db_rules {
+            Some(rules_from_db) => rules_from_db,
+            None => tags
+                .iter()
+                .flat_map(|t| t.split_whitespace().map(str::to_owned))
+                .collect(),
+        };
+        let rule_units: Vec<Vec<u16>> = rule_strings
+            .iter()
+            .map(|rule| rule.encode_utf16().collect())
+            .collect();
         let rules: Vec<&[u16]> = rule_units.iter().map(Vec::as_slice).collect();
         let can_be_kifuku = memento_anki::note::is_kifuku_applicable(&rules);
 
+        let harmonic_str = harmonic.map(|v| v.to_string()).unwrap_or_default();
+        let average_str = average.map(|v| v.to_string()).unwrap_or_default();
+
         AnkiTermMetadata {
             pitch: String::from_utf16_lossy(&memento_anki::note::format_pitch(&pitches)),
-            pitch_positions: String::from_utf16_lossy(&memento_anki::note::format_pitch_positions(&pitches)),
-            pitch_categories: String::from_utf16_lossy(&memento_anki::note::format_pitch_categories(&categories, can_be_kifuku)),
-            frequencies: String::from_utf16_lossy(&memento_anki::note::build_frequencies_html(&frequencies, false, false)),
-            frequency_harmonic_rank: harmonic.map(|value| value.to_string()).unwrap_or_default(),
-            frequency_average_rank: average.map(|value| value.to_string()).unwrap_or_default(),
+            pitch_positions: String::from_utf16_lossy(&memento_anki::note::format_pitch_positions(
+                &pitches,
+            )),
+            pitch_categories: String::from_utf16_lossy(
+                &memento_anki::note::format_pitch_categories(&categories, can_be_kifuku),
+            ),
+            frequencies: frequencies_html,
+            frequency_harmonic_rank: harmonic_str.clone(),
+            frequency_average_rank: average_str.clone(),
+            frequency_harmonic_occurrence: harmonic_str,
+            frequency_average_occurrence: average_str,
+        }
+    }
+
+    /// Gather enabled `kanji_meta_bank` frequency metadata for Anki kanji cards.
+    pub fn get_anki_kanji_metadata(&self, character: &str) -> AnkiTermMetadata {
+        let Some(database) = self.database.as_ref() else {
+            return AnkiTermMetadata::default();
+        };
+        if character.is_empty() || database.refresh_metadata_if_needed().is_err() {
+            return AnkiTermMetadata::default();
+        }
+        let raw_rows = {
+            let conn = database
+                .conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sqlite_db::query_kanji_meta_freq_utf8_conn(&conn, character).unwrap_or_default()
+        };
+        let freq_items =
+            select_term_frequencies(database, &self.dictionary_order, &raw_rows, character, "");
+        let (frequencies_html, harmonic, average) = compute_anki_frequency_summary(&freq_items);
+        let harmonic_str = harmonic.map(|v| v.to_string()).unwrap_or_default();
+        let average_str = average.map(|v| v.to_string()).unwrap_or_default();
+
+        AnkiTermMetadata {
+            frequencies: frequencies_html,
+            frequency_harmonic_rank: harmonic_str.clone(),
+            frequency_average_rank: average_str.clone(),
+            frequency_harmonic_occurrence: harmonic_str,
+            frequency_average_occurrence: average_str,
+            ..AnkiTermMetadata::default()
         }
     }
 }
 
+struct SelectedFreqItem {
+    dictionary: String,
+    parsed: sqlite_db::ParsedFreqUtf8,
+}
 
-/// One dictionary lookup key together with the number of UTF-16 units of the
-/// original query text it accounts for (the matched surface).
+fn select_term_frequencies(
+    database: &ReadOnlyDictionaryDb,
+    dictionary_order: &HashMap<i64, i64>,
+    raw_rows: &[sqlite_db::RawTermMetaRow],
+    expression: &str,
+    caller_reading: &str,
+) -> Vec<SelectedFreqItem> {
+    database.with_cache(|cache| {
+        let mut by_dict: HashMap<i64, (bool, Vec<sqlite_db::ParsedFreqUtf8>)> = HashMap::new();
+        let mut dict_ids: Vec<i64> = Vec::new();
+
+        for row in raw_rows {
+            if row.mode != "freq" || cache.disabled.contains(&row.dic_id) {
+                continue;
+            }
+            if !cache.names.contains_key(&row.dic_id) {
+                continue;
+            }
+            let parsed =
+                sqlite_db::parse_freq_blob_utf8(row.blob_type, &row.data, expression, caller_reading);
+            let entry = by_dict.entry(row.dic_id).or_insert_with(|| {
+                dict_ids.push(row.dic_id);
+                (false, Vec::new())
+            });
+            if parsed.has_reading_key {
+                entry.0 = true;
+            }
+            if parsed.matched {
+                entry.1.push(parsed);
+            }
+        }
+
+        dict_ids.sort_by_key(|&id| {
+            (
+                dictionary_order.get(&id).copied().unwrap_or(i64::MAX),
+                id,
+            )
+        });
+
+        let mut out = Vec::new();
+        for dic_id in dict_ids {
+            let Some((saw_reading_key, items)) = by_dict.remove(&dic_id) else {
+                continue;
+            };
+            let Some(dict_name) = cache.names.get(&dic_id) else {
+                continue;
+            };
+            let has_exact = !caller_reading.is_empty()
+                && items.iter().any(|item| item.exact_reading_match);
+            for parsed in items {
+                if !caller_reading.is_empty() {
+                    if has_exact && !parsed.exact_reading_match {
+                        continue;
+                    }
+                    if !has_exact && saw_reading_key {
+                        continue;
+                    }
+                }
+                out.push(SelectedFreqItem {
+                    dictionary: dict_name.clone(),
+                    parsed,
+                });
+            }
+        }
+        out
+    })
+}
+
+fn select_term_pitches(
+    database: &ReadOnlyDictionaryDb,
+    dictionary_order: &HashMap<i64, i64>,
+    raw_rows: &[sqlite_db::RawTermMetaRow],
+    expression: &str,
+    caller_reading: &str,
+) -> Vec<TermPitchDetail> {
+    database.with_cache(|cache| {
+        let mut by_dict: HashMap<i64, (bool, Vec<databasemanager::PitchBlobUtf8Data>)> =
+            HashMap::new();
+        let mut dict_ids: Vec<i64> = Vec::new();
+
+        for row in raw_rows {
+            if row.mode != "pitch" || cache.disabled.contains(&row.dic_id) {
+                continue;
+            }
+            if !cache.names.contains_key(&row.dic_id) {
+                continue;
+            }
+            let null_pos = row.data.iter().position(|&b| b == 0).unwrap_or(row.data.len());
+            let parsed = databasemanager::parse_pitch_blob_utf8(
+                &row.data[..null_pos],
+                expression,
+                caller_reading,
+            );
+            let entry = by_dict.entry(row.dic_id).or_insert_with(|| {
+                dict_ids.push(row.dic_id);
+                (false, Vec::new())
+            });
+            if parsed.has_reading_key {
+                entry.0 = true;
+            }
+            if parsed.matched {
+                entry.1.push(parsed);
+            }
+        }
+
+        dict_ids.sort_by_key(|&id| {
+            (
+                dictionary_order.get(&id).copied().unwrap_or(i64::MAX),
+                id,
+            )
+        });
+
+        let mut out = Vec::new();
+        for dic_id in dict_ids {
+            let Some((saw_reading_key, items)) = by_dict.remove(&dic_id) else {
+                continue;
+            };
+            let Some(dict_name) = cache.names.get(&dic_id) else {
+                continue;
+            };
+            let has_exact = !caller_reading.is_empty()
+                && items.iter().any(|item| item.exact_reading_match);
+            for parsed in items {
+                if !caller_reading.is_empty() {
+                    if has_exact && !parsed.exact_reading_match {
+                        continue;
+                    }
+                    if !has_exact && saw_reading_key {
+                        continue;
+                    }
+                }
+                for entry in parsed.entries {
+                    if entry.position < 0 || (entry.position as usize) > parsed.mora.len() {
+                        continue;
+                    }
+                    out.push(TermPitchDetail {
+                        dictionary: dict_name.clone(),
+                        mora: parsed.mora.clone(),
+                        position: entry.position,
+                        nasal: entry.nasal,
+                        devoice: entry.devoice,
+                        tags: entry.tags,
+                    });
+                }
+            }
+        }
+        out
+    })
+}
+
+fn compute_anki_frequency_summary(
+    freq_items: &[SelectedFreqItem],
+) -> (String, Option<i64>, Option<i64>) {
+    let owned_u16: Vec<(Vec<u16>, Vec<u16>)> = freq_items
+        .iter()
+        .map(|item| {
+            (
+                item.dictionary.encode_utf16().collect(),
+                item.parsed.display.encode_utf16().collect(),
+            )
+        })
+        .collect();
+    let entries: Vec<_> = owned_u16
+        .iter()
+        .map(|(dict, freq)| memento_anki::note::FrequencyEntry {
+            dictionary: dict,
+            freq,
+        })
+        .collect();
+    let html = String::from_utf16_lossy(&memento_anki::note::build_frequencies_html(
+        &entries, false, false,
+    ));
+
+    // Select first positive numeric value per dictionary (in caller priority order)
+    // and compute true Yomitan harmonic mean `floor(N / sum(1 / r_i))` and average.
+    let mut seen_dicts: HashSet<&str> = HashSet::new();
+    let mut numbers: Vec<f64> = Vec::new();
+    for item in freq_items {
+        if item.dictionary.is_empty() || seen_dicts.contains(item.dictionary.as_str()) {
+            continue;
+        }
+        if let Some(val) = item.parsed.numeric {
+            if val.is_finite() && val > 0.0 {
+                seen_dicts.insert(item.dictionary.as_str());
+                numbers.push(val);
+            }
+        }
+    }
+
+    if numbers.is_empty() {
+        return (html, None, None);
+    }
+
+    let inv_sum: f64 = numbers.iter().map(|&r| 1.0 / r).sum();
+    let harmonic = (inv_sum > 0.0 && inv_sum.is_finite())
+        .then(|| ((numbers.len() as f64) / inv_sum).floor() as i64);
+    let sum: f64 = numbers.iter().sum();
+    let average = sum
+        .is_finite()
+        .then(|| (sum / (numbers.len() as f64)).floor() as i64);
+
+    (html, harmonic, average)
+}
+
+/// One candidate lookup key together with its matched UTF-16 surface length,
+/// required Yomitan `rule_mask` (`0` for exact uninflected queries), and derivation chain.
 struct LookupQuery {
-    key: Vec<u16>,
+    key: String,
     surface_len: usize,
+    rule_mask: u8,
+    derivation: String,
+    derivation_descriptions: Vec<(String, String)>,
+    rule_derivations: Vec<(u8, String, Vec<(String, String)>)>,
+    seq: usize,
+}
+
+impl LookupQuery {
+    fn derivation_for_entry(&self, entry_rule_mask: u8) -> (String, Vec<(String, String)>) {
+        if entry_rule_mask != 0 {
+            for (mask, chain, descs) in &self.rule_derivations {
+                if (*mask & entry_rule_mask) != 0 {
+                    return (chain.clone(), descs.clone());
+                }
+            }
+        }
+        (self.derivation.clone(), self.derivation_descriptions.clone())
+    }
 }
 
 struct DatabaseCandidate {
     hit: SearchHit,
     is_exact: bool,
     prefix_len: usize,
-    dict_priority: i64,
+    dic_id: i64,
     source_row_id: Option<i64>,
 }
 
-fn validate_dictionary_schema(
-    database: *mut sqlite_db::sqlite3,
-) -> Result<(), sqlite_db::DictError> {
-    const REQUIRED_TABLES: [&str; 7] = [
-        "directory",
-        "dict_disabled",
-        "tag_bank",
-        "term_bank",
-        "term_meta_bank",
-        "kanji_bank",
-        "kanji_meta_bank",
-    ];
-    let mut statement =
-        sqlite_db::Statement::prepare(database, "SELECT name FROM sqlite_master WHERE type='table';")?;
-    let mut tables = HashSet::new();
-    while statement.step()? {
-        tables.insert(statement.column_text_string(0));
+const MAX_DECONJ_PREFIX_CHARS: usize = 36;
+
+fn is_ascii_regex_ws(ch: char) -> bool {
+    matches!(ch, '\t'..='\r' | ' ')
+}
+
+fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
+    let mut raw_lookups: Vec<LookupQuery> = Vec::new();
+    let mut seq = 0usize;
+
+    // Collect all non-empty prefix byte boundaries + UTF-16 lengths from longest to shortest.
+    let mut prefixes: Vec<(usize, usize, usize)> = Vec::new();
+    let mut char_count = 0usize;
+    let mut u16_count = 0usize;
+    for (byte_idx, ch) in trimmed.char_indices() {
+        char_count += 1;
+        u16_count += ch.len_utf16();
+        prefixes.push((byte_idx + ch.len_utf8(), char_count, u16_count));
     }
-    for table in REQUIRED_TABLES {
-        if !tables.contains(table) {
-            return Err(sqlite_db::DictError::InvalidSchema(format!(
-                "Missing required table '{table}'"
-            )));
+
+    for &(byte_end, chars_len, orig_u16_len) in prefixes.iter().rev() {
+        let prefix = &trimmed[..byte_end];
+        if prefix.trim().is_empty() {
+            continue;
+        }
+
+        // 1. Exact prefix variants (`rule_mask = 0`)
+        for variant in normalize::expand_query_variants(prefix) {
+            raw_lookups.push(LookupQuery {
+                key: variant,
+                surface_len: orig_u16_len,
+                rule_mask: 0,
+                derivation: String::new(),
+                derivation_descriptions: Vec::new(),
+                rule_derivations: Vec::new(),
+                seq,
+            });
+            seq += 1;
+        }
+
+        if prefix.chars().any(is_ascii_regex_ws) {
+            let no_ws: String = prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
+            for variant in normalize::expand_query_variants(&no_ws) {
+                raw_lookups.push(LookupQuery {
+                    key: variant,
+                    surface_len: orig_u16_len,
+                    rule_mask: 0,
+                    derivation: String::new(),
+                    derivation_descriptions: Vec::new(),
+                    rule_derivations: Vec::new(),
+                    seq,
+                });
+                seq += 1;
+            }
+        }
+
+        // 2. Deconjugation candidates (`rule_mask != 0`) preserving `orig_u16_len`
+        if chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == trimmed.len() {
+            let mut deconj_inputs: Vec<String> = Vec::new();
+            let mut push_deconj_in = |s: String| {
+                if !s.is_empty() && !deconj_inputs.contains(&s) {
+                    deconj_inputs.push(s);
+                }
+            };
+            let nfkc = normalize::normalize_nfkc(prefix);
+            push_deconj_in(prefix.to_owned());
+            push_deconj_in(nfkc.clone());
+            push_deconj_in(normalize::kata_to_hira_str(&nfkc));
+            for iter_var in normalize::expand_iteration_marks(&nfkc) {
+                push_deconj_in(iter_var.clone());
+                if iter_var.contains('ー') {
+                    for pv in normalize::expand_prolonged_vowels(&iter_var) {
+                        push_deconj_in(pv);
+                    }
+                }
+            }
+
+            for deconj_input in deconj_inputs {
+                let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
+                for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
+                    let base = String::from_utf16_lossy(&dq.deconj);
+                    for base_variant in normalize::expand_query_variants(&base) {
+                        raw_lookups.push(LookupQuery {
+                            key: base_variant,
+                            surface_len: orig_u16_len,
+                            rule_mask: dq.rule_mask,
+                            derivation: dq.derivation.clone(),
+                            derivation_descriptions: dq.derivation_descriptions.clone(),
+                            rule_derivations: dq.rule_derivations.clone(),
+                            seq,
+                        });
+                        seq += 1;
+                    }
+                }
+            }
         }
     }
-    Ok(())
+
+    // Longest surface first; at equal surface length, Exact (`rule_mask == 0`) precedes Deconj.
+    raw_lookups.sort_by(|a, b| {
+        b.surface_len
+            .cmp(&a.surface_len)
+            .then_with(|| (a.rule_mask != 0).cmp(&(b.rule_mask != 0)))
+            .then_with(|| a.seq.cmp(&b.seq))
+    });
+
+    // Deduplicate strictly by `(key, rule_mask)` so distinct `rule_mask`s are never collapsed!
+    let mut seen_lookups: HashSet<(String, u8)> = HashSet::with_capacity(raw_lookups.len());
+    raw_lookups.retain(|lookup| seen_lookups.insert((lookup.key.clone(), lookup.rule_mask)));
+    raw_lookups
 }
 
-fn query_data_version(
-    database: *mut sqlite_db::sqlite3,
-) -> Result<i64, sqlite_db::DictError> {
-    let mut statement = sqlite_db::Statement::prepare(database, "PRAGMA data_version;")?;
-    if statement.step()? {
-        Ok(statement.column_int64(0))
-    } else {
-        Ok(0)
-    }
-}
-
-fn load_dictionary_names(
-    database: *mut sqlite_db::sqlite3,
-) -> Result<HashMap<i64, String>, sqlite_db::DictError> {
-    let mut statement =
-        sqlite_db::Statement::prepare(database, "SELECT dic_id, title FROM directory;")?;
+fn load_dictionary_names_and_disabled_conn(
+    conn: &sqlite_db::rusqlite::Connection,
+) -> Result<(HashMap<i64, String>, HashSet<i64>), sqlite_db::DictError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) FROM directory;",
+    )?;
     let mut names = HashMap::new();
-    while statement.step()? {
-        names.insert(statement.column_int64(0), statement.column_text_string(1));
+    let mut disabled = HashSet::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let title: String = row.get(1)?;
+        let is_disabled: i64 = row.get(2)?;
+        names.insert(id, title);
+        if is_disabled != 0 {
+            disabled.insert(id);
+        }
     }
-    Ok(names)
+    Ok((names, disabled))
 }
 
-
-fn load_dictionary_tags(
-    database: *mut sqlite_db::sqlite3,
+fn load_dictionary_tags_conn(
+    conn: &sqlite_db::rusqlite::Connection,
 ) -> Result<HashMap<(i64, String), DictTag>, sqlite_db::DictError> {
-    let mut statement = sqlite_db::Statement::prepare(
-        database,
+    let mut stmt = conn.prepare_cached(
         "SELECT dic_id, category, name, ord, notes, score FROM tag_bank \
          ORDER BY dic_id ASC, ord ASC, score DESC;",
     )?;
     let mut tags = HashMap::new();
-    while statement.step()? {
-        let dictionary_id = statement.column_int64(0);
-        let category = statement.column_text_string(1);
-        let name = statement.column_text_string(2);
-        let order = i64::from(statement.column_int(3));
-        let notes = statement.column_text_string(4);
-        let score = i64::from(statement.column_int(5));
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let dictionary_id: i64 = row.get(0)?;
+        let category: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        let order: i64 = row.get(3)?;
+        let notes: String = row.get(4)?;
+        let score: i64 = row.get(5)?;
         tags.insert(
             (dictionary_id, name.clone()),
             DictTag::with_details(name, category, notes, order, score),
@@ -1245,106 +1768,170 @@ fn load_dictionary_tags(
     Ok(tags)
 }
 
+/// Strips legacy Yomichan nested-array deinflection entries (`[["base", ["rule"]]]`)
+/// from a `term_bank.glossary` JSON payload. Returns `None` if no real glossary items remain.
+fn clean_raw_glossary(raw_glossary: &str) -> Option<(String, Option<serde_json::Value>)> {
+    match serde_json::from_str::<serde_json::Value>(raw_glossary) {
+        Ok(serde_json::Value::Array(items)) => {
+            let has_nested_array = items.iter().any(serde_json::Value::is_array);
+            if !has_nested_array {
+                if items.is_empty() {
+                    return None;
+                }
+                return Some((raw_glossary.to_owned(), Some(serde_json::Value::Array(items))));
+            }
+            let filtered: Vec<serde_json::Value> = items
+                .into_iter()
+                .filter(|item| !item.is_array())
+                .collect();
+            if filtered.is_empty() {
+                return None;
+            }
+            let cleaned_val = serde_json::Value::Array(filtered);
+            let cleaned_json = serde_json::to_string(&cleaned_val).unwrap_or_default();
+            Some((cleaned_json, Some(cleaned_val)))
+        }
+        Ok(other) => Some((raw_glossary.to_owned(), Some(other))),
+        Err(_) => Some((raw_glossary.to_owned(), None)),
+    }
+}
+
 fn database_search_candidates(
     database: &ReadOnlyDictionaryDb,
     query: &str,
     normalized_query: &str,
+    full_u16_len: usize,
     lookups: &[LookupQuery],
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
     database
         .refresh_metadata_if_needed()
         .map_err(DictControllerError::Sqlite)?;
-    const TERM_DETAILS_QUERY: &str =
-        "SELECT term_bank.rowid, term_bank.dic_id, term_bank.def_tags, term_bank.term_tags, \
-                term_bank.score, term_bank.glossary, directory.title \
-         FROM term_bank \
-         JOIN directory ON directory.dic_id = term_bank.dic_id \
-         WHERE term_bank.expression = ?1 AND term_bank.reading = ?2 \
-           AND NOT EXISTS (SELECT 1 FROM dict_disabled \
-                           WHERE dict_disabled.dic_id = term_bank.dic_id) \
-         ORDER BY term_bank.dic_id ASC, term_bank.sequence ASC;";
 
-    let mut details_statement = sqlite_db::Statement::prepare(database.handle, TERM_DETAILS_QUERY)
-        .map_err(DictControllerError::Sqlite)?;
-    let mut results = Vec::new();
+    // Collect distinct UTF-8 lookup keys in priority order for a single batched SQL query.
+    let mut unique_keys: Vec<String> = Vec::with_capacity(lookups.len());
+    let mut seen_keys: HashSet<&str> = HashSet::with_capacity(lookups.len());
     for lookup in lookups {
-        if lookup.key.is_empty() {
-            continue;
+        if !lookup.key.is_empty() && seen_keys.insert(lookup.key.as_str()) {
+            unique_keys.push(lookup.key.clone());
         }
-        let prefix = String::from_utf16_lossy(&lookup.key);
-        if prefix.trim().is_empty() {
-            continue;
+    }
+    if unique_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let batch_rows = {
+        let conn = database
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sqlite_db::query_term_details_batch_conn(&conn, &unique_keys)
+            .map_err(DictControllerError::Sqlite)?
+    };
+    if batch_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Precompute `entry_rule_mask` and index rows by `expression` and `reading`.
+    let row_masks: Vec<u8> = batch_rows
+        .iter()
+        .map(|row| deconjugationquerygenerator::parse_rule_mask(&row.rules))
+        .collect();
+    let mut by_key: HashMap<&str, Vec<usize>> = HashMap::with_capacity(batch_rows.len() * 2);
+    for (idx, row) in batch_rows.iter().enumerate() {
+        by_key.entry(row.expression.as_str()).or_default().push(idx);
+        if !row.reading.is_empty() && row.reading != row.expression {
+            by_key.entry(row.reading.as_str()).or_default().push(idx);
         }
+    }
 
-        let normalized_prefix = normalize_nfkc_query(&prefix);
-        let normalized_prefix: Vec<u16> = normalized_prefix.encode_utf16().collect();
-        let plan = sqlite_db::TermQueryPlan::new(&lookup.key, &normalized_prefix);
-        let mut terms = Vec::new();
-        sqlite_db::query_terms(database.handle, &plan, &mut terms)
-            .map_err(DictControllerError::Sqlite)?;
+    let results = database.with_cache(|cache| {
+        let mut results = Vec::new();
+        let mut parsed_rows: HashMap<usize, Option<(String, String, String, String, Vec<GlossaryBlock>)>> =
+            HashMap::new();
 
-        for term in terms {
-            let expression = String::from_utf16_lossy(&term.expression);
-            let reading = String::from_utf16_lossy(&term.reading);
-            details_statement.reset().map_err(DictControllerError::Sqlite)?;
-            details_statement
-                .bind_u16_as_utf8(1, &term.expression)
-                .map_err(DictControllerError::Sqlite)?;
-            details_statement
-                .bind_u16_as_utf8(2, &term.reading)
-                .map_err(DictControllerError::Sqlite)?;
-
-            while details_statement.step().map_err(DictControllerError::Sqlite)? {
-                let source_row_id = details_statement.column_int64(0);
-                let dictionary_id = details_statement.column_int64(1);
-                let def_tags = details_statement.column_text_string(2);
-                let term_tags = details_statement.column_text_string(3);
-                let score = i64::from(details_statement.column_int(4));
-                let raw_glossary = details_statement.column_text_string(5);
-                let dictionary_name = details_statement.column_text_string(6);
-                let norm_expression = normalize_reading(&expression);
-                let norm_reading = normalize_reading(&reading);
-                let parsed_glossary = serde_json::from_str::<serde_json::Value>(&raw_glossary);
-                let (glossary, example_ja, example_en, rich_glossary) = match parsed_glossary.as_ref() {
-                    Ok(value) => {
-                        let (glossary, example_ja, example_en) = parse_glossary_entry_value(value);
-                        (glossary, example_ja, example_en, parse_rich_glossary_value(value))
-                    }
-                    Err(_) => (strip_glossary_markup(&raw_glossary), String::new(), String::new(),
-                        parse_rich_glossary(&raw_glossary)),
+        for lookup in lookups {
+            let Some(row_indices) = by_key.get(lookup.key.as_str()) else {
+                continue;
+            };
+            for &row_idx in row_indices {
+                let entry_mask = row_masks[row_idx];
+                if !deconjugationquerygenerator::rule_matches_entry(lookup.rule_mask, entry_mask) {
+                    continue;
+                }
+                let row = &batch_rows[row_idx];
+                let Some(dictionary_name) = cache.names.get(&row.dic_id) else {
+                    continue;
                 };
-                let formatted_tags = database.with_cache(|cache| {
-                    format_dictionary_tags(
-                        &cache.tags,
-                        dictionary_id,
-                        &def_tags,
-                        &term_tags,
-                    )
+
+                let parsed_entry = parsed_rows.entry(row_idx).or_insert_with(|| {
+                    let (cleaned_raw, parsed_val) = clean_raw_glossary(&row.glossary)?;
+                    let (glossary, example_ja, example_en, rich_glossary) = match parsed_val.as_ref() {
+                        Some(value) => {
+                            let (g, ja, en) = parse_glossary_entry_value(value);
+                            (g, ja, en, parse_rich_glossary_value(value))
+                        }
+                        None => (
+                            strip_glossary_markup(&cleaned_raw),
+                            String::new(),
+                            String::new(),
+                            parse_rich_glossary(&cleaned_raw),
+                        ),
+                    };
+                    Some((cleaned_raw, glossary, example_ja, example_en, rich_glossary))
                 });
+                let Some((cleaned_raw, glossary, example_ja, example_en, rich_glossary)) =
+                    parsed_entry.as_ref()
+                else {
+                    continue;
+                };
+
+                let norm_expression = normalize_reading(&row.expression);
+                let norm_reading = normalize_reading(&row.reading);
+                let formatted_tags =
+                    format_dictionary_tags(&cache.tags, row.dic_id, &row.def_tags, &row.term_tags);
+                let is_exact = lookup.rule_mask == 0
+                    && (lookup.surface_len == full_u16_len
+                        || row.expression == query
+                        || norm_expression == normalized_query
+                        || (!norm_reading.is_empty() && norm_reading == normalized_query));
+
+                let (derivation, derivation_descriptions) = if lookup.rule_mask != 0 {
+                    lookup.derivation_for_entry(entry_mask)
+                } else {
+                    (String::new(), Vec::new())
+                };
+
                 results.push(DatabaseCandidate {
                     hit: SearchHit {
-                        expression: expression.clone(),
-                        reading: reading.clone(),
-                        glossary,
+                        expression: row.expression.clone(),
+                        reading: row.reading.clone(),
+                        glossary: glossary.clone(),
                         tags: formatted_tags,
-                        score,
+                        score: row.score,
                         is_kanji: false,
                         notes: String::new(),
-                        example_ja,
-                        example_en,
+                        example_ja: example_ja.clone(),
+                        example_en: example_en.clone(),
                         dict_name: dictionary_name.clone(),
-                        rich_glossary,
+                        rich_glossary: rich_glossary.clone(),
+                        derivation,
+                        derivation_descriptions,
+                        dictionary_id: row.dic_id,
+                        rules: row.rules.clone(),
+                        raw_glossary: cleaned_raw.clone(),
+                        term_tags: row.term_tags.clone(),
+                        def_tags: row.def_tags.clone(),
                     },
-                    is_exact: expression == query
-                        || norm_expression == normalized_query
-                        || (!norm_reading.is_empty() && norm_reading == normalized_query),
+                    is_exact,
                     prefix_len: lookup.surface_len,
-                    dict_priority: dictionary_id,
-                    source_row_id: Some(source_row_id),
+                    dic_id: row.dic_id,
+                    source_row_id: Some(row.rowid),
                 });
             }
         }
-    }
+        results
+    });
+
     Ok(results)
 }
 
@@ -1352,14 +1939,38 @@ fn database_kanji_candidates(
     database: &ReadOnlyDictionaryDb,
     query: &str,
     prefix_len: usize,
+    dictionary_order: &HashMap<i64, i64>,
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
     database
         .refresh_metadata_if_needed()
         .map_err(DictControllerError::Sqlite)?;
-    let query_units: Vec<u16> = query.encode_utf16().collect();
-    let mut kanji_rows = Vec::new();
-    sqlite_db::query_kanji(database.handle, &query_units, &mut kanji_rows)
-        .map_err(DictControllerError::Sqlite)?;
+
+    let (kanji_rows, kanji_meta_rows) = {
+        let conn = database
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows =
+            sqlite_db::query_kanji_utf8_conn(&conn, query).map_err(DictControllerError::Sqlite)?;
+        let meta = if rows.is_empty() {
+            Vec::new()
+        } else {
+            sqlite_db::query_kanji_meta_freq_utf8_conn(&conn, query).unwrap_or_default()
+        };
+        (rows, meta)
+    };
+    if kanji_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let kanji_freqs =
+        select_term_frequencies(database, dictionary_order, &kanji_meta_rows, query, "");
+    let freq_notes: String = kanji_freqs
+        .iter()
+        .filter(|item| !item.parsed.display.is_empty())
+        .map(|item| format!("{}: {}", item.dictionary, item.parsed.display))
+        .collect::<Vec<_>>()
+        .join("; ");
 
     let results = database.with_cache(|cache| {
         let mut results = Vec::with_capacity(kanji_rows.len());
@@ -1367,33 +1978,38 @@ fn database_kanji_candidates(
             let Some(dictionary_name) = cache.names.get(&row.dic_id) else {
                 continue;
             };
-            let onyomi = String::from_utf16_lossy(&row.onyomi);
-            let kunyomi = String::from_utf16_lossy(&row.kunyomi);
-            let raw_tags = String::from_utf16_lossy(&row.tags);
-            let raw_stats = String::from_utf16_lossy(&row.stats);
-            let glossary = row
-                .meanings
-                .iter()
-                .map(|meaning| String::from_utf16_lossy(meaning))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let glossary = row.meanings.join("\n");
+            let stats_notes = format_kanji_stats(&cache.tags, row.dic_id, &row.stats);
+            let notes = match (stats_notes.is_empty(), freq_notes.is_empty()) {
+                (false, false) => format!("{stats_notes}; {freq_notes}"),
+                (false, true) => stats_notes,
+                (true, false) => freq_notes.clone(),
+                (true, true) => String::new(),
+            };
             results.push(DatabaseCandidate {
                 hit: SearchHit {
                     expression: query.to_owned(),
-                    reading: format_kanji_reading(&onyomi, &kunyomi),
+                    reading: format_kanji_reading(&row.onyomi, &row.kunyomi),
                     glossary,
-                    tags: format_dictionary_tags(&cache.tags, row.dic_id, "", &raw_tags),
+                    tags: format_dictionary_tags(&cache.tags, row.dic_id, "", &row.tags),
                     score: 0,
                     is_kanji: true,
-                    notes: format_kanji_stats(&cache.tags, row.dic_id, &raw_stats),
+                    notes,
                     example_ja: String::new(),
                     example_en: String::new(),
                     dict_name: dictionary_name.clone(),
                     rich_glossary: Vec::new(),
+                    derivation: String::new(),
+                    derivation_descriptions: Vec::new(),
+                    dictionary_id: row.dic_id,
+                    rules: String::new(),
+                    raw_glossary: row.raw_meanings,
+                    term_tags: row.tags,
+                    def_tags: String::new(),
                 },
                 is_exact: true,
                 prefix_len,
-                dict_priority: row.dic_id,
+                dic_id: row.dic_id,
                 source_row_id: None,
             });
         }
@@ -1413,6 +2029,8 @@ fn format_kanji_reading(onyomi: &str, kunyomi: &str) -> String {
     readings.join("; ")
 }
 
+/// Formats `kanji_bank.stats` using `tag.notes` (falling back to `tag.name` when `notes` is empty),
+/// sorted deterministically by `(tag.order ASC, tag.score DESC, tag.name ASC)`.
 fn format_kanji_stats(
     tags: &HashMap<(i64, String), DictTag>,
     dictionary_id: i64,
@@ -1423,7 +2041,7 @@ fn format_kanji_stats(
     else {
         return String::new();
     };
-    stats
+    let mut entries: Vec<(&DictTag, String)> = stats
         .iter()
         .filter_map(|(name, value)| {
             let tag = tags.get(&(dictionary_id, name.clone()))?;
@@ -1438,7 +2056,26 @@ fn format_kanji_stats(
                 | serde_json::Value::Array(_)
                 | serde_json::Value::Object(_) => return None,
             };
-            (!value.is_empty()).then(|| format!("{}: {value}", tag.name))
+            (!value.is_empty()).then_some((tag, value))
+        })
+        .collect();
+
+    entries.sort_by(|(a, _), (b, _)| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    entries
+        .into_iter()
+        .map(|(tag, value)| {
+            let label = if tag.notes.is_empty() {
+                tag.name.as_str()
+            } else {
+                tag.notes.as_str()
+            };
+            format!("{label}: {value}")
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -1463,7 +2100,17 @@ fn format_dictionary_tags(
             selected.push(tag.clone());
         }
     }
-    format_tags(&selected)
+    selected.sort_by(|a, b| {
+        a.order
+            .cmp(&b.order)
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    selected
+        .into_iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn rich_node_text(node: &serde_json::Value) -> String {
@@ -1471,10 +2118,16 @@ fn rich_node_text(node: &serde_json::Value) -> String {
         serde_json::Value::String(value) => strip_glossary_markup(value),
         serde_json::Value::Array(items) => items.iter().map(rich_node_text).collect(),
         serde_json::Value::Object(map) => {
-            if matches!(map.get("tag").and_then(serde_json::Value::as_str), Some("rt" | "rp" | "img")) {
+            if matches!(
+                map.get("tag").and_then(serde_json::Value::as_str),
+                Some("rt" | "rp" | "img")
+            ) {
                 return String::new();
             }
-            map.get("content").or_else(|| map.get("text")).map(rich_node_text).unwrap_or_default()
+            map.get("content")
+                .or_else(|| map.get("text"))
+                .map(rich_node_text)
+                .unwrap_or_default()
         }
         _ => String::new(),
     }
@@ -1486,7 +2139,11 @@ fn parse_rich_glossary_value(value: &serde_json::Value) -> Vec<GlossaryBlock> {
     fn push(blocks: &mut Vec<GlossaryBlock>, text: String, kind: i32, href: &str) {
         let text = text.trim().trim_start_matches(['◦', '•']).trim().to_owned();
         if !text.is_empty() {
-            blocks.push(GlossaryBlock { text, kind, href: href.to_owned() });
+            blocks.push(GlossaryBlock {
+                text,
+                kind,
+                href: href.to_owned(),
+            });
         }
     }
     fn walk(node: &serde_json::Value, blocks: &mut Vec<GlossaryBlock>) {
@@ -1497,43 +2154,76 @@ fn parse_rich_glossary_value(value: &serde_json::Value) -> Vec<GlossaryBlock> {
                 }
             }
             serde_json::Value::Array(items) => {
-                for item in items { walk(item, blocks); }
+                for item in items {
+                    walk(item, blocks);
+                }
             }
             serde_json::Value::Object(map) => {
                 let tag = map.get("tag").and_then(serde_json::Value::as_str).unwrap_or("");
                 let data = map.get("data").and_then(serde_json::Value::as_object);
-                if data.and_then(|data| data.get("content")).and_then(serde_json::Value::as_str) == Some("examples") {
+                if data
+                    .and_then(|data| data.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("examples")
+                {
                     return;
                 }
-                let Some(content) = map.get("content") else { return; };
+                let Some(content) = map.get("content") else {
+                    return;
+                };
                 match tag {
-                    "rt" | "rp" | "img" => {},
+                    "rt" | "rp" | "img" => {}
                     "li" => push(blocks, rich_node_text(content), 2, ""),
-                    "a" => push(blocks, rich_node_text(content), 3,
-                        map.get("href").and_then(serde_json::Value::as_str).unwrap_or("")),
+                    "a" => push(
+                        blocks,
+                        rich_node_text(content),
+                        3,
+                        map.get("href").and_then(serde_json::Value::as_str).unwrap_or(""),
+                    ),
                     "span" => {
-                        let has_link = content.as_array().is_some_and(|items| items.iter().any(|item|
-                            item.get("tag").and_then(serde_json::Value::as_str) == Some("a")));
-                        if has_link { walk(content, blocks); }
-                        else {
-                            let bold = map.get("style").and_then(|style| style.get("fontWeight"))
-                                .and_then(serde_json::Value::as_str) == Some("bold")
-                                || content.as_array().is_some_and(|items| items.iter().any(|item|
-                                    item.get("style").and_then(|style| style.get("fontWeight"))
-                                        .and_then(serde_json::Value::as_str) == Some("bold")));
+                        let has_link = content.as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("tag").and_then(serde_json::Value::as_str) == Some("a")
+                            })
+                        });
+                        if has_link {
+                            walk(content, blocks);
+                        } else {
+                            let bold = map
+                                .get("style")
+                                .and_then(|style| style.get("fontWeight"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("bold")
+                                || content.as_array().is_some_and(|items| {
+                                    items.iter().any(|item| {
+                                        item.get("style")
+                                            .and_then(|style| style.get("fontWeight"))
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("bold")
+                                    })
+                                });
                             push(blocks, rich_node_text(content), if bold { 1 } else { 0 }, "");
                         }
                     }
-                    "div" if data.and_then(|data| data.get("name")).and_then(serde_json::Value::as_str) == Some("definition") =>
-                        push(blocks, rich_node_text(content), 0, ""),
+                    "div"
+                        if data
+                            .and_then(|data| data.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("definition") =>
+                    {
+                        push(blocks, rich_node_text(content), 0, "");
+                    }
                     "div" | "ul" | "ol" => walk(content, blocks),
                     _ => {
-                        if content.is_string() { push(blocks, rich_node_text(content), 0, ""); }
-                        else { walk(content, blocks); }
+                        if content.is_string() {
+                            push(blocks, rich_node_text(content), 0, "");
+                        } else {
+                            walk(content, blocks);
+                        }
                     }
                 }
             }
-            _ => {},
+            _ => {}
         }
     }
     let mut blocks = Vec::new();
@@ -1545,10 +2235,17 @@ pub fn parse_rich_glossary(raw: &str) -> Vec<GlossaryBlock> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
         parse_rich_glossary_value(&value)
     } else {
-        strip_glossary_markup(raw).lines().filter_map(|line| {
-            let text = line.trim();
-            (!text.is_empty()).then(|| GlossaryBlock { text: text.to_owned(), kind: 0, href: String::new() })
-        }).collect()
+        strip_glossary_markup(raw)
+            .lines()
+            .filter_map(|line| {
+                let text = line.trim();
+                (!text.is_empty()).then(|| GlossaryBlock {
+                    text: text.to_owned(),
+                    kind: 0,
+                    href: String::new(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1560,7 +2257,9 @@ pub fn parse_glossary_entry(raw: &str) -> (String, String, String) {
 }
 
 fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, String, String) {
-    let items = value.as_array().map_or_else(|| vec![value], |items| items.iter().collect());
+    let items = value
+        .as_array()
+        .map_or_else(|| vec![value], |items| items.iter().collect());
     let mut senses = Vec::new();
     let mut ex_ja = Vec::new();
     let mut ex_en = Vec::new();
@@ -1568,9 +2267,11 @@ fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, String, Str
     fn extract_plain_text(node: &serde_json::Value) -> String {
         match node {
             serde_json::Value::String(text) => strip_glossary_markup(text),
-            serde_json::Value::Array(items) => {
-                items.iter().map(extract_plain_text).collect::<Vec<_>>().join("")
-            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(extract_plain_text)
+                .collect::<Vec<_>>()
+                .join(""),
             serde_json::Value::Object(map) => {
                 if let Some(tag) = map.get("tag").and_then(serde_json::Value::as_str) {
                     if tag == "rt" || tag == "rp" {
@@ -1590,6 +2291,9 @@ fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, String, Str
     }
 
     for item in items {
+        if item.is_array() {
+            continue;
+        }
         match item {
             serde_json::Value::String(text) => {
                 for line in text.split('\n') {
@@ -1604,7 +2308,8 @@ fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, String, Str
                 }
             }
             serde_json::Value::Object(map)
-                if map.get("type").and_then(serde_json::Value::as_str) == Some("structured-content") =>
+                if map.get("type").and_then(serde_json::Value::as_str)
+                    == Some("structured-content") =>
             {
                 let content_nodes = match map.get("content") {
                     Some(serde_json::Value::Array(arr)) => arr.iter().collect::<Vec<_>>(),

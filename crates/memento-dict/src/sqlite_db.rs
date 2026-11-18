@@ -1,4 +1,4 @@
-//! Pure Rust SQLite Yomichan query engine and cache validator.
+//! Pure Rust SQLite Yomichan/Yomitan query engine, batched UTF-8 helpers, and cache validator.
 
 use std::collections::HashSet;
 use std::ffi::{c_char, c_int, CStr, CString};
@@ -8,15 +8,16 @@ use std::time::Duration;
 
 pub use rusqlite;
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OpenFlags, Row};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, Row};
 
 pub use rusqlite::ffi::{
     sqlite3, sqlite3_errmsg, sqlite3_exec, sqlite3_stmt, SQLITE_DONE, SQLITE_OK, SQLITE_ROW,
 };
 
-pub use crate::databasemanager::TermQueryKind;
+pub use crate::databasemanager::{PitchEntryDetail, TermQueryKind};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 /// Closes a raw SQLite handle via `sqlite3_close_v2`.
 ///
@@ -83,7 +84,7 @@ pub unsafe fn sqlite3_open_v2(
 }
 
 /// Opens a read-only `rusqlite::Connection` configured with `busy_timeout(5s)`,
-/// `PRAGMA temp_store = MEMORY`, and `PRAGMA synchronous = NORMAL`.
+/// `PRAGMA temp_store = MEMORY`, `PRAGMA synchronous = NORMAL`, and statement caching.
 pub fn open_read_only_connection(path: &Path) -> Result<Connection, DictError> {
     if path.as_os_str().is_empty() {
         return Err(DictError::Other("Database path is empty".to_owned()));
@@ -96,9 +97,10 @@ pub fn open_read_only_connection(path: &Path) -> Result<Connection, DictError> {
     Ok(conn)
 }
 
-/// Applies busy timeout and in-memory temp store PRAGMAs on a read-only connection.
+/// Applies busy timeout, in-memory temp store PRAGMAs, and statement cache capacity on a read-only connection.
 pub fn configure_read_only_connection(conn: &Connection) -> Result<(), DictError> {
     conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
@@ -121,6 +123,7 @@ pub fn open_read_write_connection(path: &Path) -> Result<Connection, DictError> 
 /// Applies WAL, synchronous, temp_store, and busy_timeout PRAGMAs on a writable connection.
 pub fn configure_read_write_connection(conn: &Connection) -> Result<(), DictError> {
     conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
@@ -228,6 +231,43 @@ pub struct TermRow {
     pub reading: Vec<u16>,
 }
 
+/// Complete UTF-8 `term_bank` row including `rules` for fast batched lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchTermRow {
+    pub rowid: i64,
+    pub dic_id: i64,
+    pub expression: String,
+    pub reading: String,
+    pub def_tags: String,
+    pub term_tags: String,
+    pub rules: String,
+    pub score: i64,
+    pub glossary: String,
+    pub sequence: i64,
+}
+
+/// Raw UTF-8 metadata row fetched from `term_meta_bank` or `kanji_meta_bank`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTermMetaRow {
+    pub dic_id: i64,
+    pub expression: String,
+    pub mode: String,
+    pub blob_type: i32,
+    pub data: Vec<u8>,
+}
+
+/// Complete UTF-8 `kanji_bank` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KanjiUtf8Row {
+    pub dic_id: i64,
+    pub onyomi: String,
+    pub kunyomi: String,
+    pub tags: String,
+    pub meanings: Vec<String>,
+    pub raw_meanings: String,
+    pub stats: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KanjiRow {
     pub dic_id: i64,
@@ -244,18 +284,30 @@ pub struct FreqRow {
     pub frequency: Vec<u16>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PitchRow {
     pub dic_id: i64,
     pub mora: Vec<Vec<u16>>,
     pub positions: Vec<i32>,
+    pub nasal: Vec<usize>,
+    pub devoice: Vec<usize>,
+    pub tags: Vec<String>,
+    pub entries: Vec<PitchEntryDetail>,
+}
+
+/// Parsed UTF-8 frequency value with homograph reading match info and raw numeric value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedFreqUtf8 {
+    pub matched: bool,
+    pub exact_reading_match: bool,
+    pub has_reading_key: bool,
+    pub display: String,
+    pub numeric: Option<f64>,
 }
 
 /// RAII statement handle for callers holding a borrowed `*mut sqlite3`.
 pub struct Statement {
     stmt: *mut sqlite3_stmt,
-    // Keep bound CStrings alive for `SQLITE_STATIC` (`None`) until `reset()` or `drop()`.
-    // Declared after `stmt` and cleared after `sqlite3_finalize` / `sqlite3_clear_bindings`.
     bound_strings: Vec<CString>,
 }
 
@@ -287,7 +339,10 @@ impl Statement {
                     CStr::from_ptr(err).to_string_lossy().into_owned()
                 }
             };
-            return Err(DictError::Sqlite { code: rc, message: msg });
+            return Err(DictError::Sqlite {
+                code: rc,
+                message: msg,
+            });
         }
         Ok(Self {
             stmt,
@@ -299,9 +354,8 @@ impl Statement {
         let c_str = CString::new(text).map_err(|e| DictError::Other(e.to_string()))?;
         let len = c_int::try_from(c_str.as_bytes().len())
             .map_err(|_| DictError::Other("Bound text exceeds c_int::MAX".to_owned()))?;
-        let rc = unsafe {
-            rusqlite::ffi::sqlite3_bind_text(self.stmt, index, c_str.as_ptr(), len, None)
-        };
+        let rc =
+            unsafe { rusqlite::ffi::sqlite3_bind_text(self.stmt, index, c_str.as_ptr(), len, None) };
         if rc != SQLITE_OK {
             return Err(DictError::Sqlite {
                 code: rc,
@@ -469,6 +523,20 @@ where
     }
 }
 
+fn row_text_utf8(row: &Row<'_>, idx: usize) -> rusqlite::Result<String> {
+    match row.get_ref(idx)? {
+        ValueRef::Null => Ok(String::new()),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            Ok(String::from_utf8_lossy(bytes).into_owned())
+        }
+        other => Err(rusqlite::Error::InvalidColumnType(
+            idx,
+            "text".into(),
+            other.data_type(),
+        )),
+    }
+}
+
 fn row_text_u16(row: &Row<'_>, idx: usize) -> rusqlite::Result<Vec<u16>> {
     match row.get_ref(idx)? {
         ValueRef::Null => Ok(Vec::new()),
@@ -502,8 +570,8 @@ fn query_table_count(conn: &Connection, sql: &str) -> Result<i64, DictError> {
     Ok(count)
 }
 
-/// Validates database schema, reads dictionary meta and table counts on a `rusqlite::Connection`.
-pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
+/// Validates that all 7 required Yomitan tables exist on `conn`.
+pub fn validate_schema_conn(conn: &Connection) -> Result<(), DictError> {
     let mut stmt = conn.prepare_cached("SELECT name FROM sqlite_master WHERE type='table';")?;
     let mut table_names = HashSet::new();
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -528,6 +596,19 @@ pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
             )));
         }
     }
+    Ok(())
+}
+
+/// Reads `PRAGMA data_version;` using a cached prepared statement.
+pub fn query_data_version_conn(conn: &Connection) -> Result<i64, DictError> {
+    let mut stmt = conn.prepare_cached("PRAGMA data_version;")?;
+    let v = stmt.query_row([], |row| row.get(0))?;
+    Ok(v)
+}
+
+/// Validates database schema, reads dictionary meta and table counts on a `rusqlite::Connection`.
+pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
+    validate_schema_conn(conn)?;
 
     let mut dict_stmt = conn.prepare_cached(
         "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) AS disabled FROM directory;",
@@ -566,6 +647,209 @@ pub fn init_cache(db: *mut sqlite3) -> Result<CacheInfo, DictError> {
     }
     let conn = unsafe { Connection::from_handle(db) }?;
     init_cache_conn(&conn)
+}
+
+macro_rules! term_batch_sql {
+    ($placeholders:literal) => {
+        concat!(
+            "SELECT rowid, dic_id, expression, reading, def_tags, term_tags, rules, score, glossary, sequence \
+             FROM term_bank \
+             WHERE expression IN (",
+            $placeholders,
+            ") AND NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = term_bank.dic_id) \
+             UNION ALL \
+             SELECT rowid, dic_id, expression, reading, def_tags, term_tags, rules, score, glossary, sequence \
+             FROM term_bank \
+             WHERE reading IN (",
+            $placeholders,
+            ") AND NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = term_bank.dic_id);"
+        )
+    };
+}
+
+macro_rules! meta_batch_sql {
+    ($placeholders:literal) => {
+        concat!(
+            "SELECT dic_id, expression, mode, type, data \
+             FROM term_meta_bank \
+             WHERE expression IN (",
+            $placeholders,
+            ") AND NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = term_meta_bank.dic_id);"
+        )
+    };
+}
+
+const TERM_BATCH_1: &str = term_batch_sql!("?1");
+const TERM_BATCH_2: &str = term_batch_sql!("?1,?2");
+const TERM_BATCH_4: &str = term_batch_sql!("?1,?2,?3,?4");
+const TERM_BATCH_8: &str = term_batch_sql!("?1,?2,?3,?4,?5,?6,?7,?8");
+const TERM_BATCH_16: &str =
+    term_batch_sql!("?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16");
+const TERM_BATCH_32: &str = term_batch_sql!(
+    "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
+     ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32"
+);
+const TERM_BATCH_64: &str = term_batch_sql!(
+    "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
+     ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,\
+     ?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,\
+     ?49,?50,?51,?52,?53,?54,?55,?56,?57,?58,?59,?60,?61,?62,?63,?64"
+);
+
+const META_BATCH_1: &str = meta_batch_sql!("?1");
+const META_BATCH_2: &str = meta_batch_sql!("?1,?2");
+const META_BATCH_4: &str = meta_batch_sql!("?1,?2,?3,?4");
+const META_BATCH_8: &str = meta_batch_sql!("?1,?2,?3,?4,?5,?6,?7,?8");
+const META_BATCH_16: &str =
+    meta_batch_sql!("?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16");
+const META_BATCH_32: &str = meta_batch_sql!(
+    "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
+     ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32"
+);
+const META_BATCH_64: &str = meta_batch_sql!(
+    "?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,\
+     ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,\
+     ?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,\
+     ?49,?50,?51,?52,?53,?54,?55,?56,?57,?58,?59,?60,?61,?62,?63,?64"
+);
+
+fn select_batch_bucket(len: usize) -> (usize, &'static str, &'static str) {
+    if len <= 1 {
+        (1, TERM_BATCH_1, META_BATCH_1)
+    } else if len <= 2 {
+        (2, TERM_BATCH_2, META_BATCH_2)
+    } else if len <= 4 {
+        (4, TERM_BATCH_4, META_BATCH_4)
+    } else if len <= 8 {
+        (8, TERM_BATCH_8, META_BATCH_8)
+    } else if len <= 16 {
+        (16, TERM_BATCH_16, META_BATCH_16)
+    } else if len <= 32 {
+        (32, TERM_BATCH_32, META_BATCH_32)
+    } else {
+        (64, TERM_BATCH_64, META_BATCH_64)
+    }
+}
+
+/// Fetches all enabled `term_bank` rows (including `rules`) whose `expression` or `reading`
+/// matches any key in `keys`, using bucketed `IN (...)` + `prepare_cached` indexed lookups.
+pub fn query_term_details_batch_conn(
+    conn: &Connection,
+    keys: &[String],
+) -> Result<Vec<BatchTermRow>, DictError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen_rowids: HashSet<i64> = HashSet::new();
+    let mut results: Vec<BatchTermRow> = Vec::new();
+
+    for chunk in keys.chunks(64) {
+        let (bucket, sql, _) = select_batch_bucket(chunk.len());
+        let last = &chunk[chunk.len() - 1];
+        let mut stmt = conn.prepare_cached(sql)?;
+        let iter_params = (0..bucket).map(|i| chunk.get(i).unwrap_or(last).as_str());
+        let mut rows = stmt.query(params_from_iter(iter_params))?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            if !seen_rowids.insert(rowid) {
+                continue;
+            }
+            results.push(BatchTermRow {
+                rowid,
+                dic_id: row.get(1)?,
+                expression: row_text_utf8(row, 2)?,
+                reading: row_text_utf8(row, 3)?,
+                def_tags: row_text_utf8(row, 4)?,
+                term_tags: row_text_utf8(row, 5)?,
+                rules: row_text_utf8(row, 6)?,
+                score: row.get(7)?,
+                glossary: row_text_utf8(row, 8)?,
+                sequence: row.get(9)?,
+            });
+        }
+    }
+
+    results.sort_by_key(|r| (r.dic_id, r.sequence, r.rowid));
+    Ok(results)
+}
+
+/// Fetches all enabled `term_meta_bank` rows (`freq` and `pitch`) for `expressions`
+/// using bucketed `IN (...)` + `prepare_cached`.
+pub fn query_term_meta_batch_conn(
+    conn: &Connection,
+    expressions: &[String],
+) -> Result<Vec<RawTermMetaRow>, DictError> {
+    if expressions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut results: Vec<RawTermMetaRow> = Vec::new();
+    for chunk in expressions.chunks(64) {
+        let (bucket, _, sql) = select_batch_bucket(chunk.len());
+        let last = &chunk[chunk.len() - 1];
+        let mut stmt = conn.prepare_cached(sql)?;
+        let iter_params = (0..bucket).map(|i| chunk.get(i).unwrap_or(last).as_str());
+        let mut rows = stmt.query(params_from_iter(iter_params))?;
+        while let Some(row) = rows.next()? {
+            results.push(RawTermMetaRow {
+                dic_id: row.get(0)?,
+                expression: row_text_utf8(row, 1)?,
+                mode: row_text_utf8(row, 2)?,
+                blob_type: row.get(3)?,
+                data: row_bytes(row, 4)?,
+            });
+        }
+    }
+    Ok(results)
+}
+
+/// Queries `term_bank.rules` for `(expression, reading)` across enabled dictionaries.
+/// Returns `Ok(Some(tokens))` if at least one `term_bank` row matched `(expression, reading)`
+/// (including V4 kana-only rows where `reading = ''`), or `Ok(None)` if no DB row matched.
+pub fn query_term_rules_conn(
+    conn: &Connection,
+    expression: &str,
+    reading: &str,
+) -> Result<Option<Vec<String>>, DictError> {
+    const SQL: &str = "SELECT rules FROM term_bank \
+        WHERE expression = ?1 AND reading = ?2 \
+          AND NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = term_bank.dic_id);";
+
+    let mut found_row = false;
+    let mut tokens: Vec<String> = Vec::new();
+
+    {
+        let mut stmt = conn.prepare_cached(SQL)?;
+        let mut rows = stmt.query(params![expression, reading])?;
+        while let Some(row) = rows.next()? {
+            found_row = true;
+            let rules_str = row_text_utf8(row, 0)?;
+            for tok in rules_str.split_whitespace() {
+                if !tok.is_empty() && !tokens.iter().any(|existing| existing == tok) {
+                    tokens.push(tok.to_owned());
+                }
+            }
+        }
+    }
+
+    if !found_row
+        && !reading.is_empty()
+        && crate::normalize::normalize_reading_str(expression)
+            == crate::normalize::normalize_reading_str(reading)
+    {
+        let mut stmt = conn.prepare_cached(SQL)?;
+        let mut rows = stmt.query(params![expression, ""])?;
+        while let Some(row) = rows.next()? {
+            found_row = true;
+            let rules_str = row_text_utf8(row, 0)?;
+            for tok in rules_str.split_whitespace() {
+                if !tok.is_empty() && !tokens.iter().any(|existing| existing == tok) {
+                    tokens.push(tok.to_owned());
+                }
+            }
+        }
+    }
+
+    Ok(found_row.then_some(tokens))
 }
 
 /// Prepares and executes the `terms` SQL query on a `rusqlite::Connection`.
@@ -645,6 +929,61 @@ pub fn query_terms(
     query_terms_conn(&conn, plan, results)
 }
 
+/// Executes UTF-8 kanji queries on `conn` via `prepare_cached`.
+pub fn query_kanji_utf8_conn(
+    conn: &Connection,
+    kanji: &str,
+) -> Result<Vec<KanjiUtf8Row>, DictError> {
+    const QUERY: &str =
+        "SELECT dic_id, onyomi, kunyomi, tags, meanings, stats FROM kanji_bank \
+         WHERE NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = kanji_bank.dic_id) \
+           AND char = ?1;";
+
+    let mut stmt = conn.prepare_cached(QUERY)?;
+    let mut results = Vec::new();
+    let mut rows = stmt.query(params![kanji])?;
+    while let Some(row) = rows.next()? {
+        let meanings_blob = row_bytes(row, 4)?;
+        let raw_meanings = String::from_utf8_lossy(&meanings_blob).into_owned();
+        let meanings = crate::databasemanager::json_array_to_utf8_strings(&meanings_blob);
+        results.push(KanjiUtf8Row {
+            dic_id: row.get(0)?,
+            onyomi: row_text_utf8(row, 1)?,
+            kunyomi: row_text_utf8(row, 2)?,
+            tags: row_text_utf8(row, 3)?,
+            meanings,
+            raw_meanings,
+            stats: row_text_utf8(row, 5)?,
+        });
+    }
+    Ok(results)
+}
+
+/// Queries `kanji_meta_bank` (`mode = 'freq'`) in UTF-8 via `prepare_cached`.
+pub fn query_kanji_meta_freq_utf8_conn(
+    conn: &Connection,
+    kanji: &str,
+) -> Result<Vec<RawTermMetaRow>, DictError> {
+    const QUERY: &str =
+        "SELECT dic_id, expression, mode, type, data FROM kanji_meta_bank \
+         WHERE NOT EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = kanji_meta_bank.dic_id) \
+           AND expression = ?1 AND mode = 'freq';";
+
+    let mut stmt = conn.prepare_cached(QUERY)?;
+    let mut results = Vec::new();
+    let mut rows = stmt.query(params![kanji])?;
+    while let Some(row) = rows.next()? {
+        results.push(RawTermMetaRow {
+            dic_id: row.get(0)?,
+            expression: row_text_utf8(row, 1)?,
+            mode: row_text_utf8(row, 2)?,
+            blob_type: row.get(3)?,
+            data: row_bytes(row, 4)?,
+        });
+    }
+    Ok(results)
+}
+
 /// Executes kanji queries on a `rusqlite::Connection`.
 pub fn query_kanji_conn(
     conn: &Connection,
@@ -714,6 +1053,31 @@ pub fn get_frequencies(
     get_frequencies_with_sql(db, None, term, reading, results)
 }
 
+/// Queries `kanji_meta_bank` frequency rows on a `rusqlite::Connection`.
+pub fn get_kanji_frequencies_conn(
+    conn: &Connection,
+    kanji: &[u16],
+    results: &mut Vec<FreqRow>,
+) -> Result<(), DictError> {
+    const KANJI_FREQ_SQL: &str = "SELECT dic_id, data, type FROM kanji_meta_bank \
+         WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND \
+         (expression = ?1 AND mode = 'freq');";
+    execute_freq_query(conn, KANJI_FREQ_SQL, kanji, &[], results)
+}
+
+/// Queries `kanji_meta_bank` frequency rows on a raw SQLite handle.
+pub fn get_kanji_frequencies(
+    db: *mut sqlite3,
+    kanji: &[u16],
+    results: &mut Vec<FreqRow>,
+) -> Result<(), DictError> {
+    if db.is_null() {
+        return Err(DictError::NullPointer);
+    }
+    let conn = unsafe { Connection::from_handle(db) }?;
+    get_kanji_frequencies_conn(&conn, kanji, results)
+}
+
 /// Queries exactly the requested metadata table on a `rusqlite::Connection`.
 pub fn get_frequencies_with_sql_conn(
     conn: &Connection,
@@ -746,112 +1110,187 @@ pub fn get_frequencies_with_sql(
     get_frequencies_with_sql_conn(&conn, custom_sql, term, reading, results)
 }
 
-fn parse_freq_blob(blob_type: i32, blob: &[u8], reading: &[u16]) -> Option<Vec<u16>> {
+fn parse_numeric_from_freq_text(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed {
+        "★" => return Some(20.0),
+        "★★" => return Some(40.0),
+        "★★★" => return Some(60.0),
+        "★★★★" => return Some(80.0),
+        "★★★★★" => return Some(100.0),
+        _ => {}
+    }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i == digits_start || (i == digits_start + 1 && bytes[digits_start] == b'.') {
+        return None;
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let exp_pos = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let exp_digits = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_digits {
+            i = exp_pos;
+        }
+    }
+    trimmed[..i]
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// Parses a `term_meta_bank` / `kanji_meta_bank` `freq` blob in UTF-8 with strict homograph
+/// reading matching and exact numeric extraction.
+#[must_use]
+pub fn parse_freq_blob_utf8(
+    blob_type: i32,
+    blob: &[u8],
+    expression: &str,
+    caller_reading: &str,
+) -> ParsedFreqUtf8 {
     match blob_type {
-        // YOMI_BLOB_TYPE_INT (1)
         1 => {
             if blob.len() >= 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&blob[..8]);
                 let val = i64::from_ne_bytes(arr);
-                (val >= 0).then(|| val.to_string().encode_utf16().collect())
-            } else {
-                None
+                if val >= 0 {
+                    return ParsedFreqUtf8 {
+                        matched: true,
+                        exact_reading_match: false,
+                        has_reading_key: false,
+                        display: val.to_string(),
+                        numeric: (val > 0).then_some(val as f64),
+                    };
+                }
             }
+            ParsedFreqUtf8::default()
         }
-        // YOMI_BLOB_TYPE_STRING (2)
         2 => {
             let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-            let s = std::str::from_utf8(&blob[..null_pos]).unwrap_or("");
-            Some(s.encode_utf16().collect())
+            let Ok(s) = std::str::from_utf8(&blob[..null_pos]) else {
+                return ParsedFreqUtf8::default();
+            };
+            ParsedFreqUtf8 {
+                matched: true,
+                exact_reading_match: false,
+                has_reading_key: false,
+                display: s.to_owned(),
+                numeric: parse_numeric_from_freq_text(s).filter(|&v| v > 0.0),
+            }
         }
-        // YOMI_BLOB_TYPE_DOUBLE (3)
         3 => {
             if blob.len() >= 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&blob[..8]);
                 let val = f64::from_ne_bytes(arr);
-                (val.is_finite() && val >= 0.0)
-                    .then(|| format_g(val, 6).encode_utf16().collect())
-            } else {
-                None
+                if val.is_finite() && val >= 0.0 {
+                    return ParsedFreqUtf8 {
+                        matched: true,
+                        exact_reading_match: false,
+                        has_reading_key: false,
+                        display: format_g(val, 6),
+                        numeric: (val > 0.0).then_some(val),
+                    };
+                }
             }
+            ParsedFreqUtf8::default()
         }
-        // YOMI_BLOB_TYPE_OBJECT (4)
         4 => {
             let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
             let slice = &blob[..null_pos];
-            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(slice) {
-                let has_reading_key = obj.get("reading").and_then(|v| v.as_str()).is_some();
-                let obj_reading: Vec<u16> = obj
-                    .get("reading")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.encode_utf16().collect())
-                    .unwrap_or_default();
+            let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(slice) else {
+                return ParsedFreqUtf8::default();
+            };
 
-                let mut freq_kind = 0i32;
-                let mut freq_val_str: Vec<u16> = Vec::new();
-                let mut has_nested_display = false;
-                let mut nested_display_str: Vec<u16> = Vec::new();
-                let mut has_nested_value_num = false;
-                let mut nested_value_num_str: Vec<u16> = Vec::new();
-
-                if let Some(freq_val) = obj.get("frequency") {
-                    if freq_val.is_number() {
-                        freq_kind = 1;
-                        freq_val_str = format_json_number(freq_val).encode_utf16().collect();
-                    } else if let Some(s) = freq_val.as_str() {
-                        freq_kind = 2;
-                        freq_val_str = s.encode_utf16().collect();
-                    } else if let Some(nested) = freq_val.as_object() {
-                        freq_kind = 3;
-                        if let Some(d) = nested.get("displayValue").and_then(|v| v.as_str()) {
-                            has_nested_display = true;
-                            nested_display_str = d.encode_utf16().collect();
-                        }
-                        if let Some(v) = nested.get("value") {
-                            if v.is_number() {
-                                has_nested_value_num = true;
-                                nested_value_num_str = format_json_number(v).encode_utf16().collect();
-                            }
-                        }
-                    }
-                }
-
-                let has_top_display = obj.get("displayValue").and_then(|v| v.as_str()).is_some();
-                let top_display_str: Vec<u16> = obj
-                    .get("displayValue")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.encode_utf16().collect())
-                    .unwrap_or_default();
-
-                let has_top_value_num = obj.get("value").map(|v| v.is_number()).unwrap_or(false);
-                let top_value_num_str: Vec<u16> = obj
-                    .get("value")
-                    .filter(|v| v.is_number())
-                    .map(|v| format_json_number(v).encode_utf16().collect())
-                    .unwrap_or_default();
-
-                crate::databasemanager::extract_frequency_object(
+            let meta_reading = obj.get("reading").and_then(|v| v.as_str());
+            let has_reading_key = meta_reading.is_some();
+            let (matched, exact_reading_match) =
+                crate::databasemanager::metadata_reading_matches(
+                    expression,
+                    caller_reading,
+                    meta_reading,
+                );
+            if !matched {
+                return ParsedFreqUtf8 {
                     has_reading_key,
-                    &obj_reading,
-                    reading,
-                    freq_kind,
-                    &freq_val_str,
-                    has_nested_display,
-                    &nested_display_str,
-                    has_nested_value_num,
-                    &nested_value_num_str,
-                    has_top_display,
-                    &top_display_str,
-                    has_top_value_num,
-                    &top_value_num_str,
-                )
+                    ..ParsedFreqUtf8::default()
+                };
+            }
+
+            let mut display = String::new();
+            let mut numeric: Option<f64> = None;
+
+            if let Some(freq_val) = obj.get("frequency") {
+                if let Some(n) = freq_val.as_f64() {
+                    display = format_g(n, 6);
+                    if n.is_finite() && n > 0.0 {
+                        numeric = Some(n);
+                    }
+                } else if let Some(s) = freq_val.as_str() {
+                    display = s.to_owned();
+                    numeric = parse_numeric_from_freq_text(s).filter(|&v| v > 0.0);
+                } else if let Some(nested) = freq_val.as_object() {
+                    let nested_disp = nested.get("displayValue").and_then(|v| v.as_str());
+                    let nested_num = nested.get("value").and_then(|v| v.as_f64());
+                    if let Some(d) = nested_disp {
+                        display = d.to_owned();
+                    } else if let Some(n) = nested_num {
+                        display = format_g(n, 6);
+                    } else {
+                        return ParsedFreqUtf8 {
+                            has_reading_key,
+                            ..ParsedFreqUtf8::default()
+                        };
+                    }
+                    numeric = nested_num
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .or_else(|| parse_numeric_from_freq_text(&display).filter(|&v| v > 0.0));
+                }
             } else {
-                None
+                let top_disp = obj.get("displayValue").and_then(|v| v.as_str());
+                let top_num = obj.get("value").and_then(|v| v.as_f64());
+                if let Some(d) = top_disp {
+                    display = d.to_owned();
+                } else if let Some(n) = top_num {
+                    display = format_g(n, 6);
+                }
+                numeric = top_num
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .or_else(|| parse_numeric_from_freq_text(&display).filter(|&v| v > 0.0));
+            }
+
+            ParsedFreqUtf8 {
+                matched: true,
+                exact_reading_match,
+                has_reading_key,
+                display,
+                numeric,
             }
         }
-        _ => None,
+        _ => ParsedFreqUtf8::default(),
     }
 }
 
@@ -863,14 +1302,19 @@ fn execute_freq_query(
     results: &mut Vec<FreqRow>,
 ) -> Result<(), DictError> {
     let term_s = String::from_utf16_lossy(term);
+    let reading_s = String::from_utf16_lossy(reading);
     let mut stmt = conn.prepare_cached(sql)?;
     let mut rows = stmt.query(params![&term_s])?;
     while let Some(row) = rows.next()? {
         let dic_id: i64 = row.get(0)?;
         let blob = row_bytes(row, 1)?;
         let blob_type: i32 = row.get(2)?;
-        if let Some(frequency) = parse_freq_blob(blob_type, &blob, reading) {
-            results.push(FreqRow { dic_id, frequency });
+        let parsed = parse_freq_blob_utf8(blob_type, &blob, &term_s, &reading_s);
+        if parsed.matched {
+            results.push(FreqRow {
+                dic_id,
+                frequency: parsed.display.encode_utf16().collect(),
+            });
         }
     }
     Ok(())
@@ -917,11 +1361,8 @@ pub fn format_g(value: f64, precision: u32) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_json_number(val: &serde_json::Value) -> String {
-    // QJsonValue::toDouble() converts even integral JSON values to double.
-    // The C++ frequency renderer always passes that double to
-    // QString::number(value), whose default precision is six significant
-    // digits; displaying the serde_json integer directly changes ranks.
     val.as_f64().map_or_else(String::new, |value| format_g(value, 6))
 }
 
@@ -952,6 +1393,10 @@ pub fn add_pitches_conn(
                 dic_id,
                 mora: parsed.mora,
                 positions: parsed.positions,
+                nasal: parsed.nasal,
+                devoice: parsed.devoice,
+                tags: parsed.tags,
+                entries: parsed.entries,
             });
         }
     }
@@ -1047,18 +1492,17 @@ mod tests {
     }
 
     #[test]
-    fn test_query_terms_scenarios() {
+    fn test_query_terms_scenarios_and_batch_rules() {
         let db = create_test_db();
         db.execute_batch(
             "
             INSERT INTO directory VALUES (1, 'TestDict', 3, 'rev1', 0);
-            INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', '', 10, '[\"to eat\"]', 1, '');
+            INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', 'v1', 10, '[\"to eat\"]', 1, '');
             INSERT INTO term_bank VALUES (1, 'カタカナ', 'かたかな', '', '', 5, '[\"katakana\"]', 2, '');
             ",
         )
         .unwrap();
 
-        // 1. Plain search
         let raw = to_u16("食べる");
         let plan = TermQueryPlan::new(&raw, &raw);
         let mut results = Vec::new();
@@ -1067,7 +1511,6 @@ mod tests {
         assert_eq!(results[0].expression, to_u16("食べる"));
         assert_eq!(results[0].reading, to_u16("たべる"));
 
-        // 2. Katakana -> Hiragana search ("かたかな" finds "カタカナ")
         let raw_kata = to_u16("かたかな");
         let plan_kata = TermQueryPlan::new(&raw_kata, &raw_kata);
         let mut results_kata = Vec::new();
@@ -1075,7 +1518,6 @@ mod tests {
         assert_eq!(results_kata.len(), 1);
         assert_eq!(results_kata[0].expression, to_u16("カタカナ"));
 
-        // 3. Halfwidth -> Katakana search ("ｶﾀｶﾅ" finds "カタカナ")
         let raw_half = to_u16("ｶﾀｶﾅ");
         let nfkc_half = to_u16("カタカナ");
         let plan_half = TermQueryPlan::new(&raw_half, &nfkc_half);
@@ -1083,6 +1525,15 @@ mod tests {
         query_terms_conn(&db, &plan_half, &mut results_half).unwrap();
         assert_eq!(results_half.len(), 1);
         assert_eq!(results_half[0].expression, to_u16("カタカナ"));
+
+        let batch = query_term_details_batch_conn(
+            &db,
+            &["たべる".to_owned(), "カタカナ".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].rules, "v1");
+        assert_eq!(batch[1].rules, "");
     }
 
     #[test]
@@ -1097,6 +1548,11 @@ mod tests {
         let mut rows = Vec::new();
         get_frequencies_conn(&db, &to_u16("字"), &[], &mut rows).unwrap();
         assert!(rows.is_empty(), "the C++ term query reads only term_meta_bank");
+
+        // Explicit kanji frequency query reads kanji_meta_bank:
+        get_kanji_frequencies_conn(&db, &to_u16("字"), &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(String::from_utf16_lossy(&rows[0].frequency), "kanji rank");
     }
 
     #[test]
@@ -1142,13 +1598,14 @@ mod tests {
     }
 
     #[test]
-    fn test_get_frequencies_and_pitches() {
+    fn test_get_frequencies_and_pitches_with_nasal_devoice_and_homograph_guard() {
         let db = create_test_db();
         db.execute_batch(
             "
             INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
             INSERT INTO term_meta_bank VALUES (1, '食べる', 'freq', 4, '{\"reading\": \"たべる\", \"frequency\": 120}');
-            INSERT INTO term_meta_bank VALUES (1, '食べる', 'pitch', 4, '{\"reading\": \"たべる\", \"pitches\": [{\"position\": 2}]}');
+            INSERT INTO term_meta_bank VALUES (1, '食べる', 'pitch', 4, '{\"reading\": \"たべる\", \"pitches\": [{\"position\": 2, \"nasal\": [2], \"devoice\": [1], \"tags\": [\"v1\"]}]}');
+            INSERT INTO term_meta_bank VALUES (1, '人気', 'freq', 4, '{\"reading\": \"にんき\", \"frequency\": 300}');
             ",
         )
         .unwrap();
@@ -1159,12 +1616,21 @@ mod tests {
         assert_eq!(freqs[0].dic_id, 1);
         assert_eq!(freqs[0].frequency, to_u16("120"));
 
+        let mut homograph_freqs = Vec::new();
+        get_frequencies_conn(&db, &to_u16("人気"), &to_u16("ひとけ"), &mut homograph_freqs).unwrap();
+        assert!(homograph_freqs.is_empty());
+        get_frequencies_conn(&db, &to_u16("人気"), &[], &mut homograph_freqs).unwrap();
+        assert!(homograph_freqs.is_empty());
+
         let mut pitches = Vec::new();
         add_pitches_conn(&db, &to_u16("食べる"), &to_u16("たべる"), &mut pitches).unwrap();
         assert_eq!(pitches.len(), 1);
         assert_eq!(pitches[0].dic_id, 1);
         assert_eq!(pitches[0].mora, vec![to_u16("た"), to_u16("べ"), to_u16("る")]);
         assert_eq!(pitches[0].positions, vec![2]);
+        assert_eq!(pitches[0].nasal, vec![2]);
+        assert_eq!(pitches[0].devoice, vec![1]);
+        assert_eq!(pitches[0].tags, vec!["v1".to_owned()]);
     }
 
     #[test]
