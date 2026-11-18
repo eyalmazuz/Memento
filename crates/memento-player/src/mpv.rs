@@ -3,12 +3,17 @@
 //! as the C++ player; audio playback never borrows or replaces the movie handle.
 
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+
+use crate::controller::CliOption;
+use crate::events::{EngineEvent, PropertyChange, PropertyName, Track};
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 pub mod ffi {
@@ -556,16 +561,25 @@ struct CaptureJob {
     result: SyncSender<Result<RawFrame, String>>,
 }
 
+#[derive(Clone, Copy)]
+struct RawMpvHandle(*mut ffi::mpv_handle);
+unsafe impl Send for RawMpvHandle {}
+
 /// Created before rendering starts, then owned exclusively by the capture
 /// worker. Creating/destroying an mpv client can wait on the core too.
 struct ScreenshotClient {
     handle: *mut ffi::mpv_handle,
+    closing: Arc<AtomicBool>,
+    wake_handle: Arc<Mutex<Option<RawMpvHandle>>>,
 }
 
 unsafe impl Send for ScreenshotClient {}
 
 impl ScreenshotClient {
     fn capture(&self, subtitles: bool, id: u64) -> Result<RawFrame, String> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err("Player closed during screenshot capture".into());
+        }
         let mut args = [
             c"screenshot-raw".as_ptr(),
             if subtitles { c"subtitles".as_ptr() } else { c"video".as_ptr() },
@@ -576,6 +590,9 @@ impl ScreenshotClient {
         if status < 0 { return Err(screenshot_error(status)); }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
+            if self.closing.load(Ordering::Acquire) {
+                return Err("Player closed during screenshot capture".into());
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Err("mpv screenshot timed out waiting for a video frame".into());
@@ -595,6 +612,9 @@ impl ScreenshotClient {
                 }
                 ffi::MPV_EVENT_SHUTDOWN => return Err("Player closed during screenshot capture".into()),
                 ffi::MPV_EVENT_QUEUE_OVERFLOW => return Err("mpv screenshot event queue overflowed".into()),
+                ffi::MPV_EVENT_NONE if self.closing.load(Ordering::Acquire) => {
+                    return Err("Player closed during screenshot capture".into());
+                }
                 _ => {}
             }
         }
@@ -603,25 +623,50 @@ impl ScreenshotClient {
 
 impl Drop for ScreenshotClient {
     fn drop(&mut self) {
+        if let Ok(mut guard) = self.wake_handle.lock() {
+            *guard = None;
+        }
         unsafe { ffi::mpv_destroy(self.handle) };
     }
 }
 
-fn start_screenshot_worker(handle: *mut ffi::mpv_handle) -> Result<SyncSender<CaptureJob>, String> {
-    let handle = unsafe { ffi::mpv_create_weak_client(handle, c"memento-screenshots".as_ptr()) };
-    if handle.is_null() { return Err("Could not create mpv screenshot client".into()); }
-    let client = ScreenshotClient { handle };
+struct ScreenshotWorkerHandles {
+    jobs: SyncSender<CaptureJob>,
+    closing: Arc<AtomicBool>,
+    wake_handle: Arc<Mutex<Option<RawMpvHandle>>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn start_screenshot_worker(handle: *mut ffi::mpv_handle) -> Result<ScreenshotWorkerHandles, String> {
+    let weak_handle = unsafe { ffi::mpv_create_weak_client(handle, c"memento-screenshots".as_ptr()) };
+    if weak_handle.is_null() { return Err("Could not create mpv screenshot client".into()); }
+    let closing = Arc::new(AtomicBool::new(false));
+    let wake_handle = Arc::new(Mutex::new(Some(RawMpvHandle(weak_handle))));
+    let client = ScreenshotClient {
+        handle: weak_handle,
+        closing: closing.clone(),
+        wake_handle: wake_handle.clone(),
+    };
     let (requests, jobs) = mpsc::sync_channel::<CaptureJob>(8);
-    std::thread::Builder::new().name("memento-screenshots".into()).spawn(move || {
+    let thread = std::thread::Builder::new().name("memento-screenshots".into()).spawn(move || {
         let mut id = 0u64;
         while let Ok(job) = jobs.recv() {
+            if client.closing.load(Ordering::Acquire) {
+                let _ = job.result.send(Err("Player closed during screenshot capture".into()));
+                break;
+            }
             // Unique IDs prevent a timed-out command's late reply from being
             // mistaken for the next capture. No render/UI state is borrowed.
             id = id.wrapping_add(1);
             let _ = job.result.send(client.capture(job.subtitles, id));
         }
     }).map_err(|error| format!("Could not start screenshot worker: {error}"))?;
-    Ok(requests)
+    Ok(ScreenshotWorkerHandles {
+        jobs: requests,
+        closing,
+        wake_handle,
+        thread,
+    })
 }
 
 fn screenshot_error(status: i32) -> String {
@@ -947,6 +992,12 @@ pub enum CursorAutohide {
     Never,
 }
 
+impl Default for CursorAutohide {
+    fn default() -> Self {
+        Self::Number(0)
+    }
+}
+
 impl CursorAutohide {
     pub fn decode(format: u32, int64_val: i64, str_val: *const c_char) -> Option<Self> {
         if format == ffi::MPV_FORMAT_INT64 {
@@ -994,18 +1045,472 @@ pub unsafe extern "C" fn memento_player_decode_cursor_autohide(
     true
 }
 
+pub const ASR_STREAM_PROTOCOL: &str = "memento-asr";
+pub const ASR_STREAM_URI: &str = "memento-asr://live.vtt";
+
+/// A subtitle cue managed by [`AsrSubtitleTrack`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsrCue {
+    pub id: i64,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// Active backend mode selected for in-memory ASR subtitles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrTrackMode {
+    /// Patched `libmpv` (`eyalmazuz/mpv` `15d25e0f`) using `mpv_command_node_async`.
+    NativeMemory,
+    /// Stock `libmpv` using `mpv_stream_cb_add_ro` (`memento-asr://live.vtt` + `sub-reload`).
+    StreamCallback,
+}
+
+/// Format a non-negative timestamp in seconds as WebVTT `HH:MM:SS.mmm`.
+pub fn format_webvtt_timestamp(seconds: f64) -> String {
+    let total_ms = if seconds.is_finite() && seconds > 0.0 {
+        (seconds * 1000.0).round() as u64
+    } else {
+        0
+    };
+    let ms = total_ms % 1000;
+    let total_secs = total_ms / 1000;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    format!("{hours:02}:{mins:02}:{secs:02}.{ms:03}")
+}
+
+/// Render sorted ASR cues as BOM-free UTF-8 WebVTT in RAM (`WEBVTT\n\n`).
+pub fn format_webvtt_cues(cues: &[AsrCue]) -> Vec<u8> {
+    let mut sorted: Vec<&AsrCue> = cues
+        .iter()
+        .filter(|cue| {
+            cue.start.is_finite() && cue.end.is_finite() && cue.start >= 0.0 && cue.end > cue.start
+        })
+        .collect();
+    sorted.sort_by(|a, b| {
+        a.start
+            .total_cmp(&b.start)
+            .then_with(|| a.end.total_cmp(&b.end))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut out = String::from("WEBVTT\n\n");
+    for cue in sorted {
+        let cleaned = sanitize_webvtt_text(&cue.text);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let start_ms = (cue.start.max(0.0) * 1000.0).round() as u64;
+        let raw_end_ms = (cue.end.max(0.0) * 1000.0).round() as u64;
+        let end_ms = if raw_end_ms > start_ms {
+            raw_end_ms
+        } else {
+            start_ms + 1
+        };
+        let start_ts = format_webvtt_timestamp_ms(start_ms);
+        let end_ts = format_webvtt_timestamp_ms(end_ms);
+        out.push_str(&start_ts);
+        out.push_str(" --> ");
+        out.push_str(&end_ts);
+        out.push('\n');
+        out.push_str(&cleaned);
+        out.push_str("\n\n");
+    }
+    out.into_bytes()
+}
+
+fn format_webvtt_timestamp_ms(total_ms: u64) -> String {
+    let ms = total_ms % 1000;
+    let total_secs = total_ms / 1000;
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    format!("{hours:02}:{mins:02}:{secs:02}.{ms:03}")
+}
+
+fn sanitize_webvtt_text(text: &str) -> String {
+    let normalized = text.replace('\0', "").replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.join("\n")
+}
+
+struct StreamCursor {
+    data: Arc<[u8]>,
+    pos: usize,
+}
+
+unsafe extern "C" fn stream_cb_open_ro(
+    user_data: *mut c_void,
+    uri: *mut c_char,
+    info: *mut ffi::mpv_stream_cb_info,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if user_data.is_null() || uri.is_null() || info.is_null() {
+            return ffi::MPV_ERROR_LOADING_FAILED;
+        }
+        let uri_bytes = unsafe { CStr::from_ptr(uri) }.to_bytes();
+        if !uri_bytes.starts_with(b"memento-asr://") {
+            return ffi::MPV_ERROR_LOADING_FAILED;
+        }
+        let shared = unsafe { &*(user_data as *const RwLock<Arc<[u8]>>) };
+        let snapshot = shared
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let cursor = Box::into_raw(Box::new(StreamCursor {
+            data: snapshot,
+            pos: 0,
+        }));
+        unsafe {
+            (*info).cookie = cursor.cast();
+            (*info).read_fn = Some(stream_cb_read);
+            (*info).seek_fn = Some(stream_cb_seek);
+            (*info).size_fn = Some(stream_cb_size);
+            (*info).close_fn = Some(stream_cb_close);
+            (*info).cancel_fn = None;
+        }
+        0
+    }))
+    .unwrap_or(ffi::MPV_ERROR_LOADING_FAILED)
+}
+
+unsafe extern "C" fn stream_cb_read(
+    cookie: *mut c_void,
+    buf: *mut c_char,
+    nbytes: u64,
+) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cookie.is_null() || (buf.is_null() && nbytes > 0) {
+            return -1;
+        }
+        if nbytes == 0 {
+            return 0;
+        }
+        let cursor = unsafe { &mut *(cookie as *mut StreamCursor) };
+        let remaining = cursor.data.len().saturating_sub(cursor.pos);
+        if remaining == 0 {
+            return 0;
+        }
+        let requested = usize::try_from(nbytes).unwrap_or(usize::MAX);
+        let to_copy = remaining.min(requested).min(i64::MAX as usize);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                cursor.data.as_ptr().add(cursor.pos),
+                buf.cast::<u8>(),
+                to_copy,
+            );
+        }
+        cursor.pos += to_copy;
+        to_copy as i64
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe extern "C" fn stream_cb_seek(cookie: *mut c_void, offset: i64) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cookie.is_null() || offset < 0 {
+            return i64::from(ffi::MPV_ERROR_GENERIC);
+        }
+        let cursor = unsafe { &mut *(cookie as *mut StreamCursor) };
+        let Ok(target) = usize::try_from(offset) else {
+            return i64::from(ffi::MPV_ERROR_GENERIC);
+        };
+        if target > cursor.data.len() {
+            return i64::from(ffi::MPV_ERROR_GENERIC);
+        }
+        cursor.pos = target;
+        offset
+    }))
+    .unwrap_or(i64::from(ffi::MPV_ERROR_GENERIC))
+}
+
+unsafe extern "C" fn stream_cb_size(cookie: *mut c_void) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cookie.is_null() {
+            return i64::from(ffi::MPV_ERROR_UNSUPPORTED);
+        }
+        let cursor = unsafe { &*(cookie as *const StreamCursor) };
+        i64::try_from(cursor.data.len()).unwrap_or(i64::MAX)
+    }))
+    .unwrap_or(i64::from(ffi::MPV_ERROR_UNSUPPORTED))
+}
+
+unsafe extern "C" fn stream_cb_close(cookie: *mut c_void) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !cookie.is_null() {
+            drop(unsafe { Box::from_raw(cookie as *mut StreamCursor) });
+        }
+    }));
+}
+
+/// Decoded payload from an asynchronous `MPV_EVENT_COMMAND_REPLY`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandReplyResult {
+    None,
+    Int64(i64),
+    Double(f64),
+    Flag(bool),
+    String(String),
+    Other,
+}
+
+/// Reason reported by `MPV_EVENT_END_FILE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndFileReason {
+    Eof,
+    Stop,
+    Quit,
+    Error(i32),
+    Redirect,
+    Unknown(i32),
+}
+
+/// Typed property payload delivered in [`MpvEvent::PropertyChange`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MpvPropertyValue {
+    None,
+    Flag(bool),
+    Int64(i64),
+    Double(f64),
+    String(String),
+    Chapters(Vec<f64>),
+    Tracks {
+        audio: Vec<AudioTrack>,
+        subtitle: Vec<SubtitleTrack>,
+        all: Vec<Track>,
+    },
+    SubLines(Vec<SubLine>),
+    CursorAutohide(CursorAutohide),
+    Other,
+}
+
+/// Ordered event drained from `mpv_wait_event(0.0)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MpvEvent {
+    StartFile {
+        playlist_entry_id: i64,
+    },
+    FileLoaded {
+        video_width: i64,
+        video_height: i64,
+    },
+    EndFile {
+        reason: EndFileReason,
+        playlist_entry_id: i64,
+    },
+    PlaybackRestart,
+    Seek,
+    Shutdown,
+    QueueOverflow,
+    CommandReply {
+        reply_userdata: u64,
+        error: i32,
+        result: CommandReplyResult,
+    },
+    PropertyChange {
+        name: String,
+        value: MpvPropertyValue,
+    },
+}
+
+impl MpvEvent {
+    /// Convert to [`crate::events::EngineEvent`] for driving `machine::PlayerCore`.
+    pub fn to_engine_event(&self, playback: &PlaybackState) -> Option<EngineEvent> {
+        match self {
+            Self::StartFile { .. } => Some(EngineEvent::StartFile),
+            Self::FileLoaded {
+                video_width,
+                video_height,
+            } => Some(EngineEvent::FileLoaded {
+                video_width: *video_width,
+                video_height: *video_height,
+            }),
+            Self::EndFile { .. } => Some(EngineEvent::EndFile),
+            Self::Seek => Some(EngineEvent::EngineSeek),
+            Self::Shutdown => Some(EngineEvent::Shutdown),
+            Self::PlaybackRestart | Self::QueueOverflow | Self::CommandReply { .. } => None,
+            Self::PropertyChange { name, value } => {
+                let change = match (name.as_str(), value) {
+                    ("chapter-list", MpvPropertyValue::Chapters(v)) => {
+                        PropertyChange::Chapters(v.clone())
+                    }
+                    ("chapter-list", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::ChapterList)
+                    }
+                    ("duration", MpvPropertyValue::Double(v)) => PropertyChange::Duration(*v),
+                    ("duration", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Duration)
+                    }
+                    ("fullscreen", MpvPropertyValue::Flag(v)) => PropertyChange::Fullscreen(*v),
+                    ("fullscreen", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Fullscreen)
+                    }
+                    ("media-title", MpvPropertyValue::String(v)) => {
+                        PropertyChange::MediaTitle(v.clone())
+                    }
+                    ("media-title", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::MediaTitle)
+                    }
+                    ("path", MpvPropertyValue::String(v)) => PropertyChange::Path(v.clone()),
+                    ("path", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Path)
+                    }
+                    ("pause", MpvPropertyValue::Flag(v)) => PropertyChange::Pause(*v),
+                    ("pause", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Pause)
+                    }
+                    ("time-pos", MpvPropertyValue::Double(v)) => PropertyChange::TimePos(*v),
+                    ("time-pos", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::TimePos)
+                    }
+                    ("mute", MpvPropertyValue::Flag(v)) => PropertyChange::Mute(*v),
+                    ("mute", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Mute)
+                    }
+                    ("track-list", MpvPropertyValue::Tracks { all, .. }) => {
+                        PropertyChange::TrackList(all.clone())
+                    }
+                    ("volume", MpvPropertyValue::Double(v)) => {
+                        PropertyChange::Volume(v.round() as i64)
+                    }
+                    ("volume", MpvPropertyValue::Int64(v)) => PropertyChange::Volume(*v),
+                    ("volume", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Volume)
+                    }
+                    ("volume-max", MpvPropertyValue::Int64(v)) => PropertyChange::VolumeMax(*v),
+                    ("volume-max", MpvPropertyValue::Double(v)) => {
+                        PropertyChange::VolumeMax(v.round() as i64)
+                    }
+                    ("volume-max", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::VolumeMax)
+                    }
+                    ("video-params/w", MpvPropertyValue::Int64(v)) => {
+                        PropertyChange::VideoWidth(*v)
+                    }
+                    ("video-params/w", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::VideoWidth)
+                    }
+                    ("video-params/h", MpvPropertyValue::Int64(v)) => {
+                        PropertyChange::VideoHeight(*v)
+                    }
+                    ("video-params/h", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::VideoHeight)
+                    }
+                    ("aid", MpvPropertyValue::Int64(v)) => PropertyChange::Aid(*v),
+                    ("aid", MpvPropertyValue::Flag(false)) => PropertyChange::AidDisabled,
+                    ("aid", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Aid)
+                    }
+                    ("sid", MpvPropertyValue::Int64(v)) => PropertyChange::Sid(*v),
+                    ("sid", MpvPropertyValue::Flag(false)) => PropertyChange::SidDisabled,
+                    ("sid", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Sid)
+                    }
+                    ("secondary-sid", MpvPropertyValue::Int64(v)) => {
+                        PropertyChange::SecondarySid(*v)
+                    }
+                    ("secondary-sid", MpvPropertyValue::Flag(false)) => {
+                        PropertyChange::SecondarySidDisabled
+                    }
+                    ("secondary-sid", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SecondarySid)
+                    }
+                    ("vid", MpvPropertyValue::Int64(v)) => PropertyChange::Vid(*v),
+                    ("vid", MpvPropertyValue::Flag(false)) => PropertyChange::VidDisabled,
+                    ("vid", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::Vid)
+                    }
+                    ("sub-delay", MpvPropertyValue::Double(v)) => PropertyChange::SubDelay(*v),
+                    ("sub-delay", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SubDelay)
+                    }
+                    ("sub-speed", MpvPropertyValue::Double(v)) => PropertyChange::SubSpeed(*v),
+                    ("sub-speed", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SubSpeed)
+                    }
+                    ("secondary-sub-delay", MpvPropertyValue::Double(v)) => {
+                        PropertyChange::SecondarySubDelay(*v)
+                    }
+                    ("secondary-sub-delay", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SecondarySubDelay)
+                    }
+                    ("sub-text", MpvPropertyValue::String(text)) => PropertyChange::SubText {
+                        text: text.clone(),
+                        start: Some(playback.sub_start),
+                        end: Some(playback.sub_end),
+                    },
+                    ("sub-text", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SubText)
+                    }
+                    ("secondary-sub-text", MpvPropertyValue::String(text)) => {
+                        PropertyChange::SecondarySubText {
+                            text: text.clone(),
+                            start: Some(playback.secondary_sub_start),
+                            end: Some(playback.secondary_sub_end),
+                        }
+                    }
+                    ("secondary-sub-text", MpvPropertyValue::None) => {
+                        PropertyChange::Unavailable(PropertyName::SecondarySubText)
+                    }
+                    ("sub-lines", MpvPropertyValue::SubLines(lines)) => {
+                        PropertyChange::SubLines(
+                            lines
+                                .iter()
+                                .map(|l| crate::events::SubLine {
+                                    id: l.id,
+                                    text: l.text.clone(),
+                                    start: l.start,
+                                    end: l.end,
+                                })
+                                .collect(),
+                        )
+                    }
+                    ("sub-visibility", MpvPropertyValue::Flag(v)) => {
+                        PropertyChange::SubVisibility(*v)
+                    }
+                    ("secondary-sub-visibility", MpvPropertyValue::Flag(v)) => {
+                        PropertyChange::SecondarySubVisibility(*v)
+                    }
+                    ("cursor-autohide", MpvPropertyValue::CursorAutohide(v)) => {
+                        PropertyChange::CursorAutohide(*v)
+                    }
+                    ("cursor-autohide-fs-only", MpvPropertyValue::Flag(v)) => {
+                        PropertyChange::CursorAutohideFullscreenOnly(*v)
+                    }
+                    _ => return None,
+                };
+                Some(EngineEvent::Property(change))
+            }
+        }
+    }
+}
+
 /// An initialized mpv instance. It starts with a software render context and
 /// can switch to OpenGL after the UI has created its graphics context.
 pub struct MpvInstance {
     handle: *mut ffi::mpv_handle,
     render_lock: Arc<Mutex<RenderContext>>,
-    // mpv may call the update callback from another thread. Dropped only
-    // after unregistering it and freeing the render context.
+    // mpv may call update/wakeup callbacks from worker threads. Dropped only
+    // after unregistering them and calling mpv_terminate_destroy.
     render_pending: Box<RenderNotification>,
+    event_pending: Box<EventNotification>,
     playback: RefCell<PlaybackState>,
+    queued_events: RefCell<Vec<MpvEvent>>,
     configured_hwdec: String,
     memory_subtitles_supported: bool,
+    asr_stream: Arc<RwLock<Arc<[u8]>>>,
+    asr_stream_raw: Option<*const RwLock<Arc<[u8]>>>,
+    next_reply_id: AtomicU64,
     screenshot_jobs: Option<SyncSender<CaptureJob>>,
+    screenshot_closing: Arc<AtomicBool>,
+    screenshot_wake_handle: Arc<Mutex<Option<RawMpvHandle>>>,
+    screenshot_thread: Option<std::thread::JoinHandle<()>>,
     render_update_delay: Cell<std::time::Duration>,
 }
 unsafe impl Send for MpvInstance {}
@@ -1021,134 +1526,356 @@ pub struct PlaybackState {
     pub position: f64,
     pub duration: f64,
     pub paused: bool,
+    pub mute: bool,
     pub volume: f64,
+    pub volume_max: i64,
+    pub fullscreen: bool,
     pub dimensions: (u32, u32),
+    pub video_width: i64,
+    pub video_height: i64,
+    pub chapters: Vec<f64>,
     pub audio_id: i64,
     pub primary_sid: i64,
     pub secondary_sid: i64,
+    pub video_id: i64,
     pub sub_text: String,
     pub secondary_sub_text: String,
     pub sub_start: f64,
     pub sub_end: f64,
     pub sub_delay: f64,
     pub sub_speed: f64,
+    pub sub_visibility: bool,
     pub secondary_sub_start: f64,
     pub secondary_sub_end: f64,
     pub secondary_sub_delay: f64,
+    pub secondary_sub_visibility: bool,
     pub audio_tracks: Vec<AudioTrack>,
     pub subtitle_tracks: Vec<SubtitleTrack>,
     pub sub_lines: Vec<SubLine>,
     pub frame_drops: i64,
     pub decoder_drops: i64,
     pub hwdec_current: String,
+    pub cursor_autohide: CursorAutohide,
+    pub cursor_autohide_fs_only: bool,
 }
 
 const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
+    (c"chapter-list", ffi::MPV_FORMAT_NODE),
+    (c"chapters", ffi::MPV_FORMAT_INT64),
     (c"path", ffi::MPV_FORMAT_STRING),
     (c"media-title", ffi::MPV_FORMAT_STRING),
     (c"time-pos", ffi::MPV_FORMAT_DOUBLE),
     (c"duration", ffi::MPV_FORMAT_DOUBLE),
     (c"pause", ffi::MPV_FORMAT_FLAG),
+    (c"fullscreen", ffi::MPV_FORMAT_FLAG),
+    (c"mute", ffi::MPV_FORMAT_FLAG),
+    (c"volume-max", ffi::MPV_FORMAT_INT64),
     (c"volume", ffi::MPV_FORMAT_DOUBLE),
     (c"dwidth", ffi::MPV_FORMAT_INT64),
     (c"dheight", ffi::MPV_FORMAT_INT64),
+    (c"video-params/w", ffi::MPV_FORMAT_INT64),
+    (c"video-params/h", ffi::MPV_FORMAT_INT64),
     (c"aid", ffi::MPV_FORMAT_INT64),
+    (c"aid", ffi::MPV_FORMAT_FLAG),
     (c"sid", ffi::MPV_FORMAT_INT64),
+    (c"sid", ffi::MPV_FORMAT_FLAG),
     (c"secondary-sid", ffi::MPV_FORMAT_INT64),
+    (c"secondary-sid", ffi::MPV_FORMAT_FLAG),
+    (c"vid", ffi::MPV_FORMAT_INT64),
+    (c"vid", ffi::MPV_FORMAT_FLAG),
     (c"sub-text", ffi::MPV_FORMAT_STRING),
     (c"secondary-sub-text", ffi::MPV_FORMAT_STRING),
     (c"sub-start", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-end", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-delay", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-speed", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-visibility", ffi::MPV_FORMAT_FLAG),
     (c"secondary-sub-start", ffi::MPV_FORMAT_DOUBLE),
     (c"secondary-sub-end", ffi::MPV_FORMAT_DOUBLE),
     (c"secondary-sub-delay", ffi::MPV_FORMAT_DOUBLE),
+    (c"secondary-sub-visibility", ffi::MPV_FORMAT_FLAG),
     (c"track-list", ffi::MPV_FORMAT_NODE),
     (c"sub-lines", ffi::MPV_FORMAT_NODE),
     (c"frame-drop-count", ffi::MPV_FORMAT_INT64),
     (c"decoder-frame-drop-count", ffi::MPV_FORMAT_INT64),
     (c"hwdec-current", ffi::MPV_FORMAT_STRING),
+    (c"cursor-autohide", ffi::MPV_FORMAT_INT64),
+    (c"cursor-autohide", ffi::MPV_FORMAT_STRING),
+    (c"cursor-autohide-fs-only", ffi::MPV_FORMAT_FLAG),
 ];
+
+fn extract_tracks_from_node(
+    node: *const ffi::mpv_node,
+) -> (Vec<AudioTrack>, Vec<SubtitleTrack>, Vec<Track>) {
+    let tracks = OwnedTrackList(unsafe { memento_player_extract_tracks(node) });
+    let items = tracks.as_slice();
+    let audio = items
+        .iter()
+        .filter(|t| t.track_type == TrackType::Audio as i32)
+        .map(|t| AudioTrack {
+            id: t.id,
+            language: copy_mpv_string(t.lang),
+            title: copy_mpv_string(t.title),
+            external_filename: copy_mpv_string(t.external_filename),
+            external: t.external,
+            default_track: t.default_track,
+            selected: t.selected,
+        })
+        .collect();
+    let subtitle = items
+        .iter()
+        .filter(|t| t.track_type == TrackType::Subtitle as i32)
+        .map(|t| SubtitleTrack {
+            id: t.id,
+            language: copy_mpv_string(t.lang),
+            title: copy_mpv_string(t.title),
+            external_path: copy_mpv_string(t.external_filename),
+            external: t.external,
+            default_track: t.default_track,
+            selected: t.selected,
+        })
+        .collect();
+    let all = items
+        .iter()
+        .map(|t| Track {
+            id: t.id,
+            track_type: match t.track_type {
+                1 => TrackType::Audio,
+                2 => TrackType::Video,
+                3 => TrackType::Subtitle,
+                _ => TrackType::None,
+            },
+            src_id: t.src_id,
+            title: copy_mpv_string(t.title),
+            language: copy_mpv_string(t.lang),
+            album_art: t.albumart,
+            default_track: t.default_track,
+            selected: t.selected,
+            main_selection: t.main_selection,
+            external: t.external,
+            external_filename: copy_mpv_string(t.external_filename),
+            codec: copy_mpv_string(t.codec),
+        })
+        .collect();
+    (audio, subtitle, all)
+}
+
+fn extract_sub_lines_from_node(node: *const ffi::mpv_node) -> Vec<SubLine> {
+    let lines = OwnedSubLineList(unsafe { memento_player_extract_sub_lines(node) });
+    lines
+        .as_slice()
+        .iter()
+        .map(|line| SubLine {
+            id: line.id,
+            text: copy_mpv_string(line.text),
+            start: line.start,
+            end: line.end,
+        })
+        .collect()
+}
+
+fn extract_chapters_from_node(node: *const ffi::mpv_node) -> Vec<f64> {
+    let list = unsafe { memento_player_extract_chapter_times(node) };
+    let chapters = if list.len == 0 || list.items.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(list.items, list.len) }.to_vec()
+    };
+    unsafe { memento_player_f64_list_free(list) };
+    chapters
+}
 
 impl PlaybackState {
     // Event storage belongs to mpv and expires at the next mpv_wait_event call.
     // Copy strings and node contents here, while that storage is still valid.
     unsafe fn update(&mut self, property: &ffi::mpv_event_property) {
-        if property.name.is_null() { return; }
+        if property.name.is_null() {
+            return;
+        }
         let name = unsafe { CStr::from_ptr(property.name) }.to_bytes();
         let data = property.data;
         let number = |default| {
             if property.format == ffi::MPV_FORMAT_DOUBLE && !data.is_null() {
                 unsafe { *data.cast::<f64>() }
-            } else { default }
+            } else if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                unsafe { *data.cast::<i64>() as f64 }
+            } else {
+                default
+            }
         };
         let integer = || {
             if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
                 unsafe { *data.cast::<i64>() }
-            } else { 0 }
+            } else {
+                0
+            }
+        };
+        let flag = || -> Option<bool> {
+            if property.format == ffi::MPV_FORMAT_FLAG && !data.is_null() {
+                Some(unsafe { *data.cast::<c_int>() } != 0)
+            } else {
+                None
+            }
         };
         let string = || {
             if property.format == ffi::MPV_FORMAT_STRING && !data.is_null() {
                 copy_mpv_string(unsafe { *data.cast::<*const c_char>() })
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         };
+        let update_track_id = |slot: &mut i64| {
+            if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                *slot = unsafe { *data.cast::<i64>() };
+            } else if property.format == ffi::MPV_FORMAT_FLAG && !data.is_null() {
+                if unsafe { *data.cast::<c_int>() } == 0 {
+                    *slot = 0;
+                }
+            }
+        };
+
         match name {
             b"path" => self.path = string(),
             b"media-title" => self.media_title = string(),
             b"time-pos" => self.position = number(0.0).max(0.0),
             b"duration" => self.duration = number(0.0).max(0.0),
-            b"pause" => self.paused = property.format != ffi::MPV_FORMAT_FLAG
-                || data.is_null() || unsafe { *data.cast::<c_int>() } != 0,
+            b"pause" => {
+                if let Some(paused) = flag() {
+                    self.paused = paused;
+                }
+            }
+            b"fullscreen" => {
+                if let Some(fs) = flag() {
+                    self.fullscreen = fs;
+                }
+            }
+            b"mute" => {
+                if let Some(muted) = flag() {
+                    self.mute = muted;
+                }
+            }
             b"volume" => self.volume = number(100.0),
+            b"volume-max" => {
+                if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                    self.volume_max = unsafe { *data.cast::<i64>() };
+                } else if property.format == ffi::MPV_FORMAT_DOUBLE && !data.is_null() {
+                    self.volume_max = unsafe { *data.cast::<f64>() }.round() as i64;
+                }
+            }
             b"dwidth" => self.dimensions.0 = u32::try_from(integer()).unwrap_or(0),
             b"dheight" => self.dimensions.1 = u32::try_from(integer()).unwrap_or(0),
-            b"aid" => self.audio_id = integer(),
-            b"sid" => self.primary_sid = integer(),
-            b"secondary-sid" => self.secondary_sid = integer(),
+            b"video-params/w" => self.video_width = integer(),
+            b"video-params/h" => self.video_height = integer(),
+            b"chapter-list" => {
+                self.chapters = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    extract_chapters_from_node(data.cast())
+                } else {
+                    Vec::new()
+                };
+            }
+            b"aid" => update_track_id(&mut self.audio_id),
+            b"sid" => update_track_id(&mut self.primary_sid),
+            b"secondary-sid" => update_track_id(&mut self.secondary_sid),
+            b"vid" => update_track_id(&mut self.video_id),
             b"sub-text" => self.sub_text = string().trim().to_owned(),
             b"secondary-sub-text" => self.secondary_sub_text = string().trim().to_owned(),
             b"sub-start" => self.sub_start = number(0.0),
             b"sub-end" => self.sub_end = number(0.0),
             b"sub-delay" => self.sub_delay = number(0.0),
             b"sub-speed" => self.sub_speed = number(1.0).max(f64::EPSILON),
+            b"sub-visibility" => {
+                if let Some(v) = flag() {
+                    self.sub_visibility = v;
+                }
+            }
             b"secondary-sub-start" => self.secondary_sub_start = number(0.0),
             b"secondary-sub-end" => self.secondary_sub_end = number(0.0),
             b"secondary-sub-delay" => self.secondary_sub_delay = number(0.0),
+            b"secondary-sub-visibility" => {
+                if let Some(v) = flag() {
+                    self.secondary_sub_visibility = v;
+                }
+            }
             b"frame-drop-count" => self.frame_drops = integer(),
             b"decoder-frame-drop-count" => self.decoder_drops = integer(),
             b"hwdec-current" => self.hwdec_current = string(),
+            b"cursor-autohide" => {
+                let int64_val = if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                    unsafe { *data.cast::<i64>() }
+                } else {
+                    0
+                };
+                let str_val = if property.format == ffi::MPV_FORMAT_STRING && !data.is_null() {
+                    unsafe { *data.cast::<*const c_char>() }
+                } else {
+                    ptr::null()
+                };
+                if let Some(decoded) = CursorAutohide::decode(property.format, int64_val, str_val) {
+                    self.cursor_autohide = decoded;
+                }
+            }
+            b"cursor-autohide-fs-only" => {
+                if let Some(v) = flag() {
+                    self.cursor_autohide_fs_only = v;
+                }
+            }
             b"track-list" => {
-                let tracks = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    Some(OwnedTrackList(unsafe { memento_player_extract_tracks(data.cast()) }))
-                } else { None };
-                let tracks = tracks.as_ref().map_or(&[][..], |list| list.as_slice());
-                self.audio_tracks = tracks.iter()
-                    .filter(|t| t.track_type == TrackType::Audio as i32)
-                    .map(|t| AudioTrack {
-                        id: t.id, language: copy_mpv_string(t.lang), title: copy_mpv_string(t.title),
-                        external_filename: copy_mpv_string(t.external_filename),
-                        external: t.external, default_track: t.default_track, selected: t.selected,
-                    }).collect();
-                self.subtitle_tracks = tracks.iter()
-                    .filter(|t| t.track_type == TrackType::Subtitle as i32)
-                    .map(|t| SubtitleTrack {
-                        id: t.id, language: copy_mpv_string(t.lang), title: copy_mpv_string(t.title),
-                        external_path: copy_mpv_string(t.external_filename),
-                        external: t.external, default_track: t.default_track, selected: t.selected,
-                    }).collect();
+                if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    let (audio, subtitle, all) = extract_tracks_from_node(data.cast());
+                    self.audio_tracks = audio;
+                    self.subtitle_tracks = subtitle;
+                    if let Some(primary) = all
+                        .iter()
+                        .find(|t| t.track_type == TrackType::Subtitle && t.selected && t.main_selection == 0)
+                    {
+                        self.primary_sid = primary.id;
+                    }
+                    if let Some(secondary) = all
+                        .iter()
+                        .find(|t| t.track_type == TrackType::Subtitle && t.selected && t.main_selection == 1)
+                    {
+                        self.secondary_sid = secondary.id;
+                    }
+                    if let Some(audio) = all
+                        .iter()
+                        .find(|t| t.track_type == TrackType::Audio && t.selected && t.main_selection == 0)
+                    {
+                        self.audio_id = audio.id;
+                    }
+                } else {
+                    self.audio_tracks.clear();
+                    self.subtitle_tracks.clear();
+                }
             }
             b"sub-lines" => {
                 self.sub_lines = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let lines = OwnedSubLineList(unsafe { memento_player_extract_sub_lines(data.cast()) });
-                    lines.as_slice().iter().map(|line| SubLine {
-                        id: line.id, text: copy_mpv_string(line.text),
-                        start: line.start, end: line.end,
-                    }).collect()
-                } else { Vec::new() };
+                    extract_sub_lines_from_node(data.cast())
+                } else {
+                    Vec::new()
+                };
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Default)]
+struct EventNotification {
+    pending: AtomicBool,
+    wake: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl EventNotification {
+    fn notify(&self) {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            if let Some(wake) = self.wake.get() {
+                wake();
+            }
+        }
+    }
+
+    fn clear_pending(&self) {
+        self.pending.store(false, Ordering::Release);
     }
 }
 
@@ -1190,12 +1917,92 @@ pub struct MpvSoftwareRenderer {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderApi { Software, OpenGl }
 
+enum GlProcResolverInner {
+    /// Borrowed synchronously during `mpv_render_context_create`, then cleared.
+    Scoped(*const dyn Fn(&CStr) -> *const c_void),
+    /// Owned `'static` resolver valid for the lifetime of the GL render context.
+    Owned(Box<dyn Fn(&CStr) -> *const c_void + Send + Sync>),
+    Cleared,
+}
+
+pub struct GlProcResolver {
+    inner: Mutex<GlProcResolverInner>,
+}
+unsafe impl Send for GlProcResolver {}
+unsafe impl Sync for GlProcResolver {}
+
+impl GlProcResolver {
+    fn scoped(resolver: &dyn Fn(&CStr) -> *const c_void) -> Self {
+        let ptr: *const (dyn Fn(&CStr) -> *const c_void + '_) = resolver;
+        // SAFETY: `ScopedResolverClear` resets this pointer to `Cleared` before
+        // `create_opengl_context_with_display` returns, so the borrowed
+        // trait object is never dereferenced after `'a` ends.
+        let erased: *const (dyn Fn(&CStr) -> *const c_void + 'static) =
+            unsafe { std::mem::transmute(ptr) };
+        Self {
+            inner: Mutex::new(GlProcResolverInner::Scoped(erased)),
+        }
+    }
+
+    fn owned(resolver: impl Fn(&CStr) -> *const c_void + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Mutex::new(GlProcResolverInner::Owned(Box::new(resolver))),
+        }
+    }
+
+    fn clear_scoped(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*guard, GlProcResolverInner::Scoped(_)) {
+            *guard = GlProcResolverInner::Cleared;
+        }
+    }
+
+    fn resolve(&self, name: &CStr) -> *mut c_void {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            GlProcResolverInner::Scoped(ptr) => {
+                if ptr.is_null() {
+                    ptr::null_mut()
+                } else {
+                    unsafe { (&**ptr)(name).cast_mut() }
+                }
+            }
+            GlProcResolverInner::Owned(func) => func(name).cast_mut(),
+            GlProcResolverInner::Cleared => ptr::null_mut(),
+        }
+    }
+}
+
+struct ScopedResolverClear(*mut GlProcResolver);
+impl Drop for ScopedResolverClear {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { &*self.0 }.clear_scoped();
+        }
+    }
+}
+
 struct RenderContext {
     pointer: Option<std::ptr::NonNull<ffi::mpv_render_context>>,
     api: RenderApi,
+    gl_proc_resolver: Option<std::ptr::NonNull<GlProcResolver>>,
 }
 
 unsafe impl Send for RenderContext {}
+
+impl RenderContext {
+    fn free_context(&mut self) {
+        if let Some(context) = self.pointer.take() {
+            unsafe {
+                ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
+                ffi::mpv_render_context_free(context.as_ptr());
+            }
+        }
+        if let Some(resolver) = self.gl_proc_resolver.take() {
+            drop(unsafe { Box::from_raw(resolver.as_ptr()) });
+        }
+    }
+}
 
 impl MpvSoftwareRenderer {
     /// # Safety
@@ -1209,25 +2016,31 @@ impl MpvSoftwareRenderer {
     }
 }
 
-thread_local! {
-    // mpv resolves OpenGL symbols while creating its render context. Keep the
-    // borrowed Slint resolver available only for that synchronous call.
-    static GL_PROC_RESOLVER: Cell<*const c_void> = const { Cell::new(ptr::null()) };
-}
-
-unsafe extern "C" fn resolve_gl_proc(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
-    if name.is_null() { return ptr::null_mut(); }
-    GL_PROC_RESOLVER.with(|slot| {
-        let resolver = slot.get() as *const &dyn Fn(&CStr) -> *const c_void;
-        if resolver.is_null() { return ptr::null_mut(); }
-        unsafe { (*resolver)(CStr::from_ptr(name)).cast_mut() }
-    })
+unsafe extern "C" fn resolve_gl_proc(ctx: *mut c_void, name: *const c_char) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        if ctx.is_null() || name.is_null() {
+            return ptr::null_mut();
+        }
+        let resolver = unsafe { &*(ctx as *const GlProcResolver) };
+        resolver.resolve(unsafe { CStr::from_ptr(name) })
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 unsafe extern "C" fn on_render_update(userdata: *mut std::ffi::c_void) {
-    if !userdata.is_null() {
-        unsafe { &*(userdata as *const RenderNotification) }.notify();
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !userdata.is_null() {
+            unsafe { &*(userdata as *const RenderNotification) }.notify();
+        }
+    }));
+}
+
+unsafe extern "C" fn on_mpv_wakeup(userdata: *mut std::ffi::c_void) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !userdata.is_null() {
+            unsafe { &*(userdata as *const EventNotification) }.notify();
+        }
+    }));
 }
 
 impl MpvInstance {
@@ -1238,113 +2051,217 @@ impl MpvInstance {
 
     /// Initialize mpv and a software fallback before the first media load.
     pub fn new_software(config_dir: Option<&Path>) -> Result<Self, String> {
-        Self::create(config_dir)
+        Self::create(config_dir, &[])
     }
 
-    fn create(config_dir: Option<&Path>) -> Result<Self, String> {
+    /// Initialize mpv with global CLI `--<opt>=<val>` overrides.
+    pub fn new_with_options(
+        config_dir: Option<&Path>,
+        cli_options: &[CliOption],
+    ) -> Result<Self, String> {
+        Self::create(config_dir, cli_options)
+    }
+
+    fn create(config_dir: Option<&Path>, cli_options: &[CliOption]) -> Result<Self, String> {
         let handle = unsafe { ffi::mpv_create() };
         if handle.is_null() {
             return Err("Failed to create mpv instance".into());
         }
 
-        let initialize = || {
-            let opt = |name: &CStr, value: &CStr| unsafe {
-                ffi::mpv_set_option_string(handle, name.as_ptr(), value.as_ptr())
-            };
-            for (name, value) in [
-                (c"config", c"yes"),
-                (c"input-default-bindings", c"yes"),
-                (c"keep-open", c"yes"),
-                (c"screenshot-directory", c"~~desktop/"),
-                (c"terminal", c"yes"),
-                (c"ytdl", c"yes"),
-                (c"pause", c"yes"),
-                (c"sub-visibility", c"no"),
-                (c"profile", c"fast"),
-                // Software rendering needs decoded frames in CPU memory.
-                // Request a copy-back decoder when hardware decode is available.
-                (c"hwdec", c"auto-copy-safe"),
-                (c"hwdec-codecs", c"all"),
-                (c"framedrop", c"vo"),
-                // Rendering never sleeps on the UI thread. Ask mpv to notify
-                // us at the frame deadline instead of its default 50ms ahead.
-                (c"video-timing-offset", c"0"),
-                (c"vd-lavc-threads", c"0"),
-                (c"sws-scaler", c"fast-bilinear"),
-                (c"sws-fast", c"yes"),
-                (c"sw-fast", c"yes"),
-            ] {
-                opt(name, value);
-            }
-            if let Some(dir) = config_dir {
-                if let Ok(dir_c) = CString::new(dir.to_string_lossy().as_bytes()) {
-                    opt(c"config-dir", &dir_c);
-                }
-                let input_conf = dir.join("input.conf");
-                if let Ok(input_c) = CString::new(input_conf.to_string_lossy().as_bytes()) {
-                    opt(c"input-conf", &input_c);
-                }
-            }
-            let status = opt(c"vo", c"libmpv");
-            if status < 0 {
-                return Err(format!("mpv libmpv video option failed with code {status}"));
-            }
-
-            let status = unsafe { ffi::mpv_initialize(handle) };
-            if status < 0 {
-                return Err(format!("mpv initialization failed with code {status}"));
-            }
-
-            // Read the effective configuration before media/rendering starts.
-            // A user mpv.conf can override the auto-copy default above.
-            let configured_hwdec = unsafe {
-                let value = ffi::mpv_get_property_string(handle, c"hwdec".as_ptr());
-                let text = copy_mpv_string(value);
-                if !value.is_null() { ffi::mpv_free(value.cast()); }
-                text
-            };
-            let memory_subtitles_supported = unsafe { memento_player_supports_memory_subtitles(handle) };
-            let screenshot_jobs = start_screenshot_worker(handle)?;
-            let context = create_software_context(handle)?;
-            let mut pending = Box::new(RenderNotification::default());
-            unsafe {
-                ffi::mpv_render_context_set_update_callback(
-                    context.as_ptr(),
-                    Some(on_render_update),
-                    (&mut *pending as *mut RenderNotification).cast(),
-                );
-            }
-            for (id, (name, format)) in PLAYBACK_PROPERTIES.iter().enumerate() {
-                let status = unsafe {
-                    ffi::mpv_observe_property(handle, id as u64 + 1, name.as_ptr(), *format)
-                };
-                if status < 0 {
-                    eprintln!("Could not observe mpv property {}: {status}", name.to_string_lossy());
-                }
-            }
-            Ok((context, pending, configured_hwdec, memory_subtitles_supported, screenshot_jobs))
+        let opt = |name: &CStr, value: &CStr| unsafe {
+            ffi::mpv_set_option_string(handle, name.as_ptr(), value.as_ptr())
         };
-
-        match initialize() {
-            Ok((render, render_pending, configured_hwdec, memory_subtitles_supported, screenshot_jobs)) => Ok(Self {
-                handle,
-                render_lock: Arc::new(Mutex::new(RenderContext {
-                    pointer: Some(render), api: RenderApi::Software,
-                })),
-                render_pending,
-                playback: RefCell::new(PlaybackState {
-                    paused: true, volume: 100.0, sub_speed: 1.0, ..Default::default()
-                }),
-                configured_hwdec,
-                memory_subtitles_supported,
-                screenshot_jobs: Some(screenshot_jobs),
-                render_update_delay: Cell::new(std::time::Duration::ZERO),
-            }),
-            Err(error) => {
-                unsafe { ffi::mpv_terminate_destroy(handle) };
-                Err(error)
+        for (name, value) in [
+            (c"config", c"yes"),
+            (c"input-default-bindings", c"yes"),
+            (c"keep-open", c"yes"),
+            (c"screenshot-directory", c"~~desktop/"),
+            (c"terminal", c"yes"),
+            (c"ytdl", c"yes"),
+            (c"pause", c"yes"),
+            (c"sub-visibility", c"no"),
+            // Gentle default respecting user `mpv.conf` (and supporting zero-copy GL hwdec).
+            (c"hwdec", c"auto-safe"),
+            (c"hwdec-codecs", c"all"),
+            (c"framedrop", c"vo"),
+            // Rendering never sleeps on the UI thread. Ask mpv to notify
+            // us at the frame deadline instead of its default 50ms ahead.
+            (c"video-timing-offset", c"0"),
+            (c"vd-lavc-threads", c"0"),
+        ] {
+            opt(name, value);
+        }
+        if let Some(dir) = config_dir {
+            if let Ok(dir_c) = CString::new(dir.to_string_lossy().as_bytes()) {
+                opt(c"config-dir", &dir_c);
+            }
+            let input_conf = dir.join("input.conf");
+            if let Ok(input_c) = CString::new(input_conf.to_string_lossy().as_bytes()) {
+                opt(c"input-conf", &input_c);
             }
         }
+        for cli_opt in cli_options {
+            if cli_opt.name == "vo" {
+                continue;
+            }
+            if let (Ok(name_c), Ok(val_c)) = (
+                CString::new(cli_opt.name.as_bytes()),
+                CString::new(cli_opt.value.as_bytes()),
+            ) {
+                let status = opt(&name_c, &val_c);
+                if status < 0 {
+                    eprintln!("mpv CLI option --{}={} ignored ({status})", cli_opt.name, cli_opt.value);
+                }
+            }
+        }
+        let status = opt(c"vo", c"libmpv");
+        if status < 0 {
+            unsafe { ffi::mpv_terminate_destroy(handle) };
+            return Err(format!("mpv libmpv video option failed with code {status}"));
+        }
+
+        let status = unsafe { ffi::mpv_initialize(handle) };
+        if status < 0 {
+            unsafe { ffi::mpv_terminate_destroy(handle) };
+            return Err(format!("mpv initialization failed with code {status}"));
+        }
+
+        // Re-apply runtime-adjustable CLI options after `mpv_initialize` so CLI flags
+        // override `mpv.conf`, matching mpv CLI precedence.
+        for cli_opt in cli_options {
+            if matches!(
+                cli_opt.name.as_str(),
+                "config" | "config-dir" | "input-conf" | "load-scripts" | "script" | "vo"
+            ) {
+                continue;
+            }
+            if let (Ok(name_c), Ok(val_c)) = (
+                CString::new(cli_opt.name.as_bytes()),
+                CString::new(cli_opt.value.as_bytes()),
+            ) {
+                let _ = unsafe {
+                    ffi::mpv_set_property_string(handle, name_c.as_ptr(), val_c.as_ptr())
+                };
+            }
+        }
+
+        let configured_hwdec = unsafe {
+            let value = ffi::mpv_get_property_string(handle, c"hwdec".as_ptr());
+            let text = copy_mpv_string(value);
+            if !value.is_null() {
+                ffi::mpv_free(value.cast());
+            }
+            text
+        };
+        let memory_subtitles_supported = unsafe { memento_player_supports_memory_subtitles(handle) };
+
+        let asr_stream: Arc<RwLock<Arc<[u8]>>> =
+            Arc::new(RwLock::new(Arc::from(b"WEBVTT\n\n".as_slice())));
+        let asr_stream_raw = Arc::into_raw(asr_stream.clone());
+        let stream_status = unsafe {
+            ffi::mpv_stream_cb_add_ro(
+                handle,
+                c"memento-asr".as_ptr(),
+                asr_stream_raw.cast_mut().cast(),
+                Some(stream_cb_open_ro),
+            )
+        };
+        if stream_status < 0 {
+            unsafe { ffi::mpv_terminate_destroy(handle) };
+            drop(unsafe { Arc::from_raw(asr_stream_raw) });
+            return Err(format!(
+                "mpv_stream_cb_add_ro failed with code {stream_status}"
+            ));
+        }
+
+        let mut event_pending = Box::new(EventNotification::default());
+        unsafe {
+            ffi::mpv_set_wakeup_callback(
+                handle,
+                Some(on_mpv_wakeup),
+                (&mut *event_pending as *mut EventNotification).cast(),
+            );
+        }
+
+        for (id, (name, format)) in PLAYBACK_PROPERTIES.iter().enumerate() {
+            let status = unsafe {
+                ffi::mpv_observe_property(handle, id as u64 + 1, name.as_ptr(), *format)
+            };
+            if status < 0 {
+                eprintln!(
+                    "Could not observe mpv property {}: {status}",
+                    name.to_string_lossy()
+                );
+            }
+        }
+
+        let context = match create_software_context(handle) {
+            Ok(context) => context,
+            Err(error) => {
+                unsafe {
+                    ffi::mpv_set_wakeup_callback(handle, None, ptr::null_mut());
+                    ffi::mpv_terminate_destroy(handle);
+                }
+                drop(unsafe { Arc::from_raw(asr_stream_raw) });
+                return Err(error);
+            }
+        };
+
+        let mut render_pending = Box::new(RenderNotification::default());
+        unsafe {
+            ffi::mpv_render_context_set_update_callback(
+                context.as_ptr(),
+                Some(on_render_update),
+                (&mut *render_pending as *mut RenderNotification).cast(),
+            );
+        }
+
+        let worker = match start_screenshot_worker(handle) {
+            Ok(worker) => worker,
+            Err(error) => {
+                unsafe {
+                    ffi::mpv_render_context_set_update_callback(
+                        context.as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                    );
+                    ffi::mpv_render_context_free(context.as_ptr());
+                    ffi::mpv_set_wakeup_callback(handle, None, ptr::null_mut());
+                    ffi::mpv_terminate_destroy(handle);
+                }
+                drop(unsafe { Arc::from_raw(asr_stream_raw) });
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            handle,
+            render_lock: Arc::new(Mutex::new(RenderContext {
+                pointer: Some(context),
+                api: RenderApi::Software,
+                gl_proc_resolver: None,
+            })),
+            render_pending,
+            event_pending,
+            playback: RefCell::new(PlaybackState {
+                paused: true,
+                volume: 100.0,
+                volume_max: 100,
+                sub_speed: 1.0,
+                ..Default::default()
+            }),
+            queued_events: RefCell::new(Vec::new()),
+            configured_hwdec,
+            memory_subtitles_supported,
+            asr_stream,
+            asr_stream_raw: Some(asr_stream_raw),
+            next_reply_id: AtomicU64::new(1),
+            screenshot_jobs: Some(worker.jobs),
+            screenshot_closing: worker.closing,
+            screenshot_wake_handle: worker.wake_handle,
+            screenshot_thread: Some(worker.thread),
+            render_update_delay: Cell::new(std::time::Duration::ZERO),
+        })
     }
 
     /// NVDEC's direct CUDA/GL interop requires an NVIDIA GL context. Hybrid
@@ -1371,32 +2288,247 @@ impl MpvInstance {
         self.render_pending.pending.load(Ordering::Acquire)
     }
 
-    /// Drain asynchronous property events without waiting for mpv's core.
-    pub fn poll_playback_state(&self) -> Ref<'_, PlaybackState> {
+    /// Register a lightweight coalesced wakeup callback via `mpv_set_wakeup_callback`.
+    /// Called from mpv threads when new events enter the queue; it must only
+    /// schedule a drain on the owner thread and never call libmpv directly.
+    pub fn set_wakeup_callback(&self, wake: impl Fn() + Send + Sync + 'static) {
+        if self.event_pending.wake.set(Box::new(wake)).is_ok()
+            && self.event_pending.pending.load(Ordering::Acquire)
         {
-            let mut state = self.playback.borrow_mut();
-            loop {
-                let event = unsafe { ffi::mpv_wait_event(self.handle, 0.0) };
-                if event.is_null() || unsafe { (*event).event_id } == ffi::MPV_EVENT_NONE { break; }
-                match unsafe { (*event).event_id } {
-                    ffi::MPV_EVENT_START_FILE | ffi::MPV_EVENT_END_FILE => {
-                        state.file_loaded = false;
-                        state.playback_ready = false;
-                    }
-                    ffi::MPV_EVENT_FILE_LOADED => state.file_loaded = true,
-                    ffi::MPV_EVENT_PLAYBACK_RESTART => state.playback_ready = true,
-                    ffi::MPV_EVENT_COMMAND_REPLY if unsafe { (*event).error } < 0 => {
-                        let status = unsafe { (*event).error };
-                        eprintln!("mpv command failed: {} ({status})",
-                            copy_mpv_string(unsafe { ffi::mpv_error_string(status) }));
-                    }
-                    _ => {}
-                }
-                if unsafe { (*event).event_id } == ffi::MPV_EVENT_PROPERTY_CHANGE {
-                    let property = unsafe { (*event).data.cast::<ffi::mpv_event_property>().as_ref() };
-                    if let Some(property) = property { unsafe { state.update(property) }; }
-                }
+            if let Some(wake) = self.event_pending.wake.get() {
+                wake();
             }
+        }
+    }
+
+    pub fn has_pending_events(&self) -> bool {
+        self.event_pending.pending.load(Ordering::Acquire)
+            || !self.queued_events.borrow().is_empty()
+    }
+
+    fn decode_one_event(&self, raw: &ffi::mpv_event) -> Option<MpvEvent> {
+        let mut state = self.playback.borrow_mut();
+        match raw.event_id {
+            ffi::MPV_EVENT_START_FILE => {
+                state.file_loaded = false;
+                state.playback_ready = false;
+                let playlist_entry_id = unsafe { raw.data.cast::<ffi::mpv_event_start_file>().as_ref() }
+                    .map_or(0, |e| e.playlist_entry_id);
+                Some(MpvEvent::StartFile { playlist_entry_id })
+            }
+            ffi::MPV_EVENT_FILE_LOADED => {
+                state.file_loaded = true;
+                let mut w = state.video_width;
+                let mut h = state.video_height;
+                if w == 0 && h == 0 && !self.is_opengl_active() {
+                    let mut probed_w: i64 = 0;
+                    let mut probed_h: i64 = 0;
+                    unsafe {
+                        if ffi::mpv_get_property(
+                            self.handle,
+                            c"video-params/w".as_ptr(),
+                            ffi::MPV_FORMAT_INT64,
+                            (&mut probed_w as *mut i64).cast(),
+                        ) >= 0
+                        {
+                            w = probed_w;
+                        }
+                        if ffi::mpv_get_property(
+                            self.handle,
+                            c"video-params/h".as_ptr(),
+                            ffi::MPV_FORMAT_INT64,
+                            (&mut probed_h as *mut i64).cast(),
+                        ) >= 0
+                        {
+                            h = probed_h;
+                        }
+                    }
+                    state.video_width = w;
+                    state.video_height = h;
+                }
+                Some(MpvEvent::FileLoaded {
+                    video_width: w,
+                    video_height: h,
+                })
+            }
+            ffi::MPV_EVENT_END_FILE => {
+                state.file_loaded = false;
+                state.playback_ready = false;
+                let (reason, playlist_entry_id) = unsafe { raw.data.cast::<ffi::mpv_event_end_file>().as_ref() }
+                    .map_or((EndFileReason::Unknown(-1), 0), |info| {
+                        let reason = match info.reason {
+                            ffi::MPV_END_FILE_REASON_EOF => EndFileReason::Eof,
+                            ffi::MPV_END_FILE_REASON_STOP => EndFileReason::Stop,
+                            ffi::MPV_END_FILE_REASON_QUIT => EndFileReason::Quit,
+                            ffi::MPV_END_FILE_REASON_ERROR => EndFileReason::Error(info.error),
+                            ffi::MPV_END_FILE_REASON_REDIRECT => EndFileReason::Redirect,
+                            other => EndFileReason::Unknown(other as i32),
+                        };
+                        (reason, info.playlist_entry_id)
+                    });
+                Some(MpvEvent::EndFile {
+                    reason,
+                    playlist_entry_id,
+                })
+            }
+            ffi::MPV_EVENT_PLAYBACK_RESTART => {
+                state.playback_ready = true;
+                Some(MpvEvent::PlaybackRestart)
+            }
+            ffi::MPV_EVENT_SEEK => Some(MpvEvent::Seek),
+            ffi::MPV_EVENT_SHUTDOWN => Some(MpvEvent::Shutdown),
+            ffi::MPV_EVENT_QUEUE_OVERFLOW => Some(MpvEvent::QueueOverflow),
+            ffi::MPV_EVENT_COMMAND_REPLY => {
+                let error = raw.error;
+                let reply_userdata = raw.reply_userdata;
+                if error < 0 && reply_userdata == 0 {
+                    eprintln!(
+                        "mpv command failed: {} ({error})",
+                        copy_mpv_string(unsafe { ffi::mpv_error_string(error) })
+                    );
+                }
+                let result = unsafe { raw.data.cast::<ffi::mpv_event_command>().as_ref() }
+                    .map_or(CommandReplyResult::None, |cmd| {
+                        let node = &cmd.result;
+                        match node.format {
+                            ffi::MPV_FORMAT_NONE => CommandReplyResult::None,
+                            ffi::MPV_FORMAT_INT64 => {
+                                CommandReplyResult::Int64(unsafe { node.u.int64 })
+                            }
+                            ffi::MPV_FORMAT_DOUBLE => {
+                                CommandReplyResult::Double(unsafe { node.u.double_ })
+                            }
+                            ffi::MPV_FORMAT_FLAG => {
+                                CommandReplyResult::Flag(unsafe { node.u.flag != 0 })
+                            }
+                            ffi::MPV_FORMAT_STRING => {
+                                CommandReplyResult::String(copy_mpv_string(unsafe { node.u.string }))
+                            }
+                            _ => CommandReplyResult::Other,
+                        }
+                    });
+                Some(MpvEvent::CommandReply {
+                    reply_userdata,
+                    error,
+                    result,
+                })
+            }
+            ffi::MPV_EVENT_PROPERTY_CHANGE => {
+                let property = unsafe { raw.data.cast::<ffi::mpv_event_property>().as_ref() }?;
+                unsafe { state.update(property) };
+                let prop_name = if property.name.is_null() {
+                    String::new()
+                } else {
+                    copy_mpv_string(property.name)
+                };
+                let data = property.data;
+                let value = match prop_name.as_str() {
+                    "chapter-list" => {
+                        if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                            MpvPropertyValue::Chapters(state.chapters.clone())
+                        } else {
+                            MpvPropertyValue::None
+                        }
+                    }
+                    "track-list" => {
+                        if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                            let (audio, subtitle, all) = extract_tracks_from_node(data.cast());
+                            MpvPropertyValue::Tracks {
+                                audio,
+                                subtitle,
+                                all,
+                            }
+                        } else {
+                            MpvPropertyValue::None
+                        }
+                    }
+                    "sub-lines" => {
+                        if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                            MpvPropertyValue::SubLines(state.sub_lines.clone())
+                        } else {
+                            MpvPropertyValue::None
+                        }
+                    }
+                    "cursor-autohide" => {
+                        let int64_val =
+                            if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
+                                unsafe { *data.cast::<i64>() }
+                            } else {
+                                0
+                            };
+                        let str_val =
+                            if property.format == ffi::MPV_FORMAT_STRING && !data.is_null() {
+                                unsafe { *data.cast::<*const c_char>() }
+                            } else {
+                                ptr::null()
+                            };
+                        CursorAutohide::decode(property.format, int64_val, str_val)
+                            .map_or(MpvPropertyValue::None, MpvPropertyValue::CursorAutohide)
+                    }
+                    _ => match property.format {
+                        ffi::MPV_FORMAT_NONE => MpvPropertyValue::None,
+                        ffi::MPV_FORMAT_FLAG if !data.is_null() => {
+                            MpvPropertyValue::Flag(unsafe { *data.cast::<c_int>() } != 0)
+                        }
+                        ffi::MPV_FORMAT_INT64 if !data.is_null() => {
+                            MpvPropertyValue::Int64(unsafe { *data.cast::<i64>() })
+                        }
+                        ffi::MPV_FORMAT_DOUBLE if !data.is_null() => {
+                            MpvPropertyValue::Double(unsafe { *data.cast::<f64>() })
+                        }
+                        ffi::MPV_FORMAT_STRING if !data.is_null() => {
+                            MpvPropertyValue::String(copy_mpv_string(unsafe {
+                                *data.cast::<*const c_char>()
+                            }))
+                        }
+                        _ => MpvPropertyValue::Other,
+                    },
+                };
+                Some(MpvEvent::PropertyChange {
+                    name: prop_name,
+                    value,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Drain all queued libmpv events in strict arrival order via `mpv_wait_event(0.0)`
+    /// without collapsing intermediate `START_FILE` / `FILE_LOADED` / `COMMAND_REPLY` /
+    /// `PROPERTY_CHANGE` events. Also updates cached [`PlaybackState`].
+    pub fn drain_events(&self) -> Vec<MpvEvent> {
+        let mut events = std::mem::take(&mut *self.queued_events.borrow_mut());
+        // Clear pending BEFORE polling so any event queued concurrently triggers a fresh wakeup.
+        self.event_pending.clear_pending();
+        loop {
+            let event = unsafe { ffi::mpv_wait_event(self.handle, 0.0) };
+            let Some(raw) = (unsafe { event.as_ref() }) else {
+                break;
+            };
+            if raw.event_id == ffi::MPV_EVENT_NONE {
+                break;
+            }
+            if let Some(decoded) = self.decode_one_event(raw) {
+                events.push(decoded);
+            }
+        }
+        events
+    }
+
+    /// Drain asynchronous property events without waiting for mpv's core.
+    /// Kept compatible for existing callers; new wakeup-driven callers should
+    /// use [`Self::drain_events`].
+    pub fn poll_playback_state(&self) -> Ref<'_, PlaybackState> {
+        self.event_pending.clear_pending();
+        loop {
+            let event = unsafe { ffi::mpv_wait_event(self.handle, 0.0) };
+            let Some(raw) = (unsafe { event.as_ref() }) else {
+                break;
+            };
+            if raw.event_id == ffi::MPV_EVENT_NONE {
+                break;
+            }
+            let _ = self.decode_one_event(raw);
         }
         self.playback.borrow()
     }
@@ -1455,17 +2587,63 @@ impl MpvInstance {
     /// Call only while the UI's OpenGL context is current. If GL setup fails,
     /// the software context is restored for playback compatibility.
     pub fn activate_opengl(&self, resolver: &dyn Fn(&CStr) -> *const c_void) -> Result<(), String> {
+        self.activate_opengl_with_display(resolver, None, None)
+    }
+
+    /// Replace the CPU render context with libmpv's OpenGL renderer while
+    /// forwarding native X11 or Wayland display handles (`MPV_RENDER_PARAM_X11_DISPLAY`
+    /// / `MPV_RENDER_PARAM_WL_DISPLAY`) for zero-copy hardware decoding (`vaapi`/`nvdec`).
+    pub fn activate_opengl_with_display(
+        &self,
+        resolver: &dyn Fn(&CStr) -> *const c_void,
+        x11_display: Option<*mut c_void>,
+        wl_display: Option<*mut c_void>,
+    ) -> Result<(), String> {
+        self.activate_opengl_inner(
+            GlProcResolver::scoped(resolver),
+            true,
+            x11_display,
+            wl_display,
+        )
+    }
+
+    /// Like [`Self::activate_opengl_with_display`], but retains an owned `'static`
+    /// proc-address resolver for the entire lifetime of the OpenGL render context.
+    pub fn activate_opengl_owned_with_display(
+        &self,
+        resolver: impl Fn(&CStr) -> *const c_void + Send + Sync + 'static,
+        x11_display: Option<*mut c_void>,
+        wl_display: Option<*mut c_void>,
+    ) -> Result<(), String> {
+        self.activate_opengl_inner(
+            GlProcResolver::owned(resolver),
+            false,
+            x11_display,
+            wl_display,
+        )
+    }
+
+    fn activate_opengl_inner(
+        &self,
+        resolver: GlProcResolver,
+        is_scoped: bool,
+        x11_display: Option<*mut c_void>,
+        wl_display: Option<*mut c_void>,
+    ) -> Result<(), String> {
         let mut guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
-        if guard.api == RenderApi::OpenGl { return Ok(()); }
-        if let Some(old) = guard.pointer.take() {
-            unsafe {
-                ffi::mpv_render_context_set_update_callback(old.as_ptr(), None, ptr::null_mut());
-                ffi::mpv_render_context_free(old.as_ptr());
-            }
+        if guard.api == RenderApi::OpenGl {
+            return Ok(());
         }
-        let gl_result = create_opengl_context(self.handle, resolver);
-        let (context, api) = match gl_result {
-            Ok(context) => (context, RenderApi::OpenGl),
+        guard.free_context();
+        let gl_result = create_opengl_context_with_display(
+            self.handle,
+            resolver,
+            is_scoped,
+            x11_display,
+            wl_display,
+        );
+        let (context, resolver_ptr) = match gl_result {
+            Ok(res) => res,
             Err(error) => {
                 let fallback = create_software_context(self.handle)?;
                 guard.pointer = Some(fallback);
@@ -1475,7 +2653,8 @@ impl MpvInstance {
             }
         };
         guard.pointer = Some(context);
-        guard.api = api;
+        guard.api = RenderApi::OpenGl;
+        guard.gl_proc_resolver = Some(resolver_ptr);
         self.install_render_callback(context);
         self.render_pending.notify();
         Ok(())
@@ -1485,12 +2664,7 @@ impl MpvInstance {
     pub fn deactivate_opengl(&self) {
         if let Ok(mut guard) = self.render_lock.lock() {
             if guard.api == RenderApi::OpenGl {
-                if let Some(context) = guard.pointer.take() {
-                    unsafe {
-                        ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
-                        ffi::mpv_render_context_free(context.as_ptr());
-                    }
-                }
+                guard.free_context();
                 guard.api = RenderApi::Software;
             }
         }
@@ -1498,13 +2672,10 @@ impl MpvInstance {
 
     pub fn fallback_to_software(&self) -> Result<(), String> {
         let mut guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
-        if guard.api == RenderApi::Software && guard.pointer.is_some() { return Ok(()); }
-        if let Some(context) = guard.pointer.take() {
-            unsafe {
-                ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
-                ffi::mpv_render_context_free(context.as_ptr());
-            }
+        if guard.api == RenderApi::Software && guard.pointer.is_some() {
+            return Ok(());
         }
+        guard.free_context();
         let context = create_software_context(self.handle)?;
         guard.pointer = Some(context);
         guard.api = RenderApi::Software;
@@ -1519,23 +2690,52 @@ impl MpvInstance {
 
     /// Draw to an RGBA8 GL framebuffer while the UI's context is current.
     pub fn render_opengl(&self, fbo: u32, width: u32, height: u32) -> Result<(), String> {
+        self.render_opengl_with_format(fbo, width, height, 0)
+    }
+
+    /// Draw to an OpenGL framebuffer with an explicit internal format
+    /// (such as `GL_RGBA16F` or `GL_RGBA8`) while the UI's context is current.
+    pub fn render_opengl_with_format(
+        &self,
+        fbo: u32,
+        width: u32,
+        height: u32,
+        internal_format: i32,
+    ) -> Result<(), String> {
         let guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
-        if guard.api != RenderApi::OpenGl { return Err("OpenGL rendering is inactive".into()); }
+        if guard.api != RenderApi::OpenGl {
+            return Err("OpenGL rendering is inactive".into());
+        }
         let context = guard.pointer.ok_or("mpv render context is unavailable")?;
         let mut target = ffi::mpv_opengl_fbo {
-            fbo: fbo as c_int, w: width as c_int, h: height as c_int,
-            internal_format: 0, // Let libmpv query the framebuffer format.
+            fbo: fbo as c_int,
+            w: width as c_int,
+            h: height as c_int,
+            internal_format: internal_format as c_int,
         };
         // The UI thread must not wait inside mpv's frame pacing. Slint schedules
         // redraws from mpv's update callback and presents the frame afterward.
         let mut block_for_target_time: c_int = 0;
         let mut params = [
-            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_OPENGL_FBO, data: (&mut target as *mut ffi::mpv_opengl_fbo).cast() },
-            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, data: (&mut block_for_target_time as *mut c_int).cast() },
-            ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+            ffi::mpv_render_param {
+                type_: ffi::MPV_RENDER_PARAM_OPENGL_FBO,
+                data: (&mut target as *mut ffi::mpv_opengl_fbo).cast(),
+            },
+            ffi::mpv_render_param {
+                type_: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: (&mut block_for_target_time as *mut c_int).cast(),
+            },
+            ffi::mpv_render_param {
+                type_: ffi::MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
         ];
         let status = unsafe { ffi::mpv_render_context_render(context.as_ptr(), params.as_mut_ptr()) };
-        if status < 0 { Err(format!("mpv OpenGL render failed with code {status}")) } else { Ok(()) }
+        if status < 0 {
+            Err(format!("mpv OpenGL render failed with code {status}"))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn report_render_swap(&self) {
@@ -1580,32 +2780,72 @@ fn create_software_context(handle: *mut ffi::mpv_handle) -> Result<std::ptr::Non
     std::ptr::NonNull::new(context).ok_or_else(|| "mpv software render context was null".into())
 }
 
-fn create_opengl_context(
-    handle: *mut ffi::mpv_handle, resolver: &dyn Fn(&CStr) -> *const c_void,
-) -> Result<std::ptr::NonNull<ffi::mpv_render_context>, String> {
+/// Create an OpenGL `mpv_render_context` with heap-allocated [`GlProcResolver`]
+/// and optional X11 or Wayland display handles for hardware decoding interop.
+pub fn create_opengl_context_with_display(
+    handle: *mut ffi::mpv_handle,
+    resolver: GlProcResolver,
+    is_scoped: bool,
+    x11_display: Option<*mut c_void>,
+    wl_display: Option<*mut c_void>,
+) -> Result<(std::ptr::NonNull<ffi::mpv_render_context>, std::ptr::NonNull<GlProcResolver>), String> {
+    let non_null_resolver = std::ptr::NonNull::from(Box::leak(Box::new(resolver)));
+    let resolver_ptr = non_null_resolver.as_ptr();
+    let _clear_guard = is_scoped.then_some(ScopedResolverClear(resolver_ptr));
+
     let mut init = ffi::mpv_opengl_init_params {
-        get_proc_address: Some(resolve_gl_proc), get_proc_address_ctx: ptr::null_mut(),
+        get_proc_address: Some(resolve_gl_proc),
+        get_proc_address_ctx: resolver_ptr.cast(),
     };
     let mut context = ptr::null_mut();
     // Enables GPU screenshots (including direct NVDEC frames). All player
     // operations on the UI/render thread are asynchronous or cached; every
     // update callback must be serviced even if no video frame is due.
     let mut advanced_control: c_int = 1;
-    let mut params = [
-        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_API_TYPE, data: c"opengl".as_ptr().cast_mut().cast() },
-        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, data: (&mut init as *mut ffi::mpv_opengl_init_params).cast() },
-        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_ADVANCED_CONTROL, data: (&mut advanced_control as *mut c_int).cast() },
-        ffi::mpv_render_param { type_: ffi::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
-    ];
-    let resolver_ref = resolver;
-    let previous = GL_PROC_RESOLVER.with(|slot| slot.replace((&resolver_ref as *const _) as *const c_void));
+    let mut params = Vec::with_capacity(5);
+    params.push(ffi::mpv_render_param {
+        type_: ffi::MPV_RENDER_PARAM_API_TYPE,
+        data: c"opengl".as_ptr().cast_mut().cast(),
+    });
+    params.push(ffi::mpv_render_param {
+        type_: ffi::MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+        data: (&mut init as *mut ffi::mpv_opengl_init_params).cast(),
+    });
+    params.push(ffi::mpv_render_param {
+        type_: ffi::MPV_RENDER_PARAM_ADVANCED_CONTROL,
+        data: (&mut advanced_control as *mut c_int).cast(),
+    });
+    if let Some(display) = x11_display.filter(|p| !p.is_null()) {
+        params.push(ffi::mpv_render_param {
+            type_: ffi::MPV_RENDER_PARAM_X11_DISPLAY,
+            data: display,
+        });
+    } else if let Some(display) = wl_display.filter(|p| !p.is_null()) {
+        params.push(ffi::mpv_render_param {
+            type_: ffi::MPV_RENDER_PARAM_WL_DISPLAY,
+            data: display,
+        });
+    }
+    params.push(ffi::mpv_render_param {
+        type_: ffi::MPV_RENDER_PARAM_INVALID,
+        data: ptr::null_mut(),
+    });
+
     let status = unsafe { ffi::mpv_render_context_create(&mut context, handle, params.as_mut_ptr()) };
-    GL_PROC_RESOLVER.with(|slot| slot.set(previous));
     if status < 0 {
-        if !context.is_null() { unsafe { ffi::mpv_render_context_free(context) }; }
+        if !context.is_null() {
+            unsafe { ffi::mpv_render_context_free(context) };
+        }
+        drop(_clear_guard);
+        drop(unsafe { Box::from_raw(resolver_ptr) });
         return Err(format!("mpv OpenGL render context failed with code {status}"));
     }
-    std::ptr::NonNull::new(context).ok_or_else(|| "mpv OpenGL render context was null".into())
+    let Some(non_null_ctx) = std::ptr::NonNull::new(context) else {
+        drop(_clear_guard);
+        drop(unsafe { Box::from_raw(resolver_ptr) });
+        return Err("mpv OpenGL render context was null".into());
+    };
+    Ok((non_null_ctx, non_null_resolver))
 }
 
 fn render_rgba_context(render: *mut ffi::mpv_render_context, width: u32, height: u32, pixels: &mut [u8]) -> Result<(), String> {
@@ -1842,27 +3082,120 @@ impl MpvInstance {
         ])
     }
 
-    fn command_ret_id(&self, args: &[&str]) -> Result<i64, String> {
-        if self.is_opengl_active() {
-            return Err("Synchronous subtitle commands are unavailable on the OpenGL render thread".into());
-        }
-        let c_args: Result<Vec<std::ffi::CString>, _> =
-            args.iter().map(|arg| std::ffi::CString::new(*arg)).collect();
+    /// Dispatch a structured command via `mpv_command_node_async` without
+    /// blocking the render/UI thread. Returns the unique `reply_userdata`
+    /// matched on `MpvEvent::CommandReply`.
+    pub fn command_node_async(&self, args: &[&str]) -> Result<u64, String> {
+        let c_args: Result<Vec<CString>, _> = args.iter().map(|arg| CString::new(*arg)).collect();
         let c_args = c_args.map_err(|error| error.to_string())?;
-        let mut pointers: Vec<*const c_char> =
-            c_args.iter().map(|arg| arg.as_ptr()).collect();
-        pointers.push(ptr::null());
-        let mut id = -1;
-        let status = unsafe {
-            memento_player_command_ret_i64(self.handle, pointers.as_ptr(), &mut id)
+        let mut nodes: Vec<ffi::mpv_node> = c_args
+            .iter()
+            .map(|s| ffi::mpv_node {
+                format: ffi::MPV_FORMAT_STRING,
+                u: ffi::mpv_node__bindgen_ty_1 {
+                    string: s.as_ptr().cast_mut(),
+                },
+            })
+            .collect();
+        let num = c_int::try_from(nodes.len())
+            .map_err(|_| "mpv command argument list too long".to_owned())?;
+        let mut list = ffi::mpv_node_list {
+            num,
+            values: nodes.as_mut_ptr(),
+            keys: ptr::null_mut(),
         };
+        let mut root = ffi::mpv_node {
+            format: ffi::MPV_FORMAT_NODE_ARRAY,
+            u: ffi::mpv_node__bindgen_ty_1 { list: &mut list },
+        };
+        let reply_id = self.next_reply_id.fetch_add(1, Ordering::Relaxed);
+        let status = unsafe { ffi::mpv_command_node_async(self.handle, reply_id, &mut root) };
         if status < 0 {
             Err(format!(
-                "mpv {} command failed with code {status}",
+                "mpv_command_node_async({}) failed with code {status}",
                 args.first().copied().unwrap_or("command")
             ))
         } else {
-            Ok(id)
+            Ok(reply_id)
+        }
+    }
+
+    fn wait_command_reply_i64(&self, reply_id: u64, command: &str) -> Result<i64, String> {
+        if self.is_opengl_active() {
+            return Err(format!(
+                "Synchronous wait for `{command}` is unavailable on the OpenGL render thread; use {command}_async or AsrSubtitleTrack"
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("mpv {command} timed out waiting for reply"));
+            }
+            let event = unsafe { ffi::mpv_wait_event(self.handle, remaining.as_secs_f64()) };
+            let Some(raw) = (unsafe { event.as_ref() }) else {
+                return Err(format!("mpv {command} received null event"));
+            };
+            if raw.event_id == ffi::MPV_EVENT_NONE {
+                continue;
+            }
+            if let Some(decoded) = self.decode_one_event(raw) {
+                match decoded {
+                    MpvEvent::CommandReply {
+                        reply_userdata,
+                        error,
+                        result,
+                    } if reply_userdata == reply_id => {
+                        if error < 0 {
+                            return Err(format!("mpv {command} command failed with code {error}"));
+                        }
+                        return match result {
+                            CommandReplyResult::Int64(id) if memento_player_id_valid(id) => Ok(id),
+                            _ => Err(format!("mpv {command} command returned no valid ID")),
+                        };
+                    }
+                    MpvEvent::Shutdown => {
+                        self.queued_events.borrow_mut().push(decoded);
+                        return Err(format!("Player shut down during {command}"));
+                    }
+                    other => self.queued_events.borrow_mut().push(other),
+                }
+            }
+        }
+    }
+
+    /// Replace the in-memory WebVTT buffer backing `memento-asr://`.
+    pub fn set_asr_stream_bytes(&self, bytes: impl Into<Arc<[u8]>>) {
+        let mut guard = self
+            .asr_stream
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = bytes.into();
+    }
+
+    /// Format sorted ASR cues into BOM-free UTF-8 WebVTT in RAM for `memento-asr://`.
+    pub fn set_asr_stream_cues(&self, cues: &[AsrCue]) {
+        let bytes = format_webvtt_cues(cues);
+        self.set_asr_stream_bytes(bytes);
+    }
+
+    /// Add and select the in-memory `memento-asr://live.vtt` subtitle track via `sub-add`.
+    pub fn add_asr_stream_track_async(&self, title: &str, language: &str) -> Result<u64, String> {
+        if language.is_empty() {
+            self.command_node_async(&["sub-add", ASR_STREAM_URI, "select", title])
+        } else {
+            self.command_node_async(&["sub-add", ASR_STREAM_URI, "select", title, language])
+        }
+    }
+
+    /// Trigger an asynchronous `sub-reload` on the `memento-asr://` subtitle track.
+    pub fn reload_asr_stream_track_async(&self, sid: Option<i64>) -> Result<u64, String> {
+        match sid.filter(|&id| id > 0) {
+            Some(id) => {
+                let id_str = id.to_string();
+                self.command_node_async(&["sub-reload", &id_str])
+            }
+            None => self.command_node_async(&["sub-reload"]),
         }
     }
 
@@ -1871,7 +3204,7 @@ impl MpvInstance {
         track_id: i64,
         start: f64,
         end: f64,
-        text: &std::ffi::CString,
+        text: &CString,
     ) -> Result<(), String> {
         if !self.supports_memory_subtitles() {
             return Err("mpv does not support in-memory subtitles".into());
@@ -1887,18 +3220,117 @@ impl MpvInstance {
         Ok(())
     }
 
-    pub fn create_memory_subtitle_track(
+    /// Mode 2 non-blocking `sub-create` via `mpv_command_node_async`.
+    /// Delivers `track_id` (`Int64`) in `MpvEvent::CommandReply`.
+    pub fn create_memory_subtitle_track_async(
         &self,
         title: &str,
         language: &str,
-    ) -> Result<i64, String> {
+    ) -> Result<u64, String> {
         if !self.supports_memory_subtitles() {
             return Err("mpv does not support in-memory subtitles".into());
         }
         if self.capture_encode_context().is_none() {
             return Err("no media file is loaded".into());
         }
-        self.command_ret_id(&["sub-create", title, language])
+        self.command_node_async(&["sub-create", title, language])
+    }
+
+    /// Mode 2 non-blocking `add-subtitle` via `mpv_command_node_async`.
+    /// Delivers `cue_id` (`Int64`) in `MpvEvent::CommandReply`.
+    pub fn add_memory_subtitle_async(
+        &self,
+        track_id: i64,
+        start: f64,
+        end: f64,
+        text: &str,
+    ) -> Result<u64, String> {
+        let text = CString::new(text).map_err(|error| error.to_string())?;
+        self.validate_memory_subtitle_cue(track_id, start, end, &text)?;
+        let track_id = track_id.to_string();
+        let start = start.to_string();
+        let end = end.to_string();
+        self.command_node_async(&[
+            "add-subtitle",
+            &track_id,
+            &start,
+            &end,
+            text.to_str().map_err(|error| error.to_string())?,
+        ])
+    }
+
+    /// Mode 2 non-blocking `edit-subtitle` via `mpv_command_node_async`.
+    pub fn edit_memory_subtitle_async(
+        &self,
+        track_id: i64,
+        cue_id: i64,
+        start: f64,
+        end: f64,
+        text: &str,
+    ) -> Result<u64, String> {
+        let text = CString::new(text).map_err(|error| error.to_string())?;
+        self.validate_memory_subtitle_cue(track_id, start, end, &text)?;
+        if !memento_player_id_valid(cue_id) {
+            return Err("invalid in-memory subtitle cue ID".into());
+        }
+        let track_id = track_id.to_string();
+        let cue_id = cue_id.to_string();
+        let start = start.to_string();
+        let end = end.to_string();
+        self.command_node_async(&[
+            "edit-subtitle",
+            &track_id,
+            &cue_id,
+            &start,
+            &end,
+            text.to_str().map_err(|error| error.to_string())?,
+        ])
+    }
+
+    /// Mode 2 non-blocking `remove-subtitle` via `mpv_command_node_async`.
+    pub fn remove_memory_subtitle_async(&self, track_id: i64, cue_id: i64) -> Result<u64, String> {
+        if !self.supports_memory_subtitles() {
+            return Err("mpv does not support in-memory subtitles".into());
+        }
+        if !memento_player_id_valid(track_id) || !memento_player_id_valid(cue_id) {
+            return Err("invalid in-memory subtitle ID".into());
+        }
+        let track_id = track_id.to_string();
+        let cue_id = cue_id.to_string();
+        self.command_node_async(&["remove-subtitle", &track_id, &cue_id])
+    }
+
+    /// Mode 2 non-blocking `clear-subtitles` via `mpv_command_node_async`.
+    pub fn clear_memory_subtitles_async(&self, track_id: i64) -> Result<u64, String> {
+        if !self.supports_memory_subtitles() {
+            return Err("mpv does not support in-memory subtitles".into());
+        }
+        if !memento_player_id_valid(track_id) {
+            return Err("invalid in-memory subtitle track ID".into());
+        }
+        let track_id = track_id.to_string();
+        self.command_node_async(&["clear-subtitles", &track_id])
+    }
+
+    /// Mode 2 non-blocking `sub-remove` via `mpv_command_node_async`.
+    pub fn remove_memory_subtitle_track_async(&self, track_id: i64) -> Result<u64, String> {
+        if !self.supports_memory_subtitles() {
+            return Err("mpv does not support in-memory subtitles".into());
+        }
+        if !memento_player_id_valid(track_id) {
+            return Err("invalid in-memory subtitle track ID".into());
+        }
+        let track_id = track_id.to_string();
+        self.command_node_async(&["sub-remove", &track_id])
+    }
+
+    pub fn create_memory_subtitle_track(
+        &self,
+        title: &str,
+        language: &str,
+    ) -> Result<i64, String> {
+        let reply_id = self.create_memory_subtitle_track_async(title, language)?;
+        self.wait_command_reply_i64(reply_id, "sub-create")
     }
 
     pub fn add_memory_subtitle(
@@ -1908,18 +3340,8 @@ impl MpvInstance {
         end: f64,
         text: &str,
     ) -> Result<i64, String> {
-        let text = std::ffi::CString::new(text).map_err(|error| error.to_string())?;
-        self.validate_memory_subtitle_cue(track_id, start, end, &text)?;
-        let track_id = track_id.to_string();
-        let start = start.to_string();
-        let end = end.to_string();
-        self.command_ret_id(&[
-            "add-subtitle",
-            &track_id,
-            &start,
-            &end,
-            text.to_str().map_err(|error| error.to_string())?,
-        ])
+        let reply_id = self.add_memory_subtitle_async(track_id, start, end, text)?;
+        self.wait_command_reply_i64(reply_id, "add-subtitle")
     }
 
     pub fn edit_memory_subtitle(
@@ -1930,63 +3352,27 @@ impl MpvInstance {
         end: f64,
         text: &str,
     ) -> Result<(), String> {
-        let text = std::ffi::CString::new(text).map_err(|error| error.to_string())?;
-        self.validate_memory_subtitle_cue(track_id, start, end, &text)?;
-        if !memento_player_id_valid(cue_id) {
-            return Err("invalid in-memory subtitle cue ID".into());
-        }
-        let track_id = track_id.to_string();
-        let cue_id = cue_id.to_string();
-        let start = start.to_string();
-        let end = end.to_string();
-        self.command(&[
-            "edit-subtitle",
-            &track_id,
-            &cue_id,
-            &start,
-            &end,
-            text.to_str().map_err(|error| error.to_string())?,
-        ])
+        self.edit_memory_subtitle_async(track_id, cue_id, start, end, text)
+            .map(|_| ())
     }
 
     pub fn remove_memory_subtitle(&self, track_id: i64, cue_id: i64) -> Result<(), String> {
-        if !self.supports_memory_subtitles() {
-            return Err("mpv does not support in-memory subtitles".into());
-        }
-        if !memento_player_id_valid(track_id) || !memento_player_id_valid(cue_id) {
-            return Err("invalid in-memory subtitle ID".into());
-        }
-        let track_id = track_id.to_string();
-        let cue_id = cue_id.to_string();
-        self.command(&["remove-subtitle", &track_id, &cue_id])
+        self.remove_memory_subtitle_async(track_id, cue_id)
+            .map(|_| ())
     }
 
     pub fn clear_memory_subtitles(&self, track_id: i64) -> Result<(), String> {
-        if !self.supports_memory_subtitles() {
-            return Err("mpv does not support in-memory subtitles".into());
-        }
-        if !memento_player_id_valid(track_id) {
-            return Err("invalid in-memory subtitle track ID".into());
-        }
-        let track_id = track_id.to_string();
-        self.command(&["clear-subtitles", &track_id])
+        self.clear_memory_subtitles_async(track_id).map(|_| ())
     }
 
     pub fn remove_memory_subtitle_track(&self, track_id: i64) -> Result<(), String> {
-        if !self.supports_memory_subtitles() {
-            return Err("mpv does not support in-memory subtitles".into());
-        }
-        if !memento_player_id_valid(track_id) {
-            return Err("invalid in-memory subtitle track ID".into());
-        }
-        let track_id = track_id.to_string();
-        self.command(&["sub-remove", &track_id])
+        self.remove_memory_subtitle_track_async(track_id)
+            .map(|_| ())
     }
 
     pub fn select_subtitle_track(&self, track_id: i64) -> Result<(), String> {
         self.set_sid(track_id)
     }
-
 
     pub fn raw_handle(&self) -> *mut ffi::mpv_handle {
         self.handle
@@ -1999,13 +3385,28 @@ impl MpvInstance {
     }
 
     pub fn load_file(&self, path: &str) -> Result<(), String> {
-        drop(self.poll_playback_state());
+        self.load_file_with_options(path, false, &[])
+    }
+
+    /// Queue `loadfile` with optional `append-play` mode and per-file mpv options.
+    pub fn load_file_with_options(
+        &self,
+        path: &str,
+        append: bool,
+        options: &[String],
+    ) -> Result<(), String> {
         {
             let mut state = self.playback.borrow_mut();
             state.file_loaded = false;
             state.playback_ready = false;
         }
-        self.command(&["loadfile", path, "replace"])
+        let mode = if append { "append-play" } else { "replace" };
+        if options.is_empty() {
+            self.command(&["loadfile", path, mode])
+        } else {
+            let joined = options.join(",");
+            self.command(&["loadfile", path, mode, "-1", &joined])
+        }
     }
 
     pub fn play(&self) -> Result<(), String> {
@@ -2033,7 +3434,6 @@ impl MpvInstance {
         let sec_str = format!("{:.3}", delta);
         self.command_async(&["seek", &sec_str, "relative"])
     }
-
 
     pub fn set_volume(&self, vol: f64) -> Result<(), String> {
         let vol_str = format!("{:.1}", vol.clamp(0.0, 100.0));
@@ -2069,23 +3469,464 @@ impl MpvInstance {
     }
 }
 
-impl Drop for MpvInstance {
-    fn drop(&mut self) {
-        // Even weak mpv clients must close before terminate_destroy returns.
-        // Disconnect the worker before waiting for core shutdown. Freeing the
-        // renderer below services any GPU capture that is already in flight.
-        self.screenshot_jobs.take();
-        if let Ok(mut guard) = self.render_lock.lock() {
-            if let Some(context) = guard.pointer.take() {
-                unsafe {
-                    ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
-                    ffi::mpv_render_context_free(context.as_ptr());
+/// Unified, non-blocking ASR subtitle track manager supporting both Mode 2
+/// (`eyalmazuz/mpv` in-memory subtitle commands via `mpv_command_node_async`) and
+/// Mode 1 (stock `libmpv` `mpv_stream_cb_add_ro` `"memento-asr://live.vtt"` + `sub-reload`).
+pub struct AsrSubtitleTrack {
+    mode: AsrTrackMode,
+    sid: Option<i64>,
+    pending_create_req: Option<u64>,
+    cues: Vec<AsrCue>,
+    // Mode 1 (stream_cb) state
+    reload_in_flight: Option<u64>,
+    reload_dirty: bool,
+    deselected_by_user: bool,
+    // Mode 2 (native memory subtitles) async tracking
+    pending_cues: VecDeque<AsrCue>,
+    pending_adds: HashMap<u64, i64>,
+    mpv_cue_ids: HashMap<i64, i64>,
+    pending_edits: HashMap<i64, AsrCue>,
+    pending_removals: HashSet<i64>,
+}
+
+impl AsrSubtitleTrack {
+    /// Create a new track manager selecting Mode 2 when `mpv.supports_memory_subtitles()`
+    /// is true, otherwise Mode 1 (`memento-asr://`).
+    pub fn new(mpv: &MpvInstance) -> Self {
+        Self::with_mode(if mpv.supports_memory_subtitles() {
+            AsrTrackMode::NativeMemory
+        } else {
+            AsrTrackMode::StreamCallback
+        })
+    }
+
+    pub fn with_mode(mode: AsrTrackMode) -> Self {
+        Self {
+            mode,
+            sid: None,
+            pending_create_req: None,
+            cues: Vec::new(),
+            reload_in_flight: None,
+            reload_dirty: false,
+            deselected_by_user: false,
+            pending_cues: VecDeque::new(),
+            pending_adds: HashMap::new(),
+            mpv_cue_ids: HashMap::new(),
+            pending_edits: HashMap::new(),
+            pending_removals: HashSet::new(),
+        }
+    }
+
+    pub fn mode(&self) -> AsrTrackMode {
+        self.mode
+    }
+
+    pub fn sid(&self) -> Option<i64> {
+        self.sid
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.sid.is_some() || self.pending_create_req.is_some()
+    }
+
+    pub fn cues(&self) -> &[AsrCue] {
+        &self.cues
+    }
+
+    fn reset_local_state(&mut self) {
+        self.sid = None;
+        self.pending_create_req = None;
+        self.cues.clear();
+        self.reload_in_flight = None;
+        self.reload_dirty = false;
+        self.deselected_by_user = false;
+        self.pending_cues.clear();
+        self.pending_adds.clear();
+        self.mpv_cue_ids.clear();
+        self.pending_edits.clear();
+        self.pending_removals.clear();
+    }
+
+    /// Create/add and select the ASR track in libmpv asynchronously without
+    /// blocking the UI or GL render thread.
+    pub fn start(&mut self, mpv: &MpvInstance, title: &str, language: &str) -> Result<(), String> {
+        if let Some(old_sid) = self.sid {
+            let _ = match self.mode {
+                AsrTrackMode::NativeMemory => mpv.remove_memory_subtitle_track_async(old_sid),
+                AsrTrackMode::StreamCallback => {
+                    let id_str = old_sid.to_string();
+                    mpv.command_node_async(&["sub-remove", &id_str])
+                }
+            };
+        }
+        self.reset_local_state();
+        let req = match self.mode {
+            AsrTrackMode::NativeMemory => mpv.create_memory_subtitle_track_async(title, language)?,
+            AsrTrackMode::StreamCallback => {
+                mpv.set_asr_stream_cues(&[]);
+                mpv.add_asr_stream_track_async(title, language)?
+            }
+        };
+        self.pending_create_req = Some(req);
+        Ok(())
+    }
+
+    fn upsert_sorted_cue(&mut self, cue: AsrCue) {
+        self.cues.retain(|existing| existing.id != cue.id);
+        self.cues.push(cue);
+        self.cues.sort_by(|a, b| {
+            a.start
+                .total_cmp(&b.start)
+                .then_with(|| a.end.total_cmp(&b.end))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    fn validate_cue(cue: &AsrCue) -> Result<(), String> {
+        let text_c = CString::new(cue.text.as_str()).map_err(|error| error.to_string())?;
+        if !unsafe {
+            memento_player_cue_valid(
+                cue.start,
+                cue.end,
+                text_c.as_ptr().cast(),
+                text_c.as_bytes().len(),
+            )
+        } {
+            return Err("invalid ASR subtitle cue".into());
+        }
+        Ok(())
+    }
+
+    /// Insert or replace a cue and push the update to libmpv asynchronously.
+    pub fn add_cue(&mut self, mpv: &MpvInstance, cue: AsrCue) -> Result<(), String> {
+        Self::validate_cue(&cue)?;
+        self.upsert_sorted_cue(cue.clone());
+        match self.mode {
+            AsrTrackMode::StreamCallback => {
+                mpv.set_asr_stream_cues(&self.cues);
+                self.trigger_stream_reload(mpv)
+            }
+            AsrTrackMode::NativeMemory => {
+                self.pending_removals.remove(&cue.id);
+                if let Some(&mpv_cue_id) = self.mpv_cue_ids.get(&cue.id) {
+                    if let Some(track_id) = self.sid {
+                        mpv.edit_memory_subtitle_async(
+                            track_id,
+                            mpv_cue_id,
+                            cue.start,
+                            cue.end,
+                            &cue.text,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                if self.pending_adds.values().any(|&local_id| local_id == cue.id) {
+                    self.pending_edits.insert(cue.id, cue);
+                    return Ok(());
+                }
+                if let Some(track_id) = self.sid {
+                    let req = mpv.add_memory_subtitle_async(
+                        track_id,
+                        cue.start,
+                        cue.end,
+                        &cue.text,
+                    )?;
+                    self.pending_adds.insert(req, cue.id);
+                } else if self.pending_create_req.is_some() {
+                    self.pending_cues.retain(|c| c.id != cue.id);
+                    self.pending_cues.push_back(cue);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn edit_cue(&mut self, mpv: &MpvInstance, cue: AsrCue) -> Result<(), String> {
+        self.add_cue(mpv, cue)
+    }
+
+    pub fn remove_cue(&mut self, mpv: &MpvInstance, cue_id: i64) -> Result<(), String> {
+        self.cues.retain(|cue| cue.id != cue_id);
+        match self.mode {
+            AsrTrackMode::StreamCallback => {
+                mpv.set_asr_stream_cues(&self.cues);
+                self.trigger_stream_reload(mpv)
+            }
+            AsrTrackMode::NativeMemory => {
+                self.pending_cues.retain(|c| c.id != cue_id);
+                self.pending_edits.remove(&cue_id);
+                if let Some(mpv_cue_id) = self.mpv_cue_ids.remove(&cue_id) {
+                    if let Some(track_id) = self.sid {
+                        mpv.remove_memory_subtitle_async(track_id, mpv_cue_id)?;
+                    }
+                } else if self.pending_adds.values().any(|&local_id| local_id == cue_id) {
+                    self.pending_removals.insert(cue_id);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn clear(&mut self, mpv: &MpvInstance) -> Result<(), String> {
+        self.cues.clear();
+        self.pending_cues.clear();
+        self.pending_edits.clear();
+        match self.mode {
+            AsrTrackMode::StreamCallback => {
+                mpv.set_asr_stream_cues(&[]);
+                self.trigger_stream_reload(mpv)
+            }
+            AsrTrackMode::NativeMemory => {
+                for &local_id in self.pending_adds.values() {
+                    self.pending_removals.insert(local_id);
+                }
+                self.mpv_cue_ids.clear();
+                if let Some(track_id) = self.sid {
+                    mpv.clear_memory_subtitles_async(track_id)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn remove_track(&mut self, mpv: &MpvInstance) -> Result<(), String> {
+        if let Some(track_id) = self.sid {
+            match self.mode {
+                AsrTrackMode::NativeMemory => {
+                    mpv.remove_memory_subtitle_track_async(track_id)?;
+                }
+                AsrTrackMode::StreamCallback => {
+                    let id_str = track_id.to_string();
+                    mpv.command_node_async(&["sub-remove", &id_str])?;
                 }
             }
         }
+        mpv.set_asr_stream_cues(&[]);
+        self.reset_local_state();
+        Ok(())
+    }
+
+    pub fn select(&mut self, mpv: &MpvInstance) -> Result<(), String> {
+        self.deselected_by_user = false;
+        if let Some(sid) = self.sid {
+            mpv.set_sid(sid)?;
+            if self.mode == AsrTrackMode::StreamCallback && self.reload_dirty {
+                self.trigger_stream_reload(mpv)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn trigger_stream_reload(&mut self, mpv: &MpvInstance) -> Result<(), String> {
+        if self.sid.is_none() || self.deselected_by_user {
+            self.reload_dirty = true;
+            return Ok(());
+        }
+        if self.reload_in_flight.is_some() {
+            self.reload_dirty = true;
+            return Ok(());
+        }
+        self.reload_dirty = false;
+        let req = mpv.reload_asr_stream_track_async(self.sid)?;
+        self.reload_in_flight = Some(req);
+        Ok(())
+    }
+
+    /// Process an [`MpvEvent`] from `MpvInstance::drain_events`, resolving
+    /// async track/cue IDs and flushing queued updates. Returns `Some(sid)`
+    /// when the track's positive `sid` newly becomes ready.
+    pub fn on_event(
+        &mut self,
+        mpv: &MpvInstance,
+        event: &MpvEvent,
+    ) -> Result<Option<i64>, String> {
+        match event {
+            MpvEvent::EndFile { .. } => {
+                self.reset_local_state();
+                Ok(None)
+            }
+            MpvEvent::PropertyChange {
+                name,
+                value: MpvPropertyValue::Tracks { subtitle, .. },
+            } if name == "track-list" && self.mode == AsrTrackMode::StreamCallback => {
+                if let Some(track) = subtitle
+                    .iter()
+                    .rfind(|t| t.external && t.external_path == ASR_STREAM_URI && t.id > 0)
+                {
+                    let became_ready = self.sid.is_none();
+                    self.sid = Some(track.id);
+                    if self.pending_create_req.is_none() && self.reload_in_flight.is_none() {
+                        self.deselected_by_user = !track.selected;
+                        if !self.deselected_by_user && self.reload_dirty {
+                            self.trigger_stream_reload(mpv)?;
+                        }
+                    } else if track.selected {
+                        self.deselected_by_user = false;
+                    }
+                    if became_ready {
+                        return Ok(Some(track.id));
+                    }
+                }
+                Ok(None)
+            }
+            MpvEvent::PropertyChange { name, value }
+                if name == "sid" && self.mode == AsrTrackMode::StreamCallback =>
+            {
+                if let Some(asr_sid) = self.sid {
+                    match value {
+                        MpvPropertyValue::Int64(id) if *id == asr_sid => {
+                            self.deselected_by_user = false;
+                            if self.pending_create_req.is_none()
+                                && self.reload_in_flight.is_none()
+                                && self.reload_dirty
+                            {
+                                self.trigger_stream_reload(mpv)?;
+                            }
+                        }
+                        MpvPropertyValue::Int64(_) | MpvPropertyValue::Flag(false)
+                            if self.pending_create_req.is_none()
+                                && self.reload_in_flight.is_none() =>
+                        {
+                            self.deselected_by_user = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None)
+            }
+            MpvEvent::CommandReply {
+                reply_userdata,
+                error,
+                result,
+            } => {
+                if Some(*reply_userdata) == self.pending_create_req {
+                    self.pending_create_req = None;
+                    if *error < 0 {
+                        self.reset_local_state();
+                        return Err(format!("ASR subtitle track creation failed ({error})"));
+                    }
+                    match self.mode {
+                        AsrTrackMode::StreamCallback => {
+                            if self.sid.is_none() {
+                                if let Some(track) = mpv
+                                    .subtitle_tracks()
+                                    .into_iter()
+                                    .rfind(|t| t.external && t.external_path == ASR_STREAM_URI && t.id > 0)
+                                {
+                                    self.sid = Some(track.id);
+                                    self.deselected_by_user = !track.selected;
+                                } else if mpv.primary_sid() > 0 {
+                                    self.sid = Some(mpv.primary_sid());
+                                }
+                            }
+                            if self.reload_dirty && self.sid.is_some() && !self.deselected_by_user {
+                                self.trigger_stream_reload(mpv)?;
+                            }
+                            return Ok(self.sid);
+                        }
+                        AsrTrackMode::NativeMemory => {
+                            let CommandReplyResult::Int64(track_id) = result else {
+                                return Err("sub-create returned no track ID".into());
+                            };
+                            if !memento_player_id_valid(*track_id) {
+                                return Err("sub-create returned invalid track ID".into());
+                            }
+                            self.sid = Some(*track_id);
+                            mpv.set_sid(*track_id)?;
+                            while let Some(cue) = self.pending_cues.pop_front() {
+                                let req = mpv.add_memory_subtitle_async(
+                                    *track_id,
+                                    cue.start,
+                                    cue.end,
+                                    &cue.text,
+                                )?;
+                                self.pending_adds.insert(req, cue.id);
+                            }
+                            return Ok(Some(*track_id));
+                        }
+                    }
+                }
+
+                if Some(*reply_userdata) == self.reload_in_flight {
+                    self.reload_in_flight = None;
+                    if *error < 0 {
+                        return Err(format!("sub-reload failed with code {error}"));
+                    }
+                    if self.reload_dirty && self.sid.is_some() && !self.deselected_by_user {
+                        self.trigger_stream_reload(mpv)?;
+                    }
+                    return Ok(None);
+                }
+
+                if let Some(local_id) = self.pending_adds.remove(reply_userdata) {
+                    if *error < 0 {
+                        self.pending_removals.remove(&local_id);
+                        self.pending_edits.remove(&local_id);
+                        return Err(format!("add-subtitle failed with code {error}"));
+                    }
+                    if let CommandReplyResult::Int64(mpv_cue_id) = result {
+                        if let Some(track_id) = self.sid {
+                            if self.pending_removals.remove(&local_id) {
+                                mpv.remove_memory_subtitle_async(track_id, *mpv_cue_id)?;
+                            } else {
+                                self.mpv_cue_ids.insert(local_id, *mpv_cue_id);
+                                if let Some(edited) = self.pending_edits.remove(&local_id) {
+                                    mpv.edit_memory_subtitle_async(
+                                        track_id,
+                                        *mpv_cue_id,
+                                        edited.start,
+                                        edited.end,
+                                        &edited.text,
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Drop for MpvInstance {
+    fn drop(&mut self) {
+        // 1. Disconnect the screenshot channel and signal closing so the worker
+        //    exits immediately without waiting for the 10-second capture timeout.
+        self.screenshot_jobs.take();
+        self.screenshot_closing.store(true, Ordering::Release);
+
+        // 2. Free the render context (and any heap GlProcResolver) before joining
+        //    so any in-flight GPU capture either completes or aborts cleanly.
+        if let Ok(mut guard) = self.render_lock.lock() {
+            guard.free_context();
+        }
+
+        // 3. Wake any waiting weak screenshot client and join its thread BEFORE
+        //    calling mpv_terminate_destroy(self.handle).
+        if let Ok(guard) = self.screenshot_wake_handle.lock() {
+            if let Some(weak) = *guard {
+                unsafe { ffi::mpv_wakeup(weak.0) };
+            }
+        }
+        if let Some(thread) = self.screenshot_thread.take() {
+            let _ = thread.join();
+        }
+
+        // 4. Unregister wakeup callback and terminate-destroy the core handle.
         if !self.handle.is_null() {
-            unsafe { ffi::mpv_terminate_destroy(self.handle) };
+            unsafe {
+                ffi::mpv_set_wakeup_callback(self.handle, None, ptr::null_mut());
+                ffi::mpv_terminate_destroy(self.handle);
+            }
             self.handle = ptr::null_mut();
+        }
+
+        // 5. Protocol callbacks are guaranteed unregistered only after
+        //    mpv_terminate_destroy returns; release the user_data Arc ref now.
+        if let Some(raw) = self.asr_stream_raw.take() {
+            drop(unsafe { Arc::from_raw(raw) });
         }
     }
 }
@@ -2857,6 +4698,444 @@ mod tests {
             pixels
         }).join().expect("render worker should finish before mpv is dropped");
         assert!(worker_pixels.0.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn pause_unavailable_format_none_does_not_force_paused_true() {
+        let mut state = PlaybackState {
+            paused: false,
+            ..Default::default()
+        };
+        let event = ffi::mpv_event_property {
+            name: c"pause".as_ptr(),
+            format: ffi::MPV_FORMAT_NONE,
+            data: ptr::null_mut(),
+        };
+        unsafe { state.update(&event) };
+        assert!(!state.paused, "MPV_FORMAT_NONE on pause must retain previous value");
+
+        let mut flag: c_int = 1;
+        let event_yes = ffi::mpv_event_property {
+            name: c"pause".as_ptr(),
+            format: ffi::MPV_FORMAT_FLAG,
+            data: (&mut flag as *mut c_int).cast(),
+        };
+        unsafe { state.update(&event_yes) };
+        assert!(state.paused);
+    }
+
+    #[test]
+    fn webvtt_formats_sorted_cues_without_bom_and_sanitizes_blank_lines() {
+        let cues = vec![
+            AsrCue {
+                id: 2,
+                start: 12.5,
+                end: 15.0,
+                text: "Second\r\n\r\nLine".into(),
+            },
+            AsrCue {
+                id: 1,
+                start: 1.2345,
+                end: 3.0,
+                text: "First\0 cue".into(),
+            },
+        ];
+        let vtt = String::from_utf8(format_webvtt_cues(&cues)).unwrap();
+        assert!(!vtt.starts_with('\u{feff}'));
+        assert_eq!(
+            vtt,
+            "WEBVTT\n\n\
+             00:00:01.235 --> 00:00:03.000\n\
+             First cue\n\n\
+             00:00:12.500 --> 00:00:15.000\n\
+             Second\nLine\n\n"
+        );
+        assert_eq!(format_webvtt_timestamp(3661.042), "01:01:01.042");
+    }
+
+    struct TestTempDir(std::path::PathBuf);
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn stream_cb_callbacks_enforce_bounds_and_catch_panics() {
+        let shared: Arc<RwLock<Arc<[u8]>>> = Arc::new(RwLock::new(Arc::from(
+            b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n\n".as_slice(),
+        )));
+        let raw = Arc::into_raw(shared.clone());
+
+        let mut info: ffi::mpv_stream_cb_info = unsafe { std::mem::zeroed() };
+        let bad_uri = CString::new("http://example.com").unwrap();
+        assert_eq!(
+            unsafe { stream_cb_open_ro(raw.cast_mut().cast(), bad_uri.as_ptr().cast_mut(), &mut info) },
+            ffi::MPV_ERROR_LOADING_FAILED
+        );
+
+        let good_uri = CString::new(ASR_STREAM_URI).unwrap();
+        assert_eq!(
+            unsafe { stream_cb_open_ro(raw.cast_mut().cast(), good_uri.as_ptr().cast_mut(), &mut info) },
+            0
+        );
+        let cookie = info.cookie;
+        assert!(!cookie.is_null());
+
+        let total = unsafe { stream_cb_size(cookie) };
+        assert!(total > 8);
+        assert_eq!(unsafe { stream_cb_seek(cookie, 0) }, 0);
+        assert!(unsafe { stream_cb_seek(cookie, -1) } < 0);
+        assert!(unsafe { stream_cb_seek(cookie, total + 1) } < 0);
+
+        let mut buf = vec![0u8; 6];
+        assert_eq!(unsafe { stream_cb_read(cookie, buf.as_mut_ptr().cast(), 6) }, 6);
+        assert_eq!(&buf, b"WEBVTT");
+        assert_eq!(unsafe { stream_cb_seek(cookie, total) }, total);
+        assert_eq!(unsafe { stream_cb_read(cookie, buf.as_mut_ptr().cast(), 6) }, 0);
+
+        unsafe { stream_cb_close(cookie) };
+        drop(unsafe { Arc::from_raw(raw) });
+    }
+
+    #[test]
+    fn gl_proc_resolver_via_ctx_clears_scoped_and_catches_panics() {
+        let called = Cell::new(false);
+        let resolver_fn = |name: &CStr| -> *const c_void {
+            called.set(true);
+            if name.to_bytes() == b"panic_me" {
+                panic!("boom inside GL resolver");
+            }
+            if name.to_bytes() == b"glGetString" {
+                0x1234usize as *const c_void
+            } else {
+                ptr::null()
+            }
+        };
+        let boxed = Box::into_raw(Box::new(GlProcResolver::scoped(&resolver_fn)));
+        assert_eq!(
+            unsafe { resolve_gl_proc(boxed.cast(), c"glGetString".as_ptr()) },
+            0x1234usize as *mut c_void
+        );
+        assert!(called.get());
+        // Must catch unwinding panic cleanly instead of unwinding across extern "C".
+        assert_eq!(
+            unsafe { resolve_gl_proc(boxed.cast(), c"panic_me".as_ptr()) },
+            ptr::null_mut()
+        );
+        // Once cleared, no stale reference is ever invoked.
+        unsafe { &*boxed }.clear_scoped();
+        assert_eq!(
+            unsafe { resolve_gl_proc(boxed.cast(), c"glGetString".as_ptr()) },
+            ptr::null_mut()
+        );
+        drop(unsafe { Box::from_raw(boxed) });
+    }
+
+    #[test]
+    fn default_hwdec_respects_user_mpv_conf() {
+        let dir = TestTempDir::new("memento-hwdec-test");
+        let default_player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        assert_eq!(default_player.configured_hwdec(), "auto-safe");
+        drop(default_player);
+
+        std::fs::write(dir.path().join("mpv.conf"), "hwdec=no\n").unwrap();
+        let custom_player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        assert_eq!(custom_player.configured_hwdec(), "no");
+        drop(custom_player);
+    }
+
+    #[test]
+    fn live_memento_asr_stream_cb_delivers_sid_cues_and_sub_seek() {
+        let dir = TestTempDir::new("memento-asr-stream-test");
+        std::fs::write(dir.path().join("input.conf"), "").unwrap();
+        std::fs::write(dir.path().join("mpv.conf"), "ao=null\nhwdec=no\n").unwrap();
+
+        let player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        player.set_wakeup_callback(move || {
+            let _ = wake_tx.send(());
+        });
+
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::StreamCallback);
+        assert_eq!(asr.mode(), AsrTrackMode::StreamCallback);
+
+        player
+            .load_file("av://lavfi:testsrc=size=64x64:rate=10:duration=6,format=yuv420p")
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_start = false;
+        let mut saw_loaded = false;
+        let mut ordered_events = Vec::new();
+        while !saw_loaded && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                if matches!(ev, MpvEvent::StartFile { .. }) {
+                    saw_start = true;
+                }
+                if matches!(ev, MpvEvent::FileLoaded { .. }) {
+                    saw_loaded = true;
+                }
+                ordered_events.push(ev);
+            }
+        }
+        assert!(saw_start, "expected START_FILE event in order: {ordered_events:?}");
+        assert!(saw_loaded, "expected FILE_LOADED event: {ordered_events:?}");
+        let start_idx = ordered_events
+            .iter()
+            .position(|e| matches!(e, MpvEvent::StartFile { .. }))
+            .unwrap();
+        let loaded_idx = ordered_events
+            .iter()
+            .position(|e| matches!(e, MpvEvent::FileLoaded { .. }))
+            .unwrap();
+        assert!(start_idx < loaded_idx, "START_FILE must precede FILE_LOADED");
+
+        // Add the in-memory WebVTT track via `sub-add "memento-asr://live.vtt"`.
+        asr.start(&player, "ASR Live", "en").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while asr.sid().is_none() && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+        let sid = asr.sid().expect("memento-asr:// sub-add must assign positive sid");
+        assert!(sid > 0);
+
+        // Push cues out of chronological order; WebVTT sorts them in RAM and triggers `sub-reload`.
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 2,
+                start: 3.5,
+                end: 5.0,
+                text: "Second ASR cue".into(),
+            },
+        )
+        .unwrap();
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 1,
+                start: 0.5,
+                end: 2.0,
+                text: "First ASR cue".into(),
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (asr.reload_in_flight.is_some() || asr.reload_dirty)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+        assert!(
+            asr.reload_in_flight.is_none() && !asr.reload_dirty,
+            "reload_in_flight={:?} reload_dirty={} deselected={}",
+            asr.reload_in_flight,
+            asr.reload_dirty,
+            asr.deselected_by_user
+        );
+
+        // Seek into cue 1 and confirm real `sub-text`, `sub-start`, `sub-end`.
+        player.command(&["seek", "1.0", "absolute+exact"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_sub_text = false;
+        let mut saw_sub_start = false;
+        let mut saw_sub_end = false;
+        while !(saw_sub_text && saw_sub_start && saw_sub_end)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+                if let MpvEvent::PropertyChange { name, value } = &ev {
+                    match (name.as_str(), value) {
+                        ("sub-text", MpvPropertyValue::String(t)) if t == "First ASR cue" => {
+                            saw_sub_text = true;
+                        }
+                        ("sub-start", MpvPropertyValue::Double(v)) if (*v - 0.5).abs() < 0.01 => {
+                            saw_sub_start = true;
+                        }
+                        ("sub-end", MpvPropertyValue::Double(v)) if (*v - 2.0).abs() < 0.01 => {
+                            saw_sub_end = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(saw_sub_text, "expected sub-text == 'First ASR cue'");
+        assert!(saw_sub_start, "expected sub-start == 0.5");
+        assert!(saw_sub_end, "expected sub-end == 2.0");
+
+        // Exercise `sub-seek 1 primary` and verify jump to cue 2.
+        player.subtitle_seek(1, true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_seek_event = false;
+        let mut saw_second_cue = false;
+        while !(saw_seek_event && saw_second_cue) && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+                match &ev {
+                    MpvEvent::Seek => saw_seek_event = true,
+                    MpvEvent::PropertyChange {
+                        name,
+                        value: MpvPropertyValue::String(t),
+                    } if name == "sub-text" && t == "Second ASR cue" => {
+                        saw_second_cue = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_seek_event, "expected MPV_EVENT_SEEK after sub-seek");
+        assert!(saw_second_cue, "expected sub-text == 'Second ASR cue' after sub-seek");
+        assert_eq!(player.primary_sid(), sid);
+        assert_eq!(player.get_sub_text().as_deref(), Some("Second ASR cue"));
+        assert!((player.get_sub_start() - 3.5).abs() < 0.01);
+        assert!((player.get_sub_end() - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn command_node_async_captures_command_reply_without_blocking() {
+        let player = MpvInstance::new_software(None).unwrap();
+        let req = player.command_node_async(&["expand-text", "hello-asr"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reply = None;
+        while reply.is_none() && std::time::Instant::now() < deadline {
+            for ev in player.drain_events() {
+                if let MpvEvent::CommandReply {
+                    reply_userdata,
+                    error,
+                    result,
+                } = ev
+                {
+                    if reply_userdata == req {
+                        reply = Some((error, result));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            reply,
+            Some((0, CommandReplyResult::String("hello-asr".into())))
+        );
+    }
+
+    #[test]
+    fn mpv_event_to_engine_event_maps_observed_properties_and_lifecycle() {
+        let playback = PlaybackState {
+            sub_start: 1.5,
+            sub_end: 3.5,
+            ..Default::default()
+        };
+        assert_eq!(
+            MpvEvent::StartFile { playlist_entry_id: 1 }.to_engine_event(&playback),
+            Some(EngineEvent::StartFile)
+        );
+        assert_eq!(
+            MpvEvent::FileLoaded {
+                video_width: 1920,
+                video_height: 1080
+            }
+            .to_engine_event(&playback),
+            Some(EngineEvent::FileLoaded {
+                video_width: 1920,
+                video_height: 1080
+            })
+        );
+        assert_eq!(
+            MpvEvent::PropertyChange {
+                name: "mute".into(),
+                value: MpvPropertyValue::Flag(true),
+            }
+            .to_engine_event(&playback),
+            Some(EngineEvent::Property(PropertyChange::Mute(true)))
+        );
+        assert_eq!(
+            MpvEvent::PropertyChange {
+                name: "volume-max".into(),
+                value: MpvPropertyValue::Int64(130),
+            }
+            .to_engine_event(&playback),
+            Some(EngineEvent::Property(PropertyChange::VolumeMax(130)))
+        );
+        assert_eq!(
+            MpvEvent::PropertyChange {
+                name: "sub-text".into(),
+                value: MpvPropertyValue::String("こんにちは".into()),
+            }
+            .to_engine_event(&playback),
+            Some(EngineEvent::Property(PropertyChange::SubText {
+                text: "こんにちは".into(),
+                start: Some(1.5),
+                end: Some(3.5),
+            }))
+        );
+    }
+
+    #[test]
+    fn drop_joins_screenshot_worker_without_waiting_ten_seconds() {
+        let player = MpvInstance::new_software(None).unwrap();
+        let pending = player.request_screenshot(false).unwrap();
+        let started = std::time::Instant::now();
+        drop(player);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "MpvInstance::drop blocked waiting for screenshot worker"
+        );
+        let _ = pending.wait();
+    }
+
+    #[test]
+    fn mode2_asr_track_state_machine_buffers_cues_until_sub_create_reply() {
+        let player = MpvInstance::new_software(None).unwrap();
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::NativeMemory);
+        asr.pending_create_req = Some(99);
+        asr.pending_cues.push_back(AsrCue {
+            id: 1,
+            start: 1.0,
+            end: 2.0,
+            text: "queued".into(),
+        });
+        assert!(asr.is_active());
+        assert!(asr.sid().is_none());
+
+        // Emulate `sub-create` reply failing cleanly.
+        let err = asr
+            .on_event(
+                &player,
+                &MpvEvent::CommandReply {
+                    reply_userdata: 99,
+                    error: -1,
+                    result: CommandReplyResult::None,
+                },
+            )
+            .unwrap_err();
+        assert!(err.contains("creation failed"), "{err}");
+        assert!(!asr.is_active());
     }
 }
 

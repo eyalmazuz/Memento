@@ -42,7 +42,7 @@ fn main() {
         .allowlist_function("mpv_.*")
         .prepend_enum_name(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
-    for name in ["client.h", "render.h", "render_gl.h"] {
+    for name in ["client.h", "render.h", "render_gl.h", "stream_cb.h"] {
         let header = include.join("mpv").join(name);
         assert!(
             header.is_file(),

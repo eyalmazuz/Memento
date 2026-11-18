@@ -194,6 +194,7 @@ pub enum PropertyName {
     TrackListCount,
     Volume,
     VolumeMax,
+    Mute,
     VideoWidth,
     VideoHeight,
     Aid,
@@ -234,6 +235,7 @@ pub enum PropertyChange {
     TrackList(Vec<Track>),
     Volume(i64),
     VolumeMax(i64),
+    Mute(bool),
     VideoWidth(i64),
     VideoHeight(i64),
     /// `aid` delivered as `MPV_FORMAT_INT64`.
