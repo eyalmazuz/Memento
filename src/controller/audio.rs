@@ -476,50 +476,17 @@ fn parse_json_audio_sources(data: &[u8]) -> Result<Vec<String>, String> {
 }
 
 fn parse_json_audio_entries(data: &[u8]) -> Result<Vec<(String, String)>, String> {
-    // The audio crate's parser preserves Qt's JSON/QString UTF-16 behavior,
-    // including surrogate escapes. Keep the C-ABI allocation under an RAII
-    // guard so all parser outcomes release their nested strings exactly once.
-    let entries = unsafe {
-        memento_audio::audiofiles::memento_audio_parse_json(data.as_ptr(), data.len())
-    };
-    let entries = ParsedAudioEntries(entries);
-    if !entries.0.valid {
+    let Some(entries) = memento_audio::audiofiles::parse_json(data) else {
         return Err("audio source response is not a valid audioSourceList JSON document".into());
-    }
-    if entries.0.len != 0 && entries.0.entries.is_null() {
-        return Err("audio source JSON parser returned an invalid entry list".into());
-    }
-
-    let mut urls = Vec::with_capacity(entries.0.len);
-    for item in 0..entries.0.len {
-        let entry = unsafe { &*entries.0.entries.add(item) };
-        let read = |text: &memento_audio::audiofiles::AudioText| -> Option<String> {
-            if text.len > isize::MAX as usize / std::mem::size_of::<u16>()
-                || (text.len != 0 && text.data.is_null()) { return None }
-            let units = if text.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(text.data, text.len) } };
-            String::from_utf16(units).ok()
-        };
-        if let (Some(name), Some(url)) = (read(&entry.name), read(&entry.url)) {
+    };
+    let mut urls = Vec::with_capacity(entries.len());
+    for (name_units, url_units) in entries {
+        if let (Ok(name), Ok(url)) = (String::from_utf16(&name_units), String::from_utf16(&url_units))
+        {
             urls.push((name, url));
         }
     }
     Ok(urls)
-}
-
-struct ParsedAudioEntries(memento_audio::audiofiles::AudioEntries);
-
-impl Drop for ParsedAudioEntries {
-    fn drop(&mut self) {
-        let entries = std::mem::replace(
-            &mut self.0,
-            memento_audio::audiofiles::AudioEntries {
-                entries: std::ptr::null_mut(),
-                len: 0,
-                valid: false,
-            },
-        );
-        unsafe { memento_audio::audiofiles::memento_audio_free_entries(entries) };
-    }
 }
 
 enum SourceLocation {

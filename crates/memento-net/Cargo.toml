@@ -22,4 +22,4 @@ memento-setting = { path = "../memento-setting" }
 [lib]
 name = "memento_net"
 path = "src/lib.rs"
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib"]

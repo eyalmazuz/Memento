@@ -24,10 +24,6 @@ impl Default for AutoPauseState {
     }
 }
 
-/// Deprecated alias kept temporarily for callers migrating from the old C-ABI name.
-#[deprecated(note = "use AutoPauseState")]
-pub type MementoAutoPauseStateC = AutoPauseState;
-
 /// Returns whether `new_speed` is a valid new subtitle speed multiplier.
 pub fn subtitle_valid_speed(current_speed: f64, new_speed: f64) -> bool {
     new_speed.is_finite() && new_speed > 0.0 && current_speed != new_speed
@@ -131,55 +127,6 @@ impl AutoPauseState {
     }
 }
 
-/// Corrects auto-pause state on player position updates, matching
-/// `PlayerManager::handleAutoPausePosition(double position)`.
-#[deprecated(note = "use AutoPauseState::update_position")]
-pub unsafe extern "C" fn memento_player_autopause_position(
-    state: *mut AutoPauseState,
-    position: f64,
-    speed: f64,
-    delay: f64,
-) {
-    if let Some(s) = unsafe { state.as_mut() } {
-        s.update_position(position, speed, delay);
-    }
-}
-
-/// Handles auto pausing on subtitle events, matching `PlayerManager::handleAutoPause()`.
-/// Returns `true` (and writes clamped seek target to `out_seek_time`) if the player
-/// should pause and seek.
-#[deprecated(note = "use AutoPauseState::step")]
-pub unsafe extern "C" fn memento_player_autopause_step(
-    state: *mut AutoPauseState,
-    setting_enabled: bool,
-    sub_start_time: f64,
-    sub_end_time: f64,
-    sub_speed: f64,
-    sub_delay: f64,
-    player_paused: bool,
-    duration: f64,
-    out_seek_time: *mut f64,
-) -> bool {
-    let Some(s) = (unsafe { state.as_mut() }) else {
-        return false;
-    };
-    let Some(clamped_seek) = s.step(
-        setting_enabled,
-        sub_start_time,
-        sub_end_time,
-        sub_speed,
-        sub_delay,
-        player_paused,
-        duration,
-    ) else {
-        return false;
-    };
-    if !out_seek_time.is_null() {
-        unsafe { *out_seek_time = clamped_seek };
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,23 +214,5 @@ mod tests {
             state.step(true, 0.0, 5.0, 1.0, 0.0, false, 100.0),
             None
         );
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_autopause_wrappers_delegate() {
-        let mut state = MementoAutoPauseStateC::default();
-        let mut seek_out = 0.0;
-        unsafe {
-            memento_player_autopause_position(std::ptr::null_mut(), 5.0, 1.0, 0.0);
-            memento_player_autopause_position(&mut state, 10.0, 1.0, 0.0);
-            assert!(!memento_player_autopause_step(
-                &mut state, true, 2.0, 5.0, 1.0, 0.0, false, 100.0, &mut seek_out
-            ));
-            assert!(memento_player_autopause_step(
-                &mut state, true, 0.0, 0.0, 1.0, 0.0, false, 100.0, &mut seek_out
-            ));
-            assert!((seek_out - 4.9).abs() < 1e-12);
-        }
     }
 }

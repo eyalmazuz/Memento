@@ -22,10 +22,6 @@ pub mod state;
 pub use autopause::{
     subtitle_playback_time, subtitle_raw_time, subtitle_valid_speed, AutoPauseState,
 };
-#[allow(deprecated)]
-pub use autopause::{
-    memento_player_autopause_position, memento_player_autopause_step, MementoAutoPauseStateC,
-};
 pub use controller::{
     format_keypress, format_modifiers, is_subtitle_file, parse_cli_options_u16,
     parse_cli_options_utf8, CliOption, KeyMapping, KeypadPrefix, MouseButton, ScreenshotSpec,

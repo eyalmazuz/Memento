@@ -38,8 +38,8 @@
 //!   `MpvState::setPause` in C++.
 //!
 //! The subtitle pause-on-end logic is *not* re-ported: the machine reuses
-//! the certified `autopause.rs` functions (`memento_player_autopause_position`
-//! on position ticks, `memento_player_autopause_step` on primary subtitle
+//! the certified `autopause.rs` functions (`AutoPauseState::update_position`
+//! on position ticks, `AutoPauseState::step` on primary subtitle
 //! text changes), wired to the same trigger set the C++ `PlayerManager`
 //! connects (playermanager.cpp:35-74): file-loaded / sid change / primary
 //! subtitle delay or speed change reset the bookkeeping; position ticks feed
@@ -53,10 +53,7 @@
 //! relative order; the hooks do not touch the property store, so state
 //! results are identical — only instruction timing differs.
 
-use crate::autopause::{
-    MementoAutoPauseStateC, memento_player_autopause_position,
-    memento_player_autopause_step,
-};
+use crate::autopause::AutoPauseState;
 use crate::events::{EngineEvent, Event, Intent, MpvEventSource, PropertyChange, SubLine};
 use crate::state::{MpvStateCore, Signal, SubtitleChange, q_bound};
 
@@ -188,7 +185,7 @@ pub enum Decision {
     AutoPauseRequest,
     /// `MpvController::seek(time)` — the auto-pause rewind target,
     /// already clamped into `[0, duration]` by the certified
-    /// `memento_player_autopause_step` (`playbackTime(end) - 0.1`). On a
+    /// `AutoPauseState::step` (`playbackTime(end) - 0.1`). On a
     /// successful queue the adapter closes the loop by feeding back
     /// [`Intent::SeekAbsolute`], which is what sets the intent latch —
     /// mirroring C++ where `MpvController::seek()` *emits* `seekRequested`.
@@ -227,7 +224,7 @@ pub struct PlayerCore {
     phase: Phase,
     seek_intent: Option<f64>,
     stop_requested: bool,
-    auto_pause: MementoAutoPauseStateC,
+    auto_pause: AutoPauseState,
     auto_pause_enabled: bool,
 }
 
@@ -244,7 +241,7 @@ impl PlayerCore {
             phase: Phase::Idle,
             seek_intent: None,
             stop_requested: false,
-            auto_pause: MementoAutoPauseStateC::default(),
+            auto_pause: AutoPauseState::default(),
             auto_pause_enabled: false,
         }
     }
@@ -292,7 +289,7 @@ impl PlayerCore {
     }
 
     /// Auto-pause bookkeeping, exposed for tests and diagnostics.
-    pub fn auto_pause(&self) -> &MementoAutoPauseStateC {
+    pub fn auto_pause(&self) -> &AutoPauseState {
         &self.auto_pause
     }
 
@@ -502,9 +499,9 @@ impl PlayerCore {
     /// - primary `SubtitleChanged { Delay } / { Speed }` and `SidChanged`
     ///   → reset the bookkeeping;
     /// - `TimePositionChanged` → position correction
-    ///   ([`memento_player_autopause_position`]);
+    ///   ([`AutoPauseState::update_position`]);
     /// - primary `SubtitleChanged { Text }` → the pause step
-    ///   ([`memento_player_autopause_step`]), whose decisions are appended.
+    ///   ([`AutoPauseState::step`]), whose decisions are appended.
     ///
     /// All signals here are change-gated by the store, so a hook only runs
     /// when the C++ Qt signal would actually have fired.
@@ -538,36 +535,19 @@ impl PlayerCore {
             let position = self.state.time_position();
             let speed = self.state.subtitle().speed();
             let delay = self.state.subtitle().delay();
-            // Safety: `&mut self.auto_pause` is a valid, exclusively
-            // borrowed state pointer for the duration of the call.
-            unsafe {
-                memento_player_autopause_position(
-                    &mut self.auto_pause,
-                    position,
-                    speed,
-                    delay,
-                );
-            }
+            self.auto_pause.update_position(position, speed, delay);
         }
         if subtitle_text_changed && self.auto_pause_enabled {
             let subtitle = self.state.subtitle();
-            let mut seek_time = 0.0;
-            // Safety: all parameters are owned temporaries or exclusive
-            // borrows; `out_seek_time` points to a local.
-            let pause_now = unsafe {
-                memento_player_autopause_step(
-                    &mut self.auto_pause,
-                    self.auto_pause_enabled,
-                    subtitle.start_time(),
-                    subtitle.end_time(),
-                    subtitle.speed(),
-                    subtitle.delay(),
-                    self.state.pause(),
-                    self.state.duration(),
-                    &mut seek_time,
-                )
-            };
-            if pause_now {
+            if let Some(seek_time) = self.auto_pause.step(
+                self.auto_pause_enabled,
+                subtitle.start_time(),
+                subtitle.end_time(),
+                subtitle.speed(),
+                subtitle.delay(),
+                self.state.pause(),
+                self.state.duration(),
+            ) {
                 // C++: controller->pause(); controller->seek(idealSeekTime);
                 out.push(Decision::Transition(Transition::AutoPause));
                 out.push(Decision::AutoPauseRequest);

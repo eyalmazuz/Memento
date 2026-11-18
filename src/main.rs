@@ -3619,7 +3619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut previous_mpv_subtitles_hidden: Option<bool> = None;
     let mut previous_furigana_visible = app.get_furigana_visible();
     let mut previous_subtitle_layout: Option<(i32, i32, u32, bool)> = None;
-    let mut auto_pause_state = memento_player::MementoAutoPauseStateC::default();
+    let mut auto_pause_state = memento_player::AutoPauseState::default();
     let mut poll_number = 0usize;
     let mut observed_media_generation = u64::MAX;
     let mut status_message_ticks = 0usize;
@@ -3684,7 +3684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 previous_auto_pause = false;
                 previous_mpv_subtitles_hidden = None;
                 timer_hover_owned.set(false);
-                auto_pause_state = memento_player::MementoAutoPauseStateC::default();
+                auto_pause_state = memento_player::AutoPauseState::default();
                 poll_number = 0;
 
                 timer_sub_ctrl.borrow_mut().clear();
@@ -3958,24 +3958,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            unsafe {
-                memento_player::memento_player_autopause_position(
-                    &mut auto_pause_state, pos, state.sub_speed, state.sub_delay,
-                );
-            }
+            auto_pause_state.update_position(pos, state.sub_speed, state.sub_delay);
             let times = primary_times;
             let auto_pause = app.get_auto_pause();
             if times != previous_sub_times || auto_pause != previous_auto_pause {
                 previous_sub_times = times;
                 previous_auto_pause = auto_pause;
-                let mut seek_time = 0.0;
-                if unsafe {
-                    memento_player::memento_player_autopause_step(
-                        &mut auto_pause_state, auto_pause, times.0, times.1,
-                        state.sub_speed, state.sub_delay,
-                        paused, duration, &mut seek_time,
-                    )
-                } {
+                if let Some(seek_time) = auto_pause_state.step(
+                    auto_pause,
+                    times.0,
+                    times.1,
+                    state.sub_speed,
+                    state.sub_delay,
+                    paused,
+                    duration,
+                ) {
                     let _ = player.pause();
                     let _ = player.seek(seek_time);
                 }

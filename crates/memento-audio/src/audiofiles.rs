@@ -1,68 +1,6 @@
 //! Audio source URL templates and JSON audioSourceList extraction.
 
 use std::borrow::Cow;
-use std::panic::catch_unwind;
-use std::ptr;
-
-#[repr(C)]
-pub struct AudioText {
-    pub data: *mut u16,
-    pub len: usize,
-}
-
-impl AudioText {
-    fn from_units(units: Vec<u16>) -> Self {
-        let owned = units.into_boxed_slice();
-        let len = owned.len();
-        // A zero-length boxed slice still has a non-null (dangling) pointer:
-        // this distinguishes QString("") from a null QString for the caller.
-        let data = Box::into_raw(owned) as *mut u16;
-        Self { data, len }
-    }
-}
-
-#[repr(C)]
-pub struct AudioEntry {
-    pub name: AudioText,
-    pub url: AudioText,
-}
-
-#[repr(C)]
-pub struct AudioEntries {
-    pub entries: *mut AudioEntry,
-    pub len: usize,
-    pub valid: bool,
-}
-
-impl AudioEntries {
-    fn invalid() -> Self {
-        Self { entries: ptr::null_mut(), len: 0, valid: false }
-    }
-
-    fn from_entries(entries: Vec<(Vec<u16>, Vec<u16>)>) -> Self {
-        if entries.is_empty() {
-            return Self { entries: ptr::null_mut(), len: 0, valid: true };
-        }
-        let owned: Box<[AudioEntry]> = entries.into_iter().map(|(name, url)| AudioEntry {
-            name: AudioText::from_units(name),
-            url: AudioText::from_units(url),
-        }).collect();
-        let len = owned.len();
-        let entries = Box::into_raw(owned) as *mut AudioEntry;
-        Self { entries, len, valid: true }
-    }
-}
-
-// A null URL pointer with zero length represents a null QString; a non-null
-// pointer with zero length represents an empty but non-null QString. Null
-// expression or reading pointers with zero length are empty replacements.
-unsafe fn input<'a, T>(data: *const T, len: usize) -> Option<&'a [T]> {
-    if len > isize::MAX as usize / std::mem::size_of::<T>() ||
-       (len != 0 && data.is_null()) {
-        return None;
-    }
-    if len == 0 { Some(&[]) } else { Some(unsafe { std::slice::from_raw_parts(data, len) }) }
-}
 
 fn replace_all<'a>(input: &'a [u16], needle: &[u8], replacement: &[u16]) -> Option<Vec<u16>> {
     // The template tokens are ASCII; compare directly to UTF-16 units without
@@ -278,40 +216,6 @@ pub fn parse_json(bytes: &[u8]) -> Option<Vec<(Vec<u16>, Vec<u16>)>> {
     }).collect())
 }
 
-/// # Safety
-/// `data` must point to `len` readable bytes (or be null with zero length).
-/// The returned array and its nested texts must be passed to
-/// `memento_audio_free_entries` exactly once, including for invalid JSON.
-#[deprecated(note = "use memento_audio::audiofiles::parse_json")]
-pub unsafe extern "C" fn memento_audio_parse_json(data: *const u8, len: usize) -> AudioEntries {
-    let Some(bytes) = (unsafe { input(data, len) }) else { return AudioEntries::invalid() };
-    catch_unwind(|| parse_json(bytes).map_or_else(AudioEntries::invalid, AudioEntries::from_entries))
-        .unwrap_or_else(|_| AudioEntries::invalid())
-}
-
-unsafe fn free_text(text: &AudioText) {
-    if !text.data.is_null() {
-        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(text.data, text.len)) });
-    }
-}
-
-/// # Safety
-/// `entries` must be a value returned by `memento_audio_parse_json`, not yet
-/// freed. This frees both the entry array and all of its nested texts.
-#[deprecated(note = "use memento_audio::audiofiles::parse_json")]
-pub unsafe extern "C" fn memento_audio_free_entries(entries: AudioEntries) {
-    if entries.entries.is_null() {
-        return;
-    }
-    let owned = unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(entries.entries, entries.len)) };
-    for entry in owned.iter() {
-        unsafe {
-            free_text(&entry.name);
-            free_text(&entry.url);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,31 +281,5 @@ mod tests {
             (vec![0xd800], vec![0xdfff]),
             (utf16("😺"), vec![65, 0, 66]),
         ]));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn ffi_entries_release_nested_unicode_and_empty_text() {
-        let json = r#"{"type":"audioSourceList","audioSources":[{"name":"音🎵","url":""}]}"#.as_bytes();
-        let parsed = unsafe { memento_audio_parse_json(json.as_ptr(), json.len()) };
-        assert!(parsed.valid);
-        assert_eq!(parsed.len, 1);
-        let entry = unsafe { &*parsed.entries };
-        assert_eq!(unsafe { std::slice::from_raw_parts(entry.name.data, entry.name.len) }, utf16("音🎵"));
-        assert!(!entry.url.data.is_null());
-        assert_eq!(entry.url.len, 0);
-        unsafe { memento_audio_free_entries(parsed) };
-        let invalid = unsafe { memento_audio_parse_json(ptr::null(), 1) };
-        assert!(!invalid.valid);
-        unsafe { memento_audio_free_entries(invalid) };
-        let empty = br#"{"type":"audioSourceList","audioSources":[]}"#;
-        let accepted = unsafe { memento_audio_parse_json(empty.as_ptr(), empty.len()) };
-        assert!(accepted.valid);
-        assert_eq!(accepted.len, 0);
-        unsafe { memento_audio_free_entries(accepted) };
-        let wrong_type = br#"{"type":"notAudio","audioSources":[]}"#;
-        let rejected = unsafe { memento_audio_parse_json(wrong_type.as_ptr(), wrong_type.len()) };
-        assert!(!rejected.valid);
-        unsafe { memento_audio_free_entries(rejected) };
     }
 }
