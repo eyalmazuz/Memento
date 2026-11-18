@@ -94,6 +94,22 @@ pub const RESULT_CANCELED: i32 = 2;
 const WAV_READ_FAILED: &str = "Could not read extracted WAV audio.";
 const NOT_LOADED: &str = "ONNX ASR model is not loaded.";
 const UNSUPPORTED_ARCHITECTURE: &str = "Unsupported ONNX ASR model architecture.";
+const MAX_ONNX_N_FFT: i32 = 65_536;
+
+fn validate_frontend_config(
+    frontend: &memento_asr::audio::melfrontend::MelFrontendConfig,
+) -> Result<(), String> {
+    if frontend.n_fft <= 0 || frontend.n_fft > MAX_ONNX_N_FFT {
+        return Err(format!("invalid frontend n_fft ({})", frontend.n_fft));
+    }
+    if frontend.hop_length <= 0 || frontend.n_mels <= 0 || frontend.sample_rate <= 0 {
+        return Err(format!(
+            "invalid frontend parameters (sample_rate={}, hop_length={}, n_mels={})",
+            frontend.sample_rate, frontend.hop_length, frontend.n_mels
+        ));
+    }
+    Ok(())
+}
 
 /// Pure-Rust callbacks for ONNX ASR transcription progress and cancellation.
 pub struct Callbacks<'a> {
@@ -528,6 +544,10 @@ impl Engine {
                 // architecture." exactly like this port.
             }
         }
+
+        // Validate frontend dimensions (allowing arbitrary positive n_fft such as
+        // Whisper's n_fft = 400 while rejecting zero/negative/unbounded configs).
+        validate_frontend_config(&config.frontend)?;
 
         // C++ constructs the frontend last, from the (possibly nMels-updated)
         // configuration.
@@ -1955,5 +1975,43 @@ mod tests {
         let status = engine.transcribe(Path::new("/nonexistent/audio.wav"), "ja", &mut callbacks);
         assert_eq!(status, RESULT_FAILED);
         assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn frontend_validator_accepts_whisper_n_fft_400_and_rejects_zero_or_unbounded() {
+        use memento_asr::audio::melfrontend::MelFrontendConfig;
+        let whisper_cfg = MelFrontendConfig {
+            n_fft: 400,
+            win_length: 400,
+            hop_length: 160,
+            n_mels: 80,
+            sample_rate: 16000,
+            ..MelFrontendConfig::default()
+        };
+        assert!(validate_frontend_config(&whisper_cfg).is_ok());
+        assert!(validate_frontend_config(&MelFrontendConfig::default()).is_ok());
+
+        for bad_n_fft in [0, -1, MAX_ONNX_N_FFT + 1] {
+            assert!(validate_frontend_config(&MelFrontendConfig {
+                n_fft: bad_n_fft,
+                ..whisper_cfg
+            })
+            .is_err());
+        }
+        assert!(validate_frontend_config(&MelFrontendConfig {
+            hop_length: 0,
+            ..whisper_cfg
+        })
+        .is_err());
+        assert!(validate_frontend_config(&MelFrontendConfig {
+            n_mels: 0,
+            ..whisper_cfg
+        })
+        .is_err());
+        assert!(validate_frontend_config(&MelFrontendConfig {
+            sample_rate: 0,
+            ..whisper_cfg
+        })
+        .is_err());
     }
 }

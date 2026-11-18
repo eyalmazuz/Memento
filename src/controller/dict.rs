@@ -13,6 +13,7 @@ use memento_dict::sqlite_db;
 use memento_util::furiganaparser;
 
 pub use memento_dict::searchcontroller::ClozeSpans;
+pub use memento_dict::sqlite_db::{db_file_fingerprint, DbFileFingerprint, FileMetaStamp};
 
 /// A dictionary search hit for display, search ranking, and note creation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,10 +479,45 @@ impl fmt::Display for DictControllerError {
 
 impl std::error::Error for DictControllerError {}
 
-struct ReadOnlyDictionaryDb {
-    handle: *mut sqlite_db::sqlite3,
+struct DictionaryMetadataCache {
+    data_version: Option<i64>,
+    fingerprint: sqlite_db::DbFileFingerprint,
     tags: HashMap<(i64, String), DictTag>,
     names: HashMap<i64, String>,
+}
+
+struct ReadOnlyDictionaryDb {
+    path: PathBuf,
+    handle: *mut sqlite_db::sqlite3,
+    cache: std::sync::Mutex<DictionaryMetadataCache>,
+}
+
+impl ReadOnlyDictionaryDb {
+    fn refresh_metadata_if_needed(&self) -> Result<(), sqlite_db::DictError> {
+        let current_version = query_data_version(self.handle).ok();
+        let current_fingerprint = sqlite_db::db_file_fingerprint(&self.path);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.data_version == current_version && cache.fingerprint == current_fingerprint {
+            return Ok(());
+        }
+        cache.tags = load_dictionary_tags(self.handle)?;
+        cache.names = load_dictionary_names(self.handle)?;
+        cache.data_version = current_version;
+        cache.fingerprint = current_fingerprint;
+        Ok(())
+    }
+
+    fn with_cache<R>(&self, f: impl FnOnce(&DictionaryMetadataCache) -> R) -> R {
+        let _ = self.refresh_metadata_if_needed();
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&cache)
+    }
 }
 
 impl Drop for ReadOnlyDictionaryDb {
@@ -559,16 +595,34 @@ impl DictController {
             }));
         }
 
-        let mut database = ReadOnlyDictionaryDb {
-            handle,
-            tags: HashMap::new(),
-            names: HashMap::new(),
+        if let Err(error) = validate_dictionary_schema(handle) {
+            unsafe { sqlite_db::sqlite3_close_v2(handle) };
+            return Err(DictControllerError::Sqlite(error));
+        }
+        let tags = match load_dictionary_tags(handle) {
+            Ok(tags) => tags,
+            Err(error) => {
+                unsafe { sqlite_db::sqlite3_close_v2(handle) };
+                return Err(DictControllerError::Sqlite(error));
+            }
         };
-        validate_dictionary_schema(database.handle).map_err(DictControllerError::Sqlite)?;
-        database.tags =
-            load_dictionary_tags(database.handle).map_err(DictControllerError::Sqlite)?;
-        database.names =
-            load_dictionary_names(database.handle).map_err(DictControllerError::Sqlite)?;
+        let names = match load_dictionary_names(handle) {
+            Ok(names) => names,
+            Err(error) => {
+                unsafe { sqlite_db::sqlite3_close_v2(handle) };
+                return Err(DictControllerError::Sqlite(error));
+            }
+        };
+        let database = ReadOnlyDictionaryDb {
+            path: path.to_path_buf(),
+            handle,
+            cache: std::sync::Mutex::new(DictionaryMetadataCache {
+                data_version: query_data_version(handle).ok(),
+                fingerprint: sqlite_db::db_file_fingerprint(path),
+                tags,
+                names,
+            }),
+        };
         Ok(Self {
             dictionaries: Vec::new(),
             database: Some(database),
@@ -877,8 +931,12 @@ impl DictController {
     }
 
     pub fn dictionary_id_for_name(&self, name: &str) -> Option<i64> {
-        self.database.as_ref()?.names.iter()
-            .find_map(|(id, title)| (title == name).then_some(*id))
+        self.database.as_ref()?.with_cache(|cache| {
+            cache
+                .names
+                .iter()
+                .find_map(|(id, title)| (title == name).then_some(*id))
+        })
     }
 
     /// Fetches pitch accent, general frequency rank, and JPDB frequency rank for the term.
@@ -886,8 +944,9 @@ impl DictController {
         let Some(database) = self.database.as_ref() else {
             return (String::new(), String::new(), String::new());
         };
+        let _ = database.refresh_metadata_if_needed();
         const QUERY: &str =
-            "SELECT directory.title, term_meta_bank.mode, term_meta_bank.data \
+            "SELECT directory.title, term_meta_bank.mode, term_meta_bank.data, term_meta_bank.type \
              FROM term_meta_bank \
              JOIN directory ON directory.dic_id = term_meta_bank.dic_id \
              WHERE term_meta_bank.expression = ?1 \
@@ -909,23 +968,47 @@ impl DictController {
             let title = statement.column_text_string(0);
             let mode = statement.column_text_string(1);
             let blob = statement.column_blob_bytes(2);
-            let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
-            let blob_slice = &blob[..null_pos];
-            let Ok(text) = std::str::from_utf8(blob_slice) else { continue };
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { continue };
+            let blob_type = statement.column_int(3);
 
             if mode == "freq" {
-                let reading_match = json.get("reading").and_then(serde_json::Value::as_str)
-                    .map_or(true, |r| r == reading || reading.is_empty());
-                if !reading_match { continue; }
+                let rank_val = match blob_type {
+                    1 if blob.len() >= 8 => {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&blob[..8]);
+                        let val = i64::from_ne_bytes(arr);
+                        (val >= 0).then(|| val.to_string())
+                    }
+                    2 => {
+                        let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+                        std::str::from_utf8(&blob[..null_pos])
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    }
+                    3 if blob.len() >= 8 => {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&blob[..8]);
+                        let val = f64::from_ne_bytes(arr);
+                        (val.is_finite() && val >= 0.0).then(|| sqlite_db::format_g(val, 6))
+                    }
+                    _ => {
+                        let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+                        let blob_slice = &blob[..null_pos];
+                        let Ok(text) = std::str::from_utf8(blob_slice) else { continue };
+                        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { continue };
+                        let reading_match = json.get("reading").and_then(serde_json::Value::as_str)
+                            .map_or(true, |r| r == reading || reading.is_empty());
+                        if !reading_match { continue; }
 
-                let rank_val = if let Some(obj) = json.get("frequency").and_then(serde_json::Value::as_object) {
-                    obj.get("displayValue").and_then(serde_json::Value::as_str).map(str::to_owned)
-                        .or_else(|| obj.get("value").map(|v| v.to_string()))
-                } else if let Some(num) = json.get("frequency") {
-                    Some(num.to_string())
-                } else {
-                    None
+                        if let Some(obj) = json.get("frequency").and_then(serde_json::Value::as_object) {
+                            obj.get("displayValue").and_then(serde_json::Value::as_str).map(str::to_owned)
+                                .or_else(|| obj.get("value").map(|v| v.to_string()))
+                        } else if let Some(num) = json.get("frequency") {
+                            Some(num.to_string())
+                        } else {
+                            None
+                        }
+                    }
                 };
 
                 if let Some(val) = rank_val {
@@ -936,6 +1019,10 @@ impl DictController {
                     }
                 }
             } else if mode == "pitch" && pitch_accent.is_empty() {
+                let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+                let blob_slice = &blob[..null_pos];
+                let Ok(text) = std::str::from_utf8(blob_slice) else { continue };
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { continue };
                 let reading_match = json.get("reading").and_then(serde_json::Value::as_str)
                     .map_or(true, |r| r == reading || reading.is_empty());
                 if !reading_match { continue; }
@@ -960,6 +1047,7 @@ impl DictController {
     /// Return every pitch accent supplied by enabled dictionaries for the popup.
     pub fn get_pitch_graphs(&self, expression: &str, reading: &str) -> Vec<TermPitchGraph> {
         let Some(database) = self.database.as_ref() else { return Vec::new() };
+        let _ = database.refresh_metadata_if_needed();
         let mut rows = Vec::new();
         if sqlite_db::add_pitches(
             database.handle,
@@ -968,20 +1056,23 @@ impl DictController {
             &mut rows,
         ).is_err() { return Vec::new() }
         rows.sort_by_key(|row| row.dic_id);
-        let mut result = Vec::new();
-        for row in rows {
-            let Some(dictionary) = database.names.get(&row.dic_id) else { continue };
-            let mora: Vec<String> = row.mora.iter().map(|unit| String::from_utf16_lossy(unit)).collect();
-            for position in row.positions {
-                if position < 0 || position as usize > mora.len() { continue }
-                result.push(TermPitchGraph { dictionary: dictionary.clone(), mora: mora.clone(), position });
+        database.with_cache(|cache| {
+            let mut result = Vec::new();
+            for row in rows {
+                let Some(dictionary) = cache.names.get(&row.dic_id) else { continue };
+                let mora: Vec<String> = row.mora.iter().map(|unit| String::from_utf16_lossy(unit)).collect();
+                for position in row.positions {
+                    if position < 0 || position as usize > mora.len() { continue }
+                    result.push(TermPitchGraph { dictionary: dictionary.clone(), mora: mora.clone(), position });
+                }
             }
-        }
-        result
+            result
+        })
     }
 
     pub fn get_frequencies(&self, expression: &str, reading: &str) -> Vec<TermFrequency> {
         let Some(database) = self.database.as_ref() else { return Vec::new() };
+        let _ = database.refresh_metadata_if_needed();
         let mut rows = Vec::new();
         if sqlite_db::get_frequencies(
             database.handle,
@@ -990,18 +1081,21 @@ impl DictController {
             &mut rows,
         ).is_err() { return Vec::new() }
         rows.sort_by_key(|row| row.dic_id);
-        rows.into_iter().filter_map(|row| {
-            database.names.get(&row.dic_id).map(|dictionary| TermFrequency {
-                dictionary: dictionary.clone(),
-                value: String::from_utf16_lossy(&row.frequency),
-            })
-        }).collect()
+        database.with_cache(|cache| {
+            rows.into_iter().filter_map(|row| {
+                cache.names.get(&row.dic_id).map(|dictionary| TermFrequency {
+                    dictionary: dictionary.clone(),
+                    value: String::from_utf16_lossy(&row.frequency),
+                })
+            }).collect()
+        })
     }
 
     /// Gather all enabled frequency and pitch entries for Anki, using the
     /// shared note formatter so field values match Memento's card format.
     pub fn get_anki_term_metadata(&self, expression: &str, reading: &str, tags: &[String]) -> AnkiTermMetadata {
         let Some(database) = self.database.as_ref() else { return AnkiTermMetadata::default() };
+        let _ = database.refresh_metadata_if_needed();
         let expression_units: Vec<u16> = expression.encode_utf16().collect();
         let reading_units: Vec<u16> = reading.encode_utf16().collect();
         let mut frequency_rows = Vec::new();
@@ -1103,6 +1197,17 @@ fn validate_dictionary_schema(
     Ok(())
 }
 
+fn query_data_version(
+    database: *mut sqlite_db::sqlite3,
+) -> Result<i64, sqlite_db::DictError> {
+    let mut statement = sqlite_db::Statement::prepare(database, "PRAGMA data_version;")?;
+    if statement.step()? {
+        Ok(statement.column_int64(0))
+    } else {
+        Ok(0)
+    }
+}
+
 fn load_dictionary_names(
     database: *mut sqlite_db::sqlite3,
 ) -> Result<HashMap<i64, String>, sqlite_db::DictError> {
@@ -1146,6 +1251,9 @@ fn database_search_candidates(
     normalized_query: &str,
     lookups: &[LookupQuery],
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
+    database
+        .refresh_metadata_if_needed()
+        .map_err(DictControllerError::Sqlite)?;
     const TERM_DETAILS_QUERY: &str =
         "SELECT term_bank.rowid, term_bank.dic_id, term_bank.def_tags, term_bank.term_tags, \
                 term_bank.score, term_bank.glossary, directory.title \
@@ -1205,17 +1313,20 @@ fn database_search_candidates(
                     Err(_) => (strip_glossary_markup(&raw_glossary), String::new(), String::new(),
                         parse_rich_glossary(&raw_glossary)),
                 };
+                let formatted_tags = database.with_cache(|cache| {
+                    format_dictionary_tags(
+                        &cache.tags,
+                        dictionary_id,
+                        &def_tags,
+                        &term_tags,
+                    )
+                });
                 results.push(DatabaseCandidate {
                     hit: SearchHit {
                         expression: expression.clone(),
                         reading: reading.clone(),
                         glossary,
-                        tags: format_dictionary_tags(
-                            &database.tags,
-                            dictionary_id,
-                            &def_tags,
-                            &term_tags,
-                        ),
+                        tags: formatted_tags,
                         score,
                         is_kanji: false,
                         notes: String::new(),
@@ -1242,46 +1353,52 @@ fn database_kanji_candidates(
     query: &str,
     prefix_len: usize,
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
+    database
+        .refresh_metadata_if_needed()
+        .map_err(DictControllerError::Sqlite)?;
     let query_units: Vec<u16> = query.encode_utf16().collect();
     let mut kanji_rows = Vec::new();
     sqlite_db::query_kanji(database.handle, &query_units, &mut kanji_rows)
         .map_err(DictControllerError::Sqlite)?;
 
-    let mut results = Vec::with_capacity(kanji_rows.len());
-    for row in kanji_rows {
-        let Some(dictionary_name) = database.names.get(&row.dic_id) else {
-            continue;
-        };
-        let onyomi = String::from_utf16_lossy(&row.onyomi);
-        let kunyomi = String::from_utf16_lossy(&row.kunyomi);
-        let raw_tags = String::from_utf16_lossy(&row.tags);
-        let raw_stats = String::from_utf16_lossy(&row.stats);
-        let glossary = row
-            .meanings
-            .iter()
-            .map(|meaning| String::from_utf16_lossy(meaning))
-            .collect::<Vec<_>>()
-            .join("\n");
-        results.push(DatabaseCandidate {
-            hit: SearchHit {
-                expression: query.to_owned(),
-                reading: format_kanji_reading(&onyomi, &kunyomi),
-                glossary,
-                tags: format_dictionary_tags(&database.tags, row.dic_id, "", &raw_tags),
-                score: 0,
-                is_kanji: true,
-                notes: format_kanji_stats(&database.tags, row.dic_id, &raw_stats),
-                example_ja: String::new(),
-                example_en: String::new(),
-                dict_name: dictionary_name.clone(),
-                rich_glossary: Vec::new(),
-            },
-            is_exact: true,
-            prefix_len,
-            dict_priority: row.dic_id,
-            source_row_id: None,
-        });
-    }
+    let results = database.with_cache(|cache| {
+        let mut results = Vec::with_capacity(kanji_rows.len());
+        for row in kanji_rows {
+            let Some(dictionary_name) = cache.names.get(&row.dic_id) else {
+                continue;
+            };
+            let onyomi = String::from_utf16_lossy(&row.onyomi);
+            let kunyomi = String::from_utf16_lossy(&row.kunyomi);
+            let raw_tags = String::from_utf16_lossy(&row.tags);
+            let raw_stats = String::from_utf16_lossy(&row.stats);
+            let glossary = row
+                .meanings
+                .iter()
+                .map(|meaning| String::from_utf16_lossy(meaning))
+                .collect::<Vec<_>>()
+                .join("\n");
+            results.push(DatabaseCandidate {
+                hit: SearchHit {
+                    expression: query.to_owned(),
+                    reading: format_kanji_reading(&onyomi, &kunyomi),
+                    glossary,
+                    tags: format_dictionary_tags(&cache.tags, row.dic_id, "", &raw_tags),
+                    score: 0,
+                    is_kanji: true,
+                    notes: format_kanji_stats(&cache.tags, row.dic_id, &raw_stats),
+                    example_ja: String::new(),
+                    example_en: String::new(),
+                    dict_name: dictionary_name.clone(),
+                    rich_glossary: Vec::new(),
+                },
+                is_exact: true,
+                prefix_len,
+                dict_priority: row.dic_id,
+                source_row_id: None,
+            });
+        }
+        results
+    });
     Ok(results)
 }
 

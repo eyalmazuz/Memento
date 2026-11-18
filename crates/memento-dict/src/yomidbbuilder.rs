@@ -315,7 +315,11 @@ fn prepare_schema(conn: &mut Connection, defer_indexes_if_empty: bool) -> Result
                 tx.execute_batch(CREATE_INDEXES_SQL)?;
             }
         }
-        _ => {}
+        _ => {
+            if !defer_indexes_if_empty {
+                tx.execute_batch(CREATE_INDEXES_SQL)?;
+            }
+        }
     }
 
     if defer_indexes_if_empty && !deferred_indexes {
@@ -629,8 +633,6 @@ fn encode_meta_blob(data: &Value, entry: &str) -> Result<(i64, Option<Vec<u8>>),
         Value::Number(num) => {
             if let Some(i) = num.as_i64() {
                 Ok((1, Some(i.to_ne_bytes().to_vec())))
-            } else if let Some(u) = num.as_u64() {
-                Ok((1, Some(u.to_ne_bytes().to_vec())))
             } else if let Some(f) = num.as_f64() {
                 Ok((3, Some(f.to_ne_bytes().to_vec())))
             } else {
@@ -1028,22 +1030,34 @@ fn process_dictionary_with_limits(
         })?;
 
     let mut total_bytes = 0u64;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-    let (dic_id, replaced_dic_id) = add_index(&mut archive, &tx, &mut total_bytes, limits)?;
-    for bank in [
-        Bank::Tag,
-        Bank::Term,
-        Bank::TermMeta,
-        Bank::Kanji,
-        Bank::KanjiMeta,
-    ] {
-        add_bank(&mut archive, &tx, dic_id, bank, &mut total_bytes, limits)?;
-    }
-    if defer_indexes {
-        tx.execute_batch(CREATE_INDEXES_SQL)?;
-    }
-    extract_resources_to_staging(&mut archive, staging.path(), &mut total_bytes, limits)?;
-    tx.commit()?;
+    let import_result = (|| -> Result<(i64, Option<i64>), YomiError> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        let (dic_id, replaced_dic_id) = add_index(&mut archive, &tx, &mut total_bytes, limits)?;
+        for bank in [
+            Bank::Tag,
+            Bank::Term,
+            Bank::TermMeta,
+            Bank::Kanji,
+            Bank::KanjiMeta,
+        ] {
+            add_bank(&mut archive, &tx, dic_id, bank, &mut total_bytes, limits)?;
+        }
+        if defer_indexes {
+            tx.execute_batch(CREATE_INDEXES_SQL)?;
+        }
+        extract_resources_to_staging(&mut archive, staging.path(), &mut total_bytes, limits)?;
+        tx.commit()?;
+        Ok((dic_id, replaced_dic_id))
+    })();
+    let (dic_id, replaced_dic_id) = match import_result {
+        Ok(ids) => ids,
+        Err(err) => {
+            if defer_indexes {
+                let _ = conn.execute_batch(CREATE_INDEXES_SQL);
+            }
+            return Err(err);
+        }
+    };
 
     safe_remove_dict_resource_dir(&canon_res_dir, dic_id)?;
     if let Some(old_id) = replaced_dic_id {
@@ -1559,5 +1573,114 @@ mod tests {
         let cache = sqlite_db::init_cache_conn(&conn).unwrap();
         assert_eq!(cache.dictionaries.len(), 1);
         assert_eq!(cache.table_counts.term_bank, 1);
+    }
+
+    #[test]
+    fn failed_initial_import_restores_all_schema_indexes() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let bad_zip = root.path().join("bad.zip");
+
+        build_zip(
+            &bad_zip,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"BadDict","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                (
+                    "term_bank_1.json",
+                    br#"[["too_few_columns"]]"#,
+                    None,
+                ),
+            ],
+        );
+
+        let err = process_dictionary(&bad_zip, &db_path, &res_dir).unwrap_err();
+        assert!(matches!(err, YomiError::MalformedBank { .. }));
+
+        let expected_indexes = [
+            "idx_kanji_bank_char",
+            "idx_kanji_meta_exp",
+            "idx_term_bank_combo",
+            "idx_term_bank_exp",
+            "idx_term_bank_reading",
+            "idx_term_meta_exp",
+        ];
+
+        let query_indexes = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name;")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        assert_eq!(query_indexes(&conn), expected_indexes);
+        drop(conn);
+
+        // Even if indexes were manually dropped on a v4 DB, prepare_db restores them.
+        let rw = sqlite_db::open_read_write_connection(&db_path).unwrap();
+        rw.execute_batch(DROP_INDEXES_SQL).unwrap();
+        assert!(query_indexes(&rw).is_empty());
+        drop(rw);
+
+        prepare_db(&db_path).unwrap();
+        let conn2 = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        assert_eq!(query_indexes(&conn2), expected_indexes);
+    }
+
+    #[test]
+    fn meta_blob_int_and_float_frequencies_round_trip() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("freq.zip");
+
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"FreqDict","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                (
+                    "term_meta_bank_1.json",
+                    r#"[["食べる","freq",150],["飲む","freq",42.5]]"#.as_bytes(),
+                    None,
+                ),
+            ],
+        );
+
+        process_dictionary(&zip_path, &db_path, &res_dir).unwrap();
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+
+        let mut rows_int = Vec::new();
+        sqlite_db::get_frequencies_conn(
+            &conn,
+            &"食べる".encode_utf16().collect::<Vec<_>>(),
+            &[],
+            &mut rows_int,
+        )
+        .unwrap();
+        assert_eq!(rows_int.len(), 1);
+        assert_eq!(String::from_utf16(&rows_int[0].frequency).unwrap(), "150");
+
+        let mut rows_float = Vec::new();
+        sqlite_db::get_frequencies_conn(
+            &conn,
+            &"飲む".encode_utf16().collect::<Vec<_>>(),
+            &[],
+            &mut rows_float,
+        )
+        .unwrap();
+        assert_eq!(rows_float.len(), 1);
+        assert_eq!(String::from_utf16(&rows_float[0].frequency).unwrap(), "42.5");
     }
 }

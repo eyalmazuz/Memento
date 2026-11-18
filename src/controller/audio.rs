@@ -426,6 +426,9 @@ fn first_audio_candidate(
 ) -> Result<(String, String), String> {
     for source in sources {
         let source_url = expand_source_url(&source.url, expression, reading)?;
+        if source_url.trim().is_empty() {
+            continue;
+        }
         let Ok(kind) = i32::try_from(source.kind) else {
             continue;
         };
@@ -794,5 +797,25 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("no audio files"));
+    }
+
+    #[test]
+    fn first_audio_candidate_skips_empty_and_whitespace_file_urls() {
+        let sources = vec![
+            source("empty", "", AudioSourceType::AudioSourceTypeFile, "h1"),
+            source("spaces", "   \t  ", AudioSourceType::AudioSourceTypeFile, "h2"),
+            source(
+                "valid",
+                "https://audio.test/{expression}.mp3",
+                AudioSourceType::AudioSourceTypeFile,
+                "h3",
+            ),
+        ];
+        let (url, md5) = first_audio_candidate("猫", "ねこ", &sources, |_| {
+            panic!("JSON loader must not be called for file sources");
+        })
+        .unwrap();
+        assert_eq!(url, "https://audio.test/猫.mp3");
+        assert_eq!(md5, "h3");
     }
 }
