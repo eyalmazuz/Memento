@@ -34,12 +34,15 @@ struct Control {
     stop: bool,
     active: bool,
     suspended: bool,
+    parked_no_audio: bool,
     paused_on_errors: bool,
     done: bool,
     reset_cues: bool,
     emit_snapshot: bool,
+    media_path: String,
     audio_id: i64,
     generation: u64,
+    min_cue_generation: u64,
     duration: f64,
     position: f64,
     last_position: Option<f64>,
@@ -53,9 +56,25 @@ struct Control {
 
 struct Shared {
     control: Mutex<Control>,
-    latest_cues: Mutex<Vec<AsrCue>>,
+    latest_cues: Mutex<(u64, Vec<AsrCue>)>,
     wake: Condvar,
     running: AtomicBool,
+}
+
+struct JoinOnDrop(Option<JoinHandle<()>>);
+
+impl JoinOnDrop {
+    fn join_now(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for JoinOnDrop {
+    fn drop(&mut self) {
+        self.join_now();
+    }
 }
 
 /// Main-thread facade for the streaming ASR worker.
@@ -80,7 +99,7 @@ impl AsrController {
         Self {
             shared: Arc::new(Shared {
                 control: Mutex::new(Control::default()),
-                latest_cues: Mutex::new(Vec::new()),
+                latest_cues: Mutex::new((0, Vec::new())),
                 wake: Condvar::new(),
                 running: AtomicBool::new(false),
             }),
@@ -130,7 +149,8 @@ impl AsrController {
                 let baseline = control.suspended_at_position.unwrap_or(control.position);
                 let jumped = (clamped_pos - baseline).abs() > SEEK_JUMP_THRESHOLD_SECONDS;
                 let outside_window = is_outside_window(control.current_window, clamped_pos);
-                let worker_paused_or_done = control.paused_on_errors || control.done;
+                let worker_paused_or_done =
+                    control.paused_on_errors || control.done || control.parked_no_audio;
                 if jumped || worker_paused_or_done {
                     control.generation += 1;
                     control.restart_position = Some(clamped_pos);
@@ -148,42 +168,89 @@ impl AsrController {
                 control.last_position_at = Some(Instant::now());
                 control.last_paused = false;
                 control.suspended = false;
+                control.parked_no_audio = false;
                 control.suspended_at_position = None;
                 control.emit_snapshot = true;
                 self.shared.wake.notify_all();
                 return Ok(SessionStart::Resumed);
             }
         }
-        if self.is_active() {
-            self.cancel();
-        }
-        if let Some(worker) = self.worker.take() {
-            if !worker.is_finished() {
-                self.worker = Some(worker);
-                return Err("The previous ASR session is still stopping.".into());
-            }
-            let _ = worker.join();
-        }
-        let model = resolve_model(&settings)?;
 
-        let (sender, receiver) = mpsc::channel();
-        self.receiver = receiver;
         let initial_position = if settings.start_from_beginning {
             0.0
         } else {
             clamped_pos
         };
+
+        // Zero-reload media retargeting: when ASR settings are unchanged and a live
+        // worker is already holding the loaded Whisper/ONNX model in RAM, retarget
+        // `AsrMedia` (`path` / `audio_id`) in-place instead of reloading gigabytes.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(loaded, source)| loaded == &settings && source != &media)
+            && self.worker.as_ref().is_some_and(|w| !w.is_finished())
+        {
+            let mut control = lock(&self.shared.control);
+            if control.active && !control.stop {
+                control.generation += 1;
+                let next_gen = control.generation;
+                control.min_cue_generation = next_gen;
+                control.reset_cues = true;
+                control.emit_snapshot = false;
+                control.media_path = media.path.clone();
+                control.audio_id = media.audio_id;
+                control.duration = duration;
+                control.position = clamped_pos;
+                control.last_position = Some(clamped_pos);
+                control.last_position_at = Some(Instant::now());
+                control.last_paused = false;
+                control.suspended = false;
+                control.parked_no_audio = false;
+                control.suspended_at_position = None;
+                control.paused_on_errors = false;
+                control.done = false;
+                control.restart_position = Some(initial_position);
+                if let Some(abort) = &control.current_abort {
+                    abort.store(true, Ordering::Release);
+                }
+                drop(control);
+                *lock(&self.shared.latest_cues) = (next_gen, Vec::new());
+                self.shared.wake.notify_all();
+                self.session = Some((settings, media));
+                return Ok(SessionStart::New);
+            }
+        }
+
+        if self.is_active() {
+            self.cancel();
+        }
+        let model = resolve_model(&settings)?;
+        let prev_worker = match self.worker.take() {
+            Some(worker) if worker.is_finished() => {
+                let _ = worker.join();
+                None
+            }
+            other => other,
+        };
+        let prev_guard = JoinOnDrop(prev_worker);
+
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = receiver;
         let shared = Arc::new(Shared {
             control: Mutex::new(Control {
                 stop: false,
                 active: true,
                 suspended: false,
+                parked_no_audio: false,
                 paused_on_errors: false,
                 done: false,
                 reset_cues: false,
                 emit_snapshot: false,
+                media_path: media.path.clone(),
                 audio_id: media.audio_id,
                 generation: 0,
+                min_cue_generation: 0,
                 duration,
                 position: clamped_pos,
                 last_position: Some(clamped_pos),
@@ -194,7 +261,7 @@ impl AsrController {
                 restart_position: None,
                 current_abort: None,
             }),
-            latest_cues: Mutex::new(Vec::new()),
+            latest_cues: Mutex::new((0, Vec::new())),
             wake: Condvar::new(),
             running: AtomicBool::new(true),
         });
@@ -205,7 +272,15 @@ impl AsrController {
             thread::Builder::new()
                 .name("memento-asr".into())
                 .spawn(move || {
-                    run_session(shared, sender, settings, media, model, initial_position)
+                    run_session(
+                        shared,
+                        sender,
+                        settings,
+                        media,
+                        model,
+                        initial_position,
+                        prev_guard,
+                    )
                 })
                 .map_err(|error| format!("Could not start ASR worker: {error}"))?,
         );
@@ -255,7 +330,7 @@ impl AsrController {
         control.position = clamped_pos;
         control.last_position = Some(clamped_pos);
         control.last_position_at = Some(Instant::now());
-        if control.suspended {
+        if control.suspended || control.parked_no_audio {
             return;
         }
         if control.paused_on_errors
@@ -296,7 +371,7 @@ impl AsrController {
         control.last_position_at = Some(now);
         control.last_paused = paused;
 
-        if control.suspended || !jumped {
+        if control.suspended || control.parked_no_audio || !jumped {
             return;
         }
         if control.paused_on_errors
@@ -309,7 +384,8 @@ impl AsrController {
 
     /// Switch the active audio track (`aid`) on a retained ASR session without
     /// reloading the model. Clears `CueBook` for the old track and restarts
-    /// transcription from the current playback position, or cancels if `new_audio_id <= 0`.
+    /// transcription from the current playback position, or parks/suspends the
+    /// worker while keeping the model warm if `new_audio_id <= 0`.
     pub fn notify_audio_track_changed(&mut self, new_audio_id: i64) {
         let Some((_, media)) = self.session.as_mut() else {
             return;
@@ -317,32 +393,42 @@ impl AsrController {
         if media.audio_id == new_audio_id {
             return;
         }
-        if new_audio_id <= 0 {
-            self.cancel();
-            return;
-        }
         media.audio_id = new_audio_id;
         let mut control = lock(&self.shared.control);
         if !control.active || control.stop {
+            drop(control);
+            *lock(&self.shared.latest_cues) = (u64::MAX, Vec::new());
             return;
         }
+        control.generation += 1;
+        let next_gen = control.generation;
+        control.min_cue_generation = next_gen;
         control.audio_id = new_audio_id;
         control.reset_cues = true;
-        control.generation += 1;
         control.paused_on_errors = false;
         control.done = false;
-        control.restart_position = Some(control.position);
         if let Some(abort) = &control.current_abort {
             abort.store(true, Ordering::Release);
         }
-        if !control.suspended {
+        if new_audio_id <= 0 {
+            control.parked_no_audio = true;
+            control.restart_position = None;
+            drop(control);
+            *lock(&self.shared.latest_cues) = (next_gen, Vec::new());
+            self.shared.running.store(false, Ordering::Release);
+            self.shared.wake.notify_all();
+        } else {
+            control.parked_no_audio = false;
+            control.restart_position = Some(control.position);
+            drop(control);
+            *lock(&self.shared.latest_cues) = (next_gen, Vec::new());
             self.shared.wake.notify_all();
         }
     }
 
     /// Return a sorted snapshot of the cues currently retained in `CueBook`.
     pub fn current_cues(&self) -> Vec<AsrCue> {
-        lock(&self.shared.latest_cues).clone()
+        lock(&self.shared.latest_cues).1.clone()
     }
 
     pub fn is_running(&self) -> bool {
@@ -357,18 +443,21 @@ impl AsrController {
 
     /// Drain worker notifications on the UI thread.
     pub fn poll(&mut self) -> Vec<AsrEvent> {
-        let generation = lock(&self.shared.control).generation;
+        let (generation, min_cue_generation) = {
+            let control = lock(&self.shared.control);
+            (control.generation, control.min_cue_generation)
+        };
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
-            // CueBook keeps cues across seeks. Its queued deltas and snapshots
-            // remain valid even if the playback generation changed before the UI polled.
-            if matches!(
-                event,
+            // CueBook keeps cues across seeks, while track/media resets bump
+            // `min_cue_generation` so pre-reset cue deltas/snapshots are dropped.
+            let keep = match &event {
                 AsrEvent::CueAdded { .. }
-                    | AsrEvent::CueRemoved { .. }
-                    | AsrEvent::CuesSnapshot { .. }
-            ) || event.generation() == generation
-            {
+                | AsrEvent::CueRemoved { .. }
+                | AsrEvent::CuesSnapshot { .. } => event.generation() >= min_cue_generation,
+                _ => event.generation() == generation,
+            };
+            if keep {
                 events.push(event);
             }
         }
@@ -387,7 +476,7 @@ impl AsrController {
     /// cancellation during audio extraction or Whisper inference and exits.
     pub fn cancel(&mut self) {
         self.session = None;
-        *lock(&self.shared.latest_cues) = Vec::new();
+        *lock(&self.shared.latest_cues) = (u64::MAX, Vec::new());
         let mut control = lock(&self.shared.control);
         if !control.active && control.stop {
             return;
@@ -700,7 +789,7 @@ struct SegmentContext<'a> {
     window_end: f64,
     abort: &'a AtomicBool,
     cues: &'a mut CueBook,
-    latest_cues: &'a Mutex<Vec<AsrCue>>,
+    shared: &'a Shared,
     sender: &'a mpsc::Sender<AsrEvent>,
 }
 
@@ -708,6 +797,12 @@ impl SegmentContext<'_> {
     fn emit_segment(&mut self, text: &str, seg_start: f64, seg_end: f64) -> bool {
         if self.abort.load(Ordering::Acquire) {
             return false;
+        }
+        {
+            let control = lock(&self.shared.control);
+            if control.stop || !control.active || self.generation < control.min_cue_generation {
+                return false;
+            }
         }
         let text = text.trim().to_owned();
         let adjusted = adjust_segment(seg_start, seg_end, self.window_start, self.window_end);
@@ -720,7 +815,13 @@ impl SegmentContext<'_> {
                 self.sender,
             );
             let snapshot = self.cues.cues.clone();
-            *lock(self.latest_cues) = snapshot.clone();
+            {
+                let mut guard = lock(&self.shared.latest_cues);
+                if self.generation < guard.0 {
+                    return false;
+                }
+                *guard = (self.generation, snapshot.clone());
+            }
             let _ = self.sender.send(AsrEvent::CuesSnapshot {
                 generation: self.generation,
                 cues: snapshot,
@@ -900,10 +1001,16 @@ fn run_session(
     media: AsrMedia,
     resolved: ResolvedModel,
     initial_position: f64,
+    mut prev_worker: JoinOnDrop,
 ) {
+    // Wait for any stopping previous worker to release its native/CUDA model buffers
+    // on this background thread before allocating the new model.
+    prev_worker.join_now();
+
     let generation = {
         let control = lock(&shared.control);
         if control.stop || !control.active {
+            shared.running.store(false, Ordering::Release);
             return;
         }
         control.generation
@@ -961,11 +1068,13 @@ fn run_session_loop<F>(
         }
         let (
             stop,
+            currently_parked,
             active_generation,
             duration,
             position,
             restart_position,
             reset_cues,
+            new_media_path,
             new_audio_id,
             emit_snapshot,
         ) = {
@@ -973,21 +1082,28 @@ fn run_session_loop<F>(
             if control.stop || !control.active {
                 break;
             }
+            let parked = control.suspended || control.parked_no_audio;
             let generation = control.generation;
-            let restart = if generation != seen_generation {
+            let restart = if !parked && generation != seen_generation {
                 control.restart_position.take()
             } else {
                 None
             };
             let reset_cues = std::mem::replace(&mut control.reset_cues, false);
-            let emit_snapshot = std::mem::replace(&mut control.emit_snapshot, false);
+            let emit_snapshot = if !parked {
+                std::mem::replace(&mut control.emit_snapshot, false)
+            } else {
+                false
+            };
             (
                 control.stop,
+                parked,
                 generation,
                 control.duration,
                 control.position,
                 restart,
                 reset_cues,
+                control.media_path.clone(),
                 control.audio_id,
                 emit_snapshot,
             )
@@ -996,14 +1112,24 @@ fn run_session_loop<F>(
             break;
         }
         if reset_cues {
+            if !new_media_path.is_empty() {
+                media.path = new_media_path;
+            }
             media.audio_id = new_audio_id;
             cues.clear_all(active_generation, &sender);
-            *lock(&shared.latest_cues) = Vec::new();
+            let mut guard = lock(&shared.latest_cues);
+            if active_generation >= guard.0 {
+                *guard = (active_generation, Vec::new());
+            }
         } else if emit_snapshot {
             let _ = sender.send(AsrEvent::CuesSnapshot {
                 generation: active_generation,
                 cues: cues.cues.clone(),
             });
+        }
+        if currently_parked {
+            shared.running.store(false, Ordering::Release);
+            continue;
         }
         if active_generation != seen_generation {
             seen_generation = active_generation;
@@ -1020,7 +1146,12 @@ fn run_session_loop<F>(
             WindowPlan::Done => {
                 shared.running.store(false, Ordering::Release);
                 let mut control = lock(&shared.control);
-                if control.stop || !control.active || control.generation != seen_generation {
+                if control.stop
+                    || !control.active
+                    || control.suspended
+                    || control.parked_no_audio
+                    || control.generation != seen_generation
+                {
                     continue;
                 }
                 let _ = sender.send(AsrEvent::Completed {
@@ -1028,7 +1159,11 @@ fn run_session_loop<F>(
                     cue_count: cues.cues.len(),
                 });
                 control.done = true;
-                while !control.stop && control.active && control.generation == seen_generation {
+                while !control.stop
+                    && control.active
+                    && !control.reset_cues
+                    && control.generation == seen_generation
+                {
                     control = shared
                         .wake
                         .wait(control)
@@ -1057,7 +1192,11 @@ fn run_session_loop<F>(
                 let abort = Arc::new(AtomicBool::new(false));
                 {
                     let mut control = lock(&shared.control);
-                    if control.stop || control.suspended || control.generation != seen_generation {
+                    if control.stop
+                        || control.suspended
+                        || control.parked_no_audio
+                        || control.generation != seen_generation
+                    {
                         continue;
                     }
                     control.current_window = Some((window.start, window.end));
@@ -1069,7 +1208,7 @@ fn run_session_loop<F>(
                     window_end: window.end,
                     abort: &abort,
                     cues: &mut cues,
-                    latest_cues: &shared.latest_cues,
+                    shared: &shared,
                     sender: &sender,
                 };
                 let status = match process_window(&media, &window, &abort, &mut seg_ctx) {
@@ -1158,7 +1297,11 @@ fn run_session_loop<F>(
 /// Wait between windows, retaining the worker's model and CueBook on its stack.
 fn wait_for_selection(shared: &Shared) -> bool {
     let mut control = lock(&shared.control);
-    while control.active && !control.stop && control.suspended {
+    while control.active
+        && !control.stop
+        && (control.suspended || control.parked_no_audio)
+        && !control.reset_cues
+    {
         shared.running.store(false, Ordering::Release);
         control = shared
             .wake
@@ -1289,6 +1432,7 @@ mod tests {
             let mut control = lock(&controller.shared.control);
             control.active = true;
             control.duration = 90.0;
+            control.media_path = media.path.clone();
             control.audio_id = media.audio_id;
         }
         (controller, settings, media)
@@ -1906,11 +2050,188 @@ mod tests {
         assert_eq!(controller.current_cues().len(), 1);
         assert_eq!(controller.current_cues()[0].text, "aid-2");
 
-        // Switching to audio_id <= 0 cancels the session.
+        // Switching to audio_id <= 0 parks the worker while keeping the model warm
+        // and clears `latest_cues` synchronously.
         controller.notify_audio_track_changed(0);
-        assert!(!controller.is_active());
+        assert!(controller.is_active(), "session/model must stay warm when aid <= 0");
+        assert!(!controller.is_running());
         assert!(controller.current_cues().is_empty());
+
+        // Cycling back to audio_id = 1 resumes transcription immediately without model reload.
+        controller.notify_audio_track_changed(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut resumed_aid1 = false;
+        while Instant::now() < deadline && !resumed_aid1 {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { cue, .. } = ev {
+                    if cue.text == "aid-1" {
+                        resumed_aid1 = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(resumed_aid1, "cycling back to aid = 1 must resume warm worker");
         controller.shutdown();
+    }
+
+    #[test]
+    fn start_retargets_live_worker_across_media_without_reloading_model() {
+        let (mut controller, settings, media1) = cached_session();
+        {
+            let mut control = lock(&controller.shared.control);
+            control.duration = 60.0;
+            control.position = 0.0;
+        }
+        let shared = controller.shared.clone();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        let model_dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = model_dropped.clone();
+
+        controller.worker = Some(thread::spawn(move || {
+            struct ModelGuard(Arc<AtomicBool>);
+            impl Drop for ModelGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let _model = ModelGuard(worker_dropped);
+            run_session_loop(shared, sender, media1, 0.0, 0, |m, window, _abort, seg_ctx| {
+                seg_ctx.emit_segment(
+                    &format!("{}:aid{}:{:.0}", m.path, m.audio_id, window.start),
+                    0.5,
+                    2.0,
+                );
+                Ok(Transcription::Success)
+            });
+        }));
+
+        // Wait for first file cue.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.current_cues().is_empty() && Instant::now() < deadline {
+            let _ = controller.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(controller.current_cues()[0].text, "/unused/video.mkv:aid1:0");
+
+        // Retarget to a new playlist file (`episode2.mkv`, `aid = 3`) with identical settings.
+        // Because `/unused` has no model files on disk, `start()` can ONLY succeed by retargeting
+        // the live worker in-place without calling `resolve_model` / `load_runtime_model`!
+        let media2 = AsrMedia::new("/unused/episode2.mkv", 3);
+        let outcome = controller
+            .start(settings.clone(), media2, 120.0, 42.0)
+            .expect("media retarget must succeed in 0ms without model reload");
+        assert_eq!(outcome, SessionStart::New);
+        assert!(controller.current_cues().is_empty(), "old file cues must clear immediately");
+        assert!(!model_dropped.load(Ordering::Acquire), "model must stay warm in RAM");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_ep2 = false;
+        while Instant::now() < deadline && !saw_ep2 {
+            for ev in controller.poll() {
+                if let AsrEvent::CueAdded { cue, .. } = ev {
+                    assert!(
+                        !cue.text.contains("video.mkv"),
+                        "pre-retarget cue leaked across min_cue_generation: {cue:?}"
+                    );
+                    if cue.text == "/unused/episode2.mkv:aid3:42" {
+                        saw_ep2 = true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_ep2, "retargeted worker did not transcribe episode2.mkv at 42s");
+        controller.shutdown();
+        assert!(model_dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn start_hands_stopping_previous_worker_to_new_thread_instead_of_failing_still_stopping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake_model = dir.path().join("ggml-tiny.bin");
+        std::fs::write(&fake_model, b"invalid-whisper-header").unwrap();
+
+        let (mut controller, mut settings, media) = cached_session();
+        settings.backend = AsrBackend::Whisper;
+        settings.whisper.model = "custom".into();
+        settings.whisper.custom_model = fake_model.to_string_lossy().into_owned();
+        settings.whisper.vad_enabled = false;
+        // Differ from `cached_session()` settings so `start()` takes the full reload path.
+        settings.whisper.threads += 1;
+
+        let prev_shared = controller.shared.clone();
+        let prev_finished_cleanup = Arc::new(AtomicBool::new(false));
+        let prev_cleanup_flag = prev_finished_cleanup.clone();
+        controller.worker = Some(thread::spawn(move || {
+            let mut control = lock(&prev_shared.control);
+            while !control.stop {
+                control = prev_shared.wake.wait(control).unwrap();
+            }
+            drop(control);
+            // Simulate slow native/CUDA destructor after `cancel()`.
+            thread::sleep(Duration::from_millis(80));
+            prev_cleanup_flag.store(true, Ordering::Release);
+        }));
+
+        // Must NOT return `Err("The previous ASR session is still stopping.")`!
+        let result = controller
+            .start(settings, media, 60.0, 0.0)
+            .expect("start() must hand off stopping JoinHandle instead of failing on UI thread");
+        assert_eq!(result, SessionStart::New);
+
+        // Shutting down the new session must wait until `prev_worker` also finished cleanup.
+        controller.shutdown();
+        assert!(prev_finished_cleanup.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn min_cue_generation_filters_stale_pre_reset_cues_in_poll() {
+        let mut controller = AsrController::new();
+        let (sender, receiver) = mpsc::channel();
+        controller.receiver = receiver;
+        {
+            let mut control = lock(&controller.shared.control);
+            control.generation = 2;
+            control.min_cue_generation = 2;
+        }
+        sender
+            .send(AsrEvent::CueAdded {
+                generation: 1,
+                cue: AsrCue {
+                    id: 1,
+                    text: "stale track cue".into(),
+                    start: 1.0,
+                    end: 2.0,
+                },
+            })
+            .unwrap();
+        sender
+            .send(AsrEvent::CuesSnapshot {
+                generation: 1,
+                cues: vec![AsrCue {
+                    id: 1,
+                    text: "stale track cue".into(),
+                    start: 1.0,
+                    end: 2.0,
+                }],
+            })
+            .unwrap();
+        sender
+            .send(AsrEvent::CueAdded {
+                generation: 2,
+                cue: AsrCue {
+                    id: 1,
+                    text: "fresh track cue".into(),
+                    start: 1.0,
+                    end: 2.0,
+                },
+            })
+            .unwrap();
+        let events = controller.poll();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], AsrEvent::CueAdded { generation: 2, cue } if cue.text == "fresh track cue"));
     }
 
     #[test]

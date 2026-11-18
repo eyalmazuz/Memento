@@ -41,9 +41,9 @@ pub fn version_text(version: &str) -> String {
 }
 
 /// Parse full CLI arguments (including `argv[0]`), extracting `--help`/`-h`,
-/// `--version`/`-v`, global `--<mpv-opt>=...` / `--no-<opt>` / `--<flag>`
-/// options, and ordered playlist entries with optional nested `--{` / `--}`
-/// per-file options.
+/// `--version`/`-V`, `-v` (verbose mpv flag), global `--<mpv-opt>=...` /
+/// `--no-<opt>` / `--<flag>` options, and ordered playlist entries with
+/// optional nested `--{` / `--}` per-file options.
 pub fn parse_args<I, S>(args: I) -> Result<ParsedArgs, ParseArgsError>
 where
     I: IntoIterator<Item = S>,
@@ -59,14 +59,14 @@ where
     u16_args.push(raw[0].encode_utf16().collect());
 
     let mut depth = 0usize;
-    let mut end_of_options = false;
+    let mut end_of_options: Option<usize> = None;
     for arg in raw.iter().skip(1) {
-        if end_of_options {
+        if end_of_options.is_some() {
             u16_args.push(arg.encode_utf16().collect());
             continue;
         }
         if arg == "--" && depth == 0 {
-            end_of_options = true;
+            end_of_options = Some(u16_args.len());
             continue;
         }
         if arg == "--{" {
@@ -90,8 +90,13 @@ where
 
         if arg == "--help" || arg == "-h" {
             out.show_help = true;
-        } else if arg == "--version" || arg == "-v" || arg == "-V" {
+        } else if arg == "--version" || arg == "-V" {
             out.show_version = true;
+        } else if arg == "-v" {
+            out.global_options.push(CliOption {
+                name: "v".to_owned(),
+                value: "yes".to_owned(),
+            });
         } else if let Some(rest) = arg.strip_prefix("--") {
             if let Some(negated) = rest.strip_prefix("no-") {
                 if let Some((name, val)) = negated.split_once('=') {
@@ -125,32 +130,9 @@ where
         return Err(ParseArgsError::InvalidBrackets);
     }
 
-    if end_of_options {
+    if let Some(split_idx) = end_of_options {
         // When `--` ended options, reconstruct remaining args verbatim as file loads
         // alongside any earlier grouped loads without misinterpreting `--foo` files.
-        let mut split_idx = 1usize;
-        let mut g_depth = 0usize;
-        for arg in raw.iter().skip(1) {
-            if arg == "--" && g_depth == 0 {
-                break;
-            }
-            if arg == "--{" {
-                g_depth += 1;
-                split_idx += 1;
-            } else if arg == "--}" {
-                g_depth = g_depth.saturating_sub(1);
-                split_idx += 1;
-            } else if g_depth > 0
-                || (arg != "--help"
-                    && arg != "-h"
-                    && arg != "--version"
-                    && arg != "-v"
-                    && arg != "-V"
-                    && !arg.starts_with("--"))
-            {
-                split_idx += 1;
-            }
-        }
         let before_loads = parse_load_args(&u16_args[..split_idx])?;
         out.loads.extend(before_loads.into_iter().map(|entry| PlaylistLoad {
             path: String::from_utf16_lossy(&entry.filename),
@@ -492,13 +474,27 @@ mod tests {
             ]
         );
 
-        let short = parse_args(["memento", "-h", "-v", "--", "--not-an-option.mkv"]).unwrap();
+        let short = parse_args(["memento", "-h", "-V", "-v", "--", "--not-an-option.mkv"]).unwrap();
         assert!(short.show_help);
         assert!(short.show_version);
-        assert!(short.global_options.is_empty());
+        assert_eq!(
+            short.global_options,
+            vec![CliOption { name: "v".into(), value: "yes".into() }]
+        );
         assert_eq!(
             short.loads,
             vec![PlaylistLoad { path: "--not-an-option.mkv".into(), options: vec![] }]
+        );
+
+        let verbose_only = parse_args(["memento", "-v", "ep1.mkv"]).unwrap();
+        assert!(!verbose_only.show_version);
+        assert_eq!(
+            verbose_only.global_options,
+            vec![CliOption { name: "v".into(), value: "yes".into() }]
+        );
+        assert_eq!(
+            verbose_only.loads,
+            vec![PlaylistLoad { path: "ep1.mkv".into(), options: vec![] }]
         );
 
         assert_eq!(

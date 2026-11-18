@@ -38,8 +38,13 @@ pub fn create_video_fbo_texture(
         let old_draw_fb = gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING);
         let old_read_fb = gl.get_parameter_i32(glow::READ_FRAMEBUFFER_BINDING);
         let old_texture = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
+        let old_unpack_buffer = gl.get_parameter_i32(glow::PIXEL_UNPACK_BUFFER_BINDING);
 
         let restore = || {
+            gl.bind_buffer(
+                glow::PIXEL_UNPACK_BUFFER,
+                std::num::NonZeroU32::new(old_unpack_buffer as u32).map(glow::NativeBuffer),
+            );
             gl.bind_framebuffer(
                 glow::DRAW_FRAMEBUFFER,
                 std::num::NonZeroU32::new(old_draw_fb as u32).map(glow::NativeFramebuffer),
@@ -100,6 +105,9 @@ pub fn create_video_fbo_texture(
             glow::CLAMP_TO_EDGE as i32,
         );
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        if old_unpack_buffer != 0 {
+            gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        }
 
         let mut last_status = 0u32;
         for (internal_format, pixel_type) in [
@@ -222,10 +230,12 @@ pub fn with_saved_state<T>(gl: &glow::Context, action: impl FnOnce() -> T) -> T 
             glow::ARRAY_BUFFER,
             std::num::NonZeroU32::new(old_array_buffer as u32).map(glow::NativeBuffer),
         );
-        gl.bind_buffer(
-            glow::ELEMENT_ARRAY_BUFFER,
-            std::num::NonZeroU32::new(old_element_array_buffer as u32).map(glow::NativeBuffer),
-        );
+        if old_vertex_array != 0 {
+            gl.bind_buffer(
+                glow::ELEMENT_ARRAY_BUFFER,
+                std::num::NonZeroU32::new(old_element_array_buffer as u32).map(glow::NativeBuffer),
+            );
+        }
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, old_unpack_alignment);
         gl.viewport(
             old_viewport[0],

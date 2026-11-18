@@ -1131,11 +1131,19 @@ fn format_webvtt_timestamp_ms(total_ms: u64) -> String {
 }
 
 fn sanitize_webvtt_text(text: &str) -> String {
-    let normalized = text.replace('\0', "").replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = normalized
+    let normalized = text
+        .replace('\0', "")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let lines: Vec<String> = normalized
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        })
         .collect();
     lines.join("\n")
 }
@@ -1279,6 +1287,13 @@ pub enum MpvPropertyValue {
     Int64(i64),
     Double(f64),
     String(String),
+    /// Subtitle text paired with the `(start, end)` cue times snapshotted at
+    /// the exact instant the event was decoded in `drain_events`.
+    SubText {
+        text: String,
+        start: f64,
+        end: f64,
+    },
     Chapters(Vec<f64>),
     Tracks {
         audio: Vec<AudioTrack>,
@@ -1288,6 +1303,16 @@ pub enum MpvPropertyValue {
     SubLines(Vec<SubLine>),
     CursorAutohide(CursorAutohide),
     Other,
+}
+
+impl MpvPropertyValue {
+    /// Borrow the string payload for `String` or `SubText` property values.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) | Self::SubText { text: s, .. } => Some(s.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// Ordered event drained from `mpv_wait_event(0.0)`.
@@ -1440,6 +1465,13 @@ impl MpvEvent {
                     ("secondary-sub-delay", MpvPropertyValue::None) => {
                         PropertyChange::Unavailable(PropertyName::SecondarySubDelay)
                     }
+                    ("sub-text", MpvPropertyValue::SubText { text, start, end }) => {
+                        PropertyChange::SubText {
+                            text: text.clone(),
+                            start: Some(*start),
+                            end: Some(*end),
+                        }
+                    }
                     ("sub-text", MpvPropertyValue::String(text)) => PropertyChange::SubText {
                         text: text.clone(),
                         start: Some(playback.sub_start),
@@ -1447,6 +1479,13 @@ impl MpvEvent {
                     },
                     ("sub-text", MpvPropertyValue::None) => {
                         PropertyChange::Unavailable(PropertyName::SubText)
+                    }
+                    ("secondary-sub-text", MpvPropertyValue::SubText { text, start, end }) => {
+                        PropertyChange::SecondarySubText {
+                            text: text.clone(),
+                            start: Some(*start),
+                            end: Some(*end),
+                        }
                     }
                     ("secondary-sub-text", MpvPropertyValue::String(text)) => {
                         PropertyChange::SecondarySubText {
@@ -1583,15 +1622,15 @@ const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
     (c"secondary-sid", ffi::MPV_FORMAT_FLAG),
     (c"vid", ffi::MPV_FORMAT_INT64),
     (c"vid", ffi::MPV_FORMAT_FLAG),
-    (c"sub-text", ffi::MPV_FORMAT_STRING),
-    (c"secondary-sub-text", ffi::MPV_FORMAT_STRING),
     (c"sub-start", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-end", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-text", ffi::MPV_FORMAT_STRING),
     (c"sub-delay", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-speed", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-visibility", ffi::MPV_FORMAT_FLAG),
     (c"secondary-sub-start", ffi::MPV_FORMAT_DOUBLE),
     (c"secondary-sub-end", ffi::MPV_FORMAT_DOUBLE),
+    (c"secondary-sub-text", ffi::MPV_FORMAT_STRING),
     (c"secondary-sub-delay", ffi::MPV_FORMAT_DOUBLE),
     (c"secondary-sub-visibility", ffi::MPV_FORMAT_FLAG),
     (c"track-list", ffi::MPV_FORMAT_NODE),
@@ -1824,27 +1863,45 @@ impl PlaybackState {
                     let (audio, subtitle, all) = extract_tracks_from_node(data.cast());
                     self.audio_tracks = audio;
                     self.subtitle_tracks = subtitle;
-                    if let Some(primary) = all
+                    self.primary_sid = all
                         .iter()
-                        .find(|t| t.track_type == TrackType::Subtitle && t.selected && t.main_selection == 0)
-                    {
-                        self.primary_sid = primary.id;
-                    }
-                    if let Some(secondary) = all
+                        .find(|t| {
+                            t.track_type == TrackType::Subtitle
+                                && t.selected
+                                && t.main_selection == 0
+                        })
+                        .map_or(0, |t| t.id);
+                    self.secondary_sid = all
                         .iter()
-                        .find(|t| t.track_type == TrackType::Subtitle && t.selected && t.main_selection == 1)
-                    {
-                        self.secondary_sid = secondary.id;
-                    }
-                    if let Some(audio) = all
+                        .find(|t| {
+                            t.track_type == TrackType::Subtitle
+                                && t.selected
+                                && t.main_selection == 1
+                        })
+                        .map_or(0, |t| t.id);
+                    self.audio_id = all
                         .iter()
-                        .find(|t| t.track_type == TrackType::Audio && t.selected && t.main_selection == 0)
-                    {
-                        self.audio_id = audio.id;
-                    }
+                        .find(|t| {
+                            t.track_type == TrackType::Audio
+                                && t.selected
+                                && t.main_selection == 0
+                        })
+                        .map_or(0, |t| t.id);
+                    self.video_id = all
+                        .iter()
+                        .find(|t| {
+                            t.track_type == TrackType::Video
+                                && t.selected
+                                && t.main_selection == 0
+                        })
+                        .map_or(0, |t| t.id);
                 } else {
                     self.audio_tracks.clear();
                     self.subtitle_tracks.clear();
+                    self.primary_sid = 0;
+                    self.secondary_sid = 0;
+                    self.audio_id = 0;
+                    self.video_id = 0;
                 }
             }
             b"sub-lines" => {
@@ -2100,17 +2157,70 @@ impl MpvInstance {
                 opt(c"input-conf", &input_c);
             }
         }
+        fn is_pre_init_only(name: &str) -> bool {
+            matches!(
+                name,
+                "config"
+                    | "config-dir"
+                    | "input-conf"
+                    | "input-test"
+                    | "load-scripts"
+                    | "msg-level"
+                    | "v"
+                    | "dump-stats"
+                    | "gpu-debug"
+            ) || name == "script"
+                || name.starts_with("scripts")
+                || name.starts_with("script-opts")
+        }
+        fn parse_list_action(name: &str) -> Option<(&str, &'static str)> {
+            if is_pre_init_only(name) {
+                return None;
+            }
+            match name {
+                "glsl-shader" => return Some(("glsl-shaders", "append")),
+                "sub-file" => return Some(("sub-files", "append")),
+                "audio-file" => return Some(("audio-files", "append")),
+                "external-file" => return Some(("external-files", "append")),
+                _ => {}
+            }
+            for (suffix, op) in [
+                ("-append", "append"),
+                ("-add", "add"),
+                ("-pre", "pre"),
+                ("-clr", "clr"),
+                ("-del", "del"),
+                ("-remove", "remove"),
+                ("-toggle", "toggle"),
+            ] {
+                if let Some(prop) = name.strip_suffix(suffix).filter(|p| !p.is_empty()) {
+                    return Some((prop, op));
+                }
+            }
+            None
+        }
+
+        // Pre-init pass: apply scalar and pre-init-only CLI options (`--config`, `--script`,
+        // `-v`, etc.), skipping runtime list-modifying options (`--glsl-shader`, `*-append`,
+        // `*-add`, `*-pre`, `*-toggle`) so they are neither overwritten by `mpv.conf` nor
+        // applied twice after `mpv_initialize`.
         for cli_opt in cli_options {
-            if cli_opt.name == "vo" {
+            if cli_opt.name == "vo" || parse_list_action(&cli_opt.name).is_some() {
                 continue;
             }
             if let (Ok(name_c), Ok(val_c)) = (
                 CString::new(cli_opt.name.as_bytes()),
                 CString::new(cli_opt.value.as_bytes()),
             ) {
-                let status = opt(&name_c, &val_c);
+                let mut status = opt(&name_c, &val_c);
+                if status == ffi::MPV_ERROR_OPTION_ERROR && cli_opt.value == "yes" {
+                    status = opt(&name_c, c"");
+                }
                 if status < 0 {
-                    eprintln!("mpv CLI option --{}={} ignored ({status})", cli_opt.name, cli_opt.value);
+                    eprintln!(
+                        "mpv CLI option --{}={} ignored ({status})",
+                        cli_opt.name, cli_opt.value
+                    );
                 }
             }
         }
@@ -2126,13 +2236,39 @@ impl MpvInstance {
             return Err(format!("mpv initialization failed with code {status}"));
         }
 
-        // Re-apply runtime-adjustable CLI options after `mpv_initialize` so CLI flags
-        // override `mpv.conf`, matching mpv CLI precedence.
+        // Post-init pass: re-apply idempotent scalar options so CLI overrides `mpv.conf`,
+        // and apply list-modifying options (`--glsl-shader`, `*-append`, `*-add`, `*-pre`,
+        // `*-toggle`) ONCE via `change-list`.
         for cli_opt in cli_options {
-            if matches!(
-                cli_opt.name.as_str(),
-                "config" | "config-dir" | "input-conf" | "load-scripts" | "script" | "vo"
-            ) {
+            if cli_opt.name == "vo" || is_pre_init_only(&cli_opt.name) {
+                continue;
+            }
+            if let Some((prop, action)) = parse_list_action(&cli_opt.name) {
+                let val = if action == "clr" && cli_opt.value == "yes" {
+                    ""
+                } else {
+                    cli_opt.value.as_str()
+                };
+                if let (Ok(prop_c), Ok(act_c), Ok(val_c)) = (
+                    CString::new(prop.as_bytes()),
+                    CString::new(action.as_bytes()),
+                    CString::new(val.as_bytes()),
+                ) {
+                    let mut cmd = [
+                        c"change-list".as_ptr(),
+                        prop_c.as_ptr(),
+                        act_c.as_ptr(),
+                        val_c.as_ptr(),
+                        ptr::null(),
+                    ];
+                    let status = unsafe { ffi::mpv_command(handle, cmd.as_mut_ptr()) };
+                    if status < 0 {
+                        eprintln!(
+                            "mpv CLI list option --{}={} ignored ({status})",
+                            cli_opt.name, cli_opt.value
+                        );
+                    }
+                }
                 continue;
             }
             if let (Ok(name_c), Ok(val_c)) = (
@@ -2312,6 +2448,10 @@ impl MpvInstance {
             ffi::MPV_EVENT_START_FILE => {
                 state.file_loaded = false;
                 state.playback_ready = false;
+                state.audio_id = 0;
+                state.primary_sid = 0;
+                state.secondary_sid = 0;
+                state.video_id = 0;
                 let playlist_entry_id = unsafe { raw.data.cast::<ffi::mpv_event_start_file>().as_ref() }
                     .map_or(0, |e| e.playlist_entry_id);
                 Some(MpvEvent::StartFile { playlist_entry_id })
@@ -2354,6 +2494,10 @@ impl MpvInstance {
             ffi::MPV_EVENT_END_FILE => {
                 state.file_loaded = false;
                 state.playback_ready = false;
+                state.audio_id = 0;
+                state.primary_sid = 0;
+                state.secondary_sid = 0;
+                state.video_id = 0;
                 let (reason, playlist_entry_id) = unsafe { raw.data.cast::<ffi::mpv_event_end_file>().as_ref() }
                     .map_or((EndFileReason::Unknown(-1), 0), |info| {
                         let reason = match info.reason {
@@ -2449,6 +2593,24 @@ impl MpvInstance {
                             MpvPropertyValue::None
                         }
                     }
+                    "sub-text" => match property.format {
+                        ffi::MPV_FORMAT_NONE => MpvPropertyValue::None,
+                        ffi::MPV_FORMAT_STRING if !data.is_null() => MpvPropertyValue::SubText {
+                            text: copy_mpv_string(unsafe { *data.cast::<*const c_char>() }),
+                            start: state.sub_start,
+                            end: state.sub_end,
+                        },
+                        _ => MpvPropertyValue::Other,
+                    },
+                    "secondary-sub-text" => match property.format {
+                        ffi::MPV_FORMAT_NONE => MpvPropertyValue::None,
+                        ffi::MPV_FORMAT_STRING if !data.is_null() => MpvPropertyValue::SubText {
+                            text: copy_mpv_string(unsafe { *data.cast::<*const c_char>() }),
+                            start: state.secondary_sub_start,
+                            end: state.secondary_sub_end,
+                        },
+                        _ => MpvPropertyValue::Other,
+                    },
                     "cursor-autohide" => {
                         let int64_val =
                             if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
@@ -2493,6 +2655,31 @@ impl MpvInstance {
         }
     }
 
+    fn push_queued_event(&self, event: MpvEvent) {
+        const MAX_QUEUED_EVENTS: usize = 4096;
+        let mut queued = self.queued_events.borrow_mut();
+        if queued.len() >= MAX_QUEUED_EVENTS {
+            if let Some(drop_idx) = queued.iter().position(|ev| {
+                matches!(
+                    ev,
+                    MpvEvent::PropertyChange { name, .. }
+                        if name != "track-list" && name != "sid" && name != "aid"
+                )
+            }) {
+                queued.remove(drop_idx);
+            } else {
+                queued.remove(0);
+            }
+        }
+        queued.push(event);
+    }
+
+    /// Borrow the cached [`PlaybackState`] without calling `mpv_wait_event` or
+    /// draining queued events.
+    pub fn playback_state(&self) -> Ref<'_, PlaybackState> {
+        self.playback.borrow()
+    }
+
     /// Drain all queued libmpv events in strict arrival order via `mpv_wait_event(0.0)`
     /// without collapsing intermediate `START_FILE` / `FILE_LOADED` / `COMMAND_REPLY` /
     /// `PROPERTY_CHANGE` events. Also updates cached [`PlaybackState`].
@@ -2515,9 +2702,10 @@ impl MpvInstance {
         events
     }
 
-    /// Drain asynchronous property events without waiting for mpv's core.
-    /// Kept compatible for existing callers; new wakeup-driven callers should
-    /// use [`Self::drain_events`].
+    /// Drain asynchronous events into [`PlaybackState`] without waiting for mpv's core,
+    /// preserving decoded events in `queued_events` so mixing `poll_playback_state()`
+    /// and [`Self::drain_events`] never drops `CommandReply` / lifecycle / track events.
+    /// Prefer [`Self::playback_state`] when reading state alongside `drain_events()`.
     pub fn poll_playback_state(&self) -> Ref<'_, PlaybackState> {
         self.event_pending.clear_pending();
         loop {
@@ -2528,7 +2716,9 @@ impl MpvInstance {
             if raw.event_id == ffi::MPV_EVENT_NONE {
                 break;
             }
-            let _ = self.decode_one_event(raw);
+            if let Some(decoded) = self.decode_one_event(raw) {
+                self.push_queued_event(decoded);
+            }
         }
         self.playback.borrow()
     }
@@ -3677,9 +3867,8 @@ impl AsrSubtitleTrack {
                 self.trigger_stream_reload(mpv)
             }
             AsrTrackMode::NativeMemory => {
-                for &local_id in self.pending_adds.values() {
-                    self.pending_removals.insert(local_id);
-                }
+                self.pending_adds.clear();
+                self.pending_removals.clear();
                 self.mpv_cue_ids.clear();
                 if let Some(track_id) = self.sid {
                     mpv.clear_memory_subtitles_async(track_id)?;
@@ -3753,8 +3942,7 @@ impl AsrSubtitleTrack {
                     .iter()
                     .rfind(|t| t.external && t.external_path == ASR_STREAM_URI && t.id > 0)
                 {
-                    let became_ready = self.sid.is_none();
-                    self.sid = Some(track.id);
+                    let became_ready = self.sid.replace(track.id) != Some(track.id);
                     if self.pending_create_req.is_none() && self.reload_in_flight.is_none() {
                         self.deselected_by_user = !track.selected;
                         if !self.deselected_by_user && self.reload_dirty {
@@ -3807,22 +3995,26 @@ impl AsrSubtitleTrack {
                     }
                     match self.mode {
                         AsrTrackMode::StreamCallback => {
+                            let mut became_ready = false;
                             if self.sid.is_none() {
                                 if let Some(track) = mpv
                                     .subtitle_tracks()
                                     .into_iter()
-                                    .rfind(|t| t.external && t.external_path == ASR_STREAM_URI && t.id > 0)
+                                    .rfind(|t| {
+                                        t.external
+                                            && t.external_path == ASR_STREAM_URI
+                                            && t.id > 0
+                                    })
                                 {
-                                    self.sid = Some(track.id);
+                                    became_ready =
+                                        self.sid.replace(track.id) != Some(track.id);
                                     self.deselected_by_user = !track.selected;
-                                } else if mpv.primary_sid() > 0 {
-                                    self.sid = Some(mpv.primary_sid());
                                 }
                             }
                             if self.reload_dirty && self.sid.is_some() && !self.deselected_by_user {
                                 self.trigger_stream_reload(mpv)?;
                             }
-                            return Ok(self.sid);
+                            return Ok(became_ready.then_some(self.sid).flatten());
                         }
                         AsrTrackMode::NativeMemory => {
                             let CommandReplyResult::Int64(track_id) = result else {
@@ -4970,7 +5162,7 @@ mod tests {
                 asr.on_event(&player, &ev).unwrap();
                 if let MpvEvent::PropertyChange { name, value } = &ev {
                     match (name.as_str(), value) {
-                        ("sub-text", MpvPropertyValue::String(t)) if t == "First ASR cue" => {
+                        ("sub-text", v) if v.as_str() == Some("First ASR cue") => {
                             saw_sub_text = true;
                         }
                         ("sub-start", MpvPropertyValue::Double(v)) if (*v - 0.5).abs() < 0.01 => {
@@ -4999,10 +5191,9 @@ mod tests {
                 asr.on_event(&player, &ev).unwrap();
                 match &ev {
                     MpvEvent::Seek => saw_seek_event = true,
-                    MpvEvent::PropertyChange {
-                        name,
-                        value: MpvPropertyValue::String(t),
-                    } if name == "sub-text" && t == "Second ASR cue" => {
+                    MpvEvent::PropertyChange { name, value }
+                        if name == "sub-text" && value.as_str() == Some("Second ASR cue") =>
+                    {
                         saw_second_cue = true;
                     }
                     _ => {}
@@ -5136,6 +5327,474 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("creation failed"), "{err}");
         assert!(!asr.is_active());
+    }
+
+    #[test]
+    fn live_asr_stream_cb_with_preexisting_subtitle_track_binds_sid_2_not_1() {
+        let dir = TestTempDir::new("memento-asr-sid2-test");
+        std::fs::write(dir.path().join("input.conf"), "").unwrap();
+        std::fs::write(dir.path().join("mpv.conf"), "ao=null\nhwdec=no\n").unwrap();
+        let existing_vtt = dir.path().join("existing.vtt");
+        std::fs::write(
+            &existing_vtt,
+            "WEBVTT\n\n00:00:00.200 --> 00:00:04.000\nEmbedded track cue\n\n",
+        )
+        .unwrap();
+
+        let player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        player.set_wakeup_callback(move || {
+            let _ = wake_tx.send(());
+        });
+
+        player
+            .load_file("av://lavfi:testsrc=size=64x64:rate=10:duration=6,format=yuv420p")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !player.playback_state().file_loaded && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+        assert!(player.playback_state().file_loaded);
+
+        // Add and select an already-active subtitle track (`sid = 1`) BEFORE ASR starts.
+        let vtt_str = existing_vtt.to_string_lossy().into_owned();
+        player
+            .command_node_async(&["sub-add", &vtt_str, "select", "Existing"])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.primary_sid() != 1 && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+        assert_eq!(player.primary_sid(), 1);
+
+        // Start ASR track (`sid = 2`) and immediately enqueue a cue while `sub-add` is in flight
+        // so `reload_dirty` is set when `CommandReply` arrives ahead of `track-list`.
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::StreamCallback);
+        asr.start(&player, "ASR Live", "ja").unwrap();
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 1,
+                start: 0.5,
+                end: 3.0,
+                text: "ASR track 2 cue".into(),
+            },
+        )
+        .unwrap();
+
+        let mut emitted_sids = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (asr.sid() != Some(2) || asr.reload_in_flight.is_some() || asr.reload_dirty)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            // Also exercise mixing `poll_playback_state()` before `drain_events()`!
+            let _ = player.poll_playback_state();
+            for ev in player.drain_events() {
+                if let Some(sid) = asr.on_event(&player, &ev).unwrap() {
+                    emitted_sids.push(sid);
+                }
+            }
+        }
+        assert_eq!(asr.sid(), Some(2), "ASR sid must resolve to 2, never poisoned with 1");
+        assert_eq!(emitted_sids, vec![2], "on_event must emit Some(2) exactly once");
+        assert_eq!(player.primary_sid(), 2);
+
+        // Update cues again (`sub-reload 2`) and seek into cue to confirm `sub-text` comes from ASR.
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 1,
+                start: 0.5,
+                end: 3.0,
+                text: "Updated ASR track 2 cue".into(),
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (asr.reload_in_flight.is_some() || asr.reload_dirty)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+        player.command(&["seek", "1.0", "absolute+exact"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.get_sub_text().as_deref() != Some("Updated ASR track 2 cue")
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+        assert_eq!(
+            player.get_sub_text().as_deref(),
+            Some("Updated ASR track 2 cue")
+        );
+    }
+
+    #[test]
+    fn live_sub_start_sub_end_precede_sub_text_and_drive_autopause_across_cues() {
+        use crate::autopause::AutoPauseState;
+
+        let dir = TestTempDir::new("memento-sub-order-test");
+        std::fs::write(dir.path().join("input.conf"), "").unwrap();
+        std::fs::write(dir.path().join("mpv.conf"), "ao=null\nhwdec=no\n").unwrap();
+        let vtt = dir.path().join("cues.vtt");
+        std::fs::write(
+            &vtt,
+            "WEBVTT\n\n\
+             00:00:00.400 --> 00:00:01.000\n\
+             Cue One\n\n\
+             00:00:01.600 --> 00:00:02.200\n\
+             Cue Two\n\n",
+        )
+        .unwrap();
+
+        let player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        player.set_wakeup_callback(move || {
+            let _ = wake_tx.send(());
+        });
+        player
+            .load_file("av://lavfi:testsrc=size=64x64:rate=25:duration=4,format=yuv420p")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !player.playback_state().file_loaded && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+        let vtt_str = vtt.to_string_lossy().into_owned();
+        player
+            .command_node_async(&["sub-add", &vtt_str, "select", "Test"])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.primary_sid() != 1 && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+
+        // Play continuously from 0.0 across Cue 1 [0.4, 1.0] -> gap [1.0, 1.6] -> Cue 2 [1.6, 2.2]
+        // while rendering software frames so mpv advances its clock deterministically.
+        player.play().unwrap();
+        let mut pixels = AlignedBytes([0; 16]);
+        let mut sub_events: Vec<MpvEvent> = Vec::new();
+        let mut saw_cue2 = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !saw_cue2 && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(20));
+            if player.take_render_update() {
+                let _ = player.render_rgba(2, 2, &mut pixels.0);
+            }
+            for ev in player.drain_events() {
+                if let MpvEvent::PropertyChange { name, value } = &ev {
+                    if matches!(name.as_str(), "sub-start" | "sub-end" | "sub-text") {
+                        if name == "sub-text" && value.as_str() == Some("Cue Two") {
+                            saw_cue2 = true;
+                        }
+                        sub_events.push(ev);
+                    }
+                }
+            }
+        }
+        assert!(saw_cue2, "did not observe Cue Two: {sub_events:?}");
+
+        // Overwrite playback state to prove `to_engine_event` uses per-event snapshotted times!
+        let dummy_overwritten = PlaybackState {
+            sub_start: 99.0,
+            sub_end: 199.0,
+            ..Default::default()
+        };
+
+        let mut autopause = AutoPauseState::default();
+        let mut triggered_seeks = Vec::new();
+        let mut cur_start = 0.0f64;
+        let mut cur_end = 0.0f64;
+
+        for ev in &sub_events {
+            if let MpvEvent::PropertyChange { name, value } = ev {
+                match name.as_str() {
+                    "sub-start" => {
+                        cur_start = match value {
+                            MpvPropertyValue::Double(v) => *v,
+                            _ => 0.0,
+                        };
+                    }
+                    "sub-end" => {
+                        cur_end = match value {
+                            MpvPropertyValue::Double(v) => *v,
+                            _ => 0.0,
+                        };
+                    }
+                    "sub-text" => {
+                        let text = value.as_str().unwrap_or("");
+                        if text == "Cue One" {
+                            assert!(
+                                (cur_start - 0.4).abs() < 0.05 && (cur_end - 1.0).abs() < 0.05,
+                                "sub-start/sub-end must arrive BEFORE Cue One sub-text: got ({cur_start}, {cur_end})"
+                            );
+                        } else if text.is_empty() && autopause.end_time > 0.0 {
+                            assert!(
+                                cur_start == 0.0 && cur_end == 0.0,
+                                "sub-start/sub-end must clear to 0.0 BEFORE empty sub-text: got ({cur_start}, {cur_end})"
+                            );
+                        } else if text == "Cue Two" {
+                            assert!(
+                                (cur_start - 1.6).abs() < 0.05 && (cur_end - 2.2).abs() < 0.05,
+                                "sub-start/sub-end must arrive BEFORE Cue Two sub-text: got ({cur_start}, {cur_end})"
+                            );
+                        }
+
+                        if let Some(EngineEvent::Property(PropertyChange::SubText {
+                            start: Some(snap_s),
+                            end: Some(snap_e),
+                            ..
+                        })) = ev.to_engine_event(&dummy_overwritten)
+                        {
+                            assert_eq!((snap_s, snap_e), (cur_start, cur_end));
+                            if let Some(seek_target) =
+                                autopause.step(true, snap_s, snap_e, 1.0, 0.0, false, 4.0)
+                            {
+                                triggered_seeks.push(seek_target);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Cue 1 [0.4, 1.0] -> gap [0.0, 0.0] triggers autopause seek to 1.0 - 0.1 = 0.9;
+        // Cue 2 [1.6, 2.2] arms autopause (end_time == 2.2) without prematurely seeking!
+        assert_eq!(triggered_seeks.len(), 1, "triggered_seeks={triggered_seeks:?}");
+        assert!((triggered_seeks[0] - 0.9).abs() < 0.05);
+        assert!((autopause.end_time - 2.2).abs() < 0.05);
+    }
+
+    #[test]
+    fn live_webvtt_html_entities_and_arrows_round_trip_verbatim() {
+        let dir = TestTempDir::new("memento-webvtt-escape-test");
+        std::fs::write(dir.path().join("input.conf"), "").unwrap();
+        std::fs::write(dir.path().join("mpv.conf"), "ao=null\nhwdec=no\n").unwrap();
+
+        let tricky = "<音楽> 1 < 2 & 3 --> end";
+        let formatted = String::from_utf8(format_webvtt_cues(&[AsrCue {
+            id: 1,
+            start: 0.2,
+            end: 3.0,
+            text: tricky.into(),
+        }]))
+        .unwrap();
+        assert!(formatted.contains("&lt;音楽&gt; 1 &lt; 2 &amp; 3 --&gt; end"));
+
+        let player = MpvInstance::new_software(Some(dir.path())).unwrap();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        player.set_wakeup_callback(move || {
+            let _ = wake_tx.send(());
+        });
+        player
+            .load_file("av://lavfi:testsrc=size=64x64:rate=10:duration=4,format=yuv420p")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !player.playback_state().file_loaded && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::StreamCallback);
+        asr.start(&player, "ASR", "ja").unwrap();
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 1,
+                start: 0.2,
+                end: 3.0,
+                text: tricky.into(),
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (asr.sid().is_none() || asr.reload_in_flight.is_some() || asr.reload_dirty)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+
+        player.command(&["seek", "1.0", "absolute+exact"]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.get_sub_text().as_deref() != Some(tricky)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                asr.on_event(&player, &ev).unwrap();
+            }
+        }
+        assert_eq!(player.get_sub_text().as_deref(), Some(tricky));
+    }
+
+    #[test]
+    fn live_switching_from_audio_file_to_silent_video_resets_aid_and_sid_and_cli_options_apply_once() {
+        let dir = TestTempDir::new("memento-silent-switch-test");
+        std::fs::write(dir.path().join("input.conf"), "").unwrap();
+        std::fs::write(
+            dir.path().join("mpv.conf"),
+            "ao=null\nhwdec=no\nglsl-shaders=/tmp/conf_shader.glsl\n",
+        )
+        .unwrap();
+        let ext_vtt = dir.path().join("sub.vtt");
+        std::fs::write(&ext_vtt, "WEBVTT\n\n00:00:00.100 --> 00:00:01.500\nhi\n\n").unwrap();
+
+        let player = MpvInstance::new_with_options(
+            Some(dir.path()),
+            &[
+                CliOption {
+                    name: "hwdec".into(),
+                    value: "vaapi".into(),
+                },
+                CliOption {
+                    name: "glsl-shaders-append".into(),
+                    value: "/tmp/cli_shader.glsl".into(),
+                },
+                CliOption {
+                    name: "glsl-shader".into(),
+                    value: "/tmp/cli_alias_shader.glsl".into(),
+                },
+            ],
+        )
+        .unwrap();
+        // Verify CLI overrides mpv.conf AND list-appending options are applied ONCE (not duplicated).
+        assert_eq!(player.configured_hwdec(), "vaapi");
+        let shaders = unsafe {
+            let raw = ffi::mpv_get_property_string(player.raw_handle(), c"glsl-shaders".as_ptr());
+            let s = copy_mpv_string(raw);
+            if !raw.is_null() {
+                ffi::mpv_free(raw.cast());
+            }
+            s
+        };
+        assert_eq!(
+            shaders.matches("/tmp/cli_shader.glsl").count(),
+            1,
+            "glsl-shaders-append must not be applied twice: {shaders}"
+        );
+        assert_eq!(
+            shaders.matches("/tmp/cli_alias_shader.glsl").count(),
+            1,
+            "glsl-shader must not be applied twice: {shaders}"
+        );
+
+        let (wake_tx, wake_rx) = mpsc::channel();
+        player.set_wakeup_callback(move || {
+            let _ = wake_tx.send(());
+        });
+
+        // File 1: audio stream + selected external subtitle track (`aid = 1`, `sid = 1`).
+        player
+            .load_file("av://lavfi:sine=frequency=440:duration=2")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (!player.playback_state().file_loaded || player.selected_aid() != 1)
+            && std::time::Instant::now() < deadline
+        {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+        assert_eq!(player.selected_aid(), 1);
+        let vtt_str = ext_vtt.to_string_lossy().into_owned();
+        player
+            .command_node_async(&["sub-add", &vtt_str, "select", "Sub"])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while player.primary_sid() != 1 && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            let _ = player.drain_events();
+        }
+        assert_eq!(player.primary_sid(), 1);
+        assert_eq!(player.capture_encode_context().unwrap().audio_id, 1);
+
+        // File 2: silent video with 0 audio tracks and 0 subtitle tracks (`aid=auto`, `sid=auto`).
+        player
+            .load_file("av://lavfi:testsrc=size=64x64:rate=10:duration=2,format=yuv420p")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_second_loaded = false;
+        while !saw_second_loaded && std::time::Instant::now() < deadline {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(50));
+            for ev in player.drain_events() {
+                if matches!(ev, MpvEvent::FileLoaded { .. }) {
+                    saw_second_loaded = true;
+                }
+            }
+        }
+        // Drain any trailing `track-list` property update.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        while std::time::Instant::now() < settle {
+            let _ = wake_rx.recv_timeout(std::time::Duration::from_millis(25));
+            let _ = player.drain_events();
+        }
+        assert!(saw_second_loaded);
+        assert_eq!(player.selected_aid(), 0, "silent video must reset audio_id to 0");
+        assert_eq!(player.primary_sid(), 0, "silent video must reset primary_sid to 0");
+        assert_eq!(player.secondary_sid(), 0);
+        assert_eq!(player.capture_encode_context().unwrap().audio_id, 0);
+    }
+
+    #[test]
+    fn mode2_clear_resets_pending_adds_preventing_reused_local_id_collision() {
+        let player = MpvInstance::new_software(None).unwrap();
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::NativeMemory);
+        asr.sid = Some(3);
+        // Simulate pre-clear `add-subtitle` (userdata = 10, local_id = 0) still awaiting reply.
+        asr.pending_adds.insert(10, 0);
+        asr.cues.push(AsrCue {
+            id: 0,
+            start: 1.0,
+            end: 2.0,
+            text: "old track cue".into(),
+        });
+
+        // Clear: on stock libmpv `clear_memory_subtitles_async` returns Err because Mode 2 is
+        // unsupported, so verify the state-clearing invariant before/independent of IPC dispatch.
+        let _ = asr.clear(&player);
+        assert!(asr.pending_adds.is_empty(), "clear must reset pending_adds");
+        assert!(asr.pending_removals.is_empty(), "clear must reset pending_removals");
+        assert!(asr.mpv_cue_ids.is_empty());
+        assert!(asr.pending_edits.is_empty());
+
+        // Pre-clear reply (userdata = 10) arriving after `clear-subtitles` must be ignored cleanly,
+        // and a post-clear add (userdata = 12, reused local_id = 0) must bind its new mpv_cue_id!
+        asr.pending_adds.insert(12, 0);
+        asr.on_event(
+            &player,
+            &MpvEvent::CommandReply {
+                reply_userdata: 10,
+                error: 0,
+                result: CommandReplyResult::Int64(55),
+            },
+        )
+        .unwrap();
+        assert!(!asr.mpv_cue_ids.contains_key(&0));
+
+        asr.on_event(
+            &player,
+            &MpvEvent::CommandReply {
+                reply_userdata: 12,
+                error: 0,
+                result: CommandReplyResult::Int64(56),
+            },
+        )
+        .unwrap();
+        assert_eq!(asr.mpv_cue_ids.get(&0), Some(&56));
     }
 }
 

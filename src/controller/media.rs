@@ -97,6 +97,7 @@ fn validate_audio_clip_args(media: &MediaContext, start: f64, end: f64) -> Resul
         || media.audio_id <= 0
         || !start.is_finite()
         || !end.is_finite()
+        || start < 0.0
         || end <= start
     {
         return Err(
@@ -113,6 +114,8 @@ fn build_loadfile_options(
     audio_id: Option<i64>,
     subtitle_id: Option<i64>,
 ) -> String {
+    let start = if start == 0.0 { 0.0 } else { start };
+    let end = if end == 0.0 { 0.0 } else { end };
     let mut load_options = format!("start={start:.3},end={end:.3}");
     if let Some(aid) = audio_id {
         load_options.push_str(&format!(",aid={aid}"));
@@ -411,7 +414,12 @@ pub fn extract_clip_mp4(
     subtitles: bool,
     normalize_db: Option<f64>,
 ) -> Result<Vec<u8>, String> {
-    if media.path.is_empty() || !start.is_finite() || !end.is_finite() || end <= start {
+    if media.path.is_empty()
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+    {
         return Err("Could not extract Anki video: media path or clip range is invalid".into());
     }
     let temporary = create_temp_mp4_path()?;
@@ -621,6 +629,15 @@ mod tests {
                 .is_err()
         );
         assert!(build_anki_video_clip_options(&zero_aid, 0, true, true, None, "/tmp/clip.mp4").is_err());
+
+        let valid = MediaContext::new("/tmp/movie.mkv", 1);
+        assert!(validate_audio_clip_args(&valid, -0.3, 1.0).is_err());
+        assert!(validate_audio_clip_args(&valid, -0.001, 1.0).is_err());
+        assert!(validate_audio_clip_args(&valid, -0.0, 1.0).is_ok());
+        assert_eq!(build_loadfile_options(-0.0, 1.0, Some(1), None), "start=0.000,end=1.000,aid=1");
+        assert!(extract_clip_audio(&valid, -0.3, 1.0, None).is_err());
+        assert!(extract_clip_wav(&valid, -0.3, 1.0, None).is_err());
+        assert!(extract_clip_mp4(&valid, 1, -0.3, 1.0, false, false, None).is_err());
     }
 
     #[test]

@@ -163,21 +163,31 @@ fn mel_to_hz_slaney(mel: f64) -> f64 {
     F_MIN + F_SP * mel
 }
 
-/// Precomputed radix-2 FFT bit-reversal swaps and twiddle tables for a fixed
-/// `n_fft`. Twiddle factors are accumulated by the same repeated `f32` complex
+/// Precomputed radix-2 FFT bit-reversal swaps and twiddle tables for power-of-two
+/// `n_fft`, plus a precomputed real-DFT cosine/sine matrix fallback for
+/// non-power-of-two `n_fft` (e.g., `n_fft = 400` in Whisper ONNX configs).
+/// Twiddle factors for radix-2 are accumulated by the same repeated `f32` complex
 /// multiplication as the C++ reference so STFT outputs remain bit-identical.
 #[derive(Debug, Clone)]
 struct FftPlan {
     n: usize,
     bit_reversal_swaps: Vec<(usize, usize)>,
     twiddles: Vec<Complex32>,
+    dft_cos: Vec<f32>,
+    dft_sin: Vec<f32>,
 }
+
+const MAX_PRECOMPUTED_DFT_N: usize = 4096;
 
 impl FftPlan {
     fn new(n_fft: i32) -> Self {
         let n = n_fft.max(0) as usize;
         let mut bit_reversal_swaps = Vec::new();
-        if n > 1 {
+        let mut twiddles = Vec::new();
+        let mut dft_cos = Vec::new();
+        let mut dft_sin = Vec::new();
+
+        if n > 1 && n.is_power_of_two() {
             let mut i = 1usize;
             let mut j = 0usize;
             while i < n {
@@ -192,33 +202,68 @@ impl FftPlan {
                 }
                 i += 1;
             }
-        }
 
-        let mut twiddles = Vec::with_capacity(n);
-        let mut len = 2usize;
-        while len <= n {
-            let ang = -2.0 * PI / (len as f64);
-            let wlen = Complex32::new(ang.cos() as f32, ang.sin() as f32);
-            let half = len >> 1;
-            let mut w = Complex32::new(1.0, 0.0);
-            for _ in 0..half {
-                twiddles.push(w);
-                w = w.mul(wlen);
+            twiddles.reserve(n);
+            let mut len = 2usize;
+            while len <= n {
+                let ang = -2.0 * PI / (len as f64);
+                let wlen = Complex32::new(ang.cos() as f32, ang.sin() as f32);
+                let half = len >> 1;
+                let mut w = Complex32::new(1.0, 0.0);
+                for _ in 0..half {
+                    twiddles.push(w);
+                    w = w.mul(wlen);
+                }
+                len <<= 1;
             }
-            len <<= 1;
+        } else if n > 1 && n <= MAX_PRECOMPUTED_DFT_N {
+            let num_bins = n / 2 + 1;
+            let total = num_bins * n;
+            dft_cos.reserve_exact(total);
+            dft_sin.reserve_exact(total);
+            let inv_n = -2.0 * PI / (n as f64);
+            for k in 0..num_bins {
+                let k_factor = inv_n * (k as f64);
+                for j in 0..n {
+                    let ang = k_factor * (j as f64);
+                    dft_cos.push(ang.cos() as f32);
+                    dft_sin.push(ang.sin() as f32);
+                }
+            }
         }
 
         Self {
             n,
             bit_reversal_swaps,
             twiddles,
+            dft_cos,
+            dft_sin,
         }
     }
 
     #[inline]
     fn fft_in_place(&self, a: &mut [Complex32]) {
         let n = self.n;
-        if a.len() != n {
+        if n <= 1 || a.len() != n {
+            return;
+        }
+        if !n.is_power_of_two() {
+            let input = a.to_vec();
+            let inv_n = -2.0 * PI / (n as f64);
+            for (k, out) in a.iter_mut().enumerate() {
+                let step = inv_n * (k as f64);
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for (j, c) in input.iter().enumerate() {
+                    let ang = step * (j as f64);
+                    let (sin_a, cos_a) = ang.sin_cos();
+                    let xr = c.re as f64;
+                    let xi = c.im as f64;
+                    re += xr * cos_a - xi * sin_a;
+                    im += xr * sin_a + xi * cos_a;
+                }
+                *out = Complex32::new(re as f32, im as f32);
+            }
             return;
         }
 
@@ -243,6 +288,75 @@ impl FftPlan {
                 i += len;
             }
             len <<= 1;
+        }
+    }
+
+    #[inline]
+    fn compute_power_spectrum(
+        &self,
+        frame: &[f32],
+        window: &[f32],
+        fft_buf: &mut [Complex32],
+        power_spec: &mut [f32],
+    ) {
+        let n = self.n;
+        if n == 0 || frame.len() < n || window.len() < n {
+            power_spec.fill(0.0);
+            return;
+        }
+        if n.is_power_of_two() {
+            for i in 0..n {
+                fft_buf[i] = Complex32::new(frame[i] * window[i], 0.0);
+            }
+            self.fft_in_place(fft_buf);
+            for (k, out_bin) in power_spec.iter_mut().enumerate() {
+                let re = fft_buf[k].re;
+                let im = fft_buf[k].im;
+                *out_bin = re * re + im * im;
+            }
+        } else if !self.dft_cos.is_empty() {
+            // Pre-window into fft_buf[..].re so each bin's dot product reads contiguous f32s.
+            for i in 0..n {
+                fft_buf[i].re = frame[i] * window[i];
+            }
+            for (k, out_bin) in power_spec.iter_mut().enumerate() {
+                let row = k * n;
+                let cos_row = &self.dft_cos[row..row + n];
+                let sin_row = &self.dft_sin[row..row + n];
+                let mut re = 0.0f32;
+                let mut im = 0.0f32;
+                for j in 0..n {
+                    let x = fft_buf[j].re;
+                    re += x * cos_row[j];
+                    im += x * sin_row[j];
+                }
+                *out_bin = re * re + im * im;
+            }
+        } else {
+            for i in 0..n {
+                fft_buf[i].re = frame[i] * window[i];
+            }
+            let inv_n = -2.0 * PI / (n as f64);
+            for (k, out_bin) in power_spec.iter_mut().enumerate() {
+                let step = inv_n * (k as f64);
+                let (step_sin, step_cos) = step.sin_cos();
+                let mut cos_j = 1.0f64;
+                let mut sin_j = 0.0f64;
+                let mut re = 0.0f64;
+                let mut im = 0.0f64;
+                for item in fft_buf.iter().take(n) {
+                    let x = item.re as f64;
+                    re += x * cos_j;
+                    im += x * sin_j;
+                    let next_cos = cos_j * step_cos - sin_j * step_sin;
+                    let next_sin = cos_j * step_sin + sin_j * step_cos;
+                    cos_j = next_cos;
+                    sin_j = next_sin;
+                }
+                let re_f = re as f32;
+                let im_f = im as f32;
+                *out_bin = re_f * re_f + im_f * im_f;
+            }
         }
     }
 }
@@ -349,10 +463,14 @@ impl MelFrontend {
     pub fn extract(&self, samples: &[f32]) -> MelFeatureOutput {
         let num_samples = samples.len();
         let mut out = MelFeatureOutput {
-            n_mels: self.config.n_mels as i64,
+            n_mels: self.config.n_mels.max(0) as i64,
             ..Default::default()
         };
-        if num_samples == 0 || self.config.hop_length <= 0 || self.config.n_fft <= 0 {
+        if num_samples == 0
+            || self.config.hop_length <= 0
+            || self.config.n_fft <= 0
+            || self.config.n_mels <= 0
+        {
             return out;
         }
 
@@ -404,18 +522,12 @@ impl MelFrontend {
 
         for t in 0..total_frames as usize {
             let frame_start = t * hop as usize;
-            for i in 0..n_fft as usize {
-                fft_buf[i] =
-                    Complex32::new(padded[frame_start + i] * self.padded_window[i], 0.0);
-            }
-
-            self.fft_plan.fft_in_place(&mut fft_buf);
-
-            for k in 0..num_bins as usize {
-                let re = fft_buf[k].re;
-                let im = fft_buf[k].im;
-                power_spec[k] = re * re + im * im;
-            }
+            self.fft_plan.compute_power_spectrum(
+                &padded[frame_start..frame_start + n_fft as usize],
+                &self.padded_window,
+                &mut fft_buf,
+                &mut power_spec,
+            );
 
             let mel_frame = t as usize * n_mels as usize;
             for m in 0..n_mels as usize {
@@ -642,5 +754,63 @@ mod tests {
         let dc_expected: f32 = original.iter().map(|c| c.re).sum();
         assert!((buf[0].re - dc_expected).abs() < 1e-4);
         assert!(buf[0].im.abs() < 1e-4);
+    }
+
+    #[test]
+    fn non_power_of_two_n_fft_400_computes_accurate_dft_without_panicking() {
+        let cfg = MelFrontendConfig {
+            sample_rate: 16000,
+            n_fft: 400,
+            win_length: 400,
+            hop_length: 160,
+            n_mels: 80,
+            preemphasis: 0.0,
+            normalize_per_feature: false,
+            ..MelFrontendConfig::default()
+        };
+        let frontend = MelFrontend::new(cfg);
+        assert_eq!(frontend.fft_plan.n, 400);
+        assert!(frontend.fft_plan.twiddles.is_empty());
+        assert_eq!(frontend.fft_plan.dft_cos.len(), 201 * 400);
+        assert_eq!(frontend.fft_plan.dft_sin.len(), 201 * 400);
+
+        // Verify exact 400-point DFT power spectrum against f64 reference on a 400 Hz tone
+        // (exact bin k = 400 * 400 / 16000 = 10).
+        let frame: Vec<f32> = (0..400)
+            .map(|n| (2.0 * PI * 400.0 * (n as f64) / 16000.0).sin() as f32)
+            .collect();
+        let ones = vec![1.0f32; 400];
+        let mut fft_buf = vec![Complex32::new(0.0, 0.0); 400];
+        let mut power = vec![0.0f32; 201];
+        frontend
+            .fft_plan
+            .compute_power_spectrum(&frame, &ones, &mut fft_buf, &mut power);
+        // Bin 10 has amplitude 200 -> power = 40000; adjacent bins are ~0.
+        assert!((power[10] - 40_000.0).abs() < 1.0, "power[10]={}", power[10]);
+        assert!(power[0] < 1e-3);
+        assert!(power[9] < 1e-2);
+        assert!(power[11] < 1e-2);
+
+        // Full MelFrontend::extract on 1 second of 16 kHz audio with n_fft = 400.
+        let samples: Vec<f32> = (0..16000)
+            .map(|i| (2.0 * PI * 440.0 * (i as f64) / 16000.0).sin() as f32 * 0.5)
+            .collect();
+        let mel = frontend.extract(&samples);
+        assert!(mel.num_frames > 0);
+        assert!(mel.valid_frames > 0);
+        assert_eq!(mel.n_mels, 80);
+        assert_eq!(mel.features.len(), mel.num_frames as usize * 80);
+        assert!(mel.features.iter().all(|v| v.is_finite()));
+
+        // Malformed zero / negative configs return empty output cleanly without panicking.
+        for bad_fft in [0, -1, -400] {
+            let bad = MelFrontend::new(MelFrontendConfig {
+                n_fft: bad_fft,
+                ..MelFrontendConfig::default()
+            });
+            let empty = bad.extract(&samples);
+            assert_eq!(empty.num_frames, 0);
+            assert!(empty.features.is_empty());
+        }
     }
 }
