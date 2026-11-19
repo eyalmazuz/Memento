@@ -539,9 +539,9 @@ component SubtitleDrawerPanel inherits Rectangle {
     scroll-to-row(row-idx) => {
         let count = root.active-tab == 1 ? root.secondary-entries.length : root.entries.length;
         if row-idx >= 0 && count > 0 {
-            let avg-row-h = sub-list-view.viewport-height > count * 36px
+            let avg-row-h = sub-list-view.viewport-height > count * 24px
                 ? (sub-list-view.viewport-height / count)
-                : 36px;
+                : 24px;
             root.scroll-to-offset(row-idx * avg-row-h, avg-row-h, count * avg-row-h);
         }
     }
@@ -685,9 +685,9 @@ component SubtitleDrawerPanel inherits Rectangle {
                         root.user-scrolled();
                     }
                 }
-                for entry[idx] in (root.active-tab == 1 ? root.secondary-entries : root.entries) : Rectangle {
-                    height: max(36px, cue-text.preferred-height + 14px);
-                    border-radius: 4px;
+                for entry[idx] in (root.active-tab == 1 ? root.secondary-entries : root.entries) : sub-cue-row := Rectangle {
+                    height: max(24px, cue-text.preferred-height + 6px);
+                    border-radius: 3px;
                     border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
                     border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : #C29D4B;
                     background: entry.selected
@@ -696,27 +696,39 @@ component SubtitleDrawerPanel inherits Rectangle {
                             ? #134E4A
                             : (d-touch.has-hover ? root.hover-color : transparent));
 
+                    // Subtle row separation hairline
+                    if idx > 0 && !entry.selected && !entry.is_active && !entry.search-match : Rectangle {
+                        x: 8px;
+                        y: 0px;
+                        width: parent.width - 16px;
+                        height: 1px;
+                        background: MementoPalette.border;
+                        opacity: 0.45;
+                    }
+
                     // Emerald indicator for active playing cue
                     if entry.is_active : Rectangle {
-                        x: 3px;
-                        y: 4px;
+                        x: 2px;
+                        y: 3px;
                         width: 3px;
-                        height: parent.height - 8px;
+                        height: parent.height - 6px;
                         background: MementoPalette.active-cue;
-                        border-radius: 2px;
+                        border-radius: 1.5px;
                     }
 
                     HorizontalLayout {
                         width: parent.width;
                         height: parent.height;
-                        padding-left: 10px;
-                        padding-right: 10px;
-                        spacing: 12px;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 3px;
+                        padding-bottom: 3px;
+                        spacing: 8px;
                         alignment: start;
 
                         // Timecode (omitted completely when `show-timestamps` is false so cue text gets full width)
                         if root.show-timestamps : Text {
-                            width: 52px;
+                            width: 50px;
                             horizontal-alignment: left;
                             vertical-alignment: center;
                             font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
@@ -1975,6 +1987,26 @@ export component MementoApp inherits Window {
         height: 100%;
 
         capture-key-pressed(event) => {
+            // Route bare modifier keys to PopupBridge first while the dictionary popup is open so
+            // recursive glossary scanning works regardless of which FocusScope currently has focus.
+            if (root.dict-open && PopupBridge.rich-enabled
+                && (event.text == Key.Shift || event.text == Key.ShiftR
+                    || event.text == Key.Control || event.text == Key.ControlR
+                    || event.text == Key.Alt || event.text == Key.AltGr
+                    || event.text == Key.Meta || event.text == Key.MetaR
+                    || (event.text == ""
+                        && (event.modifiers.control || event.modifiers.shift
+                            || event.modifiers.alt || event.modifiers.meta)))) {
+                if (PopupBridge.popup-key-pressed(
+                    event.text,
+                    event.modifiers.control || event.text == Key.Control || event.text == Key.ControlR,
+                    event.modifiers.shift || event.text == Key.Shift || event.text == Key.ShiftR,
+                    event.modifiers.alt || event.text == Key.Alt || event.text == Key.AltGr,
+                    event.modifiers.meta || event.text == Key.Meta || event.text == Key.MetaR,
+                )) {
+                    return accept;
+                }
+            }
             if (event.text == Key.F3) {
                 if (root.key-pressed(event.text, event.modifiers.control, event.modifiers.shift, event.modifiers.alt, event.modifiers.meta)) {
                     return accept;
@@ -2076,6 +2108,14 @@ export component MementoApp inherits Window {
             reject
         }
         key-released(event) => {
+            if (root.dict-open && PopupBridge.rich-enabled && !root.custom-key-handler-installed) {
+                PopupBridge.popup-key-released(
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.meta,
+                );
+            }
             root.key-released(
                 event.modifiers.control,
                 event.modifiers.shift,
@@ -3113,7 +3153,7 @@ export component MementoApp inherits Window {
         if root.update-dialog-open : Rectangle {
             width: 100%;
             height: 100%;
-            background: #00000099;
+            background: #000000CC;
             TouchArea {
                 clicked => {
                     if root.update-dialog-opt-in {
@@ -3126,33 +3166,61 @@ export component MementoApp inherits Window {
                 }
             }
             update-card := Rectangle {
-                width: 460px;
-                height: max(195px, update-col.preferred-height + 40px);
+                width: min(460px, parent.width - 48px);
+                height: update-col.preferred-height;
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 background: MementoPalette.surface-bg;
                 border-color: MementoPalette.border-light;
                 border-width: 1px;
-                border-radius: 8px;
-                drop-shadow-blur: 20px;
-                drop-shadow-color: #000000AA;
+                border-radius: 10px;
+                drop-shadow-blur: 28px;
+                drop-shadow-color: #000000CC;
                 // Click-shield prevents clicks inside the dialog from dismissing it
                 TouchArea {}
+                // Subtle top accent highlight
+                Rectangle {
+                    x: 16px;
+                    y: 0px;
+                    width: parent.width - 32px;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: MementoPalette.cyan-accent;
+                }
                 update-col := VerticalLayout {
-                    x: 20px;
-                    y: 20px;
-                    width: parent.width - 40px;
-                    spacing: 12px;
+                    width: parent.width;
+                    padding: 24px;
+                    spacing: 14px;
 
                     HorizontalLayout {
                         spacing: 10px;
                         alignment: space-between;
-                        Text {
-                            text: root.update-dialog-title != "" ? root.update-dialog-title : "Updates";
-                            color: MementoPalette.text;
-                            font-size: 18px;
-                            font-weight: 700;
-                            vertical-alignment: center;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            alignment: start;
+                            Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                border-radius: 7px;
+                                background: #38A3E524;
+                                border-width: 1px;
+                                border-color: #38A3E566;
+                                Text {
+                                    text: "↻";
+                                    color: MementoPalette.cyan-accent;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                text: root.update-dialog-title != "" ? root.update-dialog-title : "Updates";
+                                color: MementoPalette.text;
+                                font-size: 17px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
                         }
                         if !root.update-dialog-opt-in && root.update-dialog-release-tag != "" : Rectangle {
                             height: 24px;
@@ -3172,24 +3240,38 @@ export component MementoApp inherits Window {
                         }
                     }
 
-                    Text {
-                        text: root.update-dialog-message;
-                        color: MementoPalette.text-secondary;
-                        font-size: 13px;
-                        wrap: word-wrap;
+                    update-message-box := Rectangle {
+                        width: update-card.width - 48px;
+                        height: update-message-text.preferred-height;
+                        update-message-text := Text {
+                            width: parent.width;
+                            text: root.update-dialog-message;
+                            color: MementoPalette.text-secondary;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: MementoPalette.border;
                     }
 
                     if root.update-dialog-opt-in : HorizontalLayout {
                         alignment: end;
-                        spacing: 8px;
-                        Button {
+                        spacing: 10px;
+                        update-btn-no := Button {
+                            min-width: 84px;
+                            height: 32px;
                             text: "No";
                             clicked => {
                                 root.update-opt-in-responded(false);
                                 f-scope.focus();
                             }
                         }
-                        Button {
+                        update-btn-yes := Button {
+                            min-width: 84px;
+                            height: 32px;
                             text: "Yes";
                             primary: true;
                             clicked => {
@@ -3201,15 +3283,19 @@ export component MementoApp inherits Window {
 
                     if !root.update-dialog-opt-in : HorizontalLayout {
                         alignment: end;
-                        spacing: 8px;
-                        if root.update-dialog-release-url != "" && (root.update-dialog-release-tag != "" || root.update-dialog-title == "Update Check Failed") : Button {
+                        spacing: 10px;
+                        if root.update-dialog-release-url != "" && (root.update-dialog-release-tag != "" || root.update-dialog-title == "Update Check Failed") : update-btn-releases := Button {
+                            min-width: 84px;
+                            height: 32px;
                             text: "Open GitHub Releases";
                             primary: root.update-dialog-release-tag != "";
                             clicked => {
                                 root.open-external-link(root.update-dialog-release-url);
                             }
                         }
-                        Button {
+                        update-btn-dismiss := Button {
+                            min-width: 84px;
+                            height: 32px;
                             text: "Dismiss";
                             clicked => {
                                 root.update-dialog-open = false;

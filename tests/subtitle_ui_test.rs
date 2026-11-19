@@ -880,3 +880,437 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,660)\\an2}鳥白島
         app.hide().unwrap();
     }
 }
+
+mod ui_dialogs_settings_and_modifier_tests {
+    use super::*;
+    use i_slint_backend_testing::ElementQuery;
+    use memento_app::controller::config::ConfigController;
+    use memento_app::{PopupBridge, SettingsField, SettingsGroup, SettingsWindow, SubEntry};
+    use slint::platform::{Key, WindowEvent};
+    use slint::VecModel;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn update_dialog_buttons_stay_strictly_inside_card_with_generous_bottom_margin() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
+        app.show().unwrap();
+
+        // 1. First-launch Auto Update opt-in dialog (`No` / `Yes`)
+        app.set_update_dialog_opt_in(true);
+        app.set_update_dialog_title("Auto Update".into());
+        app.set_update_dialog_message(
+            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts."
+                .into(),
+        );
+        app.set_update_dialog_release_tag("".into());
+        app.set_update_dialog_release_url("https://github.com/ripose-jp/Memento/releases".into());
+        app.set_update_dialog_open(true);
+
+        let assert_buttons_inside_card = |label: &str, button_ids: &[&str]| {
+            let card = ElementQuery::from_root(&app)
+                .match_id("MementoApp::update-card")
+                .find_first()
+                .unwrap_or_else(|| panic!("{label}: update-card must exist (run with SLINT_EMIT_DEBUG_INFO=1)"));
+            let card_pos = card.absolute_position();
+            let card_size = card.size();
+            let card_left = card_pos.x;
+            let card_right = card_pos.x + card_size.width;
+            let card_bottom = card_pos.y + card_size.height;
+
+            let msg = ElementQuery::from_root(&app)
+                .match_id("MementoApp::update-message-text")
+                .find_first()
+                .unwrap_or_else(|| panic!("{label}: update-message-text must exist"));
+            let msg_pos = msg.absolute_position();
+            let msg_size = msg.size();
+            let msg_bottom = msg_pos.y + msg_size.height;
+            assert!(
+                msg_pos.x >= card_left + 16.0 && msg_pos.x + msg_size.width <= card_right - 16.0,
+                "{label}: message text horizontally overflows card (msg={}..{}, card={}..{})",
+                msg_pos.x,
+                msg_pos.x + msg_size.width,
+                card_left,
+                card_right
+            );
+
+            for &btn_id in button_ids {
+                let btn = ElementQuery::from_root(&app)
+                    .match_id(btn_id)
+                    .find_first()
+                    .unwrap_or_else(|| panic!("{label}: {btn_id} must exist"));
+                let pos = btn.absolute_position();
+                let size = btn.size();
+                let btn_right = pos.x + size.width;
+                let btn_bottom = pos.y + size.height;
+                let bottom_margin = card_bottom - btn_bottom;
+                assert!(
+                    pos.y >= msg_bottom + 8.0,
+                    "{label}: {btn_id} overlaps message text (btn_top={}, msg_bottom={msg_bottom})",
+                    pos.y
+                );
+                assert!(
+                    pos.x >= card_left + 16.0 && btn_right <= card_right - 16.0,
+                    "{label}: {btn_id} overflows card horizontally (btn={}..{}, card={}..{})",
+                    pos.x,
+                    btn_right,
+                    card_left,
+                    card_right
+                );
+                assert!(
+                    bottom_margin >= 16.0,
+                    "{label}: {btn_id} must stay strictly inside update-card with >= 16px bottom margin (btn_bottom={btn_bottom}, card_bottom={card_bottom}, margin={bottom_margin})"
+                );
+                assert!(
+                    size.width >= 84.0 && size.height >= 30.0,
+                    "{label}: {btn_id} must be well-proportioned ({}x{})",
+                    size.width,
+                    size.height
+                );
+            }
+        };
+
+        assert_buttons_inside_card(
+            "opt-in",
+            &["MementoApp::update-btn-no", "MementoApp::update-btn-yes"],
+        );
+
+        // Even with a very long multi-paragraph message, update-card must expand cleanly.
+        app.set_update_dialog_message(
+            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts and notify you whenever a newer release tag is published on GitHub Releases."
+                .into(),
+        );
+        assert_buttons_inside_card(
+            "opt-in-long",
+            &["MementoApp::update-btn-no", "MementoApp::update-btn-yes"],
+        );
+
+        // 2. Release-available dialog (`Open GitHub Releases` / `Dismiss`)
+        app.set_update_dialog_opt_in(false);
+        app.set_update_dialog_title("New Version Available".into());
+        app.set_update_dialog_release_tag("v2.1.0".into());
+        app.set_update_dialog_message(
+            "Memento v2.1.0 is available on GitHub Releases (currently installed: v2.0.0). Visit GitHub Releases to download the latest build and review the changelog."
+                .into(),
+        );
+        assert_buttons_inside_card(
+            "release-available",
+            &[
+                "MementoApp::update-btn-releases",
+                "MementoApp::update-btn-dismiss",
+            ],
+        );
+
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn settings_window_multiline_descriptions_stay_strictly_inside_row_and_card() {
+        i_slint_backend_testing::init_no_event_loop();
+        let cfg = ConfigController::new();
+
+        // Test both Options -> Interface (category 5, with ASS native 2-3 line description)
+        // and Options -> Search (category 9, with max-recursion-depth description), plus a
+        // synthetic 3+ line stress description at normal and narrow window widths.
+        let settings = SettingsWindow::new().unwrap();
+        settings.show().unwrap();
+
+        let assert_all_descriptions_contained = |label: &str| {
+            let cards = ElementQuery::from_root(&settings)
+                .match_id("SettingsSection::settings-card")
+                .find_all();
+            let rows = ElementQuery::from_root(&settings)
+                .match_id("SettingsSection::field-row")
+                .find_all();
+            let descs = ElementQuery::from_root(&settings)
+                .match_id("FieldRow::field-desc")
+                .find_all();
+            assert!(
+                !cards.is_empty() && !rows.is_empty() && !descs.is_empty(),
+                "{label}: expected settings-card, field-row, and field-desc elements"
+            );
+
+            for (idx, desc) in descs.iter().enumerate() {
+                let dp = desc.absolute_position();
+                let ds = desc.size();
+                let d_top = dp.y;
+                let d_bottom = dp.y + ds.height;
+                let d_left = dp.x;
+                let d_right = dp.x + ds.width;
+                assert!(
+                    ds.height > 10.0 && ds.width > 100.0,
+                    "{label}: desc[{idx}] has degenerate size {}x{}",
+                    ds.width,
+                    ds.height
+                );
+
+                // Must be strictly contained inside its owning FieldRow
+                let owner_row = rows.iter().find(|r| {
+                    let rp = r.absolute_position();
+                    let rs = r.size();
+                    rs.height > 0.0 && d_top >= rp.y - 0.5 && d_top < rp.y + rs.height
+                });
+                let row = owner_row.unwrap_or_else(|| {
+                    panic!("{label}: desc[{idx}] top={d_top} has no containing field-row")
+                });
+                let rp = row.absolute_position();
+                let rs = row.size();
+                let row_bottom = rp.y + rs.height;
+                assert!(
+                    d_bottom <= row_bottom - 4.0,
+                    "{label}: desc[{idx}] overflows FieldRow bottom (desc_bottom={d_bottom}, row_bottom={row_bottom}, desc_h={}, row_h={})",
+                    ds.height,
+                    rs.height
+                );
+                assert!(
+                    d_left >= rp.x - 0.5 && d_right <= rp.x + rs.width + 0.5,
+                    "{label}: desc[{idx}] overflows FieldRow horizontally (desc={}..{}, row={}..{})",
+                    d_left,
+                    d_right,
+                    rp.x,
+                    rp.x + rs.width
+                );
+
+                // Must also be strictly contained inside its parent settings-card
+                let owner_card = cards.iter().find(|c| {
+                    let cp = c.absolute_position();
+                    let cs = c.size();
+                    d_top >= cp.y - 0.5 && d_top < cp.y + cs.height
+                });
+                let card = owner_card.unwrap_or_else(|| {
+                    panic!("{label}: desc[{idx}] top={d_top} has no containing settings-card")
+                });
+                let cp = card.absolute_position();
+                let cs = card.size();
+                let card_bottom = cp.y + cs.height;
+                assert!(
+                    row_bottom <= card_bottom - 4.0,
+                    "{label}: FieldRow overflows settings-card bottom (row_bottom={row_bottom}, card_bottom={card_bottom})"
+                );
+                assert!(
+                    d_bottom <= card_bottom - 8.0,
+                    "{label}: desc[{idx}] overflows settings-card bottom (desc_bottom={d_bottom}, card_bottom={card_bottom})"
+                );
+            }
+        };
+
+        for (w, h) in [(940.0f32, 1600.0f32), (760.0, 1600.0)] {
+            settings.window().set_size(slint::LogicalSize::new(w, h));
+            settings.set_active_category(5);
+            settings.set_settings_groups(
+                Rc::new(VecModel::from(cfg.category_settings_groups(5))).into(),
+            );
+            assert_all_descriptions_contained(&format!("interface-{w}x{h}"));
+
+            // Verify the real ASS native description wrapped onto multiple lines and expanded the row
+            let descs = ElementQuery::from_root(&settings)
+                .match_id("FieldRow::field-desc")
+                .find_all();
+            assert!(
+                descs.len() >= 2,
+                "interface-{w}x{h}: expected Theme + Subtitle descriptions visible (got {})",
+                descs.len()
+            );
+            assert!(
+                descs.iter().any(|d| d.size().height > 20.0),
+                "interface-{w}x{h}: ASS native description should wrap across multiple lines (descs={:?})",
+                descs.iter().map(|d| (d.absolute_position(), d.size())).collect::<Vec<_>>()
+            );
+
+            // Also verify the Subtitle group specifically at typical 680px window height
+            let subtitle_only: Vec<_> = cfg
+                .category_settings_groups(5)
+                .into_iter()
+                .filter(|g| g.title == "Subtitle")
+                .collect();
+            settings.window().set_size(slint::LogicalSize::new(w, 680.0));
+            settings.set_settings_groups(Rc::new(VecModel::from(subtitle_only)).into());
+            assert_all_descriptions_contained(&format!("interface-subtitle-only-{w}x680"));
+
+            settings.window().set_size(slint::LogicalSize::new(w, 1600.0));
+            settings.set_active_category(9);
+            settings.set_settings_groups(
+                Rc::new(VecModel::from(cfg.category_settings_groups(9))).into(),
+            );
+            assert_all_descriptions_contained(&format!("search-{w}x{h}"));
+        }
+
+        // Stress test: 1-line, 2-line, and 3+ line descriptions in one card
+        let make_field = |key: &str, label: &str, desc: &str, kind: &str| SettingsField {
+            key: key.into(),
+            label: label.into(),
+            description: desc.into(),
+            kind: kind.into(),
+            value: if kind == "switch" { "true" } else { "4" }.into(),
+            choices: Rc::new(VecModel::default()).into(),
+            enabled: true,
+            visible: true,
+            font_family: "".into(),
+            font_size: "".into(),
+            font_bold: false,
+            font_italic: false,
+            color_swatch: slint::Color::default(),
+            color_a: 255,
+            color_r: 0,
+            color_g: 0,
+            color_b: 0,
+            conflict: "".into(),
+        };
+        let stress_group = SettingsGroup {
+            category: 5,
+            title: "Description Stress".into(),
+            entry_id: "".into(),
+            fields: Rc::new(VecModel::from(vec![
+                make_field("stress/one", "One line", "Short single-line description.", "switch"),
+                make_field(
+                    "stress/two",
+                    "Two lines",
+                    "Preserve full ASS positioning, styling, typesetting, and embedded fonts via libmpv/libass with interactive dictionary lookup and highlighting.",
+                    "switch",
+                ),
+                make_field(
+                    "stress/three",
+                    "Three lines",
+                    "This is an intentionally very long three-line settings description paired with a wide 260px text input control so that it must wrap cleanly across at least three visual lines and expand both its FieldRow and its parent settings card without clipping or overflowing the card border.",
+                    "text",
+                ),
+            ]))
+            .into(),
+        };
+        settings.window().set_size(slint::LogicalSize::new(820.0, 680.0));
+        settings.set_active_category(5);
+        settings.set_settings_groups(Rc::new(VecModel::from(vec![stress_group])).into());
+        assert_all_descriptions_contained("stress-1-2-3-lines");
+        let stress_descs = ElementQuery::from_root(&settings)
+            .match_id("FieldRow::field-desc")
+            .find_all();
+        assert_eq!(stress_descs.len(), 3);
+        assert!(
+            stress_descs[2].size().height > stress_descs[0].size().height * 2.0,
+            "3-line description must wrap taller than 1-line ({} vs {})",
+            stress_descs[2].size().height,
+            stress_descs[0].size().height
+        );
+
+        settings.hide().unwrap();
+    }
+
+    #[test]
+    fn subtitle_drawer_rows_are_compact_and_do_not_overlap() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
+        app.set_sub_drawer_open(true);
+        let rows: Vec<SubEntry> = (0..25)
+            .map(|i| SubEntry {
+                id: i,
+                start: (i * 2) as f32,
+                end: (i * 2 + 1) as f32,
+                text: format!("短い字幕行 #{i}").into(),
+                selected: false,
+                is_active: i == 3,
+                search_match: false,
+            })
+            .collect();
+        app.set_subtitle_entries(Rc::new(VecModel::from(rows)).into());
+        app.show().unwrap();
+
+        let rendered_rows = ElementQuery::from_root(&app)
+            .match_id("SubtitleDrawerPanel::sub-cue-row")
+            .find_all();
+        assert!(
+            rendered_rows.len() >= 18,
+            "compact subtitle drawer should fit many cues visibly (got {})",
+            rendered_rows.len()
+        );
+        for (idx, row) in rendered_rows.iter().enumerate() {
+            let h = row.size().height;
+            assert!(
+                (22.0..=28.0).contains(&h),
+                "compact single-line cue row[{idx}] height should be ~24px (got {h})"
+            );
+        }
+        let mut sorted: Vec<_> = rendered_rows
+            .iter()
+            .map(|r| (r.absolute_position().y, r.size().height))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for pair in sorted.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0 + pair[0].1 - 0.5,
+                "adjacent subtitle drawer rows must not overlap ({pair:?})"
+            );
+        }
+
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn global_bare_modifier_capture_reaches_popup_bridge_when_dict_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+        pb.set_rich_enabled(true);
+        app.set_dict_open(true);
+
+        let captured_presses: Rc<RefCell<Vec<(String, bool, bool, bool, bool)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let captured_releases: Rc<RefCell<Vec<(bool, bool, bool, bool)>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let fallback_presses: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        let cp = captured_presses.clone();
+        pb.on_popup_key_pressed(move |text, ctrl, shift, alt, meta| {
+            cp.borrow_mut().push((text.to_string(), ctrl, shift, alt, meta));
+            true
+        });
+        let cr = captured_releases.clone();
+        pb.on_popup_key_released(move |ctrl, shift, alt, meta| {
+            cr.borrow_mut().push((ctrl, shift, alt, meta));
+        });
+        let fp = fallback_presses.clone();
+        app.on_key_pressed(move |_, _, _, _, _| {
+            *fp.borrow_mut() += 1;
+            false
+        });
+
+        // Dispatch bare Shift & ShiftR while f-scope has focus and dict_open == true.
+        for key in [Key::Shift, Key::ShiftR, Key::Control, Key::Alt, Key::Meta] {
+            app.window().dispatch_event(WindowEvent::KeyPressed {
+                text: key.into(),
+            });
+            app.window().dispatch_event(WindowEvent::KeyReleased {
+                text: key.into(),
+            });
+        }
+
+        let presses = captured_presses.borrow();
+        assert_eq!(
+            presses.len(),
+            5,
+            "all 5 bare modifiers must reach PopupBridge.popup-key-pressed via f-scope.capture-key-pressed ({presses:?})"
+        );
+        assert!(presses[0].2, "Key::Shift must report shift=true");
+        assert!(presses[1].2, "Key::ShiftR must report shift=true");
+        assert!(presses[2].1, "Key::Control must report control=true");
+        assert!(presses[3].3, "Key::Alt must report alt=true");
+        assert!(presses[4].4, "Key::Meta must report meta=true");
+        assert_eq!(
+            *fallback_presses.borrow(),
+            0,
+            "when PopupBridge consumes a glossary modifier press, f-scope key-pressed must not re-fire behind the popup"
+        );
+        assert_eq!(
+            captured_releases.borrow().len(),
+            5,
+            "bare modifier releases must forward to PopupBridge.popup-key-released"
+        );
+
+        app.hide().unwrap();
+    }
+}

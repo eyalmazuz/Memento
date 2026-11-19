@@ -297,6 +297,7 @@ pub enum SearchField {
     RemoveRegex,
     SubtitleFurigana,
     ShowAnkiGlossaryCheckbox,
+    MaxRecursionDepth,
 }
 
 field_enum! {
@@ -315,6 +316,7 @@ field_enum! {
     RemoveRegex(raw = raw::search::REMOVE_REGEX, default = DefaultFallback::Str(raw::search::REMOVE_REGEX_DEFAULT)),
     SubtitleFurigana(raw = raw::search::SUBTITLE_FURIGANA, default = DefaultFallback::Bool(raw::search::SUBTITLE_FURIGANA_DEFAULT)),
     ShowAnkiGlossaryCheckbox(raw = raw::search::SHOW_ANKI_GLOSSARY_CHECKBOX, default = DefaultFallback::Bool(raw::search::SHOW_ANKI_GLOSSARY_CHECKBOX_DEFAULT)),
+    MaxRecursionDepth(raw = raw::search::MAX_RECURSION_DEPTH, default = DefaultFallback::Int(raw::search::MAX_RECURSION_DEPTH_DEFAULT)),
 }
 
 /// Fields of `Keys::Search::Matcher` — leaf keys of the `[search]` group.
