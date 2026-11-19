@@ -79,6 +79,7 @@ static NEXT_BRIDGE_INSTANCE_ID: AtomicI32 = AtomicI32::new(1);
 thread_local! {
     static LAST_GROUPED_HITS: RefCell<Vec<SearchHit>> = const { RefCell::new(Vec::new()) };
     static ACTIVE_RICH_BRIDGES: RefCell<Vec<Rc<RichUiBridge>>> = const { RefCell::new(Vec::new()) };
+    static SUPPRESS_FIRST_TERM_READY: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn is_kanji_char(character: char) -> bool {
@@ -87,7 +88,10 @@ pub fn is_kanji_char(character: char) -> bool {
         || ('\u{20000}'..='\u{3134f}').contains(&character)
 }
 
-pub fn dictionary_result_rows(hits: &[SearchHit], excluded: &[String]) -> Vec<DictResult> {
+fn build_dictionary_result_rows_grouped(
+    hits: &[SearchHit],
+    excluded: &[String],
+) -> (Vec<DictResult>, Vec<SearchHit>) {
     let mut grouped: Vec<&SearchHit> = Vec::with_capacity(hits.len());
     let mut terms: Vec<(&str, &str, bool)> = Vec::new();
     let mut by_term: HashMap<(&str, &str, bool), Vec<&SearchHit>> = HashMap::new();
@@ -107,11 +111,8 @@ pub fn dictionary_result_rows(hits: &[SearchHit], excluded: &[String]) -> Vec<Di
         }
     }
 
-    LAST_GROUPED_HITS.with(|slot| {
-        *slot.borrow_mut() = grouped.iter().map(|hit| (*hit).clone()).collect();
-    });
-
-    grouped
+    let grouped_owned: Vec<SearchHit> = grouped.iter().map(|hit| (*hit).clone()).collect();
+    let rows = grouped
         .iter()
         .enumerate()
         .map(|(index, hit)| DictResult {
@@ -155,7 +156,16 @@ pub fn dictionary_result_rows(hits: &[SearchHit], excluded: &[String]) -> Vec<Di
             pitch_graphs: Default::default(),
             frequencies: Default::default(),
         })
-        .collect()
+        .collect();
+    (rows, grouped_owned)
+}
+
+pub fn dictionary_result_rows(hits: &[SearchHit], excluded: &[String]) -> Vec<DictResult> {
+    let (rows, grouped_owned) = build_dictionary_result_rows_grouped(hits, excluded);
+    LAST_GROUPED_HITS.with(|slot| {
+        *slot.borrow_mut() = grouped_owned;
+    });
+    rows
 }
 
 fn popup_rows_through(rows: &slint::ModelRc<DictResult>, count: usize) -> Vec<DictResult> {
@@ -178,7 +188,10 @@ pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
     let pb = app.global::<PopupBridge>();
     pb.set_selected_glossary_text("".into());
     pb.set_tooltip_visible(false);
+    pb.set_last_added_was_nested(false);
     pb.set_row_anki_duplicates(Rc::new(VecModel::from(Vec::<bool>::new())).into());
+    pb.set_row_anki_note_ids(Rc::new(VecModel::from(Vec::<i32>::new())).into());
+    pb.set_row_anki_note_id_strings(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
     pb.set_row_anki_browse_queries(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
     pb.set_row_anki_tags(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
     pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
@@ -194,6 +207,18 @@ pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
                 }
             }
         });
+    }
+
+    if !SUPPRESS_FIRST_TERM_READY.with(|flag| flag.get()) {
+        if let Some(first_term) = rows
+            .iter()
+            .find(|r| !r.is_kanji && !r.expression.is_empty())
+        {
+            pb.invoke_first_term_ready(
+                first_term.expression.clone(),
+                first_term.reading.clone(),
+            );
+        }
     }
 }
 
@@ -501,6 +526,10 @@ fn active_subtitle_render_style() -> SubtitleRenderStyle {
     })
 }
 
+pub fn active_subtitle_style_for_app(app: &MementoApp) -> SubtitleRenderStyle {
+    subtitle_style_for_app(app)
+}
+
 fn subtitle_style_for_app(app: &MementoApp) -> SubtitleRenderStyle {
     let bridge_id = app.global::<PopupBridge>().get_bridge_instance_id();
     if bridge_id > 0 {
@@ -679,6 +708,7 @@ pub struct SubtitleRenderStyle {
     pub bg_rgba: [u8; 4],
     pub stroke_size: f32,
     pub furigana_ratio: f32,
+    pub line_spacing: f32,
     pub bold: bool,
     pub italic: bool,
 }
@@ -692,6 +722,7 @@ impl Default for SubtitleRenderStyle {
             bg_rgba: [0, 0, 0, 0],
             stroke_size: 6.0,
             furigana_ratio: 0.4,
+            line_spacing: raw::interface::subtitle::LINE_SPACING_DEFAULT as f32,
             bold: true,
             italic: false,
         }
@@ -752,6 +783,7 @@ struct SubtitleCacheKey {
     bg_rgba: [u8; 4],
     stroke_tenth: i32,
     furigana_pct: i32,
+    line_spacing_tenth: i32,
     bold: bool,
     italic: bool,
 }
@@ -1311,6 +1343,7 @@ impl TextEngine {
         style: &SubtitleRenderStyle,
     ) -> ShapedSubtitleToken {
         let font_px = font_px.clamp(8.0, 140.0);
+        let line_spacing_extra = style.line_spacing.clamp(0.0, 120.0);
         let key = SubtitleCacheKey {
             text: word.text.to_string(),
             reading: if show_furigana {
@@ -1326,6 +1359,7 @@ impl TextEngine {
             bg_rgba: [0, 0, 0, 0],
             stroke_tenth: (style.stroke_size * 10.0).round() as i32,
             furigana_pct: (style.furigana_ratio * 100.0).round() as i32,
+            line_spacing_tenth: (line_spacing_extra * 10.0).round() as i32,
             bold: style.bold,
             italic: style.italic,
         };
@@ -1407,10 +1441,13 @@ impl TextEngine {
         };
 
         let layout_width = base_width.max(ruby_width).ceil().max(1.0);
-        let total_height = (ruby_space + base_height + pad_y * 2.0).ceil().max(2.0);
+        let half_line_spacing = line_spacing_extra * 0.5;
+        let total_height = (ruby_space + base_height + pad_y * 2.0 + line_spacing_extra)
+            .ceil()
+            .max(2.0);
         let base_origin_x_token = (layout_width - base_width) * 0.5;
         let base_origin_x_pix = bleed_x + base_origin_x_token;
-        let base_origin_y = ruby_space + pad_y;
+        let base_origin_y = ruby_space + pad_y + half_line_spacing;
 
         let mut clusters = Vec::new();
         if let Some(line) = base_layout.lines().next() {
@@ -1435,7 +1472,7 @@ impl TextEngine {
         );
         let (ruby_svg_clusters, ruby_color_images) = if let Some(ref r_layout) = ruby_layout {
             let r_origin_x_pix = bleed_x + (layout_width - ruby_width) * 0.5;
-            let r_origin_y = (ruby_space - ruby_height).max(0.0) + pad_y * 0.5;
+            let r_origin_y = (ruby_space - ruby_height).max(0.0) + pad_y * 0.5 + half_line_spacing;
             self.collect_svg_clusters_from_layout(
                 r_layout,
                 word.reading.as_str(),
@@ -2044,6 +2081,9 @@ pub fn default_custom_popup_css_template() -> &'static str {
     --definition-columns: 1;
     --definition-columns-min-width: 560px;
     --definition-gap: 8px;
+
+    /* Clamp long definitions to N lines with a "Show more" toggle (0 or none to disable) */
+    /* --collapsible-definition-line-count: 5; */
 }
 
 /* Example: Color headwords by pitch accent category
@@ -2056,10 +2096,11 @@ pub fn default_custom_popup_css_template() -> &'static str {
 }
 */
 
-/* Example: Per-dictionary badge color, subtle card tint & hover-to-reveal JMdict
+/* Example: Per-dictionary badge color, subtle card tint, collapsible lines & hover-to-reveal JMdict
 [data-dictionary="デジタル大辞泉"] {
     --dict-color: rgb(170, 0, 0);
     --dict-bg-opacity: 0.08;
+    --collapsible-definition-line-count: 4;
 }
 [data-dictionary*="JMdict"] {
     --dict-color: rgb(0, 132, 255);
@@ -2067,6 +2108,7 @@ pub fn default_custom_popup_css_template() -> &'static str {
     --glossary-opacity: 0;
     --glossary-hover-opacity: 1;
     --glossary-solo-opacity: 1;
+    --collapsible-definition-line-count: none;
 }
 */
 
@@ -2144,6 +2186,7 @@ pub struct DictStyleRule {
     pub glossary_opacity: Option<f32>,
     pub glossary_hover_opacity: Option<f32>,
     pub glossary_solo_opacity: Option<f32>,
+    pub collapsible_line_count: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2171,6 +2214,41 @@ pub struct ResolvedDictStyle {
     pub glossary_opacity: f32,
     pub glossary_hover_opacity: f32,
     pub glossary_solo_opacity: f32,
+    pub collapsible_line_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterfaceFontFallback {
+    pub family: String,
+    pub size_px: f32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PopupInterfaceFonts {
+    pub expression: Option<InterfaceFontFallback>,
+    pub reading: Option<InterfaceFontFallback>,
+    pub conj: Option<InterfaceFontFallback>,
+    pub tag: Option<InterfaceFontFallback>,
+    pub glossary: Option<InterfaceFontFallback>,
+    pub kanji: Option<InterfaceFontFallback>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PopupCssExplicitOverrides {
+    pub font_family: bool,
+    pub glossary_font_size: bool,
+    pub headword_font_family: bool,
+    pub headword_size: bool,
+    pub reading_font_family: bool,
+    pub reading_size: bool,
+    pub conj_font_family: bool,
+    pub conj_font_size: bool,
+    pub tag_font_family: bool,
+    pub tag_font_size: bool,
+    pub kanji_font_family: bool,
+    pub kanji_font_size: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2194,6 +2272,14 @@ pub struct PopupCssTheme {
     pub reading_color: [u8; 4],
     pub reading_size: f32,
     pub font_family: String,
+    pub headword_font_family: String,
+    pub reading_font_family: String,
+    pub conj_font_family: String,
+    pub conj_font_size: f32,
+    pub tag_font_family: String,
+    pub tag_font_size: f32,
+    pub kanji_font_family: String,
+    pub kanji_font_size: f32,
     pub glossary_font_size: f32,
     pub link_color: [u8; 4],
     pub divider_color: [u8; 4],
@@ -2215,6 +2301,7 @@ pub struct PopupCssTheme {
     pub definition_columns: i32,
     pub definition_columns_min_width: f32,
     pub definition_gap: f32,
+    pub collapsible_definition_line_count: usize,
     pub card_bg: [u8; 4],
     pub card_border: [u8; 4],
     pub card_border_width: f32,
@@ -2260,6 +2347,14 @@ impl Default for PopupCssTheme {
             reading_color: [0x94, 0xA3, 0xB8, 0xFF],
             reading_size: 12.0,
             font_family: "Noto Sans CJK JP".to_owned(),
+            headword_font_family: String::new(),
+            reading_font_family: String::new(),
+            conj_font_family: String::new(),
+            conj_font_size: 11.0,
+            tag_font_family: String::new(),
+            tag_font_size: 11.0,
+            kanji_font_family: String::new(),
+            kanji_font_size: 0.0,
             glossary_font_size: 14.5,
             link_color: [0x93, 0xC5, 0xFD, 0xFF],
             divider_color: [0x30, 0x37, 0x3D, 0xFF],
@@ -2277,6 +2372,7 @@ impl Default for PopupCssTheme {
             definition_columns: 1,
             definition_columns_min_width: 560.0,
             definition_gap: 8.0,
+            collapsible_definition_line_count: 0,
             card_bg: [0, 0, 0, 0],
             card_border: [0, 0, 0, 0],
             card_border_width: 0.0,
@@ -2300,6 +2396,78 @@ impl Default for PopupCssTheme {
 }
 
 impl PopupCssTheme {
+    pub fn with_interface_font_fallbacks(
+        &self,
+        overrides: &PopupCssExplicitOverrides,
+        fonts: &PopupInterfaceFonts,
+    ) -> Self {
+        let mut out = self.clone();
+        if let Some(ref f) = fonts.glossary {
+            if !overrides.font_family {
+                out.font_family = f.family.clone();
+            }
+            if !overrides.glossary_font_size {
+                out.glossary_font_size = f.size_px;
+            }
+        }
+        if let Some(ref f) = fonts.expression {
+            if !overrides.headword_font_family && !overrides.font_family {
+                out.headword_font_family = f.family.clone();
+            }
+            if !overrides.headword_size {
+                out.headword_size = f.size_px;
+            }
+        }
+        if let Some(ref f) = fonts.reading {
+            if !overrides.reading_font_family && !overrides.font_family {
+                out.reading_font_family = f.family.clone();
+            }
+            if !overrides.reading_size {
+                out.reading_size = f.size_px;
+            }
+        }
+        if let Some(ref f) = fonts.conj {
+            if !overrides.conj_font_family && !overrides.font_family {
+                out.conj_font_family = f.family.clone();
+            }
+            if !overrides.conj_font_size {
+                out.conj_font_size = f.size_px;
+            }
+        }
+        if let Some(ref f) = fonts.tag {
+            if !overrides.tag_font_family && !overrides.font_family {
+                out.tag_font_family = f.family.clone();
+            }
+            if !overrides.tag_font_size {
+                out.tag_font_size = f.size_px;
+            }
+        }
+        if let Some(ref f) = fonts.kanji {
+            if !overrides.kanji_font_family && !overrides.font_family {
+                out.kanji_font_family = f.family.clone();
+            }
+            if !overrides.kanji_font_size {
+                out.kanji_font_size = f.size_px;
+            }
+        }
+        if out.headword_font_family.is_empty() {
+            out.headword_font_family = out.font_family.clone();
+        }
+        if out.reading_font_family.is_empty() {
+            out.reading_font_family = out.font_family.clone();
+        }
+        if out.conj_font_family.is_empty() {
+            out.conj_font_family = out.font_family.clone();
+        }
+        if out.tag_font_family.is_empty() {
+            out.tag_font_family = out.font_family.clone();
+        }
+        if out.kanji_font_family.is_empty() {
+            out.kanji_font_family = out.font_family.clone();
+        }
+        out
+    }
+
     pub fn resolve_headword_pitch_color(&self, category: Option<&str>) -> [u8; 4] {
         match category {
             Some("heiban") => self.pitch_heiban_color.unwrap_or(self.headword_color),
@@ -2321,6 +2489,7 @@ impl PopupCssTheme {
         let mut glossary_opacity = 1.0f32;
         let mut glossary_hover_opacity = 1.0f32;
         let mut glossary_solo_opacity = 1.0f32;
+        let mut collapsible_line_count = self.collapsible_definition_line_count;
 
         for rule in &self.dict_rules {
             if !rule.matcher.matches(dict_name) {
@@ -2350,6 +2519,9 @@ impl PopupCssTheme {
             }
             if let Some(o) = rule.glossary_solo_opacity {
                 glossary_solo_opacity = o;
+            }
+            if let Some(lines) = rule.collapsible_line_count {
+                collapsible_line_count = lines;
             }
         }
 
@@ -2390,6 +2562,7 @@ impl PopupCssTheme {
             glossary_opacity,
             glossary_hover_opacity,
             glossary_solo_opacity,
+            collapsible_line_count,
         }
     }
 
@@ -2875,10 +3048,33 @@ fn parse_css_rules_flattened(
     }
 }
 
+fn parse_css_collapsible_lines(value: &str) -> Option<usize> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if matches!(
+        lower.as_str(),
+        "none" | "0" | "false" | "off" | "unset" | "initial"
+    ) {
+        return Some(0);
+    }
+    if let Ok(n) = lower.parse::<usize>() {
+        return Some(n.min(200));
+    }
+    if let Ok(f) = lower.parse::<f32>() {
+        if f.is_finite() && f >= 0.0 {
+            return Some((f.round() as usize).min(200));
+        }
+    }
+    None
+}
+
 fn apply_theme_rules(
     rules: &[(String, Vec<(String, String)>)],
     vars: &HashMap<String, String>,
     theme: &mut PopupCssTheme,
+    overrides: &mut PopupCssExplicitOverrides,
     is_outer: bool,
 ) {
     for (selector_list, decls) in rules {
@@ -2957,6 +3153,14 @@ fn apply_theme_rules(
                         "--headword-size" => {
                             if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
                                 theme.headword_size = px.clamp(12.0, 48.0);
+                                overrides.headword_size = true;
+                            }
+                        }
+                        "--headword-font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.headword_font_family = ff;
+                                overrides.headword_font_family = true;
                             }
                         }
                         "--reading-color" => {
@@ -2967,17 +3171,66 @@ fn apply_theme_rules(
                         "--reading-size" => {
                             if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
                                 theme.reading_size = px.clamp(8.0, 28.0);
+                                overrides.reading_size = true;
+                            }
+                        }
+                        "--reading-font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.reading_font_family = ff;
+                                overrides.reading_font_family = true;
+                            }
+                        }
+                        "--conj-font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.conj_font_family = ff;
+                                overrides.conj_font_family = true;
+                            }
+                        }
+                        "--conj-font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, 11.0) {
+                                theme.conj_font_size = px.clamp(8.0, 24.0);
+                                overrides.conj_font_size = true;
+                            }
+                        }
+                        "--tag-font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.tag_font_family = ff;
+                                overrides.tag_font_family = true;
+                            }
+                        }
+                        "--tag-font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, 11.0) {
+                                theme.tag_font_size = px.clamp(8.0, 22.0);
+                                overrides.tag_font_size = true;
+                            }
+                        }
+                        "--kanji-font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.kanji_font_family = ff;
+                                overrides.kanji_font_family = true;
+                            }
+                        }
+                        "--kanji-font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.headword_size) {
+                                theme.kanji_font_size = px.clamp(16.0, 96.0);
+                                overrides.kanji_font_size = true;
                             }
                         }
                         "--font-family" => {
                             let ff = clean_css_font_family(&val);
                             if !ff.is_empty() {
                                 theme.font_family = ff;
+                                overrides.font_family = true;
                             }
                         }
                         "--glossary-font-size" => {
                             if let Some(px) = parse_css_length_px(&val, 14.5) {
                                 theme.glossary_font_size = px.clamp(9.0, 32.0);
+                                overrides.glossary_font_size = true;
                             }
                         }
                         "--link-color" => {
@@ -3059,6 +3312,11 @@ fn apply_theme_rules(
                         "--definition-gap" => {
                             if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
                                 theme.definition_gap = px.clamp(0.0, 32.0);
+                            }
+                        }
+                        "--collapsible-definition-line-count" => {
+                            if let Some(lines) = parse_css_collapsible_lines(&val) {
+                                theme.collapsible_definition_line_count = lines;
                             }
                         }
                         "--card-bg" => {
@@ -3189,11 +3447,13 @@ fn apply_theme_rules(
                             let ff = clean_css_font_family(&val);
                             if !ff.is_empty() {
                                 theme.font_family = ff;
+                                overrides.font_family = true;
                             }
                         }
                         "font-size" => {
                             if let Some(px) = parse_css_length_px(&val, 14.5) {
                                 theme.glossary_font_size = px.clamp(9.0, 32.0);
+                                overrides.glossary_font_size = true;
                             }
                         }
                         _ => {}
@@ -3239,6 +3499,7 @@ fn apply_theme_rules(
                         glossary_opacity: None,
                         glossary_hover_opacity: None,
                         glossary_solo_opacity: None,
+                        collapsible_line_count: None,
                     };
                     let mut has_any = false;
                     for (prop, raw_val) in decls {
@@ -3289,6 +3550,12 @@ fn apply_theme_rules(
                             "--glossary-solo-opacity" => {
                                 if let Some(op) = parse_css_unit_float(&val) {
                                     rule.glossary_solo_opacity = Some(op);
+                                    has_any = true;
+                                }
+                            }
+                            "--collapsible-definition-line-count" => {
+                                if let Some(lines) = parse_css_collapsible_lines(&val) {
+                                    rule.collapsible_line_count = Some(lines);
                                     has_any = true;
                                 }
                             }
@@ -3437,13 +3704,30 @@ fn apply_theme_rules(
                 }
                 ".derivations" | ".inflection-rule-chains" => {
                     for (prop, raw_val) in decls {
-                        if prop == "display" {
-                            let v = raw_val.trim().to_ascii_lowercase();
-                            if v == "compact" || v == "tooltip" {
-                                theme.compact_derivations = true;
-                            } else if v == "flex" || v == "block" {
-                                theme.compact_derivations = false;
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "display" => {
+                                let v = val.trim().to_ascii_lowercase();
+                                if v == "compact" || v == "tooltip" {
+                                    theme.compact_derivations = true;
+                                } else if v == "flex" || v == "block" {
+                                    theme.compact_derivations = false;
+                                }
                             }
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.conj_font_family = ff;
+                                    overrides.conj_font_family = true;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, 11.0) {
+                                    theme.conj_font_size = px.clamp(8.0, 24.0);
+                                    overrides.conj_font_size = true;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -3456,9 +3740,38 @@ fn apply_theme_rules(
                                     theme.headword_color = c;
                                 }
                             }
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.headword_font_family = ff;
+                                    overrides.headword_font_family = true;
+                                }
+                            }
                             "font-size" => {
                                 if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
                                     theme.headword_size = px.clamp(12.0, 48.0);
+                                    overrides.headword_size = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".kanji-headword" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.kanji_font_family = ff;
+                                    overrides.kanji_font_family = true;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.headword_size) {
+                                    theme.kanji_font_size = px.clamp(16.0, 96.0);
+                                    overrides.kanji_font_size = true;
                                 }
                             }
                             _ => {}
@@ -3474,9 +3787,17 @@ fn apply_theme_rules(
                                     theme.reading_color = c;
                                 }
                             }
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.reading_font_family = ff;
+                                    overrides.reading_font_family = true;
+                                }
+                            }
                             "font-size" => {
                                 if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
                                     theme.reading_size = px.clamp(8.0, 28.0);
+                                    overrides.reading_size = true;
                                 }
                             }
                             _ => {}
@@ -3495,12 +3816,14 @@ fn apply_theme_rules(
                             "font-size" => {
                                 if let Some(px) = parse_css_length_px(&val, 14.5) {
                                     theme.glossary_font_size = px.clamp(9.0, 32.0);
+                                    overrides.glossary_font_size = true;
                                 }
                             }
                             "font-family" => {
                                 let ff = clean_css_font_family(&val);
                                 if !ff.is_empty() {
                                     theme.font_family = ff;
+                                    overrides.font_family = true;
                                 }
                             }
                             _ => {}
@@ -3593,6 +3916,19 @@ fn apply_theme_rules(
                                     theme.dict_badge_color = c;
                                 }
                             }
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.tag_font_family = ff;
+                                    overrides.tag_font_family = true;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, 11.0) {
+                                    theme.tag_font_size = px.clamp(8.0, 22.0);
+                                    overrides.tag_font_size = true;
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -3660,8 +3996,14 @@ fn collect_root_vars(rules: &[(String, Vec<(String, String)>)], vars: &mut HashM
 fn parse_popup_css_theme_full(
     inner_css: &str,
     outer_css: &str,
-) -> (PopupCssTheme, HashMap<String, String>, Vec<(String, Vec<(String, String)>)>) {
+) -> (
+    PopupCssTheme,
+    PopupCssExplicitOverrides,
+    HashMap<String, String>,
+    Vec<(String, Vec<(String, String)>)>,
+) {
     let mut theme = PopupCssTheme::default();
+    let mut overrides = PopupCssExplicitOverrides::default();
     let mut vars: HashMap<String, String> = HashMap::new();
 
     let inner_stripped = strip_css_comments(inner_css);
@@ -3675,10 +4017,10 @@ fn parse_popup_css_theme_full(
     collect_root_vars(&inner_rules, &mut vars);
     collect_root_vars(&outer_rules, &mut vars);
 
-    apply_theme_rules(&inner_rules, &vars, &mut theme, false);
-    apply_theme_rules(&outer_rules, &vars, &mut theme, true);
+    apply_theme_rules(&inner_rules, &vars, &mut theme, &mut overrides, false);
+    apply_theme_rules(&outer_rules, &vars, &mut theme, &mut overrides, true);
 
-    (theme, vars, inner_rules)
+    (theme, overrides, vars, inner_rules)
 }
 
 pub fn parse_popup_css_theme(css: &str) -> PopupCssTheme {
@@ -3758,6 +4100,49 @@ fn apply_popup_css_theme_to_bridge(app: &MementoApp, theme: &PopupCssTheme) {
     pb.set_css_reading_color(rgba_to_slint_color(theme.reading_color));
     pb.set_css_reading_size(theme.reading_size);
     pb.set_css_font_family(theme.font_family.clone().into());
+    pb.set_css_headword_font_family(
+        if theme.headword_font_family.is_empty() {
+            theme.font_family.as_str()
+        } else {
+            theme.headword_font_family.as_str()
+        }
+        .into(),
+    );
+    pb.set_css_reading_font_family(
+        if theme.reading_font_family.is_empty() {
+            theme.font_family.as_str()
+        } else {
+            theme.reading_font_family.as_str()
+        }
+        .into(),
+    );
+    pb.set_css_conj_font_family(
+        if theme.conj_font_family.is_empty() {
+            theme.font_family.as_str()
+        } else {
+            theme.conj_font_family.as_str()
+        }
+        .into(),
+    );
+    pb.set_css_conj_font_size(theme.conj_font_size);
+    pb.set_css_tag_font_family(
+        if theme.tag_font_family.is_empty() {
+            theme.font_family.as_str()
+        } else {
+            theme.tag_font_family.as_str()
+        }
+        .into(),
+    );
+    pb.set_css_tag_font_size(theme.tag_font_size);
+    pb.set_css_kanji_font_family(
+        if theme.kanji_font_family.is_empty() {
+            theme.font_family.as_str()
+        } else {
+            theme.kanji_font_family.as_str()
+        }
+        .into(),
+    );
+    pb.set_css_kanji_font_size(theme.kanji_font_size);
     pb.set_css_glossary_font_size(theme.glossary_font_size);
     pb.set_css_link_color(rgba_to_slint_color(theme.link_color));
     pb.set_css_divider_color(rgba_to_slint_color(theme.divider_color));
@@ -3791,6 +4176,7 @@ struct StylesheetCache {
     user_outer_css_raw: String,
     user_css_glossary_preprocessed: String,
     user_css_theme: PopupCssTheme,
+    user_css_overrides: PopupCssExplicitOverrides,
     user_css_revision: u64,
     user_only_sheet: Option<Arc<ParsedStylesheet>>,
     entries: HashMap<PathBuf, (Option<SystemTime>, u64, Arc<ParsedStylesheet>)>,
@@ -3809,6 +4195,10 @@ impl StylesheetCache {
 
     fn theme(&self) -> &PopupCssTheme {
         &self.user_css_theme
+    }
+
+    fn overrides(&self) -> &PopupCssExplicitOverrides {
+        &self.user_css_overrides
     }
 
     fn read_file_sig(path: &Path) -> Option<(Option<SystemTime>, u64)> {
@@ -3868,13 +4258,15 @@ impl StylesheetCache {
         self.user_outer_css_raw = outer_raw;
         if self.user_css_raw.trim().is_empty() && self.user_outer_css_raw.trim().is_empty() {
             self.user_css_theme = PopupCssTheme::default();
+            self.user_css_overrides = PopupCssExplicitOverrides::default();
             self.user_css_glossary_preprocessed.clear();
             self.user_only_sheet = None;
         } else {
-            let (theme, vars, inner_rules) =
+            let (theme, overrides, vars, inner_rules) =
                 parse_popup_css_theme_full(&self.user_css_raw, &self.user_outer_css_raw);
             let preprocessed = preprocess_user_glossary_css(&inner_rules, &vars);
             self.user_css_theme = theme;
+            self.user_css_overrides = overrides;
             self.user_only_sheet = (!preprocessed.trim().is_empty())
                 .then(|| parse_dictionary_css_str(&preprocessed));
             self.user_css_glossary_preprocessed = preprocessed;
@@ -4151,7 +4543,214 @@ pub struct RenderedGlossaryDoc {
     pub image: slint::Image,
     pub hit_zones: Vec<GlossaryHitZone>,
     pub selectable_chars: Vec<GlossaryCharCell>,
+    pub line_bottoms: Vec<f32>,
     pub plain_text: String,
+}
+
+pub const MAX_NESTED_POPUP_DEPTH: usize = 4;
+const GLOSSARY_SCAN_MAX_CHARS: usize = 24;
+const NESTED_DISMISS_GRACE_MS: u64 = 260;
+
+fn is_japanese_scan_start_char(ch: char) -> bool {
+    is_japanese_lookup_char(ch) && ch != '\u{30fb}' && ch != '\u{30fc}'
+}
+
+fn is_japanese_scan_continue_char(ch: char) -> bool {
+    is_japanese_lookup_char(ch) && ch != '\u{30fb}'
+}
+
+/// Strict bounding-box hit-test over `RenderedGlossaryDoc::selectable_chars` for
+/// hover-scanning inside glossary definitions (returns `None` on blank margins/empty space).
+pub fn strict_char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> Option<usize> {
+    if doc.selectable_chars.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, f32)> = None;
+    for (idx, cell) in doc.selectable_chars.iter().enumerate() {
+        if cell.ch == '\n' || cell.w <= 0.0 || cell.h <= 0.0 {
+            continue;
+        }
+        let pad_x = 1.5f32;
+        let pad_y = 1.5f32;
+        if x < cell.x - pad_x
+            || x > cell.x + cell.w + pad_x
+            || y < cell.y - pad_y
+            || y > cell.y + cell.h + pad_y
+        {
+            continue;
+        }
+        let cx = cell.x + cell.w * 0.5;
+        let cy = cell.y + cell.h * 0.5;
+        let dist = (x - cx).hypot(y - cy);
+        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
+            best = Some((idx, dist));
+        }
+    }
+    best.map(|(idx, _)| idx)
+}
+
+/// Extract a contiguous Japanese scan substring (up to `max_chars`) starting at `start_idx`
+/// in `selectable_chars`, seamlessly bridging soft line wraps inside the same paragraph while
+/// stopping at punctuation, whitespace, non-Japanese characters, or block breaks.
+/// Returns `(substring, cell_indices)` where each char maps 1:1 back to its cell index.
+pub fn extract_glossary_scan_substring(
+    chars: &[GlossaryCharCell],
+    start_idx: usize,
+    max_chars: usize,
+) -> Option<(String, Vec<usize>)> {
+    let first = chars.get(start_idx)?;
+    if !is_japanese_scan_start_char(first.ch) {
+        return None;
+    }
+    let limit = max_chars.max(1);
+    let mut query = String::new();
+    let mut indices = Vec::new();
+    let mut prev_cell = first;
+    query.push(first.ch);
+    indices.push(start_idx);
+
+    let mut i = start_idx + 1;
+    while i < chars.len() && indices.len() < limit {
+        let cell = &chars[i];
+        if cell.ch == '\n' {
+            // Bridge a single soft visual wrap within the same paragraph when the next
+            // visible character continues the Japanese run without a paragraph gap.
+            if let Some(next_cell) = chars.get(i + 1) {
+                let vertical_step = next_cell.y - prev_cell.y;
+                if is_japanese_scan_continue_char(next_cell.ch)
+                    && vertical_step >= 0.0
+                    && vertical_step <= prev_cell.h.max(14.0) * 1.65
+                {
+                    i += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if !is_japanese_scan_continue_char(cell.ch) {
+            break;
+        }
+        query.push(cell.ch);
+        indices.push(i);
+        prev_cell = cell;
+        i += 1;
+    }
+
+    (!query.is_empty()).then_some((query, indices))
+}
+
+fn utf16_units_to_char_count(text: &str, utf16_units: usize) -> usize {
+    if utf16_units == 0 {
+        return 0;
+    }
+    let mut acc = 0usize;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        acc += ch.len_utf16();
+        count += 1;
+        if acc >= utf16_units {
+            break;
+        }
+    }
+    count
+}
+
+fn build_selection_rects_for_cells(
+    chars: &[GlossaryCharCell],
+    indices: &[usize],
+) -> Vec<RichSelectionRect> {
+    let mut rects = Vec::new();
+    let mut cur: Option<(usize, f32, f32, f32, f32)> = None;
+    for &idx in indices {
+        let Some(cell) = chars.get(idx) else {
+            continue;
+        };
+        if cell.ch == '\n' || cell.w <= 0.0 {
+            continue;
+        }
+        match cur {
+            Some((lid, sx, sy, sw, sh)) if lid == cell.line_id => {
+                let nx = sx.min(cell.x);
+                let nw = (sx + sw).max(cell.x + cell.w) - nx;
+                cur = Some((lid, nx, sy.min(cell.y), nw, sh.max(cell.h)));
+            }
+            Some((_, sx, sy, sw, sh)) => {
+                rects.push(RichSelectionRect {
+                    x_px: sx,
+                    y_px: sy,
+                    w_px: sw,
+                    h_px: sh,
+                });
+                cur = Some((cell.line_id, cell.x, cell.y, cell.w, cell.h));
+            }
+            None => {
+                cur = Some((cell.line_id, cell.x, cell.y, cell.w, cell.h));
+            }
+        }
+    }
+    if let Some((_, sx, sy, sw, sh)) = cur {
+        rects.push(RichSelectionRect {
+            x_px: sx,
+            y_px: sy,
+            w_px: sw,
+            h_px: sh,
+        });
+    }
+    rects
+}
+
+fn compute_visual_line_bottoms(bounds: &[(f32, f32)]) -> Vec<f32> {
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<(f32, f32)> = bounds
+        .iter()
+        .copied()
+        .filter(|&(top, bottom)| top.is_finite() && bottom.is_finite() && bottom > top)
+        .collect();
+    sorted.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut merged: Vec<(f32, f32)> = Vec::new();
+    for (top, bottom) in sorted {
+        if let Some(last) = merged.last_mut() {
+            // Merge horizontally adjacent table cells sharing the same visual row band.
+            if (top - last.0).abs() <= 6.0 && top < last.1 - 3.0 {
+                last.1 = last.1.max(bottom);
+                continue;
+            }
+        }
+        merged.push((top, bottom));
+    }
+    merged.into_iter().map(|(_, bottom)| bottom).collect()
+}
+
+/// Compute `(collapsible, collapsed_height_px, total_lines)` for a rendered glossary card
+/// against its resolved `--collapsible-definition-line-count` limit (`0` = disabled).
+pub fn compute_collapsible_metrics(
+    doc: &RenderedGlossaryDoc,
+    line_limit: usize,
+) -> (bool, f32, i32) {
+    let total_lines = doc.line_bottoms.len() as i32;
+    if !doc.height_px.is_finite() || doc.height_px <= 0.0 {
+        return (false, 0.0, total_lines);
+    }
+    if line_limit == 0 || doc.line_bottoms.len() <= line_limit {
+        return (false, doc.height_px, total_lines);
+    }
+    let raw_bottom = doc.line_bottoms[line_limit - 1];
+    if !raw_bottom.is_finite() {
+        return (false, doc.height_px, total_lines);
+    }
+    let min_h = 18.0f32.min(doc.height_px);
+    let clamped_h = (raw_bottom + 4.0).ceil().clamp(min_h, doc.height_px);
+    if clamped_h + 4.0 >= doc.height_px {
+        (false, doc.height_px, total_lines)
+    } else {
+        (true, clamped_h, total_lines)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5193,6 +5792,7 @@ struct PaintCollector {
     mask_glyphs: Vec<PositionedMaskGlyph>,
     hit_zones: Vec<GlossaryHitZone>,
     selectable_chars: Vec<GlossaryCharCell>,
+    line_bounds: Vec<(f32, f32)>,
     next_line_id: usize,
 }
 
@@ -5657,6 +6257,7 @@ fn layout_inline_atoms(
         collector.next_line_id += 1;
         let line_top = origin_y + line.metrics().min_coord;
         let line_h = line.metrics().line_height.max(14.0);
+        collector.line_bounds.push((line_top, line_top + line_h));
         let baseline = origin_y + line.metrics().baseline;
         let mut prev_run_key: Option<(usize, usize, u64, u32)> = None;
         let mut run_glyph_cursor: usize = 0;
@@ -6386,6 +6987,7 @@ fn render_structured_glossary_entry_with_theme(
                 image: pixmap_to_slint_image(&empty_pm),
                 hit_zones: Vec::new(),
                 selectable_chars: Vec::new(),
+                line_bottoms: Vec::new(),
                 plain_text: String::new(),
             });
         }
@@ -6445,6 +7047,7 @@ fn render_structured_glossary_entry_with_theme(
             collector.selectable_chars.pop();
         }
         let plain_text: String = collector.selectable_chars.iter().map(|c| c.ch).collect();
+        let line_bottoms = compute_visual_line_bottoms(&collector.line_bounds);
 
         Some(RenderedGlossaryDoc {
             width_px: pw as f32,
@@ -6452,6 +7055,7 @@ fn render_structured_glossary_entry_with_theme(
             image: pixmap_to_slint_image(&pixmap),
             hit_zones: collector.hit_zones,
             selectable_chars: collector.selectable_chars,
+            line_bottoms,
             plain_text,
         })
     })
@@ -6774,8 +7378,88 @@ struct HoveredSubtitleCluster {
     sub_query: String,
 }
 
+#[derive(Clone, Debug)]
+struct GlossaryScanHighlight {
+    row_index: i32,
+    cell_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct HoveredGlossaryTarget {
+    depth: i32,
+    row_index: i32,
+    start_char: usize,
+    query: String,
+    cell_indices: Vec<usize>,
+    anchor_x: f32,
+    anchor_y: f32,
+}
+
+#[derive(Default)]
+struct NestedPopupLevel {
+    label: String,
+    rows: Vec<DictResult>,
+    headword: String,
+    reading: String,
+    anchor_x: f32,
+    anchor_y: f32,
+    locked: bool,
+    source_row_index: i32,
+    source_start_char: usize,
+    rich_epoch: u64,
+    row_extras: HashMap<i32, RichRowExtras>,
+    glossary_cache: HashMap<GlossaryDocCacheKey, RenderedGlossaryDoc>,
+    last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
+    selection: Option<GlossarySelectionState>,
+    scan_highlight: Option<GlossaryScanHighlight>,
+    expanded_cards: HashSet<i32>,
+    row_anki_duplicates: Vec<bool>,
+    row_anki_note_ids_i64: Vec<i64>,
+    row_anki_browse_queries: Vec<SharedString>,
+    row_anki_tags: Vec<SharedString>,
+}
+
+fn encode_note_id_i32(nid: i64) -> i32 {
+    if nid <= 0 {
+        0
+    } else if nid <= i64::from(i32::MAX) {
+        nid as i32
+    } else {
+        i32::MAX
+    }
+}
+
+fn parse_interface_font_setting(
+    config: &ConfigController,
+    stock_config: &ConfigController,
+    key: &str,
+    min_px: f32,
+    max_px: f32,
+) -> Option<InterfaceFontFallback> {
+    let raw_val = config.get_setting(raw::interface::GROUP, key)?;
+    let memento_config::Value::Text(ref raw_csv) = raw_val else {
+        return None;
+    };
+    // `ConfigController::get_setting` synthesizes legacy Qt defaults (e.g., 10pt glossary,
+    // 108pt Kanji Stroke Orders) when unset. Only override Memento's built-in Slint theme
+    // defaults when the user actually customized the setting away from the stock Qt default.
+    let stock_default = stock_config.effective_setting(raw::interface::GROUP, key);
+    if stock_default.as_ref() == Some(&raw_val) {
+        return None;
+    }
+    let spec = memento_config::QtFontSpec::parse(raw_csv).ok()?;
+    let size_px = ((spec.point_size as f32) * (96.0 / 72.0)).clamp(min_px, max_px);
+    Some(InterfaceFontFallback {
+        family: spec.family,
+        size_px,
+        bold: spec.bold,
+        italic: spec.italic,
+    })
+}
+
 struct CachedConfigSettings {
     subtitle_style: SubtitleRenderStyle,
+    popup_fonts: PopupInterfaceFonts,
     search_method: i32,
     search_modifier: i32,
     search_delay_ms: u64,
@@ -6796,6 +7480,7 @@ impl CachedConfigSettings {
     fn from_controller(config: &ConfigController, config_dir: &Path) -> Self {
         let mut out = Self {
             subtitle_style: SubtitleRenderStyle::default(),
+            popup_fonts: PopupInterfaceFonts::default(),
             search_method: raw::search::METHOD_DEFAULT as i32,
             search_modifier: raw::search::MODIFIER_DEFAULT as i32,
             search_delay_ms: raw::search::DELAY_DEFAULT as u64,
@@ -6878,6 +7563,64 @@ impl CachedConfigSettings {
                 self.subtitle_style.furigana_ratio = n.clamp(0.2, 0.8);
             }
         }
+        if let Some(v) = config.effective_setting(
+            raw::interface::GROUP,
+            raw::interface::subtitle::LINE_SPACING,
+        ) {
+            let num = match v {
+                Value::Real(f) => Some(f as f32),
+                Value::Int(i) => Some(i as f32),
+                _ => None,
+            };
+            if let Some(n) = num {
+                self.subtitle_style.line_spacing = n.clamp(0.0, 120.0);
+            }
+        }
+        let stock_config = ConfigController::new();
+        self.popup_fonts = PopupInterfaceFonts {
+            expression: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_EXPRESSION_FONT,
+                12.0,
+                48.0,
+            ),
+            reading: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_READING_FONT,
+                8.0,
+                28.0,
+            ),
+            conj: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_CONJ_FONT,
+                8.0,
+                24.0,
+            ),
+            tag: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_TAG_FONT,
+                8.0,
+                22.0,
+            ),
+            glossary: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_GLOSSARY_FONT,
+                9.0,
+                32.0,
+            ),
+            kanji: parse_interface_font_setting(
+                config,
+                &stock_config,
+                raw::interface::SEARCH_KANJI_FONT,
+                16.0,
+                96.0,
+            ),
+        };
         if let Some(Value::Int(m)) =
             config.effective_setting(raw::search::GROUP, raw::search::METHOD)
         {
@@ -6972,16 +7715,201 @@ struct RichUiMutable {
     glossary_cache: HashMap<GlossaryDocCacheKey, RenderedGlossaryDoc>,
     last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
     selection: Option<GlossarySelectionState>,
+    root_scan_highlight: Option<GlossaryScanHighlight>,
+    root_expanded_cards: HashSet<i32>,
+    root_row_anki_note_ids_i64: Vec<i64>,
 
     suppress_history_reset: bool,
     back_stack: Vec<PopupHistoryEntry>,
     forward_stack: Vec<PopupHistoryEntry>,
+
+    nested_stack: Vec<NestedPopupLevel>,
+    hovered_glossary_target: Option<HoveredGlossaryTarget>,
+    nested_card_hovered: bool,
+    nested_body_hovered: bool,
+    nested_scan_timer: slint::Timer,
+    nested_dismiss_timer: slint::Timer,
+    pending_nested_anki_add: Option<(usize, String, String, bool)>,
 
     hovered_cluster: Option<HoveredSubtitleCluster>,
     active_scan_utf16_range: Option<(usize, usize)>,
     pending_scan_utf16_start: Option<usize>,
     pending_scan_sub_query: Option<String>,
     scan_timer: slint::Timer,
+}
+
+impl RichUiMutable {
+    fn effective_popup_theme(&self) -> PopupCssTheme {
+        self.stylesheets.theme().with_interface_font_fallbacks(
+            self.stylesheets.overrides(),
+            &self.settings.popup_fonts,
+        )
+    }
+
+    fn nested_level(&self, depth: i32) -> Option<&NestedPopupLevel> {
+        if depth <= 0 {
+            return None;
+        }
+        self.nested_stack.get((depth - 1) as usize)
+    }
+
+    fn nested_level_mut(&mut self, depth: i32) -> Option<&mut NestedPopupLevel> {
+        if depth <= 0 {
+            return None;
+        }
+        self.nested_stack.get_mut((depth - 1) as usize)
+    }
+
+    fn clear_all_glossary_caches(&mut self) {
+        self.rich_epoch = self.rich_epoch.wrapping_add(1);
+        self.glossary_cache.clear();
+        self.last_rendered_key.clear();
+        for lvl in &mut self.nested_stack {
+            lvl.rich_epoch = lvl.rich_epoch.wrapping_add(1);
+            lvl.glossary_cache.clear();
+            lvl.last_rendered_key.clear();
+        }
+    }
+}
+
+fn build_row_extras_for_grouped(
+    db_helper: &mut RichDbHelper,
+    dict_ctrl: &mut DictController,
+    rows: &mut [DictResult],
+    grouped_hits: &[SearchHit],
+    precomputed_pitch_details: Option<&HashMap<(String, String), Vec<TermPitchDetail>>>,
+) -> HashMap<i32, RichRowExtras> {
+    let mut extras_map = HashMap::new();
+    let mut group_start = 0usize;
+    while group_start < rows.len() && group_start < grouped_hits.len() {
+        let mut group_end = group_start + 1;
+        while group_end < rows.len() && group_end < grouped_hits.len() && !rows[group_end].term_start {
+            group_end += 1;
+        }
+        let first_hit = &grouped_hits[group_start];
+        let mut raw_term_tags = Vec::new();
+        for hit in &grouped_hits[group_start..group_end] {
+            raw_term_tags.extend(db_helper.resolve_tag_list(hit.dictionary_id, &hit.term_tags));
+        }
+        let pitch_details = if !first_hit.is_kanji {
+            if let Some(pre) = precomputed_pitch_details {
+                pre.get(&(first_hit.expression.clone(), first_hit.reading.clone()))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                dict_ctrl.get_pitch_details(&first_hit.expression, &first_hit.reading)
+            }
+        } else {
+            Vec::new()
+        };
+        let rich_pitches = rich_pitch_graphs_from_details(&pitch_details);
+        let mut group_pos_tags = String::new();
+        for hit in &grouped_hits[group_start..group_end] {
+            if !hit.def_tags.is_empty() {
+                group_pos_tags.push(' ');
+                group_pos_tags.push_str(&hit.def_tags);
+            }
+            if !hit.term_tags.is_empty() {
+                group_pos_tags.push(' ');
+                group_pos_tags.push_str(&hit.term_tags);
+            }
+        }
+        let group_pitch_category = classify_pitch_category(&rich_pitches, &group_pos_tags);
+        let kanji_freqs: Vec<TermFrequency> = if first_hit.is_kanji {
+            dict_ctrl.get_kanji_frequencies(&first_hit.expression)
+        } else {
+            Vec::new()
+        };
+
+        for idx in group_start..group_end {
+            let hit = &grouped_hits[idx];
+            let raw_def_tags = db_helper.resolve_tag_list(hit.dictionary_id, &hit.def_tags);
+            let (dedup_term, dedup_def) =
+                suppress_redundant_tags(&raw_term_tags, &raw_def_tags, &hit.raw_glossary);
+
+            let term_pills = if idx == group_start {
+                dedup_term
+                    .into_iter()
+                    .map(|t| RichTagPill {
+                        bg_color: tag_brush(&t.category),
+                        name: t.name.into(),
+                        category: t.category.into(),
+                        notes: t.notes.into(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let def_pills = dedup_def
+                .into_iter()
+                .map(|t| RichTagPill {
+                    bg_color: tag_brush(&t.category),
+                    name: t.name.into(),
+                    category: t.category.into(),
+                    notes: t.notes.into(),
+                })
+                .collect();
+
+            let derivation_steps = if idx == group_start {
+                let total = hit.derivation_descriptions.len();
+                hit.derivation_descriptions
+                    .iter()
+                    .enumerate()
+                    .map(|(si, (label, desc))| RichDerivationStep {
+                        label: label.clone().into(),
+                        description: desc.clone().into(),
+                        has_arrow: si + 1 < total,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let kanji_detail = if hit.is_kanji {
+                db_helper.build_kanji_detail(&hit.expression, hit.dictionary_id)
+            } else {
+                None
+            };
+
+            extras_map.insert(
+                (idx + 1) as i32,
+                RichRowExtras {
+                    hit: Some(hit.clone()),
+                    term_pills,
+                    def_pills,
+                    derivation_steps,
+                    pitch_graphs: if idx == group_start {
+                        rich_pitches.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    pitch_category: if idx == group_start {
+                        group_pitch_category
+                    } else {
+                        None
+                    },
+                    kanji_detail,
+                    detail_states: collect_default_detail_states(&hit.raw_glossary),
+                },
+            );
+        }
+
+        if first_hit.is_kanji && !kanji_freqs.is_empty() {
+            rows[group_start].frequencies = Rc::new(VecModel::from(
+                kanji_freqs
+                    .into_iter()
+                    .map(|f| PopupFrequency {
+                        dictionary: f.dictionary.into(),
+                        value: f.value.into(),
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+            .into();
+        }
+
+        group_start = group_end;
+    }
+    extras_map
 }
 
 /// Collect initial depth-first `<details>` open states (`"0"`, `"1"`, ...) from a
@@ -7019,6 +7947,7 @@ fn collect_default_detail_states(raw_glossary: &str) -> HashMap<String, bool> {
 struct AnkiPopupCheckRequest {
     nav_epoch: u64,
     lookup_epoch: Option<u64>,
+    target_nested_depth: Option<usize>,
     show_tags: bool,
     term_profile: Option<crate::controller::config::AnkiNoteConfig>,
     kanji_profile: Option<crate::controller::config::AnkiNoteConfig>,
@@ -7029,9 +7958,48 @@ struct AnkiPopupCheckRequest {
 struct AnkiPopupCheckResponse {
     nav_epoch: u64,
     lookup_epoch: Option<u64>,
+    target_nested_depth: Option<usize>,
     show_tags: bool,
     term_statuses: HashMap<(String, String), crate::controller::anki::EntryAnkiStatus>,
     kanji_statuses: HashMap<String, crate::controller::anki::EntryAnkiStatus>,
+}
+
+struct NestedScanRequest {
+    epoch: u64,
+    parent_depth: i32,
+    row_index: i32,
+    start_char: usize,
+    query: String,
+    cell_indices: Vec<usize>,
+    anchor_x: f32,
+    anchor_y: f32,
+    locked: bool,
+    dict_order: Vec<i64>,
+    excluded_glossaries: Vec<String>,
+    mecab_enabled: bool,
+}
+
+struct NestedScanResponse {
+    epoch: u64,
+    parent_depth: i32,
+    row_index: i32,
+    start_char: usize,
+    matched_char_count: usize,
+    cell_indices: Vec<usize>,
+    anchor_x: f32,
+    anchor_y: f32,
+    locked: bool,
+    hits: Vec<SearchHit>,
+    excluded_glossaries: Vec<String>,
+    headword: String,
+    reading: String,
+    term_meta_rows: Vec<(
+        String,
+        String,
+        Vec<crate::controller::dict::TermPitchGraph>,
+        Vec<TermFrequency>,
+    )>,
+    term_pitch_details: HashMap<(String, String), Vec<TermPitchDetail>>,
 }
 
 fn current_external_lookup_epoch(
@@ -7055,7 +8023,12 @@ struct RichUiBridge {
     anki_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<AnkiPopupCheckResponse>>>,
     anki_poll_timer: slint::Timer,
     anki_nav_epoch: Arc<AtomicU64>,
+    nested_anki_nav_epoch: Arc<AtomicU64>,
     external_lookup_epoch: Arc<std::sync::Mutex<Option<Arc<AtomicU64>>>>,
+    nested_tx: mpsc::Sender<NestedScanRequest>,
+    nested_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<NestedScanResponse>>>,
+    nested_poll_timer: slint::Timer,
+    nested_epoch: Arc<AtomicU64>,
 }
 
 impl RichUiBridge {
@@ -7067,18 +8040,18 @@ impl RichUiBridge {
             let config_dir = st.config_dir.clone();
             if st.settings.reload_if_changed_on_disk(&config_dir) {
                 reloaded_config = true;
+                st.clear_all_glossary_caches();
                 let bg = st.settings.subtitle_style.bg_rgba;
                 let sb = app.global::<SubtitleOverlayBridge>();
                 sb.set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
                 sb.set_subtitle_bg_color(slint::Color::from_argb_u8(bg[3], bg[0], bg[1], bg[2]));
                 let rev = sb.get_style_revision();
                 sb.set_style_revision(rev.wrapping_add(1));
+                reloaded_css_theme = Some(st.effective_popup_theme());
             }
             if st.stylesheets.reload_user_css_if_changed() {
-                st.rich_epoch = st.rich_epoch.wrapping_add(1);
-                st.glossary_cache.clear();
-                st.last_rendered_key.clear();
-                reloaded_css_theme = Some(st.stylesheets.theme().clone());
+                st.clear_all_glossary_caches();
+                reloaded_css_theme = Some(st.effective_popup_theme());
             }
             let sig = crate::controller::dict::db_file_fingerprint(&self.db_path);
             if sig != st.db_sig {
@@ -7095,6 +8068,9 @@ impl RichUiBridge {
             apply_popup_css_theme_to_bridge(app, &theme);
             let pb = app.global::<PopupBridge>();
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+            if pb.get_nested_depth() > 0 {
+                pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
+            }
         }
         if reloaded_config {
             let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
@@ -7141,6 +8117,18 @@ impl RichUiBridge {
         st.glossary_cache.clear();
         st.last_rendered_key.clear();
         st.selection = None;
+        st.root_scan_highlight = None;
+        st.root_expanded_cards.clear();
+        st.root_row_anki_note_ids_i64.clear();
+        st.nested_stack.clear();
+        st.hovered_glossary_target = None;
+        st.nested_card_hovered = false;
+        st.nested_body_hovered = false;
+        st.nested_scan_timer.stop();
+        st.nested_dismiss_timer.stop();
+        st.pending_nested_anki_add = None;
+        self.nested_epoch.fetch_add(1, Ordering::AcqRel);
+        self.nested_poll_timer.stop();
 
         if matches_hits {
             st.current_hits = candidate_hits.clone();
@@ -7346,15 +8334,25 @@ impl RichUiBridge {
         }
         pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
+        self.sync_nested_popup_to_bridge(app, true);
 
         let sb = app.global::<SubtitleOverlayBridge>();
         sb.set_highlight_revision(sb.get_highlight_revision().wrapping_add(1));
 
-        self.dispatch_anki_check_for_rows(app, rows);
+        self.dispatch_anki_check_for_rows(app, rows, None);
     }
 
-    fn dispatch_anki_check_for_rows(self: &Rc<Self>, app: &MementoApp, rows: &[DictResult]) {
-        let next_nav = self.anki_nav_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+    fn dispatch_anki_check_for_rows(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        rows: &[DictResult],
+        target_nested_depth: Option<usize>,
+    ) {
+        let next_nav = if target_nested_depth.is_some() {
+            self.nested_anki_nav_epoch.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            self.anki_nav_epoch.fetch_add(1, Ordering::AcqRel) + 1
+        };
         let pb = app.global::<PopupBridge>();
         let (anki_enabled, show_tags, term_profile, kanji_profile) = {
             let st = self.state.borrow();
@@ -7366,14 +8364,25 @@ impl RichUiBridge {
             )
         };
         pb.set_anki_show_tags(show_tags);
-        pb.set_row_anki_duplicates(Rc::new(VecModel::from(Vec::<bool>::new())).into());
-        pb.set_row_anki_browse_queries(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
-        pb.set_row_anki_tags(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
-        pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+        if target_nested_depth.is_none() {
+            self.state.borrow_mut().root_row_anki_note_ids_i64.clear();
+            pb.set_row_anki_duplicates(Rc::new(VecModel::from(Vec::<bool>::new())).into());
+            pb.set_row_anki_note_ids(Rc::new(VecModel::from(Vec::<i32>::new())).into());
+            pb.set_row_anki_note_id_strings(
+                Rc::new(VecModel::from(Vec::<SharedString>::new())).into(),
+            );
+            pb.set_row_anki_browse_queries(
+                Rc::new(VecModel::from(Vec::<SharedString>::new())).into(),
+            );
+            pb.set_row_anki_tags(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
+            pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+        }
 
         if rows.is_empty() || !anki_enabled {
-            self.anki_poll_timer.stop();
-            pb.set_anki_checking(false);
+            if target_nested_depth.is_none() {
+                self.anki_poll_timer.stop();
+                pb.set_anki_checking(false);
+            }
             return;
         }
 
@@ -7411,8 +8420,10 @@ impl RichUiBridge {
                     && !p.field_templates.is_empty()
             });
         if !has_valid_term && !has_valid_kanji {
-            self.anki_poll_timer.stop();
-            pb.set_anki_checking(false);
+            if target_nested_depth.is_none() {
+                self.anki_poll_timer.stop();
+                pb.set_anki_checking(false);
+            }
             return;
         }
 
@@ -7421,6 +8432,7 @@ impl RichUiBridge {
         let _ = self.anki_tx.send(AnkiPopupCheckRequest {
             nav_epoch: next_nav,
             lookup_epoch,
+            target_nested_depth,
             show_tags,
             term_profile: has_valid_term.then_some(term_profile).flatten(),
             kanji_profile: has_valid_kanji.then_some(kanji_profile).flatten(),
@@ -7444,6 +8456,7 @@ impl RichUiBridge {
                     &app,
                     &br.anki_res_rx,
                     &br.anki_nav_epoch,
+                    &br.nested_anki_nav_epoch,
                     &br.external_lookup_epoch,
                 );
                 if !app.global::<PopupBridge>().get_anki_checking() {
@@ -7499,7 +8512,9 @@ impl RichUiBridge {
 
         app.set_anki_added_note_id("".into());
         app.set_anki_added_result_index(-1);
+        SUPPRESS_FIRST_TERM_READY.with(|flag| flag.set(true));
         set_dictionary_rows(app, entry.rows);
+        SUPPRESS_FIRST_TERM_READY.with(|flag| flag.set(false));
         let full = app.get_dict_results();
         let loaded = entry.loaded_count.max(1) as usize;
         app.set_popup_loaded_count(loaded.min(full.row_count()) as i32);
@@ -7687,15 +8702,29 @@ impl RichUiBridge {
         self.state.borrow_mut().suppress_history_reset = false;
     }
 
-    fn render_or_get_glossary(&self, row_index: i32, width_px: f32, selected: bool) -> Option<RenderedGlossaryDoc> {
+    fn render_or_get_glossary_at_depth(
+        &self,
+        depth: i32,
+        row_index: i32,
+        width_px: f32,
+        selected: bool,
+    ) -> Option<RenderedGlossaryDoc> {
         let bucket_w = ((width_px.max(120.0) / 4.0).round() as i32 * 4).max(120);
         let mut st = self.state.borrow_mut();
-        let extras = st.row_extras.get(&row_index)?.clone();
-        let hit = extras.hit.as_ref()?;
+        let (hit, detail_states, epoch) = if depth == 0 {
+            let extras = st.row_extras.get(&row_index)?;
+            let hit = extras.hit.as_ref()?.clone();
+            (hit, extras.detail_states.clone(), st.rich_epoch)
+        } else {
+            let lvl = st.nested_level(depth)?;
+            let extras = lvl.row_extras.get(&row_index)?;
+            let hit = extras.hit.as_ref()?.clone();
+            (hit, extras.detail_states.clone(), lvl.rich_epoch)
+        };
         if hit.is_kanji {
             return None;
         }
-        let mut pairs: Vec<_> = extras.detail_states.iter().collect();
+        let mut pairs: Vec<_> = detail_states.iter().collect();
         pairs.sort_by_key(|(k, _)| *k);
         let details_sig: String = pairs
             .into_iter()
@@ -7706,27 +8735,38 @@ impl RichUiBridge {
             width_px: bucket_w,
             selected,
             details_sig,
-            rich_epoch: st.rich_epoch,
+            rich_epoch: epoch,
         };
-        if let Some(doc) = st.glossary_cache.get(&cache_key).cloned() {
-            st.last_rendered_key.insert(row_index, cache_key);
-            return Some(doc);
-        }
-        if st.glossary_cache.len() > 256 {
-            st.glossary_cache.clear();
-            st.last_rendered_key.clear();
+        if depth == 0 {
+            if let Some(doc) = st.glossary_cache.get(&cache_key).cloned() {
+                st.last_rendered_key.insert(row_index, cache_key);
+                return Some(doc);
+            }
+            if st.glossary_cache.len() > 256 {
+                st.glossary_cache.clear();
+                st.last_rendered_key.clear();
+            }
+        } else if let Some(lvl) = st.nested_level_mut(depth) {
+            if let Some(doc) = lvl.glossary_cache.get(&cache_key).cloned() {
+                lvl.last_rendered_key.insert(row_index, cache_key);
+                return Some(doc);
+            }
+            if lvl.glossary_cache.len() > 128 {
+                lvl.glossary_cache.clear();
+                lvl.last_rendered_key.clear();
+            }
         }
         let res_dirs = st.dict_resource_dirs.clone();
+        let theme = st.effective_popup_theme();
+        let legacy_style = st.settings.glossary_style;
         let sheet = st
             .stylesheets
             .get_for_dictionary(&res_dirs, hit.dictionary_id, &hit.dict_name);
-        let theme = st.stylesheets.theme().clone();
-        let legacy_style = st.settings.glossary_style;
         let doc = render_structured_glossary_entry_with_theme(
             &hit.raw_glossary,
             &hit.glossary,
             sheet,
-            &extras.detail_states,
+            &detail_states,
             legacy_style,
             &res_dirs,
             hit.dictionary_id,
@@ -7735,25 +8775,127 @@ impl RichUiBridge {
             selected,
             &theme,
         )?;
-        st.last_rendered_key.insert(row_index, cache_key.clone());
-        st.glossary_cache.insert(cache_key, doc.clone());
+        if depth == 0 {
+            st.last_rendered_key.insert(row_index, cache_key.clone());
+            st.glossary_cache.insert(cache_key, doc.clone());
+        } else if let Some(lvl) = st.nested_level_mut(depth) {
+            lvl.last_rendered_key.insert(row_index, cache_key.clone());
+            lvl.glossary_cache.insert(cache_key, doc.clone());
+        }
         Some(doc)
     }
 
-    fn latest_cached_doc(&self, row_index: i32) -> Option<RenderedGlossaryDoc> {
+    fn latest_cached_doc_at_depth(&self, depth: i32, row_index: i32) -> Option<RenderedGlossaryDoc> {
         let st = self.state.borrow();
-        let epoch = st.rich_epoch;
-        if let Some(key) = st.last_rendered_key.get(&row_index) {
+        let (epoch, last_key, cache) = if depth == 0 {
+            (st.rich_epoch, &st.last_rendered_key, &st.glossary_cache)
+        } else {
+            let lvl = st.nested_level(depth)?;
+            (lvl.rich_epoch, &lvl.last_rendered_key, &lvl.glossary_cache)
+        };
+        if let Some(key) = last_key.get(&row_index) {
             if key.rich_epoch == epoch {
-                if let Some(doc) = st.glossary_cache.get(key) {
+                if let Some(doc) = cache.get(key) {
                     return Some(doc.clone());
                 }
             }
         }
-        st.glossary_cache
+        cache
             .iter()
             .find(|(k, _)| k.row_index == row_index && k.rich_epoch == epoch)
             .map(|(_, doc)| doc.clone())
+    }
+
+    fn build_rich_glossary_render(
+        &self,
+        depth: i32,
+        row_index: i32,
+        avail_w: f32,
+        selected: bool,
+    ) -> RichGlossaryRender {
+        let Some(doc) = self.render_or_get_glossary_at_depth(depth, row_index, avail_w, selected)
+        else {
+            return RichGlossaryRender::default();
+        };
+        let (sel_rects, scan_rects, collapsible, collapsed_h, total_lines, expanded) = {
+            let st = self.state.borrow();
+            let (sel_opt, scan_opt, expanded, dict_name) = if depth == 0 {
+                let dname = st
+                    .row_extras
+                    .get(&row_index)
+                    .and_then(|e| e.hit.as_ref())
+                    .map(|h| h.dict_name.as_str())
+                    .unwrap_or("");
+                (
+                    st.selection.as_ref(),
+                    st.root_scan_highlight.as_ref(),
+                    st.root_expanded_cards.contains(&row_index),
+                    dname,
+                )
+            } else if let Some(lvl) = st.nested_level(depth) {
+                let dname = lvl
+                    .row_extras
+                    .get(&row_index)
+                    .and_then(|e| e.hit.as_ref())
+                    .map(|h| h.dict_name.as_str())
+                    .unwrap_or("");
+                (
+                    lvl.selection.as_ref(),
+                    lvl.scan_highlight.as_ref(),
+                    lvl.expanded_cards.contains(&row_index),
+                    dname,
+                )
+            } else {
+                (None, None, false, "")
+            };
+            let sel_rects = if let Some(sel) = sel_opt {
+                if sel.row_index == row_index && sel.anchor_char != sel.focus_char {
+                    let lo = sel.anchor_char.min(sel.focus_char).min(doc.selectable_chars.len());
+                    let hi = sel.anchor_char.max(sel.focus_char).min(doc.selectable_chars.len());
+                    let indices: Vec<usize> = (lo..hi).collect();
+                    build_selection_rects_for_cells(&doc.selectable_chars, &indices)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let scan_rects = if let Some(hl) = scan_opt {
+                if hl.row_index == row_index && !hl.cell_indices.is_empty() {
+                    build_selection_rects_for_cells(&doc.selectable_chars, &hl.cell_indices)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let line_limit = st
+                .effective_popup_theme()
+                .resolve_dict_style(dict_name)
+                .collapsible_line_count;
+            let (collapsible, collapsed_h, total_lines) =
+                compute_collapsible_metrics(&doc, line_limit);
+            (
+                sel_rects,
+                scan_rects,
+                collapsible,
+                collapsed_h,
+                total_lines,
+                expanded,
+            )
+        };
+        RichGlossaryRender {
+            has_rich: true,
+            width_px: doc.width_px,
+            height_px: doc.height_px,
+            rendered: doc.image,
+            selection_rects: Rc::new(VecModel::from(sel_rects)).into(),
+            scan_highlight_rects: Rc::new(VecModel::from(scan_rects)).into(),
+            collapsible,
+            collapsed_height: collapsed_h,
+            total_lines,
+            expanded,
+        }
     }
 
     fn char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> Option<usize> {
@@ -7787,11 +8929,18 @@ impl RichUiBridge {
         best.map(|(idx, _)| idx)
     }
 
-    fn update_glossary_selection_text(&self, app: &MementoApp) {
-        let sel_opt = self.state.borrow().selection.clone();
+    fn update_glossary_selection_text_at_depth(&self, app: &MementoApp, depth: i32) {
+        let sel_opt = {
+            let st = self.state.borrow();
+            if depth == 0 {
+                st.selection.clone()
+            } else {
+                st.nested_level(depth).and_then(|lvl| lvl.selection.clone())
+            }
+        };
         let text = match sel_opt {
             Some(sel) if sel.anchor_char != sel.focus_char => {
-                if let Some(doc) = self.latest_cached_doc(sel.row_index) {
+                if let Some(doc) = self.latest_cached_doc_at_depth(depth, sel.row_index) {
                     let lo = sel.anchor_char.min(sel.focus_char).min(doc.selectable_chars.len());
                     let hi = sel.anchor_char.max(sel.focus_char).min(doc.selectable_chars.len());
                     doc.selectable_chars[lo..hi]
@@ -7814,7 +8963,47 @@ impl RichUiBridge {
         pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
     }
 
-    fn handle_internal_link_str(&self, app: &MementoApp, link: &str) -> bool {
+    fn toggle_glossary_details_at_depth(
+        &self,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        detail_id: &str,
+    ) {
+        {
+            let mut st = self.state.borrow_mut();
+            if depth == 0 {
+                if let Some(extras) = st.row_extras.get_mut(&row_idx) {
+                    let current = extras.detail_states.get(detail_id).copied().unwrap_or(false);
+                    extras.detail_states.insert(detail_id.to_owned(), !current);
+                }
+                st.glossary_cache.retain(|k, _| k.row_index != row_idx);
+                st.last_rendered_key.remove(&row_idx);
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                if let Some(extras) = lvl.row_extras.get_mut(&row_idx) {
+                    let current = extras.detail_states.get(detail_id).copied().unwrap_or(false);
+                    extras.detail_states.insert(detail_id.to_owned(), !current);
+                }
+                lvl.glossary_cache.retain(|k, _| k.row_index != row_idx);
+                lvl.last_rendered_key.remove(&row_idx);
+            }
+        }
+        let pb = app.global::<PopupBridge>();
+        pb.set_tooltip_visible(false);
+        if depth == 0 {
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        } else {
+            pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
+        }
+    }
+
+    fn handle_internal_link_str_at_depth(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        link: &str,
+    ) -> bool {
         if let Some(rest) = link.strip_prefix("memento://glossary-details?") {
             let mut id = String::new();
             for (k, v) in url::form_urlencoded::parse(rest.as_bytes()) {
@@ -7823,8 +9012,7 @@ impl RichUiBridge {
                 }
             }
             if !id.is_empty() {
-                app.global::<PopupBridge>()
-                    .invoke_toggle_glossary_details(1, id.into());
+                self.toggle_glossary_details_at_depth(app, depth, row_idx, &id);
             }
             return true;
         }
@@ -7836,7 +9024,7 @@ impl RichUiBridge {
                 }
             }
             if !target.is_empty() {
-                return self.handle_internal_link_str(app, &target);
+                return self.handle_internal_link_str_at_depth(app, depth, row_idx, &target);
             }
             return true;
         }
@@ -7846,12 +9034,1064 @@ impl RichUiBridge {
             {
                 let q_owned = q.into_owned();
                 if !q_owned.is_empty() {
-                    self.navigate_to_term_query(app, &q_owned, None);
+                    if depth == 0 {
+                        self.navigate_to_term_query(app, &q_owned, None);
+                    } else {
+                        self.navigate_nested_query(app, depth, &q_owned);
+                    }
                     return true;
                 }
             }
         }
         false
+    }
+
+    fn sync_nested_popup_to_bridge(&self, app: &MementoApp, nav_changed: bool) {
+        let (
+            depth,
+            locked,
+            breadcrumb,
+            headword,
+            reading,
+            anchor_x,
+            anchor_y,
+            rows,
+            dups,
+            note_ids,
+            queries,
+            tags,
+        ) = {
+            let st = self.state.borrow();
+            let depth = st.nested_stack.len();
+            if let Some(top) = st.nested_stack.last() {
+                let crumb = st
+                    .nested_stack
+                    .iter()
+                    .map(|lvl| lvl.label.as_str())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" › ");
+                let note_ids: Vec<i32> = top
+                    .row_anki_note_ids_i64
+                    .iter()
+                    .copied()
+                    .map(encode_note_id_i32)
+                    .collect();
+                (
+                    depth,
+                    top.locked,
+                    crumb,
+                    top.headword.clone(),
+                    top.reading.clone(),
+                    top.anchor_x,
+                    top.anchor_y,
+                    top.rows.clone(),
+                    top.row_anki_duplicates.clone(),
+                    note_ids,
+                    top.row_anki_browse_queries.clone(),
+                    top.row_anki_tags.clone(),
+                )
+            } else {
+                (
+                    0,
+                    false,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    0.0,
+                    0.0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        };
+        let pb = app.global::<PopupBridge>();
+        pb.set_nested_depth(depth as i32);
+        pb.set_nested_max_depth(MAX_NESTED_POPUP_DEPTH as i32);
+        pb.set_nested_locked(locked);
+        pb.set_nested_breadcrumb(breadcrumb.into());
+        pb.set_nested_headword(headword.into());
+        pb.set_nested_reading(reading.into());
+        pb.set_nested_anchor_x(anchor_x);
+        pb.set_nested_anchor_y(anchor_y);
+        pb.set_nested_results(Rc::new(VecModel::from(rows)).into());
+        pb.set_nested_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+        pb.set_nested_row_anki_note_ids(Rc::new(VecModel::from(note_ids)).into());
+        pb.set_nested_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+        pb.set_nested_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+        pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
+        if nav_changed {
+            pb.set_nested_nav_revision(pb.get_nested_nav_revision().wrapping_add(1));
+        }
+        if depth == 0 {
+            pb.set_nested_searching(false);
+        }
+    }
+
+    fn pop_nested_popup(&self, app: &MementoApp) {
+        self.nested_epoch.fetch_add(1, Ordering::AcqRel);
+        self.nested_poll_timer.stop();
+        let popped = {
+            let mut st = self.state.borrow_mut();
+            st.nested_scan_timer.stop();
+            st.nested_dismiss_timer.stop();
+            let popped = st.nested_stack.pop().is_some();
+            if let Some(top) = st.nested_stack.last_mut() {
+                top.scan_highlight = None;
+            } else {
+                st.root_scan_highlight = None;
+                st.nested_card_hovered = false;
+                st.nested_body_hovered = false;
+                st.pending_nested_anki_add = None;
+            }
+            popped
+        };
+        if popped {
+            let pb = app.global::<PopupBridge>();
+            pb.set_tooltip_visible(false);
+            pb.set_nested_searching(false);
+            self.sync_nested_popup_to_bridge(app, true);
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        }
+    }
+
+    fn dismiss_all_nested_popups(&self, app: &MementoApp) {
+        self.nested_epoch.fetch_add(1, Ordering::AcqRel);
+        self.nested_poll_timer.stop();
+        let had_any = {
+            let mut st = self.state.borrow_mut();
+            st.nested_scan_timer.stop();
+            st.nested_dismiss_timer.stop();
+            let had_any = !st.nested_stack.is_empty() || st.root_scan_highlight.is_some();
+            st.nested_stack.clear();
+            st.root_scan_highlight = None;
+            st.nested_card_hovered = false;
+            st.nested_body_hovered = false;
+            st.pending_nested_anki_add = None;
+            had_any
+        };
+        let pb = app.global::<PopupBridge>();
+        pb.set_nested_searching(false);
+        if had_any {
+            pb.set_tooltip_visible(false);
+            self.sync_nested_popup_to_bridge(app, true);
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        }
+    }
+
+    fn schedule_unlocked_nested_dismiss(self: &Rc<Self>) {
+        let should_schedule = {
+            let st = self.state.borrow();
+            let Some(top) = st.nested_stack.last() else {
+                return;
+            };
+            if top.locked || st.nested_card_hovered || st.nested_body_hovered {
+                false
+            } else {
+                let parent_depth = (st.nested_stack.len() - 1) as i32;
+                let still_on_source = st.hovered_glossary_target.as_ref().is_some_and(|t| {
+                    t.depth == parent_depth
+                        && t.row_index == top.source_row_index
+                        && t.start_char == top.source_start_char
+                });
+                !still_on_source
+            }
+        };
+        if !should_schedule {
+            return;
+        }
+        let weak_br = Rc::downgrade(self);
+        self.state.borrow_mut().nested_dismiss_timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(NESTED_DISMISS_GRACE_MS),
+            move || {
+                let Some(br) = weak_br.upgrade() else {
+                    return;
+                };
+                let Some(app) = br.app_weak.upgrade() else {
+                    return;
+                };
+                let dismiss_now = {
+                    let st = br.state.borrow();
+                    let Some(top) = st.nested_stack.last() else {
+                        return;
+                    };
+                    if top.locked || st.nested_card_hovered || st.nested_body_hovered {
+                        false
+                    } else {
+                        let parent_depth = (st.nested_stack.len() - 1) as i32;
+                        let still_on_source = st.hovered_glossary_target.as_ref().is_some_and(|t| {
+                            t.depth == parent_depth
+                                && t.row_index == top.source_row_index
+                                && t.start_char == top.source_start_char
+                        });
+                        !still_on_source
+                    }
+                };
+                if dismiss_now {
+                    br.pop_nested_popup(&app);
+                }
+            },
+        );
+    }
+
+    fn dispatch_nested_scan(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        target: HoveredGlossaryTarget,
+        locked: bool,
+    ) {
+        if target.depth < 0 || (target.depth as usize) >= MAX_NESTED_POPUP_DEPTH {
+            return;
+        }
+        let (order, excluded, mecab_enabled) = {
+            let st = self.state.borrow();
+            st.nested_scan_timer.stop();
+            st.nested_dismiss_timer.stop();
+            (
+                st.settings.dict_order.clone(),
+                st.settings.excluded_glossaries.clone(),
+                st.settings.mecab_enabled,
+            )
+        };
+        let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        app.global::<PopupBridge>().set_nested_searching(true);
+        let _ = self.nested_tx.send(NestedScanRequest {
+            epoch,
+            parent_depth: target.depth,
+            row_index: target.row_index,
+            start_char: target.start_char,
+            query: target.query,
+            cell_indices: target.cell_indices,
+            anchor_x: target.anchor_x,
+            anchor_y: target.anchor_y,
+            locked,
+            dict_order: order,
+            excluded_glossaries: excluded,
+            mecab_enabled,
+        });
+        let weak_br = Rc::downgrade(self);
+        self.nested_poll_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(8),
+            move || {
+                let Some(br) = weak_br.upgrade() else {
+                    return;
+                };
+                let Some(app) = br.app_weak.upgrade() else {
+                    br.nested_poll_timer.stop();
+                    return;
+                };
+                let _ = br.drain_nested_scan_results(&app);
+                if !app.global::<PopupBridge>().get_nested_searching() {
+                    br.nested_poll_timer.stop();
+                }
+            },
+        );
+    }
+
+    fn drain_nested_scan_results(self: &Rc<Self>, app: &MementoApp) -> bool {
+        let mut latest: Option<NestedScanResponse> = None;
+        if let Ok(guard) = self.nested_res_rx.lock() {
+            while let Ok(item) = guard.try_recv() {
+                latest = Some(item);
+            }
+        }
+        let Some(resp) = latest else {
+            return false;
+        };
+        if resp.epoch != self.nested_epoch.load(Ordering::Acquire) {
+            return false;
+        }
+        let pb = app.global::<PopupBridge>();
+        pb.set_nested_searching(false);
+        if !app.get_dict_open() {
+            return false;
+        }
+        if resp.hits.is_empty() {
+            return true;
+        }
+
+        let (mut rows, grouped_hits) =
+            build_dictionary_result_rows_grouped(&resp.hits, &resp.excluded_glossaries);
+        for row in &mut rows {
+            if row.term_start && !row.is_kanji {
+                if let Some((_, _, graphs, freqs)) = resp.term_meta_rows.iter().find(|(e, r, _, _)| {
+                    e == row.expression.as_str() && r == row.reading.as_str()
+                }) {
+                    row.pitch_graphs =
+                        Rc::new(VecModel::from(popup_pitch_graphs(graphs.clone()))).into();
+                    row.frequencies = Rc::new(VecModel::from(
+                        freqs
+                            .iter()
+                            .map(|f| PopupFrequency {
+                                dictionary: f.dictionary.clone().into(),
+                                value: f.value.clone().into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                    .into();
+                }
+            }
+        }
+
+        let new_depth_opt = {
+            let mut st = self.state.borrow_mut();
+            let parent_depth = resp.parent_depth.max(0) as usize;
+            if parent_depth > st.nested_stack.len() || parent_depth >= MAX_NESTED_POPUP_DEPTH {
+                None
+            } else {
+                st.nested_stack.truncate(parent_depth);
+                let hl_count = resp
+                    .matched_char_count
+                    .clamp(1, resp.cell_indices.len().max(1));
+                let highlight = GlossaryScanHighlight {
+                    row_index: resp.row_index,
+                    cell_indices: resp.cell_indices.into_iter().take(hl_count).collect(),
+                };
+                if parent_depth == 0 {
+                    st.root_scan_highlight = Some(highlight);
+                } else if let Some(parent_lvl) = st.nested_stack.get_mut(parent_depth - 1) {
+                    parent_lvl.scan_highlight = Some(highlight);
+                    parent_lvl.locked = true;
+                }
+                let state_ref = &mut *st;
+                let row_extras = build_row_extras_for_grouped(
+                    &mut state_ref.db_helper,
+                    &mut state_ref.dict_ctrl,
+                    &mut rows,
+                    &grouped_hits,
+                    Some(&resp.term_pitch_details),
+                );
+                let row_count = rows.len();
+                let level = NestedPopupLevel {
+                    label: resp.headword.clone(),
+                    rows: rows.clone(),
+                    headword: resp.headword,
+                    reading: resp.reading,
+                    anchor_x: resp.anchor_x,
+                    anchor_y: resp.anchor_y,
+                    locked: resp.locked,
+                    source_row_index: resp.row_index,
+                    source_start_char: resp.start_char,
+                    rich_epoch: 1,
+                    row_extras,
+                    glossary_cache: HashMap::new(),
+                    last_rendered_key: HashMap::new(),
+                    selection: None,
+                    scan_highlight: None,
+                    expanded_cards: HashSet::new(),
+                    row_anki_duplicates: vec![false; row_count],
+                    row_anki_note_ids_i64: vec![0; row_count],
+                    row_anki_browse_queries: vec![SharedString::default(); row_count],
+                    row_anki_tags: vec![SharedString::default(); row_count],
+                };
+                st.nested_stack.push(level);
+                Some(st.nested_stack.len())
+            }
+        };
+
+        if let Some(new_depth) = new_depth_opt {
+            self.sync_nested_popup_to_bridge(app, true);
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+            self.dispatch_anki_check_for_rows(app, &rows, Some(new_depth));
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_glossary_scan_hover(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+        popup_x: f32,
+        popup_y: f32,
+        control: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+    ) {
+        self.ensure_fresh_db_and_config(app);
+        let pb = app.global::<PopupBridge>();
+        let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
+            pb.set_tooltip_visible(false);
+            return;
+        };
+
+        if let Some(zone) = doc.hit_zones.iter().rev().find(|z| {
+            z.tooltip.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
+        }) {
+            if let Some(ref tip) = zone.tooltip {
+                pb.set_tooltip_text(tip.clone().into());
+                pb.set_tooltip_x(popup_x);
+                pb.set_tooltip_y(popup_y);
+                pb.set_tooltip_visible(true);
+            }
+        } else {
+            pb.set_tooltip_visible(false);
+        }
+
+        // Never hijack explicit links / <details> disclosure headers or active drag-selection.
+        let over_action_zone = doc.hit_zones.iter().any(|z| {
+            z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
+        });
+        let is_dragging = {
+            let st = self.state.borrow();
+            if depth == 0 {
+                st.selection.as_ref().is_some_and(|s| s.dragging)
+            } else {
+                st.nested_level(depth)
+                    .and_then(|lvl| lvl.selection.as_ref())
+                    .is_some_and(|s| s.dragging)
+            }
+        };
+        if over_action_zone || is_dragging || depth < 0 || (depth as usize) >= MAX_NESTED_POPUP_DEPTH
+        {
+            let mut st = self.state.borrow_mut();
+            st.hovered_glossary_target = None;
+            st.nested_scan_timer.stop();
+            return;
+        }
+
+        let scan_match = strict_char_index_at_point(&doc, x, y).and_then(|ci| {
+            extract_glossary_scan_substring(&doc.selectable_chars, ci, GLOSSARY_SCAN_MAX_CHARS)
+                .map(|(q, indices)| (ci, q, indices))
+        });
+
+        let Some((char_idx, query, cell_indices)) = scan_match else {
+            {
+                let mut st = self.state.borrow_mut();
+                st.hovered_glossary_target = None;
+                st.nested_scan_timer.stop();
+            }
+            self.schedule_unlocked_nested_dismiss();
+            return;
+        };
+
+        let target = HoveredGlossaryTarget {
+            depth,
+            row_index: row_idx,
+            start_char: char_idx,
+            query,
+            cell_indices,
+            anchor_x: popup_x,
+            anchor_y: popup_y,
+        };
+
+        let (method, mod_setting, delay_ms, already_showing_this) = {
+            let mut st = self.state.borrow_mut();
+            st.hovered_glossary_target = Some(target.clone());
+            let already = st.nested_stack.get(depth as usize).is_some_and(|child| {
+                child.source_row_index == row_idx && child.source_start_char == char_idx
+            });
+            if already {
+                st.nested_dismiss_timer.stop();
+            }
+            (
+                st.settings.search_method,
+                st.settings.search_modifier,
+                st.settings.search_delay_ms,
+                already,
+            )
+        };
+
+        let mod_held = modifier_matches_setting(mod_setting, control, shift, alt, meta);
+        if method == 1 && !mod_held {
+            self.state.borrow_mut().nested_scan_timer.stop();
+            return;
+        }
+        if already_showing_this {
+            self.state.borrow_mut().nested_scan_timer.stop();
+            return;
+        }
+
+        let wait_ms = if mod_held { delay_ms.min(50) } else { delay_ms };
+        if wait_ms == 0 {
+            self.dispatch_nested_scan(app, target, false);
+            return;
+        }
+
+        let expected_depth = depth;
+        let expected_row = row_idx;
+        let expected_char = char_idx;
+        let weak_br = Rc::downgrade(self);
+        self.state.borrow_mut().nested_scan_timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(wait_ms),
+            move || {
+                let Some(br) = weak_br.upgrade() else {
+                    return;
+                };
+                let Some(app) = br.app_weak.upgrade() else {
+                    return;
+                };
+                let current_opt = {
+                    let st = br.state.borrow();
+                    let dragging = if expected_depth == 0 {
+                        st.selection.as_ref().is_some_and(|s| s.dragging)
+                    } else {
+                        st.nested_level(expected_depth)
+                            .and_then(|l| l.selection.as_ref())
+                            .is_some_and(|s| s.dragging)
+                    };
+                    if dragging {
+                        None
+                    } else {
+                        st.hovered_glossary_target.clone()
+                    }
+                };
+                if let Some(cur) = current_opt {
+                    if cur.depth == expected_depth
+                        && cur.row_index == expected_row
+                        && cur.start_char == expected_char
+                    {
+                        br.dispatch_nested_scan(&app, cur, false);
+                    }
+                }
+            },
+        );
+    }
+
+    fn handle_glossary_scan_middle_click(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+        popup_x: f32,
+        popup_y: f32,
+    ) {
+        self.ensure_fresh_db_and_config(app);
+        let enabled = self.state.borrow().settings.middle_mouse_scan;
+        if !enabled || depth < 0 || (depth as usize) >= MAX_NESTED_POPUP_DEPTH {
+            return;
+        }
+        let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
+            return;
+        };
+        let Some(char_idx) = strict_char_index_at_point(&doc, x, y) else {
+            return;
+        };
+        let Some((query, cell_indices)) =
+            extract_glossary_scan_substring(&doc.selectable_chars, char_idx, GLOSSARY_SCAN_MAX_CHARS)
+        else {
+            return;
+        };
+        let target = HoveredGlossaryTarget {
+            depth,
+            row_index: row_idx,
+            start_char: char_idx,
+            query,
+            cell_indices,
+            anchor_x: popup_x,
+            anchor_y: popup_y,
+        };
+        self.state.borrow_mut().hovered_glossary_target = Some(target.clone());
+        self.dispatch_nested_scan(app, target, true);
+    }
+
+    fn handle_glossary_scan_leave(self: &Rc<Self>, depth: i32, row_idx: i32) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st
+                .hovered_glossary_target
+                .as_ref()
+                .is_some_and(|t| t.depth == depth && t.row_index == row_idx)
+            {
+                st.hovered_glossary_target = None;
+                st.nested_scan_timer.stop();
+            }
+        }
+        self.schedule_unlocked_nested_dismiss();
+    }
+
+    fn handle_glossary_pointer_down_at_depth(
+        &self,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+    ) {
+        // Clicking/dragging immediately cancels any pending hover-scan timer or in-flight scan.
+        self.nested_epoch.fetch_add(1, Ordering::AcqRel);
+        self.nested_poll_timer.stop();
+        let mut truncated_nested = false;
+        let mut locked_nested = false;
+        {
+            let mut st = self.state.borrow_mut();
+            st.nested_scan_timer.stop();
+            if depth >= 0 && (depth as usize) < st.nested_stack.len() {
+                st.nested_stack.truncate(depth as usize);
+                if depth == 0 {
+                    st.root_scan_highlight = None;
+                } else if let Some(lvl) = st.nested_level_mut(depth) {
+                    lvl.scan_highlight = None;
+                }
+                truncated_nested = true;
+            } else if depth > 0 {
+                st.nested_dismiss_timer.stop();
+                if let Some(lvl) = st.nested_level_mut(depth) {
+                    lvl.locked = true;
+                    locked_nested = true;
+                }
+            }
+        }
+        if truncated_nested {
+            let pb = app.global::<PopupBridge>();
+            pb.set_nested_searching(false);
+            self.sync_nested_popup_to_bridge(app, true);
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        } else if locked_nested {
+            app.global::<PopupBridge>().set_nested_locked(true);
+        }
+
+        let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
+            return;
+        };
+        if let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) {
+            let sel = GlossarySelectionState {
+                row_index: row_idx,
+                anchor_char: ci,
+                focus_char: ci,
+                dragging: false,
+                press_pos: (x, y),
+            };
+            {
+                let mut st = self.state.borrow_mut();
+                if depth == 0 {
+                    st.selection = Some(sel);
+                } else if let Some(lvl) = st.nested_level_mut(depth) {
+                    lvl.selection = Some(sel);
+                }
+            }
+            self.update_glossary_selection_text_at_depth(app, depth);
+        }
+    }
+
+    fn handle_glossary_pointer_drag_at_depth(
+        &self,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+    ) {
+        let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
+            return;
+        };
+        let mut updated = false;
+        {
+            let mut st = self.state.borrow_mut();
+            st.nested_scan_timer.stop();
+            let sel_slot = if depth == 0 {
+                &mut st.selection
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                &mut lvl.selection
+            } else {
+                return;
+            };
+            if let Some(ref mut sel) = sel_slot {
+                if sel.row_index == row_idx {
+                    let dist = (x - sel.press_pos.0).hypot(y - sel.press_pos.1);
+                    if dist >= 3.0 {
+                        sel.dragging = true;
+                    }
+                    if sel.dragging {
+                        if let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) {
+                            let target =
+                                if x > doc.selectable_chars[ci].x + doc.selectable_chars[ci].w * 0.5
+                                {
+                                    (ci + 1).min(doc.selectable_chars.len())
+                                } else {
+                                    ci
+                                };
+                            if sel.focus_char != target {
+                                sel.focus_char = target;
+                                updated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if updated {
+            self.update_glossary_selection_text_at_depth(app, depth);
+        }
+    }
+
+    fn handle_glossary_pointer_up_at_depth(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+    ) {
+        let was_dragging = {
+            let mut st = self.state.borrow_mut();
+            let sel_slot = if depth == 0 {
+                &mut st.selection
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                &mut lvl.selection
+            } else {
+                return;
+            };
+            let dragged = sel_slot
+                .as_ref()
+                .is_some_and(|s| s.dragging && s.anchor_char != s.focus_char);
+            if let Some(ref mut s) = sel_slot {
+                s.dragging = false;
+            }
+            dragged
+        };
+        if was_dragging {
+            return;
+        }
+        if let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) {
+            if let Some(zone) = doc.hit_zones.iter().rev().find(|z| {
+                z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
+            }) {
+                match zone.action.as_ref() {
+                    Some(GlossaryZoneAction::ToggleDetails(did)) => {
+                        self.toggle_glossary_details_at_depth(app, depth, row_idx, did);
+                    }
+                    Some(GlossaryZoneAction::Link(href)) => {
+                        if !self.handle_internal_link_str_at_depth(app, depth, row_idx, href) {
+                            app.invoke_open_glossary_link(href.clone().into());
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    fn handle_glossary_double_click_at_depth(
+        &self,
+        app: &MementoApp,
+        depth: i32,
+        row_idx: i32,
+        x: f32,
+        y: f32,
+    ) {
+        let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
+            return;
+        };
+        let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) else {
+            return;
+        };
+        let is_word = |c: char| c.is_alphanumeric() || is_japanese_lookup_char(c);
+        let mut lo = ci;
+        while lo > 0 && is_word(doc.selectable_chars[lo - 1].ch) {
+            lo -= 1;
+        }
+        let mut hi = (ci + 1).min(doc.selectable_chars.len());
+        while hi < doc.selectable_chars.len() && is_word(doc.selectable_chars[hi].ch) {
+            hi += 1;
+        }
+        let sel = GlossarySelectionState {
+            row_index: row_idx,
+            anchor_char: lo,
+            focus_char: hi,
+            dragging: false,
+            press_pos: (x, y),
+        };
+        {
+            let mut st = self.state.borrow_mut();
+            if depth == 0 {
+                st.selection = Some(sel);
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                lvl.selection = Some(sel);
+            }
+        }
+        self.update_glossary_selection_text_at_depth(app, depth);
+    }
+
+    fn navigate_nested_query(self: &Rc<Self>, app: &MementoApp, from_depth: i32, query: &str) {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.ensure_fresh_db_and_config(app);
+        let (hits, excluded, headword, reading, term_meta_rows) = {
+            let mut st = self.state.borrow_mut();
+            let mut hits = st.dict_ctrl.search(trimmed).to_vec();
+            let excluded = st.settings.excluded_glossaries.clone();
+            if hits.is_empty() && trimmed.chars().count() == 1 {
+                hits = st.dict_ctrl.search_kanji(trimmed).to_vec();
+            }
+            let headword = hits
+                .first()
+                .map(|h| h.expression.clone())
+                .unwrap_or_else(|| trimmed.to_owned());
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let mut term_meta_rows = Vec::new();
+            for h in &hits {
+                if !h.is_kanji
+                    && !term_meta_rows
+                        .iter()
+                        .any(|(e, r, _, _): &(String, String, _, _)| {
+                            e == &h.expression && r == &h.reading
+                        })
+                {
+                    let graphs = st.dict_ctrl.get_pitch_graphs(&h.expression, &h.reading);
+                    let freqs = st.dict_ctrl.get_frequencies(&h.expression, &h.reading);
+                    term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
+                }
+            }
+            (hits, excluded, headword, reading, term_meta_rows)
+        };
+        if hits.is_empty() {
+            app.set_status_message(format!("No dictionary entries found for {trimmed}").into());
+            return;
+        }
+        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped(&hits, &excluded);
+        for row in &mut rows {
+            if row.term_start && !row.is_kanji {
+                if let Some((_, _, graphs, freqs)) = term_meta_rows.iter().find(|(e, r, _, _)| {
+                    e == row.expression.as_str() && r == row.reading.as_str()
+                }) {
+                    row.pitch_graphs =
+                        Rc::new(VecModel::from(popup_pitch_graphs(graphs.clone()))).into();
+                    row.frequencies = Rc::new(VecModel::from(
+                        freqs
+                            .iter()
+                            .map(|f| PopupFrequency {
+                                dictionary: f.dictionary.clone().into(),
+                                value: f.value.clone().into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                    .into();
+                }
+            }
+        }
+        let target_depth = {
+            let mut st = self.state.borrow_mut();
+            let (anchor_x, anchor_y) = st
+                .nested_level(from_depth)
+                .map(|l| (l.anchor_x, l.anchor_y))
+                .unwrap_or((80.0, 80.0));
+            let state_ref = &mut *st;
+            let row_extras = build_row_extras_for_grouped(
+                &mut state_ref.db_helper,
+                &mut state_ref.dict_ctrl,
+                &mut rows,
+                &grouped_hits,
+                None,
+            );
+            let row_count = rows.len();
+            let level = NestedPopupLevel {
+                label: headword.clone(),
+                rows: rows.clone(),
+                headword,
+                reading,
+                anchor_x,
+                anchor_y,
+                locked: true,
+                source_row_index: 0,
+                source_start_char: 0,
+                rich_epoch: 1,
+                row_extras,
+                glossary_cache: HashMap::new(),
+                last_rendered_key: HashMap::new(),
+                selection: None,
+                scan_highlight: None,
+                expanded_cards: HashSet::new(),
+                row_anki_duplicates: vec![false; row_count],
+                row_anki_note_ids_i64: vec![0; row_count],
+                row_anki_browse_queries: vec![SharedString::default(); row_count],
+                row_anki_tags: vec![SharedString::default(); row_count],
+            };
+            let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
+            st.nested_stack.truncate(base);
+            if st.nested_stack.len() >= MAX_NESTED_POPUP_DEPTH {
+                st.nested_stack.pop();
+            }
+            st.nested_stack.push(level);
+            st.nested_stack.len()
+        };
+        self.sync_nested_popup_to_bridge(app, true);
+        self.dispatch_anki_check_for_rows(app, &rows, Some(target_depth));
+    }
+
+    fn navigate_nested_kanji(
+        self: &Rc<Self>,
+        app: &MementoApp,
+        from_depth: i32,
+        expression: &str,
+        clicked_kanji: &str,
+    ) {
+        let target_char = clicked_kanji
+            .chars()
+            .find(|&c| is_kanji_char(c))
+            .or_else(|| expression.chars().find(|&c| is_kanji_char(c)));
+        let Some(ch) = target_char else {
+            return;
+        };
+        let query = ch.to_string();
+        self.ensure_fresh_db_and_config(app);
+        let (hits, excluded) = {
+            let mut st = self.state.borrow_mut();
+            let hits = st.dict_ctrl.search_kanji(&query).to_vec();
+            let excluded = st.settings.excluded_glossaries.clone();
+            (hits, excluded)
+        };
+        if hits.is_empty() {
+            app.set_status_message(format!("No kanji entry found for {query}").into());
+            return;
+        }
+        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped(&hits, &excluded);
+        let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+        let target_depth = {
+            let mut st = self.state.borrow_mut();
+            let (anchor_x, anchor_y) = st
+                .nested_level(from_depth)
+                .map(|l| (l.anchor_x, l.anchor_y))
+                .unwrap_or((80.0, 80.0));
+            let state_ref = &mut *st;
+            let row_extras = build_row_extras_for_grouped(
+                &mut state_ref.db_helper,
+                &mut state_ref.dict_ctrl,
+                &mut rows,
+                &grouped_hits,
+                None,
+            );
+            let row_count = rows.len();
+            let level = NestedPopupLevel {
+                label: query.clone(),
+                rows: rows.clone(),
+                headword: query,
+                reading,
+                anchor_x,
+                anchor_y,
+                locked: true,
+                source_row_index: 0,
+                source_start_char: 0,
+                rich_epoch: 1,
+                row_extras,
+                glossary_cache: HashMap::new(),
+                last_rendered_key: HashMap::new(),
+                selection: None,
+                scan_highlight: None,
+                expanded_cards: HashSet::new(),
+                row_anki_duplicates: vec![false; row_count],
+                row_anki_note_ids_i64: vec![0; row_count],
+                row_anki_browse_queries: vec![SharedString::default(); row_count],
+                row_anki_tags: vec![SharedString::default(); row_count],
+            };
+            let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
+            st.nested_stack.truncate(base);
+            if st.nested_stack.len() >= MAX_NESTED_POPUP_DEPTH {
+                st.nested_stack.pop();
+            }
+            st.nested_stack.push(level);
+            st.nested_stack.len()
+        };
+        self.sync_nested_popup_to_bridge(app, true);
+        self.dispatch_anki_check_for_rows(app, &rows, Some(target_depth));
+    }
+
+    fn is_nested_target_already_shown(&self, target: &HoveredGlossaryTarget) -> bool {
+        if target.depth < 0 {
+            return false;
+        }
+        let st = self.state.borrow();
+        st.nested_stack
+            .get(target.depth as usize)
+            .is_some_and(|child| {
+                child.source_row_index == target.row_index
+                    && child.source_start_char == target.start_char
+            })
+    }
+
+    fn toggle_nested_select_definition(&self, app: &MementoApp, depth: i32, zero_based_idx: i32) {
+        if zero_based_idx < 0 {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(lvl) = st.nested_level_mut(depth) {
+                lvl.locked = true;
+                if let Some(row) = lvl.rows.get_mut(zero_based_idx as usize) {
+                    row.selected = !row.selected;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_nested_popup_to_bridge(app, false);
+        }
+    }
+
+    fn toggle_nested_term_collapse(&self, app: &MementoApp, depth: i32, term_start_zero_idx: i32) {
+        if term_start_zero_idx < 0 {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(lvl) = st.nested_level_mut(depth) {
+                lvl.locked = true;
+                let start = term_start_zero_idx as usize;
+                if start < lvl.rows.len() {
+                    let target_collapsed = !lvl.rows[start].collapsed;
+                    lvl.rows[start].collapsed = target_collapsed;
+                    changed = true;
+                    for row in lvl.rows.iter_mut().skip(start + 1) {
+                        if row.term_start {
+                            break;
+                        }
+                        row.collapsed = target_collapsed;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.sync_nested_popup_to_bridge(app, false);
+        }
+    }
+
+    fn add_nested_anki_note(&self, app: &MementoApp, row_zero_idx: i32) {
+        let (depth, nested_rows, pending) = {
+            let mut st = self.state.borrow_mut();
+            let depth = st.nested_stack.len();
+            let Some(top) = st.nested_stack.last_mut() else {
+                return;
+            };
+            top.locked = true;
+            let idx = row_zero_idx.max(0) as usize;
+            let Some(target) = top.rows.get(idx) else {
+                return;
+            };
+            (
+                depth,
+                top.rows.clone(),
+                (
+                    depth,
+                    target.expression.to_string(),
+                    target.reading.to_string(),
+                    target.is_kanji,
+                ),
+            )
+        };
+        let parent_rows = app.get_dict_results();
+        self.state.borrow_mut().pending_nested_anki_add = Some(pending);
+        app.set_dict_results(Rc::new(VecModel::from(nested_rows)).into());
+        app.invoke_add_anki_note(row_zero_idx);
+        app.set_dict_results(parent_rows);
+        if depth > 0 {
+            app.global::<PopupBridge>().set_nested_locked(true);
+        }
     }
 
     fn resolve_subtitle_cluster(
@@ -7970,77 +10210,180 @@ fn drain_panel_results(
         return false;
     }
     // Build DictResult rows WITHOUT touching LAST_GROUPED_HITS or app.dict_results!
-    let saved = LAST_GROUPED_HITS.with(|s| s.borrow().clone());
-    let rows = dictionary_result_rows(&hits, &excluded);
-    LAST_GROUPED_HITS.with(|s| *s.borrow_mut() = saved);
+    let (rows, _) = build_dictionary_result_rows_grouped(&hits, &excluded);
     let pb = app.global::<PopupBridge>();
     pb.set_panel_results(Rc::new(VecModel::from(rows)).into());
     pb.set_panel_searching(false);
     true
 }
 
+fn drain_nested_scan_results_for_app(app: &MementoApp) -> bool {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    let bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .cloned()
+    });
+    if let Some(br) = bridge {
+        br.drain_nested_scan_results(app)
+    } else {
+        false
+    }
+}
+
 fn drain_anki_results(
     app: &MementoApp,
     rx: &std::sync::Mutex<mpsc::Receiver<AnkiPopupCheckResponse>>,
     nav_epoch: &AtomicU64,
+    nested_nav_epoch: &AtomicU64,
     external_lookup_epoch: &std::sync::Mutex<Option<Arc<AtomicU64>>>,
 ) -> bool {
-    let mut latest: Option<AnkiPopupCheckResponse> = None;
+    let mut latest_root: Option<AnkiPopupCheckResponse> = None;
+    let mut latest_nested: Option<AnkiPopupCheckResponse> = None;
     if let Ok(guard) = rx.lock() {
         while let Ok(item) = guard.try_recv() {
-            latest = Some(item);
-        }
-    }
-    let Some(resp) = latest else {
-        return false;
-    };
-    if resp.nav_epoch != nav_epoch.load(Ordering::Acquire) {
-        return false;
-    }
-    if resp.lookup_epoch != current_external_lookup_epoch(external_lookup_epoch) {
-        app.global::<PopupBridge>().set_anki_checking(false);
-        return false;
-    }
-    let pb = app.global::<PopupBridge>();
-    pb.set_anki_checking(false);
-    if !app.get_dict_open() {
-        return false;
-    }
-    let full = app.get_dict_results();
-    let count = full.row_count();
-    let mut dups = Vec::with_capacity(count);
-    let mut queries = Vec::with_capacity(count);
-    let mut tags = Vec::with_capacity(count);
-    for idx in 0..count {
-        if let Some(row) = full.row_data(idx) {
-            let status_opt = if row.is_kanji {
-                resp.kanji_statuses.get(row.expression.as_str())
+            if item.target_nested_depth.is_some() {
+                latest_nested = Some(item);
             } else {
-                resp.term_statuses
-                    .get(&(row.expression.to_string(), row.reading.to_string()))
-            };
-            if let Some(st) = status_opt {
-                dups.push(st.is_duplicate);
-                queries.push(SharedString::from(st.browse_query.as_str()));
-                tags.push(SharedString::from(st.tags.join(" ")));
-            } else {
-                dups.push(false);
-                queries.push(SharedString::default());
-                tags.push(SharedString::default());
+                latest_root = Some(item);
             }
-        } else {
-            dups.push(false);
-            queries.push(SharedString::default());
-            tags.push(SharedString::default());
         }
     }
-    pb.set_anki_show_tags(resp.show_tags);
-    pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
-    pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
-    pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
-    pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
-    pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
-    true
+    if latest_root.is_none() && latest_nested.is_none() {
+        return false;
+    }
+
+    let current_ext = current_external_lookup_epoch(external_lookup_epoch);
+    let pb = app.global::<PopupBridge>();
+    let instance_id = pb.get_bridge_instance_id();
+    let active_bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .cloned()
+    });
+    let mut applied_any = false;
+
+    if let Some(resp) = latest_root {
+        if resp.nav_epoch == nav_epoch.load(Ordering::Acquire) {
+            pb.set_anki_checking(false);
+            if resp.lookup_epoch == current_ext && app.get_dict_open() {
+                let full = app.get_dict_results();
+                let count = full.row_count();
+                let mut dups = Vec::with_capacity(count);
+                let mut note_ids_i32 = Vec::with_capacity(count);
+                let mut note_ids_i64 = Vec::with_capacity(count);
+                let mut note_id_strings = Vec::with_capacity(count);
+                let mut queries = Vec::with_capacity(count);
+                let mut tags = Vec::with_capacity(count);
+                for idx in 0..count {
+                    if let Some(row) = full.row_data(idx) {
+                        let status_opt = if row.is_kanji {
+                            resp.kanji_statuses.get(row.expression.as_str())
+                        } else {
+                            resp.term_statuses
+                                .get(&(row.expression.to_string(), row.reading.to_string()))
+                        };
+                        if let Some(st) = status_opt {
+                            let nid = st.note_ids.first().copied().unwrap_or(0);
+                            dups.push(st.is_duplicate);
+                            note_ids_i32.push(encode_note_id_i32(nid));
+                            note_ids_i64.push(nid);
+                            note_id_strings.push(if nid > 0 {
+                                SharedString::from(nid.to_string())
+                            } else {
+                                SharedString::default()
+                            });
+                            queries.push(SharedString::from(st.browse_query.as_str()));
+                            tags.push(SharedString::from(st.tags.join(" ")));
+                        } else {
+                            dups.push(false);
+                            note_ids_i32.push(0);
+                            note_ids_i64.push(0);
+                            note_id_strings.push(SharedString::default());
+                            queries.push(SharedString::default());
+                            tags.push(SharedString::default());
+                        }
+                    } else {
+                        dups.push(false);
+                        note_ids_i32.push(0);
+                        note_ids_i64.push(0);
+                        note_id_strings.push(SharedString::default());
+                        queries.push(SharedString::default());
+                        tags.push(SharedString::default());
+                    }
+                }
+                if let Some(ref br) = active_bridge {
+                    br.state.borrow_mut().root_row_anki_note_ids_i64 = note_ids_i64;
+                }
+                pb.set_anki_show_tags(resp.show_tags);
+                pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+                pb.set_row_anki_note_ids(Rc::new(VecModel::from(note_ids_i32)).into());
+                pb.set_row_anki_note_id_strings(Rc::new(VecModel::from(note_id_strings)).into());
+                pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+                pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+                pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+                pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+                applied_any = true;
+            }
+        }
+    }
+
+    if let Some(resp) = latest_nested {
+        if resp.nav_epoch == nested_nav_epoch.load(Ordering::Acquire) {
+            pb.set_anki_checking(false);
+            if resp.lookup_epoch == current_ext && app.get_dict_open() {
+                if let (Some(depth), Some(br)) = (resp.target_nested_depth, active_bridge.as_ref()) {
+                    let sync_needed = {
+                        let mut st = br.state.borrow_mut();
+                        let stack_len = st.nested_stack.len();
+                        if let Some(lvl) = st.nested_level_mut(depth as i32) {
+                            let count = lvl.rows.len();
+                            let mut dups = Vec::with_capacity(count);
+                            let mut note_ids_i64 = Vec::with_capacity(count);
+                            let mut queries = Vec::with_capacity(count);
+                            let mut tags = Vec::with_capacity(count);
+                            for row in &lvl.rows {
+                                let status_opt = if row.is_kanji {
+                                    resp.kanji_statuses.get(row.expression.as_str())
+                                } else {
+                                    resp.term_statuses
+                                        .get(&(row.expression.to_string(), row.reading.to_string()))
+                                };
+                                if let Some(entry_st) = status_opt {
+                                    let nid = entry_st.note_ids.first().copied().unwrap_or(0);
+                                    dups.push(entry_st.is_duplicate);
+                                    note_ids_i64.push(nid);
+                                    queries.push(SharedString::from(entry_st.browse_query.as_str()));
+                                    tags.push(SharedString::from(entry_st.tags.join(" ")));
+                                } else {
+                                    dups.push(false);
+                                    note_ids_i64.push(0);
+                                    queries.push(SharedString::default());
+                                    tags.push(SharedString::default());
+                                }
+                            }
+                            lvl.row_anki_duplicates = dups;
+                            lvl.row_anki_note_ids_i64 = note_ids_i64;
+                            lvl.row_anki_browse_queries = queries;
+                            lvl.row_anki_tags = tags;
+                            depth == stack_len
+                        } else {
+                            false
+                        }
+                    };
+                    if sync_needed {
+                        pb.set_anki_show_tags(resp.show_tags);
+                        br.sync_nested_popup_to_bridge(app, false);
+                        applied_any = true;
+                    }
+                }
+            }
+        }
+    }
+
+    applied_any
 }
 
 /// Extension hook for rich definition/subtitle UI bridges.
@@ -8126,84 +10469,208 @@ pub fn install_rich_ui_bridges(
         }
     });
 
+    // Independent async worker thread for recursive nested glossary hover-scans (depth 1..=4).
+    let (nested_tx, nested_rx) = mpsc::channel::<NestedScanRequest>();
+    let (nested_res_tx, raw_nested_res_rx) = mpsc::channel::<NestedScanResponse>();
+    let nested_res_rx = Arc::new(std::sync::Mutex::new(raw_nested_res_rx));
+    let nested_epoch = Arc::new(AtomicU64::new(0));
+    let worker_nested_epoch = nested_epoch.clone();
+    let worker_nested_db_path = dictionary_db_path.to_path_buf();
+    let worker_nested_app = app.as_weak();
+    std::thread::spawn(move || {
+        let mut sig = crate::controller::dict::db_file_fingerprint(&worker_nested_db_path);
+        let mut dict = DictController::open(&worker_nested_db_path).unwrap_or_default();
+        while let Ok(mut req) = nested_rx.recv() {
+            while let Ok(newer) = nested_rx.try_recv() {
+                req = newer;
+            }
+            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                continue;
+            }
+            let cur_sig = crate::controller::dict::db_file_fingerprint(&worker_nested_db_path);
+            if cur_sig != sig {
+                sig = cur_sig;
+                dict = DictController::open(&worker_nested_db_path).unwrap_or_default();
+            }
+            dict.set_order(&req.dict_order);
+            dict.set_mecab_enabled(req.mecab_enabled);
+
+            let mut hits = dict.search(&req.query).to_vec();
+            let match_units = dict.last_match_units();
+            let mut matched_char_count = utf16_units_to_char_count(&req.query, match_units);
+            if hits.is_empty() {
+                if let Some(first_ch) = req.query.chars().next() {
+                    if is_kanji_char(first_ch) {
+                        let ch_str = first_ch.to_string();
+                        let khits = dict.search_kanji(&ch_str).to_vec();
+                        if !khits.is_empty() {
+                            hits = khits;
+                            matched_char_count = 1;
+                        }
+                    }
+                }
+            } else if matched_char_count == 0 {
+                matched_char_count = hits
+                    .first()
+                    .map(|h| h.expression.chars().count())
+                    .unwrap_or(1)
+                    .max(1);
+            }
+
+            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                continue;
+            }
+
+            let headword = hits
+                .first()
+                .map(|h| h.expression.clone())
+                .unwrap_or_default();
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let mut term_meta_rows = Vec::new();
+            let mut term_pitch_details = HashMap::new();
+            for h in &hits {
+                if !h.is_kanji
+                    && !term_meta_rows
+                        .iter()
+                        .any(|(e, r, _, _): &(String, String, _, _)| {
+                            e == &h.expression && r == &h.reading
+                        })
+                {
+                    let graphs = dict.get_pitch_graphs(&h.expression, &h.reading);
+                    let freqs = dict.get_frequencies(&h.expression, &h.reading);
+                    let details = dict.get_pitch_details(&h.expression, &h.reading);
+                    term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
+                    term_pitch_details.insert((h.expression.clone(), h.reading.clone()), details);
+                }
+            }
+
+            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                continue;
+            }
+
+            let _ = nested_res_tx.send(NestedScanResponse {
+                epoch: req.epoch,
+                parent_depth: req.parent_depth,
+                row_index: req.row_index,
+                start_char: req.start_char,
+                matched_char_count,
+                cell_indices: req.cell_indices,
+                anchor_x: req.anchor_x,
+                anchor_y: req.anchor_y,
+                locked: req.locked,
+                hits,
+                excluded_glossaries: req.excluded_glossaries,
+                headword,
+                reading,
+                term_meta_rows,
+                term_pitch_details,
+            });
+            let _ = worker_nested_app.upgrade_in_event_loop(move |app| {
+                let _ = drain_nested_scan_results_for_app(&app);
+            });
+        }
+    });
+
     // Background Anki duplicate & `show-tag` checker thread (#340, #346) so AnkiConnect
     // round-trips never block subtitle hover latency and fail silently when Anki is closed.
     let (anki_tx, anki_rx) = mpsc::channel::<AnkiPopupCheckRequest>();
     let (anki_res_tx, raw_anki_res_rx) = mpsc::channel::<AnkiPopupCheckResponse>();
     let anki_res_rx = Arc::new(std::sync::Mutex::new(raw_anki_res_rx));
     let anki_nav_epoch = Arc::new(AtomicU64::new(0));
+    let nested_anki_nav_epoch = Arc::new(AtomicU64::new(0));
     let external_lookup_epoch: Arc<std::sync::Mutex<Option<Arc<AtomicU64>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let worker_anki_epoch = anki_nav_epoch.clone();
+    let worker_nested_anki_epoch = nested_anki_nav_epoch.clone();
     let worker_anki_ext = external_lookup_epoch.clone();
     let worker_anki_res_rx = anki_res_rx.clone();
     let worker_anki_app = app.as_weak();
     std::thread::spawn(move || {
-        while let Ok(mut req) = anki_rx.recv() {
+        while let Ok(first_req) = anki_rx.recv() {
+            let mut pending_root: Option<AnkiPopupCheckRequest> = None;
+            let mut pending_nested: Option<AnkiPopupCheckRequest> = None;
+            if first_req.target_nested_depth.is_some() {
+                pending_nested = Some(first_req);
+            } else {
+                pending_root = Some(first_req);
+            }
             while let Ok(newer) = anki_rx.try_recv() {
-                req = newer;
-            }
-            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
-                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
-            {
-                continue;
-            }
-
-            let mut term_statuses = HashMap::new();
-            if let Some(mut profile) = req.term_profile.clone() {
-                if profile.endpoint.timeout.is_none() {
-                    profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
+                if newer.target_nested_depth.is_some() {
+                    pending_nested = Some(newer);
+                } else {
+                    pending_root = Some(newer);
                 }
-                let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
-                if let Ok(statuses) =
-                    ctrl.check_entries_anki_status(&profile, &req.term_entries, req.show_tags)
+            }
+            for req in pending_root.into_iter().chain(pending_nested) {
+                let target_epoch = if req.target_nested_depth.is_some() {
+                    &worker_nested_anki_epoch
+                } else {
+                    &worker_anki_epoch
+                };
+                if req.nav_epoch != target_epoch.load(Ordering::Acquire)
+                    || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
                 {
-                    for (pair, st) in req.term_entries.iter().cloned().zip(statuses) {
-                        term_statuses.insert(pair, st);
+                    continue;
+                }
+
+                let mut term_statuses = HashMap::new();
+                if let Some(mut profile) = req.term_profile.clone() {
+                    if profile.endpoint.timeout.is_none() {
+                        profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
+                    }
+                    let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
+                    if let Ok(statuses) =
+                        ctrl.check_entries_anki_status(&profile, &req.term_entries, req.show_tags)
+                    {
+                        for (pair, st) in req.term_entries.iter().cloned().zip(statuses) {
+                            term_statuses.insert(pair, st);
+                        }
                     }
                 }
-            }
 
-            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
-                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
-            {
-                continue;
-            }
-
-            let mut kanji_statuses = HashMap::new();
-            if let Some(mut profile) = req.kanji_profile.clone() {
-                if profile.endpoint.timeout.is_none() {
-                    profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
-                }
-                let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
-                if let Ok(statuses) =
-                    ctrl.check_entries_anki_status(&profile, &req.kanji_entries, req.show_tags)
+                if req.nav_epoch != target_epoch.load(Ordering::Acquire)
+                    || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
                 {
-                    for ((expr, _), st) in req.kanji_entries.iter().cloned().zip(statuses) {
-                        kanji_statuses.insert(expr, st);
+                    continue;
+                }
+
+                let mut kanji_statuses = HashMap::new();
+                if let Some(mut profile) = req.kanji_profile.clone() {
+                    if profile.endpoint.timeout.is_none() {
+                        profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
+                    }
+                    let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
+                    if let Ok(statuses) =
+                        ctrl.check_entries_anki_status(&profile, &req.kanji_entries, req.show_tags)
+                    {
+                        for ((expr, _), st) in req.kanji_entries.iter().cloned().zip(statuses) {
+                            kanji_statuses.insert(expr, st);
+                        }
                     }
                 }
-            }
 
-            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
-                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
-            {
-                continue;
-            }
+                if req.nav_epoch != target_epoch.load(Ordering::Acquire)
+                    || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
+                {
+                    continue;
+                }
 
-            let _ = anki_res_tx.send(AnkiPopupCheckResponse {
-                nav_epoch: req.nav_epoch,
-                lookup_epoch: req.lookup_epoch,
-                show_tags: req.show_tags,
-                term_statuses,
-                kanji_statuses,
-            });
-            let rx_cl = worker_anki_res_rx.clone();
-            let ep_cl = worker_anki_epoch.clone();
-            let ext_cl = worker_anki_ext.clone();
-            let _ = worker_anki_app.upgrade_in_event_loop(move |app| {
-                let _ = drain_anki_results(&app, &rx_cl, &ep_cl, &ext_cl);
-            });
+                let _ = anki_res_tx.send(AnkiPopupCheckResponse {
+                    nav_epoch: req.nav_epoch,
+                    lookup_epoch: req.lookup_epoch,
+                    target_nested_depth: req.target_nested_depth,
+                    show_tags: req.show_tags,
+                    term_statuses,
+                    kanji_statuses,
+                });
+                let rx_cl = worker_anki_res_rx.clone();
+                let ep_cl = worker_anki_epoch.clone();
+                let nep_cl = worker_nested_anki_epoch.clone();
+                let ext_cl = worker_anki_ext.clone();
+                let _ = worker_anki_app.upgrade_in_event_loop(move |app| {
+                    let _ = drain_anki_results(&app, &rx_cl, &ep_cl, &nep_cl, &ext_cl);
+                });
+            }
         }
     });
 
@@ -8212,7 +10679,9 @@ pub fn install_rich_ui_bridges(
     app.global::<PopupBridge>().set_bridge_instance_id(instance_id);
 
     let stylesheets = StylesheetCache::new(config_dir);
-    let initial_popup_theme = stylesheets.theme().clone();
+    let initial_popup_theme = stylesheets
+        .theme()
+        .with_interface_font_fallbacks(stylesheets.overrides(), &settings.popup_fonts);
 
     let bridge = Rc::new(RichUiBridge {
         instance_id,
@@ -8232,9 +10701,19 @@ pub fn install_rich_ui_bridges(
             glossary_cache: HashMap::new(),
             last_rendered_key: HashMap::new(),
             selection: None,
+            root_scan_highlight: None,
+            root_expanded_cards: HashSet::new(),
+            root_row_anki_note_ids_i64: Vec::new(),
             suppress_history_reset: false,
             back_stack: Vec::new(),
             forward_stack: Vec::new(),
+            nested_stack: Vec::new(),
+            hovered_glossary_target: None,
+            nested_card_hovered: false,
+            nested_body_hovered: false,
+            nested_scan_timer: slint::Timer::default(),
+            nested_dismiss_timer: slint::Timer::default(),
+            pending_nested_anki_add: None,
             hovered_cluster: None,
             active_scan_utf16_range: None,
             pending_scan_utf16_start: None,
@@ -8249,7 +10728,12 @@ pub fn install_rich_ui_bridges(
         anki_res_rx,
         anki_poll_timer: slint::Timer::default(),
         anki_nav_epoch,
+        nested_anki_nav_epoch,
         external_lookup_epoch,
+        nested_tx,
+        nested_res_rx,
+        nested_poll_timer: slint::Timer::default(),
+        nested_epoch,
     });
 
     ACTIVE_RICH_BRIDGES.with(|slot| {
@@ -8280,7 +10764,7 @@ pub fn install_rich_ui_bridges(
 
     let b_hw_lines = bridge.clone();
     pb.on_headword_lines(move |expr, avail_w| {
-        let hw_scale = (b_hw_lines.state.borrow().stylesheets.theme().headword_size / 23.0)
+        let hw_scale = (b_hw_lines.state.borrow().effective_popup_theme().headword_size / 23.0)
             .clamp(0.5, 2.5);
         let max_w = avail_w.max(96.0);
         let mut lines: Vec<RichHeadwordLine> = Vec::new();
@@ -8313,13 +10797,13 @@ pub fn install_rich_ui_bridges(
     pb.on_headword_pitch_color(move |row_idx, _rev| {
         let st = b_hw_pitch.state.borrow();
         let cat = st.row_extras.get(&row_idx).and_then(|e| e.pitch_category);
-        rgba_to_slint_color(st.stylesheets.theme().resolve_headword_pitch_color(cat))
+        rgba_to_slint_color(st.effective_popup_theme().resolve_headword_pitch_color(cat))
     });
 
     let b_dict_style = bridge.clone();
     pb.on_dict_entry_style(move |dict_name, _is_solo, _rev| {
         let st = b_dict_style.state.borrow();
-        let resolved = st.stylesheets.theme().resolve_dict_style(dict_name.as_str());
+        let resolved = st.effective_popup_theme().resolve_dict_style(dict_name.as_str());
         PopupDictStyle {
             badge_bg: rgba_to_slint_color(resolved.badge_bg),
             badge_color: rgba_to_slint_color(resolved.badge_color),
@@ -8337,7 +10821,7 @@ pub fn install_rich_ui_bridges(
     let b_freq_style = bridge.clone();
     pb.on_freq_badge_style(move |freq_dict, _rev| {
         let st = b_freq_style.state.borrow();
-        let (bg, color) = st.stylesheets.theme().resolve_freq_style(freq_dict.as_str());
+        let (bg, color) = st.effective_popup_theme().resolve_freq_style(freq_dict.as_str());
         PopupFreqStyle {
             bg: rgba_to_slint_color(bg),
             color: rgba_to_slint_color(color),
@@ -8347,7 +10831,10 @@ pub fn install_rich_ui_bridges(
     let b_pitch_dict_bg = bridge.clone();
     pb.on_pitch_dict_bg(move |pitch_dict, _rev| {
         let st = b_pitch_dict_bg.state.borrow();
-        rgba_to_slint_color(st.stylesheets.theme().resolve_pitch_dict_bg(pitch_dict.as_str()))
+        rgba_to_slint_color(
+            st.effective_popup_theme()
+                .resolve_pitch_dict_bg(pitch_dict.as_str()),
+        )
     });
 
     pb.on_definition_grid_rows(|all_rows, term_start_index| {
@@ -8474,64 +10961,117 @@ pub fn install_rich_ui_bridges(
 
     let b_render_gloss = bridge.clone();
     pb.on_render_glossary(move |row_idx, avail_w, selected, _rev, _sel_rev| {
-        let Some(doc) = b_render_gloss.render_or_get_glossary(row_idx, avail_w, selected) else {
-            return RichGlossaryRender::default();
-        };
-        let mut sel_rects = Vec::new();
-        {
-            let st = b_render_gloss.state.borrow();
-            if let Some(ref sel) = st.selection {
-                if sel.row_index == row_idx && sel.anchor_char != sel.focus_char {
-                    let lo = sel.anchor_char.min(sel.focus_char).min(doc.selectable_chars.len());
-                    let hi = sel.anchor_char.max(sel.focus_char).min(doc.selectable_chars.len());
-                    let mut cur: Option<(usize, f32, f32, f32, f32)> = None;
-                    for cell in &doc.selectable_chars[lo..hi] {
-                        if cell.ch == '\n' || cell.w <= 0.0 {
-                            continue;
-                        }
-                        match cur {
-                            Some((lid, sx, sy, sw, sh)) if lid == cell.line_id => {
-                                let nx = sx.min(cell.x);
-                                let nw = (sx + sw).max(cell.x + cell.w) - nx;
-                                cur = Some((lid, nx, sy.min(cell.y), nw, sh.max(cell.h)));
-                            }
-                            Some((_, sx, sy, sw, sh)) => {
-                                sel_rects.push(RichSelectionRect {
-                                    x_px: sx,
-                                    y_px: sy,
-                                    w_px: sw,
-                                    h_px: sh,
-                                });
-                                cur = Some((cell.line_id, cell.x, cell.y, cell.w, cell.h));
-                            }
-                            None => {
-                                cur = Some((cell.line_id, cell.x, cell.y, cell.w, cell.h));
-                            }
-                        }
-                    }
-                    if let Some((_, sx, sy, sw, sh)) = cur {
-                        sel_rects.push(RichSelectionRect {
-                            x_px: sx,
-                            y_px: sy,
-                            w_px: sw,
-                            h_px: sh,
-                        });
-                    }
-                }
-            }
-        }
-        RichGlossaryRender {
-            has_rich: true,
-            width_px: doc.width_px,
-            height_px: doc.height_px,
-            rendered: doc.image,
-            selection_rects: Rc::new(VecModel::from(sel_rects)).into(),
-        }
+        b_render_gloss.build_rich_glossary_render(0, row_idx, avail_w, selected)
     });
 
     let b_cursor = bridge.clone();
     pb.on_glossary_cursor_is_pointer(move |row_idx, x, y| {
-        let Some(doc) = b_cursor.latest_cached_doc(row_idx) else {
+        let Some(doc) = b_cursor.latest_cached_doc_at_depth(0, row_idx) else {
+            return false;
+        };
+        doc.hit_zones.iter().any(|z| {
+            z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
+        })
+    });
+
+    // Nested child popup rich query callbacks (depth >= 1)
+    let b_nhw_pitch = bridge.clone();
+    pb.on_nested_headword_pitch_color(move |depth, row_idx, _rev| {
+        let st = b_nhw_pitch.state.borrow();
+        let cat = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .and_then(|e| e.pitch_category);
+        rgba_to_slint_color(st.effective_popup_theme().resolve_headword_pitch_color(cat))
+    });
+
+    let b_nterm_pills = bridge.clone();
+    pb.on_nested_term_tag_pills(move |depth, row_idx, _rev| {
+        let st = b_nterm_pills.state.borrow();
+        let pills = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .map(|e| e.term_pills.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(pills)).into()
+    });
+
+    let b_ndef_pills = bridge.clone();
+    pb.on_nested_def_tag_pills(move |depth, row_idx, _rev| {
+        let st = b_ndef_pills.state.borrow();
+        let pills = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .map(|e| e.def_pills.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(pills)).into()
+    });
+
+    let b_nderiv = bridge.clone();
+    pb.on_nested_derivation_steps(move |depth, row_idx, _rev| {
+        let st = b_nderiv.state.borrow();
+        let steps = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .map(|e| e.derivation_steps.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(steps)).into()
+    });
+
+    let b_nderiv_sum = bridge.clone();
+    pb.on_nested_derivation_summary(move |depth, row_idx, _rev| {
+        let st = b_nderiv_sum.state.borrow();
+        let Some(extras) = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+        else {
+            return SharedString::default();
+        };
+        if extras.derivation_steps.is_empty() {
+            return SharedString::default();
+        }
+        let joined: Vec<String> = extras
+            .derivation_steps
+            .iter()
+            .map(|s| {
+                if s.description.is_empty() {
+                    s.label.to_string()
+                } else {
+                    format!("{} ({})", s.label, s.description)
+                }
+            })
+            .collect();
+        format!("« {}", joined.join(" ← ")).into()
+    });
+
+    let b_npitches = bridge.clone();
+    pb.on_nested_rich_pitch_graphs(move |depth, row_idx, _rev| {
+        let st = b_npitches.state.borrow();
+        let graphs = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .map(|e| e.pitch_graphs.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(graphs)).into()
+    });
+
+    let b_nkanji = bridge.clone();
+    pb.on_nested_kanji_detail(move |depth, row_idx, _rev| {
+        let st = b_nkanji.state.borrow();
+        st.nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .and_then(|e| e.kanji_detail.clone())
+            .unwrap_or_default()
+    });
+
+    let b_nrender = bridge.clone();
+    pb.on_nested_render_glossary(move |depth, row_idx, avail_w, selected, _rev, _sel_rev| {
+        b_nrender.build_rich_glossary_render(depth, row_idx, avail_w, selected)
+    });
+
+    let b_ncursor = bridge.clone();
+    pb.on_nested_glossary_cursor_is_pointer(move |depth, row_idx, x, y| {
+        let Some(doc) = b_ncursor.latest_cached_doc_at_depth(depth, row_idx) else {
             return false;
         };
         doc.hit_zones.iter().any(|z| {
@@ -8606,7 +11146,7 @@ pub fn install_rich_ui_bridges(
         let Some(app) = b_act_link.app_weak.upgrade() else {
             return false;
         };
-        b_act_link.handle_internal_link_str(&app, href.as_str())
+        b_act_link.handle_internal_link_str_at_depth(&app, 0, 1, href.as_str())
     });
 
     let b_toggle_details = bridge.clone();
@@ -8614,24 +11154,34 @@ pub fn install_rich_ui_bridges(
         let Some(app) = b_toggle_details.app_weak.upgrade() else {
             return;
         };
+        b_toggle_details.toggle_glossary_details_at_depth(&app, 0, row_idx, detail_id.as_str());
+    });
+
+    let b_toggle_exp = bridge.clone();
+    pb.on_toggle_definition_expanded(move |depth, row_idx| {
+        let Some(app) = b_toggle_exp.app_weak.upgrade() else {
+            return;
+        };
         {
-            let mut st = b_toggle_details.state.borrow_mut();
-            if let Some(extras) = st.row_extras.get_mut(&row_idx) {
-                let current = extras
-                    .detail_states
-                    .get(detail_id.as_str())
-                    .copied()
-                    .unwrap_or(false);
-                extras
-                    .detail_states
-                    .insert(detail_id.to_string(), !current);
+            let mut st = b_toggle_exp.state.borrow_mut();
+            if depth == 0 {
+                if !st.root_expanded_cards.remove(&row_idx) {
+                    st.root_expanded_cards.insert(row_idx);
+                }
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                lvl.locked = true;
+                if !lvl.expanded_cards.remove(&row_idx) {
+                    lvl.expanded_cards.insert(row_idx);
+                }
             }
-            st.glossary_cache.retain(|k, _| k.row_index != row_idx);
-            st.last_rendered_key.remove(&row_idx);
         }
         let pb = app.global::<PopupBridge>();
-        pb.set_tooltip_visible(false);
-        pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        if depth == 0 {
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        } else {
+            pb.set_nested_locked(true);
+            pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
+        }
     });
 
     let b_tip_show = bridge.clone();
@@ -8655,96 +11205,22 @@ pub fn install_rich_ui_bridges(
 
     let b_g_down = bridge.clone();
     pb.on_glossary_pointer_down(move |row_idx, x, y| {
-        let Some(app) = b_g_down.app_weak.upgrade() else {
-            return;
-        };
-        let Some(doc) = b_g_down.latest_cached_doc(row_idx) else {
-            return;
-        };
-        if let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) {
-            b_g_down.state.borrow_mut().selection = Some(GlossarySelectionState {
-                row_index: row_idx,
-                anchor_char: ci,
-                focus_char: ci,
-                dragging: false,
-                press_pos: (x, y),
-            });
-            b_g_down.update_glossary_selection_text(&app);
+        if let Some(app) = b_g_down.app_weak.upgrade() {
+            b_g_down.handle_glossary_pointer_down_at_depth(&app, 0, row_idx, x, y);
         }
     });
 
     let b_g_drag = bridge.clone();
     pb.on_glossary_pointer_drag(move |row_idx, x, y| {
-        let Some(app) = b_g_drag.app_weak.upgrade() else {
-            return;
-        };
-        let Some(doc) = b_g_drag.latest_cached_doc(row_idx) else {
-            return;
-        };
-        let mut updated = false;
-        {
-            let mut st = b_g_drag.state.borrow_mut();
-            if let Some(ref mut sel) = st.selection {
-                if sel.row_index == row_idx {
-                    let dist = (x - sel.press_pos.0).hypot(y - sel.press_pos.1);
-                    if dist >= 3.0 {
-                        sel.dragging = true;
-                    }
-                    if sel.dragging {
-                        if let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) {
-                            let target = if x > doc.selectable_chars[ci].x + doc.selectable_chars[ci].w * 0.5 {
-                                (ci + 1).min(doc.selectable_chars.len())
-                            } else {
-                                ci
-                            };
-                            if sel.focus_char != target {
-                                sel.focus_char = target;
-                                updated = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if updated {
-            b_g_drag.update_glossary_selection_text(&app);
+        if let Some(app) = b_g_drag.app_weak.upgrade() {
+            b_g_drag.handle_glossary_pointer_drag_at_depth(&app, 0, row_idx, x, y);
         }
     });
 
     let b_g_up = bridge.clone();
     pb.on_glossary_pointer_up(move |row_idx, x, y| {
-        let Some(app) = b_g_up.app_weak.upgrade() else {
-            return;
-        };
-        let was_dragging = b_g_up
-            .state
-            .borrow()
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.dragging && s.anchor_char != s.focus_char);
-        if was_dragging {
-            return;
-        }
-        if let Some(doc) = b_g_up.latest_cached_doc(row_idx) {
-            if let Some(zone) = doc
-                .hit_zones
-                .iter()
-                .rev()
-                .find(|z| z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
-            {
-                match zone.action.as_ref() {
-                    Some(GlossaryZoneAction::ToggleDetails(did)) => {
-                        app.global::<PopupBridge>()
-                            .invoke_toggle_glossary_details(row_idx, did.clone().into());
-                    }
-                    Some(GlossaryZoneAction::Link(href)) => {
-                        if !b_g_up.handle_internal_link_str(&app, href) {
-                            app.invoke_open_glossary_link(href.clone().into());
-                        }
-                    }
-                    None => {}
-                }
-            }
+        if let Some(app) = b_g_up.app_weak.upgrade() {
+            b_g_up.handle_glossary_pointer_up_at_depth(&app, 0, row_idx, x, y);
         }
     });
 
@@ -8754,7 +11230,7 @@ pub fn install_rich_ui_bridges(
             return;
         };
         let pb = app.global::<PopupBridge>();
-        if let Some(doc) = b_g_hover.latest_cached_doc(row_idx) {
+        if let Some(doc) = b_g_hover.latest_cached_doc_at_depth(0, row_idx) {
             if let Some(zone) = doc.hit_zones.iter().rev().find(|z| {
                 z.tooltip.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
             }) {
@@ -8772,32 +11248,152 @@ pub fn install_rich_ui_bridges(
 
     let b_g_dbl = bridge.clone();
     pb.on_glossary_double_clicked(move |row_idx, x, y| {
-        let Some(app) = b_g_dbl.app_weak.upgrade() else {
-            return;
-        };
-        let Some(doc) = b_g_dbl.latest_cached_doc(row_idx) else {
-            return;
-        };
-        let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) else {
-            return;
-        };
-        let is_word = |c: char| c.is_alphanumeric() || is_japanese_lookup_char(c);
-        let mut lo = ci;
-        while lo > 0 && is_word(doc.selectable_chars[lo - 1].ch) {
-            lo -= 1;
+        if let Some(app) = b_g_dbl.app_weak.upgrade() {
+            b_g_dbl.handle_glossary_double_click_at_depth(&app, 0, row_idx, x, y);
         }
-        let mut hi = (ci + 1).min(doc.selectable_chars.len());
-        while hi < doc.selectable_chars.len() && is_word(doc.selectable_chars[hi].ch) {
-            hi += 1;
+    });
+
+    // Recursive hover-scan & nested popup interactive callbacks
+    let b_scan_hover = bridge.clone();
+    pb.on_glossary_scan_hover(
+        move |depth, row_idx, x, y, popup_x, popup_y, control, shift, alt, meta| {
+            if let Some(app) = b_scan_hover.app_weak.upgrade() {
+                b_scan_hover.handle_glossary_scan_hover(
+                    &app, depth, row_idx, x, y, popup_x, popup_y, control, shift, alt, meta,
+                );
+            }
+        },
+    );
+
+    let b_scan_mid = bridge.clone();
+    pb.on_glossary_scan_middle_click(move |depth, row_idx, x, y, popup_x, popup_y| {
+        if let Some(app) = b_scan_mid.app_weak.upgrade() {
+            b_scan_mid.handle_glossary_scan_middle_click(
+                &app, depth, row_idx, x, y, popup_x, popup_y,
+            );
         }
-        b_g_dbl.state.borrow_mut().selection = Some(GlossarySelectionState {
-            row_index: row_idx,
-            anchor_char: lo,
-            focus_char: hi,
-            dragging: false,
-            press_pos: (x, y),
-        });
-        b_g_dbl.update_glossary_selection_text(&app);
+    });
+
+    let b_scan_leave = bridge.clone();
+    pb.on_glossary_scan_leave(move |depth, row_idx| {
+        b_scan_leave.handle_glossary_scan_leave(depth, row_idx);
+    });
+
+    let b_ng_down = bridge.clone();
+    pb.on_nested_glossary_pointer_down(move |depth, row_idx, x, y| {
+        if let Some(app) = b_ng_down.app_weak.upgrade() {
+            b_ng_down.handle_glossary_pointer_down_at_depth(&app, depth, row_idx, x, y);
+        }
+    });
+
+    let b_ng_drag = bridge.clone();
+    pb.on_nested_glossary_pointer_drag(move |depth, row_idx, x, y| {
+        if let Some(app) = b_ng_drag.app_weak.upgrade() {
+            b_ng_drag.handle_glossary_pointer_drag_at_depth(&app, depth, row_idx, x, y);
+        }
+    });
+
+    let b_ng_up = bridge.clone();
+    pb.on_nested_glossary_pointer_up(move |depth, row_idx, x, y| {
+        if let Some(app) = b_ng_up.app_weak.upgrade() {
+            b_ng_up.handle_glossary_pointer_up_at_depth(&app, depth, row_idx, x, y);
+        }
+    });
+
+    let b_ng_dbl = bridge.clone();
+    pb.on_nested_glossary_double_clicked(move |depth, row_idx, x, y| {
+        if let Some(app) = b_ng_dbl.app_weak.upgrade() {
+            b_ng_dbl.handle_glossary_double_click_at_depth(&app, depth, row_idx, x, y);
+        }
+    });
+
+    let b_nkanji_click = bridge.clone();
+    pb.on_nested_lookup_kanji_char(move |depth, expr, ch_str| {
+        if let Some(app) = b_nkanji_click.app_weak.upgrade() {
+            b_nkanji_click.navigate_nested_kanji(&app, depth, expr.as_str(), ch_str.as_str());
+        }
+    });
+
+    let b_nsel = bridge.clone();
+    pb.on_nested_toggle_select_definition(move |depth, idx| {
+        if let Some(app) = b_nsel.app_weak.upgrade() {
+            b_nsel.toggle_nested_select_definition(&app, depth, idx);
+        }
+    });
+
+    let b_ncoll = bridge.clone();
+    pb.on_nested_toggle_term_collapse(move |depth, term_start_idx| {
+        if let Some(app) = b_ncoll.app_weak.upgrade() {
+            b_ncoll.toggle_nested_term_collapse(&app, depth, term_start_idx);
+        }
+    });
+
+    let b_nadd = bridge.clone();
+    pb.on_nested_add_anki_note(move |row_zero_idx| {
+        if let Some(app) = b_nadd.app_weak.upgrade() {
+            b_nadd.add_nested_anki_note(&app, row_zero_idx);
+        }
+    });
+
+    let b_nhover = bridge.clone();
+    pb.on_nested_popup_hover_changed(move |hovered| {
+        {
+            let mut st = b_nhover.state.borrow_mut();
+            st.nested_card_hovered = hovered;
+            if hovered {
+                st.nested_dismiss_timer.stop();
+            }
+        }
+        if !hovered {
+            b_nhover.schedule_unlocked_nested_dismiss();
+        }
+    });
+
+    let b_nbhover = bridge.clone();
+    pb.on_nested_body_hover_changed(move |hovered| {
+        {
+            let mut st = b_nbhover.state.borrow_mut();
+            st.nested_body_hovered = hovered;
+            if hovered {
+                st.nested_dismiss_timer.stop();
+            }
+        }
+        if !hovered {
+            b_nbhover.schedule_unlocked_nested_dismiss();
+        }
+    });
+
+    let b_nlock = bridge.clone();
+    pb.on_lock_nested_popup(move || {
+        let Some(app) = b_nlock.app_weak.upgrade() else {
+            return;
+        };
+        let mut locked_any = false;
+        {
+            let mut st = b_nlock.state.borrow_mut();
+            st.nested_dismiss_timer.stop();
+            if let Some(top) = st.nested_stack.last_mut() {
+                top.locked = true;
+                locked_any = true;
+            }
+        }
+        if locked_any {
+            app.global::<PopupBridge>().set_nested_locked(true);
+        }
+    });
+
+    let b_npop = bridge.clone();
+    pb.on_pop_nested_popup(move || {
+        if let Some(app) = b_npop.app_weak.upgrade() {
+            b_npop.pop_nested_popup(&app);
+        }
+    });
+
+    let b_ndismiss = bridge.clone();
+    pb.on_dismiss_all_nested_popups(move || {
+        if let Some(app) = b_ndismiss.app_weak.upgrade() {
+            b_ndismiss.dismiss_all_nested_popups(&app);
+        }
     });
 
     let b_copy = bridge.clone();
@@ -8820,14 +11416,30 @@ pub fn install_rich_ui_bridges(
     let b_pkey = bridge.clone();
     pb.on_popup_key_pressed(move |text, control, shift, alt, meta| {
         if let Some((mc, ms, ma, mm)) = is_modifier_only_key_text(text.as_str()) {
+            let c = control || mc;
+            let s = shift || ms;
+            let a = alt || ma;
+            let m = meta || mm;
             if let Some(app) = b_pkey.app_weak.upgrade() {
+                if app.get_dict_open() {
+                    let (mod_setting, target_opt) = {
+                        let st = b_pkey.state.borrow();
+                        (
+                            st.settings.search_modifier,
+                            st.hovered_glossary_target.clone(),
+                        )
+                    };
+                    if let Some(target) = target_opt {
+                        if modifier_matches_setting(mod_setting, c, s, a, m) {
+                            if !b_pkey.is_nested_target_already_shown(&target) {
+                                b_pkey.dispatch_nested_scan(&app, target, false);
+                            }
+                            return true;
+                        }
+                    }
+                }
                 app.global::<SubtitleOverlayBridge>()
-                    .invoke_stationary_modifier_changed(
-                        control || mc,
-                        shift || ms,
-                        alt || ma,
-                        meta || mm,
-                    );
+                    .invoke_stationary_modifier_changed(c, s, a, m);
             }
             return true;
         }
@@ -9250,13 +11862,23 @@ pub fn install_rich_ui_bridges(
             return;
         };
         b_stat_mod.ensure_fresh_db_and_config(&app);
-        let (mod_setting, cluster_opt) = {
+        let (mod_setting, cluster_opt, gloss_target_opt) = {
             let st = b_stat_mod.state.borrow();
-            (st.settings.search_modifier, st.hovered_cluster.clone())
+            (
+                st.settings.search_modifier,
+                st.hovered_cluster.clone(),
+                st.hovered_glossary_target.clone(),
+            )
         };
         if modifier_matches_setting(mod_setting, control, shift, alt, meta) {
             if let Some(cluster) = cluster_opt {
                 b_stat_mod.trigger_subtitle_scan_now(&app, cluster);
+            } else if app.get_dict_open() {
+                if let Some(target) = gloss_target_opt {
+                    if !b_stat_mod.is_nested_target_already_shown(&target) {
+                        b_stat_mod.dispatch_nested_scan(&app, target, false);
+                    }
+                }
             }
         }
     });
@@ -9306,24 +11928,25 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         st.dict_ctrl.set_order(&order);
         st.dict_ctrl.set_mecab_enabled(mecab_enabled);
         st.db_helper.refresh_if_needed();
-        st.rich_epoch = st.rich_epoch.wrapping_add(1);
-        st.glossary_cache.clear();
-        st.last_rendered_key.clear();
+        st.clear_all_glossary_caches();
         (
             st.settings.middle_mouse_scan,
             st.settings.subtitle_style.bg_rgba,
-            st.stylesheets.theme().clone(),
+            st.effective_popup_theme(),
         )
     };
     apply_popup_css_theme_to_bridge(app, &popup_theme);
     let pb = app.global::<PopupBridge>();
     pb.set_anki_show_tags(config.anki_show_tag());
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+    if pb.get_nested_depth() > 0 {
+        pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
+    }
     if app.get_dict_open() {
         let full = app.get_dict_results();
         let current_rows: Vec<DictResult> =
             (0..full.row_count()).filter_map(|i| full.row_data(i)).collect();
-        bridge.dispatch_anki_check_for_rows(app, &current_rows);
+        bridge.dispatch_anki_check_for_rows(app, &current_rows, None);
     }
     let sb = app.global::<SubtitleOverlayBridge>();
     sb.set_middle_mouse_scan_enabled(middle_mouse);
@@ -9351,8 +11974,72 @@ pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU
     });
 }
 
-/// Immediately updates `PopupBridge` Anki duplicate/browse/tag state for a term right after
-/// `add_note_from_profile` succeeds so the `Browse in Anki` badge stays accurate without waiting.
+/// Returns the lossless 64-bit Anki note ID for a popup row (or active nested row if
+/// `nested_depth > 0`), avoiding `i32` truncation for 13-digit AnkiConnect epoch-ms note IDs.
+pub fn popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i64> {
+    let pb = app.global::<PopupBridge>();
+    if pb.get_nested_depth() > 0 {
+        return nested_popup_row_anki_note_id_i64(app, row_idx);
+    }
+    if let Some(s) = pb.get_row_anki_note_id_strings().row_data(row_idx) {
+        if let Ok(parsed) = s.as_str().trim().parse::<i64>() {
+            if parsed > 0 {
+                return Some(parsed);
+            }
+        }
+    }
+    let instance_id = pb.get_bridge_instance_id();
+    let from_bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .and_then(|b| {
+                b.state
+                    .borrow()
+                    .root_row_anki_note_ids_i64
+                    .get(row_idx)
+                    .copied()
+                    .filter(|&id| id > 0)
+            })
+    });
+    if from_bridge.is_some() {
+        return from_bridge;
+    }
+    pb.get_row_anki_note_ids()
+        .row_data(row_idx)
+        .filter(|&id| id > 0)
+        .map(i64::from)
+}
+
+/// Returns the lossless 64-bit Anki note ID for a row in the active nested popup level.
+pub fn nested_popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i64> {
+    let pb = app.global::<PopupBridge>();
+    let instance_id = pb.get_bridge_instance_id();
+    let from_bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .and_then(|b| {
+                b.state
+                    .borrow()
+                    .nested_stack
+                    .last()
+                    .and_then(|lvl| lvl.row_anki_note_ids_i64.get(row_idx).copied())
+                    .filter(|&id| id > 0)
+            })
+    });
+    if from_bridge.is_some() {
+        return from_bridge;
+    }
+    pb.get_nested_row_anki_note_ids()
+        .row_data(row_idx)
+        .filter(|&id| id > 0)
+        .map(i64::from)
+}
+
+/// Immediately updates `PopupBridge` Anki duplicate/browse/tag/note-id state for a term right after
+/// `add_note_from_profile` succeeds so the `Browse in Anki` / `Update existing note` badges stay
+/// accurate without waiting.
 pub fn mark_popup_term_anki_added(
     app: &MementoApp,
     added_index: usize,
@@ -9360,15 +12047,14 @@ pub fn mark_popup_term_anki_added(
     profile: &crate::controller::config::AnkiNoteConfig,
     show_tags: bool,
 ) {
-    let full = app.get_dict_results();
-    let count = full.row_count();
-    let Some(target) = full.row_data(added_index) else {
-        return;
-    };
     let pb = app.global::<PopupBridge>();
-    let existing_dups = pb.get_row_anki_duplicates();
-    let existing_queries = pb.get_row_anki_browse_queries();
-    let existing_tags = pb.get_row_anki_tags();
+    let instance_id = pb.get_bridge_instance_id();
+    let active_bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .cloned()
+    });
 
     let is_same_deck = matches!(
         crate::controller::anki::AnkiDuplicatePolicy::try_from(profile.duplicate_policy),
@@ -9377,11 +12063,97 @@ pub fn mark_popup_term_anki_added(
     let nid_query = format!("nid:{note_id}");
     let joined_profile_tags = profile.tags.join(" ");
 
+    // If this add was triggered from a nested child popup, update that nested level instead of root.
+    if let Some(ref br) = active_bridge {
+        let updated_nested = {
+            let mut st = br.state.borrow_mut();
+            if let Some((depth, expr, reading, is_kanji)) = st.pending_nested_anki_add.take() {
+                if let Some(lvl) = st.nested_level_mut(depth as i32) {
+                    let matches_row = lvl.rows.get(added_index).is_some_and(|r| {
+                        r.expression.as_str() == expr
+                            && r.reading.as_str() == reading
+                            && r.is_kanji == is_kanji
+                    });
+                    if matches_row {
+                        let count = lvl.rows.len();
+                        lvl.row_anki_duplicates.resize(count, false);
+                        lvl.row_anki_note_ids_i64.resize(count, 0);
+                        lvl.row_anki_browse_queries
+                            .resize(count, SharedString::default());
+                        lvl.row_anki_tags.resize(count, SharedString::default());
+                        for idx in 0..count {
+                            let row = &lvl.rows[idx];
+                            if row.expression.as_str() == expr
+                                && row.reading.as_str() == reading
+                                && row.is_kanji == is_kanji
+                            {
+                                if !is_same_deck {
+                                    lvl.row_anki_duplicates[idx] = true;
+                                    lvl.row_anki_note_ids_i64[idx] = note_id;
+                                    lvl.row_anki_browse_queries[idx] =
+                                        SharedString::from(nid_query.as_str());
+                                }
+                                if show_tags && !joined_profile_tags.is_empty() {
+                                    let t = &lvl.row_anki_tags[idx];
+                                    let combined = if t.is_empty() {
+                                        joined_profile_tags.clone()
+                                    } else {
+                                        format!("{t} {joined_profile_tags}")
+                                    };
+                                    let dedup: Vec<String> = split_anki_tags_str(&combined)
+                                        .into_iter()
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    lvl.row_anki_tags[idx] = SharedString::from(dedup.join(" "));
+                                }
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if updated_nested {
+            pb.set_anki_show_tags(show_tags);
+            pb.set_last_added_was_nested(true);
+            br.sync_nested_popup_to_bridge(app, false);
+            return;
+        }
+    }
+
+    let full = app.get_dict_results();
+    let count = full.row_count();
+    let Some(target) = full.row_data(added_index) else {
+        return;
+    };
+    let existing_dups = pb.get_row_anki_duplicates();
+    let existing_note_ids = pb.get_row_anki_note_ids();
+    let existing_note_id_strings = pb.get_row_anki_note_id_strings();
+    let existing_queries = pb.get_row_anki_browse_queries();
+    let existing_tags = pb.get_row_anki_tags();
+
     let mut dups = Vec::with_capacity(count);
+    let mut note_ids_i32 = Vec::with_capacity(count);
+    let mut note_ids_i64 = Vec::with_capacity(count);
+    let mut note_id_strings = Vec::with_capacity(count);
     let mut queries = Vec::with_capacity(count);
     let mut tags = Vec::with_capacity(count);
     for idx in 0..count {
         let mut d = existing_dups.row_data(idx).unwrap_or(false);
+        let mut nid32 = existing_note_ids.row_data(idx).unwrap_or(0);
+        let mut nid_str = existing_note_id_strings.row_data(idx).unwrap_or_default();
+        let mut nid64 = nid_str
+            .as_str()
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .unwrap_or_else(|| i64::from(nid32));
         let mut q = existing_queries.row_data(idx).unwrap_or_default();
         let mut t = existing_tags.row_data(idx).unwrap_or_default();
         if let Some(row) = full.row_data(idx) {
@@ -9391,6 +12163,13 @@ pub fn mark_popup_term_anki_added(
             {
                 if !is_same_deck {
                     d = true;
+                    nid64 = note_id;
+                    nid32 = encode_note_id_i32(note_id);
+                    nid_str = if note_id > 0 {
+                        SharedString::from(note_id.to_string())
+                    } else {
+                        SharedString::default()
+                    };
                     q = SharedString::from(nid_query.as_str());
                 }
                 if show_tags && !joined_profile_tags.is_empty() {
@@ -9408,11 +12187,20 @@ pub fn mark_popup_term_anki_added(
             }
         }
         dups.push(d);
+        note_ids_i32.push(nid32);
+        note_ids_i64.push(nid64);
+        note_id_strings.push(nid_str);
         queries.push(q);
         tags.push(t);
     }
+    if let Some(ref br) = active_bridge {
+        br.state.borrow_mut().root_row_anki_note_ids_i64 = note_ids_i64;
+    }
+    pb.set_last_added_was_nested(false);
     pb.set_anki_show_tags(show_tags);
     pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+    pb.set_row_anki_note_ids(Rc::new(VecModel::from(note_ids_i32)).into());
+    pb.set_row_anki_note_id_strings(Rc::new(VecModel::from(note_id_strings)).into());
     pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
     pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
     pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
