@@ -1522,4 +1522,1029 @@ mod rich_popup_phase4_tests {
         let s0 = term2_pairs.row_data(0).unwrap();
         assert!(!s0.has_right && s0.is_solo && s0.left.index == 4);
     }
+
+    fn build_recursive_scan_fixture() -> TempRichFixture {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "memento-v2-recursive-{}-{seq}-{nanos}",
+            std::process::id()
+        ));
+        let config_dir = root.join("config");
+        let dict_resources = config_dir.join("dict_resources");
+        fs::create_dir_all(&dict_resources).unwrap();
+        let db_path = config_dir.join("dictionaries.sqlite");
+
+        let index_daijisen = serde_json::json!({
+            "title": "大辞泉",
+            "format": 3,
+            "revision": "1"
+        })
+        .to_string();
+
+        let gloss_root = serde_json::json!({
+            "type": "structured-content",
+            "content": [
+                {
+                    "tag": "div",
+                    "content": "世界の言葉を指す。特に日常会話で広く使われる表現の一つであり、文脈によって様々な意味を持つ。さらに多くの用例が存在するため複数行にわたって詳しく解説される。最後に補足説明が続く。"
+                },
+                {
+                    "tag": "div",
+                    "content": [
+                        "参照：",
+                        {
+                            "tag": "a",
+                            "href": "?query=リンク先",
+                            "content": "リンク先"
+                        }
+                    ]
+                }
+            ]
+        });
+        let gloss_kotoba = serde_json::json!({
+            "type": "structured-content",
+            "content": [
+                {
+                    "tag": "div",
+                    "content": "文字や音声で思想を伝える手段。"
+                }
+            ]
+        });
+        let gloss_moji = serde_json::json!({
+            "type": "structured-content",
+            "content": [
+                {
+                    "tag": "div",
+                    "content": "言葉を書き表すための記号。"
+                }
+            ]
+        });
+        let gloss_link = serde_json::json!({
+            "type": "structured-content",
+            "content": [
+                {
+                    "tag": "div",
+                    "content": "明示的リンクの移動先。"
+                }
+            ]
+        });
+
+        let terms_daijisen = serde_json::json!([
+            ["大辞泉語", "だいじせんご", "n", "", 100, [gloss_root], 1, ""],
+            ["言葉", "ことば", "n", "", 95, [gloss_kotoba], 2, ""],
+            ["文字", "もじ", "n", "", 90, [gloss_moji], 3, ""],
+            ["リンク先", "りんくさき", "n", "", 85, [gloss_link], 4, ""],
+            ["世界", "せかい", "n", "", 80, ["地球上のすべての国や地域。"], 5, ""]
+        ])
+        .to_string();
+
+        let zip1 = root.join("daijisen.zip");
+        write_yomi_zip(
+            &zip1,
+            &[
+                ("index.json", index_daijisen.as_bytes()),
+                ("term_bank_1.json", terms_daijisen.as_bytes()),
+            ],
+        );
+
+        let index_jmdict = serde_json::json!({
+            "title": "JMdict [2025]",
+            "format": 3,
+            "revision": "1"
+        })
+        .to_string();
+        let terms_jmdict = serde_json::json!([
+            [
+                "大辞泉語",
+                "だいじせんご",
+                "n",
+                "",
+                70,
+                ["line one English\nline two 言葉\nline three details\nline four extra\nline five tail"],
+                10,
+                ""
+            ]
+        ])
+        .to_string();
+        let zip2 = root.join("jmdict.zip");
+        write_yomi_zip(
+            &zip2,
+            &[
+                ("index.json", index_jmdict.as_bytes()),
+                ("term_bank_1.json", terms_jmdict.as_bytes()),
+            ],
+        );
+
+        let dic_id =
+            yomidbbuilder::process_dictionary(&zip1, &db_path, &dict_resources).unwrap();
+        let _ = yomidbbuilder::process_dictionary(&zip2, &db_path, &dict_resources).unwrap();
+        TempRichFixture {
+            root,
+            config_dir,
+            db_path,
+            dic_id,
+        }
+    }
+
+    fn wait_for_nested_depth(app: &MementoApp, expected_depth: i32) {
+        let pb = app.global::<PopupBridge>();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(12));
+            if pb.get_nested_depth() == expected_depth && !pb.get_nested_searching() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        panic!(
+            "timed out waiting for nested_depth={expected_depth}, got depth={}, searching={}",
+            pb.get_nested_depth(),
+            pb.get_nested_searching()
+        );
+    }
+
+    #[test]
+    fn deliverable1_no_x_close_button_and_escape_closes_popup() {
+        init_no_event_loop();
+        let fixture = build_recursive_scan_fixture();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+            let close_buttons = ElementQuery::from_root(&app)
+                .match_id("YomitanPopup::close-touch")
+                .find_all();
+            assert!(
+                close_buttons.is_empty(),
+                "X close button must be completely removed from YomitanPopup"
+            );
+        }
+
+        // Pressing Escape must dismiss the popup cleanly.
+        let esc = slint::SharedString::from(slint::platform::Key::Escape);
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc });
+        assert!(
+            !app.get_dict_open(),
+            "Escape key must still close the popup after X button removal"
+        );
+    }
+
+    #[test]
+    fn deliverable2_recursive_scan_hit_test_and_soft_wrap_substring_extraction() {
+        init_no_event_loop();
+        let raw = r#"[{"type":"structured-content","content":"世界の言葉を指す。English text here."}]"#;
+        let doc = memento_app::render_structured_glossary_entry_in_dirs(
+            raw,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "大辞泉",
+            280.0,
+            true,
+        )
+        .expect("doc should render");
+
+        // Blank right-edge / negative margin must return None on strict hit test.
+        assert_eq!(memento_app::strict_char_index_at_point(&doc, -5.0, 5.0), None);
+        assert_eq!(
+            memento_app::strict_char_index_at_point(&doc, doc.width_px + 20.0, 5.0),
+            None
+        );
+
+        // Pointing at '言' inside "世界の言葉を指す。" must map strictly to '言' and extract up to '。'.
+        let k_idx = doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '言')
+            .expect("must contain 言");
+        let cell = &doc.selectable_chars[k_idx];
+        let hit = memento_app::strict_char_index_at_point(
+            &doc,
+            cell.x + cell.w * 0.5,
+            cell.y + cell.h * 0.5,
+        );
+        assert_eq!(hit, Some(k_idx));
+
+        let (sub, indices) =
+            memento_app::extract_glossary_scan_substring(&doc.selectable_chars, k_idx, 24)
+                .expect("should extract Japanese scan substring");
+        assert_eq!(sub, "言葉を指す");
+        assert_eq!(indices.len(), sub.chars().count());
+
+        // Pointing at English letter 'E' must NOT extract a Japanese scan substring.
+        let e_idx = doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == 'E')
+            .expect("must contain E");
+        assert_eq!(
+            memento_app::extract_glossary_scan_substring(&doc.selectable_chars, e_idx, 24),
+            None
+        );
+
+        // Narrow width forces soft line wrap inside a long Japanese phrase; extraction must bridge it.
+        let wrapped_raw =
+            r#"[{"type":"structured-content","content":"日本語辞書の解説文を続けて読む。"}]"#;
+        let narrow_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            wrapped_raw,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "大辞泉",
+            120.0,
+            true,
+        )
+        .expect("narrow doc should render");
+        assert!(
+            narrow_doc.line_bottoms.len() >= 2,
+            "narrow width must wrap onto multiple lines (got {})",
+            narrow_doc.line_bottoms.len()
+        );
+        let first_ja = narrow_doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '日')
+            .unwrap();
+        let (bridged, bridged_indices) =
+            memento_app::extract_glossary_scan_substring(&narrow_doc.selectable_chars, first_ja, 24)
+                .expect("should bridge soft line wrap");
+        assert_eq!(bridged, "日本語辞書の解説文を続けて読む");
+        assert_eq!(bridged_indices.len(), bridged.chars().count());
+    }
+
+    #[test]
+    fn deliverable2_recursive_nested_popup_hover_modifier_middle_click_drag_guard_stacking_and_2col() {
+        init_no_event_loop();
+        let fixture = build_recursive_scan_fixture();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        cfg.edit_setting("search/method", "0").unwrap(); // Hover
+        cfg.edit_setting("search/delay", "120").unwrap();
+        cfg.edit_setting("search/modifier", "2").unwrap(); // Shift
+        cfg.edit_setting("search/middle-mouse-scan", "false")
+            .unwrap();
+
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+        let rev = pb.get_rich_revision();
+        let sel_rev = pb.get_selection_revision();
+        let rendered = pb.invoke_render_glossary(1, 360.0, true, rev, sel_rev);
+        assert!(rendered.has_rich);
+
+        // Compute exact character coordinates for '言' in row 1's rendered doc.
+        let hit0 = &hits[0];
+        let ref_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            &hit0.raw_glossary,
+            &hit0.glossary,
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            hit0.dictionary_id,
+            &hit0.dict_name,
+            360.0,
+            true,
+        )
+        .unwrap();
+        let k_idx = ref_doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '言')
+            .unwrap();
+        let k_cell = &ref_doc.selectable_chars[k_idx];
+        let kx = k_cell.x + k_cell.w * 0.5;
+        let ky = k_cell.y + k_cell.h * 0.5;
+
+        // 1. Hover schedules scan after search_delay_ms; mouse-down MUST cancel it and preserve drag-select.
+        pb.invoke_glossary_scan_hover(0, 1, kx, ky, 120.0, 140.0, false, false, false, false);
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "hover must respect search_delay_ms before opening nested popup"
+        );
+        pb.invoke_glossary_pointer_down(1, kx, ky);
+        pb.invoke_glossary_pointer_drag(1, kx + 40.0, ky);
+        pb.invoke_glossary_pointer_up(1, kx + 40.0, ky);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(260));
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "mouse-down for drag-selection must cancel pending recursive hover-scan timer"
+        );
+        assert!(
+            !pb.get_selected_glossary_text().is_empty(),
+            "drag-to-select glossary text must remain fully intact"
+        );
+
+        // 2. Clean hover triggers async nested lookup for 言葉 + continuous blue highlight on parent.
+        pb.invoke_glossary_scan_hover(0, 1, kx, ky, 120.0, 140.0, false, false, false, false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(140));
+        wait_for_nested_depth(&app, 1);
+        assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        assert_eq!(pb.get_nested_breadcrumb().as_str(), "言葉");
+        assert!(pb.get_nested_results().row_count() >= 1);
+        assert!(!pb.get_nested_locked());
+
+        let parent_hl = pb.invoke_render_glossary(
+            1,
+            360.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(
+            parent_hl.scan_highlight_rects.row_count() >= 1,
+            "parent glossary must display continuous blue highlight on matched nested word"
+        );
+
+        // 3. Recursive depth-2 lookup inside depth-1 nested glossary (文字).
+        let nrender = pb.invoke_nested_render_glossary(
+            1,
+            1,
+            320.0,
+            true,
+            pb.get_nested_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(nrender.has_rich);
+        let kotoba_hits = dict.search("言葉").to_vec();
+        let ref_doc_1 = memento_app::render_structured_glossary_entry_in_dirs(
+            &kotoba_hits[0].raw_glossary,
+            &kotoba_hits[0].glossary,
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            kotoba_hits[0].dictionary_id,
+            &kotoba_hits[0].dict_name,
+            320.0,
+            true,
+        )
+        .unwrap();
+        let m_idx = ref_doc_1
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '文')
+            .unwrap();
+        let m_cell = &ref_doc_1.selectable_chars[m_idx];
+        pb.invoke_glossary_scan_hover(
+            1,
+            1,
+            m_cell.x + m_cell.w * 0.5,
+            m_cell.y + m_cell.h * 0.5,
+            160.0,
+            180.0,
+            false,
+            false,
+            false,
+            false,
+        );
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(140));
+        wait_for_nested_depth(&app, 2);
+        assert_eq!(pb.get_nested_headword().as_str(), "文字");
+        assert_eq!(pb.get_nested_breadcrumb().as_str(), "言葉 › 文字");
+
+        // 4. Pressing Escape pops one nested level at a time without losing the parent popup!
+        let esc = slint::SharedString::from(slint::platform::Key::Escape);
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc.clone() });
+        assert_eq!(pb.get_nested_depth(), 1);
+        assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        assert!(app.get_dict_open());
+        assert_eq!(app.get_dict_query().as_str(), "大辞泉語");
+
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+        app.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc });
+        assert_eq!(pb.get_nested_depth(), 0);
+        assert!(app.get_dict_open());
+        let parent_after_pop = pb.invoke_render_glossary(
+            1,
+            360.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert_eq!(
+            parent_after_pop.scan_highlight_rects.row_count(),
+            0,
+            "blue scan highlight must clear when child popup is dismissed"
+        );
+
+        // 5. Unlocked child dismisses after hover-leave grace period; locked child stays open.
+        pb.invoke_glossary_scan_hover(0, 1, kx, ky, 120.0, 140.0, false, false, false, false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(140));
+        wait_for_nested_depth(&app, 1);
+        pb.invoke_glossary_scan_leave(0, 1);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(320));
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "leaving an unlocked child popup must dismiss it cleanly without closing parent"
+        );
+        assert!(app.get_dict_open());
+
+        pb.invoke_glossary_scan_hover(0, 1, kx, ky, 120.0, 140.0, false, false, false, false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(140));
+        wait_for_nested_depth(&app, 1);
+        pb.invoke_lock_nested_popup();
+        assert!(pb.get_nested_locked());
+        pb.invoke_glossary_scan_leave(0, 1);
+        pb.invoke_nested_popup_hover_changed(false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(350));
+        assert_eq!(
+            pb.get_nested_depth(),
+            1,
+            "locked child popup must stay open after hover-leave"
+        );
+        pb.invoke_dismiss_all_nested_popups();
+        assert_eq!(pb.get_nested_depth(), 0);
+
+        // 6. Modifier scan mode (search/method = 1, Shift): hover without Shift does nothing, Shift triggers!
+        cfg.edit_setting("search/method", "1").unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        let _ = pb.invoke_render_glossary(
+            1,
+            360.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        pb.invoke_glossary_scan_hover(0, 1, kx, ky, 120.0, 140.0, false, false, false, false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(260));
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "Modifier mode must not scan when modifier key is not held"
+        );
+        let shift_text = slint::SharedString::from(slint::platform::Key::Shift);
+        assert!(pb.invoke_popup_key_pressed(shift_text, false, true, false, false));
+        wait_for_nested_depth(&app, 1);
+        assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        pb.invoke_dismiss_all_nested_popups();
+
+        // 7. Middle-mouse scan respects search/middle-mouse-scan toggle and opens locked child.
+        pb.invoke_glossary_scan_middle_click(0, 1, kx, ky, 120.0, 140.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "middle-mouse scan must be ignored when search/middle-mouse-scan is false"
+        );
+        cfg.edit_setting("search/middle-mouse-scan", "true")
+            .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        let _ = pb.invoke_render_glossary(
+            1,
+            360.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        pb.invoke_glossary_scan_middle_click(0, 1, kx, ky, 120.0, 140.0);
+        wait_for_nested_depth(&app, 1);
+        assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        assert!(
+            pb.get_nested_locked(),
+            "middle-click nested scan should open locked so user can interact immediately"
+        );
+        pb.invoke_dismiss_all_nested_popups();
+
+        // 8. 2-column mode (`--definition-columns: 2`): scanning row 2 (right column) works and highlights only row 2!
+        fs::write(
+            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            ":root { --definition-columns: 2; }",
+        )
+        .unwrap();
+        cfg.edit_setting("search/method", "0").unwrap();
+        cfg.edit_setting("search/delay", "0").unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        assert_eq!(pb.get_css_definition_columns(), 2);
+        let _ = pb.invoke_render_glossary(
+            1,
+            240.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        let r2 = pb.invoke_render_glossary(
+            2,
+            240.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(r2.has_rich, "second column row must render in 2-col layout");
+        let hit1 = &hits[1];
+        let ref_doc_col2 = memento_app::render_structured_glossary_entry_in_dirs(
+            &hit1.raw_glossary,
+            &hit1.glossary,
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            hit1.dictionary_id,
+            &hit1.dict_name,
+            240.0,
+            true,
+        )
+        .unwrap();
+        let col2_k_idx = ref_doc_col2
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '言')
+            .unwrap();
+        let c2 = &ref_doc_col2.selectable_chars[col2_k_idx];
+        pb.invoke_glossary_scan_hover(
+            0,
+            2,
+            c2.x + c2.w * 0.5,
+            c2.y + c2.h * 0.5,
+            340.0,
+            160.0,
+            false,
+            false,
+            false,
+            false,
+        );
+        wait_for_nested_depth(&app, 1);
+        assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        let col1_after = pb.invoke_render_glossary(
+            1,
+            240.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        let col2_after = pb.invoke_render_glossary(
+            2,
+            240.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert_eq!(col1_after.scan_highlight_rects.row_count(), 0);
+        assert!(col2_after.scan_highlight_rects.row_count() >= 1);
+
+        // 9. Explicit `?query=` links keep working cleanly.
+        assert!(pb.invoke_activate_glossary_link("?query=リンク先".into()));
+        assert_eq!(app.get_dict_query().as_str(), "リンク先");
+        assert_eq!(
+            pb.get_nested_depth(),
+            0,
+            "top-level navigation must dismiss stale nested popups"
+        );
+    }
+
+    #[test]
+    fn deliverable3_collapsible_definition_line_count_css_and_toggle_state() {
+        init_no_event_loop();
+        // Template documents --collapsible-definition-line-count and still parses as default theme.
+        let tmpl = memento_app::default_custom_popup_css_template();
+        assert!(
+            tmpl.contains("--collapsible-definition-line-count"),
+            "default popup.css template must document --collapsible-definition-line-count"
+        );
+        assert_eq!(
+            memento_app::parse_split_popup_css_theme(
+                tmpl,
+                memento_app::default_custom_popup_outer_css_template()
+            ),
+            memento_app::PopupCssTheme::default()
+        );
+
+        // CSS parsing: :root default + exact/prefix/contains/suffix overrides + 0/none disable.
+        let css = r#"
+            :root {
+                --collapsible-definition-line-count: 4;
+            }
+            [data-dictionary="大辞泉"] {
+                --collapsible-definition-line-count: 2;
+            }
+            [data-dictionary^="JMdict"] {
+                --collapsible-definition-line-count: 0;
+            }
+            [data-dictionary*="明鏡"] {
+                --collapsible-definition-line-count: none;
+            }
+            [data-dictionary$="版"] {
+                --collapsible-definition-line-count: 5;
+            }
+        "#;
+        let theme = memento_app::parse_popup_css_theme(css);
+        assert_eq!(theme.resolve_dict_style("OtherDict").collapsible_line_count, 4);
+        assert_eq!(theme.resolve_dict_style("大辞泉").collapsible_line_count, 2);
+        assert_eq!(
+            theme.resolve_dict_style("JMdict [2025]").collapsible_line_count,
+            0
+        );
+        assert_eq!(
+            theme.resolve_dict_style("明鏡国語辞典").collapsible_line_count,
+            0
+        );
+        assert_eq!(theme.resolve_dict_style("広辞苑第七版").collapsible_line_count, 5);
+
+        // End-to-end RichGlossaryRender collapse + toggle + reset on new lookup.
+        let fixture = build_recursive_scan_fixture();
+        fs::write(
+            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            css,
+        )
+        .unwrap();
+
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+        // Row 1 is 大辞泉 (limit 2 lines, content wraps to >= 4 lines at 260px width).
+        let card1 = pb.invoke_render_glossary(
+            1,
+            260.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(card1.has_rich);
+        assert!(
+            card1.total_lines > 2,
+            "大辞泉 test entry should span > 2 lines, got {}",
+            card1.total_lines
+        );
+        assert!(card1.collapsible, "大辞泉 card exceeding 2 lines must be collapsible");
+        assert!(
+            card1.collapsed_height > 0.0 && card1.collapsed_height < card1.height_px,
+            "collapsed height ({}) must be strictly smaller than full height ({})",
+            card1.collapsed_height,
+            card1.height_px
+        );
+        assert!(!card1.expanded);
+
+        // Row 2 is JMdict [2025] (limit 0 -> disabled).
+        let card2 = pb.invoke_render_glossary(
+            2,
+            260.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(card2.has_rich);
+        assert!(
+            !card2.collapsible,
+            "JMdict card with --collapsible-definition-line-count: 0 must not collapse"
+        );
+
+        // Toggle expand -> expanded becomes true; toggle again -> false.
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+            let toggle_bar = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::collapse-toggle-bar")
+                .find_first()
+                .expect("collapsed card must render collapse-toggle-bar in Slint UI");
+            assert!(toggle_bar.size().height >= 20.0);
+            let h_collapsed = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::rich-surface")
+                .find_first()
+                .expect("rich-surface must exist")
+                .size()
+                .height;
+            let expand_touch = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::expand-touch")
+                .find_first()
+                .expect("expand-touch must exist");
+            expand_touch.mock_single_click(slint::platform::PointerEventButton::Left);
+            let h_expanded = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::rich-surface")
+                .find_first()
+                .expect("rich-surface must exist after expand")
+                .size()
+                .height;
+            assert!(
+                h_expanded > h_collapsed + 5.0,
+                "clicking Show more must expand rich-surface height ({h_collapsed} -> {h_expanded})"
+            );
+            // Collapse back via click so subsequent checks start from collapsed state.
+            let collapse_touch = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::expand-touch")
+                .find_first()
+                .expect("expand-touch must still exist for Show less");
+            collapse_touch.mock_single_click(slint::platform::PointerEventButton::Left);
+        }
+        pb.invoke_toggle_definition_expanded(0, 1);
+        let card1_exp = pb.invoke_render_glossary(
+            1,
+            260.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(card1_exp.expanded);
+        pb.invoke_toggle_definition_expanded(0, 1);
+        let card1_col = pb.invoke_render_glossary(
+            1,
+            260.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(!card1_col.expanded);
+
+        // Expand again, then run a fresh lookup -> expand state must reset to collapsed!
+        pb.invoke_toggle_definition_expanded(0, 1);
+        let fresh_rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, fresh_rows);
+        let card1_reset = pb.invoke_render_glossary(
+            1,
+            260.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        assert!(
+            !card1_reset.expanded,
+            "per-card expand state must reset on a new lookup"
+        );
+    }
+
+    #[test]
+    fn deliverable4_anki_update_hook_first_term_ready_font_fallbacks_and_subtitle_line_spacing() {
+        init_no_event_loop();
+        let fixture = build_recursive_scan_fixture();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+
+        let pb = app.global::<PopupBridge>();
+
+        // 1. first-term-ready hook fires on top-level term lookup, NOT on kanji-only lookups.
+        let ready_events: Rc<std::cell::RefCell<Vec<(String, String)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ready_cl = ready_events.clone();
+        pb.on_first_term_ready(move |expr, reading| {
+            ready_cl
+                .borrow_mut()
+                .push((expr.to_string(), reading.to_string()));
+        });
+
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        assert_eq!(
+            ready_events.borrow().as_slice(),
+            &[("大辞泉語".to_owned(), "だいじせんご".to_owned())],
+            "first-term-ready must emit once for the first term result"
+        );
+
+        // Kanji-only rows must NOT trigger first-term-ready.
+        ready_events.borrow_mut().clear();
+        let kanji_row = DictResult {
+            index: 1,
+            expression: "世".into(),
+            reading: "セイ".into(),
+            is_kanji: true,
+            term_start: true,
+            term_end: true,
+            ..Default::default()
+        };
+        set_dictionary_rows(&app, vec![kanji_row]);
+        assert!(
+            ready_events.borrow().is_empty(),
+            "kanji-only lookup must not emit first-term-ready"
+        );
+
+        // History navigation Back restore must NOT re-emit first-term-ready.
+        let rows_for_nav = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows_for_nav);
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+        assert!(pb.invoke_activate_glossary_link("?query=リンク先".into()));
+        assert!(pb.get_can_go_back());
+        ready_events.borrow_mut().clear();
+        pb.invoke_nav_back();
+        assert_eq!(app.get_dict_query().as_str(), "大辞泉語");
+        assert!(
+            ready_events.borrow().is_empty(),
+            "nav-back history restore must not re-emit first-term-ready"
+        );
+
+        // Restore term rows for Anki update button test.
+        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        set_dictionary_rows(&app, rows);
+        app.set_anki_enabled(true);
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+
+        // 2. Duplicate Update existing note button + row-anki-note-ids + lossless 64-bit note ID helper.
+        let update_calls: Rc<std::cell::RefCell<Vec<(i32, i32, String, String, String)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let update_cl = update_calls.clone();
+        pb.on_update_anki_note_requested(move |row_idx, note_id, expr, reading, gloss| {
+            update_cl.borrow_mut().push((
+                row_idx,
+                note_id,
+                expr.to_string(),
+                reading.to_string(),
+                gloss.to_string(),
+            ));
+        });
+
+        let profile = memento_app::controller::config::AnkiNoteConfig {
+            enabled: true,
+            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            deck: "Japanese".to_owned(),
+            model: "Sentence".to_owned(),
+            field_templates: HashMap::new(),
+            tags: vec!["memento".to_owned()],
+            duplicate_policy: 1, // DifferentDeck -> marks duplicate
+            screenshot_type: 0,
+            audio_pad_start: 0.0,
+            audio_pad_end: 0.0,
+            audio_normalize: false,
+            audio_db: -20.0,
+            newline_replacer: "<br>".to_owned(),
+        };
+        memento_app::mark_popup_term_anki_added(&app, 0, 123_456_789, &profile, false);
+        assert_eq!(pb.get_row_anki_duplicates().row_data(0), Some(true));
+        assert_eq!(pb.get_row_anki_note_ids().row_data(0), Some(123_456_789));
+        assert_eq!(
+            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            Some(123_456_789)
+        );
+        app.show().unwrap();
+
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+            let update_btn = ElementQuery::from_root(&app)
+                .match_id("YomitanPopup::update-anki-touch")
+                .find_first()
+                .expect("Update existing note button must render for duplicate rows with note_id > 0");
+            update_btn.mock_single_click(slint::platform::PointerEventButton::Left);
+            let calls = update_calls.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, 0);
+            assert_eq!(calls[0].1, 123_456_789);
+            assert_eq!(calls[0].2, "大辞泉語");
+            assert_eq!(calls[0].3, "だいじせんご");
+        }
+
+        // Large 13-digit AnkiConnect epoch-ms note ID must clamp positive (i32::MAX) in Slint
+        // while staying lossless via popup_row_anki_note_id_i64!
+        let large_nid: i64 = 1_732_000_000_123;
+        memento_app::mark_popup_term_anki_added(&app, 0, large_nid, &profile, false);
+        assert_eq!(pb.get_row_anki_note_ids().row_data(0), Some(i32::MAX));
+        assert_eq!(
+            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            Some(large_nid)
+        );
+
+        // 3. Interface search-*-font fallbacks apply when popup.css doesn't override, and yield when popup.css does.
+        cfg.edit_setting(
+            "interface/search-expression-font",
+            "IPAexMincho,21,-1,5,75,0,0,0,0,0",
+        )
+        .unwrap();
+        cfg.edit_setting(
+            "interface/search-reading-font",
+            "IPAexGothic,11,-1,5,50,0,0,0,0,0",
+        )
+        .unwrap();
+        cfg.edit_setting(
+            "interface/search-conj-font",
+            "DejaVu Sans,10,-1,5,50,0,0,0,0,0",
+        )
+        .unwrap();
+        cfg.edit_setting(
+            "interface/search-tag-font",
+            "Liberation Sans,9,-1,5,75,0,0,0,0,0",
+        )
+        .unwrap();
+        cfg.edit_setting(
+            "interface/search-glossary-font",
+            "Source Han Sans JP,12,-1,5,50,0,0,0,0,0",
+        )
+        .unwrap();
+        cfg.edit_setting(
+            "interface/search-kanji-font",
+            "KanjiStrokeOrders,36,-1,5,50,0,0,0,0,0",
+        )
+        .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+
+        assert_eq!(pb.get_css_headword_font_family().as_str(), "IPAexMincho");
+        assert!((pb.get_css_headword_size() - 28.0).abs() < 0.2);
+        assert_eq!(pb.get_css_reading_font_family().as_str(), "IPAexGothic");
+        assert_eq!(pb.get_css_conj_font_family().as_str(), "DejaVu Sans");
+        assert_eq!(pb.get_css_tag_font_family().as_str(), "Liberation Sans");
+        assert_eq!(pb.get_css_font_family().as_str(), "Source Han Sans JP");
+        assert!((pb.get_css_glossary_font_size() - 16.0).abs() < 0.2);
+        assert_eq!(pb.get_css_kanji_font_family().as_str(), "KanjiStrokeOrders");
+        assert!((pb.get_css_kanji_font_size() - 48.0).abs() < 0.2);
+
+        // Explicit popup.css overrides must beat interface font fallbacks.
+        fs::write(
+            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            r#"
+            :root { --font-family: "OverrideGlobal"; --glossary-font-size: 18px; }
+            .headword { font-family: "OverrideHeadword"; font-size: 31px; }
+            "#,
+        )
+        .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        assert_eq!(pb.get_css_font_family().as_str(), "OverrideGlobal");
+        assert!((pb.get_css_glossary_font_size() - 18.0).abs() < 0.1);
+        assert_eq!(pb.get_css_headword_font_family().as_str(), "OverrideHeadword");
+        assert!((pb.get_css_headword_size() - 31.0).abs() < 0.1);
+
+        // 4. Subtitle line spacing (interface/sub-line-spacing) increases rendered subtitle token height.
+        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
+        let sample_word = memento_app::SubtitleWord {
+            index: 0,
+            text: "世界".into(),
+            reading: "せかい".into(),
+            query: "世界".into(),
+        };
+        cfg.edit_setting("interface/sub-line-spacing", "0.0")
+            .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        let m0 = sb.invoke_render_token(
+            sample_word.clone(),
+            36.0,
+            true,
+            false,
+            sb.get_style_revision(),
+            sb.get_highlight_revision(),
+        );
+        cfg.edit_setting("interface/sub-line-spacing", "14.0")
+            .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        let m14 = sb.invoke_render_token(
+            sample_word,
+            36.0,
+            true,
+            false,
+            sb.get_style_revision(),
+            sb.get_highlight_revision(),
+        );
+        assert!(
+            m14.height_px >= m0.height_px + 13.0,
+            "subtitle line-spacing=14 must increase rendered token height (m0={}, m14={})",
+            m0.height_px,
+            m14.height_px
+        );
+        assert!(
+            m14.glyph_y_px >= m0.glyph_y_px + 6.0,
+            "subtitle line-spacing must center glyphs cleanly (y0={}, y14={})",
+            m0.glyph_y_px,
+            m14.glyph_y_px
+        );
+    }
 }

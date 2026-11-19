@@ -98,6 +98,11 @@ export struct RichGlossaryRender {
     height_px: float,
     rendered: image,
     selection_rects: [RichSelectionRect],
+    scan_highlight_rects: [RichSelectionRect],
+    collapsible: bool,
+    collapsed_height: length,
+    total_lines: int,
+    expanded: bool,
 }
 
 export struct PopupDictStyle {
@@ -162,6 +167,14 @@ export global PopupBridge {
     in-out property <color> css-reading-color: #94A3B8;
     in-out property <length> css-reading-size: 12px;
     in-out property <string> css-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-headword-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-reading-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-conj-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-conj-font-size: 11px;
+    in-out property <string> css-tag-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-tag-font-size: 11px;
+    in-out property <string> css-kanji-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-kanji-font-size: 0px;
     in-out property <length> css-glossary-font-size: 14.5px;
     in-out property <color> css-link-color: #93C5FD;
     in-out property <color> css-divider-color: #30373D;
@@ -208,8 +221,29 @@ export global PopupBridge {
     in-out property <bool> anki-show-tags: false;
     in-out property <bool> anki-checking: false;
     in-out property <[bool]> row-anki-duplicates: [];
+    in-out property <[int]> row-anki-note-ids: [];
+    in-out property <[string]> row-anki-note-id-strings: [];
     in-out property <[string]> row-anki-browse-queries: [];
     in-out property <[string]> row-anki-tags: [];
+
+    // Recursive nested child popup state (depth 1..=4)
+    in-out property <int> nested-depth: 0;
+    in-out property <int> nested-max-depth: 4;
+    in-out property <int> nested-revision: 0;
+    in-out property <int> nested-nav-revision: 0;
+    in-out property <bool> nested-locked: false;
+    in-out property <bool> nested-searching: false;
+    in-out property <string> nested-breadcrumb: "";
+    in-out property <string> nested-headword: "";
+    in-out property <string> nested-reading: "";
+    in-out property <float> nested-anchor-x: 0.0;
+    in-out property <float> nested-anchor-y: 0.0;
+    in-out property <[DictResult]> nested-results: [];
+    in-out property <[bool]> nested-row-anki-duplicates: [];
+    in-out property <[int]> nested-row-anki-note-ids: [];
+    in-out property <[string]> nested-row-anki-browse-queries: [];
+    in-out property <[string]> nested-row-anki-tags: [];
+    in-out property <bool> last-added-was-nested: false;
 
     // Rich query callbacks
     pure callback headword-chars(string) -> [RichHeadwordChar];
@@ -230,6 +264,17 @@ export global PopupBridge {
     pure callback render-glossary(int, float, bool, int, int) -> RichGlossaryRender;
     pure callback glossary-cursor-is-pointer(int, float, float) -> bool;
 
+    // Nested child popup rich query callbacks (depth >= 1)
+    pure callback nested-headword-pitch-color(int, int, int) -> color;
+    pure callback nested-term-tag-pills(int, int, int) -> [RichTagPill];
+    pure callback nested-def-tag-pills(int, int, int) -> [RichTagPill];
+    pure callback nested-derivation-steps(int, int, int) -> [RichDerivationStep];
+    pure callback nested-derivation-summary(int, int, int) -> string;
+    pure callback nested-rich-pitch-graphs(int, int, int) -> [RichPitchGraph];
+    pure callback nested-kanji-detail(int, int, int) -> RichKanjiDetail;
+    pure callback nested-render-glossary(int, int, float, bool, int, int) -> RichGlossaryRender;
+    pure callback nested-glossary-cursor-is-pointer(int, int, float, float) -> bool;
+
     // Interactive actions
     callback nav-back();
     callback nav-forward();
@@ -237,6 +282,7 @@ export global PopupBridge {
     callback toggle-kana-reading-search(string, string);
     callback activate-glossary-link(string) -> bool;
     callback toggle-glossary-details(int, string);
+    callback toggle-definition-expanded(int, int);
     callback show-tooltip(string, float, float);
     callback hide-tooltip();
     callback glossary-pointer-down(int, float, float);
@@ -244,9 +290,29 @@ export global PopupBridge {
     callback glossary-pointer-up(int, float, float);
     callback glossary-pointer-hover(int, float, float, float, float);
     callback glossary-double-clicked(int, float, float);
+    callback glossary-scan-hover(int, int, float, float, float, float, bool, bool, bool, bool);
+    callback glossary-scan-middle-click(int, int, float, float, float, float);
+    callback glossary-scan-leave(int, int);
+    callback nested-glossary-pointer-down(int, int, float, float);
+    callback nested-glossary-pointer-drag(int, int, float, float);
+    callback nested-glossary-pointer-up(int, int, float, float);
+    callback nested-glossary-double-clicked(int, int, float, float);
+    callback nested-lookup-kanji-char(int, string, string);
+    callback nested-toggle-select-definition(int, int);
+    callback nested-toggle-term-collapse(int, int);
+    callback nested-add-anki-note(int);
+    callback nested-popup-hover-changed(bool);
+    callback nested-body-hover-changed(bool);
+    callback lock-nested-popup();
+    callback pop-nested-popup();
+    callback dismiss-all-nested-popups();
     callback copy-selected-glossary();
     callback popup-key-pressed(string, bool, bool, bool, bool) -> bool;
     callback popup-key-released(bool, bool, bool, bool);
+
+    // Sibling track hooks (default no-op until connected in main.rs)
+    callback update-anki-note-requested(int, int, string, string, string);
+    callback first-term-ready(string, string);
 
     // Independent search panel actions
     callback panel-search-requested(string);
@@ -258,7 +324,7 @@ component RichTagPillBadge inherits Rectangle {
     in property <RichTagPill> pill;
     in property <length> anchor-x: 0px;
     in property <length> anchor-y: 0px;
-    height: 18px;
+    height: max(18px, PopupBridge.css-tag-font-size + 7px);
     width: label.preferred-width + 12px;
     background: root.pill.bg-color;
     border-radius: 3px;
@@ -267,7 +333,8 @@ component RichTagPillBadge inherits Rectangle {
         width: parent.width - 12px;
         height: parent.height;
         text: root.pill.name;
-        font-size: 11px;
+        font-family: PopupBridge.css-tag-font-family;
+        font-size: PopupBridge.css-tag-font-size;
         font-weight: 700;
         color: #FFFFFF;
         vertical-alignment: center;
@@ -286,10 +353,15 @@ component RichTagPillBadge inherits Rectangle {
 
 component DefinitionEntryBody inherits Rectangle {
     in property <DictResult> res;
+    in property <int> scan-depth: 0;
+    in property <int> bridge-rev: PopupBridge.rich-revision;
     in property <bool> is-solo: false;
     in property <bool> show-anki-checkbox: true;
     in property <length> tooltip-base-x: 12px;
     in property <length> tooltip-base-y: 0px;
+    out property <bool> collapsible: gloss-wrap.cached-rich-doc.collapsible;
+    out property <length> collapsed-height: gloss-wrap.cached-rich-doc.collapsed-height;
+    out property <int> total-lines: gloss-wrap.cached-rich-doc.total-lines;
     callback toggle-select-definition(int);
     callback open-rich-link(string);
     callback focus-glossary();
@@ -310,11 +382,18 @@ component DefinitionEntryBody inherits Rectangle {
         };
     property <bool> rich-hovered: false;
     property <bool> select-hovered: false;
-    property <bool> card-hovered: card-hover.has-hover || root.rich-hovered || root.select-hovered;
+    property <bool> expand-hovered: false;
+    property <bool> card-hovered: card-hover.has-hover || root.rich-hovered || root.select-hovered || root.expand-hovered;
     property <float> active-glossary-opacity: root.is-solo
         ? root.dstyle.glossary-solo-opacity
         : (root.card-hovered ? root.dstyle.glossary-hover-opacity : root.dstyle.glossary-opacity);
     property <length> pad: root.dstyle.card-padding;
+
+    changed card-hovered => {
+        if root.scan-depth > 0 {
+            PopupBridge.nested-body-hover-changed(self.card-hovered);
+        }
+    }
 
     background: root.dstyle.card-bg;
     border-color: root.dstyle.card-border;
@@ -327,6 +406,16 @@ component DefinitionEntryBody inherits Rectangle {
     card-hover := TouchArea {
         width: 100%;
         height: 100%;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (root.scan-depth > 0) {
+                    root.focus-glossary();
+                    PopupBridge.lock-nested-popup();
+                } else if (PopupBridge.nested-depth > 0) {
+                    PopupBridge.dismiss-all-nested-popups();
+                }
+            }
+        }
     }
 
     entry-inner := VerticalLayout {
@@ -358,13 +447,20 @@ component DefinitionEntryBody inherits Rectangle {
                 select-touch := TouchArea {
                     mouse-cursor: pointer;
                     changed has-hover => { root.select-hovered = self.has-hover; }
-                    clicked => { root.toggle-select-definition(root.res.index - 1); }
+                    clicked => {
+                        if root.scan-depth > 0 {
+                            PopupBridge.lock-nested-popup();
+                        }
+                        root.toggle-select-definition(root.res.index - 1);
+                    }
                 }
             }
 
             if PopupBridge.rich-enabled : HorizontalLayout {
                 spacing: 4px;
-                for pill in PopupBridge.def-tag-pills(root.res.index, PopupBridge.rich-revision) : RichTagPillBadge {
+                for pill in (root.scan-depth == 0
+                    ? PopupBridge.def-tag-pills(root.res.index, root.bridge-rev)
+                    : PopupBridge.nested-def-tag-pills(root.scan-depth, root.res.index, root.bridge-rev)) : RichTagPillBadge {
                     pill: pill;
                     anchor-x: root.tooltip-base-x + 12px;
                     anchor-y: root.tooltip-base-y + 24px;
@@ -373,7 +469,7 @@ component DefinitionEntryBody inherits Rectangle {
 
             // Fallback Part of Speech badge(s) when rich bridge is not active
             if !PopupBridge.rich-enabled && root.res.pos-tags != "" : Rectangle {
-                height: 18px;
+                height: max(18px, PopupBridge.css-tag-font-size + 7px);
                 background: #2b3238;
                 border-radius: 3px;
                 HorizontalLayout {
@@ -381,7 +477,8 @@ component DefinitionEntryBody inherits Rectangle {
                     padding-right: 6px;
                     DictionaryText {
                         text: root.res.pos-tags;
-                        font-size: 11px;
+                        font-family: PopupBridge.css-tag-font-family;
+                        font-size: PopupBridge.css-tag-font-size;
                         font-weight: 600;
                         color: #cbd5e1;
                         vertical-alignment: center;
@@ -391,7 +488,7 @@ component DefinitionEntryBody inherits Rectangle {
 
             // Dictionary Source Badge
             if root.res.dict-name != "" : Rectangle {
-                height: 18px;
+                height: max(18px, PopupBridge.css-tag-font-size + 7px);
                 background: root.dstyle.badge-bg;
                 border-radius: 3px;
                 HorizontalLayout {
@@ -399,7 +496,8 @@ component DefinitionEntryBody inherits Rectangle {
                     padding-right: 7px;
                     DictionaryText {
                         text: root.res.dict-name;
-                        font-size: 11px;
+                        font-family: PopupBridge.css-tag-font-family;
+                        font-size: PopupBridge.css-tag-font-size;
                         font-weight: 700;
                         color: root.dstyle.badge-color;
                         vertical-alignment: center;
@@ -411,17 +509,28 @@ component DefinitionEntryBody inherits Rectangle {
         // Glossary body (respects per-dictionary opacity / hover-to-reveal)
         gloss-wrap := VerticalLayout {
             property <RichKanjiDetail> cached-kanji-detail: root.res.is-kanji && PopupBridge.rich-enabled
-                ? PopupBridge.kanji-detail(root.res.index, PopupBridge.rich-revision)
+                ? (root.scan-depth == 0
+                    ? PopupBridge.kanji-detail(root.res.index, root.bridge-rev)
+                    : PopupBridge.nested-kanji-detail(root.scan-depth, root.res.index, root.bridge-rev))
                 : { valid: false };
             property <bool> has-rich-kanji: root.res.is-kanji && PopupBridge.rich-enabled && self.cached-kanji-detail.valid;
             property <RichGlossaryRender> cached-rich-doc: !root.res.is-kanji && PopupBridge.rich-enabled
-                ? PopupBridge.render-glossary(
-                    root.res.index,
-                    self.width / 1px,
-                    root.res.selected,
-                    PopupBridge.rich-revision,
-                    PopupBridge.selection-revision
-                )
+                ? (root.scan-depth == 0
+                    ? PopupBridge.render-glossary(
+                        root.res.index,
+                        self.width / 1px,
+                        root.res.selected,
+                        root.bridge-rev,
+                        PopupBridge.selection-revision
+                    )
+                    : PopupBridge.nested-render-glossary(
+                        root.scan-depth,
+                        root.res.index,
+                        self.width / 1px,
+                        root.res.selected,
+                        root.bridge-rev,
+                        PopupBridge.selection-revision
+                    ))
                 : { has-rich: false };
             property <bool> has-rich-glossary: !root.res.is-kanji && PopupBridge.rich-enabled && self.cached-rich-doc.has-rich;
 
@@ -536,86 +645,211 @@ component DefinitionEntryBody inherits Rectangle {
                 }
             }
 
-            // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs, mouse selection)
-            if gloss-wrap.has-rich-glossary : rich-surface := Rectangle {
+            // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs,
+            // mouse selection, recursive hover-scan, and per-dictionary collapsible line clamping)
+            if gloss-wrap.has-rich-glossary : rich-container := VerticalLayout {
                 property <RichGlossaryRender> rich-doc: gloss-wrap.cached-rich-doc;
-                visible: self.rich-doc.has-rich;
+                property <bool> is-collapsed: self.rich-doc.collapsible && !self.rich-doc.expanded;
                 width: parent.width;
-                height: self.rich-doc.has-rich ? self.rich-doc.height-px * 1px : 0px;
-                background: transparent;
+                spacing: 2px;
 
-                for sel-rect in self.rich-doc.selection-rects : Rectangle {
-                    x: sel-rect.x-px * 1px;
-                    y: sel-rect.y-px * 1px;
-                    width: sel-rect.w-px * 1px;
-                    height: sel-rect.h-px * 1px;
-                    background: #38a6d666;
-                    border-radius: 2px;
-                }
-
-                if self.rich-doc.has-rich : Image {
-                    x: 0px;
-                    y: 0px;
-                    width: parent.rich-doc.width-px * 1px;
-                    height: parent.rich-doc.height-px * 1px;
-                    source: parent.rich-doc.rendered;
-                    image-fit: fill;
-                }
-
-                if self.rich-doc.has-rich : rich-touch := TouchArea {
+                rich-surface := Rectangle {
+                    visible: rich-container.rich-doc.has-rich;
                     width: parent.width;
-                    height: parent.height;
-                    mouse-cursor: PopupBridge.glossary-cursor-is-pointer(
-                        root.res.index,
-                        self.mouse-x / 1px,
-                        self.mouse-y / 1px
-                    ) ? pointer : text;
-                    pointer-event(event) => {
-                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                            root.focus-glossary();
-                            PopupBridge.glossary-pointer-down(
+                    height: !rich-container.rich-doc.has-rich
+                        ? 0px
+                        : (rich-container.is-collapsed ? rich-container.rich-doc.collapsed-height : rich-container.rich-doc.height-px * 1px);
+                    clip: true;
+                    background: transparent;
+
+                    for scan-rect in rich-container.rich-doc.scan-highlight-rects : Rectangle {
+                        x: scan-rect.x-px * 1px;
+                        y: scan-rect.y-px * 1px;
+                        width: scan-rect.w-px * 1px;
+                        height: scan-rect.h-px * 1px;
+                        background: #38a6d699;
+                        border-radius: 3px;
+                    }
+
+                    for sel-rect in rich-container.rich-doc.selection-rects : Rectangle {
+                        x: sel-rect.x-px * 1px;
+                        y: sel-rect.y-px * 1px;
+                        width: sel-rect.w-px * 1px;
+                        height: sel-rect.h-px * 1px;
+                        background: #38a6d666;
+                        border-radius: 2px;
+                    }
+
+                    if rich-container.rich-doc.has-rich : Image {
+                        x: 0px;
+                        y: 0px;
+                        width: rich-container.rich-doc.width-px * 1px;
+                        height: rich-container.rich-doc.height-px * 1px;
+                        source: rich-container.rich-doc.rendered;
+                        image-fit: fill;
+                    }
+
+                    if rich-container.is-collapsed : Rectangle {
+                        x: 0px;
+                        y: max(0px, parent.height - 22px);
+                        width: parent.width;
+                        height: min(22px, parent.height);
+                        background: @linear-gradient(180deg, #00000000 0%, PopupBridge.css-popup-bg 100%);
+                    }
+
+                    if rich-container.rich-doc.has-rich : rich-touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-cursor: (root.scan-depth == 0
+                            ? PopupBridge.glossary-cursor-is-pointer(
                                 root.res.index,
                                 self.mouse-x / 1px,
                                 self.mouse-y / 1px
-                            );
-                        } else if (event.kind == PointerEventKind.move) {
-                            if (self.pressed) {
-                                PopupBridge.glossary-pointer-drag(
+                            )
+                            : PopupBridge.nested-glossary-cursor-is-pointer(
+                                root.scan-depth,
+                                root.res.index,
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px
+                            )) ? pointer : text;
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.focus-glossary();
+                                if (root.scan-depth == 0) {
+                                    PopupBridge.glossary-pointer-down(
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else {
+                                    PopupBridge.nested-glossary-pointer-down(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                                root.focus-glossary();
+                                PopupBridge.glossary-scan-middle-click(
+                                    root.scan-depth,
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    (root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
+                                    (root.tooltip-base-y + root.pad + gloss-wrap.y + rich-container.y + rich-surface.y + self.mouse-y) / 1px
+                                );
+                            } else if (event.kind == PointerEventKind.move) {
+                                if (self.pressed) {
+                                    if (root.scan-depth == 0) {
+                                        PopupBridge.glossary-pointer-drag(
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    } else {
+                                        PopupBridge.nested-glossary-pointer-drag(
+                                            root.scan-depth,
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    }
+                                } else {
+                                    root.focus-glossary();
+                                    PopupBridge.glossary-scan-hover(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px,
+                                        (root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
+                                        (root.tooltip-base-y + root.pad + gloss-wrap.y + rich-container.y + rich-surface.y + self.mouse-y) / 1px,
+                                        event.modifiers.control,
+                                        event.modifiers.shift,
+                                        event.modifiers.alt,
+                                        event.modifiers.meta
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                if (root.scan-depth == 0) {
+                                    PopupBridge.glossary-pointer-up(
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else {
+                                    PopupBridge.nested-glossary-pointer-up(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.cancel) {
+                                PopupBridge.hide-tooltip();
+                                PopupBridge.glossary-scan-leave(root.scan-depth, root.res.index);
+                            }
+                        }
+                        double-clicked => {
+                            root.focus-glossary();
+                            if (root.scan-depth == 0) {
+                                PopupBridge.glossary-double-clicked(
                                     root.res.index,
                                     self.mouse-x / 1px,
                                     self.mouse-y / 1px
                                 );
                             } else {
-                                PopupBridge.glossary-pointer-hover(
+                                PopupBridge.nested-glossary-double-clicked(
+                                    root.scan-depth,
                                     root.res.index,
                                     self.mouse-x / 1px,
-                                    self.mouse-y / 1px,
-                                    (root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
-                                    (root.tooltip-base-y + root.pad + gloss-wrap.y + rich-surface.y + self.mouse-y) / 1px
+                                    self.mouse-y / 1px
                                 );
                             }
-                        } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
-                            PopupBridge.glossary-pointer-up(
-                                root.res.index,
-                                self.mouse-x / 1px,
-                                self.mouse-y / 1px
-                            );
-                        } else if (event.kind == PointerEventKind.cancel) {
-                            PopupBridge.hide-tooltip();
+                        }
+                        changed has-hover => {
+                            root.rich-hovered = self.has-hover;
+                            if !self.has-hover {
+                                PopupBridge.hide-tooltip();
+                                PopupBridge.glossary-scan-leave(root.scan-depth, root.res.index);
+                            }
                         }
                     }
-                    double-clicked => {
-                        root.focus-glossary();
-                        PopupBridge.glossary-double-clicked(
-                            root.res.index,
-                            self.mouse-x / 1px,
-                            self.mouse-y / 1px
-                        );
+                }
+
+                if rich-container.rich-doc.collapsible : collapse-toggle-bar := Rectangle {
+                    width: parent.width;
+                    height: 22px;
+                    border-radius: 3px;
+                    background: expand-touch.has-hover ? #33415555 : transparent;
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: 1px;
+                        background: PopupBridge.css-divider-color;
+                        opacity: 0.65;
                     }
-                    changed has-hover => {
-                        root.rich-hovered = self.has-hover;
-                        if !self.has-hover {
-                            PopupBridge.hide-tooltip();
+                    DictionaryText {
+                        x: 4px;
+                        width: parent.width - 8px;
+                        height: parent.height;
+                        text: rich-container.rich-doc.expanded
+                            ? "▴ Show less"
+                            : ("▾ Show more (" + rich-container.rich-doc.total-lines + " lines)");
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: PopupBridge.css-link-color;
+                        vertical-alignment: center;
+                    }
+                    expand-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        changed has-hover => { root.expand-hovered = self.has-hover; }
+                        clicked => {
+                            if root.scan-depth > 0 {
+                                PopupBridge.lock-nested-popup();
+                            }
+                            PopupBridge.toggle-definition-expanded(root.scan-depth, root.res.index);
                         }
                     }
                 }
@@ -758,6 +992,7 @@ export component YomitanPopup inherits Rectangle {
     property <bool> use-two-columns: PopupBridge.rich-enabled
         && PopupBridge.css-definition-columns >= 2
         && root.width >= PopupBridge.css-definition-columns-min-width;
+    property <int> watched-nested-depth: PopupBridge.nested-depth;
 
     visible: root.is-open && root.results.length > 0;
     width: 480px;
@@ -769,12 +1004,19 @@ export component YomitanPopup inherits Rectangle {
     drop-shadow-blur: PopupBridge.css-popup-shadow-blur;
     drop-shadow-color: PopupBridge.css-popup-shadow-color;
 
+    changed watched-nested-depth => {
+        if self.watched-nested-depth > 0 && root.is-open {
+            glossary-focus.focus();
+        }
+    }
     changed is-open => {
         root.audio-menu-open = false;
         PopupBridge.hide-tooltip();
         if root.is-open {
             definition-list.viewport-y = 0px;
             definition-list.fill-viewport();
+        } else {
+            PopupBridge.dismiss-all-nested-popups();
         }
     }
     reset-scroll => {
@@ -784,13 +1026,27 @@ export component YomitanPopup inherits Rectangle {
     }
 
     // Keep clicks on the card's padding from reaching the video underneath.
-    TouchArea { }
+    TouchArea {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && PopupBridge.nested-depth > 0) {
+                PopupBridge.dismiss-all-nested-popups();
+            }
+        }
+    }
 
     glossary-focus := FocusScope {
         width: 0px;
         height: 0px;
         enabled: PopupBridge.rich-enabled;
         key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (PopupBridge.nested-depth > 0) {
+                    PopupBridge.pop-nested-popup();
+                    return accept;
+                }
+                root.close-requested();
+                return accept;
+            }
             if ((event.modifiers.control || event.modifiers.meta)
                 && !event.modifiers.alt
                 && (event.text == "c" || event.text == "C")
@@ -831,7 +1087,6 @@ export component YomitanPopup inherits Rectangle {
             height: 26px;
             spacing: 4px;
             alignment: start;
-            padding-right: 34px;
 
             Rectangle {
                 width: 26px;
@@ -906,12 +1161,18 @@ export component YomitanPopup inherits Rectangle {
                 background: transparent;
                 term-segment := Rectangle {
                     property <int> row-zero-idx: res.index - 1;
-                    property <bool> added-this-row: root.added-note-id != "" && root.added-result-index == self.row-zero-idx;
+                    property <bool> added-this-row: !PopupBridge.last-added-was-nested && root.added-note-id != "" && root.added-result-index == self.row-zero-idx;
                     property <bool> row-is-duplicate:
                         (PopupBridge.popup-revision >= 0)
                         && self.row-zero-idx >= 0
                         && self.row-zero-idx < PopupBridge.row-anki-duplicates.length
                         && PopupBridge.row-anki-duplicates[self.row-zero-idx];
+                    property <int> row-anki-note-id:
+                        (PopupBridge.popup-revision >= 0)
+                        && self.row-zero-idx >= 0
+                        && self.row-zero-idx < PopupBridge.row-anki-note-ids.length
+                            ? PopupBridge.row-anki-note-ids[self.row-zero-idx]
+                            : 0;
                     property <string> row-browse-query:
                         self.added-this-row
                             ? root.added-note-id
@@ -925,6 +1186,7 @@ export component YomitanPopup inherits Rectangle {
                             ? PopupBridge.row-anki-tags[self.row-zero-idx]
                             : "";
                     property <bool> show-browse-btn: self.added-this-row || (root.anki-enabled && self.row-is-duplicate);
+                    property <bool> show-update-btn: root.anki-enabled && self.row-is-duplicate && self.row-anki-note-id > 0;
                     property <color> term-headword-color: PopupBridge.rich-enabled
                         ? PopupBridge.headword-pitch-color(res.index, PopupBridge.rich-revision)
                         : PopupBridge.css-headword-color;
@@ -950,8 +1212,8 @@ export component YomitanPopup inherits Rectangle {
                             + (!res.is-kanji && res.has-kanji ? 34px : 0px)
                             + (!res.is-kanji ? 34px : 0px)
                             + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
-                            + 34px
-                            + (res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) ? 34px : 0px);
+                            + (term-segment.show-update-btn ? 34px : 0px)
+                            + 34px;
                         property <length> avail-title-w: max(96px, card-content.width - self.buttons-reserved-w);
                         term-title := VerticalLayout {
                             horizontal-stretch: 1;
@@ -962,6 +1224,7 @@ export component YomitanPopup inherits Rectangle {
                                 text: res.reading;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
+                                font-family: PopupBridge.css-reading-font-family;
                                 font-size: PopupBridge.css-reading-size;
                                 color: PopupBridge.css-reading-color;
                             }
@@ -977,6 +1240,7 @@ export component YomitanPopup inherits Rectangle {
                                         border-radius: 3px;
                                         ch-text := DictionaryText {
                                             text: ch.text;
+                                            font-family: PopupBridge.css-headword-font-family;
                                             font-size: PopupBridge.css-headword-size;
                                             font-weight: 700;
                                             color: ch.is-kanji && ch-touch.has-hover ? PopupBridge.css-link-color : term-segment.term-headword-color;
@@ -995,7 +1259,10 @@ export component YomitanPopup inherits Rectangle {
                                 text: res.expression;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
-                                font-size: res.is-kanji ? PopupBridge.css-headword-size * 1.56 : PopupBridge.css-headword-size;
+                                font-family: res.is-kanji ? PopupBridge.css-kanji-font-family : PopupBridge.css-headword-font-family;
+                                font-size: res.is-kanji
+                                    ? (PopupBridge.css-kanji-font-size > 0px ? PopupBridge.css-kanji-font-size : PopupBridge.css-headword-size * 1.56)
+                                    : PopupBridge.css-headword-size;
                                 font-weight: 700;
                                 color: term-segment.term-headword-color;
                             }
@@ -1008,20 +1275,22 @@ export component YomitanPopup inherits Rectangle {
                                     spacing: 2px;
                                     if step-idx == 0 : DictionaryText {
                                         text: "« ";
-                                        font-size: 11px;
+                                        font-family: PopupBridge.css-conj-font-family;
+                                        font-size: PopupBridge.css-conj-font-size;
                                         color: #94A3B8;
                                         vertical-alignment: center;
                                     }
                                     step-box := Rectangle {
                                         width: step-lbl.preferred-width + 6px;
-                                        height: 17px;
+                                        height: max(17px, PopupBridge.css-conj-font-size + 6px);
                                         border-radius: 3px;
                                         background: step-touch.has-hover ? #334155 : #252D35;
                                         step-lbl := DictionaryText {
                                             x: 3px;
                                             height: parent.height;
                                             text: step.label;
-                                            font-size: 11px;
+                                            font-family: PopupBridge.css-conj-font-family;
+                                            font-size: PopupBridge.css-conj-font-size;
                                             color: #CBD5E1;
                                             vertical-alignment: center;
                                         }
@@ -1042,7 +1311,8 @@ export component YomitanPopup inherits Rectangle {
                                     }
                                     if step.has-arrow : DictionaryText {
                                         text: "←";
-                                        font-size: 11px;
+                                        font-family: PopupBridge.css-conj-font-family;
+                                        font-size: PopupBridge.css-conj-font-size;
                                         color: #64748B;
                                         vertical-alignment: center;
                                     }
@@ -1185,6 +1455,44 @@ export component YomitanPopup inherits Rectangle {
                             }
                         }
 
+                        if term-segment.show-update-btn : update-anki-btn-box := Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: update-anki-touch.has-hover ? #785A28 : #5C431D;
+                            DictionaryText {
+                                text: "↻";
+                                color: #FDE68A;
+                                font-size: 16px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            update-anki-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    PopupBridge.update-anki-note-requested(
+                                        term-segment.row-zero-idx,
+                                        term-segment.row-anki-note-id,
+                                        res.expression,
+                                        res.reading,
+                                        res.glossary
+                                    );
+                                }
+                                changed has-hover => {
+                                    if self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.show-tooltip(
+                                            "Update existing Anki note",
+                                            (root.width - 170px) / 1px,
+                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
+                                        );
+                                    } else if !self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.hide-tooltip();
+                                    }
+                                }
+                            }
+                        }
+
                         if root.anki-enabled && !term-segment.show-browse-btn : Rectangle {
                             width: 28px;
                             height: 28px;
@@ -1210,12 +1518,6 @@ export component YomitanPopup inherits Rectangle {
                             background: collapse-touch.has-hover ? #384046 : #2B3238;
                             DictionaryText { text: res.collapsed ? "›" : "⌄"; color: #CBD5E1; font-size: 19px; horizontal-alignment: center; vertical-alignment: center; }
                             collapse-touch := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-term-collapse(res.index - 1); } }
-                        }
-
-                        // Leave room for the close control pinned above the list when no nav bar is above row 1.
-                        if res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) : Rectangle {
-                            width: 28px;
-                            height: 28px;
                         }
                     }
 
@@ -1436,20 +1738,22 @@ export component YomitanPopup inherits Rectangle {
                     if !res.collapsed && !root.use-two-columns : DefinitionEntryBody {
                         width: parent.width;
                         res: res;
+                        scan-depth: 0;
+                        bridge-rev: PopupBridge.rich-revision;
                         is-solo: res.term-start && res.term-end;
                         show-anki-checkbox: root.show-anki-checkbox;
                         tooltip-base-x: PopupBridge.css-popup-padding;
-                        tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + self.y;
+                        tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 4px + self.y;
                         toggle-select-definition(i) => { root.toggle-select-definition(i); }
                         open-rich-link(href) => { root.open-rich-link(href); }
                         focus-glossary => { glossary-focus.focus(); }
                     }
 
                     // Responsive 2-column card grid (enabled by `--definition-columns: 2` when width >= min-width)
-                    if !res.collapsed && res.term-start && root.use-two-columns : VerticalLayout {
+                    if !res.collapsed && res.term-start && root.use-two-columns : grid-container := VerticalLayout {
                         width: parent.width;
                         spacing: PopupBridge.css-definition-gap;
-                        for grid-row in PopupBridge.definition-grid-rows(root.results, res.index) : HorizontalLayout {
+                        for grid-row in PopupBridge.definition-grid-rows(root.results, res.index) : grid-row-box := HorizontalLayout {
                             width: parent.width;
                             spacing: PopupBridge.css-definition-gap;
                             alignment: start;
@@ -1457,10 +1761,12 @@ export component YomitanPopup inherits Rectangle {
                             DefinitionEntryBody {
                                 width: grid-row.is-solo ? parent.width : max(120px, (parent.width - PopupBridge.css-definition-gap) / 2);
                                 res: grid-row.left;
+                                scan-depth: 0;
+                                bridge-rev: PopupBridge.rich-revision;
                                 is-solo: grid-row.is-solo;
                                 show-anki-checkbox: root.show-anki-checkbox;
                                 tooltip-base-x: PopupBridge.css-popup-padding;
-                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
+                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 4px + grid-container.y + grid-row-box.y;
                                 toggle-select-definition(i) => { root.toggle-select-definition(i); }
                                 open-rich-link(href) => { root.open-rich-link(href); }
                                 focus-glossary => { glossary-focus.focus(); }
@@ -1469,10 +1775,12 @@ export component YomitanPopup inherits Rectangle {
                             if grid-row.has-right : DefinitionEntryBody {
                                 width: max(120px, (parent.width - PopupBridge.css-definition-gap) / 2);
                                 res: grid-row.right;
+                                scan-depth: 0;
+                                bridge-rev: PopupBridge.rich-revision;
                                 is-solo: false;
                                 show-anki-checkbox: root.show-anki-checkbox;
                                 tooltip-base-x: PopupBridge.css-popup-padding + (parent.width + PopupBridge.css-definition-gap) / 2;
-                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
+                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 4px + grid-container.y + grid-row-box.y;
                                 toggle-select-definition(i) => { root.toggle-select-definition(i); }
                                 open-rich-link(href) => { root.open-rich-link(href); }
                                 focus-glossary => { glossary-focus.focus(); }
@@ -1482,6 +1790,520 @@ export component YomitanPopup inherits Rectangle {
 
                     }
                 }
+                }
+            }
+        }
+    }
+
+    // Recursive Nested Child Popup (Yomitan-style hover/modifier/middle-click lookup, depth 1..=4)
+    if PopupBridge.rich-enabled && PopupBridge.nested-depth > 0 && PopupBridge.nested-results.length > 0 : nested-popup-card := Rectangle {
+        property <length> card-w: max(0px, min(root.width - 20px, max(300px, root.width * 0.88)));
+        property <length> card-h: max(0px, min(root.height - 36px, max(190px, root.height * 0.68)));
+        property <length> anchor-x-len: PopupBridge.nested-anchor-x * 1px;
+        property <length> anchor-y-len: PopupBridge.nested-anchor-y * 1px;
+        property <bool> place-above: self.anchor-y-len > root.height * 0.48
+            && (self.anchor-y-len - 18px) >= 160px;
+        property <int> nav-rev: PopupBridge.nested-nav-revision;
+
+        x: max(10px, min(root.width - self.card-w - 10px, self.anchor-x-len - self.card-w * 0.3));
+        y: self.place-above
+            ? max(10px, self.anchor-y-len - self.card-h - 14px)
+            : max(10px, min(root.height - self.card-h - 10px, self.anchor-y-len + 18px));
+        width: self.card-w;
+        height: self.card-h;
+        background: PopupBridge.css-popup-bg;
+        border-width: max(1.5px, PopupBridge.css-popup-border-width);
+        border-color: PopupBridge.nested-locked ? #38BDF8 : #64748B;
+        border-radius: PopupBridge.css-popup-radius;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #000000CC;
+        clip: true;
+
+        changed nav-rev => {
+            nested-definition-list.viewport-y = 0px;
+        }
+
+        // Catch clicks & track hover on nested card surface
+        nested-card-touch := TouchArea {
+            width: 100%;
+            height: 100%;
+            changed has-hover => {
+                PopupBridge.nested-popup-hover-changed(self.has-hover);
+            }
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    glossary-focus.focus();
+                    PopupBridge.lock-nested-popup();
+                }
+            }
+        }
+
+        VerticalLayout {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            padding: 8px;
+            spacing: 4px;
+
+            // Nested popup header: Back button, depth indicator, breadcrumb, locked badge
+            HorizontalLayout {
+                height: 24px;
+                spacing: 6px;
+                alignment: start;
+
+                Rectangle {
+                    width: nested-back-lbl.preferred-width + 12px;
+                    height: 22px;
+                    border-radius: 3px;
+                    background: nested-back-touch.has-hover ? #384046 : #2B3238;
+                    nested-back-lbl := DictionaryText {
+                        x: 6px;
+                        height: parent.height;
+                        text: "← Back";
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: #E2E8F0;
+                        vertical-alignment: center;
+                    }
+                    nested-back-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { PopupBridge.pop-nested-popup(); }
+                    }
+                }
+
+                Rectangle {
+                    width: depth-badge-lbl.preferred-width + 10px;
+                    height: 20px;
+                    y: 1px;
+                    border-radius: 3px;
+                    background: PopupBridge.nested-locked ? #0C4A6E : #1E293B;
+                    border-width: 1px;
+                    border-color: PopupBridge.nested-locked ? #38BDF8 : #475569;
+                    depth-badge-lbl := DictionaryText {
+                        x: 5px;
+                        height: parent.height;
+                        text: PopupBridge.nested-depth + "/" + PopupBridge.nested-max-depth;
+                        font-size: 10px;
+                        font-weight: 700;
+                        color: PopupBridge.nested-locked ? #BAE6FD : #94A3B8;
+                        vertical-alignment: center;
+                    }
+                }
+
+                DictionaryText {
+                    text: PopupBridge.nested-breadcrumb;
+                    font-size: 11px;
+                    color: PopupBridge.css-muted-color;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            Rectangle {
+                width: parent.width;
+                height: 1px;
+                background: PopupBridge.css-divider-color;
+            }
+
+            nested-definition-list := ScrollView {
+                vertical-stretch: 1;
+                changed viewport-y => {
+                    PopupBridge.hide-tooltip();
+                    if self.viewport-y < -1px {
+                        PopupBridge.lock-nested-popup();
+                    }
+                }
+                nested-definition-content := VerticalLayout {
+                    width: parent.width;
+                    height: self.preferred-height;
+                    spacing: 0px;
+
+                    for nres[nidx] in PopupBridge.nested-results : nested-row-wrapper := Rectangle {
+                        property <bool> nrow-hidden: nres.collapsed && !nres.term-start;
+                        width: parent.width - 6px;
+                        height: self.nrow-hidden ? 0px : nested-term-segment.height + ((nres.term-end || (nres.collapsed && nres.term-start)) ? 8px : 0px);
+                        visible: !self.nrow-hidden;
+                        background: transparent;
+
+                        nested-term-segment := Rectangle {
+                            property <int> nrow-zero-idx: nres.index - 1;
+                            property <bool> nrow-is-duplicate:
+                                (PopupBridge.nested-revision >= 0)
+                                && self.nrow-zero-idx >= 0
+                                && self.nrow-zero-idx < PopupBridge.nested-row-anki-duplicates.length
+                                && PopupBridge.nested-row-anki-duplicates[self.nrow-zero-idx];
+                            property <int> nrow-anki-note-id:
+                                (PopupBridge.nested-revision >= 0)
+                                && self.nrow-zero-idx >= 0
+                                && self.nrow-zero-idx < PopupBridge.nested-row-anki-note-ids.length
+                                    ? PopupBridge.nested-row-anki-note-ids[self.nrow-zero-idx]
+                                    : 0;
+                            property <string> nrow-browse-query:
+                                (self.nrow-zero-idx >= 0 && self.nrow-zero-idx < PopupBridge.nested-row-anki-browse-queries.length)
+                                    ? PopupBridge.nested-row-anki-browse-queries[self.nrow-zero-idx]
+                                    : "";
+                            property <string> nrow-raw-anki-tags:
+                                (PopupBridge.nested-revision >= 0)
+                                && self.nrow-zero-idx >= 0
+                                && self.nrow-zero-idx < PopupBridge.nested-row-anki-tags.length
+                                    ? PopupBridge.nested-row-anki-tags[self.nrow-zero-idx]
+                                    : "";
+                            property <bool> nshow-browse-btn: root.anki-enabled && self.nrow-is-duplicate;
+                            property <bool> nshow-update-btn: root.anki-enabled && self.nrow-is-duplicate && self.nrow-anki-note-id > 0;
+                            property <color> nterm-headword-color: PopupBridge.nested-headword-pitch-color(
+                                PopupBridge.nested-depth,
+                                nres.index,
+                                PopupBridge.nested-revision
+                            );
+
+                            width: parent.width;
+                            height: nested-row-wrapper.nrow-hidden ? 0px : nested-card-content.preferred-height + 8px;
+                            background: transparent;
+                            if !nested-row-wrapper.nrow-hidden && nres.term-start && nres.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: PopupBridge.css-term-divider-color; }
+                            if !nested-row-wrapper.nrow-hidden && !nres.term-end && !nres.collapsed : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+
+                            nested-card-content := VerticalLayout {
+                                x: 0px;
+                                y: 4px;
+                                width: parent.width;
+                                height: self.preferred-height;
+                                spacing: 4px;
+
+                                if nres.term-start : HorizontalLayout {
+                                    width: parent.width;
+                                    spacing: 5px;
+                                    min-height: 30px;
+                                    property <length> nbuttons-w:
+                                        (!nres.is-kanji && nres.has-kanji ? 30px : 0px)
+                                        + (!nres.is-kanji ? 30px : 0px)
+                                        + (nested-term-segment.nshow-browse-btn || root.anki-enabled ? 30px : 0px)
+                                        + (nested-term-segment.nshow-update-btn ? 30px : 0px)
+                                        + 30px;
+                                    property <length> navail-title-w: max(84px, nested-card-content.width - self.nbuttons-w);
+
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                        preferred-width: 0px;
+                                        spacing: 2px;
+
+                                        if !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression : DictionaryText {
+                                            text: nres.reading;
+                                            height: self.preferred-height;
+                                            wrap: word-wrap;
+                                            font-family: PopupBridge.css-reading-font-family;
+                                            font-size: PopupBridge.css-reading-size;
+                                            color: PopupBridge.css-reading-color;
+                                        }
+                                        if !nres.is-kanji : VerticalLayout {
+                                            spacing: 1px;
+                                            for hw-line in PopupBridge.headword-lines(nres.expression, navail-title-w / 1px) : HorizontalLayout {
+                                                alignment: start;
+                                                spacing: 0px;
+                                                for ch in hw-line.chars : Rectangle {
+                                                    width: nch-text.preferred-width;
+                                                    height: nch-text.preferred-height;
+                                                    background: ch.is-kanji && nch-touch.has-hover ? #283442 : transparent;
+                                                    border-radius: 3px;
+                                                    nch-text := DictionaryText {
+                                                        text: ch.text;
+                                                        font-family: PopupBridge.css-headword-font-family;
+                                                        font-size: max(16px, PopupBridge.css-headword-size - 2px);
+                                                        font-weight: 700;
+                                                        color: ch.is-kanji && nch-touch.has-hover ? PopupBridge.css-link-color : nested-term-segment.nterm-headword-color;
+                                                    }
+                                                    nch-touch := TouchArea {
+                                                        enabled: ch.is-kanji;
+                                                        mouse-cursor: ch.is-kanji ? pointer : default;
+                                                        clicked => {
+                                                            PopupBridge.lock-nested-popup();
+                                                            PopupBridge.nested-lookup-kanji-char(PopupBridge.nested-depth, nres.expression, ch.text);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if nres.is-kanji : DictionaryText {
+                                            text: nres.expression;
+                                            height: self.preferred-height;
+                                            wrap: word-wrap;
+                                            font-family: PopupBridge.css-kanji-font-family;
+                                            font-size: PopupBridge.css-kanji-font-size > 0px ? PopupBridge.css-kanji-font-size : PopupBridge.css-headword-size * 1.4;
+                                            font-weight: 700;
+                                            color: nested-term-segment.nterm-headword-color;
+                                        }
+                                    }
+
+                                    if !nres.is-kanji && nres.has-kanji : Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: nkanji-touch.has-hover ? #384046 : transparent;
+                                        DictionaryText { text: "字"; color: #CBD5E1; font-size: 15px; horizontal-alignment: center; vertical-alignment: center; }
+                                        nkanji-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                PopupBridge.nested-lookup-kanji-char(PopupBridge.nested-depth, nres.expression, "");
+                                            }
+                                        }
+                                    }
+
+                                    if !nres.is-kanji : nested-audio-btn := Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: naudio-touch.has-hover ? #384046 : #2B3238;
+                                        Image {
+                                            x: 5px;
+                                            y: 5px;
+                                            width: 16px;
+                                            height: 16px;
+                                            source: @image-url("icons/volume-on.svg");
+                                            colorize: #CBD5E1;
+                                        }
+                                        naudio-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                if (!root.audio-menu-open) { root.play-audio(nres.expression, nres.reading); }
+                                            }
+                                            pointer-event(event) => {
+                                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                                    PopupBridge.lock-nested-popup();
+                                                    root.audio-menu-expression = nres.expression;
+                                                    root.audio-menu-reading = nres.reading;
+                                                    root.audio-menu-x = max(8px, min(root.width - 238px, nested-popup-card.x + nested-audio-btn.x - 190px));
+                                                    root.audio-menu-y = max(36px, min(root.height - 140px, nested-popup-card.y + 40px));
+                                                    root.audio-menu-open = true;
+                                                    root.request-audio-sources(nres.expression, nres.reading);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if nested-term-segment.nshow-browse-btn : Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: nbrowse-touch.has-hover ? #385D75 : #24465C;
+                                        Image {
+                                            x: 5px;
+                                            y: 5px;
+                                            width: 16px;
+                                            height: 16px;
+                                            source: @image-url("icons/note-stack.svg");
+                                            colorize: #BAE6FD;
+                                        }
+                                        nbrowse-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                if (nested-term-segment.nrow-browse-query != "") {
+                                                    root.browse-anki-note(nested-term-segment.nrow-browse-query);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if nested-term-segment.nshow-update-btn : Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: nupdate-touch.has-hover ? #785A28 : #5C431D;
+                                        DictionaryText {
+                                            text: "↻";
+                                            color: #FDE68A;
+                                            font-size: 15px;
+                                            font-weight: 700;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        nupdate-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                PopupBridge.update-anki-note-requested(
+                                                    nested-term-segment.nrow-zero-idx,
+                                                    nested-term-segment.nrow-anki-note-id,
+                                                    nres.expression,
+                                                    nres.reading,
+                                                    nres.glossary
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if root.anki-enabled && !nested-term-segment.nshow-browse-btn : Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: nanki-touch.has-hover ? #2D624D : #20503E;
+                                        DictionaryText {
+                                            text: "+";
+                                            color: #A7F3D0;
+                                            font-size: 18px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        nanki-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                PopupBridge.nested-add-anki-note(nres.index - 1);
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 26px;
+                                        height: 26px;
+                                        border-radius: 3px;
+                                        background: ncollapse-touch.has-hover ? #384046 : #2B3238;
+                                        DictionaryText { text: nres.collapsed ? "›" : "⌄"; color: #CBD5E1; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
+                                        ncollapse-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                PopupBridge.nested-toggle-term-collapse(PopupBridge.nested-depth, nres.index - 1);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !nres.collapsed && nres.term-start && PopupBridge.css-show-term-tags : HorizontalLayout {
+                                    spacing: 4px;
+                                    alignment: start;
+                                    for pill in PopupBridge.nested-term-tag-pills(PopupBridge.nested-depth, nres.index, PopupBridge.nested-revision) : RichTagPillBadge {
+                                        pill: pill;
+                                        anchor-x: nested-popup-card.x + 16px;
+                                        anchor-y: nested-popup-card.y + 44px;
+                                    }
+                                }
+
+                                if !nres.collapsed && nres.term-start && PopupBridge.anki-show-tags && nested-term-segment.nrow-raw-anki-tags != "" : HorizontalLayout {
+                                    property <[string]> nsplit-tags: PopupBridge.split-anki-tags(nested-term-segment.nrow-raw-anki-tags);
+                                    property <[string]> neffective-tags: self.nsplit-tags.length > 0 ? self.nsplit-tags : [nested-term-segment.nrow-raw-anki-tags];
+                                    spacing: 4px;
+                                    alignment: start;
+                                    for anki-tag in self.neffective-tags : Rectangle {
+                                        height: 18px;
+                                        width: nanki-tag-lbl.preferred-width + 12px;
+                                        background: PopupBridge.css-anki-tag-bg;
+                                        border-width: 1px;
+                                        border-color: PopupBridge.css-anki-tag-border;
+                                        border-radius: 3px;
+                                        nanki-tag-lbl := DictionaryText {
+                                            x: 6px;
+                                            width: parent.width - 12px;
+                                            height: parent.height;
+                                            text: anki-tag;
+                                            font-size: 10px;
+                                            font-weight: 700;
+                                            color: PopupBridge.css-anki-tag-color;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                if !nres.collapsed && nres.term-start && nres.frequencies.length > 0 : VerticalLayout {
+                                    width: parent.width;
+                                    spacing: 3px;
+                                    for line in PopupLayout.frequency-lines(nres.frequencies, self.width / 1px) : HorizontalLayout {
+                                        width: parent.width;
+                                        alignment: start;
+                                        spacing: 4px;
+                                        for frequency in line.entries : Rectangle {
+                                            property <PopupFreqStyle> nfstyle: PopupBridge.freq-badge-style(frequency.dictionary, PopupBridge.rich-revision);
+                                            width: min(nfreq-lbl.preferred-width + 10px, parent.width);
+                                            height: max(18px, nfreq-lbl.preferred-height + 2px);
+                                            background: self.nfstyle.bg;
+                                            border-radius: 3px;
+                                            nfreq-lbl := DictionaryText {
+                                                x: 5px;
+                                                width: parent.width - 10px;
+                                                height: parent.height;
+                                                text: frequency.dictionary + " " + frequency.value;
+                                                font-size: PopupBridge.css-freq-font-size;
+                                                color: parent.nfstyle.color;
+                                                vertical-alignment: center;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !nres.collapsed && nres.term-start : VerticalLayout {
+                                    spacing: 4px;
+                                    for pitch in PopupBridge.nested-rich-pitch-graphs(PopupBridge.nested-depth, nres.index, PopupBridge.nested-revision) : Rectangle {
+                                        width: parent.width;
+                                        height: 28px;
+                                        background: transparent;
+                                        HorizontalLayout {
+                                            width: parent.width;
+                                            height: 28px;
+                                            spacing: 6px;
+                                            alignment: start;
+                                            if PopupBridge.css-show-pitch-dict : Rectangle {
+                                                height: 18px;
+                                                y: 5px;
+                                                width: min(npitch-dict-lbl.preferred-width + 10px, parent.width * 0.42);
+                                                background: PopupBridge.pitch-dict-bg(pitch.dictionary, PopupBridge.rich-revision);
+                                                border-radius: 3px;
+                                                npitch-dict-lbl := DictionaryText {
+                                                    x: 5px;
+                                                    width: parent.width - 10px;
+                                                    height: parent.height;
+                                                    text: pitch.dictionary + " [" + pitch.position + "]";
+                                                    font-size: 10px;
+                                                    font-weight: 700;
+                                                    color: #FFFFFF;
+                                                    vertical-alignment: center;
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            HorizontalLayout {
+                                                width: self.preferred-width;
+                                                height: 28px;
+                                                horizontal-stretch: 0;
+                                                spacing: 0px;
+                                                for mora in pitch.mora : Rectangle {
+                                                    width: max(18px, nmora-lbl.preferred-width + 5px);
+                                                    height: 28px;
+                                                    Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1.5px; background: PopupBridge.css-pitch-color; }
+                                                    if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1.5px; y: 3px; width: 1.5px; height: 9.5px; background: PopupBridge.css-pitch-color; }
+                                                    nmora-lbl := DictionaryText {
+                                                        text: mora.text;
+                                                        y: 12px;
+                                                        horizontal-alignment: center;
+                                                        width: parent.width;
+                                                        font-size: 11px;
+                                                        color: mora.devoice ? #FCA5A5 : PopupBridge.css-text-color;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !nres.collapsed : DefinitionEntryBody {
+                                    width: parent.width;
+                                    res: nres;
+                                    scan-depth: PopupBridge.nested-depth;
+                                    bridge-rev: PopupBridge.nested-revision;
+                                    is-solo: nres.term-start && nres.term-end;
+                                    show-anki-checkbox: root.show-anki-checkbox;
+                                    tooltip-base-x: nested-popup-card.x + 8px;
+                                    tooltip-base-y: nested-popup-card.y + 8px + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 4px + self.y;
+                                    toggle-select-definition(i) => { PopupBridge.nested-toggle-select-definition(PopupBridge.nested-depth, i); }
+                                    open-rich-link(href) => { root.open-rich-link(href); }
+                                    focus-glossary => { glossary-focus.focus(); }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1510,17 +2332,6 @@ export component YomitanPopup inherits Rectangle {
             color: #F8FAFC;
             wrap: word-wrap;
         }
-    }
-
-    Rectangle {
-        x: parent.width - 46px;
-        y: 18px;
-        width: 28px;
-        height: 28px;
-        border-radius: 3px;
-        background: close-touch.has-hover ? PopupBridge.css-popup-border : PopupBridge.css-popup-bg;
-        DictionaryText { text: "×"; font-size: 18px; color: PopupBridge.css-muted-color; horizontal-alignment: center; vertical-alignment: center; }
-        close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-requested(); } }
     }
 
     if root.audio-menu-open : TouchArea {

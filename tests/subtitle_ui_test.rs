@@ -59,8 +59,14 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     click(403., 200.);
     assert!(app.get_dict_open(), "popup padding click; video size={}x{}", app.get_video_width(), app.get_video_height());
     assert_eq!(app.get_selected_token_index(), 0);
-    // The close button must clear the selection as well as hide the popup.
+    // Clicking the popup's top-right corner must not close it (the overlapping X close button was removed).
     click(848., 178.);
+    assert!(app.get_dict_open(), "popup top-right must no longer have an X close button");
+    assert_eq!(app.get_selected_token_index(), 0);
+    // Pressing Escape must clear the selection as well as hide the popup.
+    let esc = slint::SharedString::from(slint::platform::Key::Escape);
+    app.window().dispatch_event(WindowEvent::KeyPressed { text: esc.clone() });
+    app.window().dispatch_event(WindowEvent::KeyReleased { text: esc });
     assert!(!app.get_dict_open());
     assert_eq!(app.get_selected_token_index(), -1);
 
