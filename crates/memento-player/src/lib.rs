@@ -38,8 +38,8 @@ pub use mpv::{
     memento_player_tracks_free, AsrCue, AsrSubtitleTrack, AsrTrackMode, AudioInstance, AudioTrack,
     CommandReplyResult, CursorAutohide, EncodeContext, EndFileReason, ExtractedSubLine,
     ExtractedTrack, MementoF64ListC, MementoSubLineC, MementoSubLineListC, MementoTrackC,
-    MementoTrackListC, MpvEvent, MpvInstance, MpvPropertyValue, RawFrame, SubtitleTrack, TrackType,
-    ASR_STREAM_PROTOCOL, ASR_STREAM_URI,
+    MementoTrackListC, MpvEvent, MpvInstance, MpvPropertyValue, OsdDimensions, RawFrame,
+    SubtitleTrack, TrackType, ASR_STREAM_PROTOCOL, ASR_STREAM_URI,
 };
 pub use state::{
     q_bound, AutoHideType, MpvStateCore, Signal, Subtitle, SubtitleChange, VideoParams,

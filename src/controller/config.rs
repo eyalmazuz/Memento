@@ -1535,6 +1535,7 @@ fn interface_paths() -> Vec<(&'static str, &'static str)> {
         (group, raw::interface::subtitle::BACKGROUND_COLOR),
         (group, raw::interface::subtitle::STROKE_COLOR),
         (group, raw::interface::subtitle::FURIGANA_RATIO),
+        (group, raw::interface::subtitle::ASS_NATIVE),
         (group, raw::interface::POPUP_WIDTH),
         (group, raw::interface::POPUP_HEIGHT),
         (group, raw::interface::SEARCH_WINDOW),
@@ -2132,6 +2133,18 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         group_name,
                         raw::interface::subtitle::FURIGANA_RATIO,
                     )),
+                ),
+                with_description(
+                    switch_field(
+                        "interface/sub-ass-native",
+                        "Render ASS/SSA subtitles natively (mpv/libass)",
+                        effective_bool(
+                            config,
+                            group_name,
+                            raw::interface::subtitle::ASS_NATIVE,
+                        ),
+                    ),
+                    "Preserve full ASS positioning, styling, typesetting, and embedded fonts via libmpv/libass with interactive dictionary lookup and highlighting. Disable to fall back to Memento's plain subtitle bar.",
                 ),
             ],
         ),

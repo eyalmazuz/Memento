@@ -364,6 +364,7 @@ pub enum InterfaceSubtitleField {
     BackgroundColor,
     StrokeColor,
     FuriganaRatio,
+    AssNative,
 }
 
 field_enum! {
@@ -377,6 +378,7 @@ field_enum! {
     BackgroundColor(raw = raw::interface::subtitle::BACKGROUND_COLOR, default = DefaultFallback::Str(raw::interface::subtitle::BACKGROUND_COLOR_DEFAULT)),
     StrokeColor(raw = raw::interface::subtitle::STROKE_COLOR, default = DefaultFallback::Str(raw::interface::subtitle::STROKE_COLOR_DEFAULT)),
     FuriganaRatio(raw = raw::interface::subtitle::FURIGANA_RATIO, default = DefaultFallback::Real(raw::interface::subtitle::FURIGANA_RATIO_DEFAULT)),
+    AssNative(raw = raw::interface::subtitle::ASS_NATIVE, default = DefaultFallback::Bool(raw::interface::subtitle::ASS_NATIVE_DEFAULT)),
 }
 
 /// Interface search-result font fields (keys.h 308-367); the `QFont`

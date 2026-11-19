@@ -396,6 +396,10 @@ pub mod interface {
         pub const FURIGANA_RATIO: &str = "sub-furigana-ratio";
         /// keys.h:296
         pub const FURIGANA_RATIO_DEFAULT: f64 = 0.4;
+
+        /// Native libmpv/libass rendering for ASS/SSA subtitle tracks.
+        pub const ASS_NATIVE: &str = "sub-ass-native";
+        pub const ASS_NATIVE_DEFAULT: bool = true;
     }
 
     /// keys.h:299

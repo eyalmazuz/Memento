@@ -2843,6 +2843,7 @@ dependencies = [
  "memento-asr",
  "memento-asr-onnx",
  "memento-asr-whisper",
+ "memento-ass",
  "memento-audio",
  "memento-config",
  "memento-definition",
