@@ -564,7 +564,7 @@ component KeybindCaptureControl inherits VerticalLayout {
     }
 }
 
-component FieldRow inherits VerticalLayout {
+component FieldRow inherits Rectangle {
     in property <SettingsField> field;
     in property <[string]> anki-decks;
     in property <[string]> anki-models;
@@ -578,19 +578,22 @@ component FieldRow inherits VerticalLayout {
     callback open-color-picker(SettingsField);
     callback keybind-captured(string, string, bool, bool, bool, bool);
     visible: root.field.visible;
-    padding-top: 8px;
-    padding-bottom: 8px;
-    min-height: 44px;
-    alignment: center;
+    property <length> label-col-width: max(120px, root.width - ctrl-box.preferred-width - 16px);
+    height: root.field.visible ? max(44px, max(label-col.preferred-height, ctrl-box.preferred-height) + 18px) : 0px;
 
     HorizontalLayout {
+        width: parent.width;
+        height: parent.height;
+        padding-top: 9px;
+        padding-bottom: 9px;
         spacing: 16px;
-        alignment: space-between;
-        VerticalLayout {
+
+        label-col := VerticalLayout {
             alignment: center;
             horizontal-stretch: 1;
-            spacing: 2px;
-            Text {
+            spacing: 3px;
+            field-label := Text {
+                width: root.label-col-width;
                 text: root.field.label;
                 font-size: 13px;
                 font-weight: 500;
@@ -598,34 +601,31 @@ component FieldRow inherits VerticalLayout {
                 vertical-alignment: center;
                 overflow: elide;
             }
-            if root.field.description != "" : Text {
+            if root.field.description != "" : field-desc := Text {
+                width: root.label-col-width;
                 text: root.field.description;
                 font-size: 11px;
                 color: MementoPalette.text-muted;
                 wrap: word-wrap;
             }
         }
-        if root.field.kind == "switch" : VerticalLayout {
+
+        ctrl-box := VerticalLayout {
+            horizontal-stretch: 0;
             alignment: center;
-            SettingsSwitch {
+            if root.field.kind == "switch" : SettingsSwitch {
                 checked: root.field.value == "true";
                 enabled: root.field.enabled;
                 toggled(value) => { root.edited(root.field.key, value ? "true" : "false"); }
             }
-        }
-        if root.field.kind == "choice" : VerticalLayout {
-            alignment: center;
-            ComboBox {
+            if root.field.kind == "choice" : ComboBox {
                 width: 260px;
                 enabled: root.field.enabled;
                 model: root.field.choices;
                 current-value: root.field.value;
                 selected(value) => { root.edited(root.field.key, value); }
             }
-        }
-        if root.field.kind == "font" : VerticalLayout {
-            alignment: center;
-            FontPickerControl {
+            if root.field.kind == "font" : FontPickerControl {
                 field: root.field;
                 font-families: root.font-families;
                 font-edited(key, family, size, bold, italic) => {
@@ -635,39 +635,27 @@ component FieldRow inherits VerticalLayout {
                     root.font-size-typed(key, family, size, bold, italic);
                 }
             }
-        }
-        if root.field.kind == "color" : VerticalLayout {
-            alignment: center;
-            ColorSwatchControl {
+            if root.field.kind == "color" : ColorSwatchControl {
                 field: root.field;
                 edited(key, value) => { root.edited(key, value); }
                 color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                 open-color-picker(f) => { root.open-color-picker(f); }
             }
-        }
-        if root.field.kind == "keybind" : VerticalLayout {
-            alignment: center;
-            KeybindCaptureControl {
+            if root.field.kind == "keybind" : KeybindCaptureControl {
                 field: root.field;
                 edited(key, value) => { root.edited(key, value); }
                 keybind-captured(key, text, ctrl, alt, shift, meta) => {
                     root.keybind-captured(key, text, ctrl, alt, shift, meta);
                 }
             }
-        }
-        if root.field.kind == "text" && (root.use-anki-decks || root.use-anki-models) : VerticalLayout {
-            alignment: center;
-            ComboBox {
+            if root.field.kind == "text" && (root.use-anki-decks || root.use-anki-models) : ComboBox {
                 width: 260px;
                 enabled: root.field.enabled;
                 model: root.use-anki-decks ? root.anki-decks : root.anki-models;
                 current-value: root.field.value;
                 selected(value) => { root.edited(root.field.key, value); }
             }
-        }
-        if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : VerticalLayout {
-            alignment: center;
-            LineEdit {
+            if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : LineEdit {
                 width: 260px;
                 enabled: root.field.enabled;
                 text: root.field.value;
@@ -757,23 +745,25 @@ component SettingsSection inherits VerticalLayout {
         }
     }
 
-    Rectangle {
+    settings-card := Rectangle {
         background: MementoPalette.card-bg;
         border-width: 1px;
         border-color: MementoPalette.border;
         border-radius: 10px;
+        height: card-col.preferred-height;
 
-        VerticalLayout {
+        card-col := VerticalLayout {
+            width: parent.width;
             padding-left: 18px;
             padding-right: 18px;
-            padding-top: 4px;
-            padding-bottom: 4px;
+            padding-top: 6px;
+            padding-bottom: 6px;
             spacing: 0px;
 
             for field[index] in root.group.fields : VerticalLayout {
                 spacing: 0px;
-                if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
-                FieldRow {
+                if index > 0 && field.visible : Rectangle { height: 1px; background: MementoPalette.border; }
+                field-row := FieldRow {
                     field: field;
                     anki-decks: root.anki-decks;
                     anki-models: root.anki-models;

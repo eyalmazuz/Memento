@@ -1625,6 +1625,7 @@ fn search_paths() -> Vec<(&'static str, &'static str)> {
         (group, raw::search::REMOVE_REGEX),
         (group, raw::search::SUBTITLE_FURIGANA),
         (group, raw::search::SHOW_ANKI_GLOSSARY_CHECKBOX),
+        (group, raw::search::MAX_RECURSION_DEPTH),
     ]
 }
 
@@ -2715,6 +2716,18 @@ fn search_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     }
                     .to_owned(),
                     &["Alt", "Control", "Shift", "Super"],
+                ),
+                with_description(
+                    text_field(
+                        "search/max-recursion-depth",
+                        "Maximum child popups (recursive search)",
+                        value_text(&effective_value(
+                            config,
+                            group_name,
+                            raw::search::MAX_RECURSION_DEPTH,
+                        )),
+                    ),
+                    "Max depth of nested popups when scanning inside definitions (0 disables)",
                 ),
                 switch_field(
                     "search/middle-mouse-scan",
@@ -3873,6 +3886,7 @@ fn integer_range(group: &str, key: &str) -> Option<(i64, i64)> {
         (raw::search::GROUP, raw::search::METHOD) => Some((0, 1)),
         (raw::search::GROUP, raw::search::DELAY) => Some((0, 99999)),
         (raw::search::GROUP, raw::search::MODIFIER) => Some((0, 3)),
+        (raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH) => Some((0, 10)),
         (raw::search::GROUP, raw::search::GLOSSARY_STYLE) => Some((0, 2)),
         (raw::whisper::GROUP, raw::whisper::THREADS)
         | (raw::onnx::GROUP, raw::onnx::THREADS) => Some((
@@ -4138,5 +4152,83 @@ mod tests {
         assert!(conflicts
             .iter()
             .any(|(k, _, _)| k == "sub-list-copy-selected"));
+    }
+
+    #[test]
+    fn search_max_recursion_depth_clamps_roundtrips_and_resets_to_default() {
+        use slint::Model;
+        let dir = temp_dir("max-recursion-depth");
+        let anki = dir.join("anki_connect.json");
+        let ctrl = ConfigController::new();
+
+        assert_eq!(
+            ctrl.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(raw::search::MAX_RECURSION_DEPTH_DEFAULT as i64))
+        );
+
+        let groups = ctrl.category_settings_groups(9);
+        let popup_group = groups
+            .iter()
+            .find(|g| g.title == "Pop-up")
+            .expect("Search Pop-up settings group");
+        let field = popup_group
+            .fields
+            .iter()
+            .find(|f| f.key == "search/max-recursion-depth")
+            .expect("search/max-recursion-depth field");
+        assert_eq!(field.label, "Maximum child popups (recursive search)");
+        assert_eq!(
+            field.description,
+            "Max depth of nested popups when scanning inside definitions (0 disables)"
+        );
+        assert_eq!(field.value, "4");
+
+        // Clamping 0..=10 and rejecting non-integers
+        assert!(ctrl.edit_setting("search/max-recursion-depth", "abc").is_err());
+        ctrl.edit_setting("search/max-recursion-depth", "-3").unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(0))
+        );
+        ctrl.edit_setting("search/max-recursion-depth", "42").unwrap();
+        assert_eq!(
+            ctrl.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(10))
+        );
+        ctrl.edit_setting("search/max-recursion-depth", "6").unwrap();
+        ctrl.apply_settings(9, &dir, "memento.conf", &anki).unwrap();
+
+        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(6))
+        );
+
+        // Staged edit discarded by reset_settings (reverts to persisted 6)
+        reloaded.edit_setting("search/max-recursion-depth", "2").unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(2))
+        );
+        reloaded.reset_settings(9, &dir, "memento.conf", &anki).unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(6))
+        );
+
+        // Defaults restores 4
+        reloaded.defaults_settings(9).unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(4))
+        );
+        reloaded.apply_settings(9, &dir, "memento.conf", &anki).unwrap();
+        let after_defaults = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(
+            after_defaults.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
+            Some(Value::Int(4))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

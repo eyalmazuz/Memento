@@ -337,6 +337,12 @@ pub mod search {
     pub const SHOW_ANKI_GLOSSARY_CHECKBOX: &str = "show-anki-glossary-checkbox";
     /// keys.h:259
     pub const SHOW_ANKI_GLOSSARY_CHECKBOX_DEFAULT: bool = true;
+
+    /// Pure-Rust extension: maximum depth of recursive child popups when scanning
+    /// inside definitions (`0` disables recursive scanning, clamped `0..=10`).
+    pub const MAX_RECURSION_DEPTH: &str = "max-recursion-depth";
+    /// Default maximum depth of recursive child popups.
+    pub const MAX_RECURSION_DEPTH_DEFAULT: i32 = 4;
 }
 
 pub mod interface {
@@ -883,6 +889,8 @@ mod tests {
             "show-anki-glossary-checkbox"
         );
         assert_eq!(search::SHOW_ANKI_GLOSSARY_CHECKBOX_DEFAULT, true);
+        assert_eq!(search::MAX_RECURSION_DEPTH, "max-recursion-depth");
+        assert_eq!(search::MAX_RECURSION_DEPTH_DEFAULT, 4);
     }
 
     // keys.h:262-297, 299-306 — Interface top level + Subtitle.

@@ -1885,4 +1885,63 @@ mod tests {
         assert_eq!(format_key_chord("\u{0018}", false, false, false, true), None);
         assert_eq!(format_key_chord("", false, false, false, false), None);
     }
+
+    #[test]
+    fn search_max_recursion_depth_refreshes_in_settings_window_across_apply_reset_defaults() {
+        use super::refresh_category_settings;
+        use crate::controller::config::ConfigController;
+        use crate::SettingsWindow;
+        use slint::Model;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let anki = dir.path().join("anki_connect.json");
+        let cfg = ConfigController::new();
+        let win = SettingsWindow::new().unwrap();
+
+        let read_depth_field = |w: &SettingsWindow| -> (String, String, String) {
+            let groups = w.get_settings_groups();
+            for gi in 0..groups.row_count() {
+                let g = groups.row_data(gi).unwrap();
+                if g.title == "Pop-up" {
+                    for fi in 0..g.fields.row_count() {
+                        let f = g.fields.row_data(fi).unwrap();
+                        if f.key == "search/max-recursion-depth" {
+                            return (
+                                f.label.to_string(),
+                                f.description.to_string(),
+                                f.value.to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            panic!("search/max-recursion-depth missing from Search -> Pop-up group");
+        };
+
+        refresh_category_settings(&win, &cfg, 9);
+        let (label, desc, val) = read_depth_field(&win);
+        assert_eq!(label, "Maximum child popups (recursive search)");
+        assert_eq!(
+            desc,
+            "Max depth of nested popups when scanning inside definitions (0 disables)"
+        );
+        assert_eq!(val, "4");
+
+        cfg.edit_setting("search/max-recursion-depth", "8").unwrap();
+        cfg.apply_settings(9, dir.path(), "memento.conf", &anki)
+            .unwrap();
+        refresh_category_settings(&win, &cfg, 9);
+        assert_eq!(read_depth_field(&win).2, "8");
+
+        cfg.edit_setting("search/max-recursion-depth", "1").unwrap();
+        cfg.reset_settings(9, dir.path(), "memento.conf", &anki)
+            .unwrap();
+        refresh_category_settings(&win, &cfg, 9);
+        assert_eq!(read_depth_field(&win).2, "8");
+
+        cfg.defaults_settings(9).unwrap();
+        refresh_category_settings(&win, &cfg, 9);
+        assert_eq!(read_depth_field(&win).2, "4");
+    }
 }

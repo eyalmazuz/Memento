@@ -1712,8 +1712,8 @@ fn estimate_drawer_row_height(text: &str, available_text_width: f32, font_size: 
         visual_lines += wrapped;
     }
     let visual_lines = visual_lines.max(1);
-    let line_height = (18.0 * scale).max(16.0);
-    (visual_lines as f32 * line_height + 14.0).max(36.0)
+    let line_height = (17.0 * scale).max(15.0);
+    (visual_lines as f32 * line_height + 6.0).max(24.0)
 }
 
 pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
@@ -1727,7 +1727,7 @@ pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
     if count == 0 || row_idx >= count {
         return;
     }
-    let chrome_w = if app.get_sub_list_show_timestamps() { 104.0 } else { 40.0 };
+    let chrome_w = if app.get_sub_list_show_timestamps() { 94.0 } else { 36.0 };
     let text_width = (app.get_sidebar_width() - chrome_w).max(120.0);
     let font_size = if is_secondary {
         app.get_sub_list_secondary_font_size()
@@ -1735,13 +1735,13 @@ pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
         app.get_sub_list_primary_font_size()
     };
     let mut row_y = 0.0f32;
-    let mut target_h = 36.0f32;
+    let mut target_h = 24.0f32;
     let mut total_h = 0.0f32;
     for idx in 0..count {
         let h = entries
             .row_data(idx)
             .map(|entry| estimate_drawer_row_height(entry.text.as_str(), text_width, font_size))
-            .unwrap_or(36.0);
+            .unwrap_or(24.0);
         if idx < row_idx {
             row_y += h;
         } else if idx == row_idx {
@@ -2244,13 +2244,14 @@ mod subtitle_layout_tests {
             app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
             app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
         };
-        click(950., 94.);
+        // Compact subtitle rows are 24px tall starting at y=76 (centers: 88, 112, 136).
+        click(950., 88.);
         assert_eq!(subtitles.borrow().selected_indices(), &[0]);
         app.window().dispatch_event(WindowEvent::KeyPressed { text: slint::platform::Key::Shift.into() });
-        click(950., 166.);
+        click(950., 136.);
         app.window().dispatch_event(WindowEvent::KeyReleased { text: slint::platform::Key::Shift.into() });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
-        click(1100., 130.);
+        click(1100., 112.);
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
         app.invoke_search_subtitles("Middle".into());
         assert!(rows.row_data(1).unwrap().search_match);
@@ -2266,8 +2267,8 @@ mod subtitle_layout_tests {
         let seek = Rc::new(Cell::new(0.));
         let result = seek.clone();
         app.on_seek_to(move |position| result.set(position));
-        click(1100., 166.);
-        click(1100., 166.);
+        click(1100., 136.);
+        click(1100., 136.);
         assert_eq!(seek.get(), 5.);
         assert!(subtitles.borrow().is_selected(2));
         subtitles.borrow_mut().clear_selection();
@@ -2276,9 +2277,9 @@ mod subtitle_layout_tests {
         // Hold and drag across rows; updates happen before releasing. Reversing
         // the drag shrinks its range and preserves marks from earlier clicks.
         app.invoke_mark_subtitle_row(2);
-        let position = slint::LogicalPosition::new(1100., 94.);
+        let position = slint::LogicalPosition::new(1100., 88.);
         app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
-        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 166.) });
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 136.) });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
         app.window().dispatch_event(WindowEvent::PointerMoved { position });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
@@ -2286,18 +2287,18 @@ mod subtitle_layout_tests {
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2], "release must not toggle the start row");
         subtitles.borrow_mut().clear_selection();
         refresh_subtitle_marks(&rows, &subtitles.borrow());
-        let position = slint::LogicalPosition::new(1100., 166.);
+        let position = slint::LogicalPosition::new(1100., 136.);
         app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
-        let position = slint::LogicalPosition::new(1100., 94.);
+        let position = slint::LogicalPosition::new(1100., 88.);
         app.window().dispatch_event(WindowEvent::PointerMoved { position });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2], "upward drag must also mark a range");
         app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
         // Hovering after release does not change marks, and an ordinary click
         // can still unmark one row after a completed drag.
-        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 130.) });
+        app.window().dispatch_event(WindowEvent::PointerMoved { position: slint::LogicalPosition::new(1100., 112.) });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
-        click(1100., 130.);
+        click(1100., 112.);
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
         // A long press after scrolling must use the actual cue indices,
         // rather than treating the first visible row as cue zero.
@@ -2305,12 +2306,12 @@ mod subtitle_layout_tests {
             controller::subtitles::create_cue(&format!("Cue {index}"), index as f64 * 2., index as f64 * 2. + 1.)
         }).collect::<Vec<_>>());
         refresh_subtitle_list(&app, &rows, &subtitles.borrow());
-        let position = slint::LogicalPosition::new(1100., 94.);
+        let position = slint::LogicalPosition::new(1100., 88.);
         app.window().dispatch_event(WindowEvent::PointerScrolled { position, delta_x: 0., delta_y: -360. });
         i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(500));
         app.window().dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
         i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(600));
-        let position = slint::LogicalPosition::new(1100., 166.);
+        let position = slint::LogicalPosition::new(1100., 136.);
         app.window().dispatch_event(WindowEvent::PointerMoved { position });
         app.window().dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
         let selection = subtitles.borrow().selected_indices().to_vec();
@@ -2445,6 +2446,7 @@ fn is_bare_modifier_key(key: &str) -> bool {
             | "\u{0017}"
             | "\u{0018}"
             | "Shift"
+            | "ShiftR"
             | "Control"
             | "Ctrl"
             | "Alt"
@@ -2853,6 +2855,16 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
     app.set_key_sub_list_find_next(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_NEXT));
     app.set_key_sub_list_find_prev(shortcut(raw::keybind::profile::SUBTITLE_LIST_FIND_PREVIOUS));
     ui::refresh_rich_ui_bridges(app, config);
+    let max_recursion_depth = setting_number(
+        config,
+        raw::search::GROUP,
+        raw::search::MAX_RECURSION_DEPTH,
+        raw::search::MAX_RECURSION_DEPTH_DEFAULT as f64,
+    )
+    .round()
+    .clamp(0.0, 10.0) as i32;
+    app.global::<PopupBridge>()
+        .set_nested_max_depth(max_recursion_depth);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -3140,21 +3152,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if key_closing.get() { return true; }
         let Some(app) = shortcut_app.upgrade() else { return false };
         // Bare modifiers (Shift/Ctrl/Alt/Super) must never dismiss YomitanPopup,
-        // and pressing a lookup modifier while hovering a token triggers lookup.
+        // and pressing a lookup modifier while hovering a glossary word or subtitle triggers lookup.
         if is_bare_modifier_key(&text) {
+            let (mc, ms, ma, mm) = bare_modifier_flags(&text);
+            let c = control || mc;
+            let s = shift || ms;
+            let a = alt || ma;
+            let m = meta || mm;
+            if app.get_dict_open()
+                && app.global::<PopupBridge>().invoke_popup_key_pressed(
+                    text.clone(),
+                    c,
+                    s,
+                    a,
+                    m,
+                )
+            {
+                return true;
+            }
             if app.global::<SubtitleOverlayBridge>().get_rich_enabled() {
-                let (mc, ms, ma, mm) = bare_modifier_flags(&text);
                 app.global::<SubtitleOverlayBridge>()
-                    .invoke_stationary_modifier_changed(
-                        control || mc,
-                        shift || ms,
-                        alt || ma,
-                        meta || mm,
-                    );
-            } else if control || shift || alt || meta {
+                    .invoke_stationary_modifier_changed(c, s, a, m);
+            } else if c || s || a || m {
                 let hovered = key_hover_cursor.borrow().clone();
                 if let Some((word, index)) = hovered {
-                    app.invoke_hover_word(word.into(), index, control, shift, alt, meta);
+                    app.invoke_hover_word(word.into(), index, c, s, a, m);
                 }
             }
             return false;
@@ -3332,6 +3354,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_key_released(move |control, shift, alt, meta| {
         if key_rel_closing.get() { return; }
         let Some(app) = key_rel_app.upgrade() else { return };
+        if app.get_dict_open() {
+            app.global::<PopupBridge>()
+                .invoke_popup_key_released(control, shift, alt, meta);
+            if app.global::<PopupBridge>().get_rich_enabled() {
+                return;
+            }
+        }
         if app.global::<SubtitleOverlayBridge>().get_rich_enabled() {
             app.global::<SubtitleOverlayBridge>()
                 .invoke_stationary_modifier_changed(control, shift, alt, meta);
@@ -7634,5 +7663,31 @@ mod window_ux_tests {
         assert!(app.get_update_dialog_open());
         assert_eq!(app.get_update_dialog_title().as_str(), "Up to Date");
         assert!(app.get_update_dialog_release_tag().is_empty());
+    }
+
+    #[test]
+    fn max_recursion_depth_syncs_to_popup_bridge_and_compact_row_estimate_matches_24px() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+
+        refresh_player_preferences(&app, &cfg);
+        assert_eq!(app.global::<PopupBridge>().get_nested_max_depth(), 4);
+
+        cfg.edit_setting("search/max-recursion-depth", "7").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert_eq!(app.global::<PopupBridge>().get_nested_max_depth(), 7);
+
+        cfg.edit_setting("search/max-recursion-depth", "0").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert_eq!(app.global::<PopupBridge>().get_nested_max_depth(), 0);
+
+        cfg.edit_setting("search/max-recursion-depth", "99").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert_eq!(app.global::<PopupBridge>().get_nested_max_depth(), 10);
+
+        // Compact single-line estimate matches the 24px drawer row minimum.
+        assert_eq!(estimate_drawer_row_height("短い字幕", 260.0, 13.0), 24.0);
+        assert!(estimate_drawer_row_height("line1\nline2", 260.0, 13.0) > 36.0);
     }
 }
