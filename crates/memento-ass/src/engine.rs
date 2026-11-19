@@ -553,6 +553,9 @@ impl AssFrameLayout {
     }
 
     /// Convenience variant taking a UTF-8 byte range `[byte_start, byte_end)` inside `event_index`.
+    ///
+    /// Non-char-boundary indices are safely snapped (`byte_start` downward, `byte_end` upward)
+    /// so malformed byte offsets never panic.
     pub fn highlight_rects_for_byte_span(
         &self,
         event_index: usize,
@@ -562,8 +565,8 @@ impl AssFrameLayout {
         let Some(ev) = self.events.get(event_index) else {
             return Vec::new();
         };
-        let bs = byte_start.min(ev.plain_text.len());
-        let be = byte_end.min(ev.plain_text.len());
+        let bs = floor_char_boundary(&ev.plain_text, byte_start);
+        let be = ceil_char_boundary(&ev.plain_text, byte_end);
         if be <= bs {
             return Vec::new();
         }
@@ -734,6 +737,8 @@ impl AssLayoutEngine {
                 ffi::ass_renderer_done(self.renderer);
                 self.renderer = ptr::null_mut();
             }
+            self.configured = false;
+            self.fonts_initialized = false;
             ffi::ass_clear_fonts(self.library);
             self.loaded_font_count = 0;
 
@@ -763,8 +768,6 @@ impl AssLayoutEngine {
             }
             ffi::ass_set_cache_limits(renderer, 4096, 64);
             self.renderer = renderer;
-            self.configured = false;
-            self.fonts_initialized = false;
             self.apply_params_unconditional();
         }
         Ok(())
@@ -785,6 +788,9 @@ impl AssLayoutEngine {
     }
 
     fn apply_params_internal(&mut self, reinit_fonts: bool) {
+        if self.renderer.is_null() {
+            return;
+        }
         let p = &self.params;
         let fw = p.frame_w.max(1) as c_int;
         let fh = p.frame_h.max(1) as c_int;
@@ -856,6 +862,9 @@ impl AssLayoutEngine {
     }
 
     fn read_track_from_str(&self, ass_text: &str) -> Result<*mut ffi::ASS_Track, String> {
+        if ass_text.is_empty() {
+            return Err("ass_read_memory() called with empty ASS script".to_string());
+        }
         let mut bytes = ass_text.as_bytes().to_vec();
         let track = unsafe {
             ffi::ass_read_memory(
@@ -886,6 +895,9 @@ impl AssLayoutEngine {
         ass_full: &str,
         now_ms: i64,
     ) -> Result<AssFrameLayout, String> {
+        if self.renderer.is_null() {
+            return Err("libass renderer is not initialized".to_string());
+        }
         let probe = build_probe_script(extradata, ass_full, now_ms);
 
         // Cache the clean track eagerly (fast & keeps subsequent highlight renders lock-free).
@@ -984,6 +996,9 @@ impl AssLayoutEngine {
         crop_rect: AssHighlightRect,
         now_ms: i64,
     ) -> Result<RgbaPatch, String> {
+        if self.renderer.is_null() {
+            return Err("libass renderer is not initialized".to_string());
+        }
         if self.cached_clean_track.is_null() {
             return Err(
                 "render_highlight_patch() called before probe_active_events() cached a track"
@@ -1003,6 +1018,9 @@ impl AssLayoutEngine {
         crop_rect: AssHighlightRect,
         now_ms: i64,
     ) -> Result<RgbaPatch, String> {
+        if self.renderer.is_null() {
+            return Err("libass renderer is not initialized".to_string());
+        }
         let probe = build_probe_script(extradata, ass_full, now_ms);
         let track = self.ensure_clean_track(&probe.clean_ass)?;
         Ok(self.render_track_patch(track, crop_rect, probe.probe_now_ms))
@@ -1041,7 +1059,7 @@ impl AssLayoutEngine {
 
         let w = (x1 - x0) as u32;
         let h = (y1 - y0) as u32;
-        if w == 0 || h == 0 {
+        if self.renderer.is_null() || w == 0 || h == 0 {
             return RgbaPatch {
                 x: x0 as u32,
                 y: y0 as u32,
@@ -1156,6 +1174,22 @@ impl Drop for AssLayoutEngine {
             }
         }
     }
+}
+
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1547,5 +1581,11 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 0 100 100 0 
             )
             .unwrap();
         assert_eq!(layout.events[0].lines.len(), 1);
+
+        // Non-UTF-8-boundary byte offsets in highlight_rects_for_byte_span must snap safely.
+        // "テスト" is 9 bytes (3 bytes per katakana char).
+        let snapped = layout.highlight_rects_for_byte_span(0, 1, 5);
+        assert_eq!(snapped.len(), 1);
+        assert!(engine.read_track_from_str("").is_err());
     }
 }

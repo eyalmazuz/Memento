@@ -278,7 +278,7 @@ pub fn parse_ass_timecode_ms(s: &str) -> Option<i64> {
         0 => 0,
         1 => frac_str.parse::<i64>().ok()? * 100,
         2 => frac_str.parse::<i64>().ok()? * 10,
-        _ => frac_str[..3].parse::<i64>().ok()?,
+        _ => frac_str.get(..3)?.parse::<i64>().ok()?,
     };
 
     Some(((hours * 60 + mins) * 60 + secs) * 1000 + frac_ms)
@@ -928,9 +928,10 @@ fn filter_override_block(
             continue;
         }
 
-        // Transform animation: \t(...)
-        if body.starts_with("t(") && body.ends_with(')') {
-            let inner = &body[2..body.len() - 1];
+        // Transform animation: \t(...) (tolerate trailing whitespace before next tag/closing brace)
+        let body_trimmed = body.trim_end();
+        if body_trimmed.starts_with("t(") && body_trimmed.ends_with(')') {
+            let inner = &body_trimmed[2..body_trimmed.len() - 1];
             if let Some(filtered_t) = filter_transform_tag(
                 inner,
                 has_animated_geometry,
@@ -1087,11 +1088,9 @@ fn is_combining_or_joiner(ch: char) -> bool {
 }
 
 fn strip_ascii_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
 }
 
 #[cfg(test)]
@@ -1196,5 +1195,27 @@ Format: Marked, Start, End, Style, Actor, MarginL, MarginR, MarginV, Effect, Tex
         assert_eq!(d.margin_v, 30);
         assert_eq!(d.effect, "Banner");
         assert_eq!(d.raw_text, "Hello, world!");
+    }
+
+    #[test]
+    fn malformed_multibyte_utf8_and_trailing_space_transform_do_not_panic() {
+        // Non-ASCII lines straddling "Dialogue:" (9 bytes) and "Format:" (7 bytes).
+        let weird_doc = "\
+[Events]
+A「こんにちは」
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+あいうえお
+Dialogue: 0,0:00:01.1あ,0:00:05.00,Default,,0,0,0,,{\\t(0,500,\\alpha&H00&) }テスト
+";
+        assert_eq!(parse_ass_timecode_ms("0:00:01.1あ"), None);
+        assert_eq!(strip_ascii_prefix_ignore_case("A「こんにちは」", "Dialogue:"), None);
+        assert_eq!(strip_ascii_prefix_ignore_case("あいうえお", "Format:"), None);
+
+        let probe = build_probe_script(weird_doc, "", 2_000);
+        assert_eq!(probe.events.len(), 1);
+        assert!(!probe.events[0].has_animated_geometry);
+        // Trailing-whitespace alpha-only \t(...) must be stripped cleanly in probe_ass.
+        assert!(!probe.probe_ass.contains(r"\t("));
+        assert!(!probe.probe_ass.contains(r"\alpha"));
     }
 }

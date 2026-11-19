@@ -563,7 +563,7 @@ fn parse_seek_head<R: Read + Seek>(
                     break;
                 };
                 let sub_end = element_end_pos(sub.data_start, sub.size, child_end);
-                let sz = sub_end - sub.data_start;
+                let sz = sub_end.saturating_sub(sub.data_start);
                 match sub.id {
                     ID_SEEK_ID if sz >= 1 && sz <= 4 => {
                         let bytes = read_exact_vec(reader, sz as usize)?;
@@ -602,7 +602,7 @@ fn parse_info<R: Read + Seek>(reader: &mut R, end_pos: u64) -> io::Result<u64> {
             break;
         };
         let child_end = element_end_pos(hdr.data_start, hdr.size, end_pos);
-        let sz = child_end - hdr.data_start;
+        let sz = child_end.saturating_sub(hdr.data_start);
         if hdr.id == ID_TIMESTAMP_SCALE && sz <= 8 {
             let v = read_uint(reader, sz as usize)?;
             if v > 0 {
@@ -632,7 +632,12 @@ fn parse_tracks<R: Read + Seek>(
             if let Some(mut entry) = parse_track_entry(reader, child_end, sub_index)? {
                 // Decompress CodecPrivate if an encoding applies to scope bit 2.
                 if !entry.info.codec_private.is_empty() && !entry.encodings.is_empty() {
-                    if let Ok(decoded) = apply_track_encodings(&entry.info.codec_private, &entry.encodings, 2) {
+                    if let Ok(decoded) = apply_track_encodings(
+                        &entry.info.codec_private,
+                        &entry.encodings,
+                        2,
+                        MAX_CODEC_PRIVATE_BYTES,
+                    ) {
                         entry.info.codec_private = decoded;
                     }
                 }
@@ -668,7 +673,7 @@ fn parse_track_entry<R: Read + Seek>(
             break;
         };
         let child_end = element_end_pos(hdr.data_start, hdr.size, end_pos);
-        let sz = child_end - hdr.data_start;
+        let sz = child_end.saturating_sub(hdr.data_start);
         match hdr.id {
             ID_TRACK_NUMBER if sz <= 8 => track_number = read_uint(reader, sz as usize)?,
             ID_TRACK_TYPE if sz <= 8 => track_type = read_uint(reader, sz as usize)?,
@@ -740,7 +745,7 @@ fn parse_content_encodings<R: Read + Seek>(
                     break;
                 };
                 let sub_end = element_end_pos(sub.data_start, sub.size, child_end);
-                let sz = sub_end - sub.data_start;
+                let sz = sub_end.saturating_sub(sub.data_start);
                 match sub.id {
                     ID_CONTENT_ENCODING_SCOPE if sz <= 8 => {
                         scope = read_uint(reader, sz as usize)?;
@@ -782,7 +787,7 @@ fn parse_content_compression<R: Read + Seek>(
             break;
         };
         let child_end = element_end_pos(hdr.data_start, hdr.size, end_pos);
-        let sz = child_end - hdr.data_start;
+        let sz = child_end.saturating_sub(hdr.data_start);
         match hdr.id {
             ID_CONTENT_COMP_ALGO if sz <= 8 => algo = read_uint(reader, sz as usize)?,
             ID_CONTENT_COMP_SETTINGS if sz <= 4096 => {
@@ -805,6 +810,7 @@ fn apply_track_encodings(
     data: &[u8],
     encodings: &[TrackEncoding],
     scope_mask: u64,
+    max_output_bytes: u64,
 ) -> io::Result<Vec<u8>> {
     let mut buf = data.to_vec();
     // Matroska specifies decoding in reverse order of ContentEncodingOrder.
@@ -814,12 +820,30 @@ fn apply_track_encodings(
         }
         match &enc.compression {
             ContentCompression::Zlib => {
-                let mut decoder = ZlibDecoder::new(buf.as_slice());
+                let mut decoder =
+                    ZlibDecoder::new(buf.as_slice()).take(max_output_bytes.saturating_add(1));
                 let mut out = Vec::new();
                 decoder.read_to_end(&mut out)?;
+                if out.len() as u64 > max_output_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Matroska zlib payload exceeded limit ({max_output_bytes} bytes)"
+                        ),
+                    ));
+                }
                 buf = out;
             }
             ContentCompression::HeaderStripping(prefix) => {
+                let total = (prefix.len() as u64).saturating_add(buf.len() as u64);
+                if total > max_output_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Matroska header-stripped payload exceeded limit ({max_output_bytes} bytes)"
+                        ),
+                    ));
+                }
                 let mut out = Vec::with_capacity(prefix.len() + buf.len());
                 out.extend_from_slice(prefix);
                 out.extend_from_slice(&buf);
@@ -856,7 +880,7 @@ fn parse_attachments<R: Read + Seek>(
                     break;
                 };
                 let sub_end = element_end_pos(sub.data_start, sub.size, child_end);
-                let sz = sub_end - sub.data_start;
+                let sz = sub_end.saturating_sub(sub.data_start);
                 match sub.id {
                     ID_FILE_NAME if sz <= 4096 => file_name = read_utf8(reader, sz as usize)?,
                     ID_FILE_MIME_TYPE if sz <= 512 => mime_type = read_utf8(reader, sz as usize)?,
@@ -934,7 +958,7 @@ fn parse_cluster_for_track(
         }
 
         let child_end = element_end_pos(hdr.data_start, hdr.size, cluster_end);
-        let sz = child_end - hdr.data_start;
+        let sz = child_end.saturating_sub(hdr.data_start);
 
         match hdr.id {
             ID_CLUSTER_TIMESTAMP if sz <= 8 => {
@@ -944,17 +968,26 @@ fn parse_cluster_for_track(
                 // Fast-path skip: read only the leading TrackNumber VINT before touching
                 // multi-kilobyte video/audio frame payloads!
                 if let Some((trk, vint_len)) = read_data_vint(reader)? {
-                    if trk == target.info.track_number {
-                        let rem = (sz as usize).saturating_sub(vint_len);
-                        let rest = read_exact_vec(reader, rem)?;
-                        decode_block_rest(&rest, cluster_ts, None, timestamp_scale, target, cues);
-                    } else {
-                        let skip = (child_end as i64) - (stream_pos(reader)? as i64);
-                        if skip != 0 {
-                            reader.seek_relative(skip)?;
+                    if vint_len <= sz as usize {
+                        if trk == target.info.track_number {
+                            let rem = (sz as usize) - vint_len;
+                            let rest = read_exact_vec(reader, rem)?;
+                            decode_block_rest(
+                                &rest,
+                                cluster_ts,
+                                None,
+                                timestamp_scale,
+                                target,
+                                cues,
+                            );
+                        } else {
+                            let skip = (child_end as i64) - (stream_pos(reader)? as i64);
+                            if skip != 0 {
+                                reader.seek_relative(skip)?;
+                            }
                         }
+                        continue;
                     }
-                    continue;
                 }
             }
             ID_BLOCK_GROUP => {
@@ -988,13 +1021,13 @@ fn parse_block_group(
             break;
         };
         let child_end = element_end_pos(hdr.data_start, hdr.size, group_end);
-        let sz = child_end - hdr.data_start;
+        let sz = child_end.saturating_sub(hdr.data_start);
 
         match hdr.id {
             ID_BLOCK if sz >= 4 && sz <= MAX_BLOCK_BYTES => {
                 if let Some((trk, vint_len)) = read_data_vint(reader)? {
-                    if trk == target.info.track_number {
-                        let rem = (sz as usize).saturating_sub(vint_len);
+                    if vint_len <= sz as usize && trk == target.info.track_number {
+                        let rem = (sz as usize) - vint_len;
                         matching_block = Some(read_exact_vec(reader, rem)?);
                         continue;
                     }
@@ -1063,7 +1096,7 @@ fn decode_block_rest(
         let payload: &[u8] = if target.encodings.is_empty() {
             raw_frame
         } else {
-            match apply_track_encodings(raw_frame, &target.encodings, 1) {
+            match apply_track_encodings(raw_frame, &target.encodings, 1, MAX_BLOCK_BYTES) {
                 Ok(v) => {
                     decoded_owned = v;
                     &decoded_owned
@@ -1143,10 +1176,13 @@ fn split_laced_frames<'a>(data: &'a [u8], lacing: u8) -> Vec<&'a [u8]> {
     match lacing {
         // Fixed-size lacing
         2 => {
-            if frame_count == 0 || body.len() % frame_count != 0 {
+            if frame_count == 0 || body.is_empty() || body.len() % frame_count != 0 {
                 return Vec::new();
             }
             let chunk = body.len() / frame_count;
+            if chunk == 0 {
+                return Vec::new();
+            }
             body.chunks(chunk).collect()
         }
         // Xiph lacing
@@ -1271,6 +1307,9 @@ fn read_element_header<R: Read + Seek>(
         return Ok(None);
     };
     let data_start = stream_pos(reader)?;
+    if data_start > limit {
+        return Ok(None);
+    }
     Ok(Some(ElementHeader {
         id,
         size,
@@ -1421,9 +1460,23 @@ mod tests {
                 compression: ContentCompression::Zlib,
             }],
             1,
+            MAX_BLOCK_BYTES,
         )
         .unwrap();
         assert_eq!(decoded, original);
+
+        // Exceeding max_output_bytes must return InvalidData instead of unbounded OOM.
+        let bomb_err = apply_track_encodings(
+            &compressed,
+            &[TrackEncoding {
+                scope: 1,
+                compression: ContentCompression::Zlib,
+            }],
+            1,
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(bomb_err.kind(), io::ErrorKind::InvalidData);
 
         let stripped = apply_track_encodings(
             b"World",
@@ -1432,8 +1485,23 @@ mod tests {
                 compression: ContentCompression::HeaderStripping(b"Hello ".to_vec()),
             }],
             1,
+            MAX_BLOCK_BYTES,
         )
         .unwrap();
         assert_eq!(stripped, b"Hello World");
+    }
+
+    #[test]
+    fn malformed_lacing_and_truncated_vint_header_do_not_panic() {
+        // Fixed-size lacing with empty body must return empty vec instead of chunks(0) panic.
+        assert!(split_laced_frames(&[0x01], 2).is_empty());
+        assert!(split_laced_frames(&[0x00], 2).is_empty());
+
+        // Truncated multi-byte size VINT overshooting parent limit must return Ok(None).
+        let buf: &[u8] = &[0xD7, 0x40, 0x05]; // 1-byte ID + 2-byte size VINT (3 bytes total)
+        let mut cursor = io::Cursor::new(buf);
+        // Limit=2 cuts right through the 2-byte size VINT so data_start (3) > limit (2).
+        let hdr = read_element_header(&mut cursor, 2).unwrap();
+        assert!(hdr.is_none());
     }
 }
