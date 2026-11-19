@@ -2021,6 +2021,14 @@ pub struct MpvSoftwareRenderer {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderApi { Software, OpenGl }
 
+/// Native display server passed into `mpv_render_context_create` for OpenGL interop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlDisplayBackend {
+    Unknown,
+    X11,
+    Wayland,
+}
+
 enum GlProcResolverInner {
     /// Borrowed synchronously during `mpv_render_context_create`, then cleared.
     Scoped(*const dyn Fn(&CStr) -> *const c_void),
@@ -2090,6 +2098,9 @@ struct RenderContext {
     pointer: Option<std::ptr::NonNull<ffi::mpv_render_context>>,
     api: RenderApi,
     gl_proc_resolver: Option<std::ptr::NonNull<GlProcResolver>>,
+    display_backend: GlDisplayBackend,
+    advanced_control: bool,
+    owner_thread: Option<std::thread::ThreadId>,
 }
 
 unsafe impl Send for RenderContext {}
@@ -2098,13 +2109,33 @@ impl RenderContext {
     fn free_context(&mut self) {
         if let Some(context) = self.pointer.take() {
             unsafe {
-                ffi::mpv_render_context_set_update_callback(context.as_ptr(), None, ptr::null_mut());
+                // Always detach the update callback first so libmpv worker threads
+                // stop posting render notifications before VO teardown begins.
+                ffi::mpv_render_context_set_update_callback(
+                    context.as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                );
+                // When MPV_RENDER_PARAM_ADVANCED_CONTROL is enabled and we are on
+                // the owning GL render thread, drain any pending core requests
+                // (e.g., GPU screenshot / texture alloc) before tearing down the VO.
+                if self.api == RenderApi::OpenGl
+                    && self.advanced_control
+                    && self.owner_thread == Some(std::thread::current().id())
+                {
+                    let _ = ffi::mpv_render_context_update(context.as_ptr());
+                }
                 ffi::mpv_render_context_free(context.as_ptr());
             }
         }
+        // Only drop the GL proc resolver AFTER mpv_render_context_free returns,
+        // because libmpv may still resolve teardown symbols during VO shutdown.
         if let Some(resolver) = self.gl_proc_resolver.take() {
             drop(unsafe { Box::from_raw(resolver.as_ptr()) });
         }
+        self.display_backend = GlDisplayBackend::Unknown;
+        self.advanced_control = false;
+        self.owner_thread = None;
     }
 }
 
@@ -2423,6 +2454,9 @@ impl MpvInstance {
                 pointer: Some(context),
                 api: RenderApi::Software,
                 gl_proc_resolver: None,
+                display_backend: GlDisplayBackend::Unknown,
+                advanced_control: false,
+                owner_thread: None,
             })),
             render_pending,
             event_pending,
@@ -2447,16 +2481,39 @@ impl MpvInstance {
         })
     }
 
-    /// NVDEC's direct CUDA/GL interop requires an NVIDIA GL context. Hybrid
-    /// systems can still decode on NVIDIA and display on Intel/AMD by copying.
-    /// Preserve the user's decoder choice and order; adapt only that interop.
+    /// NVDEC's direct CUDA/GL interop requires an NVIDIA GL context and is
+    /// fragile over shared Wayland EGL / GUI-toolkit contexts (where FFmpeg's
+    /// decoder thread can fail with `cuCtxPushCurrent(decoder->cuda_ctx) failed`
+    /// during seeks or context transitions). Adapt `hwdec` cleanly for the
+    /// active GL renderer and display backend while preserving explicit user
+    /// choices.
     pub fn configure_opengl_decoder(&self, renderer: &str) -> Result<(), String> {
-        let compatible = compatible_opengl_hwdec(&self.configured_hwdec, renderer);
+        let is_wayland = self.active_display_backend() == GlDisplayBackend::Wayland;
+        let compatible =
+            compatible_opengl_hwdec_for_session(&self.configured_hwdec, renderer, is_wayland);
         if compatible != self.configured_hwdec {
             self.command_async(&["set", "hwdec", &compatible])?;
-            eprintln!("Video decoder compatibility: {} -> {compatible} ({renderer})", self.configured_hwdec);
+            eprintln!(
+                "Video decoder compatibility: {} -> {compatible} ({renderer}, wayland={is_wayland})",
+                self.configured_hwdec
+            );
         }
         Ok(())
+    }
+
+    /// Return the native display backend bound to the active OpenGL render context.
+    pub fn active_display_backend(&self) -> GlDisplayBackend {
+        self.render_lock
+            .lock()
+            .map(|guard| guard.display_backend)
+            .unwrap_or(GlDisplayBackend::Unknown)
+    }
+
+    /// Return whether `MPV_RENDER_PARAM_ADVANCED_CONTROL` is active on the current render context.
+    pub fn is_advanced_control_active(&self) -> bool {
+        self.render_lock
+            .lock()
+            .is_ok_and(|guard| guard.advanced_control && guard.pointer.is_some())
     }
 
     /// Register a lightweight event-loop wakeup once. Called from mpv's threads;
@@ -2802,6 +2859,24 @@ impl MpvInstance {
         }
     }
 
+    /// Unconditionally service `mpv_render_context_update()` on the render thread
+    /// with the GL context current, returning the raw `mpv_render_update_flag`
+    /// bitmask. Useful under `MPV_RENDER_PARAM_ADVANCED_CONTROL` when servicing
+    /// non-frame tasks (such as GPU screenshots or texture allocations) even if
+    /// the video viewport is temporarily `(0, 0)`.
+    pub fn pump_render_update(&self) -> u64 {
+        let Ok(guard) = self.render_lock.try_lock() else {
+            return 0;
+        };
+        if let Some(delay) = self.render_pending.take() {
+            self.render_update_delay.set(delay);
+        }
+        let Some(context) = guard.pointer else {
+            return 0;
+        };
+        unsafe { ffi::mpv_render_context_update(context.as_ptr()) }
+    }
+
     /// Render directly into caller memory (row-major, top-down RGBA8, tightly
     /// packed, opaque). The buffer must remain exclusively borrowed until
     /// mpv returns. mpv requires at least 4-byte pixel alignment; a 64-byte
@@ -2866,17 +2941,56 @@ impl MpvInstance {
         x11_display: Option<*mut c_void>,
         wl_display: Option<*mut c_void>,
     ) -> Result<(), String> {
+        self.activate_opengl_inner_with_control(resolver, is_scoped, x11_display, wl_display, true)
+    }
+
+    /// Like [`Self::activate_opengl_owned_with_display`], with explicit control
+    /// over `MPV_RENDER_PARAM_ADVANCED_CONTROL` (e.g., for dedicated offscreen
+    /// CGL/Metal producer threads).
+    pub fn activate_opengl_owned_with_options(
+        &self,
+        resolver: impl Fn(&CStr) -> *const c_void + Send + Sync + 'static,
+        x11_display: Option<*mut c_void>,
+        wl_display: Option<*mut c_void>,
+        advanced_control: bool,
+    ) -> Result<(), String> {
+        self.activate_opengl_inner_with_control(
+            GlProcResolver::owned(resolver),
+            false,
+            x11_display,
+            wl_display,
+            advanced_control,
+        )
+    }
+
+    fn activate_opengl_inner_with_control(
+        &self,
+        resolver: GlProcResolver,
+        is_scoped: bool,
+        x11_display: Option<*mut c_void>,
+        wl_display: Option<*mut c_void>,
+        advanced_control: bool,
+    ) -> Result<(), String> {
         let mut guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
         if guard.api == RenderApi::OpenGl {
             return Ok(());
         }
+        let display_backend = if x11_display.is_some_and(|p| !p.is_null()) {
+            GlDisplayBackend::X11
+        } else if wl_display.is_some_and(|p| !p.is_null()) {
+            GlDisplayBackend::Wayland
+        } else {
+            GlDisplayBackend::Unknown
+        };
+        let _ = self.render_pending.take();
         guard.free_context();
-        let gl_result = create_opengl_context_with_display(
+        let gl_result = create_opengl_context_with_options(
             self.handle,
             resolver,
             is_scoped,
             x11_display,
             wl_display,
+            advanced_control,
         );
         let (context, resolver_ptr) = match gl_result {
             Ok(res) => res,
@@ -2884,6 +2998,9 @@ impl MpvInstance {
                 let fallback = create_software_context(self.handle)?;
                 guard.pointer = Some(fallback);
                 guard.api = RenderApi::Software;
+                guard.display_backend = GlDisplayBackend::Unknown;
+                guard.advanced_control = false;
+                guard.owner_thread = None;
                 self.install_render_callback(fallback);
                 return Err(error);
             }
@@ -2891,15 +3008,28 @@ impl MpvInstance {
         guard.pointer = Some(context);
         guard.api = RenderApi::OpenGl;
         guard.gl_proc_resolver = Some(resolver_ptr);
+        guard.display_backend = display_backend;
+        guard.advanced_control = advanced_control;
+        guard.owner_thread = Some(std::thread::current().id());
         self.install_render_callback(context);
         self.render_pending.notify();
         Ok(())
     }
 
-    /// Free GL resources before Slint destroys the graphics context.
+    /// Free GL resources before the UI destroys the graphics context.
+    /// Must be called on the OpenGL render thread while its GL context is current.
     pub fn deactivate_opengl(&self) {
         if let Ok(mut guard) = self.render_lock.lock() {
             if guard.api == RenderApi::OpenGl {
+                if guard.pointer.is_some()
+                    && guard.owner_thread.is_some()
+                    && guard.owner_thread != Some(std::thread::current().id())
+                {
+                    eprintln!(
+                        "Warning: deactivate_opengl() called from a different thread than the owning GL context thread"
+                    );
+                }
+                let _ = self.render_pending.take();
                 guard.free_context();
                 guard.api = RenderApi::Software;
             }
@@ -2911,11 +3041,20 @@ impl MpvInstance {
         if guard.api == RenderApi::Software && guard.pointer.is_some() {
             return Ok(());
         }
+        let _ = self.render_pending.take();
         guard.free_context();
         let context = create_software_context(self.handle)?;
         guard.pointer = Some(context);
         guard.api = RenderApi::Software;
+        guard.display_backend = GlDisplayBackend::Unknown;
+        guard.advanced_control = false;
+        guard.owner_thread = None;
         self.install_render_callback(context);
+        drop(guard);
+        let sw_hwdec = compatible_software_hwdec(&self.configured_hwdec);
+        if sw_hwdec != self.configured_hwdec {
+            let _ = self.command_async(&["set", "hwdec", &sw_hwdec]);
+        }
         self.render_pending.notify();
         Ok(())
     }
@@ -2938,6 +3077,25 @@ impl MpvInstance {
         height: u32,
         internal_format: i32,
     ) -> Result<(), String> {
+        self.render_opengl_ex(fbo, width, height, internal_format, false, false)
+    }
+
+    /// Draw to an OpenGL framebuffer with explicit internal format, vertical
+    /// flip control (`MPV_RENDER_PARAM_FLIP_Y`), and target-time pacing.
+    pub fn render_opengl_ex(
+        &self,
+        fbo: u32,
+        width: u32,
+        height: u32,
+        internal_format: i32,
+        flip_y: bool,
+        block_for_target_time: bool,
+    ) -> Result<(), String> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(format!(
+                "mpv OpenGL render requires positive dimensions fitting in i32, got {width}x{height}"
+            ));
+        }
         let guard = self.render_lock.lock().map_err(|_| "mpv render lock poisoned")?;
         if guard.api != RenderApi::OpenGl {
             return Err("OpenGL rendering is inactive".into());
@@ -2949,17 +3107,20 @@ impl MpvInstance {
             h: height as c_int,
             internal_format: internal_format as c_int,
         };
-        // The UI thread must not wait inside mpv's frame pacing. Slint schedules
-        // redraws from mpv's update callback and presents the frame afterward.
-        let mut block_for_target_time: c_int = 0;
+        let mut block_flag: c_int = c_int::from(block_for_target_time);
+        let mut flip_flag: c_int = c_int::from(flip_y);
         let mut params = [
             ffi::mpv_render_param {
                 type_: ffi::MPV_RENDER_PARAM_OPENGL_FBO,
                 data: (&mut target as *mut ffi::mpv_opengl_fbo).cast(),
             },
             ffi::mpv_render_param {
+                type_: ffi::MPV_RENDER_PARAM_FLIP_Y,
+                data: (&mut flip_flag as *mut c_int).cast(),
+            },
+            ffi::mpv_render_param {
                 type_: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
-                data: (&mut block_for_target_time as *mut c_int).cast(),
+                data: (&mut block_flag as *mut c_int).cast(),
             },
             ffi::mpv_render_param {
                 type_: ffi::MPV_RENDER_PARAM_INVALID,
@@ -2993,13 +3154,101 @@ impl MpvInstance {
 
 }
 
-fn compatible_opengl_hwdec(configured: &str, renderer: &str) -> String {
-    if renderer.to_ascii_lowercase().contains("nvidia") {
-        return configured.to_owned();
+fn is_software_gl_renderer_name(renderer: &str) -> bool {
+    let lower = renderer.to_ascii_lowercase();
+    lower.contains("llvmpipe")
+        || lower.contains("softpipe")
+        || lower.contains("swrast")
+        || lower.contains("swiftshader")
+        || lower.contains("lavapipe")
+        || lower.contains("microsoft basic render")
+}
+
+/// Compute a safe `hwdec` string for an OpenGL `mpv_render_context` given the
+/// configured decoder list and `GL_RENDERER` name (assuming X11/non-Wayland).
+pub fn compatible_opengl_hwdec(configured: &str, renderer: &str) -> String {
+    compatible_opengl_hwdec_for_session(configured, renderer, false)
+}
+
+/// Compute a safe `hwdec` string for an OpenGL `mpv_render_context` taking into
+/// account the `GL_RENDERER` vendor/type and whether Wayland EGL is active.
+///
+/// Key safety rules:
+/// - Software GL rasterizers (`llvmpipe`, `softpipe`, `swrast`, `swiftshader`):
+///   cannot share zero-copy GPU textures; rewrite direct decoders to `-copy`
+///   and `auto-safe` to `auto-copy-safe`.
+/// - Non-NVIDIA hardware GL (Intel/AMD/Apple): rewrite `nvdec` -> `nvdec-copy`,
+///   `cuda` -> `cuda-copy`, `vdpau` -> `vdpau-copy`, preserving `vaapi`/`auto`.
+/// - NVIDIA GL:
+///   - When using the default `auto-safe` inside a shared GUI OpenGL context
+///     (or any direct `nvdec`/`cuda`/`vdpau` over Wayland EGL), prefer
+///     `nvdec-copy,auto-copy-safe` / copyback so FFmpeg's decoder worker uses a
+///     standalone CUDA context immune to `cuCtxPushCurrent(decoder->cuda_ctx)`
+///     failures during seeks, surface resizes, or context switches.
+///   - On X11/GLX, an explicit user opt-in (`hwdec=nvdec`) is preserved.
+pub fn compatible_opengl_hwdec_for_session(
+    configured: &str,
+    renderer: &str,
+    is_wayland: bool,
+) -> String {
+    if is_software_gl_renderer_name(renderer) {
+        return compatible_software_hwdec(configured);
     }
-    configured.split(',').map(|decoder| {
-        if decoder.trim() == "nvdec" { "nvdec-copy" } else { decoder }
-    }).collect::<Vec<_>>().join(",")
+    let is_nvidia = renderer.to_ascii_lowercase().contains("nvidia");
+    if is_nvidia {
+        if is_wayland {
+            return configured
+                .split(',')
+                .map(|decoder| match decoder.trim() {
+                    "auto-safe" => "nvdec-copy,auto-copy-safe",
+                    "nvdec" => "nvdec-copy",
+                    "cuda" => "cuda-copy",
+                    "vdpau" => "vdpau-copy",
+                    _ => decoder,
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+        }
+        return configured
+            .split(',')
+            .map(|decoder| match decoder.trim() {
+                "auto-safe" => "nvdec-copy,auto-copy-safe",
+                _ => decoder,
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    configured
+        .split(',')
+        .map(|decoder| match decoder.trim() {
+            "nvdec" => "nvdec-copy",
+            "cuda" => "cuda-copy",
+            "vdpau" => "vdpau-copy",
+            _ => decoder,
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Convert direct GPU-interop decoders to copyback equivalents for software
+/// rendering or software-rasterized GL contexts (`llvmpipe`, `swrast`, etc.).
+pub fn compatible_software_hwdec(configured: &str) -> String {
+    configured
+        .split(',')
+        .map(|decoder| match decoder.trim() {
+            "auto-safe" => "auto-copy-safe",
+            "auto" | "yes" => "auto-copy",
+            "nvdec" => "nvdec-copy",
+            "cuda" => "cuda-copy",
+            "vaapi" => "vaapi-copy",
+            "vdpau" => "vdpau-copy",
+            "d3d11va" => "d3d11va-copy",
+            "videotoolbox" => "videotoolbox-copy",
+            "vulkan" => "vulkan-copy",
+            _ => decoder,
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn create_software_context(handle: *mut ffi::mpv_handle) -> Result<std::ptr::NonNull<ffi::mpv_render_context>, String> {
@@ -3025,6 +3274,19 @@ pub fn create_opengl_context_with_display(
     x11_display: Option<*mut c_void>,
     wl_display: Option<*mut c_void>,
 ) -> Result<(std::ptr::NonNull<ffi::mpv_render_context>, std::ptr::NonNull<GlProcResolver>), String> {
+    create_opengl_context_with_options(handle, resolver, is_scoped, x11_display, wl_display, true)
+}
+
+/// Create an OpenGL `mpv_render_context` with explicit control over
+/// `MPV_RENDER_PARAM_ADVANCED_CONTROL`.
+pub fn create_opengl_context_with_options(
+    handle: *mut ffi::mpv_handle,
+    resolver: GlProcResolver,
+    is_scoped: bool,
+    x11_display: Option<*mut c_void>,
+    wl_display: Option<*mut c_void>,
+    advanced_control_enabled: bool,
+) -> Result<(std::ptr::NonNull<ffi::mpv_render_context>, std::ptr::NonNull<GlProcResolver>), String> {
     let non_null_resolver = std::ptr::NonNull::from(Box::leak(Box::new(resolver)));
     let resolver_ptr = non_null_resolver.as_ptr();
     let _clear_guard = is_scoped.then_some(ScopedResolverClear(resolver_ptr));
@@ -3034,10 +3296,10 @@ pub fn create_opengl_context_with_display(
         get_proc_address_ctx: resolver_ptr.cast(),
     };
     let mut context = ptr::null_mut();
-    // Enables GPU screenshots (including direct NVDEC frames). All player
-    // operations on the UI/render thread are asynchronous or cached; every
-    // update callback must be serviced even if no video frame is due.
-    let mut advanced_control: c_int = 1;
+    // When enabled, supports GPU screenshots (including hardware frames). All
+    // player operations on the UI/render thread are asynchronous or cached;
+    // every update callback must be serviced even if no video frame is due.
+    let mut advanced_control: c_int = c_int::from(advanced_control_enabled);
     let mut params = Vec::with_capacity(5);
     params.push(ffi::mpv_render_param {
         type_: ffi::MPV_RENDER_PARAM_API_TYPE,
@@ -3047,10 +3309,12 @@ pub fn create_opengl_context_with_display(
         type_: ffi::MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
         data: (&mut init as *mut ffi::mpv_opengl_init_params).cast(),
     });
-    params.push(ffi::mpv_render_param {
-        type_: ffi::MPV_RENDER_PARAM_ADVANCED_CONTROL,
-        data: (&mut advanced_control as *mut c_int).cast(),
-    });
+    if advanced_control_enabled {
+        params.push(ffi::mpv_render_param {
+            type_: ffi::MPV_RENDER_PARAM_ADVANCED_CONTROL,
+            data: (&mut advanced_control as *mut c_int).cast(),
+        });
+    }
     if let Some(display) = x11_display.filter(|p| !p.is_null()) {
         params.push(ffi::mpv_render_param {
             type_: ffi::MPV_RENDER_PARAM_X11_DISPLAY,
@@ -4130,19 +4394,33 @@ impl AsrSubtitleTrack {
 
 impl Drop for MpvInstance {
     fn drop(&mut self) {
-        // 1. Disconnect the screenshot channel and signal closing so the worker
-        //    exits immediately without waiting for the 10-second capture timeout.
+        // 1. Disconnect the screenshot channel, signal closing, and wake any
+        //    blocked screenshot worker immediately so idle weak clients exit
+        //    before render-context teardown.
         self.screenshot_jobs.take();
         self.screenshot_closing.store(true, Ordering::Release);
+        if let Ok(guard) = self.screenshot_wake_handle.lock() {
+            if let Some(weak) = *guard {
+                unsafe { ffi::mpv_wakeup(weak.0) };
+            }
+        }
 
-        // 2. Free the render context (and any heap GlProcResolver) before joining
-        //    so any in-flight GPU capture either completes or aborts cleanly.
+        // 2. Always free the mpv_render_context (and its heap GlProcResolver)
+        //    BEFORE joining the screenshot worker and BEFORE calling
+        //    mpv_terminate_destroy (required by libmpv render.h), so any
+        //    in-flight GPU screenshot either completes or aborts cleanly.
+        let _ = self.render_pending.take();
         if let Ok(mut guard) = self.render_lock.lock() {
+            if guard.api == RenderApi::OpenGl && guard.pointer.is_some() {
+                eprintln!(
+                    "Warning: MpvInstance dropped while OpenGL render context was still active; call deactivate_opengl() while the GL context is current"
+                );
+            }
             guard.free_context();
         }
 
-        // 3. Wake any waiting weak screenshot client and join its thread BEFORE
-        //    calling mpv_terminate_destroy(self.handle).
+        // 3. Wake any waiting weak screenshot client again and join its thread
+        //    BEFORE calling mpv_terminate_destroy(self.handle).
         if let Ok(guard) = self.screenshot_wake_handle.lock() {
             if let Some(weak) = *guard {
                 unsafe { ffi::mpv_wakeup(weak.0) };
@@ -4300,10 +4578,35 @@ mod tests {
     fn hybrid_gpu_decoder_uses_copyback_without_overriding_other_choices() {
         assert_eq!(compatible_opengl_hwdec("nvdec", "Mesa Intel UHD 630"), "nvdec-copy");
         assert_eq!(compatible_opengl_hwdec("nvdec,vaapi", "AMD Radeon"), "nvdec-copy,vaapi");
+        assert_eq!(compatible_opengl_hwdec("cuda,vaapi", "AMD Radeon"), "cuda-copy,vaapi");
         assert_eq!(compatible_opengl_hwdec("nvdec", "NVIDIA GeForce"), "nvdec");
         for choice in ["no", "auto", "auto-copy-safe", "nvdec-copy", "vaapi"] {
             assert_eq!(compatible_opengl_hwdec(choice, "Mesa Intel UHD 630"), choice);
         }
+    }
+
+    #[test]
+    fn nvidia_shared_gl_and_wayland_avoid_direct_cuda_interop_hazards() {
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("auto-safe", "NVIDIA GeForce RTX 4080", false),
+            "nvdec-copy,auto-copy-safe"
+        );
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("nvdec", "NVIDIA GeForce RTX 4080", true),
+            "nvdec-copy"
+        );
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("cuda,auto-safe", "NVIDIA GeForce RTX 4080", true),
+            "cuda-copy,nvdec-copy,auto-copy-safe"
+        );
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("auto-safe", "llvmpipe (LLVM 18.1.8)", false),
+            "auto-copy-safe"
+        );
+        assert_eq!(
+            compatible_software_hwdec("nvdec,vaapi,auto-safe"),
+            "nvdec-copy,vaapi-copy,auto-copy-safe"
+        );
     }
 
     #[test]

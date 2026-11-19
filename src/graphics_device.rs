@@ -1,4 +1,6 @@
-//! Match an explicitly selected NVIDIA decoder to its OpenGL device on Linux.
+//! Match an explicitly selected NVIDIA decoder to its OpenGL device on Linux,
+//! and inspect Linux display servers, `mpv.conf` renderer hints, and GPU
+//! decoder capabilities before graphics initialization.
 
 use std::path::{Path, PathBuf};
 
@@ -20,14 +22,180 @@ const EGL_VENDOR_DIRS: &[&str] = &[
     "/usr/share/glvnd/egl_vendor.d",
     "/usr/local/share/glvnd/egl_vendor.d",
     "/run/opengl-driver/share/glvnd/egl_vendor.d",
+    "/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d",
+    "/usr/lib/aarch64-linux-gnu/GL/glvnd/egl_vendor.d",
 ];
+
+/// Linux display server detected from environment variables.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinuxDisplayServer {
+    Wayland,
+    WaylandWithX11Fallback,
+    X11,
+    Headless,
+}
+
+/// Preferred OpenGL context creation API on Linux.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinuxGlContextApi {
+    /// EGL (required on Wayland and for VAAPI zero-copy on Intel/AMD).
+    Egl,
+    /// GLX (legacy X11 path, also supports NVIDIA VDPAU / GLX interop).
+    Glx,
+}
+
+/// Planned Linux graphics device selection before graphics/libmpv init.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxGraphicsDevicePlan {
+    pub display_server: LinuxDisplayServer,
+    pub preferred_gl_api: LinuxGlContextApi,
+    pub request_nvidia_prime_offload: bool,
+    pub nvidia_egl_vendor_file: Option<PathBuf>,
+    pub force_software_gl: bool,
+}
+
+/// Renderer/decoder-relevant global options extracted from `mpv.conf` before
+/// creating a libmpv handle.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MpvConfRendererHints {
+    pub hwdec: Option<String>,
+    pub vo: Option<String>,
+    pub gpu_api: Option<String>,
+    pub gpu_context: Option<String>,
+}
+
+/// Detect the active Linux display server from an injectable environment lookup.
+#[allow(dead_code)]
+pub fn detect_linux_display_server_with(
+    env: impl Fn(&str) -> Option<String>,
+) -> LinuxDisplayServer {
+    let wayland = env("WAYLAND_DISPLAY").is_some_and(|v| !v.trim().is_empty());
+    let x11 = env("DISPLAY").is_some_and(|v| !v.trim().is_empty());
+    let session = env("XDG_SESSION_TYPE")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if wayland && x11 {
+        if session == "x11" {
+            LinuxDisplayServer::X11
+        } else {
+            LinuxDisplayServer::WaylandWithX11Fallback
+        }
+    } else if wayland {
+        LinuxDisplayServer::Wayland
+    } else if x11 {
+        LinuxDisplayServer::X11
+    } else {
+        LinuxDisplayServer::Headless
+    }
+}
+
+/// Detect the active Linux display server from the current process environment.
+#[allow(dead_code)]
+pub fn detect_linux_display_server() -> LinuxDisplayServer {
+    detect_linux_display_server_with(|key| std::env::var(key).ok())
+}
+
+/// Classify whether a `GL_RENDERER` string identifies a CPU software rasterizer.
+#[allow(dead_code)]
+pub fn is_software_gl_renderer(renderer: &str) -> bool {
+    let lower = renderer.to_ascii_lowercase();
+    lower.contains("llvmpipe")
+        || lower.contains("softpipe")
+        || lower.contains("swrast")
+        || lower.contains("swiftshader")
+        || lower.contains("lavapipe")
+        || lower.contains("microsoft basic render")
+}
+
+/// Classify whether a `GL_RENDERER` string identifies an NVIDIA GPU.
+#[allow(dead_code)]
+pub fn is_nvidia_gl_renderer(renderer: &str) -> bool {
+    let lower = renderer.to_ascii_lowercase();
+    lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro")
+}
+
+/// Classify whether a `GL_RENDERER` string typically uses VAAPI on Linux (Intel/AMD/Mesa).
+#[allow(dead_code)]
+pub fn is_vaapi_capable_renderer(renderer: &str) -> bool {
+    if is_software_gl_renderer(renderer) || is_nvidia_gl_renderer(renderer) {
+        return false;
+    }
+    let lower = renderer.to_ascii_lowercase();
+    lower.contains("intel")
+        || lower.contains("amd")
+        || lower.contains("radeon")
+        || lower.contains("mesa")
+}
+
+/// Determine whether a configured `hwdec` string explicitly starts with a
+/// direct NVIDIA CUDA/GL decoder (`nvdec` or `cuda`) requiring PRIME offload.
+#[allow(dead_code)]
+pub fn decoder_requests_direct_nvidia(decoder: &str) -> bool {
+    decoder
+        .split(',')
+        .next()
+        .is_some_and(|s| matches!(s.trim(), "nvdec" | "cuda"))
+}
+
+/// Pure Linux graphics-device decision planner (testable without probing `/dev`).
+#[allow(dead_code)]
+pub fn plan_linux_graphics_device(
+    decoder: &str,
+    display_server: LinuxDisplayServer,
+    nvidia_driver_available: bool,
+    device_overridden: bool,
+    libgl_always_software: bool,
+    nvidia_egl_vendor_file: Option<PathBuf>,
+) -> LinuxGraphicsDevicePlan {
+    let request_nvidia_prime_offload = nvidia_driver_available
+        && !device_overridden
+        && !libgl_always_software
+        && decoder_requests_direct_nvidia(decoder);
+
+    let preferred_gl_api = match display_server {
+        LinuxDisplayServer::Wayland | LinuxDisplayServer::WaylandWithX11Fallback => {
+            LinuxGlContextApi::Egl
+        }
+        LinuxDisplayServer::X11 => {
+            // Prefer EGL on X11 when VAAPI is selected (required by libmpv for
+            // direct VAAPI zero-copy), and GLX for direct NVIDIA/VDPAU interop.
+            if request_nvidia_prime_offload
+                || decoder
+                    .split(',')
+                    .next()
+                    .is_some_and(|s| matches!(s.trim(), "nvdec" | "cuda" | "vdpau"))
+            {
+                LinuxGlContextApi::Glx
+            } else {
+                LinuxGlContextApi::Egl
+            }
+        }
+        LinuxDisplayServer::Headless => LinuxGlContextApi::Egl,
+    };
+
+    LinuxGraphicsDevicePlan {
+        display_server,
+        preferred_gl_api,
+        request_nvidia_prime_offload,
+        nvidia_egl_vendor_file,
+        force_software_gl: libgl_always_software,
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn find_nvidia_egl_vendor_file() -> Option<PathBuf> {
     find_nvidia_egl_vendor_file_in(EGL_VENDOR_DIRS.iter().map(Path::new))
 }
 
-fn find_nvidia_egl_vendor_file_in<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+#[allow(dead_code)]
+pub fn find_nvidia_egl_vendor_file_in<'a>(
+    dirs: impl IntoIterator<Item = &'a Path>,
+) -> Option<PathBuf> {
     let dirs: Vec<&Path> = dirs.into_iter().collect();
     for dir in &dirs {
         let preferred = dir.join("10_nvidia.json");
@@ -92,12 +260,12 @@ fn unquote_conf_value(value: &str) -> String {
     }
 }
 
-/// Lightweight pre-init parser for `mpv.conf` extracting global `hwdec=...`
-/// without constructing an `mpv_handle` before `exec()`.
+/// Parse global `hwdec`, `vo`, `gpu-api`, and `gpu-context` hints from `mpv.conf`
+/// without initializing a libmpv instance.
 #[allow(dead_code)]
-pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
+pub fn parse_mpv_conf_renderer_hints(contents: &str) -> MpvConfRendererHints {
     let mut in_global_section = true;
-    let mut configured = None;
+    let mut hints = MpvConfRendererHints::default();
     for raw_line in contents.lines() {
         let line = strip_unquoted_comment(raw_line).trim();
         if line.is_empty() {
@@ -111,24 +279,47 @@ pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
             continue;
         }
         let option = line.strip_prefix("--").unwrap_or(line);
-        if option == "no-hwdec" {
-            configured = Some("no".to_owned());
-            continue;
-        }
-        if option == "hwdec" {
-            configured = Some("yes".to_owned());
-            continue;
+        match option {
+            "no-hwdec" => {
+                hints.hwdec = Some("no".to_owned());
+                continue;
+            }
+            "hwdec" => {
+                hints.hwdec = Some("yes".to_owned());
+                continue;
+            }
+            _ => {}
         }
         if let Some((key, value)) = option.split_once('=') {
-            if key.trim() == "hwdec" {
-                let parsed = unquote_conf_value(value);
-                if !parsed.is_empty() {
-                    configured = Some(parsed);
-                }
+            let parsed = unquote_conf_value(value);
+            if parsed.is_empty() {
+                continue;
+            }
+            match key.trim() {
+                "hwdec" => hints.hwdec = Some(parsed),
+                "vo" => hints.vo = Some(parsed),
+                "gpu-api" => hints.gpu_api = Some(parsed),
+                "gpu-context" => hints.gpu_context = Some(parsed),
+                _ => {}
             }
         }
     }
-    configured
+    hints
+}
+
+/// Read renderer hints from `<config_dir>/mpv.conf` if present.
+#[allow(dead_code)]
+pub fn read_mpv_conf_renderer_hints(config_dir: &Path) -> MpvConfRendererHints {
+    std::fs::read_to_string(config_dir.join("mpv.conf"))
+        .map(|contents| parse_mpv_conf_renderer_hints(&contents))
+        .unwrap_or_default()
+}
+
+/// Lightweight pre-init parser for `mpv.conf` extracting global `hwdec=...`
+/// without constructing an `mpv_handle` before `exec()`.
+#[allow(dead_code)]
+pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
+    parse_mpv_conf_renderer_hints(contents).hwdec
 }
 
 /// Read global `hwdec` directly from `<config_dir>/mpv.conf` before creating
@@ -137,6 +328,40 @@ pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
 pub fn configured_hwdec_from_mpv_conf(config_dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(config_dir.join("mpv.conf")).ok()?;
     parse_hwdec_from_mpv_conf_str(&contents)
+}
+
+/// Extract a global `--<key>=<val>` CLI override outside `--{ ... --}` groups.
+#[allow(dead_code)]
+pub fn configured_option_from_args<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    key: &str,
+) -> Option<String> {
+    let prefix = format!("--{key}=");
+    let mut depth = 0usize;
+    let mut configured = None;
+    for arg in args.into_iter().skip(1) {
+        if arg == "--" && depth == 0 {
+            break;
+        }
+        if arg == "--{" {
+            depth += 1;
+            continue;
+        }
+        if arg == "--}" {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth > 0 {
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix(&prefix) {
+            let unquoted = unquote_conf_value(val);
+            if !unquoted.is_empty() {
+                configured = Some(unquoted);
+            }
+        }
+    }
+    configured
 }
 
 /// Extract global `--hwdec=...` / `--hwdec` / `--no-hwdec` CLI overrides outside `--{ ... --}`.
@@ -175,17 +400,12 @@ pub fn configured_hwdec_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -
 
 #[cfg(target_os = "linux")]
 fn needs_nvidia_offload(decoder: &str, driver_available: bool, overridden: bool) -> bool {
-    driver_available
-        && !overridden
-        && decoder
-            .split(',')
-            .next()
-            .is_some_and(|s| s.trim() == "nvdec")
+    driver_available && !overridden && decoder_requests_direct_nvidia(decoder)
 }
 
 /// Inspect CLI options and `<config_dir>/mpv.conf` before initializing libmpv
 /// or Slint, re-execing with NVIDIA PRIME offload (X11 GLX and Wayland EGL)
-/// when `hwdec` explicitly starts with `nvdec`.
+/// when `hwdec` explicitly starts with `nvdec` or `cuda`.
 #[allow(dead_code)]
 pub fn select_for_config_dir(config_dir: &Path) {
     let cli_args: Vec<String> = std::env::args().collect();
@@ -223,6 +443,18 @@ pub fn select_for_decoder(decoder: &str) {
         let Ok(executable) = std::env::current_exe() else {
             return;
         };
+        let egl_vendor = find_nvidia_egl_vendor_file();
+        let display_server = detect_linux_display_server();
+        if matches!(
+            display_server,
+            LinuxDisplayServer::Wayland | LinuxDisplayServer::WaylandWithX11Fallback
+        ) && egl_vendor.is_none()
+        {
+            eprintln!(
+                "Video device: NVIDIA EGL vendor json not found; keeping default Wayland device for hwdec={decoder}"
+            );
+            return;
+        }
         eprintln!("Video device: selecting NVIDIA for configured hwdec={decoder}");
         // These standard driver overrides also prevent a second re-exec.
         let mut command = std::process::Command::new(executable);
@@ -230,7 +462,7 @@ pub fn select_for_decoder(decoder: &str) {
             .args(std::env::args_os().skip(1))
             .env("__NV_PRIME_RENDER_OFFLOAD", "1")
             .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
-        if let Some(egl_vendor) = find_nvidia_egl_vendor_file() {
+        if let Some(egl_vendor) = egl_vendor {
             command.env("__EGL_VENDOR_LIBRARY_FILENAMES", egl_vendor);
         }
         let error = command.exec();
@@ -248,11 +480,13 @@ mod tests {
     fn only_direct_nvidia_decoding_requests_automatic_offload() {
         assert!(needs_nvidia_offload("nvdec", true, false));
         assert!(needs_nvidia_offload(" nvdec,auto", true, false));
+        assert!(needs_nvidia_offload("cuda", true, false));
         for decoder in [
             "auto",
             "auto-safe",
             "auto-copy-safe",
             "nvdec-copy",
+            "cuda-copy",
             "no",
             "vaapi",
             "auto,nvdec",
@@ -268,12 +502,18 @@ mod tests {
         let conf = r#"
             # hwdec=no
             vo=gpu
+            gpu-api=opengl
             hwdec = "nvdec" # direct decode
             [extension.gif]
             hwdec=no
+            gpu-api=vulkan
             [default]
             --hwdec='nvdec,vaapi'
         "#;
+        let hints = parse_mpv_conf_renderer_hints(conf);
+        assert_eq!(hints.hwdec.as_deref(), Some("nvdec,vaapi"));
+        assert_eq!(hints.vo.as_deref(), Some("gpu"));
+        assert_eq!(hints.gpu_api.as_deref(), Some("opengl"));
         assert_eq!(
             parse_hwdec_from_mpv_conf_str(conf).as_deref(),
             Some("nvdec,vaapi")
