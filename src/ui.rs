@@ -7837,7 +7837,7 @@ impl CachedConfigSettings {
             self.middle_mouse_scan = b;
         }
         self.max_recursion_depth =
-            match config.effective_setting(raw::search::GROUP, "max-recursion-depth") {
+            match config.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH) {
                 Some(Value::Int(d)) => d.clamp(0, 10) as usize,
                 Some(Value::Real(f)) => (f.round() as i64).clamp(0, 10) as usize,
                 Some(Value::Text(s)) => s

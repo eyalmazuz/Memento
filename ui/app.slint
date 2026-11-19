@@ -6,7 +6,7 @@ import {
     PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult,
     PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
-    PopupLayout, YomitanPopup, DictionarySearchPanel, PopupBridge,
+    PopupLayout, YomitanPopup, NestedYomitanPopup, DictionarySearchPanel, PopupBridge,
 } from "popup.slint";
 import {
     SubtitleWord, SubtitleLine, InteractiveSubtitleToken, SubtitleOverlayBridge,
@@ -2576,6 +2576,7 @@ export component MementoApp inherits Window {
                             ? min(parent.height - self.height - 10px, self.sub-bottom + 12px)
                             : max(10px, self.sub-top - self.height - 12px);
                         is-open: root.dict-open;
+                        render-nested-inline: false;
                         anki-enabled: root.anki-enabled;
                         show-anki-checkbox: root.show-anki-checkbox;
                         added-note-id: root.anki-added-note-id;
@@ -2601,6 +2602,30 @@ export component MementoApp inherits Window {
                         load-more-results(force) => { root.load-more-definition-results(force); }
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
+                    }
+
+                    // Yomitan-style floating recursive child popup (full configured size, viewport-clamped)
+                    nested-yomi-card := NestedYomitanPopup {
+                        is-open: root.dict-open;
+                        viewport-width: parent.width;
+                        viewport-height: parent.height;
+                        parent-x: yomi-card.x;
+                        parent-y: yomi-card.y;
+                        configured-width: root.popup-configured-width;
+                        configured-height: root.popup-configured-height;
+                        anki-enabled: root.anki-enabled;
+                        show-anki-checkbox: root.show-anki-checkbox;
+                        added-note-id: root.anki-added-note-id;
+                        added-result-index: root.anki-added-result-index;
+                        audio-sources: root.popup-audio-sources;
+                        audio-sources-loading: root.popup-audio-sources-loading;
+                        selected-audio-source: root.popup-selected-audio-source;
+                        browse-anki-note(id) => { root.browse-anki-note(id); }
+                        play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
+                        request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
+                        select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
+                        open-rich-link(link) => { root.open-glossary-link(link); }
+                        close-parent-requested => { root.dismiss-definition(); }
                     }
 
                     // Bottom OSC Bar (Floating, 50px)

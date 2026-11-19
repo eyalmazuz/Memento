@@ -3172,6 +3172,7 @@ mod rich_popup_phase4_tests {
                 .find_all();
             let nested_touch = all_touches_after
                 .iter()
+                .skip(rich_touches.len())
                 .find(|el| {
                     let p = el.absolute_position();
                     p.x >= nc_pos.x - 2.0
