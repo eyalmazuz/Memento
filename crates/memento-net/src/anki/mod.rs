@@ -71,6 +71,8 @@ pub enum AnkiAction
     FieldNames,
     CanAddNotes,
     AddNote,
+    UpdateNoteFields,
+    AddTags,
     FindNotes,
     NotesInfo,
     GuiBrowse,
@@ -90,6 +92,8 @@ impl AnkiAction
             Self::FieldNames => "modelFieldNames",
             Self::CanAddNotes => "canAddNotes",
             Self::AddNote => "addNote",
+            Self::UpdateNoteFields => "updateNoteFields",
+            Self::AddTags => "addTags",
             Self::FindNotes => "findNotes",
             Self::NotesInfo => "notesInfo",
             Self::GuiBrowse => "guiBrowse",
@@ -483,6 +487,63 @@ impl AnkiClient
         as_note_id(&result).ok_or(AnkiError::InvalidNoteId)
     }
 
+    /// `updateNoteFields` with `{ "note": { "id": note_id, "fields": ..., ... } }`.
+    /// Conforms to AnkiConnect v6 by omitting `audio`, `picture`, and `video`
+    /// when `None` or empty.
+    pub fn update_note_fields(
+        &self,
+        note_id: i64,
+        fields: serde_json::Map<String, Value>,
+        audio: Option<&[Value]>,
+        picture: Option<&[Value]>,
+        video: Option<&[Value]>,
+    ) -> AnkiResult<()>
+    {
+        if note_id <= 0
+        {
+            return Err(AnkiError::InvalidNoteId);
+        }
+        let mut note = serde_json::Map::new();
+        note.insert("id".to_owned(), Value::from(note_id));
+        note.insert("fields".to_owned(), Value::Object(fields));
+        if let Some(items) = audio.filter(|items| !items.is_empty())
+        {
+            note.insert("audio".to_owned(), Value::Array(items.to_vec()));
+        }
+        if let Some(items) = picture.filter(|items| !items.is_empty())
+        {
+            note.insert("picture".to_owned(), Value::Array(items.to_vec()));
+        }
+        if let Some(items) = video.filter(|items| !items.is_empty())
+        {
+            note.insert("video".to_owned(), Value::Array(items.to_vec()));
+        }
+        let params = json!({ "note": Value::Object(note) });
+        let _ = self.request(AnkiAction::UpdateNoteFields, Some(params))?;
+        Ok(())
+    }
+
+    /// `addTags` with `{ "notes": [...], "tags": "..." }`.
+    /// Returns `Ok(())` without sending a request when `notes` is empty or `tags` is blank.
+    pub fn add_tags(&self, notes: &[i64], tags: &str) -> AnkiResult<()>
+    {
+        if notes.iter().any(|&id| id <= 0)
+        {
+            return Err(AnkiError::InvalidNoteId);
+        }
+        let trimmed = tags.trim();
+        if notes.is_empty() || trimmed.is_empty()
+        {
+            return Ok(());
+        }
+        let params = json!({
+            "notes": notes,
+            "tags": trimmed,
+        });
+        let _ = self.request(AnkiAction::AddTags, Some(params))?;
+        Ok(())
+    }
+
     /// `storeMediaFile` inside `multi` (the `addMedia` flow): the caller
     /// supplies pre-base64-encoded payloads (encoding is
     /// `memento-util`/`FileUtils::toBase64` business).
@@ -585,6 +646,8 @@ pub struct AnkiNoteInfo
     pub model_name: String,
     pub tags: Vec<String>,
     pub fields: HashMap<String, String>,
+    /// Name of the note model's first/sort field (minimum `"order"` in `notesInfo`), if reported.
+    pub sort_field: Option<String>,
 }
 
 fn parse_notes_info_result(result: &Value) -> AnkiResult<Vec<AnkiNoteInfo>>
@@ -629,18 +692,26 @@ fn parse_notes_info_result(result: &Value) -> AnkiResult<Vec<AnkiNoteInfo>>
             .and_then(Value::as_object)
             .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
         let mut fields = HashMap::with_capacity(fields_obj.len());
+        let mut min_order: Option<(i64, String)> = None;
         for (name, field_val) in fields_obj
         {
             let value_str = if let Some(s) = field_val.as_str()
             {
                 s
             }
-            else if let Some(s) = field_val
-                .as_object()
-                .and_then(|f| f.get("value"))
-                .and_then(Value::as_str)
+            else if let Some(field_obj) = field_val.as_object()
             {
-                s
+                if let Some(order) = field_obj.get("order").and_then(Value::as_i64)
+                {
+                    if min_order.as_ref().is_none_or(|(best, _)| order < *best)
+                    {
+                        min_order = Some((order, name.clone()));
+                    }
+                }
+                field_obj
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?
             }
             else
             {
@@ -653,6 +724,7 @@ fn parse_notes_info_result(result: &Value) -> AnkiResult<Vec<AnkiNoteInfo>>
             model_name,
             tags,
             fields,
+            sort_field: min_order.map(|(_, name)| name),
         });
     }
     Ok(infos)

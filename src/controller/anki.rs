@@ -15,7 +15,7 @@ use memento_anki::tokenizer::{tokenize, Marker};
 use memento_dict::searchcontroller::{self, TagSortItem};
 use memento_dict::sqlite_db;
 use memento_dict::yomidbbuilder;
-use memento_net::anki::{ to_qjson, AnkiClient, AnkiEndpoint, MediaFilePayload };
+use memento_net::anki::{ to_qjson, AnkiClient, AnkiEndpoint, AnkiNoteInfo, MediaFilePayload };
 use memento_subtitle::SubtitleEntry;
 use memento_util::furiganautils::simplify_surface;
 use memento_util::imageutils::generate_pitch_graph;
@@ -1038,6 +1038,25 @@ pub fn format_glossary_html(items: &[String], dict_name: &str) -> String {
 
 // ── Note Fields Context & Mapping ───────────────────────────────────────────
 
+/// Applies Memento's `search/remove-regex` and `search/replace-lines` (`search/replace-with`)
+/// filters to subtitle text. Empty or invalid regex patterns are safely ignored.
+pub fn filter_subtitle_text(
+    text: &str,
+    remove_regex: Option<&str>,
+    replace_lines: bool,
+    replace_with: &str,
+) -> String {
+    memento_dict::normalize::preprocess_search_text(
+        text,
+        remove_regex.unwrap_or(""),
+        replace_lines,
+        replace_with,
+    )
+}
+
+/// Convenience alias for [`NoteFieldsContext`].
+pub type AnkiNoteContext = NoteFieldsContext;
+
 /// Source data for populating Memento Anki note fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NoteFieldsContext {
@@ -1081,6 +1100,12 @@ pub struct NoteFieldsContext {
     pub part_of_speech: String,
     pub is_kanji: bool,
     pub cloze_index: usize,
+    /// Optional `search/remove-regex` pattern applied to subtitle/context/cloze text when building notes.
+    pub subtitle_filter_regex: Option<String>,
+    /// Optional `search/replace-lines` toggle applied to subtitle/context/cloze text when building notes.
+    pub replace_lines: bool,
+    /// Replacement string used when `replace_lines` (`search/replace-with`) is enabled.
+    pub replace_lines_with: String,
     /// AnkiConnect attachments populated before submitting a profile note.
     pub audio_attachments: Vec<serde_json::Value>,
     pub picture_attachments: Vec<serde_json::Value>,
@@ -1141,10 +1166,36 @@ impl NoteFieldsContext {
             part_of_speech: String::new(),
             is_kanji: false,
             cloze_index: 1,
+            subtitle_filter_regex: None,
+            replace_lines: false,
+            replace_lines_with: String::new(),
             audio_attachments: Vec::new(),
             picture_attachments: Vec::new(),
             video_attachments: Vec::new(),
             resolved_media_markers: Vec::new(),
+        }
+    }
+
+    /// Applies `search/remove-regex` and `search/replace-lines` to subtitle text fields
+    /// (`sentence`, `context`, `cloze_prefix`, `cloze_body`, `cloze_suffix`) in place.
+    pub fn apply_subtitle_filter(
+        &mut self,
+        remove_regex: Option<&str>,
+        replace_lines: bool,
+        replace_with: &str,
+    ) {
+        let regex_active = remove_regex.is_some_and(|r| !r.is_empty());
+        if !regex_active && !replace_lines {
+            return;
+        }
+        for value in [
+            &mut self.sentence,
+            &mut self.context,
+            &mut self.cloze_prefix,
+            &mut self.cloze_body,
+            &mut self.cloze_suffix,
+        ] {
+            *value = filter_subtitle_text(value, remove_regex, replace_lines, replace_with);
         }
     }
 
@@ -2622,6 +2673,17 @@ fn build_note_payload_from_profile_inner(
     }
 
     let mut text_context = ctx.clone();
+    if text_context
+        .subtitle_filter_regex
+        .as_deref()
+        .is_some_and(|r| !r.is_empty())
+        || text_context.replace_lines
+    {
+        let regex = text_context.subtitle_filter_regex.clone();
+        let replace_lines = text_context.replace_lines;
+        let replace_with = text_context.replace_lines_with.clone();
+        text_context.apply_subtitle_filter(regex.as_deref(), replace_lines, &replace_with);
+    }
     for value in [
         &mut text_context.sentence,
         &mut text_context.context,
@@ -2692,6 +2754,231 @@ pub struct EntryAnkiStatus {
     pub note_ids: Vec<i64>,
     pub tags: Vec<String>,
     pub browse_query: String,
+}
+
+impl EntryAnkiStatus {
+    /// Returns the primary existing Anki note ID for this entry, if present.
+    pub fn primary_note_id(&self) -> Option<i64> {
+        self.note_ids.first().copied()
+    }
+}
+
+/// Controls how fields and media are merged when updating an existing Anki note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnkiUpdateMode {
+    /// Populate only fields that are currently empty (or whitespace-only) on the existing note.
+    FillEmptyOnly,
+    /// Practical Yomitan-style default: updates configured fields where the newly built value
+    /// (or newly generated media attachment) is non-empty, never wipes an existing populated
+    /// field with an empty value, and preserves the first/key sort field if unchanged.
+    #[default]
+    OverwriteNonEmpty,
+    /// Fills empty fields, or appends new non-empty text (separated by the profile newline
+    /// replacer / `<br>`) and new media attachments to existing fields, while preserving the
+    /// first/key sort field unchanged.
+    AppendOrFill,
+}
+
+/// Result of merging newly built fields, media attachments, and tags against an existing Anki note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedNoteUpdate {
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    pub audio: Vec<serde_json::Value>,
+    pub picture: Vec<serde_json::Value>,
+    pub video: Vec<serde_json::Value>,
+    pub new_tags: Vec<String>,
+}
+
+impl MergedNoteUpdate {
+    /// Returns `true` when at least one field or media attachment needs `updateNoteFields`.
+    pub fn has_field_or_media_changes(&self) -> bool {
+        !self.fields.is_empty()
+            || !self.audio.is_empty()
+            || !self.picture.is_empty()
+            || !self.video.is_empty()
+    }
+}
+
+fn filter_update_media_attachments(
+    attachments: &[serde_json::Value],
+    existing: &AnkiNoteInfo,
+    mode: AnkiUpdateMode,
+    media_target_fields: &mut HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let mut kept = Vec::new();
+    for item in attachments {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(raw_fields) = obj.get("fields").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let mut filtered_fields = Vec::new();
+        for field_val in raw_fields {
+            let Some(field_name) = field_val.as_str() else {
+                continue;
+            };
+            if !existing.fields.is_empty() && !existing.fields.contains_key(field_name) {
+                continue;
+            }
+            let existing_empty = existing
+                .fields
+                .get(field_name)
+                .is_none_or(|value| value.trim().is_empty());
+            if mode == AnkiUpdateMode::FillEmptyOnly && !existing_empty {
+                continue;
+            }
+            media_target_fields.insert(field_name.to_owned());
+            filtered_fields.push(serde_json::Value::String(field_name.to_owned()));
+        }
+        if !filtered_fields.is_empty() {
+            let mut updated = obj.clone();
+            updated.insert("fields".to_owned(), serde_json::Value::Array(filtered_fields));
+            kept.push(serde_json::Value::Object(updated));
+        }
+    }
+    kept
+}
+
+/// Computes the merged field diff, media attachments, and missing tags for updating `existing`
+/// with `payload` under `mode`.
+pub fn merge_note_update(
+    existing: &AnkiNoteInfo,
+    payload: &NotePayload,
+    profile: &AnkiNoteConfig,
+    mode: AnkiUpdateMode,
+) -> MergedNoteUpdate {
+    let key_field = existing
+        .sort_field
+        .clone()
+        .or_else(|| select_primary_key_field(&profile.field_templates));
+
+    let mut media_target_fields = HashSet::new();
+    let audio = filter_update_media_attachments(
+        &payload.audio,
+        existing,
+        mode,
+        &mut media_target_fields,
+    );
+    let picture = filter_update_media_attachments(
+        &payload.picture,
+        existing,
+        mode,
+        &mut media_target_fields,
+    );
+    let video = filter_update_media_attachments(
+        &payload.video,
+        existing,
+        mode,
+        &mut media_target_fields,
+    );
+
+    let mut sorted_fields: Vec<(&String, &String)> = payload.fields.iter().collect();
+    sorted_fields.sort_by_key(|(name, _)| *name);
+
+    let sep = if profile.newline_replacer.is_empty() {
+        "<br>"
+    } else {
+        profile.newline_replacer.as_str()
+    };
+
+    let mut fields = serde_json::Map::new();
+    for (field_name, new_val) in sorted_fields {
+        if !existing.fields.is_empty() && !existing.fields.contains_key(field_name) {
+            continue;
+        }
+        let existing_val = existing
+            .fields
+            .get(field_name)
+            .map(String::as_str)
+            .unwrap_or("");
+        let existing_empty = existing_val.trim().is_empty();
+        let new_empty = new_val.trim().is_empty();
+        let is_key = key_field.as_deref() == Some(field_name.as_str());
+        let has_new_media = media_target_fields.contains(field_name);
+
+        match mode {
+            AnkiUpdateMode::FillEmptyOnly => {
+                if existing_empty && !new_empty {
+                    fields.insert(
+                        field_name.clone(),
+                        serde_json::Value::String(new_val.clone()),
+                    );
+                }
+            }
+            AnkiUpdateMode::OverwriteNonEmpty => {
+                if has_new_media {
+                    if !new_empty {
+                        fields.insert(
+                            field_name.clone(),
+                            serde_json::Value::String(new_val.clone()),
+                        );
+                    } else if !existing_empty {
+                        // Clear existing media-only field before AnkiConnect appends the
+                        // newly generated media attachment so old media is cleanly replaced.
+                        fields.insert(
+                            field_name.clone(),
+                            serde_json::Value::String(String::new()),
+                        );
+                    }
+                } else if !new_empty && new_val != existing_val {
+                    // Never wipes existing fields with empty values; skips unchanged fields
+                    // (including the first/key sort field) to avoid redundant re-indexing.
+                    fields.insert(
+                        field_name.clone(),
+                        serde_json::Value::String(new_val.clone()),
+                    );
+                }
+            }
+            AnkiUpdateMode::AppendOrFill => {
+                if !new_empty {
+                    if existing_empty {
+                        fields.insert(
+                            field_name.clone(),
+                            serde_json::Value::String(new_val.clone()),
+                        );
+                    } else if !is_key
+                        && existing_val != new_val
+                        && !existing_val.contains(new_val.as_str())
+                    {
+                        fields.insert(
+                            field_name.clone(),
+                            serde_json::Value::String(format!("{existing_val}{sep}{new_val}")),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let existing_tags_lower: HashSet<String> = existing
+        .tags
+        .iter()
+        .flat_map(|tag| tag.split_whitespace())
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| tag.to_ascii_lowercase())
+        .collect();
+    let mut seen_new_tags = HashSet::new();
+    let mut new_tags = Vec::new();
+    for raw_tag in &payload.tags {
+        for tag in raw_tag.split_whitespace() {
+            if tag.is_empty() {
+                continue;
+            }
+            let lower = tag.to_ascii_lowercase();
+            if !existing_tags_lower.contains(&lower) && seen_new_tags.insert(lower) {
+                new_tags.push(tag.to_owned());
+            }
+        }
+    }
+
+    MergedNoteUpdate {
+        fields,
+        audio,
+        picture,
+        video,
+        new_tags,
+    }
 }
 
 /// Escapes `\` and `"` for safe embedding inside Anki double-quoted search terms.
@@ -3112,6 +3399,92 @@ impl AnkiController {
         self.client
             .add_note(payload.to_value())
             .map_err(|error| error.to_string())
+    }
+
+    /// Updates an existing Anki note (`note_id`) using `profile` and `ctx` according to `mode`.
+    ///
+    /// Fetches existing fields and tags via `notesInfo`, merges fields and media attachments
+    /// cleanly (never wiping populated fields with empty values and preserving the key/sort field
+    /// when unchanged), uploads any referenced glossary dictionary media via `storeMediaFile`,
+    /// calls `updateNoteFields`, and attaches missing profile tags via `addTags`.
+    pub fn update_existing_note(
+        &self,
+        note_id: i64,
+        profile: &AnkiNoteConfig,
+        ctx: &NoteFieldsContext,
+        mode: AnkiUpdateMode,
+    ) -> Result<i64, String> {
+        if note_id <= 0 {
+            return Err("Anki note ID must be a positive integer".to_owned());
+        }
+        let payload = self
+            .create_note_payload_from_profile(profile, ctx)
+            .map_err(|error| error.to_string())?;
+        let infos = self
+            .client
+            .notes_info(&[note_id])
+            .map_err(|error| error.to_string())?;
+        let existing = infos
+            .into_iter()
+            .find(|info| info.note_id == note_id)
+            .ok_or_else(|| format!("Anki note {note_id} was not found"))?;
+
+        let merged = merge_note_update(&existing, &payload, profile, mode);
+
+        if !merged.fields.is_empty() {
+            let dict_files: Vec<MediaFilePayload> =
+                referenced_dictionary_media_files(&profile.field_templates, ctx)
+                    .into_iter()
+                    .filter(|file| {
+                        merged.fields.values().any(|val| {
+                            val.as_str()
+                                .is_some_and(|text| text.contains(&file.filename))
+                        })
+                    })
+                    .collect();
+            if !dict_files.is_empty() {
+                self.client
+                    .store_media_files(&dict_files)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        if merged.has_field_or_media_changes() {
+            self.client
+                .update_note_fields(
+                    note_id,
+                    merged.fields,
+                    (!merged.audio.is_empty()).then_some(merged.audio.as_slice()),
+                    (!merged.picture.is_empty()).then_some(merged.picture.as_slice()),
+                    (!merged.video.is_empty()).then_some(merged.video.as_slice()),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+
+        if !merged.new_tags.is_empty() {
+            self.client
+                .add_tags(&[note_id], &merged.new_tags.join(" "))
+                .map_err(|error| error.to_string())?;
+        }
+
+        Ok(note_id)
+    }
+
+    /// Captures configured media (`{audio}`, `{audio-media}`, `{audio-context}`, `{screenshot}`,
+    /// `{screenshot-video}`, `{video}`) via `prepare_note_media`, then updates the existing note.
+    pub fn update_existing_note_with_media(
+        &self,
+        note_id: i64,
+        profile: &AnkiNoteConfig,
+        ctx: &mut NoteFieldsContext,
+        media_input: crate::controller::anki_media::NoteMediaInput,
+        mode: AnkiUpdateMode,
+    ) -> Result<i64, String> {
+        if note_id <= 0 {
+            return Err("Anki note ID must be a positive integer".to_owned());
+        }
+        crate::controller::anki_media::prepare_note_media(profile, ctx, media_input)?;
+        self.update_existing_note(note_id, profile, ctx, mode)
     }
 
     /// Retrieves AnkiConnect server version.
