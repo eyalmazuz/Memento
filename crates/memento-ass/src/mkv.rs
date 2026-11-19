@@ -279,10 +279,63 @@ pub fn extract_mkv_subtitle_track(
     }
 
     cues.sort_by_key(|c| (c.start_ms, c.read_order));
+    dedup_extracted_cues(&mut cues, target.info.codec.is_ass_or_ssa());
     Ok(ExtractedSubtitleTrack {
         info: target.info,
         cues,
     })
+}
+
+/// Normalize extracted plain-text subtitle content: strips trailing NULs,
+/// converts CRLF (`\r\n`) and CR (`\r`) line endings to `\n`, collapses
+/// redundant blank lines inside multi-line cues, and trims leading/trailing
+/// whitespace and blank lines.
+fn normalize_plain_subtitle_text(text: &str) -> String {
+    let stripped = text.trim_end_matches('\0');
+    let normalized = stripped.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end_matches([' ', '\t']));
+    }
+    out.trim().to_string()
+}
+
+/// Remove exact duplicate MKV subtitle packets (timestamps within 10ms).
+///
+/// For ASS/SSA tracks, two cues are only considered duplicates when their
+/// `layer`, `style`, and `raw_text` match (preserving distinct `\pos(...)`
+/// simultaneous dialogue lines required by `libass` rendering). For SRT/WebVTT
+/// tracks, identical normalized `plain_text` within 10ms is deduplicated.
+fn dedup_extracted_cues(cues: &mut Vec<MkvSubtitleCue>, is_ass: bool) {
+    const TIME_EPS_MS: i64 = 10;
+    let mut kept: Vec<MkvSubtitleCue> = Vec::with_capacity(cues.len());
+    for cue in cues.drain(..) {
+        let is_dup = kept
+            .iter()
+            .rev()
+            .take_while(|prev| cue.start_ms.saturating_sub(prev.start_ms) <= TIME_EPS_MS)
+            .any(|prev| {
+                (cue.start_ms - prev.start_ms).abs() <= TIME_EPS_MS
+                    && (cue.end_ms - prev.end_ms).abs() <= TIME_EPS_MS
+                    && if is_ass {
+                        cue.layer == prev.layer
+                            && cue.style == prev.style
+                            && cue.raw_text == prev.raw_text
+                    } else {
+                        cue.plain_text == prev.plain_text
+                    }
+            });
+        if !is_dup {
+            kept.push(cue);
+        }
+    }
+    *cues = kept;
 }
 
 /// Zero-syscall position tracking wrapper around `BufReader<File>` so scanning
@@ -1111,7 +1164,7 @@ fn decode_block_rest(
                 cues.push(cue);
             }
         } else {
-            let trimmed = text.trim_end_matches('\0').trim().to_string();
+            let normalized = normalize_plain_subtitle_text(&text);
             cues.push(MkvSubtitleCue {
                 read_order: cues.len() as i64,
                 layer: 0,
@@ -1123,8 +1176,8 @@ fn decode_block_rest(
                 margin_r: 0,
                 margin_v: 0,
                 effect: String::new(),
-                plain_text: trimmed.clone(),
-                raw_text: trimmed,
+                plain_text: normalized.clone(),
+                raw_text: normalized,
             });
         }
     }
@@ -1148,8 +1201,12 @@ fn parse_mkv_ass_block(payload: &str, start_ms: i64, end_ms: i64) -> Option<MkvS
     let margin_r: i32 = parts.next()?.trim().parse().unwrap_or(0);
     let margin_v: i32 = parts.next()?.trim().parse().unwrap_or(0);
     let effect = parts.next()?.trim().to_string();
-    let raw_text = parts.next().unwrap_or("").to_string();
-    let plain_text = strip_ass_dialogue_text(&raw_text);
+    let raw_text = parts
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    let plain_text = normalize_plain_subtitle_text(&strip_ass_dialogue_text(&raw_text));
 
     Some(MkvSubtitleCue {
         read_order,
@@ -1503,5 +1560,57 @@ mod tests {
         // Limit=2 cuts right through the 2-byte size VINT so data_start (3) > limit (2).
         let hdr = read_element_header(&mut cursor, 2).unwrap();
         assert!(hdr.is_none());
+    }
+
+    #[test]
+    fn normalizes_crlf_and_blank_lines_and_deduplicates_exact_packets() {
+        assert_eq!(
+            normalize_plain_subtitle_text("あっ。\r\n勝った勝った！\0"),
+            "あっ。\n勝った勝った！"
+        );
+        assert_eq!(
+            normalize_plain_subtitle_text("\r\n\nあっ。\n\n  \n勝った勝った！\r\n\n"),
+            "あっ。\n勝った勝った！"
+        );
+        assert_eq!(
+            normalize_plain_subtitle_text("勝ちました！\u{3000}エヘヘヘ！"),
+            "勝ちました！\u{3000}エヘヘヘ！"
+        );
+
+        let make_cue = |read_order, start_ms, end_ms, raw: &str, plain: &str| MkvSubtitleCue {
+            read_order,
+            layer: 0,
+            start_ms,
+            end_ms,
+            style: "Default".to_string(),
+            name: String::new(),
+            margin_l: 0,
+            margin_r: 0,
+            margin_v: 0,
+            effect: String::new(),
+            raw_text: raw.to_string(),
+            plain_text: plain.to_string(),
+        };
+
+        // SRT: exact duplicate packet within 10ms collapses to 1 cue.
+        let mut srt = vec![
+            make_cue(0, 926_526, 929_028, "あっ。\n勝った勝った！", "あっ。\n勝った勝った！"),
+            make_cue(1, 926_530, 929_030, "あっ。\n勝った勝った！", "あっ。\n勝った勝った！"),
+            make_cue(2, 929_028, 931_197, "勝ちました！", "勝ちました！"),
+        ];
+        dedup_extracted_cues(&mut srt, false);
+        assert_eq!(srt.len(), 2);
+
+        // ASS: distinct \pos events at the exact same timestamp are preserved for libass,
+        // while exact duplicate ASS packets are collapsed.
+        let mut ass = vec![
+            make_cue(0, 458_520, 461_860, "{\\pos(212,437)}えっ？", "えっ？"),
+            make_cue(1, 458_520, 461_860, "{\\pos(672,497)}えっ？", "えっ？"),
+            make_cue(2, 458_520, 461_860, "{\\pos(672,497)}えっ？", "えっ？"),
+        ];
+        dedup_extracted_cues(&mut ass, true);
+        assert_eq!(ass.len(), 2);
+        assert_eq!(ass[0].raw_text, "{\\pos(212,437)}えっ？");
+        assert_eq!(ass[1].raw_text, "{\\pos(672,497)}えっ？");
     }
 }
