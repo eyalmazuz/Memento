@@ -1127,3 +1127,251 @@ fn batched_hover_lookup_completes_under_5ms_on_populated_database() {
         "expected typical hover lookup < 5ms, got {avg_ms:.3}ms"
     );
 }
+
+#[test]
+fn mecab_enabled_live_unidic_compounds_lemmas_particle_safety_and_ipadic_fallback() {
+    let sql = format!(
+        "{BASE_SCHEMA_SQL}
+         INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
+         INSERT INTO term_bank VALUES
+             (1, 'は', '', 'prt', '', 100, '[\"topic particle\"]', 1, ''),
+             (1, 'の', '', 'prt', '', 100, '[\"possessive particle\"]', 2, ''),
+             (1, 'と', '', 'prt', '', 100, '[\"quoting/with particle\"]', 3, ''),
+             (1, '春', 'はる', 'n', '', 90, '[\"spring\"]', 4, ''),
+             (1, '乗る', 'のる', 'v5r', 'v5', 90, '[\"to ride\"]', 5, ''),
+             (1, '取る', 'とる', 'v5r', 'v5', 90, '[\"to take\"]', 6, ''),
+             (1, '食べる', 'たべる', 'v1', 'v1', 100, '[\"to eat\"]', 7, 'P'),
+             (1, '食べてしまう', 'たべてしまう', 'exp', '', 95, '[\"to eat completely\"]', 8, ''),
+             (1, '食べて仕舞う', 'たべてしまう', 'exp', '', 85, '[\"to eat completely (kanji)\"]', 9, ''),
+             (1, '見る', 'みる', 'v1', 'v1', 100, '[\"to see\"]', 10, 'P'),
+             (1, '見ている', 'みている', 'exp', '', 92, '[\"to be watching\"]', 11, ''),
+             (1, '見て居る', 'みている', 'exp', '', 82, '[\"to be watching (kanji)\"]', 12, ''),
+             (1, '見ておく', 'みておく', 'exp', '', 94, '[\"to see in advance\"]', 13, ''),
+             (1, '見て置く', 'みておく', 'exp', '', 84, '[\"to see in advance (kanji)\"]', 14, ''),
+             (1, 'する', 'する', 'vs-i', 'vs', 100, '[\"to do\"]', 15, ''),
+             (1, '為る', 'する', 'vs-i', 'vs', 80, '[\"to do (kanji)\"]', 16, ''),
+             (1, 'して居る', 'している', 'exp', '', 85, '[\"to be doing\"]', 17, ''),
+             (1, 'くださる', 'くださる', 'v5r-i', 'v5', 95, '[\"to give (honorific)\"]', 18, ''),
+             (1, '下さる', 'くださる', 'v5r-i', 'v5', 90, '[\"to give (kanji)\"]', 19, ''),
+             (1, '日本語能力試験', 'にほんごのうりょくしけん', 'n', '', 98, '[\"JLPT\"]', 20, ''),
+             (1, '日本語能力', 'にほんごのうりょく', 'n', '', 95, '[\"Japanese proficiency\"]', 21, ''),
+             (1, '日本語', 'にほんご', 'n', '', 90, '[\"Japanese language\"]', 22, ''),
+             (1, '日本', 'にほん', 'n', '', 85, '[\"Japan\"]', 23, ''),
+             (1, '泳ぐ', 'およぐ', 'v5g', 'v5', 85, '[\"to swim\"]', 24, ''),
+             (1, '泳く', 'およぐ', 'n', '', 50, '[\"bogus unvoiced entry\"]', 25, '');"
+    );
+    let fixture = exec_sql_fixture(&sql);
+    let mut controller = DictController::open(&fixture.0).unwrap();
+
+    // Default `mecab_enabled` is false for deterministic unit behavior:
+    assert!(!controller.mecab_enabled());
+    assert!(!DictController::new().mecab_enabled());
+    assert!(controller.search("ください").is_empty());
+
+    // Enable live UniDic MeCab lookup:
+    controller.set_mecab_enabled(true);
+    assert!(controller.mecab_enabled());
+
+    // Honorific irregular imperative `ください` -> `くださる` & `下さる` via MeCab `orthBase` + `lemma`:
+    let kudasai = controller.search("ください");
+    let kudasai_exprs: Vec<&str> = kudasai.iter().map(|h| h.expression.as_str()).collect();
+    assert!(kudasai_exprs.contains(&"くださる"));
+    assert!(kudasai_exprs.contains(&"下さる"));
+
+    // Compound & lemma lookups (`食べてしまった`, `食べさせられてしまった`, `見ておいた`, `見ていた`, `していました`):
+    let tabeteshimatta = controller.search("食べてしまった").to_vec();
+    let tabe_exprs: Vec<&str> = tabeteshimatta.iter().map(|h| h.expression.as_str()).collect();
+    assert_eq!(tabeteshimatta[0].expression, "食べる");
+    assert_eq!(
+        controller.last_match_units(),
+        "食べてしまった".encode_utf16().count()
+    );
+    assert!(tabe_exprs.contains(&"食べてしまう"));
+    assert!(tabe_exprs.contains(&"食べて仕舞う"));
+
+    let tabesaserareteshimatta = controller.search("食べさせられてしまった").to_vec();
+    assert_eq!(tabesaserareteshimatta[0].expression, "食べる");
+    assert_eq!(
+        controller.last_match_units(),
+        "食べさせられてしまった".encode_utf16().count()
+    );
+
+    let miteoita = controller.search("見ておいた").to_vec();
+    let miteoita_exprs: Vec<&str> = miteoita.iter().map(|h| h.expression.as_str()).collect();
+    assert!(miteoita_exprs.contains(&"見ておく"));
+    assert!(miteoita_exprs.contains(&"見て置く"));
+    assert!(miteoita_exprs.contains(&"見る"));
+    assert_eq!(miteoita[0].expression, "見ておく");
+
+    let miteita = controller.search("見ていた").to_vec();
+    let miteita_exprs: Vec<&str> = miteita.iter().map(|h| h.expression.as_str()).collect();
+    assert_eq!(miteita[0].expression, "見る");
+    assert!(miteita_exprs.contains(&"見ている"));
+    assert!(miteita_exprs.contains(&"見て居る"));
+
+    let shiteimashita = controller.search("していました").to_vec();
+    let shite_exprs: Vec<&str> = shiteimashita.iter().map(|h| h.expression.as_str()).collect();
+    assert!(shite_exprs.contains(&"する"));
+    assert!(shite_exprs.contains(&"為る"));
+    assert!(shite_exprs.contains(&"して居る"));
+
+    // Noun compounds (`日本語能力`, `日本語能力試験`):
+    let nouryoku = controller.search("日本語能力").to_vec();
+    assert_eq!(nouryoku[0].expression, "日本語能力");
+    let jlpt = controller.search("日本語能力試験を受験する").to_vec();
+    assert_eq!(
+        jlpt.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
+        vec!["日本語能力試験", "日本語能力", "日本語", "日本"]
+    );
+
+    // Strict single-kana particle & rule_mask safety (`は`, `の`, `と` NEVER match `春`, `乗る`, `取る`):
+    for (particle_query, expected) in [
+        ("は", "は"),
+        ("の", "の"),
+        ("と", "と"),
+        ("は走る", "は"),
+        ("の本", "の"),
+        ("と行く", "と"),
+    ] {
+        let hits = controller.search(particle_query);
+        assert_eq!(
+            hits.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
+            vec![expected],
+            "particle query {particle_query:?} must never false-match verbs or homophones"
+        );
+    }
+
+    let oyoijau = controller.search("泳いじゃう");
+    assert_eq!(oyoijau[0].expression, "泳ぐ");
+    assert!(!oyoijau.iter().any(|h| h.expression == "泳く"));
+
+    // Deterministic 9-column IPADic tokenizer path:
+    controller.set_mecab_tokenizer(|text| {
+        let out = "食べ\t動詞,自立,*,*,一段,連用形,食べる,タベ,タベ\n\
+て\t助詞,接続助詞,*,*,*,*,て,テ,テ\n\
+しまっ\t動詞,非自立,*,*,五段・ワ行促音便,連用タ接続,しまう,シマッ,シマッ\n\
+た\t助動詞,*,*,*,特殊・タ,基本形,た,タ,タ\nEOS\n";
+        Ok(memento_util::mecab::parse_mecab_lookup_tokens(text, out))
+    });
+    let ipadic_hits = controller.search("食べてしまった");
+    assert_eq!(ipadic_hits[0].expression, "食べる");
+    assert!(ipadic_hits.iter().any(|h| h.expression == "食べてしまう"));
+
+    // Graceful fallback when MeCab is unavailable:
+    controller.set_mecab_tokenizer(|_| Err("MeCab is unavailable".into()));
+    let fallback_hits = controller.search("食べてしまった").to_vec();
+    assert_eq!(fallback_hits[0].expression, "食べる");
+    assert!(controller.take_search_error().is_none());
+    let fallback_compound = controller.search("日本語能力試験").to_vec();
+    assert_eq!(fallback_compound[0].expression, "日本語能力試験");
+    assert!(controller.take_search_error().is_none());
+}
+
+#[test]
+fn mecab_enabled_warm_lookup_completes_under_5ms_on_populated_database() {
+    let path = temporary_dictionary_path();
+    {
+        let mut conn = sqlite_db::open_read_write_connection(&path).unwrap();
+        conn.execute_batch(BASE_SCHEMA_SQL).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0), (2, 'JPDB', 3, 'rev1', 0);",
+            [],
+        )
+        .unwrap();
+        {
+            let mut term_stmt = tx
+                .prepare("INSERT INTO term_bank VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, ?7, '');")
+                .unwrap();
+            let mut meta_stmt = tx
+                .prepare("INSERT INTO term_meta_bank VALUES (?1, ?2, ?3, 4, ?4);")
+                .unwrap();
+            for i in 0..5000 {
+                let expr = format!("語彙{i}");
+                let read = format!("ごい{i}");
+                term_stmt
+                    .execute(sqlite_db::rusqlite::params![
+                        1i64,
+                        expr,
+                        read,
+                        "",
+                        10i64,
+                        "[\"vocabulary item\"]",
+                        i as i64
+                    ])
+                    .unwrap();
+                if i % 5 == 0 {
+                    let freq_json = format!(r#"{{"reading":"ごい{i}","frequency":{}}}"#, i + 10);
+                    meta_stmt
+                        .execute(sqlite_db::rusqlite::params![
+                            2i64,
+                            format!("語彙{i}"),
+                            "freq",
+                            freq_json.as_bytes()
+                        ])
+                        .unwrap();
+                }
+            }
+            for (seq, expr, read, rules, score, gloss) in [
+                (90001i64, "食べる", "たべる", "v1", 100i64, "[\"to eat\"]"),
+                (90002i64, "食べてしまう", "たべてしまう", "v5", 95i64, "[\"to eat up\"]"),
+                (90003i64, "見る", "みる", "v1", 100i64, "[\"to see\"]"),
+                (90004i64, "見ておく", "みておく", "v5", 95i64, "[\"to see beforehand\"]"),
+                (90005i64, "日本語能力試験", "にほんごのうりょくしけん", "", 98i64, "[\"JLPT\"]"),
+            ] {
+                term_stmt
+                    .execute(sqlite_db::rusqlite::params![
+                        1i64, expr, read, rules, score, gloss, seq
+                    ])
+                    .unwrap();
+            }
+            meta_stmt
+                .execute(sqlite_db::rusqlite::params![
+                    2i64,
+                    "食べる",
+                    "freq",
+                    r#"{"reading":"たべる","frequency":120}"#.as_bytes()
+                ])
+                .unwrap();
+            meta_stmt
+                .execute(sqlite_db::rusqlite::params![
+                    1i64,
+                    "食べる",
+                    "pitch",
+                    r#"{"reading":"たべる","pitches":[{"position":2}]}"#.as_bytes()
+                ])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let _guard = TemporaryDictionaryDatabase(path.clone());
+    let mut controller = DictController::open(&path).unwrap();
+    controller.set_order(&[1, 2]);
+    controller.set_mecab_enabled(true);
+
+    let queries = [
+        "食べさせられてしまったんだけど",
+        "食べてしまった",
+        "見ておいた",
+        "見ていた",
+        "日本語能力試験を受験する",
+    ];
+    for q in &queries {
+        let _ = controller.search(q);
+    }
+
+    let iterations = 6;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        for q in &queries {
+            let hits = controller.search(q);
+            assert!(!hits.is_empty());
+        }
+    }
+    let total_calls = (queries.len() * iterations) as f64;
+    let avg_ms = started.elapsed().as_secs_f64() * 1000.0 / total_calls;
+    assert!(
+        avg_ms < 5.0,
+        "expected warm MeCab-enabled lookup < 5ms, got {avg_ms:.3}ms"
+    );
+}

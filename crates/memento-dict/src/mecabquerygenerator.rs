@@ -4,6 +4,10 @@
 
 use std::collections::HashSet;
 
+use crate::deconjugationquerygenerator::{
+    RULE_ADJ_I, RULE_V1, RULE_V5, RULE_VK, RULE_VS, RULE_VZ,
+};
+
 #[derive(Clone, Copy)]
 pub struct Node<'a> {
     pub deconj: &'a [u16],
@@ -18,6 +22,31 @@ pub struct MeCabQuery {
     pub deconj: Vec<u16>,
     pub surface: Vec<u16>,
     pub surface_clean: Vec<u16>,
+}
+
+/// Borrowed morphological token view used to build a MeCab lattice [`Node`] DAG
+/// and derive `rule_mask`-safe dictionary lookup candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenSpan<'a> {
+    pub surface: &'a str,
+    pub surface_clean: &'a str,
+    pub lemma: &'a str,
+    pub alt_lemma: Option<&'a str>,
+    pub pos: &'a str,
+    pub conj_type: &'a str,
+}
+
+/// A UTF-8 / UTF-16 MeCab lookup candidate paired with its matched surface length
+/// and Yomitan POS `rule_mask`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedMecabCandidate {
+    pub deconj: String,
+    pub deconj_u16: Vec<u16>,
+    pub surface: String,
+    pub surface_clean: String,
+    pub surface_u16_len: usize,
+    pub rule_mask: u8,
+    pub span_tokens: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -151,6 +180,180 @@ pub fn generate_queries(nodes: &[Node<'_>], start: Option<usize>) -> Option<Vec<
     Some(std::mem::take(&mut memo[start_index]))
 }
 
+fn is_single_kana_only(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    matches!(
+        ch,
+        '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{FF65}'..='\u{FF9F}'
+    )
+}
+
+/// Maps a MeCab `(pos, conj_type, base_form)` triple to the required Yomitan `rule_mask`
+/// (`RULE_V5`, `RULE_V1`, `RULE_VK`, `RULE_VS`, `RULE_VZ`, `RULE_ADJ_I`), or `0` for non-inflecting POS.
+#[must_use]
+pub fn pos_rule_mask(pos: &str, conj_type: &str, base_form: &str) -> u8 {
+    match pos {
+        "形容詞" => RULE_ADJ_I,
+        "動詞" => {
+            if conj_type.starts_with("文語") {
+                0
+            } else if conj_type.contains("五段") {
+                RULE_V5
+            } else if conj_type.contains("一段") {
+                if base_form.ends_with("ずる") {
+                    RULE_V1 | RULE_VZ
+                } else {
+                    RULE_V1
+                }
+            } else if conj_type.contains("カ変") || conj_type.contains("カ行変格") {
+                RULE_VK
+            } else if conj_type.contains("サ変") || conj_type.contains("サ行変格") {
+                if base_form.ends_with("ずる") || base_form.ends_with("ズル") {
+                    RULE_VS | RULE_VZ
+                } else {
+                    RULE_VS
+                }
+            } else if conj_type.contains("ザ変") || conj_type.contains("ザ行変格") {
+                RULE_VZ
+            } else {
+                RULE_V5 | RULE_V1 | RULE_VK | RULE_VS | RULE_VZ
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Builds a [`Node`] DAG from sequential [`TokenSpan`] morphemes (using `bnext` siblings for
+/// `orthBase` + `lemma` alternatives), expands compound/inflected spans via [`generate_queries`],
+/// and enforces strict single-kana particle & `rule_mask` safety.
+#[must_use]
+pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<GeneratedMecabCandidate> {
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    struct EncodedStage {
+        surface_u16: Vec<u16>,
+        surface_clean_u16: Vec<u16>,
+        deconj_variants: Vec<Vec<u16>>,
+    }
+
+    let total_tokens = tokens.len();
+    let mut stages: Vec<EncodedStage> = Vec::with_capacity(total_tokens);
+    let mut cum_surface_u16: Vec<usize> = Vec::with_capacity(total_tokens);
+    let mut running_u16 = 0usize;
+
+    for tok in tokens {
+        let surface_u16: Vec<u16> = tok.surface.encode_utf16().collect();
+        let surface_clean_u16: Vec<u16> = tok.surface_clean.encode_utf16().collect();
+        running_u16 += surface_u16.len();
+        cum_surface_u16.push(running_u16);
+
+        let is_non_inflecting = matches!(tok.pos, "助詞" | "記号" | "補助記号" | "空白");
+        let single_kana = is_single_kana_only(tok.surface_clean);
+        let suppress_base_form = is_non_inflecting
+            || (single_kana
+                && (total_tokens == 1
+                    || !matches!(tok.pos, "動詞" | "形容詞")
+                    || tok.conj_type.starts_with("文語")));
+
+        let mut deconj_variants: Vec<Vec<u16>> = Vec::with_capacity(2);
+        if suppress_base_form {
+            if tok.surface_clean.is_empty() {
+                deconj_variants.push(vec![b'*' as u16]);
+            } else {
+                deconj_variants.push(surface_clean_u16.clone());
+            }
+        } else {
+            let primary = if tok.lemma.is_empty() {
+                "*"
+            } else {
+                tok.lemma
+            };
+            deconj_variants.push(primary.encode_utf16().collect());
+            if let Some(alt) = tok.alt_lemma {
+                if !alt.is_empty() && alt != "*" && alt != primary {
+                    deconj_variants.push(alt.encode_utf16().collect());
+                }
+            }
+        }
+
+        stages.push(EncodedStage {
+            surface_u16,
+            surface_clean_u16,
+            deconj_variants,
+        });
+    }
+
+    // Compute starting node index per token stage so `next` and `bnext` wire into a flat `Vec<Node>`.
+    let mut stage_start_idx: Vec<usize> = Vec::with_capacity(total_tokens);
+    let mut total_nodes = 0usize;
+    for stage in &stages {
+        stage_start_idx.push(total_nodes);
+        total_nodes += stage.deconj_variants.len();
+    }
+
+    let mut nodes: Vec<Node<'_>> = Vec::with_capacity(total_nodes);
+    for (stage_idx, stage) in stages.iter().enumerate() {
+        let next = stage_start_idx.get(stage_idx + 1).copied();
+        let base_node_idx = stage_start_idx[stage_idx];
+        let variant_count = stage.deconj_variants.len();
+        for (v_idx, deconj_u16) in stage.deconj_variants.iter().enumerate() {
+            let bnext = (v_idx + 1 < variant_count).then_some(base_node_idx + v_idx + 1);
+            nodes.push(Node {
+                deconj: deconj_u16.as_slice(),
+                surface: stage.surface_u16.as_slice(),
+                surface_clean: stage.surface_clean_u16.as_slice(),
+                next,
+                bnext,
+            });
+        }
+    }
+
+    let Some(raw_queries) = generate_queries(&nodes, Some(0)) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(raw_queries.len());
+    for mq in raw_queries {
+        if mq.deconj.is_empty() || mq.surface.is_empty() {
+            continue;
+        }
+        let surface_u16_len = mq.surface.len();
+        let span_tokens = cum_surface_u16
+            .binary_search(&surface_u16_len)
+            .map(|k| k + 1)
+            .unwrap_or(2);
+        let deconj = String::from_utf16_lossy(&mq.deconj);
+        let surface = String::from_utf16_lossy(&mq.surface);
+        let surface_clean = String::from_utf16_lossy(&mq.surface_clean);
+
+        let rule_mask = if span_tokens == 1 && mq.deconj != mq.surface_clean {
+            pos_rule_mask(tokens[0].pos, tokens[0].conj_type, &deconj)
+        } else {
+            0
+        };
+
+        out.push(GeneratedMecabCandidate {
+            deconj,
+            deconj_u16: mq.deconj,
+            surface,
+            surface_clean,
+            surface_u16_len,
+            rule_mask,
+            span_tokens,
+        });
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +466,65 @@ mod tests {
         let rows = generate_queries(&nodes, Some(0)).expect("DAG should succeed");
         assert!(!rows.is_empty());
         assert!(started.elapsed().as_millis() < 200);
+    }
+
+    #[test]
+    fn generates_compound_spans_with_alt_lemmas_and_blocks_single_kana_particles() {
+        let tokens = [
+            TokenSpan {
+                surface: "食べ",
+                surface_clean: "食べ",
+                lemma: "食べる",
+                alt_lemma: None,
+                pos: "動詞",
+                conj_type: "下一段-バ行",
+            },
+            TokenSpan {
+                surface: "て",
+                surface_clean: "て",
+                lemma: "て",
+                alt_lemma: None,
+                pos: "助詞",
+                conj_type: "",
+            },
+            TokenSpan {
+                surface: "しまい",
+                surface_clean: "しまい",
+                lemma: "しまう",
+                alt_lemma: Some("仕舞う"),
+                pos: "動詞",
+                conj_type: "五段-ワア行",
+            },
+        ];
+        let cands = generate_candidates_from_tokens(&tokens);
+        let keys: Vec<(&str, usize, u8)> = cands
+            .iter()
+            .map(|c| (c.deconj.as_str(), c.surface_u16_len, c.rule_mask))
+            .collect();
+        assert!(keys.contains(&("食べる", 2, RULE_V1)));
+        assert!(keys.contains(&("食べてしまう", 6, 0)));
+        assert!(keys.contains(&("食べて仕舞う", 6, 0)));
+
+        // Single-kana particles and standalone single-kana tokens never emit bogus verb lemmas:
+        for (surf, bogus_lemma, pos, ctype) in [
+            ("は", "春", "助詞", ""),
+            ("の", "乗る", "助詞", ""),
+            ("と", "取る", "助詞", ""),
+            ("と", "とる", "助動詞", "五段-ラ行"),
+            ("く", "来る", "動詞", "カ行変格"),
+        ] {
+            let single = [TokenSpan {
+                surface: surf,
+                surface_clean: surf,
+                lemma: bogus_lemma,
+                alt_lemma: Some(bogus_lemma),
+                pos,
+                conj_type: ctype,
+            }];
+            let out = generate_candidates_from_tokens(&single);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].deconj, surf);
+            assert_eq!(out[0].rule_mask, 0);
+        }
     }
 }
