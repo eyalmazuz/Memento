@@ -374,8 +374,12 @@ fn resolve_worktree_main_repo_root(workspace_root: &Path) -> Option<PathBuf> {
 }
 
 fn cache_source_link(out: &Path, dir_name: &str, found: PathBuf) -> PathBuf {
+    let found = found.canonicalize().unwrap_or(found);
     let direct = out.join(dir_name);
-    if !direct.exists() {
+    if direct.symlink_metadata().is_ok() && !is_valid_whisper_source(&direct) {
+        let _ = fs::remove_file(&direct);
+    }
+    if !direct.exists() && direct.symlink_metadata().is_err() {
         #[cfg(unix)]
         let _ = std::os::unix::fs::symlink(&found, &direct);
     }
@@ -386,12 +390,28 @@ fn probe_cached_source(out: &Path) -> Option<PathBuf> {
     let dir_name = format!("whisper.cpp-{VERSION}");
     let direct = out.join(&dir_name);
     if is_valid_whisper_source(&direct) {
-        return Some(direct);
+        return Some(direct.canonicalize().unwrap_or(direct));
+    }
+    if direct.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(&direct);
     }
 
     if let Some(build_dir) = out.ancestors().nth(2) {
         if let Some(found) = probe_build_dir(build_dir, &dir_name) {
             return Some(cache_source_link(out, &dir_name, found));
+        }
+    }
+
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
+        if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
+            if let Some(found) = probe_target_dir(&workspace_root.join("target"), &dir_name) {
+                return Some(cache_source_link(out, &dir_name, found));
+            }
+            if let Some(main_repo_root) = resolve_worktree_main_repo_root(workspace_root) {
+                if let Some(found) = probe_target_dir(&main_repo_root.join("target"), &dir_name) {
+                    return Some(cache_source_link(out, &dir_name, found));
+                }
+            }
         }
     }
 
@@ -421,19 +441,6 @@ fn probe_cached_source(out: &Path) -> Option<PathBuf> {
                             return Some(cache_source_link(out, &dir_name, found));
                         }
                     }
-                }
-            }
-        }
-    }
-
-    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
-        if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
-            if let Some(found) = probe_target_dir(&workspace_root.join("target"), &dir_name) {
-                return Some(cache_source_link(out, &dir_name, found));
-            }
-            if let Some(main_repo_root) = resolve_worktree_main_repo_root(workspace_root) {
-                if let Some(found) = probe_target_dir(&main_repo_root.join("target"), &dir_name) {
-                    return Some(cache_source_link(out, &dir_name, found));
                 }
             }
         }
