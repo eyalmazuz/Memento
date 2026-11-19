@@ -30,9 +30,13 @@ use crate::ui::{
 
 use state::{
     apply_kanji_freq_updates_to_app, apply_popup_css_theme_to_bridge, build_row_extras_for_grouped,
-    push_history_capped, AnkiPopupCheckRequest, AnkiPopupCheckResponse, NestedScanRequest,
-    NestedScanResponse, PanelSearchRequest, PanelSearchResponse, PopupHistoryEntry, RichUiMutable,
-    SuppressHistoryResetGuard, FRESH_CHECK_THROTTLE,
+    execute_nav_lookup, push_history_capped, AnkiPopupCheckRequest, AnkiPopupCheckResponse,
+    DictWorkerRequest, GlossaryPreRenderBatch, GlossaryPreRenderDone, NavLookupRequest,
+    NavLookupResponse, NavQueryKind, NestedScanResponse, PanelSearchRequest, PanelSearchResponse,
+    PopupHistoryEntry, RichUiMutable, SuppressHistoryResetGuard, FRESH_CHECK_THROTTLE,
+    IDLE_DICT_ASSET_CACHE_MAX_BYTES, IDLE_DICT_ASSET_CACHE_MAX_ENTRIES,
+    IDLE_GLOSSARY_CACHE_MAX_BYTES, IDLE_GLOSSARY_CACHE_MAX_ENTRIES,
+    IDLE_PARSED_GLOSSARY_MAX_ENTRIES, IDLE_POPUP_SHRINK_DELAY,
 };
 use subtitle::compute_subtitle_lookup_match_u16;
 
@@ -62,9 +66,14 @@ pub(in crate::ui) struct RichUiBridge {
     root_anki_in_flight: Arc<AtomicU64>,
     nested_anki_in_flight: Arc<AtomicU64>,
     external_lookup_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
-    nested_tx: mpsc::Sender<NestedScanRequest>,
+    nested_tx: mpsc::Sender<DictWorkerRequest>,
     nested_res_rx: Arc<Mutex<mpsc::Receiver<NestedScanResponse>>>,
     nested_epoch: Arc<AtomicU64>,
+    nav_res_rx: Arc<Mutex<mpsc::Receiver<NavLookupResponse>>>,
+    nav_epoch: Arc<AtomicU64>,
+    glossary_render_tx: Option<mpsc::Sender<GlossaryPreRenderBatch>>,
+    glossary_render_res_rx: Arc<Mutex<mpsc::Receiver<GlossaryPreRenderDone>>>,
+    glossary_render_epoch: Arc<AtomicU64>,
     /// Strictly `None` in production (real Slint event loops use `Weak::upgrade_in_event_loop`).
     /// Allocated only under `i_slint_backend_testing::init_no_event_loop()` where there is no
     /// event loop proxy and mock-time tests drive async completions via `mock_elapsed_time`.
@@ -79,12 +88,115 @@ pub(super) fn drain_panel_results_for_app(app: &MementoApp) -> bool {
     }
 }
 
+pub(super) fn drain_nav_lookup_results_for_app(app: &MementoApp) -> bool {
+    if let Some(br) = active_rich_bridge_for_app(app) {
+        br.drain_nav_lookup_results(app)
+    } else {
+        false
+    }
+}
+
 impl RichUiBridge {
     pub(in crate::ui) fn subtitle_style(&self) -> Option<SubtitleRenderStyle> {
         self.state
             .try_borrow()
             .ok()
             .map(|st| st.settings.subtitle_style.clone())
+    }
+
+    pub(super) fn cancel_idle_memory_shrink(&self) {
+        if let Ok(st) = self.state.try_borrow() {
+            st.idle_shrink_timer.stop();
+        }
+    }
+
+    pub(super) fn schedule_idle_memory_shrink_if_closed(&self, app: &MementoApp) {
+        if app.get_dict_open() {
+            self.cancel_idle_memory_shrink();
+            return;
+        }
+        self.glossary_render_epoch.fetch_add(1, Ordering::AcqRel);
+        let already_running = self
+            .state
+            .try_borrow()
+            .map(|st| st.idle_shrink_timer.running())
+            .unwrap_or(true);
+        if already_running {
+            return;
+        }
+        let weak_app = self.app_weak.clone();
+        if let Ok(st) = self.state.try_borrow() {
+            st.idle_shrink_timer.start(
+                slint::TimerMode::SingleShot,
+                IDLE_POPUP_SHRINK_DELAY,
+                move || {
+                    let Some(app) = weak_app.upgrade() else {
+                        return;
+                    };
+                    if app.get_dict_open() {
+                        return;
+                    }
+                    let Some(br) = active_rich_bridge_for_app(&app) else {
+                        return;
+                    };
+                    br.perform_idle_memory_shrink();
+                },
+            );
+        }
+    }
+
+    pub(super) fn perform_idle_memory_shrink(&self) {
+        self.glossary_render_epoch.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut st_guard = self.state.borrow_mut();
+            let st = &mut *st_guard;
+            st.glossary_cache
+                .shrink_to(IDLE_GLOSSARY_CACHE_MAX_ENTRIES, IDLE_GLOSSARY_CACHE_MAX_BYTES);
+            st.last_rendered_key
+                .retain(|_, key| st.glossary_cache.contains_key(key));
+            for lvl in &mut st.nested_stack {
+                lvl.glossary_cache.clear();
+                lvl.last_rendered_key.clear();
+            }
+        }
+        crate::ui::dict_assets::shrink_dict_asset_cache(
+            IDLE_DICT_ASSET_CACHE_MAX_ENTRIES,
+            IDLE_DICT_ASSET_CACHE_MAX_BYTES,
+        );
+        crate::controller::dict::shrink_parsed_glossary_cache(IDLE_PARSED_GLOSSARY_MAX_ENTRIES);
+        crate::ui::release_os_memory();
+    }
+
+    pub(super) fn drain_nav_lookup_results(&self, app: &MementoApp) -> bool {
+        let mut latest_root: Option<NavLookupResponse> = None;
+        let mut latest_nested: Option<NavLookupResponse> = None;
+        if let Ok(guard) = self.nav_res_rx.lock() {
+            while let Ok(item) = guard.try_recv() {
+                if item.kind.is_nested() {
+                    latest_nested = Some(item);
+                } else {
+                    latest_root = Some(item);
+                }
+            }
+        }
+        let mut applied = false;
+        if let Some(resp) = latest_root {
+            if resp.epoch == self.nav_epoch.load(Ordering::Acquire) {
+                self.apply_root_nav_lookup_response(app, resp);
+                applied = true;
+            }
+        }
+        if let Some(resp) = latest_nested {
+            if resp.epoch == self.nested_epoch.load(Ordering::Acquire) {
+                if app.get_dict_open() {
+                    self.apply_nested_nav_lookup_response(app, resp);
+                    applied = true;
+                } else {
+                    app.global::<PopupBridge>().set_nested_searching(false);
+                }
+            }
+        }
+        applied
     }
 
     pub(super) fn kick_no_event_loop_pump(&self) {
@@ -197,6 +309,7 @@ impl RichUiBridge {
                 || st.settings.glossary_style != prev_glossary_style
                 || st.settings.popup_fonts != prev_fonts;
             if glossary_visual_changed {
+                self.glossary_render_epoch.fetch_add(1, Ordering::AcqRel);
                 st.clear_all_glossary_caches();
                 reloaded_css_theme = Some(st.effective_popup_theme());
             }
@@ -250,6 +363,11 @@ impl RichUiBridge {
     }
 
     pub(in crate::ui) fn on_dictionary_rows_updated(&self, app: &MementoApp, rows: &[DictResult]) {
+        if rows.is_empty() {
+            self.schedule_idle_memory_shrink_if_closed(app);
+        } else {
+            self.cancel_idle_memory_shrink();
+        }
         self.ensure_fresh_db_and_config(app, false);
         let candidate_hits = clone_last_grouped_hits();
         let matches_hits = candidate_hits.len() == rows.len()
@@ -259,6 +377,8 @@ impl RichUiBridge {
                     && h.dict_name == r.dict_name.as_str()
             });
 
+        self.nav_epoch.fetch_add(1, Ordering::AcqRel);
+        self.glossary_render_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_anki_nav_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_anki_in_flight.store(0, Ordering::Release);
@@ -285,6 +405,7 @@ impl RichUiBridge {
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
             st.pending_nested_anki_adds.clear();
+            let precomputed_meta = st.pending_root_precomputed_meta.take();
 
             let mut kanji_freq_updates = Vec::new();
             let mut ass_action: Option<PendingAssHighlightAction> = None;
@@ -292,12 +413,17 @@ impl RichUiBridge {
             if matches_hits {
                 st.current_hits = candidate_hits.clone();
                 let state_ref = &mut *st;
+                let (pre_pitch, pre_kanji) = match precomputed_meta.as_ref() {
+                    Some((p, k)) => (Some(p), Some(k)),
+                    None => (None, None),
+                };
                 let (extras, freq_updates) = build_row_extras_for_grouped(
                     &mut state_ref.db_helper,
                     &mut state_ref.dict_ctrl,
                     rows,
                     &candidate_hits,
-                    None,
+                    pre_pitch,
+                    pre_kanji,
                 );
                 state_ref.row_extras = extras;
                 kanji_freq_updates = freq_updates;
@@ -391,6 +517,10 @@ impl RichUiBridge {
         let sb = app.global::<SubtitleOverlayBridge>();
         sb.set_highlight_revision(sb.get_highlight_revision().wrapping_add(1));
 
+        if matches_hits && !rows.is_empty() {
+            self.dispatch_glossary_prerender(app, rows);
+        }
+
         self.dispatch_anki_check_for_rows(app, rows, None);
     }
 
@@ -427,6 +557,7 @@ impl RichUiBridge {
     }
 
     fn restore_history_entry(&self, app: &MementoApp, entry: PopupHistoryEntry) {
+        self.cancel_idle_memory_shrink();
         set_last_grouped_hits(entry.hits);
         let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
 
@@ -463,121 +594,34 @@ impl RichUiBridge {
         if trimmed.is_empty() {
             return;
         }
+        self.cancel_idle_memory_shrink();
         self.ensure_fresh_db_and_config(app, true);
-        let current_snap = self.snapshot_current_popup(app);
-        let (hits, excluded, headword, reading, pitch, freq, jpdb, term_meta_rows) = {
-            let mut st = self.state.borrow_mut();
-            let raw_hits = st.dict_ctrl.search(trimmed).to_vec();
-            let excluded = st.settings.excluded_glossaries.clone();
-            let mut hits = if let Some(kana_target) = kana_mode {
-                let norm = crate::controller::dict::normalize_reading(kana_target);
-                let filtered: Vec<_> = raw_hits
-                    .iter()
-                    .filter(|h| {
-                        crate::controller::dict::normalize_reading(&h.reading) == norm
-                            || crate::controller::dict::normalize_reading(&h.expression) == norm
-                    })
-                    .cloned()
-                    .collect();
-                if filtered.is_empty() {
-                    raw_hits
-                } else {
-                    filtered
-                }
-            } else {
-                raw_hits
-            };
-            if hits.is_empty() && trimmed.chars().count() == 1 {
-                hits = st.dict_ctrl.search_kanji(trimmed).to_vec();
-            }
-            let headword = hits
-                .first()
-                .map(|h| h.expression.clone())
-                .unwrap_or_else(|| trimmed.to_owned());
-            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
-            let (pitch, freq, jpdb) = if !headword.is_empty() {
-                st.dict_ctrl.get_term_meta(&headword, &reading)
-            } else {
-                (String::new(), String::new(), String::new())
-            };
-            let mut term_meta_rows = Vec::new();
-            for h in &hits {
-                if !h.is_kanji
-                    && !term_meta_rows
-                        .iter()
-                        .any(|(e, r, _, _): &(String, String, _, _)| {
-                            e == &h.expression && r == &h.reading
-                        })
-                {
-                    let graphs = st.dict_ctrl.get_pitch_graphs(&h.expression, &h.reading);
-                    let freqs = st.dict_ctrl.get_frequencies(&h.expression, &h.reading);
-                    term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
-                }
-            }
+        let epoch = self.nav_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let (excluded, search_config) = {
+            let st = self.state.borrow();
             (
-                hits,
-                excluded,
-                headword,
-                reading,
-                pitch,
-                freq,
-                jpdb,
-                term_meta_rows,
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
             )
         };
-        if hits.is_empty() {
-            app.set_status_message(format!("No dictionary entries found for {trimmed}").into());
-            return;
-        }
-        {
-            let mut st = self.state.borrow_mut();
-            if let Some(snap) = current_snap {
-                push_history_capped(&mut st.back_stack, snap);
-            }
-            st.forward_stack.clear();
-        }
-        let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
-
-        let pb = app.global::<PopupBridge>();
-        if let Some(kana_target) = kana_mode {
-            pb.set_kana_reading_active(true);
-            pb.set_active_kana_reading(kana_target.into());
+        let req = NavLookupRequest {
+            epoch,
+            kind: NavQueryKind::RootTerm {
+                query: trimmed.to_owned(),
+                kana_mode: kana_mode.map(str::to_owned),
+            },
+            excluded,
+            search_config,
+        };
+        if self.no_event_loop_pump.is_some() {
+            let resp = {
+                let mut st = self.state.borrow_mut();
+                execute_nav_lookup(&mut st.dict_ctrl, req)
+            };
+            self.apply_root_nav_lookup_response(app, resp);
         } else {
-            pb.set_kana_reading_active(false);
-            pb.set_active_kana_reading("".into());
+            let _ = self.nested_tx.send(DictWorkerRequest::NavLookup(req));
         }
-
-        let mut rows = dictionary_result_rows(&hits, &excluded);
-        for row in &mut rows {
-            if row.term_start && !row.is_kanji {
-                if let Some((_, _, graphs, freqs)) = term_meta_rows.iter().find(|(e, r, _, _)| {
-                    e == row.expression.as_str() && r == row.reading.as_str()
-                }) {
-                    row.pitch_graphs =
-                        Rc::new(VecModel::from(popup_pitch_graphs(graphs.clone()))).into();
-                    row.frequencies = Rc::new(VecModel::from(
-                        freqs
-                            .iter()
-                            .map(|f| PopupFrequency {
-                                dictionary: f.dictionary.clone().into(),
-                                value: f.value.clone().into(),
-                            })
-                            .collect::<Vec<_>>(),
-                    ))
-                    .into();
-                }
-            }
-        }
-        app.set_anki_added_note_id("".into());
-        app.set_anki_added_result_index(-1);
-        set_dictionary_rows(app, rows);
-        app.set_dict_query(headword.into());
-        app.set_dict_reading(reading.into());
-        app.set_dict_pitch_accent(pitch.into());
-        app.set_dict_freq_rank(freq.into());
-        app.set_dict_jpdb_rank(jpdb.into());
-        app.set_dict_open(true);
-        app.invoke_reset_definition_scroll();
     }
 
     pub(super) fn navigate_to_kanji(
@@ -595,47 +639,134 @@ impl RichUiBridge {
             return;
         };
         let query = ch.to_string();
+        self.cancel_idle_memory_shrink();
         self.ensure_fresh_db_and_config(app, true);
-        let current_snap = self.snapshot_current_popup(app);
-        let (hits, excluded) = {
-            let mut st = self.state.borrow_mut();
-            let hits = st.dict_ctrl.search_kanji(&query).to_vec();
-            let excluded = st.settings.excluded_glossaries.clone();
-            (hits, excluded)
+        let epoch = self.nav_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let (excluded, search_config) = {
+            let st = self.state.borrow();
+            (
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
+            )
         };
-        if hits.is_empty() {
-            app.set_status_message(format!("No kanji entry found for {query}").into());
-            return;
+        let req = NavLookupRequest {
+            epoch,
+            kind: NavQueryKind::RootKanji { query },
+            excluded,
+            search_config,
+        };
+        if self.no_event_loop_pump.is_some() {
+            let resp = {
+                let mut st = self.state.borrow_mut();
+                execute_nav_lookup(&mut st.dict_ctrl, req)
+            };
+            self.apply_root_nav_lookup_response(app, resp);
+        } else {
+            let _ = self.nested_tx.send(DictWorkerRequest::NavLookup(req));
         }
-        {
-            let mut st = self.state.borrow_mut();
-            if let Some(snap) = current_snap {
-                push_history_capped(&mut st.back_stack, snap);
+    }
+
+    fn apply_root_nav_lookup_response(&self, app: &MementoApp, resp: NavLookupResponse) {
+        match resp.kind {
+            NavQueryKind::RootTerm { query, kana_mode } => {
+                if resp.hits.is_empty() {
+                    app.set_status_message(
+                        format!("No dictionary entries found for {query}").into(),
+                    );
+                    return;
+                }
+                let current_snap = self.snapshot_current_popup(app);
+                {
+                    let mut st = self.state.borrow_mut();
+                    if let Some(snap) = current_snap {
+                        push_history_capped(&mut st.back_stack, snap);
+                    }
+                    st.forward_stack.clear();
+                    st.pending_root_precomputed_meta =
+                        Some((resp.term_pitch_details, resp.kanji_frequencies));
+                }
+                let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
+
+                let pb = app.global::<PopupBridge>();
+                if let Some(kana_target) = kana_mode {
+                    pb.set_kana_reading_active(true);
+                    pb.set_active_kana_reading(kana_target.into());
+                } else {
+                    pb.set_kana_reading_active(false);
+                    pb.set_active_kana_reading("".into());
+                }
+
+                let mut rows = dictionary_result_rows(&resp.hits, &resp.excluded);
+                for row in &mut rows {
+                    if row.term_start && !row.is_kanji {
+                        if let Some((_, _, graphs, freqs)) = resp
+                            .term_meta_rows
+                            .iter()
+                            .find(|(e, r, _, _)| {
+                                e == row.expression.as_str() && r == row.reading.as_str()
+                            })
+                        {
+                            row.pitch_graphs =
+                                Rc::new(VecModel::from(popup_pitch_graphs(graphs.clone()))).into();
+                            row.frequencies = Rc::new(VecModel::from(
+                                freqs
+                                    .iter()
+                                    .map(|f| PopupFrequency {
+                                        dictionary: f.dictionary.clone().into(),
+                                        value: f.value.clone().into(),
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ))
+                            .into();
+                        }
+                    }
+                }
+                app.set_anki_added_note_id("".into());
+                app.set_anki_added_result_index(-1);
+                set_dictionary_rows(app, rows);
+                app.set_dict_query(resp.headword.into());
+                app.set_dict_reading(resp.reading.into());
+                app.set_dict_pitch_accent(resp.pitch.into());
+                app.set_dict_freq_rank(resp.freq.into());
+                app.set_dict_jpdb_rank(resp.jpdb.into());
+                app.set_dict_open(true);
+                app.invoke_reset_definition_scroll();
             }
-            st.forward_stack.clear();
+            NavQueryKind::RootKanji { query } => {
+                if resp.hits.is_empty() {
+                    app.set_status_message(format!("No kanji entry found for {query}").into());
+                    return;
+                }
+                let current_snap = self.snapshot_current_popup(app);
+                {
+                    let mut st = self.state.borrow_mut();
+                    if let Some(snap) = current_snap {
+                        push_history_capped(&mut st.back_stack, snap);
+                    }
+                    st.forward_stack.clear();
+                    st.pending_root_precomputed_meta =
+                        Some((std::collections::HashMap::new(), resp.kanji_frequencies));
+                }
+                let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
+
+                let pb = app.global::<PopupBridge>();
+                pb.set_kana_reading_active(false);
+                pb.set_active_kana_reading("".into());
+
+                let rows = dictionary_result_rows(&resp.hits, &resp.excluded);
+                app.set_anki_added_note_id("".into());
+                app.set_anki_added_result_index(-1);
+                set_dictionary_rows(app, rows);
+                app.set_dict_query(query.into());
+                app.set_dict_reading(resp.reading.into());
+                app.set_dict_pitch_accent("".into());
+                app.set_dict_freq_rank("".into());
+                app.set_dict_jpdb_rank("".into());
+                app.set_dict_open(true);
+                app.invoke_reset_definition_scroll();
+            }
+            NavQueryKind::NestedTerm { .. } | NavQueryKind::NestedKanji { .. } => {}
         }
-        let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
-
-        let pb = app.global::<PopupBridge>();
-        pb.set_kana_reading_active(false);
-        pb.set_active_kana_reading("".into());
-
-        let rows = dictionary_result_rows(&hits, &excluded);
-        app.set_anki_added_note_id("".into());
-        app.set_anki_added_result_index(-1);
-        set_dictionary_rows(app, rows);
-        app.set_dict_query(query.into());
-        app.set_dict_reading(
-            hits.first()
-                .map(|h| h.reading.clone())
-                .unwrap_or_default()
-                .into(),
-        );
-        app.set_dict_pitch_accent("".into());
-        app.set_dict_freq_rank("".into());
-        app.set_dict_jpdb_rank("".into());
-        app.set_dict_open(true);
-        app.invoke_reset_definition_scroll();
     }
 }
 
@@ -684,6 +815,7 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
             || st.settings.glossary_style != prev_glossary_style
             || st.settings.popup_fonts != prev_fonts;
         if glossary_visual_changed {
+            bridge.glossary_render_epoch.fetch_add(1, Ordering::AcqRel);
             st.clear_all_glossary_caches();
         }
 
@@ -774,7 +906,8 @@ pub fn bind_rich_bridge_ass_controller(
 
 /// Immediately clears any active ASS lookup highlight / anchor on the bound `AssOverlayController`.
 pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
-    let ass_ctrl = active_rich_bridge_for_app(app).and_then(|bridge| {
+    let bridge = active_rich_bridge_for_app(app);
+    let ass_ctrl = bridge.as_ref().and_then(|bridge| {
         let mut st = bridge.state.borrow_mut();
         st.pending_ass_scan = None;
         st.ass_controller.clone()
@@ -783,6 +916,9 @@ pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
         if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
             ctrl.clear_lookup_highlight(app);
         }
+    }
+    if let Some(bridge) = bridge {
+        bridge.schedule_idle_memory_shrink_if_closed(app);
     }
 }
 

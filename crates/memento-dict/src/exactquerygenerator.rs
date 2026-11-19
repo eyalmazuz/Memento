@@ -33,27 +33,57 @@ fn splits_surrogate_pair(text: &[u16], end: usize) -> bool {
         && (0xDC00..=0xDFFF).contains(&text[end])
 }
 
+/// Returns the index of the first unpaired UTF-16 surrogate, or `text.len()` if well-formed.
+fn first_unpaired_utf16(text: &[u16]) -> usize {
+    let mut i = 0;
+    while i < text.len() {
+        let unit = text[i];
+        if !(0xD800..=0xDFFF).contains(&unit) {
+            i += 1;
+            continue;
+        }
+        if (0xD800..=0xDBFF).contains(&unit)
+            && i + 1 < text.len()
+            && (0xDC00..=0xDFFF).contains(&text[i + 1])
+        {
+            i += 2;
+            continue;
+        }
+        return i;
+    }
+    text.len()
+}
+
 /// Generate longest-to-shortest UTF-16 prefixes and whitespace-free variants
 /// without splitting valid UTF-16 surrogate pairs.
 pub fn generate_queries(text: &[u16]) -> Vec<ExactQuery> {
-    let mut result = Vec::new();
+    let first_unpaired = first_unpaired_utf16(text);
+    let first_ws = text.iter().position(|&unit| regex_whitespace(unit));
+    let mut result = Vec::with_capacity(text.len());
     for end in (1..=text.len()).rev() {
         if splits_surrogate_pair(text, end) {
             continue;
         }
         let prefix = &text[..end];
-        result.push(ExactQuery { deconj: prefix.to_vec(), surface_override: None });
-        if prefix.iter().any(|unit| regex_whitespace(*unit)) &&
-            char::decode_utf16(prefix.iter().copied()).all(|unit| unit.is_ok()) {
-            let without_whitespace: Vec<u16> = prefix.iter().copied()
-                .filter(|unit| !regex_whitespace(*unit)).collect();
+        result.push(ExactQuery {
+            deconj: prefix.to_vec(),
+            surface_override: None,
+        });
+        if end <= first_unpaired && first_ws.is_some_and(|ws_idx| ws_idx < end) {
+            let without_whitespace: Vec<u16> = prefix
+                .iter()
+                .copied()
+                .filter(|unit| !regex_whitespace(*unit))
+                .collect();
             let left = prefix.iter().position(|unit| !trim_whitespace(*unit));
             let right = prefix.iter().rposition(|unit| !trim_whitespace(*unit));
-            let trimmed = left.zip(right)
+            let trimmed = left
+                .zip(right)
                 .map(|(start, stop)| prefix[start..=stop].to_vec())
                 .unwrap_or_default();
             result.push(ExactQuery {
-                deconj: without_whitespace, surface_override: Some(trimmed),
+                deconj: without_whitespace,
+                surface_override: Some(trimmed),
             });
         }
     }

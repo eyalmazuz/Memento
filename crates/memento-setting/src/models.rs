@@ -88,38 +88,29 @@ pub const RECENT_FILES_MAX_SIZE: usize = 10;
 ///    never exceeds `max_size`.
 ///
 /// Returns the surviving original indices from `items` that should follow `new_val`.
-pub fn plan_recent_files_add_with_limit<T: AsRef<[u16]>>(
+pub fn plan_recent_files_add_with_limit<T: AsRef<str>>(
     items: &[T],
-    new_val: &[u16],
+    new_val: &str,
     max_size: usize,
 ) -> Vec<usize> {
-    let mut surviving: Vec<usize> = items
+    let limit = max_size.saturating_sub(1);
+    items
         .iter()
         .enumerate()
         .filter(|(_, item)| item.as_ref() != new_val)
         .map(|(idx, _)| idx)
-        .collect();
-
-    surviving.truncate(max_size.saturating_sub(1));
-
-    surviving
+        .take(limit)
+        .collect()
 }
 
 /// Plans updating a recent files list when prepending `new_val` with default max size of 10.
-pub fn plan_recent_files_add<T: AsRef<[u16]>>(
-    items: &[T],
-    new_val: &[u16],
-) -> Vec<usize> {
+pub fn plan_recent_files_add<T: AsRef<str>>(items: &[T], new_val: &str) -> Vec<usize> {
     plan_recent_files_add_with_limit(items, new_val, RECENT_FILES_MAX_SIZE)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn u16_vec(s: &str) -> Vec<u16> {
-        s.encode_utf16().collect()
-    }
 
     #[test]
     fn test_q_fuzzy_compare_f64() {
@@ -159,39 +150,37 @@ mod tests {
 
     #[test]
     fn test_plan_recent_files_add() {
-        let empty: Vec<Vec<u16>> = vec![];
-        let val1 = u16_vec("file1");
-        assert_eq!(plan_recent_files_add(&empty, &val1), Vec::<usize>::new());
+        let empty: Vec<&str> = vec![];
+        assert_eq!(plan_recent_files_add(&empty, "file1"), Vec::<usize>::new());
 
-        let items = vec![u16_vec("file1"), u16_vec("file2")];
-        let val0 = u16_vec("file0");
-        assert_eq!(plan_recent_files_add(&items, &val0), vec![0, 1]);
-        assert_eq!(plan_recent_files_add(&items, &val1), vec![1]);
+        let items = vec!["file1", "file2"];
+        assert_eq!(plan_recent_files_add(&items, "file0"), vec![0, 1]);
+        assert_eq!(plan_recent_files_add(&items, "file1"), vec![1]);
 
-        let items3 = vec![u16_vec("a"), u16_vec("b"), u16_vec("c")];
-        assert_eq!(plan_recent_files_add(&items3, &u16_vec("b")), vec![0, 2]);
-        assert_eq!(plan_recent_files_add(&items3, &u16_vec("c")), vec![0, 1]);
+        let items3 = vec!["a", "b", "c"];
+        assert_eq!(plan_recent_files_add(&items3, "b"), vec![0, 2]);
+        assert_eq!(plan_recent_files_add(&items3, "c"), vec![0, 1]);
 
-        let items_dups = vec![u16_vec("a"), u16_vec("b"), u16_vec("a"), u16_vec("c")];
-        assert_eq!(plan_recent_files_add(&items_dups, &u16_vec("a")), vec![1, 3]);
+        let items_dups = vec!["a", "b", "a", "c"];
+        assert_eq!(plan_recent_files_add(&items_dups, "a"), vec![1, 3]);
 
-        let ten_items: Vec<Vec<u16>> = (1..=10).map(|i| u16_vec(&format!("file{i}"))).collect();
-        let new_item = u16_vec("file0");
-        assert_eq!(plan_recent_files_add(&ten_items, &new_item), vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
-
-        let item5 = u16_vec("file5");
+        let ten_items: Vec<String> = (1..=10).map(|i| format!("file{i}")).collect();
         assert_eq!(
-            plan_recent_files_add(&ten_items, &item5),
+            plan_recent_files_add(&ten_items, "file0"),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            plan_recent_files_add(&ten_items, "file5"),
             vec![0, 1, 2, 3, 5, 6, 7, 8, 9]
         );
 
         // Oversized list (> max_size) is truncated down to max_size - 1 surviving entries.
-        let twelve_items: Vec<Vec<u16>> = (1..=12).map(|i| u16_vec(&format!("file{i}"))).collect();
-        let plan12 = plan_recent_files_add(&twelve_items, &new_item);
+        let twelve_items: Vec<String> = (1..=12).map(|i| format!("file{i}")).collect();
+        let plan12 = plan_recent_files_add(&twelve_items, "file0");
         assert_eq!(plan12, (0..9).collect::<Vec<usize>>());
 
         // Limit of 0 or 1 leaves no surviving tail.
-        assert!(plan_recent_files_add_with_limit(&items, &val0, 1).is_empty());
-        assert!(plan_recent_files_add_with_limit(&items, &val0, 0).is_empty());
+        assert!(plan_recent_files_add_with_limit(&items, "file0", 1).is_empty());
+        assert!(plan_recent_files_add_with_limit(&items, "file0", 0).is_empty());
     }
 }

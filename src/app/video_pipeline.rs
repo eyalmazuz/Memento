@@ -10,10 +10,157 @@ use slint::{ComponentHandle, Model as _, Rgba8Pixel, SharedPixelBuffer};
 
 use crate::app::window_chrome::native_window_display_pointers;
 use crate::controller::player::compute_video_render_size;
-use crate::platform_renderer::{PlatformRendererConfig, PlatformRendererKind, RendererOverrides};
+use crate::platform_renderer::{PlatformRendererConfig, PlatformRendererKind};
 use crate::ui::MementoApp;
 use crate::video_gl::{self, GlCapabilities};
 use memento_player::MpvInstance;
+
+/// Non-blocking observer of `video-params/{primaries,gamma,pixelformat,hw-pixelformat}`
+/// backed by a weak libmpv client created before OpenGL activation.
+///
+/// Drained via `mpv_wait_event(0.0)` so it never blocks on mpv's core (preventing
+/// deadlocks with `MPV_RENDER_PARAM_ADVANCED_CONTROL`), and explicitly closed on
+/// shutdown before `MpvInstance::drop`.
+pub(crate) struct VideoParamsObserver {
+    handle: Option<*mut memento_player::mpv::ffi::mpv_handle>,
+    primaries: Option<String>,
+    gamma: Option<String>,
+    pixelformat: Option<String>,
+    hw_pixelformat: Option<String>,
+    dirty: bool,
+}
+
+impl VideoParamsObserver {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            handle: None,
+            primaries: None,
+            gamma: None,
+            pixelformat: None,
+            hw_pixelformat: None,
+            dirty: false,
+        }
+    }
+
+    /// Attach a weak client to `player` before OpenGL rendering starts.
+    pub(crate) fn attach(player: &MpvInstance) -> Self {
+        use memento_player::mpv::ffi;
+
+        let raw_parent = player.raw_handle();
+        if raw_parent.is_null() {
+            return Self::disabled();
+        }
+        let weak =
+            unsafe { ffi::mpv_create_weak_client(raw_parent, c"memento-fbo-format".as_ptr()) };
+        if weak.is_null() {
+            return Self::disabled();
+        }
+        const PROPS: &[(u64, &std::ffi::CStr)] = &[
+            (1, c"video-params/primaries"),
+            (2, c"video-params/gamma"),
+            (3, c"video-params/pixelformat"),
+            (4, c"video-params/hw-pixelformat"),
+        ];
+        for &(id, name) in PROPS {
+            unsafe {
+                let _ = ffi::mpv_observe_property(weak, id, name.as_ptr(), ffi::MPV_FORMAT_STRING);
+            }
+        }
+        Self {
+            handle: Some(weak),
+            primaries: None,
+            gamma: None,
+            pixelformat: None,
+            hw_pixelformat: None,
+            dirty: false,
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Drain any pending `video-params/*` property changes without blocking.
+    pub(crate) fn poll(&mut self) {
+        use memento_player::mpv::ffi;
+
+        let Some(handle) = self.handle else {
+            return;
+        };
+        loop {
+            let event = unsafe { ffi::mpv_wait_event(handle, 0.0) };
+            let Some(raw) = (unsafe { event.as_ref() }) else {
+                break;
+            };
+            match raw.event_id {
+                ffi::MPV_EVENT_NONE => break,
+                ffi::MPV_EVENT_SHUTDOWN => {
+                    self.close();
+                    break;
+                }
+                ffi::MPV_EVENT_PROPERTY_CHANGE => {
+                    let Some(prop) =
+                        (unsafe { raw.data.cast::<ffi::mpv_event_property>().as_ref() })
+                    else {
+                        continue;
+                    };
+                    let value = if prop.format == ffi::MPV_FORMAT_STRING && !prop.data.is_null() {
+                        let ptr = unsafe { *prop.data.cast::<*const std::ffi::c_char>() };
+                        if !ptr.is_null() {
+                            let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                                .to_string_lossy()
+                                .into_owned();
+                            (!text.is_empty()).then_some(text)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let slot = match raw.reply_userdata {
+                        1 => &mut self.primaries,
+                        2 => &mut self.gamma,
+                        3 => &mut self.pixelformat,
+                        4 => &mut self.hw_pixelformat,
+                        _ => continue,
+                    };
+                    if *slot != value {
+                        *slot = value;
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
+    }
+
+    pub(crate) fn prefers_16f(&self) -> bool {
+        video_gl::video_stream_prefers_16f(
+            self.primaries.as_deref(),
+            self.gamma.as_deref(),
+            self.pixelformat.as_deref(),
+            self.hw_pixelformat.as_deref(),
+        )
+    }
+
+    pub(crate) fn close(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                memento_player::mpv::ffi::mpv_destroy(handle);
+            }
+        }
+    }
+}
+
+impl Drop for VideoParamsObserver {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 pub(crate) struct VideoRenderWorker {
     stop: std::sync::mpsc::SyncSender<(u32, u32)>,
@@ -161,6 +308,20 @@ impl GlVideoSurface {
         )
     }
 
+    fn needs_format_reallocation(&self, requested_prefer_16f: bool) -> bool {
+        if self.prefer_16f == requested_prefer_16f {
+            return false;
+        }
+        if self.texture.is_none() || self.framebuffer.is_none() {
+            return false;
+        }
+        if requested_prefer_16f {
+            self.internal_format != glow::RGBA16F as i32
+        } else {
+            self.internal_format != glow::RGBA8 as i32
+        }
+    }
+
     fn texture_info(&self) -> Option<(std::num::NonZeroU32, u32, u32)> {
         self.texture
             .map(|texture| (texture.0, self.size.0, self.size.1))
@@ -173,9 +334,16 @@ impl GlVideoSurface {
         player: &MpvInstance,
         size: (u32, u32),
         force_pending: bool,
+        requested_prefer_16f: bool,
     ) -> Result<FrameStepOutcome, String> {
         let has_update = player.has_render_update();
-        let needs_realloc = self.should_reallocate(size);
+        let format_realloc = self.needs_format_reallocation(requested_prefer_16f);
+        if !format_realloc && self.prefer_16f != requested_prefer_16f && self.texture.is_some() {
+            // Attachment already matches the requested format (e.g., GPU lacked 16F
+            // and previously fell back to RGBA8, now switching preference back to RGBA8).
+            self.prefer_16f = requested_prefer_16f;
+        }
+        let needs_realloc = format_realloc || self.should_reallocate(size);
         if !force_pending && !has_update && !needs_realloc {
             return Ok(FrameStepOutcome {
                 rendered: false,
@@ -185,11 +353,11 @@ impl GlVideoSurface {
 
         let gl = &self.gl;
         let caps = self.caps;
-        let prefer_16f = self.prefer_16f;
         let max_texture_size = self.max_texture_size;
         let texture = &mut self.texture;
         let framebuffer = &mut self.framebuffer;
         let internal_format = &mut self.internal_format;
+        let surface_prefer_16f = &mut self.prefer_16f;
         let cur_size = &mut self.size;
 
         video_gl::with_saved_state_caps(gl, caps, || {
@@ -204,11 +372,13 @@ impl GlVideoSurface {
                     frame_ready: false,
                 });
             }
-            if video_gl::should_reallocate_fbo(
-                texture.is_some() && framebuffer.is_some(),
-                *cur_size,
-                size,
-            ) {
+            if format_realloc
+                || video_gl::should_reallocate_fbo(
+                    texture.is_some() && framebuffer.is_some(),
+                    *cur_size,
+                    size,
+                )
+            {
                 let target = video_gl::create_video_fbo_texture_with_caps(
                     gl,
                     caps,
@@ -216,12 +386,13 @@ impl GlVideoSurface {
                     *framebuffer,
                     size.0,
                     size.1,
-                    prefer_16f,
+                    requested_prefer_16f,
                     max_texture_size,
                 )?;
                 *texture = Some(target.texture);
                 *framebuffer = Some(target.framebuffer);
                 *internal_format = target.internal_format;
+                *surface_prefer_16f = requested_prefer_16f;
                 *cur_size = size;
             }
             if let Some(fb) = *framebuffer {
@@ -357,7 +528,7 @@ pub(crate) fn install_video_pipeline(
     pending_playback_frame: Rc<Cell<Option<i32>>>,
     current_render_size: Rc<Cell<(u32, u32)>>,
     renderer_plan: &PlatformRendererConfig,
-    renderer_overrides: &RendererOverrides,
+    gl_prefer_16f: Rc<Cell<bool>>,
     trigger_initial_loads: Rc<dyn Fn()>,
     verbose_video_timings: bool,
 ) -> VideoRenderWorker {
@@ -384,7 +555,7 @@ pub(crate) fn install_video_pipeline(
     let notifier_timings = video_timings.clone();
     let notifier_pending_frame = pending_playback_frame;
     let notifier_trigger_initial = trigger_initial_loads.clone();
-    let gl_prefer_16f = !renderer_overrides.force_rgba8;
+    let notifier_prefer_16f = gl_prefer_16f;
 
     if renderer_plan.primary == PlatformRendererKind::Software {
         eprintln!("Video renderer: libmpv software (per startup renderer plan)");
@@ -441,9 +612,12 @@ pub(crate) fn install_video_pipeline(
                             });
                             match gl_res {
                                 Ok(()) => {
-                                    *notifier_surface.borrow_mut() = Some(
-                                        GlVideoSurface::from_context(gl, player, gl_prefer_16f),
-                                    );
+                                    *notifier_surface.borrow_mut() =
+                                        Some(GlVideoSurface::from_context(
+                                            gl,
+                                            player,
+                                            notifier_prefer_16f.get(),
+                                        ));
                                     notifier_pending.set(true);
                                     eprintln!("Video renderer: libmpv OpenGL");
                                 }
@@ -502,7 +676,12 @@ pub(crate) fn install_video_pipeline(
                     };
                     let force_pending = notifier_pending.replace(false);
                     let render_started = Instant::now();
-                    match surface.update_and_render(player, size, force_pending) {
+                    match surface.update_and_render(
+                        player,
+                        size,
+                        force_pending,
+                        notifier_prefer_16f.get(),
+                    ) {
                         Ok(FrameStepOutcome {
                             rendered: false, ..
                         }) => {

@@ -20,9 +20,10 @@ use parley::{
 };
 use resvg::tiny_skia;
 use serde_json::Value as JsonValue;
+use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 use super::dict_assets::{
-    load_dictionary_image_pixmap_scaled, resolve_dictionary_asset_path_in_dirs,
+    load_dictionary_image_pixmap_scaled_with_engine, resolve_dictionary_asset_path_in_dirs,
 };
 use super::popup_css::{
     clean_css_font_family, parse_css_theme_color, parse_css_unit_float, rgba_to_css_color,
@@ -30,7 +31,7 @@ use super::popup_css::{
 };
 use super::subtitle_layout::is_japanese_lookup_char;
 use super::text_engine::{
-    blit_alpha_glyph, composite_rgb_over_opaque, pixmap_to_slint_image, quantize_subpixel_x,
+    blit_alpha_glyph, composite_rgb_over_opaque, pixmap_to_pixel_buffer, quantize_subpixel_x,
     with_shared_text_engine, BorrowFontExt, PositionedMaskGlyph, TextEngine,
     RICH_EMOJI_FALLBACK_STACK,
 };
@@ -71,6 +72,32 @@ pub struct RenderedGlossaryDoc {
     pub selectable_chars: Vec<GlossaryCharCell>,
     pub line_bottoms: Vec<f32>,
     pub plain_text: String,
+}
+
+/// Thread-safe (`Send`) pre-rasterized glossary payload produced off the UI thread
+/// and wrapped into a `RenderedGlossaryDoc` on the UI thread with zero pixel copy.
+pub(super) struct RasterizedGlossaryDoc {
+    pub(super) width_px: f32,
+    pub(super) height_px: f32,
+    pub(super) pixels: SharedPixelBuffer<Rgba8Pixel>,
+    pub(super) hit_zones: Vec<GlossaryHitZone>,
+    pub(super) selectable_chars: Vec<GlossaryCharCell>,
+    pub(super) line_bottoms: Vec<f32>,
+    pub(super) plain_text: String,
+}
+
+impl RasterizedGlossaryDoc {
+    pub(super) fn into_rendered_doc(self) -> RenderedGlossaryDoc {
+        RenderedGlossaryDoc {
+            width_px: self.width_px,
+            height_px: self.height_px,
+            image: slint::Image::from_rgba8_premultiplied(self.pixels),
+            hit_zones: self.hit_zones,
+            selectable_chars: self.selectable_chars,
+            line_bottoms: self.line_bottoms,
+            plain_text: self.plain_text,
+        }
+    }
 }
 
 pub const MAX_NESTED_POPUP_DEPTH: usize = 4;
@@ -502,6 +529,7 @@ fn extract_ruby_pairs(ruby_content: &JsonValue) -> Vec<(String, String)> {
 }
 
 struct GlossaryBuilder<'a> {
+    engine: &'a mut TextEngine,
     renderer: DefRenderer,
     ctx: DefContext,
     dict_resource_dirs: &'a [PathBuf],
@@ -717,7 +745,8 @@ impl<'a> GlossaryBuilder<'a> {
             self.dict_name,
             rel_path,
         )?;
-        let (mut pixmap, w, h) = load_dictionary_image_pixmap_scaled(
+        let (mut pixmap, w, h) = load_dictionary_image_pixmap_scaled_with_engine(
+            self.engine,
             &asset_path,
             req_w,
             req_h,
@@ -1512,8 +1541,332 @@ impl PaintCollector {
             self.rects.push(((x + w - bw).max(x), y, bw, h, col));
         }
     }
+
+    fn append_shifted_y(&mut self, other: PaintCollector, dy: f32) {
+        let scale = self.render_scale;
+        let phys_dy = dy * scale;
+        let phys_dy_i32 = phys_dy.round() as i32;
+        let line_id_base = self.next_line_id;
+        self.next_line_id += other.next_line_id;
+
+        self.rects.reserve(other.rects.len());
+        for (rx, ry, rw, rh, col) in other.rects {
+            self.rects.push((rx, ry + dy, rw, rh, col));
+        }
+        self.images.reserve(other.images.len());
+        for mut img in other.images {
+            img.phys_y += phys_dy;
+            self.images.push(img);
+        }
+        self.mask_glyphs.reserve(other.mask_glyphs.len());
+        for mut mg in other.mask_glyphs {
+            mg.y += phys_dy_i32;
+            self.mask_glyphs.push(mg);
+        }
+        self.hit_zones.reserve(other.hit_zones.len());
+        for mut hz in other.hit_zones {
+            hz.y += dy;
+            self.hit_zones.push(hz);
+        }
+        self.selectable_chars.reserve(other.selectable_chars.len());
+        for mut sc in other.selectable_chars {
+            sc.y += dy;
+            sc.line_id += line_id_base;
+            self.selectable_chars.push(sc);
+        }
+        self.line_bounds.reserve(other.line_bounds.len());
+        for (top, bottom) in other.line_bounds {
+            self.line_bounds.push((top + dy, bottom + dy));
+        }
+    }
 }
 
+/// Per-document memoization cache of each `BlockIR` node's intrinsic unwrapped width
+/// (keyed by immutable `&BlockIR` pointer address) so nested tables measure every cell
+/// at most once instead of exponentially (`3^depth`).
+#[derive(Default)]
+struct LayoutMeasureCache {
+    intrinsic_w: HashMap<usize, f32>,
+}
+
+fn measure_inline_atoms_intrinsic_width(engine: &mut TextEngine, atoms: &[InlineAtom]) -> f32 {
+    if atoms.is_empty() {
+        return 0.0;
+    }
+
+    let mut full_text = String::new();
+    let mut spans: Vec<(std::ops::Range<usize>, &InlineStyleIR)> = Vec::new();
+    let mut inline_boxes: Vec<InlineBox> = Vec::new();
+    let mut next_box_id = 1u64;
+
+    for atom in atoms {
+        match atom {
+            InlineAtom::Text { text, style, .. } => {
+                if text.is_empty() {
+                    continue;
+                }
+                let has_pill = style.pill_bg.is_some() || style.pill_border.is_some();
+                let start = full_text.len();
+                if has_pill {
+                    full_text.push('\u{00A0}');
+                }
+                full_text.push_str(text);
+                if has_pill {
+                    full_text.push('\u{00A0}');
+                }
+                let end = full_text.len();
+                spans.push((start..end, style));
+                if has_pill {
+                    full_text.push(' ');
+                }
+            }
+            InlineAtom::DetailsToggle { open, style, .. } => {
+                let start = full_text.len();
+                full_text.push(if *open { '▾' } else { '▸' });
+                full_text.push(' ');
+                let end = full_text.len();
+                spans.push((start..end, style));
+            }
+            InlineAtom::LineBreak => {
+                full_text.push('\n');
+            }
+            InlineAtom::Ruby {
+                base,
+                reading,
+                style,
+            } => {
+                let base_l = engine.shape_single_line(
+                    base,
+                    &style.font_family,
+                    style.font_px,
+                    style.weight,
+                    style.italic,
+                    style.color,
+                );
+                let ruby_px = (style.font_px * 0.58).max(8.5);
+                let ruby_l = engine.shape_single_line(
+                    reading,
+                    &style.font_family,
+                    ruby_px,
+                    style.weight,
+                    false,
+                    [196, 181, 253, 255],
+                );
+                let bw = base_l
+                    .lines()
+                    .next()
+                    .map_or(style.font_px, |l| l.metrics().advance);
+                let bh = base_l
+                    .lines()
+                    .next()
+                    .map_or(style.font_px * 1.2, |l| l.metrics().line_height);
+                let rw = ruby_l.lines().next().map_or(0.0, |l| l.metrics().advance);
+                let rh = ruby_l
+                    .lines()
+                    .next()
+                    .map_or(ruby_px * 1.1, |l| l.metrics().line_height);
+                let id = next_box_id;
+                next_box_id += 1;
+                inline_boxes.push(InlineBox {
+                    id,
+                    index: full_text.len(),
+                    width: bw.max(rw) + 2.0,
+                    height: rh + bh,
+                });
+            }
+            InlineAtom::Image { w, h, .. } => {
+                let id = next_box_id;
+                next_box_id += 1;
+                inline_boxes.push(InlineBox {
+                    id,
+                    index: full_text.len(),
+                    width: w.max(1.0) + 2.0,
+                    height: h.max(1.0) + 2.0,
+                });
+            }
+        }
+    }
+
+    let mut builder = engine
+        .layout_cx
+        .ranged_builder(&mut engine.font_cx, &full_text, 1.0, true);
+    builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
+        Cow::Borrowed(RICH_EMOJI_FALLBACK_STACK),
+    )));
+    builder.push_default(StyleProperty::FontSize(14.5));
+    builder.push_default(StyleProperty::LineHeight(LineHeight::MetricsRelative(1.18)));
+    builder.push_default(StyleProperty::Brush([241, 245, 249, 255]));
+
+    for (range, style) in spans {
+        let ff = style.font_family.trim();
+        if !ff.is_empty() && !ff.eq_ignore_ascii_case("Noto Sans CJK JP") {
+            builder.push(
+                StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(format!(
+                    "{ff}, {RICH_EMOJI_FALLBACK_STACK}"
+                )))),
+                range.clone(),
+            );
+        }
+        builder.push(StyleProperty::FontSize(style.font_px), range.clone());
+        builder.push(
+            StyleProperty::FontWeight(FontWeight::new(style.weight as f32)),
+            range.clone(),
+        );
+        if style.italic {
+            builder.push(StyleProperty::FontStyle(FontStyle::Italic), range);
+        }
+    }
+    for ibox in inline_boxes {
+        builder.push_inline_box(ibox);
+    }
+
+    let mut layout = builder.build(&full_text);
+    layout.break_all_lines(None);
+    let mut max_line_w = 0.0f32;
+    for line in layout.lines() {
+        max_line_w = max_line_w.max(line.metrics().advance - line.metrics().trailing_whitespace);
+    }
+    max_line_w.max(0.0)
+}
+
+fn place_table_cells(rows: &[Vec<TableCellIR>]) -> (Vec<PlacedCell<'_>>, usize) {
+    let num_rows = rows.len();
+    let mut occupied: HashSet<(usize, usize)> = HashSet::new();
+    let mut placed: Vec<PlacedCell<'_>> = Vec::new();
+    let mut num_cols = 0usize;
+
+    for (r_idx, row) in rows.iter().enumerate() {
+        let mut c_idx = 0usize;
+        for cell in row {
+            while occupied.contains(&(r_idx, c_idx)) {
+                c_idx += 1;
+            }
+            let cs = cell.col_span.max(1);
+            let rs = cell.row_span.max(1).min(num_rows - r_idx);
+            for dr in 0..rs {
+                for dc in 0..cs {
+                    occupied.insert((r_idx + dr, c_idx + dc));
+                }
+            }
+            num_cols = num_cols.max(c_idx + cs);
+            placed.push(PlacedCell {
+                cell,
+                row: r_idx,
+                col: c_idx,
+                col_span: cs,
+                row_span: rs,
+            });
+            c_idx += cs;
+        }
+    }
+    (placed, num_cols)
+}
+
+fn measure_block_intrinsic_width(
+    engine: &mut TextEngine,
+    block: &BlockIR,
+    cache: &mut LayoutMeasureCache,
+) -> f32 {
+    let key = block as *const BlockIR as usize;
+    if let Some(&cached) = cache.intrinsic_w.get(&key) {
+        return cached;
+    }
+
+    let measured = match block {
+        BlockIR::Paragraph {
+            atoms,
+            frame,
+            marker,
+            ..
+        } => {
+            let border_l = frame.borders[LEFT].map_or(0.0, |(w, _)| w);
+            let border_r = frame.borders[RIGHT].map_or(0.0, |(w, _)| w);
+            let marker_w = if let Some((ref m_txt, m_col, m_px)) = *marker {
+                let m_layout =
+                    engine.shape_single_line(m_txt, "Noto Sans CJK JP", m_px, 600, false, m_col);
+                let adv = m_layout
+                    .lines()
+                    .next()
+                    .map_or(m_px, |l| l.metrics().advance)
+                    + 6.0;
+                adv
+            } else {
+                0.0
+            };
+            let para_w = measure_inline_atoms_intrinsic_width(engine, atoms);
+            frame.margin_left
+                + border_l
+                + frame.padding[LEFT]
+                + marker_w
+                + para_w
+                + frame.padding[RIGHT]
+                + border_r
+                + frame.margin_right
+        }
+        BlockIR::Container {
+            blocks,
+            frame,
+            marker,
+        } => {
+            let border_l = frame.borders[LEFT].map_or(0.0, |(w, _)| w);
+            let border_r = frame.borders[RIGHT].map_or(0.0, |(w, _)| w);
+            let marker_w = if let Some((ref m_txt, m_col, m_px)) = *marker {
+                let m_layout =
+                    engine.shape_single_line(m_txt, "Noto Sans CJK JP", m_px, 600, false, m_col);
+                let adv = m_layout
+                    .lines()
+                    .next()
+                    .map_or(m_px, |l| l.metrics().advance)
+                    + 6.0;
+                adv
+            } else {
+                0.0
+            };
+            let mut max_child_w = 0.0f32;
+            for child in blocks {
+                max_child_w = max_child_w.max(measure_block_intrinsic_width(engine, child, cache));
+            }
+            frame.margin_left
+                + border_l
+                + frame.padding[LEFT]
+                + marker_w
+                + max_child_w
+                + frame.padding[RIGHT]
+                + border_r
+                + frame.margin_right
+        }
+        BlockIR::Table { rows, frame } => {
+            if rows.is_empty() {
+                0.0
+            } else {
+                let (placed, num_cols) = place_table_cells(rows);
+                if num_cols == 0 {
+                    0.0
+                } else {
+                    let mut col_pref = vec![36.0f32; num_cols];
+                    for p in &placed {
+                        let pad_h = p.cell.frame.padding[LEFT] + p.cell.frame.padding[RIGHT] + 4.0;
+                        let mut natural_w = 24.0f32;
+                        for blk in &p.cell.blocks {
+                            natural_w =
+                                natural_w.max(measure_block_intrinsic_width(engine, blk, cache));
+                        }
+                        let needed = (natural_w + pad_h) / (p.col_span as f32);
+                        for dc in 0..p.col_span {
+                            col_pref[p.col + dc] = col_pref[p.col + dc].max(needed);
+                        }
+                    }
+                    frame.margin_left + col_pref.iter().sum::<f32>() + frame.margin_right
+                }
+            }
+        }
+    };
+
+    cache.intrinsic_w.insert(key, measured);
+    measured
+}
+
+#[allow(clippy::too_many_arguments)]
 fn layout_and_collect_block(
     engine: &mut TextEngine,
     block: &BlockIR,
@@ -1522,6 +1875,7 @@ fn layout_and_collect_block(
     avail_w: f32,
     collector: &mut PaintCollector,
     measure_only: bool,
+    cache: &mut LayoutMeasureCache,
 ) -> (f32, f32) {
     match block {
         BlockIR::Paragraph {
@@ -1676,6 +2030,7 @@ fn layout_and_collect_block(
                     content_w,
                     collector,
                     measure_only,
+                    cache,
                 );
                 max_child_w = max_child_w.max(cw);
                 cur_y += ch;
@@ -1710,6 +2065,7 @@ fn layout_and_collect_block(
             avail_w,
             collector,
             measure_only,
+            cache,
         ),
     }
 }
@@ -1731,6 +2087,10 @@ struct RubyBoxItem {
     h: f32,
     base_y: f32,
     ruby_h: f32,
+    base_w: f32,
+    ruby_w: f32,
+    base_layout: parley::Layout<[u8; 4]>,
+    ruby_layout: parley::Layout<[u8; 4]>,
 }
 
 struct ImageBoxItem {
@@ -1866,6 +2226,10 @@ fn layout_inline_atoms(
                     h,
                     base_y: rh,
                     ruby_h: rh,
+                    base_w: bw,
+                    ruby_w: rw,
+                    base_layout: base_l,
+                    ruby_layout: ruby_l,
                 });
             }
             InlineAtom::Image {
@@ -2147,9 +2511,9 @@ fn layout_inline_atoms(
                             if !slice.is_empty() && !slice.chars().all(|c| c == '\n' || c == '\r') {
                                 let selectable = span_meta.is_none_or(|m| m.selectable);
                                 if selectable {
-                                    let chars: Vec<char> = slice.chars().collect();
-                                    let per_w = adv / (chars.len().max(1) as f32);
-                                    for (ci, ch) in chars.into_iter().enumerate() {
+                                    let char_count = slice.chars().count();
+                                    let per_w = adv / (char_count.max(1) as f32);
+                                    for (ci, ch) in slice.chars().enumerate() {
                                         let norm_ch = if ch == '\u{00A0}' { ' ' } else { ch };
                                         collector.selectable_chars.push(GlossaryCharCell {
                                             ch: norm_ch,
@@ -2172,48 +2536,26 @@ fn layout_inline_atoms(
                     let bx = origin_x + ibox.x;
                     let by = origin_y + ibox.y;
                     if let Some(rbox) = ruby_boxes.iter().find(|r| r.box_id == ibox.id) {
-                        let base_l = engine.shape_single_line(
-                            &rbox.base,
-                            &rbox.style.font_family,
-                            rbox.style.font_px,
-                            rbox.style.weight,
-                            rbox.style.italic,
-                            rbox.style.color,
-                        );
-                        let bw = base_l
-                            .lines()
-                            .next()
-                            .map_or(rbox.style.font_px, |l| l.metrics().advance);
-                        let ruby_px = (rbox.style.font_px * 0.58).max(8.5);
-                        let ruby_l = engine.shape_single_line(
-                            &rbox.reading,
-                            &rbox.style.font_family,
-                            ruby_px,
-                            rbox.style.weight,
-                            false,
-                            [196, 181, 253, 255],
-                        );
-                        let rw = ruby_l.lines().next().map_or(0.0, |l| l.metrics().advance);
                         engine.collect_glossary_glyphs_from_layout(
-                            &ruby_l,
-                            bx + (rbox.w - rw) * 0.5,
+                            &rbox.ruby_layout,
+                            bx + (rbox.w - rbox.ruby_w) * 0.5,
                             by,
                             false,
                             false,
                             collector,
                         );
                         engine.collect_glossary_glyphs_from_layout(
-                            &base_l,
-                            bx + (rbox.w - bw) * 0.5,
+                            &rbox.base_layout,
+                            bx + (rbox.w - rbox.base_w) * 0.5,
                             by + rbox.base_y,
                             rbox.style.underline,
                             rbox.style.strikethrough,
                             collector,
                         );
 
-                        let base_chars: Vec<char> = rbox.base.chars().collect();
-                        let per_w = rbox.w / (base_chars.len().max(1) as f32);
-                        for (ci, ch) in base_chars.into_iter().enumerate() {
+                        let base_char_count = rbox.base.chars().count();
+                        let per_w = rbox.w / (base_char_count.max(1) as f32);
+                        for (ci, ch) in rbox.base.chars().enumerate() {
                             collector.selectable_chars.push(GlossaryCharCell {
                                 ch,
                                 x: bx + per_w * ci as f32,
@@ -2300,40 +2642,14 @@ fn layout_table_block(
     avail_w: f32,
     collector: &mut PaintCollector,
     measure_only: bool,
+    cache: &mut LayoutMeasureCache,
 ) -> (f32, f32) {
     let num_rows = rows.len();
     if num_rows == 0 {
         return (0.0, 0.0);
     }
 
-    let mut occupied: HashSet<(usize, usize)> = HashSet::new();
-    let mut placed: Vec<PlacedCell<'_>> = Vec::new();
-    let mut num_cols = 0usize;
-
-    for (r_idx, row) in rows.iter().enumerate() {
-        let mut c_idx = 0usize;
-        for cell in row {
-            while occupied.contains(&(r_idx, c_idx)) {
-                c_idx += 1;
-            }
-            let cs = cell.col_span.max(1);
-            let rs = cell.row_span.max(1).min(num_rows - r_idx);
-            for dr in 0..rs {
-                for dc in 0..cs {
-                    occupied.insert((r_idx + dr, c_idx + dc));
-                }
-            }
-            num_cols = num_cols.max(c_idx + cs);
-            placed.push(PlacedCell {
-                cell,
-                row: r_idx,
-                col: c_idx,
-                col_span: cs,
-                row_span: rs,
-            });
-            c_idx += cs;
-        }
-    }
+    let (placed, num_cols) = place_table_cells(rows);
     if num_cols == 0 {
         return (0.0, 0.0);
     }
@@ -2342,21 +2658,14 @@ fn layout_table_block(
     let outer_y = y + frame.margin_top;
     let max_table_w = (avail_w - frame.margin_left - frame.margin_right).max(40.0);
 
+    // Pass 1: memoized intrinsic width per cell block (each node measured at most once across
+    // the entire document, eliminating exponential 3^depth re-layout on nested tables).
     let mut col_pref = vec![36.0f32; num_cols];
-    let mut dummy_collector = PaintCollector::new(collector.render_scale);
     for p in &placed {
         let pad_h = p.cell.frame.padding[LEFT] + p.cell.frame.padding[RIGHT] + 4.0;
         let mut natural_w = 24.0f32;
         for blk in &p.cell.blocks {
-            let (bw, _) = layout_and_collect_block(
-                engine,
-                blk,
-                0.0,
-                0.0,
-                max_table_w,
-                &mut dummy_collector,
-                true,
-            );
+            let bw = measure_block_intrinsic_width(engine, blk, cache).min(max_table_w);
             natural_w = natural_w.max(bw);
         }
         let needed = (natural_w + pad_h) / (p.col_span as f32);
@@ -2384,28 +2693,64 @@ fn layout_table_block(
     }
     col_offsets.push(acc_x);
 
+    // Pass 2: single final column-width layout pass — when painting (`!measure_only`), collect
+    // each cell directly at its final `inner_x` into a cell-local `PaintCollector` so row heights
+    // and paint items are produced together with zero 3rd re-layout pass.
     let mut row_heights = vec![22.0f32; num_rows];
     let mut cell_measured_heights = Vec::with_capacity(placed.len());
+    let mut cell_collectors: Vec<PaintCollector> = if measure_only {
+        Vec::new()
+    } else {
+        Vec::with_capacity(placed.len())
+    };
+    let mut dummy_collector = PaintCollector::new(collector.render_scale);
+
     for p in &placed {
-        let cell_w = (col_offsets[p.col + p.col_span] - col_offsets[p.col]).max(18.0);
+        let cx = outer_x + col_offsets[p.col];
+        let cw = (col_offsets[p.col + p.col_span] - col_offsets[p.col]).max(18.0);
+        let inner_x = cx + p.cell.frame.padding[LEFT] + 1.0;
         let inner_w =
-            (cell_w - p.cell.frame.padding[LEFT] - p.cell.frame.padding[RIGHT] - 2.0).max(12.0);
+            (cw - p.cell.frame.padding[LEFT] - p.cell.frame.padding[RIGHT] - 2.0).max(12.0);
+
         let mut ch_sum = 0.0f32;
-        for (idx, blk) in p.cell.blocks.iter().enumerate() {
-            if idx > 0 {
-                ch_sum += 2.0;
+        if measure_only {
+            for (idx, blk) in p.cell.blocks.iter().enumerate() {
+                if idx > 0 {
+                    ch_sum += 2.0;
+                }
+                let (_, bh) = layout_and_collect_block(
+                    engine,
+                    blk,
+                    inner_x,
+                    ch_sum,
+                    inner_w,
+                    &mut dummy_collector,
+                    true,
+                    cache,
+                );
+                ch_sum += bh;
             }
-            let (_, bh) = layout_and_collect_block(
-                engine,
-                blk,
-                0.0,
-                0.0,
-                inner_w,
-                &mut dummy_collector,
-                true,
-            );
-            ch_sum += bh;
+        } else {
+            let mut cell_collector = PaintCollector::new(collector.render_scale);
+            for (idx, blk) in p.cell.blocks.iter().enumerate() {
+                if idx > 0 {
+                    ch_sum += 2.0;
+                }
+                let (_, bh) = layout_and_collect_block(
+                    engine,
+                    blk,
+                    inner_x,
+                    ch_sum,
+                    inner_w,
+                    &mut cell_collector,
+                    false,
+                    cache,
+                );
+                ch_sum += bh;
+            }
+            cell_collectors.push(cell_collector);
         }
+
         let total_ch = ch_sum + p.cell.frame.padding[TOP] + p.cell.frame.padding[BOTTOM] + 2.0;
         cell_measured_heights.push(total_ch);
         if p.row_span == 1 {
@@ -2435,31 +2780,14 @@ fn layout_table_block(
 
     if !measure_only {
         collector.push_frame(outer_x, outer_y, table_w, table_h, frame);
-        for p in &placed {
+        for (p, cell_collector) in placed.iter().zip(cell_collectors) {
             let cx = outer_x + col_offsets[p.col];
             let cy = outer_y + row_offsets[p.row];
             let cw = col_offsets[p.col + p.col_span] - col_offsets[p.col];
             let ch = row_offsets[p.row + p.row_span] - row_offsets[p.row];
             collector.push_frame(cx, cy, cw, ch, &p.cell.frame);
-            let inner_x = cx + p.cell.frame.padding[LEFT] + 1.0;
-            let mut inner_y = cy + p.cell.frame.padding[TOP] + 1.0;
-            let inner_w =
-                (cw - p.cell.frame.padding[LEFT] - p.cell.frame.padding[RIGHT] - 2.0).max(12.0);
-            for (idx, blk) in p.cell.blocks.iter().enumerate() {
-                if idx > 0 {
-                    inner_y += 2.0;
-                }
-                let (_, bh) = layout_and_collect_block(
-                    engine,
-                    blk,
-                    inner_x,
-                    inner_y,
-                    inner_w,
-                    collector,
-                    false,
-                );
-                inner_y += bh;
-            }
+            let inner_y = cy + p.cell.frame.padding[TOP] + 1.0;
+            collector.append_shifted_y(cell_collector, inner_y);
         }
     }
 
@@ -2575,9 +2903,11 @@ pub(super) fn render_structured_glossary_entry_with_theme_scaled(
 }
 
 /// Build and rasterize a rich structured-content glossary entry directly from a pre-parsed
-/// `serde_json::Value` (when provided by the caller) or a single `serde_json::from_str` pass.
+/// `serde_json::Value` (when provided by the caller) or a single `serde_json::from_str` pass
+/// using a caller-owned `TextEngine` (UI thread or background `GlossaryRenderWorker`).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn render_structured_glossary_entry_with_value_scaled(
+pub(super) fn rasterize_structured_glossary_entry_with_engine(
+    engine: &mut TextEngine,
     raw_glossary: &str,
     fallback_glossary: &str,
     parsed_value: Option<&JsonValue>,
@@ -2591,7 +2921,7 @@ pub(super) fn render_structured_glossary_entry_with_value_scaled(
     selected: bool,
     theme: &PopupCssTheme,
     render_scale: f32,
-) -> Option<RenderedGlossaryDoc> {
+) -> Option<RasterizedGlossaryDoc> {
     let scale = render_scale.clamp(1.0, 3.0);
     let avail_w = avail_width_px.clamp(120.0, 960.0);
     let mut base_text_color = if selected {
@@ -2716,116 +3046,123 @@ pub(super) fn render_structured_glossary_entry_with_value_scaled(
         }
     }
 
-    let mut builder = GlossaryBuilder {
-        renderer,
-        ctx,
-        dict_resource_dirs,
-        dic_id,
-        dict_name,
-        default_link_color: theme.link_color,
-        render_scale: scale,
-        had_hidden_elements: root_hidden,
-    };
+    let (top_blocks, had_hidden_elements) = {
+        let mut builder = GlossaryBuilder {
+            engine,
+            renderer,
+            ctx,
+            dict_resource_dirs,
+            dic_id,
+            dict_name,
+            default_link_color: theme.link_color,
+            render_scale: scale,
+            had_hidden_elements: root_hidden,
+        };
 
-    let mut top_blocks: Vec<BlockIR> = Vec::new();
-    let use_bullets = legacy_style == LegacyGlossaryStyle::Bullet && !contains_structured;
+        let mut top_blocks: Vec<BlockIR> = Vec::new();
+        let use_bullets = legacy_style == LegacyGlossaryStyle::Bullet && !contains_structured;
 
-    if !root_hidden {
-        for (idx, entry) in entries.iter().enumerate() {
-            match entry {
-                JsonValue::String(text) => {
-                    let mut atoms = Vec::new();
-                    for (li, line) in text.split('\n').enumerate() {
-                        if li > 0 {
-                            atoms.push(InlineAtom::LineBreak);
-                        }
-                        atoms.push(InlineAtom::Text {
-                            text: line.to_owned(),
-                            style: root_inline.clone(),
-                            selectable: true,
-                        });
-                    }
-                    if !use_bullets
-                        && idx + 1 < entries.len()
-                        && legacy_style == LegacyGlossaryStyle::Pipe
-                    {
-                        atoms.push(InlineAtom::Text {
-                            text: " | ".to_owned(),
-                            style: root_inline.clone(),
-                            selectable: true,
-                        });
-                    }
-                    top_blocks.push(BlockIR::Paragraph {
-                        atoms,
-                        frame: BoxFrameIR::default(),
-                        marker: use_bullets
-                            .then(|| ("•".to_owned(), base_text_color, root_inline.font_px)),
-                        summary_detail_id: None,
-                    });
-                }
-                JsonValue::Object(_) => {
-                    match entry.get("type").and_then(JsonValue::as_str).unwrap_or("") {
-                        "structured-content" => {
-                            if let Some(content) = entry.get("content") {
-                                let blocks = builder.build_children_blocks(content, &root_inline);
-                                top_blocks.extend(blocks);
+        if !root_hidden {
+            for (idx, entry) in entries.iter().enumerate() {
+                match entry {
+                    JsonValue::String(text) => {
+                        let mut atoms = Vec::new();
+                        for (li, line) in text.split('\n').enumerate() {
+                            if li > 0 {
+                                atoms.push(InlineAtom::LineBreak);
                             }
+                            atoms.push(InlineAtom::Text {
+                                text: line.to_owned(),
+                                style: root_inline.clone(),
+                                selectable: true,
+                            });
                         }
-                        "image" => {
-                            if let Some(atom) = builder.resolve_image_atom(entry, &root_inline) {
-                                let mut atoms = vec![atom];
-                                if let Some(desc) =
-                                    entry.get("description").and_then(JsonValue::as_str)
+                        if !use_bullets
+                            && idx + 1 < entries.len()
+                            && legacy_style == LegacyGlossaryStyle::Pipe
+                        {
+                            atoms.push(InlineAtom::Text {
+                                text: " | ".to_owned(),
+                                style: root_inline.clone(),
+                                selectable: true,
+                            });
+                        }
+                        top_blocks.push(BlockIR::Paragraph {
+                            atoms,
+                            frame: BoxFrameIR::default(),
+                            marker: use_bullets
+                                .then(|| ("•".to_owned(), base_text_color, root_inline.font_px)),
+                            summary_detail_id: None,
+                        });
+                    }
+                    JsonValue::Object(_) => {
+                        match entry.get("type").and_then(JsonValue::as_str).unwrap_or("") {
+                            "structured-content" => {
+                                if let Some(content) = entry.get("content") {
+                                    let blocks =
+                                        builder.build_children_blocks(content, &root_inline);
+                                    top_blocks.extend(blocks);
+                                }
+                            }
+                            "image" => {
+                                if let Some(atom) = builder.resolve_image_atom(entry, &root_inline)
                                 {
-                                    if !desc.is_empty() {
-                                        atoms.push(InlineAtom::LineBreak);
-                                        atoms.push(InlineAtom::Text {
-                                            text: desc.to_owned(),
+                                    let mut atoms = vec![atom];
+                                    if let Some(desc) =
+                                        entry.get("description").and_then(JsonValue::as_str)
+                                    {
+                                        if !desc.is_empty() {
+                                            atoms.push(InlineAtom::LineBreak);
+                                            atoms.push(InlineAtom::Text {
+                                                text: desc.to_owned(),
+                                                style: root_inline.clone(),
+                                                selectable: true,
+                                            });
+                                        }
+                                    }
+                                    top_blocks.push(BlockIR::Paragraph {
+                                        atoms,
+                                        frame: BoxFrameIR::default(),
+                                        marker: None,
+                                        summary_detail_id: None,
+                                    });
+                                }
+                            }
+                            "text" => {
+                                let txt =
+                                    entry.get("text").and_then(JsonValue::as_str).unwrap_or("");
+                                if !txt.is_empty() {
+                                    top_blocks.push(BlockIR::Paragraph {
+                                        atoms: vec![InlineAtom::Text {
+                                            text: txt.to_owned(),
                                             style: root_inline.clone(),
                                             selectable: true,
-                                        });
-                                    }
+                                        }],
+                                        frame: BoxFrameIR::default(),
+                                        marker: use_bullets.then(|| {
+                                            ("•".to_owned(), base_text_color, root_inline.font_px)
+                                        }),
+                                        summary_detail_id: None,
+                                    });
                                 }
-                                top_blocks.push(BlockIR::Paragraph {
-                                    atoms,
-                                    frame: BoxFrameIR::default(),
-                                    marker: None,
-                                    summary_detail_id: None,
-                                });
                             }
+                            _ => {}
                         }
-                        "text" => {
-                            let txt = entry.get("text").and_then(JsonValue::as_str).unwrap_or("");
-                            if !txt.is_empty() {
-                                top_blocks.push(BlockIR::Paragraph {
-                                    atoms: vec![InlineAtom::Text {
-                                        text: txt.to_owned(),
-                                        style: root_inline.clone(),
-                                        selectable: true,
-                                    }],
-                                    frame: BoxFrameIR::default(),
-                                    marker: use_bullets.then(|| {
-                                        ("•".to_owned(), base_text_color, root_inline.font_px)
-                                    }),
-                                    summary_detail_id: None,
-                                });
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
+        (top_blocks, builder.had_hidden_elements)
+    };
 
     if top_blocks.is_empty() {
-        if builder.had_hidden_elements {
+        if had_hidden_elements {
             let empty_pm = tiny_skia::Pixmap::new(1, 1)?;
-            return Some(RenderedGlossaryDoc {
+            return Some(RasterizedGlossaryDoc {
                 width_px: 1.0,
                 height_px: 1.0,
-                image: pixmap_to_slint_image(&empty_pm),
+                pixels: pixmap_to_pixel_buffer(&empty_pm),
                 hit_zones: Vec::new(),
                 selectable_chars: Vec::new(),
                 line_bottoms: Vec::new(),
@@ -2835,96 +3172,135 @@ pub(super) fn render_structured_glossary_entry_with_value_scaled(
         return None;
     }
 
-    with_shared_text_engine(|engine| {
-        let mut collector = PaintCollector::new(scale);
-        let mut cur_y = 2.0f32;
-        for (idx, blk) in top_blocks.iter().enumerate() {
-            if idx > 0 {
-                cur_y += 4.0;
-            }
-            let (_, bh) = layout_and_collect_block(
-                engine,
-                blk,
-                0.0,
-                cur_y,
-                avail_w,
-                &mut collector,
-                false,
+    let mut collector = PaintCollector::new(scale);
+    let mut layout_cache = LayoutMeasureCache::default();
+    let mut cur_y = 2.0f32;
+    for (idx, blk) in top_blocks.iter().enumerate() {
+        if idx > 0 {
+            cur_y += 4.0;
+        }
+        let (_, bh) = layout_and_collect_block(
+            engine,
+            blk,
+            0.0,
+            cur_y,
+            avail_w,
+            &mut collector,
+            false,
+            &mut layout_cache,
+        );
+        cur_y += bh;
+    }
+    let logical_w = avail_w.ceil().clamp(1.0, 1400.0);
+    let max_logical_h = (16384.0 / scale).floor().min(8192.0);
+    let logical_h = (cur_y + 2.0).ceil().clamp(18.0, max_logical_h);
+    let pw = (logical_w * scale).ceil().clamp(1.0, 4200.0) as u32;
+    let ph = (logical_h * scale).ceil().clamp(1.0, 16384.0) as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+
+    for &(rx, ry, rw, rh, col) in &collector.rects {
+        if let Some(rect) = tiny_skia::Rect::from_xywh(
+            (rx * scale).round(),
+            (ry * scale).round(),
+            (rw * scale).round().max(1.0),
+            (rh * scale).round().max(1.0),
+        ) {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(col[0], col[1], col[2], col[3]);
+            pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
+        }
+    }
+
+    let img_paint = tiny_skia::PixmapPaint {
+        opacity: 1.0,
+        blend_mode: tiny_skia::BlendMode::SourceOver,
+        quality: tiny_skia::FilterQuality::Bilinear,
+    };
+    for img in &collector.images {
+        let src_w = img.pixmap.width().max(1) as f32;
+        let src_h = img.pixmap.height().max(1) as f32;
+        if (src_w - img.phys_w).abs() <= 0.75 && (src_h - img.phys_h).abs() <= 0.75 {
+            pixmap.draw_pixmap(
+                img.phys_x.round() as i32,
+                img.phys_y.round() as i32,
+                (*img.pixmap).as_ref(),
+                &img_paint,
+                tiny_skia::Transform::default(),
+                None,
             );
-            cur_y += bh;
+        } else {
+            let sx = img.phys_w / src_w;
+            let sy = img.phys_h / src_h;
+            let xform =
+                tiny_skia::Transform::from_scale(sx, sy).post_translate(img.phys_x, img.phys_y);
+            pixmap.draw_pixmap(0, 0, (*img.pixmap).as_ref(), &img_paint, xform, None);
         }
-        let logical_w = avail_w.ceil().clamp(1.0, 1400.0);
-        let max_logical_h = (16384.0 / scale).floor().min(8192.0);
-        let logical_h = (cur_y + 2.0).ceil().clamp(18.0, max_logical_h);
-        let pw = (logical_w * scale).ceil().clamp(1.0, 4200.0) as u32;
-        let ph = (logical_h * scale).ceil().clamp(1.0, 16384.0) as u32;
-        let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    }
 
-        for &(rx, ry, rw, rh, col) in &collector.rects {
-            if let Some(rect) = tiny_skia::Rect::from_xywh(
-                (rx * scale).round(),
-                (ry * scale).round(),
-                (rw * scale).round().max(1.0),
-                (rh * scale).round().max(1.0),
-            ) {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color_rgba8(col[0], col[1], col[2], col[3]);
-                pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
-            }
-        }
+    let card_bg = theme.resolve_dict_style(dict_name).card_bg;
+    let backdrop_rgb = composite_rgb_over_opaque(card_bg, theme.popup_bg);
+    for mg in &collector.mask_glyphs {
+        blit_alpha_glyph(&mut pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, backdrop_rgb);
+    }
 
-        let img_paint = tiny_skia::PixmapPaint {
-            opacity: 1.0,
-            blend_mode: tiny_skia::BlendMode::SourceOver,
-            quality: tiny_skia::FilterQuality::Bilinear,
-        };
-        for img in &collector.images {
-            let src_w = img.pixmap.width().max(1) as f32;
-            let src_h = img.pixmap.height().max(1) as f32;
-            if (src_w - img.phys_w).abs() <= 0.75 && (src_h - img.phys_h).abs() <= 0.75 {
-                pixmap.draw_pixmap(
-                    img.phys_x.round() as i32,
-                    img.phys_y.round() as i32,
-                    (*img.pixmap).as_ref(),
-                    &img_paint,
-                    tiny_skia::Transform::default(),
-                    None,
-                );
-            } else {
-                let sx = img.phys_w / src_w;
-                let sy = img.phys_h / src_h;
-                let xform = tiny_skia::Transform::from_scale(sx, sy)
-                    .post_translate(img.phys_x, img.phys_y);
-                pixmap.draw_pixmap(0, 0, (*img.pixmap).as_ref(), &img_paint, xform, None);
-            }
-        }
+    while collector
+        .selectable_chars
+        .last()
+        .is_some_and(|c| c.ch == '\n')
+    {
+        collector.selectable_chars.pop();
+    }
+    let plain_text: String = collector.selectable_chars.iter().map(|c| c.ch).collect();
+    let line_bottoms = compute_visual_line_bottoms(&collector.line_bounds);
 
-        let card_bg = theme.resolve_dict_style(dict_name).card_bg;
-        let backdrop_rgb = composite_rgb_over_opaque(card_bg, theme.popup_bg);
-        for mg in &collector.mask_glyphs {
-            blit_alpha_glyph(&mut pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, backdrop_rgb);
-        }
-
-        while collector
-            .selectable_chars
-            .last()
-            .is_some_and(|c| c.ch == '\n')
-        {
-            collector.selectable_chars.pop();
-        }
-        let plain_text: String = collector.selectable_chars.iter().map(|c| c.ch).collect();
-        let line_bottoms = compute_visual_line_bottoms(&collector.line_bounds);
-
-        Some(RenderedGlossaryDoc {
-            width_px: pw as f32 / scale,
-            height_px: ph as f32 / scale,
-            image: pixmap_to_slint_image(&pixmap),
-            hit_zones: collector.hit_zones,
-            selectable_chars: collector.selectable_chars,
-            line_bottoms,
-            plain_text,
-        })
+    Some(RasterizedGlossaryDoc {
+        width_px: pw as f32 / scale,
+        height_px: ph as f32 / scale,
+        pixels: pixmap_to_pixel_buffer(&pixmap),
+        hit_zones: collector.hit_zones,
+        selectable_chars: collector.selectable_chars,
+        line_bottoms,
+        plain_text,
     })
+}
+
+/// Build and rasterize a rich structured-content glossary entry directly from a pre-parsed
+/// `serde_json::Value` (when provided by the caller) or a single `serde_json::from_str` pass.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_structured_glossary_entry_with_value_scaled(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    parsed_value: Option<&JsonValue>,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+    theme: &PopupCssTheme,
+    render_scale: f32,
+) -> Option<RenderedGlossaryDoc> {
+    with_shared_text_engine(|engine| {
+        rasterize_structured_glossary_entry_with_engine(
+            engine,
+            raw_glossary,
+            fallback_glossary,
+            parsed_value,
+            stylesheet,
+            detail_states,
+            legacy_style,
+            dict_resource_dirs,
+            dic_id,
+            dict_name,
+            avail_width_px,
+            selected,
+            theme,
+            render_scale,
+        )
+    })
+    .map(RasterizedGlossaryDoc::into_rendered_doc)
 }
 
 /// Build and rasterize a rich structured-content glossary entry into a `RenderedGlossaryDoc`

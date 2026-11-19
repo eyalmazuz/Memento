@@ -515,22 +515,11 @@ impl Config {
 
     /// Prepends a recent file, de-duplicating against the existing list and
     /// trimming the tail beyond [`models::RECENT_FILES_MAX_SIZE`].
-    ///
-    /// The plan comes from the certified
-    /// [`models::plan_recent_files_add_with_limit`] model (UTF-16 based, so
-    /// the comparison behaves exactly like the C++ `QString` comparison);
-    /// this method only translates between the [`Value::Strings`] storage
-    /// and the model's UTF-16 views.
     pub fn recent_files_add(&mut self, value: &str) -> ConfigResult<bool> {
         let items = self.recent_files()?;
-        let new_val: Vec<u16> = value.encode_utf16().collect();
-        let item_views: Vec<Vec<u16>> = items
-            .iter()
-            .map(|item| item.encode_utf16().collect())
-            .collect();
         let surviving = models::plan_recent_files_add_with_limit(
-            &item_views,
-            &new_val,
+            &items,
+            value,
             models::RECENT_FILES_MAX_SIZE,
         );
         let mut next = Vec::with_capacity(surviving.len() + 1);

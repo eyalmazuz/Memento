@@ -1,21 +1,211 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-use slint::{ComponentHandle, VecModel};
+use slint::{ComponentHandle, Model as _, VecModel};
 
 use crate::ui::glossary_render::{
     compute_collapsible_metrics, quantize_glossary_render_scale,
     render_structured_glossary_entry_with_value_scaled, GlossaryZoneAction, RenderedGlossaryDoc,
 };
+use crate::ui::popup_model::active_rich_bridge_for_app;
 use crate::ui::subtitle_layout::is_japanese_lookup_char;
-use crate::ui::{MementoApp, PopupBridge, RichGlossaryRender};
+use crate::ui::{DictResult, MementoApp, PopupBridge, RichGlossaryRender};
 
 use super::state::{
-    build_selection_rects_for_cells, GlossaryDocCacheKey, GlossarySelectionState,
+    build_selection_rects_for_cells, GlossaryDocCacheKey, GlossaryPreRenderBatch,
+    GlossaryPreRenderItem, GlossarySelectionState, GLOSSARY_PRERENDER_MAX_ROWS,
 };
 use super::RichUiBridge;
 
+pub(super) fn format_details_sig(detail_states: &HashMap<String, bool>) -> String {
+    if detail_states.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<_> = detail_states.iter().collect();
+    pairs.sort_by_key(|(k, _)| *k);
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}:{};", u8::from(*v)))
+        .collect()
+}
+
+fn popup_width_and_cols(app: &MementoApp) -> (f32, bool, f32, f32) {
+    let pb = app.global::<PopupBridge>();
+    let live_w = app.get_popup_width();
+    let popup_w = if live_w > 1.0 {
+        live_w
+    } else {
+        let css_w = pb.get_css_popup_width();
+        if css_w > 0.0 {
+            css_w
+        } else {
+            app.get_popup_configured_width().max(320.0)
+        }
+    };
+    let use_two_cols = pb.get_css_definition_columns() >= 2
+        && popup_w >= pb.get_css_definition_columns_min_width();
+    let popup_pad = pb.get_css_popup_padding().max(0.0);
+    let col_gap = pb.get_css_definition_gap().round().max(0.0);
+    (popup_w, use_two_cols, popup_pad, col_gap)
+}
+
+pub(super) fn drain_glossary_prerender_results_for_app(app: &MementoApp) -> bool {
+    if let Some(br) = active_rich_bridge_for_app(app) {
+        br.drain_glossary_prerender_results(app)
+    } else {
+        false
+    }
+}
+
 impl RichUiBridge {
+    pub(super) fn dispatch_glossary_prerender(&self, app: &MementoApp, rows: &[DictResult]) {
+        let Some(ref tx) = self.glossary_render_tx else {
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+
+        let window_scale = app.window().scale_factor();
+        let (render_scale, scale_quarter) = quantize_glossary_render_scale(window_scale);
+        let (popup_w, use_two_cols, popup_pad, col_gap) = popup_width_and_cols(app);
+        let popup_w_rounded = popup_w.round() as i32;
+        let grid_w = (popup_w - popup_pad * 2.0 - 12.0).max(160.0);
+        let col_w = ((grid_w - col_gap) * 0.5).floor().max(120.0);
+        let solo_w = grid_w.floor().max(120.0);
+
+        let epoch = self.glossary_render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let items: Vec<GlossaryPreRenderItem> = {
+            let mut st_guard = self.state.borrow_mut();
+            let st = &mut *st_guard;
+            let rich_epoch = st.rich_epoch;
+            let res_dirs = st.dict_resource_dirs.clone();
+            let theme = st.effective_popup_theme();
+            let legacy_style = st.settings.glossary_style;
+            let observed_solo = st
+                .last_observed_solo_width_px
+                .filter(|&(pw, two, _)| pw == popup_w_rounded && two == use_two_cols)
+                .map(|(_, _, bw)| bw);
+            let observed_col = st
+                .last_observed_col_width_px
+                .filter(|&(pw, two, _)| pw == popup_w_rounded && two == use_two_cols)
+                .map(|(_, _, bw)| bw);
+
+            let mut out = Vec::with_capacity(GLOSSARY_PRERENDER_MAX_ROWS);
+            let mut i = 0usize;
+            while i < rows.len() && out.len() < GLOSSARY_PRERENDER_MAX_ROWS {
+                let row = &rows[i];
+                if row.collapsed && !row.term_start {
+                    i += 1;
+                    continue;
+                }
+                if row.is_kanji {
+                    i += 1;
+                    continue;
+                }
+                let is_solo = !use_two_cols || (row.term_start && row.term_end);
+                let row_index = row.index;
+                let Some(extras) = st.row_extras.get(&row_index) else {
+                    i += 1;
+                    continue;
+                };
+                let Some(hit) = extras.hit.as_ref() else {
+                    i += 1;
+                    continue;
+                };
+                if hit.is_kanji {
+                    i += 1;
+                    continue;
+                }
+                let card_pad = theme.resolve_dict_style(&hit.dict_name).card_padding.max(0.0);
+                let bucket_w = if is_solo {
+                    observed_solo.unwrap_or_else(|| {
+                        (((solo_w - card_pad * 2.0).max(120.0) / 4.0).floor() as i32 * 4).max(120)
+                    })
+                } else {
+                    observed_col.unwrap_or_else(|| {
+                        (((col_w - card_pad * 2.0).max(120.0) / 4.0).floor() as i32 * 4).max(120)
+                    })
+                };
+                let details_sig = format_details_sig(&extras.detail_states);
+                let cache_key = GlossaryDocCacheKey {
+                    row_index,
+                    width_px: bucket_w,
+                    selected: row.selected,
+                    details_sig,
+                    rich_epoch,
+                    scale_quarter,
+                };
+                if st.glossary_cache.contains_key(&cache_key) {
+                    i += 1;
+                    continue;
+                }
+                let raw_glossary = hit.raw_glossary.clone();
+                let fallback_glossary = hit.glossary.clone();
+                let parsed_glossary = extras.parsed_glossary.clone();
+                let detail_states = extras.detail_states.clone();
+                let dic_id = hit.dictionary_id;
+                let dict_name = hit.dict_name.clone();
+                let sheet = st
+                    .stylesheets
+                    .get_for_dictionary(&res_dirs, dic_id, &dict_name);
+                out.push(GlossaryPreRenderItem {
+                    cache_key,
+                    raw_glossary,
+                    fallback_glossary,
+                    parsed_glossary,
+                    stylesheet: sheet,
+                    detail_states,
+                    legacy_style,
+                    dict_resource_dirs: res_dirs.clone(),
+                    dic_id,
+                    dict_name,
+                    avail_width_px: bucket_w as f32,
+                    selected: row.selected,
+                    theme: theme.clone(),
+                    render_scale,
+                });
+                i += 1;
+            }
+            out
+        };
+
+        if !items.is_empty() {
+            let _ = tx.send(GlossaryPreRenderBatch { epoch, items });
+        }
+    }
+
+    pub(super) fn drain_glossary_prerender_results(&self, app: &MementoApp) -> bool {
+        let mut completed = Vec::new();
+        if let Ok(guard) = self.glossary_render_res_rx.lock() {
+            while let Ok(item) = guard.try_recv() {
+                completed.push(item);
+            }
+        }
+        if completed.is_empty() {
+            return false;
+        }
+        if !app.get_dict_open() {
+            return false;
+        }
+        let current_epoch = self.glossary_render_epoch.load(Ordering::Acquire);
+        let mut st = self.state.borrow_mut();
+        let mut inserted_any = false;
+        for done in completed {
+            if done.epoch != current_epoch || done.cache_key.rich_epoch != st.rich_epoch {
+                continue;
+            }
+            if st.glossary_cache.contains_key(&done.cache_key) {
+                continue;
+            }
+            let rendered = done.doc.into_rendered_doc();
+            st.glossary_cache.insert(done.cache_key, rendered);
+            inserted_any = true;
+        }
+        inserted_any
+    }
+
     pub(super) fn render_or_get_glossary_at_depth(
         &self,
         depth: i32,
@@ -23,14 +213,39 @@ impl RichUiBridge {
         width_px: f32,
         selected: bool,
     ) -> Option<RenderedGlossaryDoc> {
+        self.cancel_idle_memory_shrink();
         let bucket_w = ((width_px.max(120.0) / 4.0).floor() as i32 * 4).max(120);
-        let window_scale = self
-            .app_weak
-            .upgrade()
+        let app_opt = self.app_weak.upgrade();
+        let window_scale = app_opt
+            .as_ref()
             .map(|app| app.window().scale_factor())
             .unwrap_or(1.0);
         let (render_scale, scale_quarter) = quantize_glossary_render_scale(window_scale);
+        let observed_root_width = if depth == 0 {
+            app_opt.as_ref().map(|app| {
+                let (popup_w, use_two_cols, _, _) = popup_width_and_cols(app);
+                let pw_rounded = popup_w.round() as i32;
+                let is_solo = if !use_two_cols {
+                    true
+                } else {
+                    let full = app.get_dict_results();
+                    let zero_idx = row_index.saturating_sub(1) as usize;
+                    full.row_data(zero_idx)
+                        .is_some_and(|r| r.term_start && r.term_end)
+                };
+                (pw_rounded, use_two_cols, is_solo)
+            })
+        } else {
+            None
+        };
         let mut st = self.state.borrow_mut();
+        if let Some((pw_rounded, use_two_cols, is_solo)) = observed_root_width {
+            if is_solo {
+                st.last_observed_solo_width_px = Some((pw_rounded, use_two_cols, bucket_w));
+            } else {
+                st.last_observed_col_width_px = Some((pw_rounded, use_two_cols, bucket_w));
+            }
+        }
         let (hit, parsed_glossary, detail_states, epoch) = if depth == 0 {
             let extras = st.row_extras.get(&row_index)?;
             let hit = extras.hit.as_ref()?.clone();
@@ -54,12 +269,7 @@ impl RichUiBridge {
         if hit.is_kanji {
             return None;
         }
-        let mut pairs: Vec<_> = detail_states.iter().collect();
-        pairs.sort_by_key(|(k, _)| *k);
-        let details_sig: String = pairs
-            .into_iter()
-            .map(|(k, v)| format!("{k}:{};", u8::from(*v)))
-            .collect();
+        let details_sig = format_details_sig(&detail_states);
         let cache_key = GlossaryDocCacheKey {
             row_index,
             width_px: bucket_w,

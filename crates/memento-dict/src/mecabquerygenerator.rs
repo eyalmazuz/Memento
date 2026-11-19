@@ -1,6 +1,4 @@
-//! MeCab lattice graph expansion from `mecabquerygenerator.cpp`.
-//! Qt/MeCab retain tokenization, UTF-8 decoding and tagger lifetime; this
-//! module owns the memoized DAG alternatives and query concatenation.
+//! Pure UTF-8 MeCab lattice graph expansion and Yomitan `rule_mask` candidate generation.
 
 use std::collections::HashSet;
 
@@ -8,23 +6,7 @@ use crate::deconjugationquerygenerator::{
     RULE_ADJ_I, RULE_V1, RULE_V5, RULE_VK, RULE_VS, RULE_VZ,
 };
 
-#[derive(Clone, Copy)]
-pub struct Node<'a> {
-    pub deconj: &'a [u16],
-    pub surface: &'a [u16],
-    pub surface_clean: &'a [u16],
-    pub next: Option<usize>,
-    pub bnext: Option<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct MeCabQuery {
-    pub deconj: Vec<u16>,
-    pub surface: Vec<u16>,
-    pub surface_clean: Vec<u16>,
-}
-
-/// Borrowed morphological token view used to build a MeCab lattice [`Node`] DAG
+/// Borrowed morphological token view used to build a MeCab lattice DAG
 /// and derive `rule_mask`-safe dictionary lookup candidates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenSpan<'a> {
@@ -36,17 +18,28 @@ pub struct TokenSpan<'a> {
     pub conj_type: &'a str,
 }
 
-/// A UTF-8 / UTF-16 MeCab lookup candidate paired with its matched surface length
+/// A UTF-8 MeCab lookup candidate paired with its matched UTF-16 surface length
 /// and Yomitan POS `rule_mask`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedMecabCandidate {
     pub deconj: String,
-    pub deconj_u16: Vec<u16>,
     pub surface: String,
     pub surface_clean: String,
     pub surface_u16_len: usize,
     pub rule_mask: u8,
     pub span_tokens: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LatticeNode<'a> {
+    deconj: &'a str,
+    deconj_u16_len: usize,
+    surface: &'a str,
+    surface_u16_len: usize,
+    surface_clean: &'a str,
+    surface_clean_u16_len: usize,
+    next: Option<usize>,
+    bnext: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,14 +55,23 @@ const MAX_QUERIES_PER_NODE: usize = 128;
 /// Maximum UTF-16 length of a concatenated compound MeCab lookup candidate.
 const MAX_COMPOUND_UTF16_UNITS: usize = 24;
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct MeCabQueryKey {
+    deconj: String,
+    surface: String,
+    surface_clean: String,
+}
+
 #[derive(Clone)]
 struct ExpandedQuery {
-    query: MeCabQuery,
+    key: MeCabQueryKey,
+    deconj_u16_len: usize,
+    surface_u16_len: usize,
     span_tokens: usize,
 }
 
 fn expand_memoized(
-    nodes: &[Node<'_>],
+    nodes: &[LatticeNode<'_>],
     start_index: usize,
     state: &mut [VisitState],
     memo: &mut [Vec<ExpandedQuery>],
@@ -114,59 +116,59 @@ fn expand_memoized(
         let node = nodes[idx];
         let mut queries: Vec<ExpandedQuery> = Vec::new();
 
-        if node.deconj != ['*' as u16] {
+        if node.deconj != "*" {
             queries.push(ExpandedQuery {
-                query: MeCabQuery {
-                    deconj: node.deconj.to_vec(),
-                    surface: node.surface.to_vec(),
-                    surface_clean: node.surface_clean.to_vec(),
+                key: MeCabQueryKey {
+                    deconj: node.deconj.to_owned(),
+                    surface: node.surface.to_owned(),
+                    surface_clean: node.surface_clean.to_owned(),
                 },
+                deconj_u16_len: node.deconj_u16_len,
+                surface_u16_len: node.surface_u16_len,
                 span_tokens: 1,
             });
         }
 
-        // Skip expanding `next` if a later sibling in `bnext` already expanded the
-        // exact same `(next_index, surface, surface_clean)` prefix, or deduplicate at end.
         if let Some(next_index) = node.next {
             for suffix in &memo[next_index] {
                 if queries.len() >= MAX_QUERIES_PER_NODE {
                     break;
                 }
-                if node.surface_clean.len() + suffix.query.deconj.len() > MAX_COMPOUND_UTF16_UNITS
-                {
+                let combined_deconj_u16 = node.surface_clean_u16_len + suffix.deconj_u16_len;
+                if combined_deconj_u16 > MAX_COMPOUND_UTF16_UNITS {
                     continue;
                 }
-                let mut deconj =
-                    Vec::with_capacity(node.surface_clean.len() + suffix.query.deconj.len());
-                deconj.extend_from_slice(node.surface_clean);
-                deconj.extend_from_slice(&suffix.query.deconj);
-                let mut surface =
-                    Vec::with_capacity(node.surface.len() + suffix.query.surface.len());
-                surface.extend_from_slice(node.surface);
-                surface.extend_from_slice(&suffix.query.surface);
+                let mut deconj = String::with_capacity(node.surface_clean.len() + suffix.key.deconj.len());
+                deconj.push_str(node.surface_clean);
+                deconj.push_str(&suffix.key.deconj);
+                let mut surface = String::with_capacity(node.surface.len() + suffix.key.surface.len());
+                surface.push_str(node.surface);
+                surface.push_str(&suffix.key.surface);
                 let mut clean =
-                    Vec::with_capacity(node.surface_clean.len() + suffix.query.surface_clean.len());
-                clean.extend_from_slice(node.surface_clean);
-                clean.extend_from_slice(&suffix.query.surface_clean);
+                    String::with_capacity(node.surface_clean.len() + suffix.key.surface_clean.len());
+                clean.push_str(node.surface_clean);
+                clean.push_str(&suffix.key.surface_clean);
                 queries.push(ExpandedQuery {
-                    query: MeCabQuery {
+                    key: MeCabQueryKey {
                         deconj,
                         surface,
                         surface_clean: clean,
                     },
+                    deconj_u16_len: combined_deconj_u16,
+                    surface_u16_len: node.surface_u16_len + suffix.surface_u16_len,
                     span_tokens: 1 + suffix.span_tokens,
                 });
             }
         }
 
         if let Some(bnext_index) = node.bnext {
-            let mut seen: HashSet<MeCabQuery> =
-                queries.iter().map(|eq| eq.query.clone()).collect();
+            let mut seen: HashSet<MeCabQueryKey> =
+                queries.iter().map(|eq| eq.key.clone()).collect();
             for sibling in &memo[bnext_index] {
                 if queries.len() >= MAX_QUERIES_PER_NODE {
                     break;
                 }
-                if seen.insert(sibling.query.clone()) {
+                if seen.insert(sibling.key.clone()) {
                     queries.push(sibling.clone());
                 }
             }
@@ -180,7 +182,7 @@ fn expand_memoized(
 }
 
 fn generate_queries_with_spans(
-    nodes: &[Node<'_>],
+    nodes: &[LatticeNode<'_>],
     start: Option<usize>,
 ) -> Option<Vec<ExpandedQuery>> {
     let Some(start_index) = start else {
@@ -193,18 +195,6 @@ fn generate_queries_with_spans(
     let mut memo = vec![Vec::new(); nodes.len()];
     expand_memoized(nodes, start_index, &mut state, &mut memo)?;
     Some(std::mem::take(&mut memo[start_index]))
-}
-
-/// Returns `None` if the caller supplied invalid indexes or cyclic links.
-/// Real MeCab lattices are DAGs; memoization prevents exponential blowup on
-/// reconvergent multi-morpheme lattices.
-pub fn generate_queries(nodes: &[Node<'_>], start: Option<usize>) -> Option<Vec<MeCabQuery>> {
-    Some(
-        generate_queries_with_spans(nodes, start)?
-            .into_iter()
-            .map(|eq| eq.query)
-            .collect(),
-    )
 }
 
 fn is_single_kana_only(s: &str) -> bool {
@@ -256,8 +246,8 @@ pub fn pos_rule_mask(pos: &str, conj_type: &str, base_form: &str) -> u8 {
     }
 }
 
-/// Builds a [`Node`] DAG from sequential [`TokenSpan`] morphemes (using `bnext` siblings for
-/// `orthBase` + `lemma` alternatives), expands compound/inflected spans via [`generate_queries`],
+/// Builds a UTF-8 lattice DAG from sequential [`TokenSpan`] morphemes (using `bnext` siblings for
+/// `orthBase` + `lemma` alternatives), expands compound/inflected spans without UTF-16 round-trips,
 /// and enforces strict single-kana particle & `rule_mask` safety.
 #[must_use]
 pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<GeneratedMecabCandidate> {
@@ -265,19 +255,12 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
         return Vec::new();
     }
 
-    struct EncodedStage {
-        surface_u16: Vec<u16>,
-        surface_clean_u16: Vec<u16>,
-        deconj_variants: Vec<Vec<u16>>,
-    }
-
     let total_tokens = tokens.len();
-    let mut stages: Vec<EncodedStage> = Vec::with_capacity(total_tokens);
+    let mut stage_variants: Vec<(&str, Option<&str>)> = Vec::with_capacity(total_tokens);
+    let mut stage_start_idx: Vec<usize> = Vec::with_capacity(total_tokens);
+    let mut total_nodes = 0usize;
 
     for tok in tokens {
-        let surface_u16: Vec<u16> = tok.surface.encode_utf16().collect();
-        let surface_clean_u16: Vec<u16> = tok.surface_clean.encode_utf16().collect();
-
         let is_non_inflecting = matches!(tok.pos, "助詞" | "記号" | "補助記号" | "空白");
         let single_kana = is_single_kana_only(tok.surface_clean);
         let suppress_base_form = is_non_inflecting
@@ -286,55 +269,55 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
                     || !matches!(tok.pos, "動詞" | "形容詞")
                     || tok.conj_type.starts_with("文語")));
 
-        let mut deconj_variants: Vec<Vec<u16>> = Vec::with_capacity(2);
-        if suppress_base_form {
-            if tok.surface_clean.is_empty() {
-                deconj_variants.push(vec![b'*' as u16]);
-            } else {
-                deconj_variants.push(surface_clean_u16.clone());
-            }
-        } else {
-            let primary = if tok.lemma.is_empty() {
+        let (primary, secondary) = if suppress_base_form {
+            let p = if tok.surface_clean.is_empty() {
                 "*"
             } else {
-                tok.lemma
+                tok.surface_clean
             };
-            deconj_variants.push(primary.encode_utf16().collect());
-            if let Some(alt) = tok.alt_lemma {
-                if !alt.is_empty() && alt != "*" && alt != primary {
-                    deconj_variants.push(alt.encode_utf16().collect());
-                }
-            }
-        }
+            (p, None)
+        } else {
+            let p = if tok.lemma.is_empty() { "*" } else { tok.lemma };
+            let s = tok
+                .alt_lemma
+                .filter(|&alt| !alt.is_empty() && alt != "*" && alt != p);
+            (p, s)
+        };
 
-        stages.push(EncodedStage {
-            surface_u16,
-            surface_clean_u16,
-            deconj_variants,
-        });
-    }
-
-    // Compute starting node index per token stage so `next` and `bnext` wire into a flat `Vec<Node>`.
-    let mut stage_start_idx: Vec<usize> = Vec::with_capacity(total_tokens);
-    let mut total_nodes = 0usize;
-    for stage in &stages {
         stage_start_idx.push(total_nodes);
-        total_nodes += stage.deconj_variants.len();
+        total_nodes += 1 + usize::from(secondary.is_some());
+        stage_variants.push((primary, secondary));
     }
 
-    let mut nodes: Vec<Node<'_>> = Vec::with_capacity(total_nodes);
-    for (stage_idx, stage) in stages.iter().enumerate() {
+    let mut nodes: Vec<LatticeNode<'_>> = Vec::with_capacity(total_nodes);
+    for (stage_idx, (tok, &(primary, secondary))) in
+        tokens.iter().zip(stage_variants.iter()).enumerate()
+    {
         let next = stage_start_idx.get(stage_idx + 1).copied();
         let base_node_idx = stage_start_idx[stage_idx];
-        let variant_count = stage.deconj_variants.len();
-        for (v_idx, deconj_u16) in stage.deconj_variants.iter().enumerate() {
-            let bnext = (v_idx + 1 < variant_count).then_some(base_node_idx + v_idx + 1);
-            nodes.push(Node {
-                deconj: deconj_u16.as_slice(),
-                surface: stage.surface_u16.as_slice(),
-                surface_clean: stage.surface_clean_u16.as_slice(),
+        let surface_u16_len = tok.surface.encode_utf16().count();
+        let surface_clean_u16_len = tok.surface_clean.encode_utf16().count();
+
+        nodes.push(LatticeNode {
+            deconj: primary,
+            deconj_u16_len: primary.encode_utf16().count(),
+            surface: tok.surface,
+            surface_u16_len,
+            surface_clean: tok.surface_clean,
+            surface_clean_u16_len,
+            next,
+            bnext: secondary.map(|_| base_node_idx + 1),
+        });
+        if let Some(alt) = secondary {
+            nodes.push(LatticeNode {
+                deconj: alt,
+                deconj_u16_len: alt.encode_utf16().count(),
+                surface: tok.surface,
+                surface_u16_len,
+                surface_clean: tok.surface_clean,
+                surface_clean_u16_len,
                 next,
-                bnext,
+                bnext: None,
             });
         }
     }
@@ -345,29 +328,25 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
 
     let mut out = Vec::with_capacity(raw_queries.len());
     for ExpandedQuery {
-        query: mq,
+        key,
+        surface_u16_len,
         span_tokens,
+        ..
     } in raw_queries
     {
-        if mq.deconj.is_empty() || mq.surface.is_empty() {
+        if key.deconj.is_empty() || key.surface.is_empty() {
             continue;
         }
-        let surface_u16_len = mq.surface.len();
-        let deconj = String::from_utf16_lossy(&mq.deconj);
-        let surface = String::from_utf16_lossy(&mq.surface);
-        let surface_clean = String::from_utf16_lossy(&mq.surface_clean);
-
-        let rule_mask = if span_tokens == 1 && mq.deconj != mq.surface_clean {
-            pos_rule_mask(tokens[0].pos, tokens[0].conj_type, &deconj)
+        let rule_mask = if span_tokens == 1 && key.deconj != key.surface_clean {
+            pos_rule_mask(tokens[0].pos, tokens[0].conj_type, &key.deconj)
         } else {
             0
         };
 
         out.push(GeneratedMecabCandidate {
-            deconj,
-            deconj_u16: mq.deconj,
-            surface,
-            surface_clean,
+            deconj: key.deconj,
+            surface: key.surface,
+            surface_clean: key.surface_clean,
             surface_u16_len,
             rule_mask,
             span_tokens,
@@ -381,112 +360,73 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
 mod tests {
     use super::*;
 
+    fn node<'a>(
+        deconj: &'a str,
+        surface: &'a str,
+        surface_clean: &'a str,
+        next: Option<usize>,
+        bnext: Option<usize>,
+    ) -> LatticeNode<'a> {
+        LatticeNode {
+            deconj,
+            deconj_u16_len: deconj.encode_utf16().count(),
+            surface,
+            surface_u16_len: surface.encode_utf16().count(),
+            surface_clean,
+            surface_clean_u16_len: surface_clean.encode_utf16().count(),
+            next,
+            bnext,
+        }
+    }
+
     #[test]
     fn keeps_alternatives_and_prepends_clean_and_raw_surfaces() {
         let nodes = [
-            Node {
-                deconj: &[0x98df],
-                surface: &[0x20, 0x98df],
-                surface_clean: &[0x98df],
-                next: Some(2),
-                bnext: Some(1),
-            },
-            Node {
-                deconj: &['*' as u16],
-                surface: &[0x5225],
-                surface_clean: &[0x5225],
-                next: Some(2),
-                bnext: None,
-            },
-            Node {
-                deconj: &[0x3079, 0x308b],
-                surface: &[0x3079],
-                surface_clean: &[0x3079],
-                next: None,
-                bnext: None,
-            },
+            node("食", " 食", "食", Some(2), Some(1)),
+            node("*", "別", "別", Some(2), None),
+            node("べる", "べ", "べ", None, None),
         ];
-        let rows = generate_queries(&nodes, Some(0)).unwrap();
+        let rows = generate_queries_with_spans(&nodes, Some(0)).unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].deconj, vec![0x98df]);
-        assert_eq!(rows[1].deconj, vec![0x98df, 0x3079, 0x308b]);
-        assert_eq!(rows[1].surface, vec![0x20, 0x98df, 0x3079]);
-        assert_eq!(rows[2].deconj, vec![0x5225, 0x3079, 0x308b]);
+        assert_eq!(rows[0].key.deconj, "食");
+        assert_eq!(rows[1].key.deconj, "食べる");
+        assert_eq!(rows[1].key.surface, " 食べ");
+        assert_eq!(rows[2].key.deconj, "別べる");
     }
 
     #[test]
     fn detects_cycles_safely() {
         let next_cycle = [
-            Node {
-                deconj: &[0x98df],
-                surface: &[0x98df],
-                surface_clean: &[0x98df],
-                next: Some(1),
-                bnext: None,
-            },
-            Node {
-                deconj: &[0x3079],
-                surface: &[0x3079],
-                surface_clean: &[0x3079],
-                next: Some(0),
-                bnext: None,
-            },
+            node("食", "食", "食", Some(1), None),
+            node("べ", "べ", "べ", Some(0), None),
         ];
-        assert!(generate_queries(&next_cycle, Some(0)).is_none());
+        assert!(generate_queries_with_spans(&next_cycle, Some(0)).is_none());
 
         let bnext_cycle = [
-            Node {
-                deconj: &[0x98df],
-                surface: &[0x98df],
-                surface_clean: &[0x98df],
-                next: None,
-                bnext: Some(1),
-            },
-            Node {
-                deconj: &[0x3079],
-                surface: &[0x3079],
-                surface_clean: &[0x3079],
-                next: None,
-                bnext: Some(0),
-            },
+            node("食", "食", "食", None, Some(1)),
+            node("べ", "べ", "べ", None, Some(0)),
         ];
-        assert!(generate_queries(&bnext_cycle, Some(0)).is_none());
+        assert!(generate_queries_with_spans(&bnext_cycle, Some(0)).is_none());
     }
 
     #[test]
     fn empty_or_missing_start_returns_empty() {
-        assert_eq!(generate_queries(&[], None).unwrap(), vec![]);
-        assert!(generate_queries(&[], Some(0)).is_none());
+        assert!(generate_queries_with_spans(&[], None).unwrap().is_empty());
+        assert!(generate_queries_with_spans(&[], Some(0)).is_none());
     }
 
     #[test]
     fn memoizes_deep_diamond_lattice_without_exponential_blowup() {
         // 64-stage reconvergent lattice (4^64 = 2^128 paths without memoization).
         let stages = 64usize;
-        let surf_a = [0x3042u16]; // あ
-        let surf_b = [0x3044u16]; // い
-        let deconj_1 = [0x3042u16, 0x308bu16];
-        let deconj_2 = [0x3044u16, 0x308bu16];
         let mut nodes = Vec::with_capacity(stages * 2);
         for s in 0..stages {
             let next = (s + 1 < stages).then_some((s + 1) * 2);
-            nodes.push(Node {
-                deconj: &deconj_1,
-                surface: &surf_a,
-                surface_clean: &surf_a,
-                next,
-                bnext: Some(s * 2 + 1),
-            });
-            nodes.push(Node {
-                deconj: &deconj_2,
-                surface: &surf_b,
-                surface_clean: &surf_b,
-                next,
-                bnext: None,
-            });
+            nodes.push(node("ある", "あ", "あ", next, Some(s * 2 + 1)));
+            nodes.push(node("いる", "い", "い", next, None));
         }
         let started = std::time::Instant::now();
-        let rows = generate_queries(&nodes, Some(0)).expect("DAG should succeed");
+        let rows = generate_queries_with_spans(&nodes, Some(0)).expect("DAG should succeed");
         assert!(!rows.is_empty());
         assert!(started.elapsed().as_millis() < 200);
     }

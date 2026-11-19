@@ -33,6 +33,7 @@ impl RichUiBridge {
         bridge.set_hovered_global_char_index(-1);
         bridge.set_hovered_query("".into());
         bridge.set_highlight_revision(bridge.get_highlight_revision().wrapping_add(1));
+        self.schedule_idle_memory_shrink_if_closed(app);
     }
 
     pub(super) fn resolve_subtitle_cluster(

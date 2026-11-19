@@ -2,6 +2,7 @@
 //! opening, URL handling, BOM detection and text-mode newline conversion stay
 //! at the Qt boundary; parser decisions and subtitle values live here.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use crate::subtitleentry::SubtitleEntry;
@@ -68,9 +69,12 @@ fn update_ass_drawing_mode(block: &str, in_drawing: &mut bool) {
 
 /// Strip `{...}` ASS override blocks, omit vector drawing payloads while `\p<scale>` (`scale > 0`)
 /// is active, and replace `\n`/`\N` with `'\n'`.
-fn strip_ass_formatting(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+fn strip_ass_formatting(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
+    if !bytes.iter().any(|&b| b == b'{' || b == b'\\') {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut in_drawing = false;
     while i < bytes.len() {
@@ -106,7 +110,7 @@ fn strip_ass_formatting(input: &str) -> String {
         }
         out.push_str(&input[start..i]);
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Match an SRT style tag at the start of `bytes`:
@@ -162,9 +166,12 @@ fn match_srt_tag(bytes: &[u8]) -> Option<usize> {
     }
 }
 
-fn strip_srt_style(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+fn strip_srt_style(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
+    if !bytes.iter().any(|&b| b == b'<' || b == b'{') {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
         if let Some(skip) = match_srt_tag(&bytes[i..]) {
@@ -178,13 +185,16 @@ fn strip_srt_style(input: &str) -> String {
         }
         out.push_str(&input[start..i]);
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Strip `<...>` WebVTT cue tags.
-fn strip_vtt_tags(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+fn strip_vtt_tags(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
+    if !bytes.contains(&b'<') {
+        return Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'<' {
@@ -200,7 +210,7 @@ fn strip_vtt_tags(input: &str) -> String {
         }
         out.push_str(&input[start..i]);
     }
-    out
+    Cow::Owned(out)
 }
 
 fn is_pcre2_ascii_space(ch: char) -> bool {
@@ -211,10 +221,9 @@ fn is_blank_line(line: &str) -> bool {
     line.chars().all(is_pcre2_ascii_space)
 }
 
-fn split_pcre2_whitespace(text: &str) -> Vec<&str> {
-    text.split(is_pcre2_ascii_space)
-        .filter(|part| !part.is_empty())
-        .collect()
+fn first_three_pcre2_tokens(text: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
+    let mut iter = text.split(is_pcre2_ascii_space).filter(|part| !part.is_empty());
+    (iter.next(), iter.next(), iter.next())
 }
 
 // QString::toInt converts through Latin-1, trims ASCII whitespace, and treats
@@ -332,36 +341,41 @@ fn decode_malformed_utf16(text: &[u16]) -> String {
     decoded
 }
 
-fn restore_malformed_utf16(entries: &mut [SubtitleEntry]) {
-    for entry in entries {
-        let decoded = String::from_utf16(&entry.text).expect("parser text is valid UTF-16");
-        let mut units = Vec::with_capacity(entry.text.len());
-        let mut chars = decoded.chars();
-        while let Some(ch) = chars.next() {
-            if ch == SURROGATE_MARKER {
-                let escaped = chars.next().expect("encoded surrogate or literal marker");
-                if escaped == SURROGATE_MARKER {
-                    units.extend(SURROGATE_MARKER.encode_utf16(&mut [0; 2]).iter().copied());
-                } else {
-                    units.push(0xd800 + (escaped as u32 - 0xe000) as u16);
-                }
-            } else {
-                units.extend(ch.encode_utf16(&mut [0; 2]).iter().copied());
-            }
-        }
-        entry.text = units;
+fn encode_entry_text(text: &str, malformed: bool) -> Vec<u16> {
+    if !malformed {
+        return text.encode_utf16().collect();
     }
+    let mut units = Vec::with_capacity(text.len());
+    let mut buf = [0u16; 2];
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == SURROGATE_MARKER {
+            let escaped = chars.next().expect("encoded surrogate or literal marker");
+            if escaped == SURROGATE_MARKER {
+                units.extend_from_slice(SURROGATE_MARKER.encode_utf16(&mut buf));
+            } else {
+                units.push(0xd800 + (escaped as u32 - 0xe000) as u16);
+            }
+        } else {
+            units.extend_from_slice(ch.encode_utf16(&mut buf));
+        }
+    }
+    units
 }
 
 fn sorted_start(a: &SubtitleEntry, b: &SubtitleEntry) -> Ordering {
     a.start.partial_cmp(&b.start).unwrap_or(Ordering::Equal)
 }
 
-fn entry(text: &str, start: f64, end: f64) -> SubtitleEntry {
-    SubtitleEntry { text: text.encode_utf16().collect(), start, end }
+fn entry(text: &str, start: f64, end: f64, malformed: bool) -> SubtitleEntry {
+    SubtitleEntry {
+        text: encode_entry_text(text, malformed),
+        start,
+        end,
+    }
 }
 
-fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
+fn parse_ass(lines: &[&str], malformed: bool) -> Result<Vec<SubtitleEntry>, ()> {
     if lines.is_empty() {
         return Err(());
     }
@@ -410,6 +424,8 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         }
     }
     let (start_at, end_at, text_at) = (start_at.ok_or(())?, end_at.ok_or(())?, text_at.ok_or(())?);
+    let text_is_last = text_at + 1 == fields.len();
+    let mut columns: Vec<&str> = Vec::with_capacity(fields.len());
     let mut output = Vec::new();
     for line in &lines[format_idx + 1..] {
         let trimmed = line.trim_start();
@@ -422,16 +438,25 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         let dialogue = rest
             .strip_prefix(' ')
             .unwrap_or_else(|| rest.trim_start());
-        let columns: Vec<&str> = dialogue.split(',').collect();
+        columns.clear();
+        if text_is_last {
+            columns.extend(dialogue.splitn(fields.len(), ','));
+        } else {
+            columns.extend(dialogue.split(','));
+        }
         if columns.len() < fields.len() { continue; }
         let (Some(start), Some(end)) = (timecode_to_double(columns[start_at]), timecode_to_double(columns[end_at])) else {
             continue;
         };
         if start < 0.0 || end < start { continue; }
-        let joined = columns[text_at..].join(",");
-        let content = strip_ass_formatting(&joined);
+        let raw_text: Cow<'_, str> = if text_is_last {
+            Cow::Borrowed(columns[text_at])
+        } else {
+            Cow::Owned(columns[text_at..].join(","))
+        };
+        let content = strip_ass_formatting(&raw_text);
         if !content.trim().is_empty() {
-            output.push(entry(&content, start, end));
+            output.push(entry(&content, start, end, malformed));
         }
     }
     output.sort_unstable_by(sorted_start);
@@ -444,9 +469,10 @@ struct NumberedEntry {
     subtitle: SubtitleEntry,
 }
 
-fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
+fn parse_srt(lines: &[&str], malformed: bool) -> Result<Vec<SubtitleEntry>, ()> {
     let mut index = 0;
     let mut subtitles: Vec<NumberedEntry> = Vec::new();
+    let mut text = String::new();
     while index < lines.len() {
         let mut line = if index == 0 {
             lines[index].trim_start_matches('\u{feff}')
@@ -466,14 +492,16 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         if is_blank_line(line) || index == lines.len() { break; }
         let position = line.trim().parse::<u32>().map_err(|_| ())?;
         let position = i32::try_from(position).map_err(|_| ())?;
-        let timing = split_pcre2_whitespace(lines[index]);
+        let (t0, t1, t2) = first_three_pcre2_tokens(lines[index]);
         index += 1;
-        if timing.len() < 3 || timing[1] != "-->" { return Err(()); }
-        let start = timecode_to_double(timing[0]).ok_or(())?;
-        let end = timecode_to_double(timing[2]).ok_or(())?;
+        let (Some(start_tok), Some("-->"), Some(end_tok)) = (t0, t1, t2) else {
+            return Err(());
+        };
+        let start = timecode_to_double(start_tok).ok_or(())?;
+        let end = timecode_to_double(end_tok).ok_or(())?;
         if start < 0.0 || end < start { return Err(()); }
         if index == lines.len() { return Err(()); }
-        let mut text = String::new();
+        text.clear();
         while index < lines.len() {
             let line = lines[index];
             index += 1;
@@ -484,7 +512,10 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         text.pop();
         let content = strip_srt_style(&text);
         if !content.trim().is_empty() {
-            subtitles.push(NumberedEntry { position, subtitle: entry(&content, start, end) });
+            subtitles.push(NumberedEntry {
+                position,
+                subtitle: entry(&content, start, end, malformed),
+            });
         }
     }
     subtitles.sort_unstable_by(|a, b| {
@@ -493,7 +524,7 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
     Ok(subtitles.into_iter().map(|item| item.subtitle).collect())
 }
 
-fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
+fn parse_vtt(lines: &[&str], malformed: bool) -> Result<Vec<SubtitleEntry>, ()> {
     if lines.is_empty()
         || !lines[0]
             .trim_start_matches('\u{feff}')
@@ -508,12 +539,13 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         if line.trim().is_empty() { break; }
     }
     let mut output = Vec::new();
+    let mut text = String::new();
     while index < lines.len() {
         let line = lines[index].trim();
         index += 1;
         if line.is_empty() { continue; }
-        let tokens = split_pcre2_whitespace(line);
-        let first = tokens.first().copied().unwrap_or("");
+        let (t0, t1, t2) = first_three_pcre2_tokens(line);
+        let first = t0.unwrap_or("");
         if matches!(first, "NOTE" | "STYLE" | "REGION") {
             while index < lines.len() {
                 let line = lines[index];
@@ -522,20 +554,22 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
             }
             continue;
         }
-        let timing = if tokens.len() >= 3 && tokens[1] == "-->" {
-            tokens
+        let (start_tok, end_tok) = if let (Some(s), Some("-->"), Some(e)) = (t0, t1, t2) {
+            (s, e)
         } else {
             if index == lines.len() { return Err(()); }
-            let tokens = split_pcre2_whitespace(lines[index]);
+            let (nt0, nt1, nt2) = first_three_pcre2_tokens(lines[index]);
             index += 1;
-            if tokens.len() < 3 || tokens[1] != "-->" { return Err(()); }
-            tokens
+            let (Some(s), Some("-->"), Some(e)) = (nt0, nt1, nt2) else {
+                return Err(());
+            };
+            (s, e)
         };
-        let start = timecode_to_double(timing[0]).ok_or(())?;
-        let end = timecode_to_double(timing[2]).ok_or(())?;
+        let start = timecode_to_double(start_tok).ok_or(())?;
+        let end = timecode_to_double(end_tok).ok_or(())?;
         if start < 0.0 || end < start { return Err(()); }
         if index == lines.len() { return Err(()); }
-        let mut text = String::new();
+        text.clear();
         while index < lines.len() {
             let line = lines[index];
             index += 1;
@@ -546,31 +580,38 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         text.pop();
         let content = strip_vtt_tags(&text);
         if !content.trim().is_empty() {
-            output.push(entry(&content, start, end));
+            output.push(entry(&content, start, end, malformed));
         }
     }
     output.sort_unstable_by(sorted_start);
     Ok(output)
 }
 
-/// Parse the three formats supported by the C++ parser. Qt decodes the file
-/// first so its path, BOM and QTextStream behavior remains one implementation.
+fn parse_decoded(format: Format, decoded: &str, malformed: bool) -> Result<Vec<SubtitleEntry>, ()> {
+    let lines = text_lines(decoded);
+    match format {
+        Format::Ass => parse_ass(&lines, malformed),
+        Format::Srt => parse_srt(&lines, malformed),
+        Format::Vtt => parse_vtt(&lines, malformed),
+    }
+}
+
+/// Parse ASS, SRT, or WebVTT directly from UTF-8 text without an upfront UTF-16 conversion.
+#[allow(clippy::result_unit_err)]
+pub fn parse_subtitles_str(format: Format, text: &str) -> Result<Vec<SubtitleEntry>, ()> {
+    parse_decoded(format, text, false)
+}
+
+/// Parse the three formats supported by the C++ parser from UTF-16 input.
 #[allow(clippy::result_unit_err)]
 pub fn parse_subtitles(format: Format, text: &[u16]) -> Result<Vec<SubtitleEntry>, ()> {
-    let (decoded, malformed) = match String::from_utf16(text) {
-        Ok(decoded) => (decoded, false),
-        Err(_) => (decode_malformed_utf16(text), true),
-    };
-    let lines = text_lines(&decoded);
-    let mut entries = match format {
-        Format::Ass => parse_ass(&lines),
-        Format::Srt => parse_srt(&lines),
-        Format::Vtt => parse_vtt(&lines),
-    }?;
-    if malformed {
-        restore_malformed_utf16(&mut entries);
+    match String::from_utf16(text) {
+        Ok(decoded) => parse_decoded(format, &decoded, false),
+        Err(_) => {
+            let decoded = decode_malformed_utf16(text);
+            parse_decoded(format, &decoded, true)
+        }
     }
-    Ok(entries)
 }
 
 #[cfg(test)]

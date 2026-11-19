@@ -29,7 +29,8 @@ component SidebarItem inherits Rectangle {
     animate background { duration: 100ms; }
 
     // Left vertical accent pill on active category
-    if root.selected : Rectangle {
+    Rectangle {
+        visible: root.selected;
         x: 3px;
         y: (parent.height - self.height) / 2;
         width: 3px;
@@ -61,7 +62,8 @@ component SidebarItem inherits Rectangle {
     }
 
     // Unsaved changes dot
-    if root.dirty : Rectangle {
+    Rectangle {
+        visible: root.dirty;
         x: parent.width - 16px;
         y: (parent.height - self.height) / 2;
         width: 6px;
@@ -168,63 +170,31 @@ export component SettingsSidebar inherits Rectangle {
         Rectangle { height: 1px; background: MementoPalette.border; }
 
         HorizontalLayout { padding-left: 10px; padding-top: 6px; SidebarGroupLabel { text: "STUDY & MINING"; } }
-        SidebarItem {
-            label: "Anki Integration";
-            icon: @image-url("../icons/anki.svg");
-            selected: root.search-query == "" && root.active-category == 0;
-            dirty: root.dirty-categories[0];
-            clicked => { root.select-category(0); }
-        }
-        SidebarItem {
-            label: "Dictionary";
-            icon: @image-url("../icons/dictionary.svg");
-            selected: root.search-query == "" && root.active-category == 4;
-            dirty: root.dirty-categories[4];
-            clicked => { root.select-category(4); }
-        }
-        SidebarItem {
-            label: "Search";
-            icon: @image-url("../icons/search.svg");
-            selected: root.search-query == "" && root.active-category == 9;
-            dirty: root.dirty-categories[9];
-            clicked => { root.select-category(9); }
-        }
-        SidebarItem {
-            label: "Audio Sources";
-            icon: @image-url("../icons/volume-on.svg");
-            selected: root.search-query == "" && root.active-category == 2;
-            dirty: root.dirty-categories[2];
-            clicked => { root.select-category(2); }
+        for item in [
+            { label: "Anki Integration", icon: @image-url("../icons/anki.svg"), cat: 0 },
+            { label: "Dictionary", icon: @image-url("../icons/dictionary.svg"), cat: 4 },
+            { label: "Search", icon: @image-url("../icons/search.svg"), cat: 9 },
+            { label: "Audio Sources", icon: @image-url("../icons/volume-on.svg"), cat: 2 },
+        ] : SidebarItem {
+            label: item.label;
+            icon: item.icon;
+            selected: root.search-query == "" && root.active-category == item.cat;
+            dirty: root.dirty-categories[item.cat];
+            clicked => { root.select-category(item.cat); }
         }
 
         HorizontalLayout { padding-left: 10px; padding-top: 10px; SidebarGroupLabel { text: "PLAYER & UI"; } }
-        SidebarItem {
-            label: "Interface";
-            icon: @image-url("../icons/window.svg");
-            selected: root.search-query == "" && root.active-category == 5;
-            dirty: root.dirty-categories[5];
-            clicked => { root.select-category(5); }
-        }
-        SidebarItem {
-            label: "Behavior";
-            icon: @image-url("../icons/gear.svg");
-            selected: root.search-query == "" && root.active-category == 3;
-            dirty: root.dirty-categories[3];
-            clicked => { root.select-category(3); }
-        }
-        SidebarItem {
-            label: "Keybinds";
-            icon: @image-url("../icons/keyboard.svg");
-            selected: root.search-query == "" && root.active-category == 6;
-            dirty: root.dirty-categories[6];
-            clicked => { root.select-category(6); }
-        }
-        SidebarItem {
-            label: "Application";
-            icon: @image-url("../icons/settings.svg");
-            selected: root.search-query == "" && root.active-category == 1;
-            dirty: root.dirty-categories[1];
-            clicked => { root.select-category(1); }
+        for item in [
+            { label: "Interface", icon: @image-url("../icons/window.svg"), cat: 5 },
+            { label: "Behavior", icon: @image-url("../icons/gear.svg"), cat: 3 },
+            { label: "Keybinds", icon: @image-url("../icons/keyboard.svg"), cat: 6 },
+            { label: "Application", icon: @image-url("../icons/settings.svg"), cat: 1 },
+        ] : SidebarItem {
+            label: item.label;
+            icon: item.icon;
+            selected: root.search-query == "" && root.active-category == item.cat;
+            dirty: root.dirty-categories[item.cat];
+            clicked => { root.select-category(item.cat); }
         }
 
         if root.ocr-built || root.asr-available : HorizontalLayout {

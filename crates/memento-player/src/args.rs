@@ -1,13 +1,7 @@
-//! Pure command-line argument handling for `MpvController::loadArgs`.
-//!
-//! Strings remain UTF-16 code units throughout: Qt's `QString` comparisons,
-//! `startsWith`, `mid`, and `insert` do not repair unpaired surrogates.
+//! Pure UTF-8 command-line argument handling for Memento.
 
 use crate::controller::CliOption;
 
-const OPEN_GROUP: &[u16] = &[b'-' as u16, b'-' as u16, b'{' as u16];
-const CLOSE_GROUP: &[u16] = &[b'-' as u16, b'-' as u16, b'}' as u16];
-const OPTION_PREFIX: &[u16] = &[b'-' as u16, b'-' as u16];
 const MAX_TREE_DEPTH: usize = 64;
 
 /// One media/playlist load entry parsed from UTF-8 CLI arguments.
@@ -26,6 +20,12 @@ pub struct ParsedArgs {
     pub loads: Vec<PlaylistLoad>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseArgsError {
+    InvalidBrackets,
+    MaxDepthExceeded,
+}
+
 pub const HELP_TEXT: &str = "\
 Usage: memento [options] [url|path]
 
@@ -40,6 +40,97 @@ pub fn version_text(version: &str) -> String {
     format!("memento {version}")
 }
 
+/// Quote the value after the first `=` with double quotes, escaping embedded
+/// `"` and `\` characters so mpv's `loadfile` option parser never breaks on
+/// values containing quotes or trailing backslashes.
+fn quote_arg_str(arg: &str) -> String {
+    let Some((key, val)) = arg.split_once('=') else {
+        return arg.to_owned();
+    };
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push_str(key);
+    quoted.push_str("=\"");
+    for ch in val.chars() {
+        if ch == '"' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+struct LoadFileNode<'a> {
+    entries: Vec<FileEntry<'a>>,
+    options: Vec<String>,
+}
+
+enum FileEntry<'a> {
+    File(&'a str),
+    Child(LoadFileNode<'a>),
+}
+
+fn build_args_tree<'a>(
+    args: &[&'a str],
+    index: &mut usize,
+    depth: usize,
+) -> Result<LoadFileNode<'a>, ParseArgsError> {
+    if depth == 0 {
+        return Err(ParseArgsError::MaxDepthExceeded);
+    }
+
+    let mut node = LoadFileNode {
+        entries: Vec::new(),
+        options: Vec::new(),
+    };
+    while let Some(&arg) = args.get(*index) {
+        if arg == "--}" {
+            *index += 1;
+            break;
+        }
+        if arg == "--{" {
+            *index += 1;
+            node.entries
+                .push(FileEntry::Child(build_args_tree(args, index, depth - 1)?));
+        } else {
+            if let Some(opt) = arg.strip_prefix("--") {
+                node.options.push(quote_arg_str(opt));
+            } else {
+                node.entries.push(FileEntry::File(arg));
+            }
+            *index += 1;
+        }
+    }
+    Ok(node)
+}
+
+fn flatten_tree<'a>(
+    node: &'a LoadFileNode<'_>,
+    inherited: &mut Vec<&'a str>,
+    loads: &mut Vec<PlaylistLoad>,
+) {
+    let previous_len = inherited.len();
+    inherited.extend(node.options.iter().map(String::as_str));
+
+    for entry in &node.entries {
+        match entry {
+            FileEntry::File(filename) => loads.push(PlaylistLoad {
+                path: (*filename).to_owned(),
+                options: inherited.iter().map(|&opt| opt.to_owned()).collect(),
+            }),
+            FileEntry::Child(child) => flatten_tree(child, inherited, loads),
+        }
+    }
+    inherited.truncate(previous_len);
+}
+
+fn parse_load_slice(args: &[&str], out: &mut Vec<PlaylistLoad>) -> Result<(), ParseArgsError> {
+    let mut index = 0;
+    let root = build_args_tree(args, &mut index, MAX_TREE_DEPTH)?;
+    flatten_tree(&root, &mut Vec::new(), out);
+    Ok(())
+}
+
 /// Parse full CLI arguments (including `argv[0]`), extracting `--help`/`-h`,
 /// `--version`/`-V`, `-v` (verbose mpv flag), global `--<mpv-opt>=...` /
 /// `--no-<opt>` / `--<flag>` options, and ordered playlist entries with
@@ -49,29 +140,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let raw: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    let raw: Vec<S> = args.into_iter().collect();
     if raw.len() <= 1 {
         return Ok(ParsedArgs::default());
     }
 
     let mut out = ParsedArgs::default();
-    let mut u16_args: Vec<Vec<u16>> = Vec::with_capacity(raw.len());
-    u16_args.push(raw[0].encode_utf16().collect());
+    let mut load_args: Vec<&str> = Vec::with_capacity(raw.len() - 1);
 
     let mut depth = 0usize;
     let mut end_of_options: Option<usize> = None;
-    for arg in raw.iter().skip(1) {
+    for arg in raw.iter().skip(1).map(S::as_ref) {
         if end_of_options.is_some() {
-            u16_args.push(arg.encode_utf16().collect());
+            load_args.push(arg);
             continue;
         }
         if arg == "--" && depth == 0 {
-            end_of_options = Some(u16_args.len());
+            end_of_options = Some(load_args.len());
             continue;
         }
         if arg == "--{" {
             depth += 1;
-            u16_args.push(arg.encode_utf16().collect());
+            load_args.push(arg);
             continue;
         }
         if arg == "--}" {
@@ -79,12 +169,12 @@ where
                 return Err(ParseArgsError::InvalidBrackets);
             }
             depth -= 1;
-            u16_args.push(arg.encode_utf16().collect());
+            load_args.push(arg);
             continue;
         }
         if depth > 0 {
             // Preserve per-file options and paths inside `--{ ... --}` for tree flattening.
-            u16_args.push(arg.encode_utf16().collect());
+            load_args.push(arg);
             continue;
         }
 
@@ -119,7 +209,7 @@ where
                 });
             }
         } else {
-            u16_args.push(arg.encode_utf16().collect());
+            load_args.push(arg);
         }
     }
 
@@ -130,203 +220,36 @@ where
     if let Some(split_idx) = end_of_options {
         // When `--` ended options, reconstruct remaining args verbatim as file loads
         // alongside any earlier grouped loads without misinterpreting `--foo` files.
-        let before_loads = parse_load_args(&u16_args[..split_idx])?;
-        out.loads.extend(before_loads.into_iter().map(|entry| PlaylistLoad {
-            path: String::from_utf16_lossy(&entry.filename),
-            options: entry
-                .options
-                .into_iter()
-                .map(|opt| String::from_utf16_lossy(&opt))
-                .collect(),
-        }));
-        for path_u16 in &u16_args[split_idx..] {
+        parse_load_slice(&load_args[..split_idx], &mut out.loads)?;
+        for &path in &load_args[split_idx..] {
             out.loads.push(PlaylistLoad {
-                path: String::from_utf16_lossy(path_u16),
+                path: path.to_owned(),
                 options: Vec::new(),
             });
         }
         return Ok(out);
     }
 
-    let loads = parse_load_args(&u16_args)?;
-    out.loads = loads
-        .into_iter()
-        .map(|entry| PlaylistLoad {
-            path: String::from_utf16_lossy(&entry.filename),
-            options: entry
-                .options
-                .into_iter()
-                .map(|opt| String::from_utf16_lossy(&opt))
-                .collect(),
-        })
-        .collect();
+    parse_load_slice(&load_args, &mut out.loads)?;
     Ok(out)
-}
-
-/// One call to `loadFile(filename, true, options)`, in invocation order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadFileArgs {
-    pub filename: Vec<u16>,
-    pub options: Vec<Vec<u16>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseArgsError {
-    InvalidBrackets,
-    MaxDepthExceeded,
-}
-
-/// Check the exact `--{`/`--}` bracket balance, ignoring argv[0].
-///
-/// This deliberately does not enforce the tree's depth limit; that is checked
-/// when parsing, just as in the original command-line loader.
-pub fn args_valid(args: &[Vec<u16>]) -> bool {
-    let mut depth = 0usize;
-    for arg in args.iter().skip(1) {
-        if arg.as_slice() == OPEN_GROUP {
-            depth += 1;
-        } else if arg.as_slice() == CLOSE_GROUP {
-            if depth == 0 {
-                return false;
-            }
-            depth -= 1;
-        }
-    }
-    depth == 0
-}
-
-/// Quote the value after the first `=` with double quotes, escaping embedded
-/// `"` and `\` characters so mpv's `loadfile` option parser never breaks on
-/// values containing quotes or trailing backslashes.
-pub fn quote_arg(arg: &[u16]) -> Vec<u16> {
-    let Some(index) = arg.iter().position(|&unit| unit == b'=' as u16) else {
-        return arg.to_vec();
-    };
-
-    let mut quoted = Vec::with_capacity(arg.len() + 2);
-    quoted.extend_from_slice(&arg[..=index]);
-    quoted.push(b'"' as u16);
-    for &unit in &arg[index + 1..] {
-        if unit == b'"' as u16 || unit == b'\\' as u16 {
-            quoted.push(b'\\' as u16);
-        }
-        quoted.push(unit);
-    }
-    quoted.push(b'"' as u16);
-    quoted
-}
-
-/// Interpret the complete argv list (including argv[0]) as file/option pairs.
-///
-/// The root has depth 64, so at most 63 nested `--{` groups are accepted.
-/// Options at a level apply to every file there, even files appearing before
-/// the option or before/after a child group. Child groups inherit all ancestor
-/// options; sibling groups never inherit one another's options. A literal
-/// `--` is an empty option, *not* a filename or group marker.
-///
-/// An empty list or one containing only argv[0] produces no loads; callers
-/// implementing `loadArgs` must separately return false for those inputs.
-pub fn parse_load_args(args: &[Vec<u16>]) -> Result<Vec<LoadFileArgs>, ParseArgsError> {
-    if !args_valid(args) {
-        return Err(ParseArgsError::InvalidBrackets);
-    }
-
-    let mut index = 1;
-    let root = build_args_tree(args, &mut index, MAX_TREE_DEPTH)?;
-    let mut loads = Vec::new();
-    flatten_tree(&root, &mut Vec::new(), &mut loads);
-    Ok(loads)
-}
-
-struct LoadFileNode<'a> {
-    entries: Vec<FileEntry<'a>>,
-    options: Vec<Vec<u16>>,
-}
-
-enum FileEntry<'a> {
-    File(&'a [u16]),
-    Child(LoadFileNode<'a>),
-}
-
-fn build_args_tree<'a>(
-    args: &'a [Vec<u16>],
-    index: &mut usize,
-    depth: usize,
-) -> Result<LoadFileNode<'a>, ParseArgsError> {
-    // This is checked before examining the next token: even an empty group
-    // beyond the limit exceeds C++ buildArgsTree's recursion depth.
-    if depth == 0 {
-        return Err(ParseArgsError::MaxDepthExceeded);
-    }
-
-    let mut node = LoadFileNode {
-        entries: Vec::new(),
-        options: Vec::new(),
-    };
-    while let Some(arg) = args.get(*index) {
-        if arg.as_slice() == CLOSE_GROUP {
-            *index += 1;
-            break;
-        }
-        if arg.as_slice() == OPEN_GROUP {
-            *index += 1;
-            node.entries
-                .push(FileEntry::Child(build_args_tree(args, index, depth - 1)?));
-        } else {
-            if arg.starts_with(OPTION_PREFIX) {
-                node.options.push(quote_arg(&arg[OPTION_PREFIX.len()..]));
-            } else {
-                node.entries.push(FileEntry::File(arg));
-            }
-            *index += 1;
-        }
-    }
-    Ok(node)
-}
-
-fn flatten_tree<'a>(
-    node: &'a LoadFileNode<'_>,
-    inherited: &mut Vec<&'a [u16]>,
-    loads: &mut Vec<LoadFileArgs>,
-) {
-    let previous_len = inherited.len();
-    inherited.extend(node.options.iter().map(Vec::as_slice));
-
-    for entry in &node.entries {
-        match entry {
-            FileEntry::File(filename) => loads.push(LoadFileArgs {
-                filename: filename.to_vec(),
-                options: inherited.iter().map(|option| option.to_vec()).collect(),
-            }),
-            FileEntry::Child(child) => flatten_tree(child, inherited, loads),
-        }
-    }
-    inherited.truncate(previous_len);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn utf16(value: &str) -> Vec<u16> {
-        value.encode_utf16().collect()
-    }
-
-    fn args(values: &[&str]) -> Vec<Vec<u16>> {
-        values.iter().map(|value| utf16(value)).collect()
-    }
-
-    fn load(filename: &str, options: &[&str]) -> LoadFileArgs {
-        LoadFileArgs {
-            filename: utf16(filename),
-            options: options.iter().map(|option| utf16(option)).collect(),
+    fn load(path: &str, options: &[&str]) -> PlaylistLoad {
+        PlaylistLoad {
+            path: path.to_owned(),
+            options: options.iter().map(|&opt| opt.to_owned()).collect(),
         }
     }
 
     #[test]
     fn nested_groups_inherit_all_parent_options_in_source_order() {
-        let argv = args(&[
+        let parsed = parse_args([
             "program",
+            "--{",
             "first",
             "--root=early",
             "--{",
@@ -344,10 +267,12 @@ mod tests {
             "--}",
             "last",
             "--root=late",
-        ]);
+            "--}",
+        ])
+        .unwrap();
         assert_eq!(
-            parse_load_args(&argv),
-            Ok(vec![
+            parsed.loads,
+            vec![
                 load("first", &["root=\"early\"", "root=\"late\""]),
                 load(
                     "inside-before",
@@ -371,81 +296,41 @@ mod tests {
                     &["root=\"early\"", "root=\"late\"", "sibling=\"yes\""]
                 ),
                 load("last", &["root=\"early\"", "root=\"late\""]),
-            ])
+            ]
         );
     }
 
     #[test]
     fn invalid_closings_and_unclosed_groups_are_rejected() {
         for argv in [
-            args(&["program", "--}"]),
-            args(&["program", "--{", "--}", "--}"]),
-            args(&["program", "file", "--{"]),
-            args(&["program", "--}", "--{"]),
+            vec!["program", "--}"],
+            vec!["program", "--{", "--}", "--}"],
+            vec!["program", "file", "--{"],
+            vec!["program", "--}", "--{"],
         ] {
-            assert!(!args_valid(&argv));
-            assert_eq!(parse_load_args(&argv), Err(ParseArgsError::InvalidBrackets));
+            assert_eq!(parse_args(argv), Err(ParseArgsError::InvalidBrackets));
         }
     }
 
     #[test]
     fn root_depth_64_allows_63_groups_but_not_64_or_65() {
         for depth in [63, 64, 65] {
-            let mut argv = vec![utf16("program")];
-            argv.extend((0..depth).map(|_| utf16("--{")));
-            argv.push(utf16("file"));
-            argv.extend((0..depth).map(|_| utf16("--}")));
-            assert!(args_valid(&argv));
+            let mut argv = vec!["program"];
+            argv.extend(std::iter::repeat_n("--{", depth));
+            argv.push("file");
+            argv.extend(std::iter::repeat_n("--}", depth));
             if depth == 63 {
-                assert_eq!(parse_load_args(&argv), Ok(vec![load("file", &[])]));
+                assert_eq!(parse_args(argv).unwrap().loads, vec![load("file", &[])]);
             } else {
-                assert_eq!(parse_load_args(&argv), Err(ParseArgsError::MaxDepthExceeded));
+                assert_eq!(parse_args(argv), Err(ParseArgsError::MaxDepthExceeded));
             }
         }
     }
 
     #[test]
-    fn quote_arg_preserves_raw_utf16_and_quotes_only_first_equals() {
-        let raw = [0xd800, b'=' as u16, 0xdc00, b'=' as u16, b'"' as u16];
-        assert_eq!(
-            quote_arg(&raw),
-            [
-                0xd800,
-                b'=' as u16,
-                b'"' as u16,
-                0xdc00,
-                b'=' as u16,
-                b'\\' as u16,
-                b'"' as u16,
-                b'"' as u16,
-            ]
-        );
-        assert_eq!(quote_arg(&[0xd800, 0xdc00]), [0xd800, 0xdc00]);
-
-        let mut argv = args(&["program"]);
-        argv.push(vec![0xd800]);
-        argv.push(vec![b'-' as u16, b'-' as u16, b'x' as u16, b'=' as u16, 0xdc00]);
-        assert_eq!(
-            parse_load_args(&argv),
-            Ok(vec![LoadFileArgs {
-                filename: vec![0xd800],
-                options: vec![vec![b'x' as u16, b'=' as u16, b'"' as u16, 0xdc00, b'"' as u16]],
-            }])
-        );
-    }
-
-    #[test]
-    fn exact_brackets_and_literal_dash_dash_option() {
-        let argv = args(&["--{", "--", "--{x", "--}x", "not--option", "file"]);
-        assert!(args_valid(&argv)); // argv[0] is ignored, even if it resembles a bracket.
-        assert_eq!(
-            parse_load_args(&argv),
-            Ok(vec![
-                load("not--option", &["", "{x", "}x"]),
-                load("file", &["", "{x", "}x"]),
-            ])
-        );
-        assert_eq!(parse_load_args(&args(&["program"])), Ok(vec![]));
+    fn quote_arg_escapes_quotes_and_backslashes_after_first_equals() {
+        assert_eq!(quote_arg_str("k=a=b\"c\\"), "k=\"a=b\\\"c\\\\\"");
+        assert_eq!(quote_arg_str("flag"), "flag");
     }
 
     #[test]
@@ -470,17 +355,35 @@ mod tests {
         assert_eq!(
             parsed.global_options,
             vec![
-                CliOption { name: "hwdec".into(), value: "vaapi".into() },
-                CliOption { name: "sub-visibility".into(), value: "no".into() },
-                CliOption { name: "pause".into(), value: "yes".into() },
+                CliOption {
+                    name: "hwdec".into(),
+                    value: "vaapi".into()
+                },
+                CliOption {
+                    name: "sub-visibility".into(),
+                    value: "no".into()
+                },
+                CliOption {
+                    name: "pause".into(),
+                    value: "yes".into()
+                },
             ]
         );
         assert_eq!(
             parsed.loads,
             vec![
-                PlaylistLoad { path: "ep1.mkv".into(), options: vec![] },
-                PlaylistLoad { path: "ep2.mkv".into(), options: vec!["start=\"12.5\"".into()] },
-                PlaylistLoad { path: "ep3.mkv".into(), options: vec![] },
+                PlaylistLoad {
+                    path: "ep1.mkv".into(),
+                    options: vec![]
+                },
+                PlaylistLoad {
+                    path: "ep2.mkv".into(),
+                    options: vec!["start=\"12.5\"".into()]
+                },
+                PlaylistLoad {
+                    path: "ep3.mkv".into(),
+                    options: vec![]
+                },
             ]
         );
 
@@ -489,22 +392,34 @@ mod tests {
         assert!(short.show_version);
         assert_eq!(
             short.global_options,
-            vec![CliOption { name: "v".into(), value: "yes".into() }]
+            vec![CliOption {
+                name: "v".into(),
+                value: "yes".into()
+            }]
         );
         assert_eq!(
             short.loads,
-            vec![PlaylistLoad { path: "--not-an-option.mkv".into(), options: vec![] }]
+            vec![PlaylistLoad {
+                path: "--not-an-option.mkv".into(),
+                options: vec![]
+            }]
         );
 
         let verbose_only = parse_args(["memento", "-v", "ep1.mkv"]).unwrap();
         assert!(!verbose_only.show_version);
         assert_eq!(
             verbose_only.global_options,
-            vec![CliOption { name: "v".into(), value: "yes".into() }]
+            vec![CliOption {
+                name: "v".into(),
+                value: "yes".into()
+            }]
         );
         assert_eq!(
             verbose_only.loads,
-            vec![PlaylistLoad { path: "ep1.mkv".into(), options: vec![] }]
+            vec![PlaylistLoad {
+                path: "ep1.mkv".into(),
+                options: vec![]
+            }]
         );
 
         assert_eq!(

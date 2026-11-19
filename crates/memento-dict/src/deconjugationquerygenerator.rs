@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::deconjugator::{deconjugate, format_derivation_chain, ConjugationInfo, WordForm};
+use crate::deconjugator::{deconjugate_str, format_derivation_chain, ConjugationInfo, WordForm};
 
 pub const RULE_V5: u8 = 1;
 pub const RULE_V1: u8 = 2;
@@ -17,9 +17,8 @@ pub const RULE_VZ: u8 = 64;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeconjugationQuery {
     pub deconj: Vec<u16>,
-    pub surface: Vec<u16>,
     pub rule_mask: u8,
-    pub derivation_display: Vec<u16>,
+    pub derivation_display: String,
     pub derivations: Vec<WordForm>,
     pub derivation: String,
     pub derivation_descriptions: Vec<(String, String)>,
@@ -48,8 +47,7 @@ fn rule_for_info(info: &ConjugationInfo) -> u8 {
     match info.derivations.first().copied() {
         Some(WordForm::GodanVerb) => RULE_V5,
         Some(WordForm::IchidanVerb) => {
-            // ZURU_U16 = "ずる"
-            if info.base.ends_with(&[0x305A, 0x308B]) {
+            if info.base.ends_with("ずる") {
                 RULE_V1 | RULE_VZ
             } else {
                 RULE_V1
@@ -91,8 +89,8 @@ pub const fn rule_matches_entry(query_rule_mask: u8, entry_rule_mask: u8) -> boo
 }
 
 pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<DeconjugationQuery> {
-    let mut result: Vec<DeconjugationQuery> = Vec::new();
-    let mut by_base: HashMap<Vec<u16>, Vec<usize>> = HashMap::new();
+    let mut result: Vec<DeconjugationQuery> = Vec::with_capacity(infos.len());
+    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
     for info in infos {
         let filter = rule_for_info(&info);
         let existing_idx = by_base.get(&info.base).and_then(|indices| {
@@ -122,10 +120,9 @@ pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<Deconjuga
             let rule_derivations =
                 vec![(filter, derivation.clone(), derivation_descriptions.clone())];
             let idx = result.len();
-            let base_key = info.base.clone();
+            let deconj: Vec<u16> = info.base.encode_utf16().collect();
             result.push(DeconjugationQuery {
-                deconj: info.base,
-                surface: info.conjugated,
+                deconj,
                 rule_mask: filter,
                 derivation_display: info.derivation_display,
                 derivations: info.derivations,
@@ -133,26 +130,27 @@ pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<Deconjuga
                 derivation_descriptions,
                 rule_derivations,
             });
-            by_base.entry(base_key).or_default().push(idx);
+            by_base.entry(info.base).or_default().push(idx);
         }
     }
     result
 }
 
-/// Generate deconjugated query rows from the complete UTF-16 input (sentence mode).
-pub fn generate_queries(text: &[u16]) -> Vec<DeconjugationQuery> {
+/// Generate deconjugated query rows for a single UTF-8 prefix (non-sentence mode).
+pub fn generate_queries_single_str(text: &str) -> Vec<DeconjugationQuery> {
     if text.is_empty() {
         return Vec::new();
     }
-    generate_queries_from_infos(deconjugate(text, true))
+    generate_queries_from_infos(deconjugate_str(text, false))
 }
 
-/// Generate deconjugated query rows for a single exact prefix (non-sentence mode).
+/// Generate deconjugated query rows for a single exact UTF-16 prefix (non-sentence mode).
 pub fn generate_queries_single(text: &[u16]) -> Vec<DeconjugationQuery> {
     if text.is_empty() {
         return Vec::new();
     }
-    generate_queries_from_infos(deconjugate(text, false))
+    let decoded = String::from_utf16_lossy(text);
+    generate_queries_from_infos(deconjugate_str(&decoded, false))
 }
 
 #[cfg(test)]
@@ -161,10 +159,9 @@ mod tests {
 
     fn info(base: &str, display: &str, form: WordForm) -> ConjugationInfo {
         ConjugationInfo {
-            base: base.encode_utf16().collect(),
-            conjugated: "surface".encode_utf16().collect(),
+            base: base.to_owned(),
             derivations: vec![form],
-            derivation_display: display.encode_utf16().collect(),
+            derivation_display: display.to_owned(),
         }
     }
 
@@ -179,16 +176,10 @@ mod tests {
         ]);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].rule_mask, RULE_V5 | RULE_V1);
-        assert_eq!(
-            result[0].derivation_display,
-            "past".encode_utf16().collect::<Vec<_>>()
-        );
+        assert_eq!(result[0].derivation_display, "past");
         assert_eq!(result[1].deconj, "a".encode_utf16().collect::<Vec<_>>());
         assert_eq!(result[1].rule_mask, RULE_ADJ_I);
-        assert_eq!(
-            result[1].derivation_display,
-            "different".encode_utf16().collect::<Vec<_>>()
-        );
+        assert_eq!(result[1].derivation_display, "different");
         assert_eq!(result[2].deconj, "b".encode_utf16().collect::<Vec<_>>());
         assert_eq!(result[2].rule_mask, RULE_V5);
     }
@@ -207,7 +198,10 @@ mod tests {
         assert_eq!(parse_rule_mask(""), 0);
         assert_eq!(parse_rule_mask("v1"), RULE_V1);
         assert_eq!(parse_rule_mask("v5 v1"), RULE_V5 | RULE_V1);
-        assert_eq!(parse_rule_mask("vk vs vz adj-i"), RULE_VK | RULE_VS | RULE_VZ | RULE_ADJ_I);
+        assert_eq!(
+            parse_rule_mask("vk vs vz adj-i"),
+            RULE_VK | RULE_VS | RULE_VZ | RULE_ADJ_I
+        );
 
         assert!(rule_matches_entry(0, 0));
         assert!(rule_matches_entry(0, RULE_V5));

@@ -61,22 +61,6 @@ pub fn trim_u16(units: &[u16]) -> &[u16] {
     &units[start..end]
 }
 
-/// `QString::split` (Qt 6 default `KeepEmptyParts`) over code units: splits
-/// on every occurrence of `delim` and keeps empty fields, including a
-/// trailing one. Always yields at least one field.
-pub fn split_keep_empty(delim: u16, units: &[u16]) -> Vec<&[u16]> {
-    let mut fields = Vec::new();
-    let mut begin = 0;
-    for (index, &unit) in units.iter().enumerate() {
-        if unit == delim {
-            fields.push(&units[begin..index]);
-            begin = index + 1;
-        }
-    }
-    fields.push(&units[begin..]);
-    fields
-}
-
 /// True when the subject is valid UTF-16 in the sense PCRE2 checks for a
 /// UTF-mode match: every high surrogate must be followed by a low surrogate
 /// and every low surrogate must follow one. Qt validates the whole subject
@@ -165,22 +149,6 @@ pub fn token_spans(text: &[u16]) -> Vec<TokenSpan> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_always_yields_at_least_one_field() {
-        assert_eq!(split_keep_empty(b'|' as u16, &[]).len(), 1);
-        assert_eq!(split_keep_empty(b':' as u16, &[]).len(), 1);
-    }
-
-    #[test]
-    fn split_keeps_empty_fields_including_trailing() {
-        let fields = split_keep_empty(b'|' as u16, &[7, 7, 7, 7, 7]);
-        assert_eq!(fields, vec![&[7, 7, 7, 7, 7][..]]);
-        assert_eq!(
-            split_keep_empty(b'|' as u16, &[1, 124, 2]),
-            vec![&[1][..], &[2][..]]
-        );
-    }
 
     #[test]
     fn trim_removals() {

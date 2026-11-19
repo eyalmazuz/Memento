@@ -13,8 +13,9 @@ use crate::ui::{DictResult, MementoApp, PopupBridge, PopupFrequency};
 
 use super::state::{
     apply_kanji_freq_updates_to_rows, build_row_extras_for_grouped, encode_note_id_i32,
-    modifier_matches_setting, GlossaryDocLruCache, GlossaryScanHighlight, HoveredGlossaryTarget,
-    NestedPopupLevel, NestedScanRequest, NestedScanResponse, PendingNestedAnkiAdd,
+    execute_nav_lookup, modifier_matches_setting, DictWorkerRequest, GlossaryDocLruCache,
+    GlossaryScanHighlight, HoveredGlossaryTarget, NavLookupRequest, NavLookupResponse,
+    NavQueryKind, NestedPopupLevel, NestedScanRequest, NestedScanResponse, PendingNestedAnkiAdd,
     GLOSSARY_SCAN_MAX_CHARS, MAX_PENDING_NESTED_ANKI_ADDS, NESTED_DISMISS_GRACE_MS,
 };
 use super::RichUiBridge;
@@ -187,6 +188,7 @@ impl RichUiBridge {
             self.sync_nested_popup_to_bridge(app, true);
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         }
+        self.schedule_idle_memory_shrink_if_closed(app);
     }
 
     pub(super) fn schedule_unlocked_nested_dismiss(self: &Rc<Self>) {
@@ -268,9 +270,10 @@ impl RichUiBridge {
         if max_depth == 0 {
             return;
         }
+        self.cancel_idle_memory_shrink();
         let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         app.global::<PopupBridge>().set_nested_searching(true);
-        let _ = self.nested_tx.send(NestedScanRequest {
+        let _ = self.nested_tx.send(DictWorkerRequest::NestedScan(NestedScanRequest {
             epoch,
             parent_depth: target.depth,
             row_index: target.row_index,
@@ -282,7 +285,7 @@ impl RichUiBridge {
             locked,
             excluded_glossaries: excluded,
             search_config,
-        });
+        }));
         self.kick_no_event_loop_pump();
     }
 
@@ -362,6 +365,7 @@ impl RichUiBridge {
                     &rows,
                     &grouped_hits,
                     Some(&resp.term_pitch_details),
+                    Some(&resp.kanji_frequencies),
                 );
                 apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
                 let row_count = rows.len();
@@ -632,43 +636,106 @@ impl RichUiBridge {
         if trimmed.is_empty() {
             return;
         }
+        self.cancel_idle_memory_shrink();
         self.ensure_fresh_db_and_config(app, true);
-        let (hits, excluded, headword, reading, term_meta_rows) = {
-            let mut st = self.state.borrow_mut();
-            let mut hits = st.dict_ctrl.search(trimmed).to_vec();
-            let excluded = st.settings.excluded_glossaries.clone();
-            if hits.is_empty() && trimmed.chars().count() == 1 {
-                hits = st.dict_ctrl.search_kanji(trimmed).to_vec();
-            }
-            let headword = hits
-                .first()
-                .map(|h| h.expression.clone())
-                .unwrap_or_else(|| trimmed.to_owned());
-            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
-            let mut term_meta_rows = Vec::new();
-            for h in &hits {
-                if !h.is_kanji
-                    && !term_meta_rows
-                        .iter()
-                        .any(|(e, r, _, _): &(String, String, _, _)| {
-                            e == &h.expression && r == &h.reading
-                        })
-                {
-                    let graphs = st.dict_ctrl.get_pitch_graphs(&h.expression, &h.reading);
-                    let freqs = st.dict_ctrl.get_frequencies(&h.expression, &h.reading);
-                    term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
-                }
-            }
-            (hits, excluded, headword, reading, term_meta_rows)
+        let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let (excluded, search_config) = {
+            let st = self.state.borrow();
+            (
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
+            )
         };
-        if hits.is_empty() {
-            app.set_status_message(format!("No dictionary entries found for {trimmed}").into());
+        let req = NavLookupRequest {
+            epoch,
+            kind: NavQueryKind::NestedTerm {
+                from_depth,
+                query: trimmed.to_owned(),
+            },
+            excluded,
+            search_config,
+        };
+        if self.no_event_loop_pump.is_some() {
+            let resp = {
+                let mut st = self.state.borrow_mut();
+                execute_nav_lookup(&mut st.dict_ctrl, req)
+            };
+            self.apply_nested_nav_lookup_response(app, resp);
+        } else {
+            app.global::<PopupBridge>().set_nested_searching(true);
+            let _ = self.nested_tx.send(DictWorkerRequest::NavLookup(req));
+        }
+    }
+
+    pub(super) fn navigate_nested_kanji(
+        &self,
+        app: &MementoApp,
+        from_depth: i32,
+        expression: &str,
+        clicked_kanji: &str,
+    ) {
+        let target_char = clicked_kanji
+            .chars()
+            .find(|&c| is_kanji_char(c))
+            .or_else(|| expression.chars().find(|&c| is_kanji_char(c)));
+        let Some(ch) = target_char else {
+            return;
+        };
+        let query = ch.to_string();
+        self.cancel_idle_memory_shrink();
+        self.ensure_fresh_db_and_config(app, true);
+        let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let (excluded, search_config) = {
+            let st = self.state.borrow();
+            (
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
+            )
+        };
+        let req = NavLookupRequest {
+            epoch,
+            kind: NavQueryKind::NestedKanji { from_depth, query },
+            excluded,
+            search_config,
+        };
+        if self.no_event_loop_pump.is_some() {
+            let resp = {
+                let mut st = self.state.borrow_mut();
+                execute_nav_lookup(&mut st.dict_ctrl, req)
+            };
+            self.apply_nested_nav_lookup_response(app, resp);
+        } else {
+            app.global::<PopupBridge>().set_nested_searching(true);
+            let _ = self.nested_tx.send(DictWorkerRequest::NavLookup(req));
+        }
+    }
+
+    pub(super) fn apply_nested_nav_lookup_response(
+        &self,
+        app: &MementoApp,
+        resp: NavLookupResponse,
+    ) {
+        app.global::<PopupBridge>().set_nested_searching(false);
+        let (from_depth, query_label, is_kanji_nav) = match resp.kind {
+            NavQueryKind::NestedTerm { from_depth, query } => (from_depth, query, false),
+            NavQueryKind::NestedKanji { from_depth, query } => (from_depth, query, true),
+            _ => return,
+        };
+        if resp.hits.is_empty() {
+            if is_kanji_nav {
+                app.set_status_message(format!("No kanji entry found for {query_label}").into());
+            } else {
+                app.set_status_message(
+                    format!("No dictionary entries found for {query_label}").into(),
+                );
+            }
             return;
         }
-        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped(&hits, &excluded);
+        let (mut rows, grouped_hits) =
+            build_dictionary_result_rows_grouped(&resp.hits, &resp.excluded);
         for row in &mut rows {
             if row.term_start && !row.is_kanji {
-                if let Some((_, _, graphs, freqs)) = term_meta_rows.iter().find(|(e, r, _, _)| {
+                if let Some((_, _, graphs, freqs)) = resp.term_meta_rows.iter().find(|(e, r, _, _)| {
                     e == row.expression.as_str() && r == row.reading.as_str()
                 }) {
                     row.pitch_graphs =
@@ -702,100 +769,16 @@ impl RichUiBridge {
                 &mut state_ref.dict_ctrl,
                 &rows,
                 &grouped_hits,
-                None,
+                Some(&resp.term_pitch_details),
+                Some(&resp.kanji_frequencies),
             );
             apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
             let row_count = rows.len();
             let level = NestedPopupLevel {
-                label: headword.clone(),
+                label: resp.headword.clone(),
                 rows: rows.clone(),
-                headword,
-                reading,
-                anchor_x,
-                anchor_y,
-                locked: true,
-                source_row_index: 0,
-                source_start_char: 0,
-                rich_epoch: 1,
-                row_extras,
-                glossary_cache: GlossaryDocLruCache::new_nested(),
-                last_rendered_key: HashMap::new(),
-                selection: None,
-                scan_highlight: None,
-                expanded_cards: HashSet::new(),
-                row_anki_duplicates: vec![false; row_count],
-                row_anki_note_ids_i64: vec![0; row_count],
-                row_anki_browse_queries: vec![SharedString::default(); row_count],
-                row_anki_tags: vec![SharedString::default(); row_count],
-            };
-            let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
-            st.nested_stack.truncate(base);
-            if st.nested_stack.len() >= max_depth {
-                st.nested_stack.pop();
-            }
-            let keep = st.nested_stack.len();
-            st.pending_nested_anki_adds.retain(|p| p.depth <= keep);
-            st.nested_body_hover_count = 0;
-            st.nested_stack.push(level);
-            st.nested_stack.len()
-        };
-        self.sync_nested_popup_to_bridge(app, true);
-        self.dispatch_anki_check_for_rows(app, &rows, Some(target_depth));
-    }
-
-    pub(super) fn navigate_nested_kanji(
-        &self,
-        app: &MementoApp,
-        from_depth: i32,
-        expression: &str,
-        clicked_kanji: &str,
-    ) {
-        let target_char = clicked_kanji
-            .chars()
-            .find(|&c| is_kanji_char(c))
-            .or_else(|| expression.chars().find(|&c| is_kanji_char(c)));
-        let Some(ch) = target_char else {
-            return;
-        };
-        let query = ch.to_string();
-        self.ensure_fresh_db_and_config(app, true);
-        let (hits, excluded) = {
-            let mut st = self.state.borrow_mut();
-            let hits = st.dict_ctrl.search_kanji(&query).to_vec();
-            let excluded = st.settings.excluded_glossaries.clone();
-            (hits, excluded)
-        };
-        if hits.is_empty() {
-            app.set_status_message(format!("No kanji entry found for {query}").into());
-            return;
-        }
-        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped(&hits, &excluded);
-        let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
-        let target_depth = {
-            let mut st = self.state.borrow_mut();
-            let max_depth = st.settings.max_recursion_depth;
-            if max_depth == 0 {
-                return;
-            }
-            let (anchor_x, anchor_y) = st
-                .nested_level(from_depth)
-                .map(|l| (l.anchor_x, l.anchor_y))
-                .unwrap_or((80.0, 80.0));
-            let state_ref = &mut *st;
-            let (row_extras, kanji_freq_updates) = build_row_extras_for_grouped(
-                &mut state_ref.db_helper,
-                &mut state_ref.dict_ctrl,
-                &rows,
-                &grouped_hits,
-                None,
-            );
-            apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
-            let row_count = rows.len();
-            let level = NestedPopupLevel {
-                label: query.clone(),
-                rows: rows.clone(),
-                headword: query,
-                reading,
+                headword: resp.headword,
+                reading: resp.reading,
                 anchor_x,
                 anchor_y,
                 locked: true,

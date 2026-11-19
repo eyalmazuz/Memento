@@ -19,20 +19,20 @@ pub fn normalize_nfkc(text: &str) -> String {
     text.nfkc().collect()
 }
 
+#[inline]
+fn kata_to_hira_char(ch: char) -> char {
+    let code = ch as u32;
+    if (u32::from(KATAKANA_LOW)..=u32::from(KATAKANA_HIGH)).contains(&code) {
+        char::from_u32(u32::from(HIRAGANA_LOW) + (code - u32::from(KATAKANA_LOW))).unwrap_or(ch)
+    } else {
+        ch
+    }
+}
+
 /// Converts katakana (`ァ`..=`ヶ`) in `text` to hiragana (`ぁ`..=`ゖ`), leaving other characters intact.
 #[must_use]
 pub fn kata_to_hira_str(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            let code = ch as u32;
-            if (u32::from(KATAKANA_LOW)..=u32::from(KATAKANA_HIGH)).contains(&code) {
-                char::from_u32(u32::from(HIRAGANA_LOW) + (code - u32::from(KATAKANA_LOW)))
-                    .unwrap_or(ch)
-            } else {
-                ch
-            }
-        })
-        .collect()
+    text.chars().map(kata_to_hira_char).collect()
 }
 
 /// Converts hiragana (`ぁ`..=`ゖ`) in `text` to katakana (`ァ`..=`ヶ`), leaving other characters intact.
@@ -51,11 +51,18 @@ pub fn hira_to_kata_str(text: &str) -> String {
         .collect()
 }
 
-/// Normalizes text with NFKC followed by katakana-to-hiragana folding.
+/// Normalizes text with NFKC followed by katakana-to-hiragana folding in a single pass.
 #[must_use]
 pub fn normalize_reading_str(text: &str) -> String {
-    let nfkc = normalize_nfkc(text);
-    kata_to_hira_str(&nfkc)
+    text.nfkc().map(kata_to_hira_char).collect()
+}
+
+/// Compares two readings after NFKC + katakana-to-hiragana folding with zero heap allocations.
+#[must_use]
+pub(crate) fn normalized_readings_eq(a: &str, b: &str) -> bool {
+    a.nfkc()
+        .map(kata_to_hira_char)
+        .eq(b.nfkc().map(kata_to_hira_char))
 }
 
 /// Returns `true` if `ch` is a CJK Unified, Extension A-I, or Compatibility ideograph.

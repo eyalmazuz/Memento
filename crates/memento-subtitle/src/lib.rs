@@ -5,10 +5,11 @@ pub mod subtitleparser;
 pub mod model;
 
 pub use subtitleentry::SubtitleEntry;
-pub use subtitleparser::{parse_subtitles, Format};
+pub use subtitleparser::{parse_subtitles, parse_subtitles_str, Format};
 pub use model::{
-    collect_overlapping_spans, diff_items, find_first_overlapping_span, plan_add_subtitle,
-    same_entry, select_position_rows, AddAction, AddPlan, ModelDiffPlan, SubtitleCueView,
-    SubtitleSpanC, MAX_NEWLINE_COUNT, MAX_TEXT_LENGTH, TIME_DELTA,
+    collect_overlapping_spans, diff_items, find_first_overlapping_span, find_matching_rows,
+    find_matching_rows_str, plan_add_subtitle, same_entry, select_position_rows, AddAction,
+    AddPlan, ModelDiffPlan, SubtitleCueView, SubtitleSpanC, MAX_NEWLINE_COUNT, MAX_TEXT_LENGTH,
+    TIME_DELTA,
 };
 

@@ -49,11 +49,26 @@ pub fn parse_frequency_value(frequency: &[u16]) -> Option<f64> {
     }
 
     if matched_len > 0 {
-        let s: String = frequency[..matched_len]
-            .iter()
-            .map(|&c| c as u8 as char)
-            .collect();
-        if let Ok(val) = s.parse::<f64>() {
+        let mut stack_buf = [0u8; 64];
+        let parsed = if matched_len <= stack_buf.len() {
+            for (dst, &unit) in stack_buf[..matched_len]
+                .iter_mut()
+                .zip(&frequency[..matched_len])
+            {
+                *dst = unit as u8;
+            }
+            // All bytes in `frequency[..matched_len]` are verified ASCII (`+`, `-`, `.`, `0`..=`9`).
+            std::str::from_utf8(&stack_buf[..matched_len])
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        } else {
+            let s: String = frequency[..matched_len]
+                .iter()
+                .map(|&c| c as u8 as char)
+                .collect();
+            s.parse::<f64>().ok()
+        };
+        if let Some(val) = parsed {
             if val.is_finite() {
                 return Some(val);
             }

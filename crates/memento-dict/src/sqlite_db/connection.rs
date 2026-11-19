@@ -12,16 +12,16 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 const READ_ONLY_PRAGMAS: &str = "\
-    PRAGMA cache_size = -65536;\
-    PRAGMA mmap_size = 268435456;\
+    PRAGMA cache_size = -12288;\
+    PRAGMA mmap_size = 33554432;\
     PRAGMA temp_store = MEMORY;\
     PRAGMA synchronous = NORMAL;";
 
 const READ_WRITE_PRAGMAS: &str = "\
     PRAGMA journal_mode = WAL;\
     PRAGMA synchronous = NORMAL;\
-    PRAGMA cache_size = -65536;\
-    PRAGMA mmap_size = 268435456;\
+    PRAGMA cache_size = -12288;\
+    PRAGMA mmap_size = 33554432;\
     PRAGMA temp_store = MEMORY;";
 
 /// File length and modification timestamp snapshot used to detect external changes.
@@ -48,7 +48,7 @@ pub fn db_file_fingerprint(path: &Path) -> DbFileFingerprint {
 }
 
 /// Opens a read-only `rusqlite::Connection` configured with `busy_timeout(5s)`,
-/// 64 MiB page cache, 256 MiB mmap, in-memory temp store, and statement caching.
+/// 12 MiB page cache, 32 MiB mmap, in-memory temp store, and statement caching.
 pub fn open_read_only_connection(path: &Path) -> Result<Connection, DictError> {
     if path.as_os_str().is_empty() {
         return Err(DictError::Other("Database path is empty".to_owned()));
@@ -71,7 +71,7 @@ pub fn configure_read_only_connection(conn: &Connection) -> Result<(), DictError
 }
 
 /// Opens a read-write `rusqlite::Connection` configured with `WAL`,
-/// `synchronous = NORMAL`, 64 MiB cache, 256 MiB mmap, `temp_store = MEMORY`,
+/// `synchronous = NORMAL`, 12 MiB cache, 32 MiB mmap, `temp_store = MEMORY`,
 /// and `busy_timeout(5s)`.
 pub fn open_read_write_connection(path: &Path) -> Result<Connection, DictError> {
     if path.as_os_str().is_empty() {

@@ -19,7 +19,7 @@ use crate::app::preferences::{
 use crate::app::subtitle_drawer::{
     auto_scroll_subtitle_drawer_if_needed, refresh_secondary_subtitle_list, refresh_subtitle_list,
 };
-use crate::app::video_pipeline::{SyncTiming, VideoTimings};
+use crate::app::video_pipeline::{SyncTiming, VideoParamsObserver, VideoTimings};
 use crate::app::window_chrome::{chapter_marks_for_duration, query_window_monitor_logical};
 use crate::app::workers::{ChannelSlot, MkvExtractRequest, UiDispatchGuard, UiEvent, UiRelay};
 use crate::controller::asr::{AsrController, AsrSettings};
@@ -32,7 +32,10 @@ use crate::controller::subtitles::{
     create_cue, prewarm_subtitle_furigana, ExternalSubtitleLoad, SubtitleController,
 };
 use crate::platform_window::compute_auto_fit_window_rect;
-use crate::ui::{publish_active_subtitle, subtitle_lines_for_app, MementoApp, SubEntry};
+use crate::ui::{
+    active_subtitle_style_for_app, prewarm_subtitle_tokens, publish_active_subtitle,
+    subtitle_lines_for_app, MementoApp, SubEntry,
+};
 use memento_player::MpvInstance;
 
 pub(crate) struct SyncLoopHandles {
@@ -67,6 +70,9 @@ pub(crate) fn install_sync_loop(
     screensaver: Rc<RefCell<memento_os::Screensaver>>,
     ui_relay: UiRelay,
     handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)>,
+    gl_prefer_16f: Rc<Cell<bool>>,
+    default_prefer_16f: bool,
+    video_params_observer: Rc<RefCell<VideoParamsObserver>>,
     verbose_video_timings: bool,
 ) -> SyncLoopHandles {
     // Keep a local unbounded sender view into `furigana_tx` for `ui::publish_active_subtitle`.
@@ -103,12 +109,16 @@ pub(crate) fn install_sync_loop(
         let sync_mkv_tx = mkv_tx;
         let sync_ass_ctrl = ass_ctrl.clone();
         let sync_screensaver = screensaver;
+        let sync_gl_prefer_16f = gl_prefer_16f;
+        let sync_video_params = video_params_observer;
         let extracted_mkv_fonts_gen: Cell<Option<u64>> = Cell::new(None);
         let extracted_mkv_tracks: RefCell<HashSet<(u64, i64)>> = RefCell::new(HashSet::new());
         // Cached `(gen, is_local_mkv)` so `media_path.is_file()` (`stat()`) runs AT MOST ONCE per file!
         let mkv_file_probe: Cell<Option<(u64, bool)>> = Cell::new(None);
         // Cached `(gen, primary_sid, secondary_sid, track_count)` to skip MKV work on steady ticks.
         let last_mkv_trigger_key: Cell<Option<(u64, i64, i64, usize)>> = Cell::new(None);
+        // Cached `(gen, video_id)` for one-shot SDR vs 10-bit/HDR FBO format updates.
+        let last_video_fbo_key: Cell<Option<(u64, i64)>> = Cell::new(None);
         let previous_furigana_visible = Cell::new(app.get_furigana_visible());
         let previous_subtitle_layout: Cell<Option<(i32, i32, u32, bool)>> = Cell::new(None);
         let previous_chapters: RefCell<Vec<f64>> = RefCell::new(Vec::new());
@@ -119,6 +129,7 @@ pub(crate) fn install_sync_loop(
         let previous_playback_active: Cell<Option<bool>> = Cell::new(None);
         let previous_active_scroll: Cell<(bool, i32, Option<usize>, Option<usize>)> =
             Cell::new((false, 0, None, None));
+        let previous_prewarm_key: Cell<Option<(u64, i64, usize, i32, u32, bool)>> = Cell::new(None);
         let last_video_report = Cell::new(Instant::now());
         let previous_drops = Cell::new((0i64, 0i64));
         let last_sync = Cell::new(Instant::now());
@@ -185,6 +196,8 @@ pub(crate) fn install_sync_loop(
                 extracted_mkv_tracks.borrow_mut().clear();
                 mkv_file_probe.set(None);
                 last_mkv_trigger_key.set(None);
+                last_video_fbo_key.set(None);
+                previous_prewarm_key.set(None);
                 if let Ok(mut ass) = sync_ass_ctrl.try_borrow_mut() {
                     ass.clear_for_new_media(&app);
                 }
@@ -195,6 +208,33 @@ pub(crate) fn install_sync_loop(
 
             let primary_is_native_ass = coord.primary_is_native_ass(&app);
             let state = coord.playback_state();
+
+            // Drain non-blocking `video-params/*` observer and switch OpenGL FBO format
+            // between `GL_RGBA8` (8-bit SDR: half VRAM & bandwidth) and `GL_RGBA16F`
+            // (10-bit / HDR) only on file load or video track/format changes.
+            if let Ok(mut obs) = sync_video_params.try_borrow_mut() {
+                obs.poll();
+                if obs.is_active() {
+                    if state.file_loaded && (state.dimensions.0 > 0 || state.video_width > 0) {
+                        let fbo_key = (gen_after, state.video_id);
+                        let key_changed = last_video_fbo_key.get() != Some(fbo_key);
+                        let params_changed = obs.take_dirty();
+                        if key_changed || params_changed {
+                            last_video_fbo_key.set(Some(fbo_key));
+                            let want_16f = obs.prefers_16f();
+                            if sync_gl_prefer_16f.replace(want_16f) != want_16f {
+                                app.window().request_redraw();
+                            }
+                        }
+                    } else if !state.file_loaded && sync_current_media.borrow().is_none() {
+                        last_video_fbo_key.set(None);
+                        let _ = obs.take_dirty();
+                        if sync_gl_prefer_16f.replace(default_prefer_16f) != default_prefer_16f {
+                            app.window().request_redraw();
+                        }
+                    }
+                }
+            }
 
             // Trigger non-blocking MKV EBML extraction ONLY when `(gen, primary_sid, secondary_sid, track_count)`
             // changes, caching the `is_matroska_path && is_file()` check once per generation (zero per-tick `stat()`).
@@ -332,10 +372,41 @@ pub(crate) fn install_sync_loop(
                     ss.sync_playback(state.file_loaded, state.paused, "Playing media");
                 }
             }
-            let prim_active = subtitles
-                .active_indices(subtitles.primary_sid())
-                .first()
-                .copied();
+            let prim_sid = subtitles.primary_sid();
+            let prim_active = subtitles.active_indices(prim_sid).first().copied();
+            let subtitle_overlay_shown = app.get_subtitles_visible()
+                && !primary_is_native_ass
+                && !(app.get_hide_memento_while_playing() && !state.paused);
+            if subtitle_overlay_shown && app.get_video_height() > 0 {
+                if let Some(active_idx) = prim_active {
+                    let prewarm_key = (
+                        gen_after,
+                        prim_sid,
+                        active_idx,
+                        app.get_video_height(),
+                        app.get_subtitle_scale().to_bits(),
+                        app.get_furigana_visible(),
+                    );
+                    if previous_prewarm_key.get() != Some(prewarm_key) {
+                        previous_prewarm_key.set(Some(prewarm_key));
+                        let upcoming: Vec<String> = ((active_idx + 1)..=(active_idx + 3))
+                            .filter_map(|idx| subtitles.cue_text(idx))
+                            .filter(|line| !line.trim().is_empty())
+                            .collect();
+                        if !upcoming.is_empty() {
+                            let font_px =
+                                (app.get_video_height() as f32 * app.get_subtitle_scale()).max(8.0);
+                            let style = active_subtitle_style_for_app(&app);
+                            prewarm_subtitle_tokens(
+                                upcoming,
+                                font_px,
+                                app.get_furigana_visible(),
+                                style,
+                            );
+                        }
+                    }
+                }
+            }
             let sec_sid = subtitles.secondary_sid();
             let sec_count = subtitles.secondary_entries().len();
             let sec_active = subtitles.active_indices(sec_sid).first().copied();

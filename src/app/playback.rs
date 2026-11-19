@@ -935,6 +935,7 @@ pub(crate) fn install_playback_handlers(
             app.set_current_time("00:00".into());
             app.set_duration_time("00:00".into());
         }
+        crate::app::trim_os_heap();
     });
 
     // ── Bounded Graceful Quit / Close Window Handler ────────────────────────

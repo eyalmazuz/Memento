@@ -1,31 +1,10 @@
-//! Furigana, tags, kanji, term glossary, and audio URL/filename formatting.
+//! Furigana, tags, kanji, and term glossary HTML formatting.
 
 use std::collections::BTreeSet;
 
 use crate::glossary::escape::{
     append_escaped, append_escaped_style_block, ascii_to_u16, push_ascii,
 };
-use crate::note::metadata::replace_all;
-use crate::strings::qt_is_space;
-
-const HEX_UPPER: [u16; 16] = [
-    b'0' as u16,
-    b'1' as u16,
-    b'2' as u16,
-    b'3' as u16,
-    b'4' as u16,
-    b'5' as u16,
-    b'6' as u16,
-    b'7' as u16,
-    b'8' as u16,
-    b'9' as u16,
-    b'A' as u16,
-    b'B' as u16,
-    b'C' as u16,
-    b'D' as u16,
-    b'E' as u16,
-    b'F' as u16,
-];
 
 /// Borrowed furigana pair (surface and optional reading).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,7 +15,11 @@ pub struct FuriganaPair<'a> {
 
 /// Matches `getFurigana` and `getFuriganaPlain` pair formatting in `notebuilder.cpp`.
 pub fn format_furigana(pairs: &[FuriganaPair<'_>], plain: bool) -> Vec<u16> {
-    let mut result = Vec::new();
+    let cap: usize = pairs
+        .iter()
+        .map(|p| p.surface.len() + p.reading.len() + if plain { 2 } else { 22 })
+        .sum();
+    let mut result = Vec::with_capacity(cap);
     for pair in pairs {
         if pair.reading.is_empty() {
             if plain {
@@ -60,25 +43,6 @@ pub fn format_furigana(pairs: &[FuriganaPair<'_>], plain: bool) -> Vec<u16> {
     result
 }
 
-/// Matches `getSelection` in `notebuilder.cpp`.
-pub fn format_selection(selections: &[&[u16]]) -> Vec<u16> {
-    if selections.is_empty() {
-        return Vec::new();
-    }
-    if selections.len() == 1 {
-        return selections[0].to_vec();
-    }
-    let mut result = Vec::new();
-    push_ascii(&mut result, "<ul>");
-    for &item in selections {
-        push_ascii(&mut result, "<li>");
-        result.extend_from_slice(item);
-        push_ascii(&mut result, "</li>");
-    }
-    push_ascii(&mut result, "</ul>");
-    result
-}
-
 /// Borrowed tag entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TagEntry<'a> {
@@ -92,7 +56,12 @@ pub fn format_tags(tags: &[TagEntry<'_>], brief: bool) -> Vec<u16> {
     if tags.is_empty() {
         return Vec::new();
     }
-    let mut result = Vec::new();
+    let cap = 9
+        + tags
+            .iter()
+            .map(|t| 11 + t.name.len() + if brief { 0 } else { t.notes.len() })
+            .sum::<usize>();
+    let mut result = Vec::with_capacity(cap);
     push_ascii(&mut result, "<ul>");
     for tag in tags {
         push_ascii(&mut result, "<li>");
@@ -112,7 +81,8 @@ pub fn format_kanji_readings(readings: &[&[u16]]) -> Vec<u16> {
     if readings.is_empty() {
         return Vec::new();
     }
-    let mut result = Vec::new();
+    let cap = readings.iter().map(|r| r.len()).sum::<usize>() + (readings.len() - 1) * 2;
+    let mut result = Vec::with_capacity(cap);
     for (i, &reading) in readings.iter().enumerate() {
         if i > 0 {
             push_ascii(&mut result, ", ");
@@ -137,7 +107,7 @@ pub fn format_kanji_glossary(defs: &[KanjiDefEntry<'_>]) -> Vec<u16> {
         return Vec::new();
     }
 
-    let mut glossary = Vec::new();
+    let mut glossary = Vec::with_capacity(64);
     push_ascii(&mut glossary, "<ol>");
     for def in defs {
         if def.glossary.is_empty() {
@@ -175,122 +145,6 @@ pub fn find_stroke_count<'a>(stats: &[StrokeCountStat<'a>]) -> Option<&'a [u16]>
         .iter()
         .find(|stat| stat.notes == STROKE_COUNT.as_slice())
         .map(|stat| stat.value)
-}
-
-/// Percent-encodes UTF-16 text (via UTF-8 bytes) keeping only RFC 3986
-/// unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`).
-fn percent_encode_url_component(input: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(input.len() * 3);
-    let mut utf8_buf = [0u8; 4];
-    for decoded in char::decode_utf16(input.iter().copied()) {
-        let ch = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
-        for &byte in ch.encode_utf8(&mut utf8_buf).as_bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                out.push(byte as u16);
-            } else {
-                out.push(b'%' as u16);
-                out.push(HEX_UPPER[(byte >> 4) as usize]);
-                out.push(HEX_UPPER[(byte & 0x0f) as usize]);
-            }
-        }
-    }
-    out
-}
-
-/// Appends a sanitized filename component: strips NUL/control chars and lone
-/// surrogates, replaces whitespace and filesystem/Anki/HTML metacharacters
-/// with `_`, and neutralizes `..` runs.
-fn append_sanitized_filename_part(input: &[u16], out: &mut Vec<u16>) {
-    let mut utf16_buf = [0u16; 2];
-    for decoded in char::decode_utf16(input.iter().copied()) {
-        let Ok(ch) = decoded else {
-            continue;
-        };
-        let cp = ch as u32;
-        if cp < 0x20 || cp == 0x7f {
-            continue;
-        }
-        if cp <= 0xffff && qt_is_space(cp as u16) {
-            out.push(b'_' as u16);
-            continue;
-        }
-        if matches!(
-            ch,
-            '/' | '\\'
-                | ':'
-                | '*'
-                | '?'
-                | '"'
-                | '\''
-                | '<'
-                | '>'
-                | '|'
-                | '['
-                | ']'
-                | '&'
-                | '#'
-                | '%'
-        ) {
-            out.push(b'_' as u16);
-            continue;
-        }
-        if ch == '.' && out.last() == Some(&(b'.' as u16)) {
-            out.pop();
-            out.push(b'_' as u16);
-            out.push(b'_' as u16);
-            continue;
-        }
-        out.extend_from_slice(ch.encode_utf16(&mut utf16_buf));
-    }
-}
-
-/// Matches `createAudio` URL and filename formatting in `notebuilder.cpp`,
-/// percent-encoding URL template substitutions and sanitizing the generated
-/// Anki media filename.
-pub fn format_audio_url_and_filename(
-    url: &[u16],
-    source_name: &[u16],
-    expression: &[u16],
-    reading: &[u16],
-    reading_as_expression: bool,
-) -> (Vec<u16>, Vec<u16>) {
-    let expression_val = if reading_as_expression {
-        reading
-    } else {
-        expression
-    };
-    let reading_val = if reading.is_empty() || reading_as_expression {
-        expression_val
-    } else {
-        reading
-    };
-
-    const REPLACE_EXPRESSION: [u16; 12] = ascii_to_u16("{expression}");
-    const REPLACE_TERM: [u16; 6] = ascii_to_u16("{term}");
-    const REPLACE_READING: [u16; 9] = ascii_to_u16("{reading}");
-
-    let encoded_expression = percent_encode_url_component(expression_val);
-    let encoded_reading = percent_encode_url_component(reading_val);
-
-    let mut formatted_url = url.to_vec();
-    replace_all(&mut formatted_url, &REPLACE_EXPRESSION, &encoded_expression);
-    replace_all(&mut formatted_url, &REPLACE_TERM, &encoded_expression);
-    replace_all(&mut formatted_url, &REPLACE_READING, &encoded_reading);
-
-    let mut filename =
-        Vec::with_capacity(14 + source_name.len() + reading.len() + expression.len());
-    push_ascii(&mut filename, "memento_");
-    append_sanitized_filename_part(source_name, &mut filename);
-    filename.push(b'_' as u16);
-    append_sanitized_filename_part(reading, &mut filename);
-    filename.push(b'_' as u16);
-    append_sanitized_filename_part(expression, &mut filename);
-    while filename.last() == Some(&(b'.' as u16)) {
-        filename.pop();
-    }
-    push_ascii(&mut filename, ".mp3");
-
-    (formatted_url, filename)
 }
 
 /// Borrowed definition entry for term glossary formatting.
@@ -473,28 +327,4 @@ pub fn format_term_glossary_selected(
         glossary_brief,
         glossary_compact,
     }
-}
-
-/// Builds a single requested term glossary HTML variant without building the
-/// other two variants.
-pub fn format_term_glossary_variant(
-    defs: &[TermGlossaryDef<'_>],
-    variant: TermGlossaryVariant,
-) -> Vec<u16> {
-    match variant {
-        TermGlossaryVariant::Full => {
-            format_term_glossary_selected(defs, TermGlossaryVariants::FULL).glossary
-        }
-        TermGlossaryVariant::Brief => {
-            format_term_glossary_selected(defs, TermGlossaryVariants::BRIEF).glossary_brief
-        }
-        TermGlossaryVariant::Compact => {
-            format_term_glossary_selected(defs, TermGlossaryVariants::COMPACT).glossary_compact
-        }
-    }
-}
-
-/// Matches `getGlossary(const QList<TermDefinition *> &)` in `notebuilder.cpp`.
-pub fn format_term_glossary(defs: &[TermGlossaryDef<'_>]) -> TermGlossaryOutput {
-    format_term_glossary_selected(defs, TermGlossaryVariants::ALL)
 }

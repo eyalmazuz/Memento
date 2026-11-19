@@ -14,9 +14,7 @@ use self::escape::{append_escaped, ascii_to_u16};
 use self::media::add_image;
 use self::structured::add_structured_content;
 
-pub use self::escape::{
-    escape_html, escape_html_lines, format_g, qstring_number, qstring_number_i32,
-};
+pub use self::escape::format_g;
 pub use self::structured::{
     is_supported_structured_tag, structured_data_attribute_name, MAX_STRUCTURED_CONTENT_DEPTH,
 };
@@ -28,27 +26,6 @@ const KEY_TYPE: [u16; 4] = ascii_to_u16("type");
 const VALUE_TYPE_IMAGE: [u16; 5] = ascii_to_u16("image");
 const VALUE_TYPE_STRUCTURED_CONTENT: [u16; 18] = ascii_to_u16("structured-content");
 const VALUE_TYPE_TEXT: [u16; 4] = ascii_to_u16("text");
-
-/// Render just the two top-level *textual* glossary entry forms: a JSON
-/// string, or an object with `"type": "text"`. Other values return None;
-/// this is not a replacement for `build_glossary`'s image/structured dispatch.
-/// `QJsonValue::toString()` on a missing or non-string `text` yields empty.
-pub fn render_text_entry(value: &JsonValue) -> Option<Vec<u16>> {
-    match value {
-        JsonValue::String(text) => Some(escape_html_lines(text)),
-        JsonValue::Object(obj)
-            if obj.get(KEY_TYPE.as_slice()).and_then(JsonValue::as_qstring)
-                == Some(VALUE_TYPE_TEXT.as_slice()) =>
-        {
-            let text = obj
-                .get(KEY_TEXT.as_slice())
-                .and_then(JsonValue::as_qstring)
-                .unwrap_or(&[]);
-            Some(escape_html_lines(text))
-        }
-        _ => None,
-    }
-}
 
 fn add_text(obj: &JsonObject, out: &mut Vec<u16>) {
     let text = obj
@@ -142,6 +119,18 @@ mod tests {
         String::from_utf16_lossy(units)
     }
 
+    fn escape_html(input: &[u16]) -> Vec<u16> {
+        let mut out = Vec::with_capacity(input.len());
+        append_escaped(input, &mut out, false);
+        out
+    }
+
+    fn escape_html_lines(input: &[u16]) -> Vec<u16> {
+        let mut out = Vec::with_capacity(input.len());
+        append_escaped(input, &mut out, true);
+        out
+    }
+
     #[test]
     fn escapes_qt_four_html_metacharacters_but_not_apostrophes() {
         assert_eq!(
@@ -166,29 +155,6 @@ mod tests {
         let escaped = [0xD800, 0xD83D, 0xDE00, 0x26, 0x61, 0x6d, 0x70, 0x3b, 0xDC00];
         assert_eq!(escape_html(&input), escaped);
         assert_eq!(escape_html_lines(&input), escaped);
-    }
-
-    #[test]
-    fn textual_entries_obey_qjson_type_checks() {
-        let mut obj = JsonObject::new();
-        obj.insert(u("type"), JsonValue::String(u("text")));
-        obj.insert(u("text"), JsonValue::String(u("<hello>\nworld")));
-        assert_eq!(
-            render_text_entry(&JsonValue::Object(obj.clone())),
-            Some(u("&lt;hello&gt;<br>world"))
-        );
-        assert_eq!(
-            render_text_entry(&JsonValue::String(u("x&y"))),
-            Some(u("x&amp;y"))
-        );
-        obj.insert(u("text"), JsonValue::Number(2.0));
-        assert_eq!(
-            render_text_entry(&JsonValue::Object(obj.clone())),
-            Some(Vec::new())
-        );
-        obj.insert(u("type"), JsonValue::String(u("image")));
-        assert_eq!(render_text_entry(&JsonValue::Object(obj)), None);
-        assert_eq!(render_text_entry(&JsonValue::Null), None);
     }
 
     #[test]

@@ -103,7 +103,18 @@ fn parse_marker_i32(value: &[u16]) -> Option<i32> {
 }
 
 fn parse_marker_f64(value: &[u16]) -> Option<f64> {
-    let parsed: f64 = String::from_utf16(trim_u16(value)).ok()?.parse().ok()?;
+    let trimmed = trim_u16(value);
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    for (dst, &unit) in buf[..trimmed.len()].iter_mut().zip(trimmed) {
+        if unit > 0x7f {
+            return None;
+        }
+        *dst = unit as u8;
+    }
+    let parsed: f64 = std::str::from_utf8(&buf[..trimmed.len()]).ok()?.parse().ok()?;
     parsed.is_finite().then_some(parsed)
 }
 

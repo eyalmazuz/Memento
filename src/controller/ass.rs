@@ -15,9 +15,7 @@ use memento_player::mpv::PlaybackState;
 use slint::{ComponentHandle, Model, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 use crate::controller::subtitles::{cached_subtitle_furigana_parts, prewarm_subtitle_furigana};
-use crate::ui::{
-    AssHighlightPatch, AssLineHitbox, AssRubyItem, MementoApp, SubtitleOverlayBridge,
-};
+use crate::ui::{AssHighlightPatch, AssLineHitbox, AssRubyItem, MementoApp, SubtitleOverlayBridge};
 
 /// Minimum interval between animated-geometry (`\move` / geometry `\t`) layout re-probes (~15 Hz).
 const ANIMATED_PROBE_INTERVAL: Duration = Duration::from_millis(66);
@@ -109,11 +107,8 @@ pub fn rgba_patch_to_slint_image(patch: &RgbaPatch) -> Option<slint::Image> {
     if patch.rgba.len() != expected {
         return None;
     }
-    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-        &patch.rgba,
-        patch.width,
-        patch.height,
-    );
+    let buf =
+        SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&patch.rgba, patch.width, patch.height);
     Some(slint::Image::from_rgba8(buf))
 }
 
@@ -146,7 +141,11 @@ pub fn build_ass_ruby_items(
             if surf_len == 0 {
                 continue;
             }
-            let Some(rel) = ev.plain_text.get(cursor_byte..).and_then(|s| s.find(&surface)) else {
+            let Some(rel) = ev
+                .plain_text
+                .get(cursor_byte..)
+                .and_then(|s| s.find(&surface))
+            else {
                 continue;
             };
             let b0 = cursor_byte + rel;
@@ -164,10 +163,7 @@ pub fn build_ass_ruby_items(
                 }
                 let mut min_x = f32::INFINITY;
                 let mut max_x = f32::NEG_INFINITY;
-                let line_chars = ev
-                    .chars
-                    .get(line.char_start..line.char_end)
-                    .unwrap_or(&[]);
+                let line_chars = ev.chars.get(line.char_start..line.char_end).unwrap_or(&[]);
                 for c in line_chars {
                     if c.byte_offset >= b0 && c.byte_offset < b1 && c.has_ink {
                         min_x = min_x.min(c.x);
@@ -334,6 +330,7 @@ impl AssOverlayController {
     /// Reset all state when switching or closing media files.
     pub fn clear_for_new_media(&mut self, app: &MementoApp) {
         self.loaded_fonts.clear();
+        self.loaded_fonts.shrink_to_fit();
         self.font_generation = self.font_generation.wrapping_add(1);
         if let Some(engine) = self.engine.as_mut() {
             if let Err(err) = engine.load_memory_fonts(&[]) {
@@ -341,6 +338,7 @@ impl AssOverlayController {
             }
             self.applied_font_generation = self.font_generation;
         }
+        crate::app::trim_os_heap();
         self.last_probe_key = None;
         self.last_animated_probe_at = None;
         self.layout = None;
@@ -389,8 +387,12 @@ impl AssOverlayController {
 
         let area_w = app.get_video_width().max(1) as f32;
         let area_h = app.get_video_height().max(1) as f32;
-        let transform =
-            ViewportTransform::contain(area_w, area_h, params.frame_w.max(1), params.frame_h.max(1));
+        let transform = ViewportTransform::contain(
+            area_w,
+            area_h,
+            params.frame_w.max(1),
+            params.frame_h.max(1),
+        );
         let viewport_changed = self.last_viewport != Some(transform);
         self.last_viewport = Some(transform);
 
@@ -478,7 +480,11 @@ impl AssOverlayController {
 
         // Optional Alt+A furigana over ASS lines (strictly non-blocking on the UI thread).
         let furigana_visible = app.get_furigana_visible();
-        let furi_key = (self.layout_revision, furigana_visible, furigana_ratio.to_bits());
+        let furi_key = (
+            self.layout_revision,
+            furigana_visible,
+            furigana_ratio.to_bits(),
+        );
         if self.last_furigana_key != Some(furi_key) {
             if !furigana_visible {
                 self.last_furigana_key = Some(furi_key);

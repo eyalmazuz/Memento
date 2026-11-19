@@ -13,8 +13,7 @@ use memento_util::mecab::MecabLookupToken;
 
 use super::db::{DictionaryMetadataSnapshot, ReadOnlyDictionaryDb};
 use super::glossary::{
-    cache_parsed_glossary, clean_raw_glossary, parse_glossary_entry_value, parse_rich_glossary,
-    parse_rich_glossary_value, strip_glossary_markup,
+    cache_parsed_glossary, clean_raw_glossary, parse_glossary_entry_value, strip_glossary_markup,
 };
 use super::meta::select_term_frequencies;
 use super::{ClozeSentence, DictControllerError, DictTag, SearchHit};
@@ -550,16 +549,12 @@ pub(super) fn database_search_candidates(
             let Some((cleaned_raw, parsed_val)) = clean_raw_glossary(&row.glossary) else {
                 continue;
             };
-            let (glossary, example_ja, example_en, rich_glossary) = match parsed_val.as_deref() {
-                Some(value) => {
-                    let (g, ja, en) = parse_glossary_entry_value(value);
-                    (g, ja, en, parse_rich_glossary_value(value))
-                }
+            let (glossary, example_ja, example_en) = match parsed_val.as_deref() {
+                Some(value) => parse_glossary_entry_value(value),
                 None => (
                     strip_glossary_markup(&cleaned_raw),
                     String::new(),
                     String::new(),
-                    parse_rich_glossary(&cleaned_raw),
                 ),
             };
             if let Some(ref arc_val) = parsed_val {
@@ -596,7 +591,7 @@ pub(super) fn database_search_candidates(
                     example_ja,
                     example_en,
                     dict_name: dictionary_name.clone(),
-                    rich_glossary,
+                    rich_glossary: Vec::new(),
                     derivation,
                     derivation_descriptions,
                     dictionary_id: row.dic_id,

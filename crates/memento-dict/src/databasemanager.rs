@@ -49,21 +49,29 @@ pub fn is_mora_skip_char(ch: char) -> bool {
     u16::try_from(ch as u32).is_ok_and(is_mora_skip_unit)
 }
 
+#[inline]
+fn kata_to_hira_unit(ch: u16) -> u16 {
+    if (KATAKANA_LOW..=KATAKANA_HIGH).contains(&ch) {
+        HIRAGANA_LOW + (ch - KATAKANA_LOW)
+    } else {
+        ch
+    }
+}
+
 /// Converts all katakana in `query` in the range `0x30A1..=0x30F6` to hiragana
 /// by shifting code units by `-0x60` (`0x3041 + (code - 0x30A1)`), matching
 /// `DatabaseManager::kataToHira`.
 #[must_use]
 pub fn kata_to_hira(query: &[u16]) -> Vec<u16> {
-    query
-        .iter()
-        .map(|&ch| {
-            if (KATAKANA_LOW..=KATAKANA_HIGH).contains(&ch) {
-                HIRAGANA_LOW + (ch - KATAKANA_LOW)
-            } else {
-                ch
-            }
-        })
-        .collect()
+    query.iter().map(|&ch| kata_to_hira_unit(ch)).collect()
+}
+
+#[inline]
+fn kata_to_hira_eq(a: &[u16], b: &[u16]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(&x, &y)| kata_to_hira_unit(x) == kata_to_hira_unit(y))
 }
 
 /// Splits a UTF-16 reading into mora segments according to Memento/Yomitan pitch
@@ -230,8 +238,7 @@ pub fn metadata_reading_matches(
             } else {
                 let matched = r.is_empty()
                     || r == expression
-                    || crate::normalize::normalize_reading_str(r)
-                        == crate::normalize::normalize_reading_str(expression);
+                    || crate::normalize::normalized_readings_eq(r, expression);
                 (matched, matched && !r.is_empty())
             }
         }
@@ -304,7 +311,7 @@ pub fn parse_pitch_blob(
     } else {
         reading_u16.is_empty()
             || reading_u16 == term_exp
-            || kata_to_hira(&reading_u16) == kata_to_hira(term_exp)
+            || kata_to_hira_eq(&reading_u16, term_exp)
     };
     if !matched {
         return PitchBlobData::default();

@@ -3,9 +3,11 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use memento_setting::keys as raw;
 use parley::{
@@ -20,9 +22,11 @@ use super::glossary_render::{PaintCollector, PositionedGlossaryImage};
 use super::subtitle_layout::active_subtitle_render_style;
 use super::SubtitleWord;
 
-const SUBTITLE_CACHE_MAX_ENTRIES: usize = 512;
-const EMOJI_CACHE_MAX_ENTRIES: usize = 2048;
-const ALPHA_GLYPH_CACHE_MAX_ENTRIES: usize = 32768;
+const SUBTITLE_CACHE_MAX_ENTRIES: usize = 256;
+const EMOJI_CACHE_MAX_ENTRIES: usize = 512;
+const ALPHA_GLYPH_CACHE_MAX_ENTRIES: usize = 8192;
+const SUBTITLE_PREWARM_MAX_TOKENS: usize = 96;
+const SUBTITLE_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(super) const RICH_EMOJI_FALLBACK_STACK: &str =
     "Noto Sans CJK JP, Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, sans-serif";
@@ -190,7 +194,6 @@ impl<K: Eq + Hash, V> BoundedLruCache<K, V> {
         self.entries.len()
     }
 
-    #[cfg(test)]
     fn contains_key(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }
@@ -376,16 +379,45 @@ fn append_swash_outline_to_path(
     }
 }
 
+static CACHED_SHARED_FONT_COLLECTION: OnceLock<slint::fontique_08::fontique::Collection> =
+    OnceLock::new();
+static SHARED_FONT_SOURCE_CACHE: OnceLock<slint::fontique_08::fontique::SourceCache> =
+    OnceLock::new();
+
+fn shared_font_source_cache() -> slint::fontique_08::fontique::SourceCache {
+    SHARED_FONT_SOURCE_CACHE
+        .get_or_init(slint::fontique_08::fontique::SourceCache::new_shared)
+        .clone()
+}
+
+/// Capture Slint's process-wide `fontique::Collection` on the UI thread (where
+/// `i_slint_core`'s thread-local context is initialized) so background render workers
+/// reuse the same system font database and loaded font blobs without re-scanning.
+pub(super) fn capture_shared_font_collection() -> Option<slint::fontique_08::fontique::Collection> {
+    if let Some(collection) = CACHED_SHARED_FONT_COLLECTION.get() {
+        return Some(collection.clone());
+    }
+    if let Ok(collection) = std::panic::catch_unwind(slint::fontique_08::shared_collection) {
+        let _ = CACHED_SHARED_FONT_COLLECTION.set(collection.clone());
+        return Some(collection);
+    }
+    None
+}
+
 /// Initialize Parley's `FontContext` sharing Slint's process-wide `fontique::Collection`
-/// when the Slint platform is active (avoiding a duplicate system font DB scan in RAM),
-/// falling back cleanly to `FontContext::new()` in headless unit tests without a platform.
-fn shared_parley_font_context() -> FontContext {
-    match std::panic::catch_unwind(slint::fontique_08::shared_collection) {
-        Ok(collection) => FontContext {
+/// and a thread-safe shared `SourceCache` when active (avoiding duplicate font DB scans
+/// and duplicate CJK font file reads in RAM), falling back cleanly to `FontContext::new()`
+/// in headless unit tests without a Slint platform.
+fn shared_parley_font_context(
+    pre_captured: Option<slint::fontique_08::fontique::Collection>,
+) -> FontContext {
+    if let Some(collection) = pre_captured.or_else(capture_shared_font_collection) {
+        FontContext {
             collection,
-            source_cache: slint::fontique_08::fontique::SourceCache::default(),
-        },
-        Err(_) => FontContext::new(),
+            source_cache: shared_font_source_cache(),
+        }
+    } else {
+        FontContext::new()
     }
 }
 
@@ -413,8 +445,14 @@ pub(super) fn with_shared_text_engine<R>(f: impl FnOnce(&mut TextEngine) -> R) -
 
 impl TextEngine {
     pub(super) fn new() -> Self {
+        Self::new_with_collection(None)
+    }
+
+    pub(super) fn new_with_collection(
+        collection: Option<slint::fontique_08::fontique::Collection>,
+    ) -> Self {
         Self {
-            font_cx: shared_parley_font_context(),
+            font_cx: shared_parley_font_context(collection),
             layout_cx: LayoutContext::new(),
             scale_cx: swash::scale::ScaleContext::new(),
             fontdb: Arc::new(usvg::fontdb::Database::new()),
@@ -740,8 +778,9 @@ impl TextEngine {
         layout
     }
 
-    fn make_subtitle_cache_key(
-        word: &SubtitleWord,
+    fn make_subtitle_cache_key_parts(
+        text: &str,
+        reading: &str,
         font_px: f32,
         show_furigana: bool,
         style: &SubtitleRenderStyle,
@@ -749,9 +788,9 @@ impl TextEngine {
         let font_px = font_px.clamp(8.0, 140.0);
         let line_spacing_extra = style.line_spacing.clamp(0.0, 120.0);
         SubtitleCacheKey {
-            text: word.text.to_string(),
+            text: text.to_owned(),
             reading: if show_furigana {
-                word.reading.to_string()
+                reading.to_owned()
             } else {
                 String::new()
             },
@@ -766,6 +805,21 @@ impl TextEngine {
             bold: style.bold,
             italic: style.italic,
         }
+    }
+
+    fn make_subtitle_cache_key(
+        word: &SubtitleWord,
+        font_px: f32,
+        show_furigana: bool,
+        style: &SubtitleRenderStyle,
+    ) -> SubtitleCacheKey {
+        Self::make_subtitle_cache_key_parts(
+            word.text.as_str(),
+            word.reading.as_str(),
+            font_px,
+            show_furigana,
+            style,
+        )
     }
 
     /// Measure the logical layout width of a subtitle token using Parley layout metrics
@@ -1022,23 +1076,19 @@ impl TextEngine {
         }
     }
 
-    pub(super) fn shape_and_render_subtitle_token(
+    fn rasterize_subtitle_token(
         &mut self,
-        word: &SubtitleWord,
+        text: &str,
+        reading: &str,
         font_px: f32,
         show_furigana: bool,
         style: &SubtitleRenderStyle,
-    ) -> ShapedSubtitleToken {
+    ) -> RasterizedSubtitleToken {
         let font_px = font_px.clamp(8.0, 140.0);
         let line_spacing_extra = style.line_spacing.clamp(0.0, 120.0);
-        let key = Self::make_subtitle_cache_key(word, font_px, show_furigana, style);
-        if let Some(cached) = self.subtitle_cache.get(&key) {
-            return cached.clone();
-        }
-
         let weight = if style.bold { 700 } else { 400 };
         let base_layout = self.shape_single_line(
-            word.text.as_str(),
+            text,
             &style.font_family,
             font_px,
             weight,
@@ -1082,9 +1132,9 @@ impl TextEngine {
             0.0
         };
 
-        let (ruby_layout, ruby_width, ruby_height) = if show_furigana && !word.reading.is_empty() {
+        let (ruby_layout, ruby_width, ruby_height) = if show_furigana && !reading.is_empty() {
             let layout = self.shape_single_line(
-                word.reading.as_str(),
+                reading,
                 &style.font_family,
                 ruby_font_px,
                 600,
@@ -1124,9 +1174,8 @@ impl TextEngine {
                     let r = cluster.text_range();
                     let adv = cluster.advance();
                     clusters.push((r.start, r.end, x_pos, adv));
-                    let byte_offset = r.start.min(word.text.len());
-                    let char_offset = word
-                        .text
+                    let byte_offset = r.start.min(text.len());
+                    let char_offset = text
                         .get(..byte_offset)
                         .map_or(0, |prefix| prefix.chars().count());
                     cluster_hitboxes.push(SubtitleClusterHitbox {
@@ -1142,7 +1191,7 @@ impl TextEngine {
 
         let base_geom = self.collect_subtitle_layer_geometry(
             &base_layout,
-            word.text.as_str(),
+            text,
             base_origin_x_pix,
             base_origin_y,
         );
@@ -1151,7 +1200,7 @@ impl TextEngine {
             let r_origin_y = (ruby_space - ruby_height).max(0.0) + pad_y * 0.5 + half_line_spacing;
             self.collect_subtitle_layer_geometry(
                 r_layout,
-                word.reading.as_str(),
+                reading,
                 r_origin_x_pix,
                 r_origin_y,
             )
@@ -1254,8 +1303,7 @@ impl TextEngine {
             }
         }
 
-        let image = pixmap_to_slint_image(&pixmap);
-        let shaped = ShapedSubtitleToken {
+        RasterizedSubtitleToken {
             width_px: layout_width,
             height_px: total_height,
             bleed_x_px: bleed_x,
@@ -1265,8 +1313,30 @@ impl TextEngine {
             glyph_height_px: base_height,
             clusters,
             cluster_hitboxes,
-            image,
-        };
+            pixels: pixmap_to_pixel_buffer(&pixmap),
+        }
+    }
+
+    pub(super) fn shape_and_render_subtitle_token(
+        &mut self,
+        word: &SubtitleWord,
+        font_px: f32,
+        show_furigana: bool,
+        style: &SubtitleRenderStyle,
+    ) -> ShapedSubtitleToken {
+        let key = Self::make_subtitle_cache_key(word, font_px, show_furigana, style);
+        if let Some(cached) = self.subtitle_cache.get(&key) {
+            return cached.clone();
+        }
+        let shaped = self
+            .rasterize_subtitle_token(
+                word.text.as_str(),
+                word.reading.as_str(),
+                font_px,
+                show_furigana,
+                style,
+            )
+            .into_shaped();
         self.subtitle_cache.insert(key, shaped.clone());
         shaped
     }
@@ -1314,13 +1384,264 @@ impl BorrowFontExt for parley::FontData {
     }
 }
 
-pub(super) fn pixmap_to_slint_image(pixmap: &tiny_skia::Pixmap) -> slint::Image {
-    let buf = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+pub(super) fn pixmap_to_pixel_buffer(
+    pixmap: &tiny_skia::Pixmap,
+) -> SharedPixelBuffer<Rgba8Pixel> {
+    SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
         pixmap.data(),
         pixmap.width(),
         pixmap.height(),
-    );
-    slint::Image::from_rgba8_premultiplied(buf)
+    )
+}
+
+pub(super) fn pixmap_to_slint_image(pixmap: &tiny_skia::Pixmap) -> slint::Image {
+    slint::Image::from_rgba8_premultiplied(pixmap_to_pixel_buffer(pixmap))
+}
+
+struct RasterizedSubtitleToken {
+    width_px: f32,
+    height_px: f32,
+    bleed_x_px: f32,
+    glyph_x_px: f32,
+    glyph_y_px: f32,
+    glyph_width_px: f32,
+    glyph_height_px: f32,
+    clusters: Vec<(usize, usize, f32, f32)>,
+    cluster_hitboxes: Vec<SubtitleClusterHitbox>,
+    pixels: SharedPixelBuffer<Rgba8Pixel>,
+}
+
+impl RasterizedSubtitleToken {
+    fn into_shaped(self) -> ShapedSubtitleToken {
+        ShapedSubtitleToken {
+            width_px: self.width_px,
+            height_px: self.height_px,
+            bleed_x_px: self.bleed_x_px,
+            glyph_x_px: self.glyph_x_px,
+            glyph_y_px: self.glyph_y_px,
+            glyph_width_px: self.glyph_width_px,
+            glyph_height_px: self.glyph_height_px,
+            clusters: self.clusters,
+            cluster_hitboxes: self.cluster_hitboxes,
+            image: slint::Image::from_rgba8_premultiplied(self.pixels),
+        }
+    }
+}
+
+struct SubtitlePrewarmJob {
+    epoch: u64,
+    lines: Vec<String>,
+    font_px: f32,
+    show_furigana: bool,
+    style: SubtitleRenderStyle,
+    font_collection: Option<slint::fontique_08::fontique::Collection>,
+}
+
+struct SubtitlePrewarmWorker {
+    slot: Mutex<Option<SubtitlePrewarmJob>>,
+    condvar: Condvar,
+}
+
+static SUBTITLE_PREWARM_EPOCH: AtomicU64 = AtomicU64::new(0);
+static SUBTITLE_PREWARM_WORKER: OnceLock<Arc<SubtitlePrewarmWorker>> = OnceLock::new();
+
+fn subtitle_prewarm_worker() -> &'static Arc<SubtitlePrewarmWorker> {
+    SUBTITLE_PREWARM_WORKER.get_or_init(|| {
+        let worker = Arc::new(SubtitlePrewarmWorker {
+            slot: Mutex::new(None),
+            condvar: Condvar::new(),
+        });
+        let bg = Arc::clone(&worker);
+        let _ = std::thread::Builder::new()
+            .name("memento-sub-preraster".into())
+            .spawn(move || subtitle_prewarm_worker_loop(bg));
+        worker
+    })
+}
+
+pub(super) fn cancel_subtitle_token_prewarm() {
+    let epoch = SUBTITLE_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(worker) = SUBTITLE_PREWARM_WORKER.get() {
+        if let Ok(mut guard) = worker.slot.lock() {
+            if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) == epoch {
+                *guard = None;
+            }
+        }
+    }
+}
+
+fn subtitle_prewarm_worker_loop(worker: Arc<SubtitlePrewarmWorker>) {
+    let mut engine: Option<TextEngine> = None;
+    loop {
+        let job = {
+            let Ok(mut guard) = worker.slot.lock() else {
+                return;
+            };
+            loop {
+                if let Some(job) = guard.take() {
+                    break job;
+                }
+                if engine.is_some() {
+                    let (next_guard, timeout) = match worker
+                        .condvar
+                        .wait_timeout(guard, SUBTITLE_PREWARM_IDLE_TIMEOUT)
+                    {
+                        Ok(res) => res,
+                        Err(_) => return,
+                    };
+                    guard = next_guard;
+                    if guard.is_none() && timeout.timed_out() {
+                        engine = None;
+                        crate::ui::release_os_memory();
+                    }
+                } else {
+                    guard = match worker.condvar.wait(guard) {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                }
+            }
+        };
+
+        if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch {
+            continue;
+        }
+
+        let mut seen_tokens: HashSet<(String, String)> = HashSet::new();
+        let mut rasterized_total = 0usize;
+
+        for line in job.lines {
+            if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch
+                || rasterized_total >= SUBTITLE_PREWARM_MAX_TOKENS
+            {
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let parts: Vec<(String, String)> = if job.show_furigana {
+                crate::controller::subtitles::subtitle_furigana_parts(&line).unwrap_or_else(|_| {
+                    crate::controller::subtitles::segment_subtitle_text(&line)
+                        .into_iter()
+                        .map(|tok| (tok, String::new()))
+                        .collect()
+                })
+            } else {
+                crate::controller::subtitles::segment_subtitle_text(&line)
+                    .into_iter()
+                    .map(|tok| (tok, String::new()))
+                    .collect()
+            };
+
+            if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch {
+                break;
+            }
+
+            let eng = engine.get_or_insert_with(|| {
+                TextEngine::new_with_collection(job.font_collection.clone())
+            });
+            let mut ready_batch: Vec<(SubtitleCacheKey, RasterizedSubtitleToken)> = Vec::new();
+            for (tok, reading) in parts {
+                if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch
+                    || rasterized_total >= SUBTITLE_PREWARM_MAX_TOKENS
+                {
+                    break;
+                }
+                if tok.is_empty() || tok.contains('\n') {
+                    continue;
+                }
+                let eff_reading = if job.show_furigana {
+                    reading
+                } else {
+                    String::new()
+                };
+                if !seen_tokens.insert((tok.clone(), eff_reading.clone())) {
+                    continue;
+                }
+                let key = TextEngine::make_subtitle_cache_key_parts(
+                    &tok,
+                    &eff_reading,
+                    job.font_px,
+                    job.show_furigana,
+                    &job.style,
+                );
+                let rasterized = eng.rasterize_subtitle_token(
+                    &tok,
+                    &eff_reading,
+                    job.font_px,
+                    job.show_furigana,
+                    &job.style,
+                );
+                ready_batch.push((key, rasterized));
+                rasterized_total += 1;
+            }
+
+            if ready_batch.is_empty() {
+                continue;
+            }
+            if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch {
+                break;
+            }
+
+            let deliver_epoch = job.epoch;
+            if slint::invoke_from_event_loop(move || {
+                if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) != deliver_epoch {
+                    return;
+                }
+                with_shared_text_engine(|ui_engine| {
+                    for (key, rasterized) in ready_batch {
+                        if !ui_engine.subtitle_cache.contains_key(&key) {
+                            ui_engine.subtitle_cache.insert(key, rasterized.into_shaped());
+                        }
+                    }
+                });
+            })
+            .is_err()
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Non-blockingly pre-rasterizes upcoming subtitle lines' tokens on a single reusable
+/// background worker and feeds completed `SharedPixelBuffer<Rgba8Pixel>` + cluster metadata
+/// into the UI thread's `TextEngine::subtitle_cache` via `slint::invoke_from_event_loop`.
+/// Cancels any previous in-flight prewarm generation immediately (e.g. on seek or style change).
+pub fn prewarm_subtitle_tokens(
+    lines: Vec<String>,
+    font_px: f32,
+    show_furigana: bool,
+    style: SubtitleRenderStyle,
+) {
+    let epoch = SUBTITLE_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    if lines.is_empty() || !font_px.is_finite() || font_px <= 0.0 {
+        if let Some(worker) = SUBTITLE_PREWARM_WORKER.get() {
+            if let Ok(mut guard) = worker.slot.lock() {
+                if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) == epoch {
+                    *guard = None;
+                }
+            }
+        }
+        return;
+    }
+
+    let font_collection = capture_shared_font_collection();
+    let worker = subtitle_prewarm_worker();
+    if let Ok(mut guard) = worker.slot.lock() {
+        if SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire) == epoch {
+            *guard = Some(SubtitlePrewarmJob {
+                epoch,
+                lines,
+                font_px,
+                show_furigana,
+                style,
+                font_collection,
+            });
+            worker.condvar.notify_one();
+        }
+    }
 }
 
 /// Exact per-glyph cluster hit-testing on a subtitle token using cached

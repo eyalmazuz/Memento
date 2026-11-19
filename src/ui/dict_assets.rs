@@ -1,17 +1,16 @@
 //! Local dictionary resource directory resolution and bounded LRU raster/SVG asset cache.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use resvg::{tiny_skia, usvg};
 
-use super::text_engine::with_shared_text_engine;
+use super::text_engine::{with_shared_text_engine, TextEngine};
 
-const DICT_ASSET_CACHE_MAX_ENTRIES: usize = 256;
-const DICT_ASSET_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+const DICT_ASSET_CACHE_MAX_ENTRIES: usize = 128;
+const DICT_ASSET_CACHE_MAX_BYTES: usize = 12 * 1024 * 1024; // 12 MiB
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct DictAssetCacheKey {
@@ -110,10 +109,37 @@ impl DictAssetLruCache {
             },
         );
     }
+
+    fn shrink_to(&mut self, max_entries: usize, max_bytes: usize) {
+        while self.entries.len() > max_entries || self.total_bytes > max_bytes {
+            let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest_key) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
+        }
+        self.entries.shrink_to(max_entries.max(16));
+    }
 }
 
-thread_local! {
-    static DICT_ASSET_CACHE: RefCell<DictAssetLruCache> = RefCell::new(DictAssetLruCache::new());
+fn shared_dict_asset_cache() -> &'static Mutex<DictAssetLruCache> {
+    static CACHE: OnceLock<Mutex<DictAssetLruCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DictAssetLruCache::new()))
+}
+
+pub(super) fn shrink_dict_asset_cache(max_entries: usize, max_bytes: usize) {
+    let mut cache = shared_dict_asset_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.shrink_to(max_entries, max_bytes);
 }
 
 pub fn collect_dictionary_resource_dirs(
@@ -221,6 +247,48 @@ pub(super) fn load_dictionary_image_pixmap_scaled(
     current_color_hex: &str,
     render_scale: f32,
 ) -> Option<(Arc<tiny_skia::Pixmap>, f32, f32)> {
+    load_dictionary_image_pixmap_scaled_inner(
+        None,
+        asset_path,
+        requested_w,
+        requested_h,
+        monochrome_tint,
+        current_color_hex,
+        render_scale,
+    )
+}
+
+/// Same as `load_dictionary_image_pixmap_scaled`, reusing a caller-owned `TextEngine`
+/// (e.g. a background `GlossaryRenderWorker`'s engine) for SVG font lookup.
+pub(super) fn load_dictionary_image_pixmap_scaled_with_engine(
+    engine: &mut TextEngine,
+    asset_path: &Path,
+    requested_w: Option<f32>,
+    requested_h: Option<f32>,
+    monochrome_tint: Option<[u8; 4]>,
+    current_color_hex: &str,
+    render_scale: f32,
+) -> Option<(Arc<tiny_skia::Pixmap>, f32, f32)> {
+    load_dictionary_image_pixmap_scaled_inner(
+        Some(engine),
+        asset_path,
+        requested_w,
+        requested_h,
+        monochrome_tint,
+        current_color_hex,
+        render_scale,
+    )
+}
+
+fn load_dictionary_image_pixmap_scaled_inner(
+    engine: Option<&mut TextEngine>,
+    asset_path: &Path,
+    requested_w: Option<f32>,
+    requested_h: Option<f32>,
+    monochrome_tint: Option<[u8; 4]>,
+    current_color_hex: &str,
+    render_scale: f32,
+) -> Option<(Arc<tiny_skia::Pixmap>, f32, f32)> {
     let scale = render_scale.clamp(1.0, 3.0);
     let scale_quarter = (scale * 4.0).round().clamp(4.0, 12.0) as u16;
     let meta = std::fs::metadata(asset_path).ok()?;
@@ -234,11 +302,17 @@ pub(super) fn load_dictionary_image_pixmap_scaled(
         current_color: current_color_hex.trim().to_ascii_lowercase(),
         scale_quarter,
     };
-    if let Some(hit) = DICT_ASSET_CACHE.with(|cache| cache.borrow_mut().get(&cache_key)) {
-        return Some(hit);
+    {
+        let mut cache = shared_dict_asset_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = cache.get(&cache_key) {
+            return Some(hit);
+        }
     }
 
     let result = decode_and_rasterize_dictionary_asset(
+        engine,
         asset_path,
         requested_w,
         requested_h,
@@ -246,15 +320,17 @@ pub(super) fn load_dictionary_image_pixmap_scaled(
         current_color_hex,
         scale,
     )?;
-    DICT_ASSET_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(cache_key, result.0.clone(), result.1, result.2);
-    });
+    {
+        let mut cache = shared_dict_asset_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(cache_key, result.0.clone(), result.1, result.2);
+    }
     Some(result)
 }
 
 fn decode_and_rasterize_dictionary_asset(
+    engine: Option<&mut TextEngine>,
     asset_path: &Path,
     requested_w: Option<f32>,
     requested_h: Option<f32>,
@@ -281,10 +357,16 @@ fn decode_and_rasterize_dictionary_asset(
         let mut opts = usvg::Options::default();
         opts.resources_dir = asset_path.parent().map(Path::to_path_buf);
         opts.font_family = "sans-serif".to_owned();
-        opts.fontdb = with_shared_text_engine(|engine| {
-            engine.ensure_default_svg_fonts();
-            engine.fontdb.clone()
-        });
+        opts.fontdb = match engine {
+            Some(eng) => {
+                eng.ensure_default_svg_fonts();
+                eng.fontdb.clone()
+            }
+            None => with_shared_text_engine(|eng| {
+                eng.ensure_default_svg_fonts();
+                eng.fontdb.clone()
+            }),
+        };
         if !current_color_hex.is_empty() {
             opts.style_sheet = Some(format!("svg {{ color: {current_color_hex}; }}"));
         }

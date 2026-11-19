@@ -23,6 +23,33 @@ component CheckerboardBackdrop inherits Rectangle {
     }
 }
 
+component ColorChannelRow inherits Rectangle {
+    in property <string> label;
+    in property <color> accent;
+    in property <color> label-color: root.accent;
+    in property <int> channel-value;
+    callback channel-changed(int);
+
+    height: max(24px, row-layout.preferred-height);
+    background: transparent;
+
+    row-layout := HorizontalLayout {
+        width: parent.width;
+        height: parent.height;
+        spacing: 10px;
+        Text { width: 48px; text: root.label; color: root.label-color; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+        MementoSlider {
+            horizontal-stretch: 1;
+            minimum: 0;
+            maximum: 255;
+            accent: root.accent;
+            value: root.channel-value;
+            changed(val) => { root.channel-changed(Math.round(val)); }
+        }
+        Text { width: 32px; text: root.channel-value + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+    }
+}
+
 export component ColorPickerModal inherits ModalDialog {
     in property <string> color-key;
     in property <string> color-label;
@@ -136,72 +163,45 @@ export component ColorPickerModal inherits ModalDialog {
     VerticalLayout {
         spacing: 8px;
 
-        HorizontalLayout {
-            spacing: 10px;
-            Text { width: 48px; text: "Red"; color: #F87171; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-            MementoSlider {
-                horizontal-stretch: 1;
-                minimum: 0;
-                maximum: 255;
-                accent: #F87171;
-                value: root.color-r;
-                changed(val) => {
-                    root.color-r = Math.round(val);
-                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
-                }
+        ColorChannelRow {
+            label: "Red";
+            accent: #F87171;
+            channel-value: root.color-r;
+            channel-changed(val) => {
+                root.color-r = val;
+                root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
             }
-            Text { width: 32px; text: root.color-r + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
         }
 
-        HorizontalLayout {
-            spacing: 10px;
-            Text { width: 48px; text: "Green"; color: #4ADE80; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-            MementoSlider {
-                horizontal-stretch: 1;
-                minimum: 0;
-                maximum: 255;
-                accent: #4ADE80;
-                value: root.color-g;
-                changed(val) => {
-                    root.color-g = Math.round(val);
-                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
-                }
+        ColorChannelRow {
+            label: "Green";
+            accent: #4ADE80;
+            channel-value: root.color-g;
+            channel-changed(val) => {
+                root.color-g = val;
+                root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
             }
-            Text { width: 32px; text: root.color-g + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
         }
 
-        HorizontalLayout {
-            spacing: 10px;
-            Text { width: 48px; text: "Blue"; color: #60A5FA; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-            MementoSlider {
-                horizontal-stretch: 1;
-                minimum: 0;
-                maximum: 255;
-                accent: #60A5FA;
-                value: root.color-b;
-                changed(val) => {
-                    root.color-b = Math.round(val);
-                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
-                }
+        ColorChannelRow {
+            label: "Blue";
+            accent: #60A5FA;
+            channel-value: root.color-b;
+            channel-changed(val) => {
+                root.color-b = val;
+                root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
             }
-            Text { width: 32px; text: root.color-b + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
         }
 
-        HorizontalLayout {
-            spacing: 10px;
-            Text { width: 48px; text: "Alpha"; color: MementoPalette.text-secondary; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-            MementoSlider {
-                horizontal-stretch: 1;
-                minimum: 0;
-                maximum: 255;
-                accent: MementoPalette.cyan-accent;
-                value: root.color-a;
-                changed(val) => {
-                    root.color-a = Math.round(val);
-                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
-                }
+        ColorChannelRow {
+            label: "Alpha";
+            accent: MementoPalette.cyan-accent;
+            label-color: MementoPalette.text-secondary;
+            channel-value: root.color-a;
+            channel-changed(val) => {
+                root.color-a = val;
+                root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
             }
-            Text { width: 32px; text: root.color-a + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
         }
     }
 

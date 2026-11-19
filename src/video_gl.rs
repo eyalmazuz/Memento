@@ -39,6 +39,76 @@ pub fn plan_video_fbo_formats(prefer_16f: bool) -> Vec<VideoFboFormat> {
     }
 }
 
+/// Decide whether an active video stream benefits from a 16-bit half-float FBO
+/// (`GL_RGBA16F`) instead of standard 8-bit `GL_RGBA8` (which halves video FBO
+/// VRAM and GPU memory bandwidth for 8-bit SDR streams).
+///
+/// Returns `true` when `video-params/primaries` indicates wide-gamut / HDR
+/// (`bt.2020`, `dci-p3`, `display-p3`, `v-gamut`, `s-gamut`), when
+/// `video-params/gamma` indicates an HDR/log transfer (`pq`, `hlg`, `v-log`,
+/// `s-log1`, `s-log2`, `st428`, `dolbyvision`), or when `video-params/pixelformat`
+/// or `video-params/hw-pixelformat` indicates >8-bit / floating-point precision
+/// (such as `yuv420p10`, `p010`, `p016`, `gbrp10`, `rgbaf16`), while keeping
+/// 8-bit SDR formats (`yuv420p`, `nv12`, `nv16`, `yuv410p`, `rgba`) on `GL_RGBA8`.
+#[allow(dead_code)] // Included directly as a private module in tests/video_render_timing_test.rs.
+pub fn video_stream_prefers_16f(
+    primaries: Option<&str>,
+    gamma: Option<&str>,
+    pixelformat: Option<&str>,
+    hw_pixelformat: Option<&str>,
+) -> bool {
+    if primaries.is_some_and(is_wide_gamut_primaries) {
+        return true;
+    }
+    if gamma.is_some_and(is_hdr_gamma) {
+        return true;
+    }
+    if pixelformat.is_some_and(is_high_bit_depth_pixelformat) {
+        return true;
+    }
+    hw_pixelformat.is_some_and(is_high_bit_depth_pixelformat)
+}
+
+fn is_wide_gamut_primaries(primaries: &str) -> bool {
+    let p = primaries.trim().to_ascii_lowercase();
+    matches!(
+        p.as_str(),
+        "bt.2020"
+            | "bt2020"
+            | "dci-p3"
+            | "display-p3"
+            | "v-gamut"
+            | "s-gamut"
+            | "s-gamut3"
+            | "s-gamut3.cine"
+    ) || p.contains("2020")
+}
+
+fn is_hdr_gamma(gamma: &str) -> bool {
+    let g = gamma.trim().to_ascii_lowercase();
+    matches!(
+        g.as_str(),
+        "pq" | "hlg" | "v-log" | "s-log1" | "s-log2" | "st428" | "dolbyvision" | "smpte2084"
+    )
+}
+
+fn is_high_bit_depth_pixelformat(pixfmt: &str) -> bool {
+    let f = pixfmt.trim().to_ascii_lowercase();
+    if f.is_empty() {
+        return false;
+    }
+    // Deliberately avoids substring traps on common 8-bit formats like `nv12`
+    // (8-bit 4:2:0 hwdec), `nv16` (8-bit 4:2:2), and `yuv410p` (8-bit 4:1:0).
+    const HIGH_BIT_PATTERNS: &[&str] = &[
+        "p9", "p10", "p12", "p14", "p16", "p010", "p012", "p016", "p210", "p212", "p216", "p410",
+        "p412", "p416", "f16", "f32", "10bit", "12bit", "16bit", "y210", "y212", "y216", "y410",
+        "y412", "y416", "xv30", "xv36", "v210", "r210", "nv20", "x2rgb10", "x2bgr10", "rgb48",
+        "bgr48", "rgba64", "bgra64", "ayuv64", "xyz12", "gray10", "gray12", "gray14", "gray16",
+        "ya16",
+    ];
+    HIGH_BIT_PATTERNS.iter().any(|pat| f.contains(pat))
+}
+
 /// Validate video FBO dimensions against positive `i32` bounds and an optional
 /// `GL_MAX_TEXTURE_SIZE` limit.
 pub fn validate_fbo_dimensions(
@@ -835,4 +905,83 @@ pub fn with_saved_state_caps<T>(
 /// The caller must have this GL context current.
 pub fn with_saved_state<T>(gl: &glow::Context, action: impl FnOnce() -> T) -> T {
     with_saved_state_caps(gl, GlCapabilities::from_context(gl), action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_stream_prefers_16f_uses_rgba8_for_8bit_sdr_and_16f_for_10bit_or_hdr() {
+        // Standard 8-bit SDR software & hardware decoded formats must stay on GL_RGBA8.
+        for pixfmt in [
+            "yuv420p", "yuvj420p", "yuv422p", "yuv444p", "yuv410p", "yuv411p", "nv12", "nv21",
+            "nv16", "nv24", "rgba", "bgra", "rgb24", "gray",
+        ] {
+            assert!(
+                !video_stream_prefers_16f(Some("bt.709"), Some("bt.1886"), Some(pixfmt), None),
+                "expected 8-bit SDR pixelformat `{pixfmt}` to use GL_RGBA8"
+            );
+        }
+        assert!(!video_stream_prefers_16f(
+            Some("bt.601-625"),
+            Some("srgb"),
+            Some("vaapi"),
+            Some("nv12"),
+        ));
+        assert!(!video_stream_prefers_16f(None, None, None, None));
+
+        // 10-bit / 12-bit / 16-bit / float formats (both sw and hwdec) select GL_RGBA16F.
+        for pixfmt in [
+            "yuv420p10",
+            "yuv420p10le",
+            "yuv422p10le",
+            "yuv444p10le",
+            "yuv420p12",
+            "yuv420p16",
+            "p010",
+            "p016",
+            "gbrp10",
+            "rgbaf16",
+            "gray16",
+            "x2rgb10",
+        ] {
+            assert!(
+                video_stream_prefers_16f(Some("bt.709"), Some("bt.1886"), Some(pixfmt), None),
+                "expected >8-bit pixelformat `{pixfmt}` to prefer GL_RGBA16F"
+            );
+        }
+        assert!(video_stream_prefers_16f(
+            Some("bt.709"),
+            Some("bt.1886"),
+            Some("vaapi"),
+            Some("p010"),
+        ));
+        assert!(video_stream_prefers_16f(
+            Some("bt.709"),
+            Some("bt.1886"),
+            Some("cuda"),
+            Some("p016"),
+        ));
+
+        // Wide gamut primaries and HDR transfer functions select GL_RGBA16F.
+        assert!(video_stream_prefers_16f(
+            Some("bt.2020"),
+            Some("bt.1886"),
+            Some("nv12"),
+            None,
+        ));
+        assert!(video_stream_prefers_16f(
+            Some("bt.709"),
+            Some("pq"),
+            Some("nv12"),
+            None,
+        ));
+        assert!(video_stream_prefers_16f(
+            Some("bt.709"),
+            Some("hlg"),
+            Some("yuv420p"),
+            None,
+        ));
+    }
 }

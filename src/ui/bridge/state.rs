@@ -31,10 +31,17 @@ use crate::ui::{
     RichTagPill, SubtitleLine, SubtitleWord,
 };
 
-pub(super) const ROOT_GLOSSARY_CACHE_MAX_ENTRIES: usize = 768;
-pub(super) const ROOT_GLOSSARY_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
-pub(super) const NESTED_GLOSSARY_CACHE_MAX_ENTRIES: usize = 256;
-pub(super) const NESTED_GLOSSARY_CACHE_MAX_BYTES: usize = 48 * 1024 * 1024;
+pub(super) const ROOT_GLOSSARY_CACHE_MAX_ENTRIES: usize = 384;
+pub(super) const ROOT_GLOSSARY_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const NESTED_GLOSSARY_CACHE_MAX_ENTRIES: usize = 128;
+pub(super) const NESTED_GLOSSARY_CACHE_MAX_BYTES: usize = 12 * 1024 * 1024;
+pub(super) const IDLE_POPUP_SHRINK_DELAY: Duration = Duration::from_secs(45);
+pub(super) const IDLE_GLOSSARY_CACHE_MAX_ENTRIES: usize = 16;
+pub(super) const IDLE_GLOSSARY_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const IDLE_DICT_ASSET_CACHE_MAX_ENTRIES: usize = 32;
+pub(super) const IDLE_DICT_ASSET_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const IDLE_PARSED_GLOSSARY_MAX_ENTRIES: usize = 64;
+pub(super) const GLOSSARY_PRERENDER_MAX_ROWS: usize = 6;
 pub(super) const MAX_NAV_HISTORY: usize = 64;
 pub(super) const MAX_PENDING_NESTED_ANKI_ADDS: usize = 16;
 pub(super) const FRESH_CHECK_THROTTLE: Duration = Duration::from_millis(1500);
@@ -204,6 +211,268 @@ pub(super) struct NestedScanResponse {
         Vec<TermFrequency>,
     )>,
     pub(super) term_pitch_details: HashMap<(String, String), Vec<TermPitchDetail>>,
+    pub(super) kanji_frequencies: HashMap<String, Vec<TermFrequency>>,
+}
+
+pub(super) enum NavQueryKind {
+    RootTerm {
+        query: String,
+        kana_mode: Option<String>,
+    },
+    RootKanji {
+        query: String,
+    },
+    NestedTerm {
+        from_depth: i32,
+        query: String,
+    },
+    NestedKanji {
+        from_depth: i32,
+        query: String,
+    },
+}
+
+impl NavQueryKind {
+    pub(super) fn is_nested(&self) -> bool {
+        matches!(self, Self::NestedTerm { .. } | Self::NestedKanji { .. })
+    }
+}
+
+pub(super) struct NavLookupRequest {
+    pub(super) epoch: u64,
+    pub(super) kind: NavQueryKind,
+    pub(super) excluded: Vec<String>,
+    pub(super) search_config: DictSearchConfig,
+}
+
+pub(super) struct NavLookupResponse {
+    pub(super) epoch: u64,
+    pub(super) kind: NavQueryKind,
+    pub(super) hits: Vec<SearchHit>,
+    pub(super) excluded: Vec<String>,
+    pub(super) headword: String,
+    pub(super) reading: String,
+    pub(super) pitch: String,
+    pub(super) freq: String,
+    pub(super) jpdb: String,
+    pub(super) term_meta_rows: Vec<(
+        String,
+        String,
+        Vec<crate::controller::dict::TermPitchGraph>,
+        Vec<TermFrequency>,
+    )>,
+    pub(super) term_pitch_details: HashMap<(String, String), Vec<TermPitchDetail>>,
+    pub(super) kanji_frequencies: HashMap<String, Vec<TermFrequency>>,
+}
+
+pub(super) enum DictWorkerRequest {
+    NestedScan(NestedScanRequest),
+    NavLookup(NavLookupRequest),
+}
+
+pub(super) struct GlossaryPreRenderItem {
+    pub(super) cache_key: GlossaryDocCacheKey,
+    pub(super) raw_glossary: String,
+    pub(super) fallback_glossary: String,
+    pub(super) parsed_glossary: Option<Arc<serde_json::Value>>,
+    pub(super) stylesheet: Option<Arc<memento_definition::ParsedStylesheet>>,
+    pub(super) detail_states: HashMap<String, bool>,
+    pub(super) legacy_style: LegacyGlossaryStyle,
+    pub(super) dict_resource_dirs: Vec<PathBuf>,
+    pub(super) dic_id: i64,
+    pub(super) dict_name: String,
+    pub(super) avail_width_px: f32,
+    pub(super) selected: bool,
+    pub(super) theme: Arc<PopupCssTheme>,
+    pub(super) render_scale: f32,
+}
+
+pub(super) struct GlossaryPreRenderBatch {
+    pub(super) epoch: u64,
+    pub(super) items: Vec<GlossaryPreRenderItem>,
+}
+
+pub(super) struct GlossaryPreRenderDone {
+    pub(super) epoch: u64,
+    pub(super) cache_key: GlossaryDocCacheKey,
+    pub(super) doc: crate::ui::glossary_render::RasterizedGlossaryDoc,
+}
+
+pub(super) fn collect_hits_term_and_kanji_meta(
+    dict: &DictController,
+    hits: &[SearchHit],
+) -> (
+    Vec<(
+        String,
+        String,
+        Vec<crate::controller::dict::TermPitchGraph>,
+        Vec<TermFrequency>,
+    )>,
+    HashMap<(String, String), Vec<TermPitchDetail>>,
+    HashMap<String, Vec<TermFrequency>>,
+) {
+    let mut term_meta_rows = Vec::new();
+    let mut term_pitch_details = HashMap::new();
+    let mut kanji_frequencies = HashMap::new();
+    for h in hits {
+        if h.is_kanji {
+            if !h.expression.is_empty() && !kanji_frequencies.contains_key(&h.expression) {
+                let freqs = dict.get_kanji_frequencies(&h.expression);
+                kanji_frequencies.insert(h.expression.clone(), freqs);
+            }
+        } else {
+            let key = (h.expression.clone(), h.reading.clone());
+            if !term_pitch_details.contains_key(&key) {
+                let (details, freqs) =
+                    dict.get_pitch_details_and_frequencies(&h.expression, &h.reading);
+                let graphs: Vec<crate::controller::dict::TermPitchGraph> = details
+                    .iter()
+                    .map(|detail| crate::controller::dict::TermPitchGraph {
+                        dictionary: detail.dictionary.clone(),
+                        mora: detail.mora.clone(),
+                        position: detail.position,
+                    })
+                    .collect();
+                term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
+                term_pitch_details.insert(key, details);
+            }
+        }
+    }
+    (term_meta_rows, term_pitch_details, kanji_frequencies)
+}
+
+pub(super) fn execute_nav_lookup(
+    dict: &mut DictController,
+    req: NavLookupRequest,
+) -> NavLookupResponse {
+    match req.kind {
+        NavQueryKind::RootTerm {
+            ref query,
+            ref kana_mode,
+        } => {
+            let raw_hits = dict.search(query).to_vec();
+            let mut hits = if let Some(kana_target) = kana_mode.as_deref() {
+                let norm = crate::controller::dict::normalize_reading(kana_target);
+                let filtered: Vec<_> = raw_hits
+                    .iter()
+                    .filter(|h| {
+                        crate::controller::dict::normalize_reading(&h.reading) == norm
+                            || crate::controller::dict::normalize_reading(&h.expression) == norm
+                    })
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    raw_hits
+                } else {
+                    filtered
+                }
+            } else {
+                raw_hits
+            };
+            if hits.is_empty() && query.chars().count() == 1 {
+                hits = dict.search_kanji(query).to_vec();
+            }
+            let headword = hits
+                .first()
+                .map(|h| h.expression.clone())
+                .unwrap_or_else(|| query.clone());
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let (pitch, freq, jpdb) = if !headword.is_empty() {
+                dict.get_term_meta(&headword, &reading)
+            } else {
+                (String::new(), String::new(), String::new())
+            };
+            let (term_meta_rows, term_pitch_details, kanji_frequencies) =
+                collect_hits_term_and_kanji_meta(dict, &hits);
+            NavLookupResponse {
+                epoch: req.epoch,
+                kind: req.kind,
+                hits,
+                excluded: req.excluded,
+                headword,
+                reading,
+                pitch,
+                freq,
+                jpdb,
+                term_meta_rows,
+                term_pitch_details,
+                kanji_frequencies,
+            }
+        }
+        NavQueryKind::RootKanji { ref query } => {
+            let hits = dict.search_kanji(query).to_vec();
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let headword = query.clone();
+            let mut kanji_frequencies = HashMap::new();
+            if !hits.is_empty() {
+                kanji_frequencies.insert(query.clone(), dict.get_kanji_frequencies(query));
+            }
+            NavLookupResponse {
+                epoch: req.epoch,
+                kind: req.kind,
+                hits,
+                excluded: req.excluded,
+                headword,
+                reading,
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+                term_meta_rows: Vec::new(),
+                term_pitch_details: HashMap::new(),
+                kanji_frequencies,
+            }
+        }
+        NavQueryKind::NestedTerm { ref query, .. } => {
+            let mut hits = dict.search(query).to_vec();
+            if hits.is_empty() && query.chars().count() == 1 {
+                hits = dict.search_kanji(query).to_vec();
+            }
+            let headword = hits
+                .first()
+                .map(|h| h.expression.clone())
+                .unwrap_or_else(|| query.clone());
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let (term_meta_rows, term_pitch_details, kanji_frequencies) =
+                collect_hits_term_and_kanji_meta(dict, &hits);
+            NavLookupResponse {
+                epoch: req.epoch,
+                kind: req.kind,
+                hits,
+                excluded: req.excluded,
+                headword,
+                reading,
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+                term_meta_rows,
+                term_pitch_details,
+                kanji_frequencies,
+            }
+        }
+        NavQueryKind::NestedKanji { ref query, .. } => {
+            let hits = dict.search_kanji(query).to_vec();
+            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+            let headword = query.clone();
+            let mut kanji_frequencies = HashMap::new();
+            if !hits.is_empty() {
+                kanji_frequencies.insert(query.clone(), dict.get_kanji_frequencies(query));
+            }
+            NavLookupResponse {
+                epoch: req.epoch,
+                kind: req.kind,
+                hits,
+                excluded: req.excluded,
+                headword,
+                reading,
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+                term_meta_rows: Vec::new(),
+                term_pitch_details: HashMap::new(),
+                kanji_frequencies,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -597,6 +866,10 @@ impl GlossaryDocLruCache {
         self.entries.get(key).map(|e| e.doc.clone())
     }
 
+    pub(super) fn contains_key(&self, key: &GlossaryDocCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
     pub(super) fn find_by_row_and_epoch(
         &self,
         row_index: i32,
@@ -650,6 +923,25 @@ impl GlossaryDocLruCache {
     pub(super) fn retain(&mut self, mut predicate: impl FnMut(&GlossaryDocCacheKey) -> bool) {
         self.entries.retain(|k, _| predicate(k));
         self.total_bytes = self.entries.values().map(|e| e.bytes).sum();
+    }
+
+    pub(super) fn shrink_to(&mut self, max_entries: usize, max_bytes: usize) {
+        while self.entries.len() > max_entries || self.total_bytes > max_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
+        }
+        self.entries.shrink_to(max_entries.max(16));
     }
 
     pub(super) fn clear(&mut self) {
@@ -799,7 +1091,14 @@ pub(super) struct RichUiMutable {
     pub(super) pending_scan_utf16_start: Option<usize>,
     pub(super) pending_scan_sub_query: Option<String>,
     pub(super) scan_timer: slint::Timer,
+    pub(super) idle_shrink_timer: slint::Timer,
     pub(super) subtitle_token_layout_cache: SubtitleTokenLayoutCache,
+    pub(super) pending_root_precomputed_meta: Option<(
+        HashMap<(String, String), Vec<TermPitchDetail>>,
+        HashMap<String, Vec<TermFrequency>>,
+    )>,
+    pub(super) last_observed_solo_width_px: Option<(i32, bool, i32)>,
+    pub(super) last_observed_col_width_px: Option<(i32, bool, i32)>,
 }
 
 impl RichUiMutable {
@@ -985,6 +1284,7 @@ pub(super) fn build_row_extras_for_grouped(
     rows: &[DictResult],
     grouped_hits: &[SearchHit],
     precomputed_pitch_details: Option<&HashMap<(String, String), Vec<TermPitchDetail>>>,
+    precomputed_kanji_freqs: Option<&HashMap<String, Vec<TermFrequency>>>,
 ) -> (HashMap<i32, RichRowExtras>, Vec<(usize, Vec<TermFrequency>)>) {
     let mut extras_map = HashMap::new();
     let mut kanji_freq_updates = Vec::new();
@@ -1027,7 +1327,14 @@ pub(super) fn build_row_extras_for_grouped(
         }
         let group_pitch_category = classify_pitch_category(&rich_pitches, &group_pos_tags);
         let kanji_freqs: Vec<TermFrequency> = if first_hit.is_kanji {
-            dict_ctrl.get_kanji_frequencies(&first_hit.expression)
+            if let Some(pre_kf) = precomputed_kanji_freqs {
+                pre_kf
+                    .get(&first_hit.expression)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                dict_ctrl.get_kanji_frequencies(&first_hit.expression)
+            }
         } else {
             Vec::new()
         };
@@ -1035,9 +1342,8 @@ pub(super) fn build_row_extras_for_grouped(
         for idx in group_start..group_end {
             let hit = &grouped_hits[idx];
             let parsed_glossary = (!hit.is_kanji && !hit.raw_glossary.trim().is_empty())
-                .then(|| serde_json::from_str::<serde_json::Value>(&hit.raw_glossary).ok())
-                .flatten()
-                .map(Arc::new);
+                .then(|| hit.parsed_glossary())
+                .flatten();
             let inline_tags = parsed_glossary
                 .as_deref()
                 .map(extract_inline_structured_tags_from_value)

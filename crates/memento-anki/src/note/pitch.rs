@@ -1,6 +1,6 @@
 //! Pitch accent classification, text/position/SVG formatting.
 
-use crate::glossary::escape::{append_escaped, push_ascii};
+use crate::glossary::escape::{append_escaped, append_u8_u16, push_ascii};
 
 /// Matches `isKifukuApplicable` in `notebuilder.cpp`.
 pub fn is_kifuku_applicable(rules: &[&[u16]]) -> bool {
@@ -175,7 +175,7 @@ pub fn format_pitch_positions(pitches: &[PitchEntry<'_>]) -> Vec<u16> {
             }
 
             pitch_pos.push(b'[' as u16);
-            push_ascii(&mut pitch_pos, &pos.to_string());
+            append_u8_u16(&mut pitch_pos, pos);
             pitch_pos.push(b']' as u16);
 
             if multiple_pitches {

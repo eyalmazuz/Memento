@@ -59,9 +59,19 @@ use self::updater::{
     determine_startup_update_action, install_update_and_link_handlers, open_update_opt_in_dialog,
     spawn_update_check, StartupUpdateAction,
 };
-use self::video_pipeline::{install_video_pipeline, VideoTimings};
+use self::video_pipeline::{install_video_pipeline, VideoParamsObserver, VideoTimings};
 use self::window_chrome::install_window_chrome_handlers;
 use self::workers::{install_dictionary_lookup_handlers, UiRelay, WorkerPool};
+
+/// Return freed glibc heap pages back to the Linux kernel after dropping large
+/// allocations (media decoder buffers, embedded fonts, ASR models, etc.).
+#[inline]
+pub(crate) fn trim_os_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = libc::malloc_trim(0);
+    }
+}
 
 struct AppLogger;
 impl log::Log for AppLogger {
@@ -189,6 +199,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let video_timings = Rc::new(RefCell::new(VideoTimings::default()));
     let pending_playback_frame = Rc::new(Cell::new(None::<i32>));
     let current_render_size = Rc::new(Cell::new((0u32, 0u32)));
+    let default_prefer_16f = !renderer_overrides.force_rgba8 && renderer_overrides.prefer_hdr;
+    let gl_prefer_16f = Rc::new(Cell::new(default_prefer_16f));
+    // Declared AFTER `mpv` (and never captured in `app.on_*` callbacks) so its weak
+    // libmpv client is always destroyed before `MpvInstance::drop`.
+    let video_params_observer = Rc::new(RefCell::new(
+        if !renderer_overrides.force_rgba8
+            && !renderer_overrides.prefer_hdr
+            && renderer_plan.primary != PlatformRendererKind::Software
+        {
+            mpv.borrow()
+                .as_ref()
+                .map_or_else(VideoParamsObserver::disabled, VideoParamsObserver::attach)
+        } else {
+            VideoParamsObserver::disabled()
+        },
+    ));
     let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
 
     let start_player = mpv.clone();
@@ -403,6 +429,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         screensaver.clone(),
         ui_relay,
         playback_handles.handle_open_or_drop_paths,
+        gl_prefer_16f.clone(),
+        default_prefer_16f,
+        video_params_observer.clone(),
         verbose_video_timings,
     );
 
@@ -413,7 +442,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_playback_frame,
         current_render_size,
         &renderer_plan,
-        &renderer_overrides,
+        gl_prefer_16f,
         playback_handles.trigger_initial_loads,
         verbose_video_timings,
     );
@@ -435,6 +464,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     pref_saver.flush();
     screensaver.borrow_mut().uninhibit();
     drop(sync_handles._dispatch_guard);
+    video_params_observer.borrow_mut().close();
 
     // Close all background worker channels and join worker threads cleanly.
     workers.shutdown();

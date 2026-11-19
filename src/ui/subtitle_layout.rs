@@ -8,7 +8,9 @@ use super::popup_model::{
     active_rich_bridge_for_app, active_rich_bridges_for_app, is_kanji_char,
     latest_active_rich_bridge,
 };
-use super::text_engine::{with_shared_text_engine, SubtitleRenderStyle};
+use super::text_engine::{
+    cancel_subtitle_token_prewarm, with_shared_text_engine, SubtitleRenderStyle,
+};
 use super::{MementoApp, SubtitleLine, SubtitleOverlayBridge, SubtitleWord};
 
 thread_local! {
@@ -17,9 +19,18 @@ thread_local! {
 }
 
 pub(super) fn set_active_subtitle_render_style(style: SubtitleRenderStyle) {
-    FALLBACK_SUBTITLE_STYLE.with(|slot| {
-        *slot.borrow_mut() = style;
+    let changed = FALLBACK_SUBTITLE_STYLE.with(|slot| {
+        let mut cur = slot.borrow_mut();
+        if *cur != style {
+            *cur = style;
+            true
+        } else {
+            false
+        }
     });
+    if changed {
+        cancel_subtitle_token_prewarm();
+    }
 }
 
 pub fn subtitle_words(text: &str) -> Vec<SubtitleWord> {

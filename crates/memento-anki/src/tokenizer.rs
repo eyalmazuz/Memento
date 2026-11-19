@@ -7,8 +7,7 @@
 //! `String` (which is only defined for scalar-formed UTF-16).
 
 use crate::strings::{
-    split_keep_empty, token_spans, trim_u16, CLOSE_BRACE, COLON, COMMA, EQUALS, OPEN_BRACE,
-    VERTICAL_BAR,
+    token_spans, trim_u16, CLOSE_BRACE, COLON, COMMA, EQUALS, OPEN_BRACE, VERTICAL_BAR,
 };
 
 /// `constexpr qsizetype MAX_ARG_DELIM_COUNT{1}` — a marker field yielding
@@ -60,30 +59,32 @@ pub fn tokenize(text: &[u16]) -> Vec<Token> {
         debug_assert!(raw.len() >= 2 && raw[0] == OPEN_BRACE && raw[raw.len() - 1] == CLOSE_BRACE,);
 
         // QString::mid(1, size - 2): braces dropped, the content split on '|'
-        // with empty fields kept.
+        // with empty fields kept (zero intermediate Vec allocations).
         let token_text = &raw[1..raw.len() - 1];
         let mut markers = Vec::<Marker>::new();
-        for field in split_keep_empty(VERTICAL_BAR, token_text) {
-            let mut marker = Marker::default();
-            let marker_args = split_keep_empty(COLON, field);
-            if marker_args.is_empty() {
-                // Dead code in C++ too: split never returns an empty list.
+        for field in token_text.split(|&u| u == VERTICAL_BAR) {
+            let mut marker_args = field.split(|&u| u == COLON);
+            let Some(raw_name) = marker_args.next() else {
                 break;
-            }
-            marker.name = trim_u16(marker_args[0]).to_vec();
-            if marker_args.len() == 1 {
+            };
+            let mut marker = Marker {
+                name: trim_u16(raw_name).to_vec(),
+                args: Vec::new(),
+            };
+            let Some(raw_arg_list) = marker_args.next() else {
                 markers.push(marker);
                 continue;
-            }
-            if marker_args.len() != MAX_ARG_DELIM_COUNT + 1 {
+            };
+            // `MAX_ARG_DELIM_COUNT == 1`: more than 2 colon-separated parts abandons the rest.
+            if marker_args.next().is_some() {
                 break;
             }
-            for arg in split_keep_empty(COMMA, marker_args[1]) {
-                let kv = split_keep_empty(EQUALS, arg);
-                if kv.len() != MAX_KEY_VALUE_DELIM_COUNT + 1 {
+            for arg in raw_arg_list.split(|&u| u == COMMA) {
+                let mut kv = arg.split(|&u| u == EQUALS);
+                let (Some(k), Some(v), None) = (kv.next(), kv.next(), kv.next()) else {
                     continue;
-                }
-                marker.insert_arg(trim_u16(kv[0]).to_vec(), trim_u16(kv[1]).to_vec());
+                };
+                marker.insert_arg(trim_u16(k).to_vec(), trim_u16(v).to_vec());
             }
             markers.push(marker);
         }

@@ -7,7 +7,7 @@
 
 mod rules;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use self::rules::{Rule, SilentRule, RULES, SILENT_RULES, SUB_CAUS_LONG, SUB_NONE};
@@ -63,16 +63,15 @@ pub enum WordForm {
     None = 42,
 }
 
-/// An ordered candidate; alternative derivations are retained while exact duplicates
-/// for a prefix are deduplicated before formatting.
+/// An ordered UTF-8 deconjugation candidate; alternative derivations are retained while exact
+/// duplicates for a prefix are deduplicated before formatting.
 /// `derivations` run from the candidate's base type toward its conjugated form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConjugationInfo {
-    pub base: Vec<u16>,
-    pub conjugated: Vec<u16>,
+    pub base: String,
     pub derivations: Vec<WordForm>,
     /// Display text assembled from the English translation source strings.
-    pub derivation_display: Vec<u16>,
+    pub derivation_display: String,
 }
 
 /// The untranslated source text used by C++ `Deconjugator::tr`.
@@ -196,79 +195,34 @@ pub fn format_derivation_chain(derivations: &[WordForm]) -> (String, Vec<(String
     }
     steps.reverse();
 
-    let descriptions: Vec<(String, String)> = steps
-        .iter()
-        .map(|&form| {
-            (
-                word_form_label(form).to_owned(),
-                word_form_description(form).to_owned(),
-            )
-        })
-        .collect();
-    let chain = descriptions
-        .iter()
-        .map(|(label, _)| label.as_str())
-        .collect::<Vec<_>>()
-        .join(" ← ");
+    let mut descriptions = Vec::with_capacity(steps.len());
+    let mut chain = String::new();
+    for (idx, form) in steps.into_iter().enumerate() {
+        let label = word_form_label(form);
+        if idx > 0 {
+            chain.push_str(" ← ");
+        }
+        chain.push_str(label);
+        descriptions.push((label.to_owned(), word_form_description(form).to_owned()));
+    }
     (chain, descriptions)
 }
 
-/// UTF-16 rule fragments, compiled once rather than allocated again for every query.
-struct CompiledRule {
-    base: Vec<u16>,
-    conjugated: Vec<u16>,
-    base_type: WordForm,
-    conjugated_type: WordForm,
-    v5_out: u8,
-    caus_req: u8,
-}
-
-impl From<&Rule> for CompiledRule {
-    fn from(rule: &Rule) -> Self {
-        Self {
-            base: rule.base.encode_utf16().collect(),
-            conjugated: rule.conjugated.encode_utf16().collect(),
-            base_type: rule.base_type,
-            conjugated_type: rule.conjugated_type,
-            v5_out: rule.v5_out,
-            caus_req: rule.caus_req,
-        }
-    }
-}
-
-struct CompiledSilentRule {
-    base: Vec<u16>,
-    base_type: WordForm,
-    required_v5_sub: u8,
-    caus_sub: u8,
-}
-
-impl From<&SilentRule> for CompiledSilentRule {
-    fn from(rule: &SilentRule) -> Self {
-        Self {
-            base: rule.base.encode_utf16().collect(),
-            base_type: rule.base_type,
-            required_v5_sub: rule.required_v5_sub,
-            caus_sub: rule.caus_sub,
-        }
-    }
-}
-
+/// Zero-copy UTF-8 rule index pointing directly into static `RULES` / `SILENT_RULES`.
 struct RuleIndex {
-    rules: Vec<CompiledRule>,
+    rules: &'static [Rule],
     /// Maps `(conjugated_type, last_char_of_conjugated_suffix)` -> sorted rule indices in `RULES` order.
     /// Entries under `WordForm::Any` hold all rules matching that suffix character (or `None` for empty suffix).
     by_form_and_last: HashMap<(WordForm, Option<char>), Vec<usize>>,
-    silent_by_form: HashMap<WordForm, Vec<CompiledSilentRule>>,
+    silent_by_form: HashMap<WordForm, Vec<&'static SilentRule>>,
 }
 
 impl RuleIndex {
-    fn build(raw_rules: &[Rule], raw_silent: &[SilentRule]) -> Self {
-        let mut rules = Vec::with_capacity(raw_rules.len());
+    fn build(raw_rules: &'static [Rule], raw_silent: &'static [SilentRule]) -> Self {
         let mut by_form_and_last: HashMap<(WordForm, Option<char>), Vec<usize>> = HashMap::new();
 
         for (idx, raw) in raw_rules.iter().enumerate() {
-            let last_char = raw.conjugated.chars().last();
+            let last_char = raw.conjugated.chars().next_back();
             by_form_and_last
                 .entry((raw.conjugated_type, last_char))
                 .or_default()
@@ -277,19 +231,18 @@ impl RuleIndex {
                 .entry((WordForm::Any, last_char))
                 .or_default()
                 .push(idx);
-            rules.push(CompiledRule::from(raw));
         }
 
-        let mut silent_by_form: HashMap<WordForm, Vec<CompiledSilentRule>> = HashMap::new();
+        let mut silent_by_form: HashMap<WordForm, Vec<&'static SilentRule>> = HashMap::new();
         for raw in raw_silent {
             silent_by_form
                 .entry(raw.conjugated_type)
                 .or_default()
-                .push(CompiledSilentRule::from(raw));
+                .push(raw);
         }
 
         Self {
-            rules,
+            rules: raw_rules,
             by_form_and_last,
             silent_by_form,
         }
@@ -300,7 +253,7 @@ impl RuleIndex {
         current_type: WordForm,
         last_char: Option<char>,
         allow_empty_suffix: bool,
-        mut f: impl FnMut(&CompiledRule),
+        mut f: impl FnMut(&'static Rule),
     ) {
         let exact = last_char
             .and_then(|ch| self.by_form_and_last.get(&(current_type, Some(ch))))
@@ -351,22 +304,6 @@ fn is_terminal(form: WordForm) -> bool {
     )
 }
 
-fn last_char_u16(word: &[u16]) -> Option<char> {
-    let &last = word.last()?;
-    if (0xDC00..=0xDFFF).contains(&last) {
-        if word.len() >= 2 {
-            let high = word[word.len() - 2];
-            if (0xD800..=0xDBFF).contains(&high) {
-                let cp =
-                    0x10000 + (((u32::from(high) - 0xD800) << 10) | (u32::from(last) - 0xDC00));
-                return char::from_u32(cp);
-            }
-        }
-        return None;
-    }
-    char::from_u32(u32::from(last))
-}
-
 /// Guards the empty-suffix rule (`る <- ""`) so it only fires on kana or kanji stems,
 /// never on ASCII, digits, whitespace, or Japanese punctuation/symbols.
 fn is_valid_empty_suffix_stem_end(ch: char) -> bool {
@@ -381,41 +318,41 @@ fn is_valid_empty_suffix_stem_end(ch: char) -> bool {
     )
 }
 
-fn format_derivation(derivations: &[WordForm]) -> Vec<u16> {
-    let mut display = Vec::new();
+fn format_derivation(derivations: &[WordForm]) -> String {
+    let mut display = String::new();
     let mut first = true;
     for form in derivations.iter().copied() {
         if form == WordForm::Conjunctive || is_terminal(form) {
             continue;
         }
         if !first {
-            display.extend(" « ".encode_utf16());
+            display.push_str(" « ");
         }
-        display.extend(word_form_label(form).encode_utf16());
+        display.push_str(word_form_label(form));
         first = false;
     }
     // A bare masu stem is shown only when it is the final conjugated form.
     if derivations.last() == Some(&WordForm::Conjunctive) {
         if !first {
-            display.extend(" « ".encode_utf16());
+            display.push_str(" « ");
         }
-        display.extend(word_form_label(WordForm::Conjunctive).encode_utf16());
+        display.push_str(word_form_label(WordForm::Conjunctive));
     }
     display
 }
 
 fn create_derivation(
-    word: &[u16],
+    word: &str,
     derivations: &[WordForm],
-    rule_base: &[u16],
-    rule_conjugated: &[u16],
+    rule_base: &str,
+    rule_conjugated: &str,
     base_type: WordForm,
     conjugated_type: WordForm,
-) -> (Vec<u16>, Vec<WordForm>) {
+) -> (String, Vec<WordForm>) {
     let prefix_length = word.len() - rule_conjugated.len();
-    let mut child_word = Vec::with_capacity(prefix_length + rule_base.len());
-    child_word.extend_from_slice(&word[..prefix_length]);
-    child_word.extend_from_slice(rule_base);
+    let mut child_word = String::with_capacity(prefix_length + rule_base.len());
+    child_word.push_str(&word[..prefix_length]);
+    child_word.push_str(rule_base);
 
     let mut child_derivations =
         Vec::with_capacity(derivations.len() + 1 + usize::from(derivations.is_empty()));
@@ -429,20 +366,19 @@ fn create_derivation(
 
 #[allow(clippy::too_many_arguments)]
 fn deconjugate_recursive(
-    word: &[u16],
+    word: &str,
     derivations: &[WordForm],
-    conjugated: &[u16],
     caus_sub: u8,
     depth: usize,
     results: &mut Vec<ConjugationInfo>,
-    seen: &mut HashMap<(Vec<u16>, Vec<WordForm>), ()>,
+    seen: &mut HashSet<(String, Vec<WordForm>)>,
     index: &RuleIndex,
 ) {
     if depth >= MAX_DEPTH || word.is_empty() {
         return;
     }
     let current_type = derivations.first().copied().unwrap_or(WordForm::Any);
-    let last_char = last_char_u16(word);
+    let last_char = word.chars().next_back();
     let allow_empty_suffix = last_char.is_some_and(is_valid_empty_suffix_stem_end);
 
     index.for_each_matching_rule(current_type, last_char, allow_empty_suffix, |rule| {
@@ -456,32 +392,33 @@ fn deconjugate_recursive(
                 return;
             }
         }
-        if !word.ends_with(&rule.conjugated) {
+        if !word.ends_with(rule.conjugated) {
             return;
         }
         let prefix_length = word.len() - rule.conjugated.len();
-        // A suffix-only terminal rule (`base.len() <= 1`, e.g. `る`/`う`/`い`) requires a non-empty stem.
-        if prefix_length == 0 && rule.base.len() <= 1 && is_terminal(rule.base_type) {
+        // A suffix-only terminal rule (<= 1 char, e.g. `る`/`う`/`い`) requires a non-empty stem.
+        if prefix_length == 0
+            && rule.base.chars().nth(1).is_none()
+            && is_terminal(rule.base_type)
+        {
             return;
         }
         let (base, chain) = create_derivation(
             word,
             derivations,
-            &rule.base,
-            &rule.conjugated,
+            rule.base,
+            rule.conjugated,
             rule.base_type,
             rule.conjugated_type,
         );
         if is_terminal(rule.base_type) {
-            let dedup_key = (base.clone(), chain.clone());
-            if seen.insert(dedup_key, ()).is_some() {
+            if !seen.insert((base.clone(), chain.clone())) {
                 return;
             }
             let result_index = results.len();
             results.push(ConjugationInfo {
                 derivation_display: format_derivation(&chain),
                 base,
-                conjugated: conjugated.to_vec(),
                 derivations: chain,
             });
             if depth + 1 >= MAX_DEPTH {
@@ -490,25 +427,24 @@ fn deconjugate_recursive(
             // Emit the terminal result first, then re-enter the original parent
             // with the silent rule's base type (not the terminal child).
             if let Some(silent_rules) = index.silent_by_form.get(&rule.base_type) {
-                for silent_rule in silent_rules {
+                for &silent_rule in silent_rules {
                     if rule.base_type == WordForm::GodanVerb
                         && (rule.v5_out & silent_rule.required_v5_sub) == 0
                     {
                         continue;
                     }
-                    if results[result_index].base.ends_with(&silent_rule.base) {
+                    if results[result_index].base.ends_with(silent_rule.base) {
                         let (derived_base, derived_chain) = create_derivation(
                             word,
                             derivations,
-                            &rule.base,
-                            &rule.conjugated,
+                            rule.base,
+                            rule.conjugated,
                             silent_rule.base_type,
                             rule.conjugated_type,
                         );
                         deconjugate_recursive(
                             &derived_base,
                             &derived_chain,
-                            conjugated,
                             silent_rule.caus_sub,
                             depth + 1,
                             results,
@@ -527,7 +463,6 @@ fn deconjugate_recursive(
             deconjugate_recursive(
                 &base,
                 &chain,
-                conjugated,
                 next_caus,
                 depth + 1,
                 results,
@@ -538,62 +473,48 @@ fn deconjugate_recursive(
     });
 }
 
-// QRegularExpression("\\s") with default pattern options uses ASCII PCRE2
-// shorthand whitespace, not Rust's Unicode `char::is_whitespace`.
-fn is_regex_whitespace(unit: u16) -> bool {
-    matches!(unit, 0x0009..=0x000d | 0x0020)
+// ASCII PCRE2 shorthand whitespace (`\s` without UCP).
+#[inline]
+fn is_regex_whitespace_char(ch: char) -> bool {
+    matches!(ch, '\t'..='\r' | ' ')
 }
 
-fn deconjugate_prefix(
-    conjugated: &[u16],
+fn deconjugate_prefix_str(
+    conjugated: &str,
     results: &mut Vec<ConjugationInfo>,
-    seen: &mut HashMap<(Vec<u16>, Vec<WordForm>), ()>,
+    seen: &mut HashSet<(String, Vec<WordForm>)>,
     index: &RuleIndex,
 ) {
     seen.clear();
-    // Qt's PCRE2 matcher validates the whole UTF-16 subject before finding
-    // `\s`. On an unpaired surrogate, QString::remove(regex) makes no changes.
-    if conjugated.iter().copied().any(is_regex_whitespace)
-        && char::decode_utf16(conjugated.iter().copied()).all(|unit| unit.is_ok())
-    {
-        let word: Vec<u16> = conjugated
-            .iter()
-            .copied()
-            .filter(|unit| !is_regex_whitespace(*unit))
+    if conjugated.chars().any(is_regex_whitespace_char) {
+        let word: String = conjugated
+            .chars()
+            .filter(|&c| !is_regex_whitespace_char(c))
             .collect();
-        deconjugate_recursive(&word, &[], conjugated, SUB_CAUS_LONG, 0, results, seen, index);
+        deconjugate_recursive(&word, &[], SUB_CAUS_LONG, 0, results, seen, index);
     } else {
-        deconjugate_recursive(
-            conjugated,
-            &[],
-            conjugated,
-            SUB_CAUS_LONG,
-            0,
-            results,
-            seen,
-            index,
-        );
+        deconjugate_recursive(conjugated, &[], SUB_CAUS_LONG, 0, results, seen, index);
     }
 }
 
-/// Attempts all rule chains for `query`, preserving rule order while deduplicating
+/// Attempts all rule chains for UTF-8 `query`, preserving rule order while deduplicating
 /// identical `(base, derivations)` hits per prefix before formatting derivations.
-pub fn deconjugate(query: &[u16], sentence_mode: bool) -> Vec<ConjugationInfo> {
+pub fn deconjugate_str(query: &str, sentence_mode: bool) -> Vec<ConjugationInfo> {
     let index = rule_index();
     let mut results = Vec::new();
-    let mut seen: HashMap<(Vec<u16>, Vec<WordForm>), ()> = HashMap::new();
+    let mut seen: HashSet<(String, Vec<WordForm>)> = HashSet::new();
 
     if sentence_mode {
-        let mut conjugated = query.to_vec();
+        let mut conjugated = query.to_owned();
         while !conjugated.is_empty() {
-            deconjugate_prefix(&conjugated, &mut results, &mut seen, index);
+            deconjugate_prefix_str(&conjugated, &mut results, &mut seen, index);
             conjugated.pop();
-            while conjugated.last().is_some_and(|unit| is_regex_whitespace(*unit)) {
+            while conjugated.chars().next_back().is_some_and(is_regex_whitespace_char) {
                 conjugated.pop();
             }
         }
     } else {
-        deconjugate_prefix(query, &mut results, &mut seen, index);
+        deconjugate_prefix_str(query, &mut results, &mut seen, index);
     }
     results
 }
@@ -603,15 +524,9 @@ mod tests {
     use super::*;
 
     fn bases_for(input: &str) -> Vec<(String, WordForm)> {
-        let u16_in: Vec<u16> = input.encode_utf16().collect();
-        deconjugate(&u16_in, false)
+        deconjugate_str(input, false)
             .into_iter()
-            .map(|info| {
-                (
-                    String::from_utf16_lossy(&info.base),
-                    info.derivations[0],
-                )
-            })
+            .map(|info| (info.base, info.derivations[0]))
             .collect()
     }
 
@@ -656,15 +571,13 @@ mod tests {
         assert!(!bases_for("話さされる").iter().any(|(b, _)| b == "話す"));
         assert!(!bases_for("来される").iter().any(|(b, _)| b == "来る"));
 
-        let benkyou_sareru = deconjugate(&"勉強される".encode_utf16().collect::<Vec<_>>(), false);
+        let benkyou_sareru = deconjugate_str("勉強される", false);
         assert!(benkyou_sareru
             .iter()
-            .any(|i| String::from_utf16_lossy(&i.base) == "勉強する"
-                && !i.derivations.contains(&WordForm::Causative)));
+            .any(|i| i.base == "勉強する" && !i.derivations.contains(&WordForm::Causative)));
         assert!(!benkyou_sareru
             .iter()
-            .any(|i| String::from_utf16_lossy(&i.base) == "勉強する"
-                && i.derivations.contains(&WordForm::Causative)));
+            .any(|i| i.base == "勉強する" && i.derivations.contains(&WordForm::Causative)));
     }
 
     #[test]
@@ -677,10 +590,9 @@ mod tests {
 
     #[test]
     fn formats_derivation_chain_and_grammar_descriptions() {
-        let u16_in: Vec<u16> = "食べさせられた".encode_utf16().collect();
-        let info = deconjugate(&u16_in, false)
+        let info = deconjugate_str("食べさせられた", false)
             .into_iter()
-            .find(|i| String::from_utf16_lossy(&i.base) == "食べる")
+            .find(|i| i.base == "食べる")
             .expect("should deconjugate 食べさせられた to 食べる");
         let (chain, descs) = format_derivation_chain(&info.derivations);
         assert_eq!(chain, "past ← potential or passive ← causative ← ichidan verb");

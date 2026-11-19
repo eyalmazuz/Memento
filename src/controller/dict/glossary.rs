@@ -5,11 +5,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::GlossaryBlock;
 
-const PARSED_GLOSSARY_CACHE_CAPACITY: usize = 1024;
-const PARSED_GLOSSARY_EVICT_BATCH: usize = 256;
+const PARSED_GLOSSARY_CACHE_CAPACITY: usize = 384;
+const PARSED_GLOSSARY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+const PARSED_GLOSSARY_EVICT_BATCH: usize = 96;
 
 struct ParsedGlossaryCache {
     entries: HashMap<String, (u64, Arc<serde_json::Value>)>,
+    total_key_bytes: usize,
     clock: u64,
 }
 
@@ -17,6 +19,7 @@ impl ParsedGlossaryCache {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            total_key_bytes: 0,
             clock: 0,
         }
     }
@@ -32,30 +35,66 @@ impl ParsedGlossaryCache {
         }
     }
 
-    fn insert(&mut self, raw: String, value: Arc<serde_json::Value>) {
-        if self.entries.len() >= PARSED_GLOSSARY_CACHE_CAPACITY && !self.entries.contains_key(&raw)
-        {
-            let mut stamps: Vec<(u64, String)> = self
-                .entries
-                .iter()
-                .map(|(k, (s, _))| (*s, k.clone()))
-                .collect();
-            let evict = PARSED_GLOSSARY_EVICT_BATCH.min(stamps.len());
-            if evict > 0 {
-                stamps.select_nth_unstable_by_key(evict - 1, |(s, _)| *s);
-                for (_, key) in stamps.into_iter().take(evict) {
-                    self.entries.remove(&key);
-                }
+    fn evict_oldest(&mut self, evict_target: usize) {
+        let mut stamps: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .map(|(k, (s, _))| (*s, k.clone()))
+            .collect();
+        let evict = evict_target.min(stamps.len());
+        if evict == 0 {
+            return;
+        }
+        stamps.select_nth_unstable_by_key(evict - 1, |(s, _)| *s);
+        for (_, key) in stamps.into_iter().take(evict) {
+            if self.entries.remove(&key).is_some() {
+                self.total_key_bytes = self.total_key_bytes.saturating_sub(key.len());
             }
         }
+    }
+
+    fn insert(&mut self, raw: String, value: Arc<serde_json::Value>) {
+        let key_bytes = raw.len();
+        if key_bytes > PARSED_GLOSSARY_CACHE_MAX_BYTES {
+            return;
+        }
         self.clock = self.clock.wrapping_add(1);
-        self.entries.insert(raw, (self.clock, value));
+        let stamp = self.clock;
+        if let Some(existing) = self.entries.get_mut(&raw) {
+            existing.0 = stamp;
+            existing.1 = value;
+            return;
+        }
+        while (self.entries.len() >= PARSED_GLOSSARY_CACHE_CAPACITY
+            || self.total_key_bytes.saturating_add(key_bytes) > PARSED_GLOSSARY_CACHE_MAX_BYTES)
+            && !self.entries.is_empty()
+        {
+            self.evict_oldest(PARSED_GLOSSARY_EVICT_BATCH.max(1));
+        }
+        self.total_key_bytes = self.total_key_bytes.saturating_add(key_bytes);
+        self.entries.insert(raw, (stamp, value));
+    }
+
+    fn shrink_to(&mut self, max_entries: usize) {
+        if self.entries.len() > max_entries {
+            let excess = self.entries.len() - max_entries;
+            self.evict_oldest(excess);
+        }
+        self.entries.shrink_to(max_entries.max(16));
     }
 }
 
 fn parsed_glossary_cache() -> &'static Mutex<ParsedGlossaryCache> {
     static CACHE: OnceLock<Mutex<ParsedGlossaryCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(ParsedGlossaryCache::new()))
+}
+
+/// Shrinks the shared parsed-glossary JSON cache down to at most `max_entries` hottest entries.
+pub fn shrink_parsed_glossary_cache(max_entries: usize) {
+    let mut cache = parsed_glossary_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.shrink_to(max_entries);
 }
 
 pub(super) fn cache_parsed_glossary(raw: &str, value: Arc<serde_json::Value>) {
@@ -273,31 +312,45 @@ pub(super) fn parse_glossary_entry_value(value: &serde_json::Value) -> (String, 
     let mut ex_ja = Vec::new();
     let mut ex_en = Vec::new();
 
-    fn extract_plain_text(node: &serde_json::Value) -> String {
+    fn push_plain_text(node: &serde_json::Value, out: &mut String) {
         match node {
-            serde_json::Value::String(text) => strip_glossary_markup(text),
-            serde_json::Value::Array(items) => items
-                .iter()
-                .map(extract_plain_text)
-                .collect::<Vec<_>>()
-                .join(""),
+            serde_json::Value::String(text) => {
+                if !text.contains('<') && !text.contains('&') {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&strip_glossary_markup(text));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    push_plain_text(item, out);
+                }
+            }
             serde_json::Value::Object(map) => {
                 if let Some(tag) = map.get("tag").and_then(serde_json::Value::as_str) {
                     if tag == "rt" || tag == "rp" {
-                        return String::new();
+                        return;
                     }
                 }
                 if let Some(content) = map.get("content") {
-                    extract_plain_text(content)
+                    push_plain_text(content, out);
                 } else if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
-                    strip_glossary_markup(text)
-                } else {
-                    String::new()
+                    if !text.contains('<') && !text.contains('&') {
+                        out.push_str(text);
+                    } else {
+                        out.push_str(&strip_glossary_markup(text));
+                    }
                 }
             }
-            _ => String::new(),
+            _ => {}
         }
     }
+
+    let extract_plain_text = |node: &serde_json::Value| -> String {
+        let mut buf = String::new();
+        push_plain_text(node, &mut buf);
+        buf
+    };
 
     for item in items {
         if item.is_array() {

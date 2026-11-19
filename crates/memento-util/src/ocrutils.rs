@@ -247,70 +247,7 @@ pub fn map_ocr_region(
     Some((OcrRegionStatus::Ok, (clamp_x, clamp_y, clamp_w, clamp_h)))
 }
 
-const SLASH: u16 = b'/' as u16;
-const BACKSLASH: u16 = b'\\' as u16;
-const COLON: u16 = b':' as u16;
-
-const VENV_PYTHON_UNIX: &[u16] = &[
-    b'b' as u16, b'i' as u16, b'n' as u16, b'/' as u16, b'p' as u16,
-    b'y' as u16, b't' as u16, b'h' as u16, b'o' as u16, b'n' as u16,
-];
-
-const VENV_PYTHON_WIN: &[u16] = &[
-    b'S' as u16, b'c' as u16, b'r' as u16, b'i' as u16, b'p' as u16,
-    b't' as u16, b's' as u16, b'/' as u16, b'p' as u16, b'y' as u16,
-    b't' as u16, b'h' as u16, b'o' as u16, b'n' as u16, b'.' as u16,
-    b'e' as u16, b'x' as u16, b'e' as u16,
-];
-
 /// Resolves the virtual-environment Python executable path matching `QDir(venv).filePath(VENV_PYTHON)`.
-/// Returns `None` if `python_exec_is_set` is true or `venv` is empty.
-pub fn resolve_venv_python(
-    python_exec_is_set: bool,
-    venv: &[u16],
-    is_windows: bool,
-) -> Option<Vec<u16>> {
-    if python_exec_is_set || venv.is_empty() {
-        return None;
-    }
-
-    let sub_path = if is_windows {
-        VENV_PYTHON_WIN
-    } else {
-        VENV_PYTHON_UNIX
-    };
-
-    let mut result = Vec::with_capacity(venv.len() + 1 + sub_path.len());
-
-    if is_windows {
-        result.extend(venv.iter().map(|&ch| if ch == BACKSLASH { SLASH } else { ch }));
-    } else {
-        result.extend_from_slice(venv);
-    }
-
-    // Qt's QDirPrivate::setPath strips a single trailing slash when length > 1,
-    // preserving drive root (e.g. "C:/") on Windows.
-    let is_win_drive_root = is_windows
-        && result.len() == 3
-        && result[1] == COLON
-        && result[2] == SLASH
-        && u8::try_from(result[0]).is_ok_and(|b| b.is_ascii_alphabetic());
-
-    if result.len() > 1 && result.last() == Some(&SLASH) && !is_win_drive_root {
-        result.pop();
-    }
-
-    // QDir::filePath appends '/' if not already ending in '/'
-    if result.last() != Some(&SLASH) {
-        result.push(SLASH);
-    }
-
-    result.extend_from_slice(sub_path);
-    Some(result)
-}
-
-/// Native UTF-8 version of [`resolve_venv_python`]: resolves the virtual-environment
-/// Python executable path matching `QDir(venv).filePath(VENV_PYTHON)`.
 ///
 /// Returns `None` if `python_exec_is_set` is `true` or `venv` is empty.
 pub fn resolve_venv_python_str(
@@ -354,20 +291,6 @@ pub fn resolve_venv_python_str(
 
     result.push_str(sub_path);
     Some(result)
-}
-
-/// Checks whether the OCR model instance needs to be recreated.
-///
-/// Matches `OcrController::model()` in `src/ocr/ocrcontroller.cpp`:
-/// `!has_model || cur_name != new_name || cur_gpu != new_gpu`.
-pub fn should_recreate_model(
-    has_model: bool,
-    cur_name: &[u16],
-    cur_gpu: bool,
-    new_name: &[u16],
-    new_gpu: bool,
-) -> bool {
-    !has_model || cur_gpu != new_gpu || cur_name != new_name
 }
 
 #[cfg(test)]
@@ -484,23 +407,19 @@ mod tests {
         );
     }
 
-    fn u16_str(s: &str) -> Vec<u16> {
-        s.encode_utf16().collect()
+    #[test]
+    fn resolve_venv_python_str_checks_python_exec_set_and_empty() {
+        assert_eq!(resolve_venv_python_str(true, "/tmp/venv", false), None);
+        assert_eq!(resolve_venv_python_str(true, "/tmp/venv", true), None);
+        assert_eq!(resolve_venv_python_str(false, "", false), None);
+        assert_eq!(resolve_venv_python_str(false, "", true), None);
     }
 
     #[test]
-    fn resolve_venv_python_checks_python_exec_set_and_empty() {
-        assert_eq!(resolve_venv_python(true, &u16_str("/tmp/venv"), false), None);
-        assert_eq!(resolve_venv_python(true, &u16_str("/tmp/venv"), true), None);
-        assert_eq!(resolve_venv_python(false, &[], false), None);
-        assert_eq!(resolve_venv_python(false, &[], true), None);
-    }
-
-    #[test]
-    fn resolve_venv_python_unix_variants() {
+    fn resolve_venv_python_str_unix_variants() {
         let check = |input: &str, expected: &str| {
-            let res = resolve_venv_python(false, &u16_str(input), false).expect(input);
-            assert_eq!(String::from_utf16_lossy(&res), expected, "failed for input {input}");
+            let res = resolve_venv_python_str(false, input, false).expect(input);
+            assert_eq!(res, expected, "failed for input {input}");
         };
 
         check("/tmp/venv", "/tmp/venv/bin/python");
@@ -522,10 +441,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_venv_python_windows_variants() {
+    fn resolve_venv_python_str_windows_variants() {
         let check = |input: &str, expected: &str| {
-            let res = resolve_venv_python(false, &u16_str(input), true).expect(input);
-            assert_eq!(String::from_utf16_lossy(&res), expected, "failed for input {input}");
+            let res = resolve_venv_python_str(false, input, true).expect(input);
+            assert_eq!(res, expected, "failed for input {input}");
         };
 
         check("C:\\venv", "C:/venv/Scripts/python.exe");
@@ -539,64 +458,8 @@ mod tests {
         check("\\\\server\\share\\venv", "//server/share/venv/Scripts/python.exe");
         check("/tmp/venv", "/tmp/venv/Scripts/python.exe");
         check("/tmp/venv/", "/tmp/venv/Scripts/python.exe");
-        // Non-ASCII code unit 0x3041 ('ぁ') has low byte 0x41 ('A') and must not truncate as a drive letter.
+        // Non-ASCII character 'ぁ' has low byte 0x41 ('A') and must not truncate as a drive letter.
         check("ぁ:/", "ぁ:/Scripts/python.exe");
-    }
-
-    #[test]
-    fn resolve_venv_python_str_matches_utf16_variants() {
-        assert_eq!(resolve_venv_python_str(true, "/tmp/venv", false), None);
-        assert_eq!(resolve_venv_python_str(false, "", false), None);
-        for (input, is_windows) in [
-            ("/tmp/venv", false),
-            ("/tmp/venv/", false),
-            ("/tmp/venv//", false),
-            ("/", false),
-            ("//", false),
-            ("relative/path/", false),
-            ("C:\\venv", true),
-            ("C:\\venv\\", true),
-            ("C:\\", true),
-            ("C:/", true),
-            ("C:", true),
-            ("ぁ:/", true),
-            ("\\\\server\\share\\venv", true),
-        ] {
-            let utf16 = resolve_venv_python(false, &u16_str(input), is_windows).unwrap();
-            let utf8 = resolve_venv_python_str(false, input, is_windows).unwrap();
-            assert_eq!(utf8, String::from_utf16_lossy(&utf16), "mismatch for {input}");
-        }
-    }
-
-    #[test]
-    fn should_recreate_model_truth_table() {
-        let name_a = u16_str("model-a");
-        let name_b = u16_str("model-b");
-        let empty = u16_str("");
-
-        // !has_model -> always true
-        assert!(should_recreate_model(false, &name_a, true, &name_a, true));
-        assert!(should_recreate_model(false, &name_a, true, &name_b, true));
-        assert!(should_recreate_model(false, &name_a, true, &name_a, false));
-        assert!(should_recreate_model(false, &empty, false, &empty, false));
-
-        // has_model -> match name & gpu -> false
-        assert!(!should_recreate_model(true, &name_a, true, &name_a, true));
-        assert!(!should_recreate_model(true, &name_a, false, &name_a, false));
-        assert!(!should_recreate_model(true, &empty, true, &empty, true));
-
-        // has_model -> mismatch name -> true
-        assert!(should_recreate_model(true, &name_a, true, &name_b, true));
-        assert!(should_recreate_model(true, &name_a, false, &name_b, false));
-        assert!(should_recreate_model(true, &name_a, true, &empty, true));
-        assert!(should_recreate_model(true, &empty, true, &name_a, true));
-
-        // has_model -> mismatch gpu -> true
-        assert!(should_recreate_model(true, &name_a, true, &name_a, false));
-        assert!(should_recreate_model(true, &name_a, false, &name_a, true));
-
-        // has_model -> mismatch both -> true
-        assert!(should_recreate_model(true, &name_a, true, &name_b, false));
     }
 }
 

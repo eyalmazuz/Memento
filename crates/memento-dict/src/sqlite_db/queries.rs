@@ -218,8 +218,7 @@ pub fn query_term_rules_conn(
 
     if !found_row
         && !reading.is_empty()
-        && crate::normalize::normalize_reading_str(expression)
-            == crate::normalize::normalize_reading_str(reading)
+        && crate::normalize::normalized_readings_eq(expression, reading)
     {
         let mut stmt = conn.prepare_cached(SQL)?;
         let mut rows = stmt.query(params![expression, ""])?;

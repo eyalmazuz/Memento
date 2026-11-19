@@ -55,7 +55,10 @@ pub fn sort_queries(queries: &mut [CandidateSearchQuery]) {
 /// 2. Deduplicates consecutive queries with identical (deconj, rule_mask), keeping the first.
 /// 3. Removes queries with empty deconj.
 pub fn filter_duplicates(queries: &mut Vec<CandidateSearchQuery>, mecab_enabled: bool) {
-    if mecab_enabled {
+    if mecab_enabled
+        && queries.iter().any(|q| q.source == QuerySource::Mecab)
+        && queries.iter().any(|q| q.source == QuerySource::Deconj)
+    {
         let deconj_set: HashSet<&[u16]> = queries
             .iter()
             .filter(|q| q.source == QuerySource::Deconj)

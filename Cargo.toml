@@ -6,7 +6,9 @@ publish = false
 default-run = "memento"
 
 [features]
-default = []
+default = ["software-renderer", "accessibility"]
+software-renderer = ["slint/renderer-software"]
+accessibility = ["slint/accessibility"]
 asr = ["asr-whisper"]
 asr-whisper = ["dep:memento-asr-whisper"]
 asr-onnx = ["dep:memento-asr-onnx"]
@@ -17,14 +19,12 @@ whisper-vulkan = ["asr-whisper", "memento-asr-whisper/vulkan"]
 [dependencies]
 slint = { version = "=1.16.1", default-features = false, features = [
     "std",
-    "accessibility",
     "compat-1-2",
     "backend-winit",
     "backend-winit-wayland",
     "backend-winit-x11",
     "raw-window-handle-06",
     "renderer-femtovg",
-    "renderer-software",
     "unstable-fontique-08",
 ] }
 raw-window-handle = "=0.6.2"
@@ -83,12 +83,50 @@ members = [
 ]
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
 debug-assertions = false
 overflow-checks = false
+
+# Keep hot rendering, text shaping, dictionary search, ASS, and ASR DSP crates at -O3
+# while cold UI glue and generated Slint code optimize for binary size (`opt-level = "s"`).
+[profile.release.package.swash]
+opt-level = 3
+
+[profile.release.package.parley]
+opt-level = 3
+
+[profile.release.package."tiny-skia@0.12.0"]
+opt-level = 3
+
+[profile.release.package.resvg]
+opt-level = 3
+
+[profile.release.package.harfrust]
+opt-level = 3
+
+[profile.release.package.femtovg]
+opt-level = 3
+
+[profile.release.package.memento-dict]
+opt-level = 3
+
+[profile.release.package.memento-definition]
+opt-level = 3
+
+[profile.release.package.memento-ass]
+opt-level = 3
+
+[profile.release.package.memento-asr]
+opt-level = 3
+
+[profile.release.package.memento-asr-onnx]
+opt-level = 3
+
+[profile.release.package.memento-asr-whisper]
+opt-level = 3
 
 # `cargo run` is also used for playback. Keep debug symbols/assertions while
 # optimizing the UI libraries' per-frame work.

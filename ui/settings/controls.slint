@@ -399,6 +399,7 @@ export component FieldRow inherits Rectangle {
     in property <[string]> font-families;
     property <bool> use-anki-decks: (root.field.key == "anki/profile/term/deck" || root.field.key == "anki/profile/kanji/deck") && root.anki-decks.length > 0;
     property <bool> use-anki-models: (root.field.key == "anki/profile/term/model" || root.field.key == "anki/profile/kanji/model") && root.anki-models.length > 0;
+    property <bool> use-combo: root.field.kind == "choice" || (root.field.kind == "text" && (self.use-anki-decks || self.use-anki-models));
     callback edited(string, string);
     callback color-hex-committed(string, string);
     callback font-edited(string, string, string, bool, bool);
@@ -448,10 +449,12 @@ export component FieldRow inherits Rectangle {
                 enabled: root.field.enabled;
                 toggled(value) => { root.edited(root.field.key, value ? "true" : "false"); }
             }
-            if root.field.kind == "choice" : ComboBox {
+            if root.use-combo : ComboBox {
                 width: 260px;
                 enabled: root.field.enabled;
-                model: root.field.choices;
+                model: root.field.kind == "choice"
+                    ? root.field.choices
+                    : (root.use-anki-decks ? root.anki-decks : root.anki-models);
                 current-value: root.field.value;
                 selected(value) => { root.edited(root.field.key, value); }
             }
@@ -477,13 +480,6 @@ export component FieldRow inherits Rectangle {
                 keybind-captured(key, text, ctrl, alt, shift, meta) => {
                     root.keybind-captured(key, text, ctrl, alt, shift, meta);
                 }
-            }
-            if root.field.kind == "text" && (root.use-anki-decks || root.use-anki-models) : ComboBox {
-                width: 260px;
-                enabled: root.field.enabled;
-                model: root.use-anki-decks ? root.anki-decks : root.anki-models;
-                current-value: root.field.value;
-                selected(value) => { root.edited(root.field.key, value); }
             }
             if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : LineEdit {
                 width: 260px;

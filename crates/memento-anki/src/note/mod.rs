@@ -9,11 +9,9 @@ mod metadata;
 mod pitch;
 
 pub use self::format::{
-    find_stroke_count, format_audio_url_and_filename, format_furigana, format_kanji_glossary,
-    format_kanji_readings, format_selection, format_tags, format_term_glossary,
-    format_term_glossary_selected, format_term_glossary_variant, FuriganaPair, KanjiDefEntry,
-    StrokeCountStat, TagEntry, TermGlossaryDef, TermGlossaryOutput, TermGlossaryVariant,
-    TermGlossaryVariants,
+    find_stroke_count, format_furigana, format_kanji_glossary, format_kanji_readings, format_tags,
+    format_term_glossary_selected, FuriganaPair, KanjiDefEntry, StrokeCountStat, TagEntry,
+    TermGlossaryDef, TermGlossaryOutput, TermGlossaryVariant, TermGlossaryVariants,
 };
 pub use self::frequency::{
     build_frequencies_html, frequency_average, frequency_harmonic, frequency_numbers,
@@ -24,7 +22,7 @@ pub use self::media_params::{
     AudioMediaParams, ScreenshotParams, TimingSource, VideoParams,
 };
 pub use self::metadata::{
-    build_note_metadata, replace_newlines, substitute_markers, DuplicatePolicy, MarkerResult,
+    build_note_metadata, substitute_markers, DuplicatePolicy, MarkerResult,
 };
 pub use self::pitch::{
     classify_pitch, classify_pitch_categories, format_pitch, format_pitch_categories,
@@ -64,15 +62,6 @@ mod tests {
             text: u(value),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn newlines_are_literal_and_replacement_is_not_recursive() {
-        assert_eq!(
-            replace_newlines(&u("A\r\nB\nC\u{2028}"), &u("<br>\n")),
-            u("A\r<br>\nB<br>\nC\u{2028}")
-        );
-        assert_eq!(replace_newlines(&u("a\nb"), &[]), u("ab"));
     }
 
     #[test]
@@ -547,39 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn test_format_audio_url_percent_encoding_and_filename_sanitization() {
-        let url = u("https://example.com/?term={term}&reading={reading}");
-        let src = u("Forvo Audio");
-        let expr = u("食べる");
-        let read = u("たべる");
-
-        let (out_url, out_fn) = format_audio_url_and_filename(&url, &src, &expr, &read, false);
-        assert_eq!(
-            u_str(&out_url),
-            "https://example.com/?term=%E9%A3%9F%E3%81%B9%E3%82%8B&reading=%E3%81%9F%E3%81%B9%E3%82%8B"
-        );
-        assert_eq!(u_str(&out_fn), "memento_Forvo_Audio_たべる_食べる.mp3");
-
-        let evil_src = u("../evil/src");
-        let evil_expr = u("a&b=c?d#e[f]/g\\h\0.");
-        let evil_read = u("r:1*2\"3<4>5|6");
-        let (safe_url, safe_fn) =
-            format_audio_url_and_filename(&url, &evil_src, &evil_expr, &evil_read, false);
-        let safe_url_str = u_str(&safe_url);
-        let safe_fn_str = u_str(&safe_fn);
-        assert!(safe_url_str.contains("term=a%26b%3Dc%3Fd%23e%5Bf%5D%2Fg%5Ch%00."));
-        assert!(!safe_fn_str.contains(".."));
-        assert!(!safe_fn_str.contains('/'));
-        assert!(!safe_fn_str.contains('\\'));
-        assert!(!safe_fn_str.contains('['));
-        assert!(!safe_fn_str.contains(']'));
-        assert!(!safe_fn_str.contains('\0'));
-        assert!(safe_fn_str.ends_with(".mp3"));
-    }
-
-    #[test]
     fn test_format_term_glossary_escaping_and_variant_skipping() {
-        assert_eq!(format_term_glossary(&[]), TermGlossaryOutput::default());
+        assert_eq!(
+            format_term_glossary_selected(&[], TermGlossaryVariants::ALL),
+            TermGlossaryOutput::default()
+        );
 
         let d1 = u("JM\"dict<&>");
         let t1 = u("<v1>");
@@ -598,7 +559,7 @@ mod tests {
             stylesheet: &style1,
         }];
 
-        let out = format_term_glossary(&defs);
+        let out = format_term_glossary_selected(&defs, TermGlossaryVariants::ALL);
         let full = u_str(&out.glossary);
         assert!(full.contains("<li data-dictionary=\"JM&quot;dict&lt;&amp;&gt;\">"));
         assert!(full.contains("<i>(&lt;v1&gt;, JM&quot;dict&lt;&amp;&gt;)</i>"));
@@ -609,10 +570,7 @@ mod tests {
         assert!(brief_only.glossary.is_empty());
         assert!(!brief_only.glossary_brief.is_empty());
         assert!(brief_only.glossary_compact.is_empty());
-        assert_eq!(
-            brief_only.glossary_brief,
-            format_term_glossary_variant(&defs, TermGlossaryVariant::Brief)
-        );
+        assert_eq!(brief_only.glossary_brief, out.glossary_brief);
     }
 
     #[test]

@@ -24,9 +24,46 @@ import {
 } from "term_widgets.slint";
 import { DefinitionCardGrid, DefinitionEntryBody } from "definition_body.slint";
 
+component LeadingActionsBox inherits Rectangle {
+    in property <DictResult> res;
+    in property <length> spacing: 6px;
+    in property <bool> show-kana: false;
+    in property <bool> show-browse: false;
+    in property <length> btn-size: 28px;
+    in property <length> icon-size: 16px;
+    callback kana-clicked();
+    callback kanji-clicked();
+    callback audio-clicked();
+    callback audio-right-clicked(length);
+    callback browse-clicked();
+    callback request-tooltip(string, length);
+
+    horizontal-stretch: 0;
+    width: inner.preferred-width;
+    height: inner.preferred-height;
+    background: transparent;
+
+    inner := TermLeadingActions {
+        width: parent.width;
+        height: parent.height;
+        res: root.res;
+        spacing: root.spacing;
+        btn-size: root.btn-size;
+        icon-size: root.icon-size;
+        show-kana: root.show-kana;
+        show-browse: root.show-browse;
+        kana-clicked => { root.kana-clicked(); }
+        kanji-clicked => { root.kanji-clicked(); }
+        audio-clicked => { root.audio-clicked(); }
+        audio-right-clicked(x) => { root.audio-right-clicked(x); }
+        browse-clicked => { root.browse-clicked(); }
+        request-tooltip(tip, off) => { root.request-tooltip(tip, off); }
+    }
+}
+
 // ── Yomitan-Style Floating Recursive Child Popup (depth 1..=N) ───────────────
-// Mounted in the player viewport right after `YomitanPopup` (with `render-nested-inline: false`
-// on the parent), or inline inside `YomitanPopup` when `inline-mode: true`.
+// Mounted directly in the player viewport right after `YomitanPopup` so child popups
+// float freely at full popup size, overlapping or extending beyond the parent card.
 export component NestedYomitanPopup inherits Rectangle {
     in property <bool> is-open: false;
     in property <length> viewport-width: 1280px;
@@ -35,7 +72,6 @@ export component NestedYomitanPopup inherits Rectangle {
     in property <length> parent-y: 0px;
     in property <length> configured-width: 480px;
     in property <length> configured-height: 500px;
-    in property <bool> inline-mode: false;
     in property <bool> anki-enabled: false;
     in property <bool> show-anki-checkbox: true;
     in property <string> added-note-id: "";
@@ -76,35 +112,23 @@ export component NestedYomitanPopup inherits Rectangle {
         max(160px, self.float-place-above ? self.space-above : self.space-below)
     );
 
-    // Inline fallback geometry (contained inside parent YomitanPopup when render-nested-inline: true).
-    property <length> inline-w: max(0px, min(root.viewport-width - 20px, max(300px, root.viewport-width * 0.88)));
-    property <length> inline-h: max(0px, min(root.viewport-height - 36px, max(190px, root.viewport-height * 0.68)));
-    property <bool> inline-place-above: self.anchor-vy > root.viewport-height * 0.48
-        && (self.anchor-vy - 18px) >= 160px;
-
-    property <length> card-w: round((root.inline-mode ? self.inline-w : self.float-w) / 1px) * 1px;
-    property <length> card-h: round((root.inline-mode ? self.inline-h : self.float-h) / 1px) * 1px;
+    property <length> card-w: round(self.float-w / 1px) * 1px;
+    property <length> card-h: round(self.float-h / 1px) * 1px;
     property <bool> use-two-columns: PopupBridge.rich-enabled
         && PopupBridge.css-definition-columns >= 2
         && self.width >= PopupBridge.css-definition-columns-min-width;
-    property <length> card-pad: root.inline-mode ? 8px : PopupBridge.css-popup-padding;
-    property <length> action-btn-size: root.inline-mode ? 26px : 28px;
+    property <length> card-pad: PopupBridge.css-popup-padding;
+    property <length> action-btn-size: 28px;
     property <int> nav-rev: PopupBridge.nested-nav-revision;
 
     visible: root.is-open
         && PopupBridge.rich-enabled
         && PopupBridge.nested-depth > 0
         && PopupBridge.nested-results.length > 0;
-    x: round((root.inline-mode
-        ? max(10px, min(root.viewport-width - self.card-w - 10px, self.anchor-vx - self.card-w * 0.3))
-        : max(12px, min(root.viewport-width - self.card-w - 12px, self.anchor-vx - self.card-w * 0.25))) / 1px) * 1px;
-    y: round((root.inline-mode
-        ? (self.inline-place-above
-            ? max(10px, self.anchor-vy - self.card-h - 14px)
-            : max(10px, min(root.viewport-height - self.card-h - 10px, self.anchor-vy + 18px)))
-        : (self.float-place-above
-            ? max(12px, self.anchor-vy - self.card-h - 18px)
-            : max(12px, min(root.viewport-height - self.card-h - 12px, self.anchor-vy + 22px)))) / 1px) * 1px;
+    x: round(max(12px, min(root.viewport-width - self.card-w - 12px, self.anchor-vx - self.card-w * 0.25)) / 1px) * 1px;
+    y: round((self.float-place-above
+        ? max(12px, self.anchor-vy - self.card-h - 18px)
+        : max(12px, min(root.viewport-height - self.card-h - 12px, self.anchor-vy + 22px))) / 1px) * 1px;
     width: self.card-w;
     height: self.card-h;
     background: PopupBridge.css-popup-bg;
@@ -354,8 +378,20 @@ export component NestedYomitanPopup inherits Rectangle {
                         width: parent.width;
                         height: nested-row-wrapper.nrow-hidden ? 0px : nested-card-content.preferred-height + 8px;
                         background: transparent;
-                        if !nested-row-wrapper.nrow-hidden && nres.term-start && nres.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: PopupBridge.css-term-divider-color; }
-                        if !nested-row-wrapper.nrow-hidden && !nres.term-end && !nres.collapsed && !root.use-two-columns : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+                        Rectangle {
+                            visible: !nested-row-wrapper.nrow-hidden && nres.term-start && nres.index > 1;
+                            y: 0px;
+                            height: 2px;
+                            width: parent.width;
+                            background: PopupBridge.css-term-divider-color;
+                        }
+                        Rectangle {
+                            visible: !nested-row-wrapper.nrow-hidden && !nres.term-end && !nres.collapsed && !root.use-two-columns;
+                            y: parent.height - 1px;
+                            height: 1px;
+                            width: parent.width;
+                            background: PopupBridge.css-divider-color;
+                        }
 
                         nested-card-content := VerticalLayout {
                             x: 0px;
@@ -380,7 +416,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                 TermHeadwordBlock {
                                     res: nres;
                                     nested: true;
-                                    compact: root.inline-mode;
+                                    compact: false;
                                     scan-depth: PopupBridge.nested-depth;
                                     bridge-rev: PopupBridge.nested-revision;
                                     avail-width: nterm-header.navail-title-w;
@@ -399,7 +435,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                         spacing: 5px;
                                         alignment: end;
 
-                                        if !nres.is-kanji || nested-term-segment.nshow-browse-btn : nleading-actions := TermLeadingActions {
+                                        if !nres.is-kanji || nested-term-segment.nshow-browse-btn : nleading-actions := LeadingActionsBox {
                                             res: nres;
                                             spacing: 5px;
                                             btn-size: root.action-btn-size;
@@ -667,7 +703,7 @@ export component YomitanPopup inherits Rectangle {
     in property <bool> show-anki-checkbox: true;
     in property <string> added-note-id: "";
     in property <int> added-result-index: -1;
-    in property <bool> render-nested-inline: true;
+    in property <bool> render-nested-inline: false;
     callback close-requested();
     callback add-anki-note(int);
     callback browse-anki-note(string);
@@ -821,7 +857,7 @@ export component YomitanPopup inherits Rectangle {
                 }
             }
 
-            if PopupBridge.nav-breadcrumb != "" : DictionaryText {
+            DictionaryText {
                 text: PopupBridge.nav-breadcrumb;
                 font-size: 11px;
                 color: MementoPalette.text-secondary;
@@ -903,8 +939,20 @@ export component YomitanPopup inherits Rectangle {
                         width: parent.width;
                         height: row-wrapper.row-hidden ? 0px : card-content.preferred-height + 10px;
                         background: transparent;
-                        if !row-wrapper.row-hidden && res.term-start && res.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: PopupBridge.css-term-divider-color; }
-                        if !row-wrapper.row-hidden && !res.term-end && !res.collapsed && !root.use-two-columns : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+                        Rectangle {
+                            visible: !row-wrapper.row-hidden && res.term-start && res.index > 1;
+                            y: 0px;
+                            height: 2px;
+                            width: parent.width;
+                            background: PopupBridge.css-term-divider-color;
+                        }
+                        Rectangle {
+                            visible: !row-wrapper.row-hidden && !res.term-end && !res.collapsed && !root.use-two-columns;
+                            y: parent.height - 1px;
+                            height: 1px;
+                            width: parent.width;
+                            background: PopupBridge.css-divider-color;
+                        }
 
                         card-content := VerticalLayout {
                             x: 0px;
@@ -947,7 +995,7 @@ export component YomitanPopup inherits Rectangle {
                                         spacing: 6px;
                                         alignment: end;
 
-                                        if !res.is-kanji || term-segment.show-browse-btn : leading-actions := TermLeadingActions {
+                                        if !res.is-kanji || term-segment.show-browse-btn : leading-actions := LeadingActionsBox {
                                             res: res;
                                             spacing: 6px;
                                             btn-size: 28px;
@@ -1205,33 +1253,6 @@ export component YomitanPopup inherits Rectangle {
                 }
             }
         }
-    }
-
-    // Inline Nested Child Popup fallback (used when `render-nested-inline: true`; in full app
-    // `ui/app.slint` mounts `NestedYomitanPopup` directly in the viewport with `render-nested-inline: false`
-    // so child popups float freely at full popup size overlapping/extending beyond the parent).
-    if root.render-nested-inline : nested-popup-card := NestedYomitanPopup {
-        is-open: root.is-open;
-        inline-mode: true;
-        viewport-width: root.width;
-        viewport-height: root.height;
-        parent-x: 0px;
-        parent-y: 0px;
-        configured-width: root.width;
-        configured-height: root.height;
-        anki-enabled: root.anki-enabled;
-        show-anki-checkbox: root.show-anki-checkbox;
-        added-note-id: root.added-note-id;
-        added-result-index: root.added-result-index;
-        audio-sources: root.audio-sources;
-        audio-sources-loading: root.audio-sources-loading;
-        selected-audio-source: root.selected-audio-source;
-        browse-anki-note(id) => { root.browse-anki-note(id); }
-        play-audio(word, reading) => { root.play-audio(word, reading); }
-        request-audio-sources(word, reading) => { root.request-audio-sources(word, reading); }
-        select-audio-source(idx) => { root.select-audio-source(idx); }
-        open-rich-link(href) => { root.open-rich-link(href); }
-        close-parent-requested => { root.close-requested(); }
     }
 
     // Floating Tooltip Overlay (for title attributes, <ruby> readings, tag notes, conjugation derivations #279)

@@ -35,6 +35,7 @@ pub fn prepare_text_fonts() {
     for family in families {
         let _ = collection.family(family);
     }
+    let _ = super::text_engine::capture_shared_font_collection();
 }
 
 /// Bound the initial layout work, even for a term with many long definitions.
@@ -186,17 +187,21 @@ pub(super) fn build_dictionary_result_rows_grouped(
             pos_tags: hit.tags.replace('⭐', "★").into(),
             dict_name: hit.dict_name.clone().into(),
             glossary: hit.glossary.clone().into(),
-            glossary_blocks: Rc::new(VecModel::from(
-                hit.rich_glossary
-                    .iter()
-                    .map(|block| PopupGlossaryBlock {
-                        text: block.text.clone().into(),
-                        kind: block.kind,
-                        href: block.href.clone().into(),
-                    })
-                    .collect::<Vec<_>>(),
-            ))
-            .into(),
+            glossary_blocks: if hit.rich_glossary.is_empty() {
+                Default::default()
+            } else {
+                Rc::new(VecModel::from(
+                    hit.rich_glossary
+                        .iter()
+                        .map(|block| PopupGlossaryBlock {
+                            text: block.text.clone().into(),
+                            kind: block.kind,
+                            href: block.href.clone().into(),
+                        })
+                        .collect::<Vec<_>>(),
+                ))
+                .into()
+            },
             notes: hit.notes.clone().into(),
             example_ja: hit.example_ja.clone().into(),
             example_en: hit.example_en.clone().into(),

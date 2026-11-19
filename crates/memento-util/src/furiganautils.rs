@@ -586,15 +586,6 @@ pub fn distribute_furigana_str(surface: &str, reading: &str) -> Vec<(String, Str
     out
 }
 
-/// Distribute a reading across `surface` so furigana attaches strictly over kanji
-/// stems while okurigana and kana affixes receive empty readings `""`.
-///
-/// Preserves the exact surface concatenation invariant:
-/// `distribute_furigana(surface, reading).iter().map(|(s, _)| s.as_str()).collect::<String>() == surface`.
-pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)> {
-    distribute_furigana_str(surface, reading)
-}
-
 fn peel_kana_affixes(surface: &str, reading_hira: &str) -> Option<Vec<(String, String)>> {
     let surf_chars: Vec<char> = surface.chars().collect();
     let read_chars: Vec<char> = reading_hira.chars().collect();
@@ -661,8 +652,8 @@ fn peel_kana_affixes(surface: &str, reading_hira: &str) -> Option<Vec<(String, S
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_kanji, distribute_furigana, distribute_furigana_str, is_kanji_char,
-        simplify_surface, simplify_surface_str, FuriganaSpan,
+        contains_kanji, distribute_furigana_str, is_kanji_char, simplify_surface,
+        simplify_surface_str, FuriganaSpan,
     };
 
     fn span(surface_start: u64, surface_end: u64, reading_start: u64, reading_end: u64) -> FuriganaSpan {
@@ -807,37 +798,8 @@ mod tests {
     #[test]
     fn distribute_furigana_aligns_stems_only() {
         assert_eq!(
-            distribute_furigana("食べる", "タベル"),
+            distribute_furigana_str("食べる", "タベル"),
             vec![("食".into(), "た".into()), ("べる".into(), "".into())]
-        );
-        assert_eq!(
-            distribute_furigana("申し込み", "モウシコミ"),
-            vec![
-                ("申".into(), "もう".into()),
-                ("し".into(), "".into()),
-                ("込".into(), "こ".into()),
-                ("み".into(), "".into()),
-            ]
-        );
-        assert_eq!(
-            distribute_furigana("お兄さん", "オニイサン"),
-            vec![
-                ("お".into(), "".into()),
-                ("兄".into(), "にい".into()),
-                ("さん".into(), "".into()),
-            ]
-        );
-        assert_eq!(
-            distribute_furigana("行った", "イッタ"),
-            vec![("行".into(), "い".into()), ("った".into(), "".into())]
-        );
-        assert_eq!(
-            distribute_furigana("𠮟る", "シカル"),
-            vec![("𠮟".into(), "しか".into()), ("る".into(), "".into())]
-        );
-        assert_eq!(
-            distribute_furigana("人々", "ヒトビト"),
-            vec![("人々".into(), "ひとびと".into())]
         );
         assert_eq!(
             distribute_furigana_str("申し込み", "モウシコミ"),
@@ -847,6 +809,26 @@ mod tests {
                 ("込".into(), "こ".into()),
                 ("み".into(), "".into()),
             ]
+        );
+        assert_eq!(
+            distribute_furigana_str("お兄さん", "オニイサン"),
+            vec![
+                ("お".into(), "".into()),
+                ("兄".into(), "にい".into()),
+                ("さん".into(), "".into()),
+            ]
+        );
+        assert_eq!(
+            distribute_furigana_str("行った", "イッタ"),
+            vec![("行".into(), "い".into()), ("った".into(), "".into())]
+        );
+        assert_eq!(
+            distribute_furigana_str("𠮟る", "シカル"),
+            vec![("𠮟".into(), "しか".into()), ("る".into(), "".into())]
+        );
+        assert_eq!(
+            distribute_furigana_str("人々", "ヒトビト"),
+            vec![("人々".into(), "ひとびと".into())]
         );
     }
 

@@ -11,9 +11,8 @@ pub use autopause::{
     subtitle_playback_time, subtitle_raw_time, subtitle_valid_speed, AutoPauseState,
 };
 pub use controller::{
-    format_keypress, format_modifiers, is_subtitle_file, parse_cli_options_u16,
-    parse_cli_options_utf8, CliOption, KeyMapping, KeypadPrefix, MouseButton, ScreenshotSpec,
-    ScreenshotValidationError, WheelButton,
+    format_keypress, format_modifiers, is_subtitle_file, CliOption, KeyMapping, KeypadPrefix,
+    MouseButton, ScreenshotSpec, ScreenshotValidationError, WheelButton,
 };
 pub use events::Track;
 pub use mpv::{

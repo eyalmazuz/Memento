@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 
 use crate::glossary::escape::{
-    append_css_style_value, append_css_url_in_attr, append_escaped, ascii_to_u16, is_safe_href,
-    is_valid_image_rendering, is_valid_size_unit, push_ascii, qstring_number, qstring_number_i32,
+    append_css_style_value, append_css_url_in_attr, append_escaped, append_i32_u16,
+    append_qstring_number, ascii_to_u16, is_safe_href, is_valid_image_rendering,
+    is_valid_size_unit, push_ascii,
 };
 use crate::glossary::media::add_file;
 use crate::json::{JsonObject, JsonValue};
@@ -59,12 +60,8 @@ pub fn is_supported_structured_tag(tag: &[u16]) -> bool {
     })
 }
 
-/// Convert a structured data key to an HTML data attribute name
-/// (`GlossaryBuilder::structuredDataAttributeName`), prefixing `data-sc-` and
-/// kebab-casing uppercase Unicode scalar values via `char::to_lowercase()`.
-pub fn structured_data_attribute_name(key: &[u16]) -> Vec<u16> {
-    let mut out = Vec::with_capacity(key.len() + 8);
-    push_ascii(&mut out, "data-sc-");
+fn append_structured_data_attribute_name(key: &[u16], out: &mut Vec<u16>) {
+    push_ascii(out, "data-sc-");
     let mut utf16_buf = [0u16; 2];
     for decoded in char::decode_utf16(key.iter().copied()) {
         match decoded {
@@ -82,6 +79,14 @@ pub fn structured_data_attribute_name(key: &[u16]) -> Vec<u16> {
             }
         }
     }
+}
+
+/// Convert a structured data key to an HTML data attribute name
+/// (`GlossaryBuilder::structuredDataAttributeName`), prefixing `data-sc-` and
+/// kebab-casing uppercase Unicode scalar values via `char::to_lowercase()`.
+pub fn structured_data_attribute_name(key: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(key.len() + 8);
+    append_structured_data_attribute_name(key, &mut out);
     out
 }
 
@@ -97,12 +102,17 @@ fn add_structured_data(obj: &JsonObject, out: &mut Vec<u16>) {
         let Some(s) = val.as_qstring() else {
             continue;
         };
-        let attr_name = structured_data_attribute_name(key);
-        if !attr_name.iter().all(|&u| is_safe_html_attr_name_unit(u)) {
+        let mark = out.len();
+        out.push(b' ' as u16);
+        let name_start = out.len();
+        append_structured_data_attribute_name(key, out);
+        if !out[name_start..]
+            .iter()
+            .all(|&u| is_safe_html_attr_name_unit(u))
+        {
+            out.truncate(mark);
             continue;
         }
-        out.push(b' ' as u16);
-        out.extend_from_slice(&attr_name);
         push_ascii(out, "=\"");
         append_escaped(s, out, false);
         out.push(0x22);
@@ -187,7 +197,7 @@ fn add_structured_style(obj: &JsonObject, out: &mut Vec<u16>) {
                     if n.is_finite() {
                         push_ascii(out, css_name);
                         push_ascii(out, ": ");
-                        out.extend(qstring_number(*n));
+                        append_qstring_number(out, *n);
                         push_ascii(out, "em;");
                     }
                 }
@@ -288,7 +298,7 @@ fn add_structured_img<F>(
     if let Some(JsonValue::Number(w)) = obj.get(KEY_WIDTH.as_slice()) {
         if w.is_finite() {
             push_ascii(out, "width: ");
-            out.extend(qstring_number(*w));
+            append_qstring_number(out, *w);
             out.extend_from_slice(units);
             out.push(b';' as u16);
         }
@@ -297,7 +307,7 @@ fn add_structured_img<F>(
     if let Some(JsonValue::Number(h)) = obj.get(KEY_HEIGHT.as_slice()) {
         if h.is_finite() {
             push_ascii(out, "height: ");
-            out.extend(qstring_number(*h));
+            append_qstring_number(out, *h);
             out.extend_from_slice(units);
             out.push(b';' as u16);
         }
@@ -438,7 +448,7 @@ fn add_structured_content_helper_obj<F>(
         if let Some(JsonValue::Number(colspan)) = obj.get(KEY_COLSPAN.as_slice()) {
             if colspan.is_finite() {
                 push_ascii(out, " colspan=\"");
-                out.extend(qstring_number_i32(*colspan as i32));
+                append_i32_u16(out, *colspan as i32);
                 out.push(0x22);
             }
         }
@@ -446,7 +456,7 @@ fn add_structured_content_helper_obj<F>(
         if let Some(JsonValue::Number(rowspan)) = obj.get(KEY_ROWSPAN.as_slice()) {
             if rowspan.is_finite() {
                 push_ascii(out, " rowspan=\"");
-                out.extend(qstring_number_i32(*rowspan as i32));
+                append_i32_u16(out, *rowspan as i32);
                 out.push(0x22);
             }
         }

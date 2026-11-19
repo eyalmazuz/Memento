@@ -189,6 +189,17 @@ pub(crate) enum ThumbRequest {
     Unload,
 }
 
+/// Idle timeout after which the thumbnail preview `libmpv` instance is dropped
+/// to reclaim 50–150 MB of RAM (lazily recreated on the next timeline hover).
+const THUMB_IDLE_TIMEOUT: Duration = Duration::from_secs(40);
+
+struct ThumbMpvState {
+    // Declared before `inst` so the software renderer handle drops before `MpvInstance`.
+    renderer: memento_player::mpv::MpvSoftwareRenderer,
+    inst: MpvInstance,
+    wake_signal: Arc<(Mutex<bool>, Condvar)>,
+}
+
 pub(crate) struct WordLookupRequest {
     pub(crate) generation: u64,
     pub(crate) query: String,
@@ -201,6 +212,27 @@ pub(crate) struct WordLookupRequest {
     pub(crate) remove_regex: String,
     pub(crate) replace_lines: bool,
     pub(crate) replace_with: String,
+}
+
+pub(crate) struct KanjiLookupRequest {
+    pub(crate) generation: u64,
+    pub(crate) character: String,
+    pub(crate) order: Vec<i64>,
+    pub(crate) excluded: Vec<String>,
+}
+
+pub(crate) enum LookupWorkerRequest {
+    Word(WordLookupRequest),
+    Kanji(KanjiLookupRequest),
+}
+
+impl LookupWorkerRequest {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Word(req) => req.generation,
+            Self::Kanji(req) => req.generation,
+        }
+    }
 }
 
 pub(crate) struct WordLookupResult {
@@ -318,7 +350,7 @@ fn wait_for_render_update(
 /// and joins workers cleanly within a bounded budget.
 pub(crate) struct WorkerPool {
     pub(crate) thumb_tx: ChannelSlot<ThumbRequest>,
-    pub(crate) lookup_tx: ChannelSlot<WordLookupRequest>,
+    pub(crate) lookup_tx: ChannelSlot<LookupWorkerRequest>,
     pub(crate) furigana_tx: ChannelSlot<(u64, String)>,
     pub(crate) ext_sub_tx: ChannelSlot<(u64, ExternalSubtitleLoad)>,
     pub(crate) mkv_tx: ChannelSlot<MkvExtractRequest>,
@@ -338,25 +370,42 @@ impl WorkerPool {
     ) -> Self {
         let mut handles = Vec::with_capacity(5);
 
-        // 1. Timeline hover thumbnail preview worker (Condvar-driven, zero sleep-polling).
+        // 1. Timeline hover thumbnail preview worker (Condvar-driven, zero sleep-polling,
+        //    with 40s idle teardown to reclaim 50–150 MB of libmpv/FFmpeg memory).
         let (thumb_raw_tx, thumb_rx) = std::sync::mpsc::channel::<ThumbRequest>();
         let thumb_tx = ChannelSlot::new(thumb_raw_tx);
         let thumb_worker_app = app.as_weak();
         let thumb_handle = std::thread::spawn(move || {
-            let mut thumb_mpv: Option<(
-                MpvInstance,
-                memento_player::mpv::MpvSoftwareRenderer,
-                Arc<(Mutex<bool>, Condvar)>,
-            )> = None;
+            let mut thumb_mpv: Option<ThumbMpvState> = None;
             let mut loaded_path = String::new();
-            while let Ok(mut req) = thumb_rx.recv() {
+            loop {
+                let mut req = if thumb_mpv.is_some() {
+                    match thumb_rx.recv_timeout(THUMB_IDLE_TIMEOUT) {
+                        Ok(req) => req,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(state) = thumb_mpv.take() {
+                                drop(state);
+                                crate::app::trim_os_heap();
+                            }
+                            loaded_path.clear();
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match thumb_rx.recv() {
+                        Ok(req) => req,
+                        Err(_) => break,
+                    }
+                };
                 while let Ok(newer) = thumb_rx.try_recv() {
                     req = newer;
                 }
                 match req {
                     ThumbRequest::Unload => {
-                        if let Some((inst, _, _)) = thumb_mpv.as_ref() {
-                            let _ = inst.command(&["stop"]);
+                        if let Some(state) = thumb_mpv.take() {
+                            drop(state);
+                            crate::app::trim_os_heap();
                         }
                         loaded_path.clear();
                         continue;
@@ -423,27 +472,40 @@ impl WorkerPool {
                                     }
                                 });
                                 let renderer = inst.software_renderer();
-                                thumb_mpv = Some((inst, renderer, wake_signal));
+                                thumb_mpv = Some(ThumbMpvState {
+                                    renderer,
+                                    inst,
+                                    wake_signal,
+                                });
                             }
                         }
-                        let Some((inst, renderer, wake_signal)) = thumb_mpv.as_ref() else {
+                        let Some(state) = thumb_mpv.as_ref() else {
                             continue;
                         };
                         if loaded_path != path {
-                            if inst.load_file(&path).is_err() {
+                            if state.inst.load_file(&path).is_err() {
                                 continue;
                             }
                             loaded_path = path.clone();
-                            wait_for_render_update(inst, wake_signal, Duration::from_millis(160));
+                            wait_for_render_update(
+                                &state.inst,
+                                &state.wake_signal,
+                                Duration::from_millis(160),
+                            );
                         }
-                        let _ = inst.command(&[
+                        let _ = state.inst.command(&[
                             "seek",
                             &format!("{:.3}", time_sec.max(0.0)),
                             "absolute+keyframes",
                         ]);
-                        wait_for_render_update(inst, wake_signal, Duration::from_millis(80));
+                        wait_for_render_update(
+                            &state.inst,
+                            &state.wake_signal,
+                            Duration::from_millis(80),
+                        );
                         let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(160, 90);
-                        if unsafe { renderer.render_rgba(160, 90, buffer.make_mut_bytes()) }.is_ok()
+                        if unsafe { state.renderer.render_rgba(160, 90, buffer.make_mut_bytes()) }
+                            .is_ok()
                         {
                             let _ = thumb_worker_app.upgrade_in_event_loop(move |app| {
                                 app.set_thumbnail_frame(slint::Image::from_rgba8(buffer));
@@ -455,8 +517,8 @@ impl WorkerPool {
         });
         handles.push(("thumb_worker", thumb_handle));
 
-        // 2. Dictionary lookup worker.
-        let (lookup_raw_tx, lookup_rx) = std::sync::mpsc::channel::<WordLookupRequest>();
+        // 2. Dictionary & kanji lookup worker (off-UI-thread SQLite queries).
+        let (lookup_raw_tx, lookup_rx) = std::sync::mpsc::channel::<LookupWorkerRequest>();
         let lookup_tx = ChannelSlot::new(lookup_raw_tx);
         let worker_epoch = lookup_epoch.clone();
         let lookup_path = dictionary_database_path;
@@ -471,7 +533,7 @@ impl WorkerPool {
                 while let Ok(newer) = lookup_rx.try_recv() {
                     request = newer;
                 }
-                if request.generation != worker_epoch.load(Ordering::Acquire) {
+                if request.generation() != worker_epoch.load(Ordering::Acquire) {
                     continue;
                 }
                 let signature = dict::db_file_fingerprint(&lookup_path);
@@ -482,102 +544,155 @@ impl WorkerPool {
                     });
                     database_signature = signature;
                 }
-                dictionary.set_order(&request.order);
-                dictionary.set_exact_enabled(request.exact_enabled);
-                dictionary.set_deconj_enabled(request.deconj_enabled);
-                dictionary.set_mecab_enabled(request.mecab_enabled);
-                dictionary.set_search_text_filters(
-                    &request.remove_regex,
-                    request.replace_lines,
-                    &request.replace_with,
-                );
-                let hits = dictionary.search(&request.query).to_vec();
-                let error = dictionary.take_search_error();
-                let database_open = dictionary.database_path_is_open();
-                let matched_units = dictionary.last_match_units();
-                let headword = hits
-                    .first()
-                    .map(|hit| hit.expression.clone())
-                    .unwrap_or_default();
-                let reading = hits
-                    .first()
-                    .map(|hit| hit.reading.clone())
-                    .unwrap_or_default();
-                let meta_headword = headword.clone();
-                let meta_reading = reading.clone();
-                let mut pitch_terms = Vec::new();
-                for hit in &hits {
-                    if !hit.is_kanji
-                        && !pitch_terms
-                            .iter()
-                            .any(|(expression, reading): &(String, String)| {
-                                expression == &hit.expression && reading == &hit.reading
-                            })
-                    {
-                        pitch_terms.push((hit.expression.clone(), hit.reading.clone()));
-                    }
-                }
-                let result = WordLookupResult {
-                    hits,
-                    error,
-                    database_open,
-                    matched_units,
-                    headword,
-                    reading,
-                    pitch: String::new(),
-                    freq: String::new(),
-                    jpdb: String::new(),
-                };
-                if request.generation != worker_epoch.load(Ordering::Acquire) {
-                    continue;
-                }
-                let generation = request.generation;
-                let query = request.query;
-                let source_subtitle = request.source_subtitle;
-                let excluded = request.excluded;
-                let meta_subtitle = source_subtitle.clone();
-                let event_epoch = worker_epoch.clone();
-                let _ = worker_app.upgrade_in_event_loop(move |app| {
-                    if generation == event_epoch.load(Ordering::Acquire)
-                        && app.get_active_sub_text().as_str() == source_subtitle
-                    {
-                        display_word_lookup(&app, result, &query, &excluded);
-                    }
-                });
-                if !meta_headword.is_empty() && generation == worker_epoch.load(Ordering::Acquire) {
-                    let (pitch, freq, jpdb) =
-                        dictionary.get_term_meta(&meta_headword, &meta_reading);
-                    let mut graphs = Vec::with_capacity(pitch_terms.len());
-                    for (expression, reading) in pitch_terms {
-                        if generation != worker_epoch.load(Ordering::Acquire) {
-                            break;
+                match request {
+                    LookupWorkerRequest::Word(request) => {
+                        dictionary.set_order(&request.order);
+                        dictionary.set_exact_enabled(request.exact_enabled);
+                        dictionary.set_deconj_enabled(request.deconj_enabled);
+                        dictionary.set_mecab_enabled(request.mecab_enabled);
+                        dictionary.set_search_text_filters(
+                            &request.remove_regex,
+                            request.replace_lines,
+                            &request.replace_with,
+                        );
+                        let hits = dictionary.search(&request.query).to_vec();
+                        let error = dictionary.take_search_error();
+                        let database_open = dictionary.database_path_is_open();
+                        let matched_units = dictionary.last_match_units();
+                        let headword = hits
+                            .first()
+                            .map(|hit| hit.expression.clone())
+                            .unwrap_or_default();
+                        let reading = hits
+                            .first()
+                            .map(|hit| hit.reading.clone())
+                            .unwrap_or_default();
+                        let meta_headword = headword.clone();
+                        let meta_reading = reading.clone();
+                        let mut pitch_terms = Vec::new();
+                        for hit in &hits {
+                            if !hit.is_kanji
+                                && !pitch_terms.iter().any(
+                                    |(expression, reading): &(String, String)| {
+                                        expression == &hit.expression && reading == &hit.reading
+                                    },
+                                )
+                            {
+                                pitch_terms.push((hit.expression.clone(), hit.reading.clone()));
+                            }
                         }
-                        let term_graphs = dictionary.get_pitch_graphs(&expression, &reading);
-                        let frequencies = dictionary.get_frequencies(&expression, &reading);
-                        graphs.push((expression, reading, term_graphs, frequencies));
-                    }
-                    if generation != worker_epoch.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let event_epoch = worker_epoch.clone();
-                    let _ = worker_app.upgrade_in_event_loop(move |app| {
-                        if generation == event_epoch.load(Ordering::Acquire)
-                            && app.get_active_sub_text().as_str() == meta_subtitle
+                        let result = WordLookupResult {
+                            hits,
+                            error,
+                            database_open,
+                            matched_units,
+                            headword,
+                            reading,
+                            pitch: String::new(),
+                            freq: String::new(),
+                            jpdb: String::new(),
+                        };
+                        if request.generation != worker_epoch.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let generation = request.generation;
+                        let query = request.query;
+                        let source_subtitle = request.source_subtitle;
+                        let excluded = request.excluded;
+                        let meta_subtitle = source_subtitle.clone();
+                        let event_epoch = worker_epoch.clone();
+                        let _ = worker_app.upgrade_in_event_loop(move |app| {
+                            if generation == event_epoch.load(Ordering::Acquire)
+                                && app.get_active_sub_text().as_str() == source_subtitle
+                            {
+                                display_word_lookup(&app, result, &query, &excluded);
+                            }
+                        });
+                        if !meta_headword.is_empty()
+                            && generation == worker_epoch.load(Ordering::Acquire)
                         {
+                            let (pitch, freq, jpdb) =
+                                dictionary.get_term_meta(&meta_headword, &meta_reading);
+                            let mut graphs = Vec::with_capacity(pitch_terms.len());
+                            for (expression, reading) in pitch_terms {
+                                if generation != worker_epoch.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let term_graphs =
+                                    dictionary.get_pitch_graphs(&expression, &reading);
+                                let frequencies = dictionary.get_frequencies(&expression, &reading);
+                                graphs.push((expression, reading, term_graphs, frequencies));
+                            }
+                            if generation != worker_epoch.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            let event_epoch = worker_epoch.clone();
+                            let _ = worker_app.upgrade_in_event_loop(move |app| {
+                                if generation == event_epoch.load(Ordering::Acquire)
+                                    && app.get_active_sub_text().as_str() == meta_subtitle
+                                {
+                                    app.set_dict_pitch_accent(pitch.into());
+                                    app.set_dict_freq_rank(freq.into());
+                                    app.set_dict_jpdb_rank(jpdb.into());
+                                    for (expression, reading, graph_rows, frequencies) in graphs {
+                                        set_popup_term_metadata(
+                                            &app,
+                                            &expression,
+                                            &reading,
+                                            graph_rows,
+                                            frequencies,
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    LookupWorkerRequest::Kanji(request) => {
+                        dictionary.set_order(&request.order);
+                        let hits = dictionary.search_kanji(&request.character).to_vec();
+                        let error = dictionary.take_search_error();
+                        let database_open = dictionary.database_path_is_open();
+                        let headword = hits
+                            .first()
+                            .map(|hit| hit.expression.clone())
+                            .unwrap_or_default();
+                        let reading = hits
+                            .first()
+                            .map(|hit| hit.reading.clone())
+                            .unwrap_or_default();
+                        let (pitch, freq, jpdb) = if !headword.is_empty() {
+                            dictionary.get_term_meta(&headword, &reading)
+                        } else {
+                            (String::new(), String::new(), String::new())
+                        };
+                        if request.generation != worker_epoch.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let generation = request.generation;
+                        let excluded = request.excluded;
+                        let event_epoch = worker_epoch.clone();
+                        let _ = worker_app.upgrade_in_event_loop(move |app| {
+                            if generation != event_epoch.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if let Some(error) = error {
+                                app.set_status_message(
+                                    format!("Kanji lookup failed: {error}").into(),
+                                );
+                            } else if hits.is_empty() && !database_open {
+                                app.set_status_message("Dictionary database is unavailable".into());
+                            }
+                            app.set_dict_open(false);
+                            set_dictionary_rows(&app, dictionary_result_rows(&hits, &excluded));
+                            app.invoke_reset_definition_scroll();
+                            app.set_dict_query(headword.into());
+                            app.set_dict_reading(reading.into());
                             app.set_dict_pitch_accent(pitch.into());
                             app.set_dict_freq_rank(freq.into());
                             app.set_dict_jpdb_rank(jpdb.into());
-                            for (expression, reading, graph_rows, frequencies) in graphs {
-                                set_popup_term_metadata(
-                                    &app,
-                                    &expression,
-                                    &reading,
-                                    graph_rows,
-                                    frequencies,
-                                );
-                            }
-                        }
-                    });
+                            app.set_dict_open(!hits.is_empty());
+                        });
+                    }
                 }
             }
         });
@@ -762,7 +877,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
     config_ctrl: Rc<ConfigController>,
     dict_ctrl: Rc<RefCell<DictController>>,
     popup_audio_cache: Arc<Mutex<PopupAudioState>>,
-    lookup_tx: ChannelSlot<WordLookupRequest>,
+    lookup_tx: ChannelSlot<LookupWorkerRequest>,
     lookup_epoch: Arc<AtomicU64>,
     hover_cursor: Rc<RefCell<Option<(String, i32)>>>,
 ) -> Rc<slint::Timer> {
@@ -770,7 +885,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
     let hover_pending = Rc::new(RefCell::new(None::<String>));
 
     let lookup_config = config_ctrl.clone();
-    let lookup_sender = lookup_tx;
+    let lookup_sender = lookup_tx.clone();
     let lookup_generation = lookup_epoch.clone();
     let lookup_app = app.as_weak();
     let lookup_audio_cache = popup_audio_cache.clone();
@@ -795,7 +910,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
         let mecab_enabled = mecab_matcher_enabled(&lookup_config);
         let (remove_regex, replace_lines, replace_with) = search_text_filters(&lookup_config);
         let generation = lookup_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = lookup_sender.send(WordLookupRequest {
+        let _ = lookup_sender.send(LookupWorkerRequest::Word(WordLookupRequest {
             generation,
             query: word.to_string(),
             order,
@@ -807,7 +922,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
             remove_regex,
             replace_lines,
             replace_with,
-        });
+        }));
     });
 
     let glossary_link_app = app.as_weak();
@@ -843,7 +958,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
     let hover_timer_callback = hover_timer.clone();
     let hover_pending_callback = hover_pending;
     let hover_cursor_callback = hover_cursor;
-    let hover_generation = lookup_epoch;
+    let hover_generation = lookup_epoch.clone();
     app.on_hover_word(move |word, index, control, shift, alt, meta| {
         let Some(app) = hover_app.upgrade() else {
             return;
@@ -932,7 +1047,7 @@ pub(crate) fn install_dictionary_lookup_handlers(
 
     let search_dict_app = app.as_weak();
     let search_dict_config = config_ctrl.clone();
-    let search_dict_ctrl = dict_ctrl.clone();
+    let search_dict_ctrl = dict_ctrl;
     let search_audio_cache = popup_audio_cache.clone();
     app.on_search_dictionary(move |query| {
         let Some(app) = search_dict_app.upgrade() else {
@@ -977,9 +1092,10 @@ pub(crate) fn install_dictionary_lookup_handlers(
     });
 
     let kanji_app = app.as_weak();
-    let kanji_dict = dict_ctrl;
     let kanji_config = config_ctrl;
     let kanji_audio_cache = popup_audio_cache;
+    let kanji_sender = lookup_tx;
+    let kanji_generation = lookup_epoch;
     app.on_lookup_kanji(move |word| {
         let Some(app) = kanji_app.upgrade() else {
             return;
@@ -999,54 +1115,18 @@ pub(crate) fn install_dictionary_lookup_handlers(
             app.set_status_message("No kanji in selected word".into());
             return;
         };
-        let (hits, error, database_open, headword, reading, pitch, freq, jpdb) = {
-            let Ok(mut dictionary) = kanji_dict.try_borrow_mut() else {
-                return;
+        let order =
+            match kanji_config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER) {
+                Some(Value::Ints(order)) => order,
+                _ => Vec::new(),
             };
-            let hits = dictionary.search_kanji(&character.to_string()).to_vec();
-            let error = dictionary.take_search_error();
-            let database_open = dictionary.database_path_is_open();
-            let headword = hits
-                .first()
-                .map(|hit| hit.expression.clone())
-                .unwrap_or_default();
-            let reading = hits
-                .first()
-                .map(|hit| hit.reading.clone())
-                .unwrap_or_default();
-            let (pitch, freq, jpdb) = if !headword.is_empty() {
-                dictionary.get_term_meta(&headword, &reading)
-            } else {
-                (String::new(), String::new(), String::new())
-            };
-            (
-                hits,
-                error,
-                database_open,
-                headword,
-                reading,
-                pitch,
-                freq,
-                jpdb,
-            )
-        };
-        if let Some(error) = error {
-            app.set_status_message(format!("Kanji lookup failed: {error}").into());
-        } else if hits.is_empty() && !database_open {
-            app.set_status_message("Dictionary database is unavailable".into());
-        }
-        app.set_dict_open(false);
-        set_dictionary_rows(
-            &app,
-            dictionary_result_rows(&hits, &kanji_config.anki_excluded_glossaries()),
-        );
-        app.invoke_reset_definition_scroll();
-        app.set_dict_query(headword.into());
-        app.set_dict_reading(reading.into());
-        app.set_dict_pitch_accent(pitch.into());
-        app.set_dict_freq_rank(freq.into());
-        app.set_dict_jpdb_rank(jpdb.into());
-        app.set_dict_open(!hits.is_empty());
+        let generation = kanji_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = kanji_sender.send(LookupWorkerRequest::Kanji(KanjiLookupRequest {
+            generation,
+            character: character.to_string(),
+            order,
+            excluded: kanji_config.anki_excluded_glossaries(),
+        }));
     });
 
     hover_timer

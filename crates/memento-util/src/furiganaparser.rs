@@ -37,78 +37,14 @@ fn katakana_narrow(c: char) -> char {
     }
 }
 
-/// One NFKC pass plus the narrow katakana mapping, in QString order.
-fn normalize_run(text: &str) -> Vec<u16> {
-    let mut normalized = Vec::with_capacity(text.len());
-    for c in text.nfkc().map(katakana_narrow) {
-        let mut units = [0; 2];
-        normalized.extend_from_slice(c.encode_utf16(&mut units));
-    }
-    normalized
-}
-
-/// Normalize well-formed UTF-16 runs separately while passing isolated
-/// surrogate code units through unchanged.
-fn normalize_malformed(text: &[u16]) -> Vec<u16> {
-    let mut normalized = Vec::with_capacity(text.len());
-    let mut run_start = 0;
-    let mut i = 0;
-    while i < text.len() {
-        let code = text[i];
-        if (0xd800..=0xdbff).contains(&code)
-            && text
-                .get(i + 1)
-                .is_some_and(|&low| (0xdc00..=0xdfff).contains(&low))
-        {
-            i += 2;
-            continue;
-        }
-        if (0xd800..=0xdfff).contains(&code) {
-            let run = &text[run_start..i];
-            if !run.is_empty() {
-                let decoded = String::from_utf16(run).expect("run contains valid UTF-16");
-                normalized.extend(normalize_run(&decoded));
-            }
-            normalized.push(code);
-            i += 1;
-            run_start = i;
-        } else {
-            i += 1;
-        }
-    }
-    let run = &text[run_start..];
-    if !run.is_empty() {
-        let decoded = String::from_utf16(run).expect("run contains valid UTF-16");
-        normalized.extend(normalize_run(&decoded));
-    }
-    normalized
-}
-
-/// `FuriganaParser::katakanaToHiragana`: NFKC followed by the
-/// `0x30A1–0x30F6` (inclusive) shift by `0x60`. Isolated surrogate units
-/// are preserved; behavior for malformed QString input needs Qt comparison.
-pub fn katakana_to_hiragana(text: &[u16]) -> Vec<u16> {
-    match String::from_utf16(text) {
-        Ok(decoded) => normalize_run(&decoded),
-        Err(_) => normalize_malformed(text),
-    }
-}
-
-/// Native UTF-8 version of [`katakana_to_hiragana`]: NFKC normalization
-/// followed by the narrow katakana-to-hiragana shift (`0x30A1..=0x30F6` by `-0x60`).
+/// NFKC normalization followed by the narrow katakana-to-hiragana shift (`0x30A1..=0x30F6` by `-0x60`).
+/// Leaves iteration marks `0x30FD`/`0x30FE` untouched.
 pub fn katakana_to_hiragana_str(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     for c in text.nfkc().map(katakana_narrow) {
         normalized.push(c);
     }
     normalized
-}
-
-/// `FuriganaParser::getFallbackResult` uses the unchanged surface as its
-/// sole QVariantMap element. A Rust caller can borrow the original UTF-16
-/// units until it constructs the corresponding output.
-pub fn fallback_surface(text: &[u16]) -> &[u16] {
-    text
 }
 
 /// Split a MeCab CSV feature row respecting double-quoted fields (`"1,2"`) and
@@ -439,83 +375,20 @@ pub fn extract_surface_reading_from_fields<S: AsRef<str>>(
 mod tests {
     use super::*;
 
-    fn convert(text: &str) -> String {
-        String::from_utf16_lossy(&katakana_to_hiragana(&text.encode_utf16().collect::<Vec<_>>()))
-    }
-
     #[test]
-    fn katakana_maps_to_hiragana_inclusively() {
-        assert_eq!(convert("カタカナ"), "かたかな");
-        // 0x30F4 → 0x3094
-        assert_eq!(convert("ヴ"), "ゔ");
-        // 0x30F6 (upper bound) → 0x3096
-        assert_eq!(katakana_to_hiragana(&[0x30f6]), [0x3096]);
-        // 0x30A0 lies outside the inclusive range.
-        assert_eq!(katakana_to_hiragana(&[0x30a0]), [0x30a0]);
-    }
-
-    #[test]
-    fn nfkc_normalizes_before_the_mapping() {
-        // Half-width katakana normalizes to full width first.
-        assert_eq!(convert("ｱｲｳｴｵ"), "あいうえお");
-        // A half-width voiced cluster collapses to one hiragana character.
-        assert_eq!(convert("ｶﾞ"), "が");
-        // ﾊﾟ (0xFF8A, 0xFF9F) NFKCs to composed 0x30D1 (in range) → 0x3071.
-        assert_eq!(
-            katakana_to_hiragana(&[0xff8a, 0xff9f]),
-            [0x3071]
-        );
-    }
-
-    #[test]
-    fn iteration_marks_are_not_mapped_here() {
-        // FuriganaParser::katakanaToHiragana keeps 0x30FD/0x30FE katakana
-        // marks; only FuriganaUtils normalizes those.
-        assert_eq!(
-            katakana_to_hiragana(&[0x30fd]),
-            [0x30fd]
-        );
-        assert_eq!(
-            katakana_to_hiragana(&[0x30fe]),
-            [0x30fe]
-        );
-        // Hiragana marks are untouched too.
-        assert_eq!(katakana_to_hiragana(&[0x309d]), [0x309d]);
-    }
-
-    #[test]
-    fn isolated_surrogates_pass_through_normalization() {
-        assert_eq!(katakana_to_hiragana(&[0xd800]), [0xd800]);
-        assert_eq!(
-            katakana_to_hiragana(&[0x30ac, 0xd800, 0x30d5]),
-            [0x304c, 0xd800, 0x3075]
-        );
-        // Valid pairs stay paired.
-        assert_eq!(
-            katakana_to_hiragana(&[0xd83d, 0xde00]),
-            [0xd83d, 0xde00]
-        );
-    }
-
-    #[test]
-    fn fallback_surface_is_the_unchanged_text() {
-        assert_eq!(fallback_surface(&[]), &[] as &[u16]);
-        assert_eq!(fallback_surface(&[0x3042]), [0x3042]);
-        assert_eq!(fallback_surface(&[0xd800, 0x30ac]), [0xd800, 0x30ac]);
-        assert_eq!(
-            fallback_surface(&"日本語😀".encode_utf16().collect::<Vec<_>>()),
-            "日本語😀".encode_utf16().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn katakana_to_hiragana_str_matches_utf16_semantics() {
+    fn katakana_to_hiragana_str_handles_range_nfkc_and_iteration_marks() {
         assert_eq!(katakana_to_hiragana_str("カタカナ"), "かたかな");
         assert_eq!(katakana_to_hiragana_str("ヴ"), "ゔ");
+        assert_eq!(katakana_to_hiragana_str("\u{30f6}"), "\u{3096}");
+        assert_eq!(katakana_to_hiragana_str("\u{30a0}"), "\u{30a0}");
         assert_eq!(katakana_to_hiragana_str("ｱｲｳｴｵ"), "あいうえお");
         assert_eq!(katakana_to_hiragana_str("ｶﾞﾊﾟ"), "がぱ");
+        assert_eq!(katakana_to_hiragana_str("日本語😀"), "日本語😀");
         // Iteration marks and 0x30A0 are not shifted here.
-        assert_eq!(katakana_to_hiragana_str("\u{30a0}\u{30fd}\u{30fe}"), "\u{30a0}\u{30fd}\u{30fe}");
+        assert_eq!(
+            katakana_to_hiragana_str("\u{30a0}\u{30fd}\u{30fe}\u{309d}"),
+            "\u{30a0}\u{30fd}\u{30fe}\u{309d}"
+        );
     }
 
     #[test]

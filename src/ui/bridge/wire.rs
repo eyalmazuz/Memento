@@ -4,35 +4,43 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
 use crate::controller::config::ConfigController;
 use crate::controller::dict::DictController;
 use crate::ui::dict_assets::collect_dictionary_resource_dirs;
+use crate::ui::glossary_render::rasterize_structured_glossary_entry_with_engine;
 use crate::ui::popup_css::{rgba_to_slint_color, StylesheetCache};
 use crate::ui::popup_model::{
     is_kanji_char, register_active_rich_bridge, split_anki_tags_str, NEXT_BRIDGE_INSTANCE_ID,
 };
 use crate::ui::rich_db::RichDbHelper;
 use crate::ui::subtitle_layout::set_active_subtitle_render_style;
-use crate::ui::text_engine::{subtitle_cluster_at_point_with_style, with_shared_text_engine};
+use crate::ui::text_engine::{
+    capture_shared_font_collection, subtitle_cluster_at_point_with_style, with_shared_text_engine,
+    TextEngine,
+};
 use crate::ui::{
     DefinitionGridRow, DictResult, MementoApp, PopupBridge, PopupDictStyle, PopupFreqStyle,
     RichHeadwordChar, RichHeadwordLine, SubtitleOverlayBridge,
 };
 
 use super::anki::{drain_anki_results_for_app, sync_anki_checking_for_app};
+use super::glossary::drain_glossary_prerender_results_for_app;
 use super::nested::drain_nested_scan_results_for_app;
 use super::state::{
-    apply_popup_css_theme_to_bridge, copy_to_persistent_clipboard, current_external_lookup_epoch,
+    apply_popup_css_theme_to_bridge, collect_hits_term_and_kanji_meta,
+    copy_to_persistent_clipboard, current_external_lookup_epoch, execute_nav_lookup,
     modifier_matches_setting, push_history_capped, resolve_bare_modifier_event,
     utf16_units_to_char_count, AnkiPopupCheckRequest, AnkiPopupCheckResponse, CachedConfigSettings,
-    DictSearchConfig, GlossaryDocLruCache, NestedScanRequest, NestedScanResponse,
-    PanelSearchRequest, PanelSearchResponse, RichUiMutable, SubtitleTokenLayoutCache,
+    DictSearchConfig, DictWorkerRequest, GlossaryDocLruCache, GlossaryPreRenderBatch,
+    GlossaryPreRenderDone, NavLookupRequest, NavLookupResponse, NestedScanRequest,
+    NestedScanResponse, PanelSearchRequest, PanelSearchResponse, RichUiMutable,
+    SubtitleTokenLayoutCache,
 };
-use super::{drain_panel_results_for_app, RichUiBridge};
+use super::{drain_nav_lookup_results_for_app, drain_panel_results_for_app, RichUiBridge};
 
 fn spawn_panel_worker(
     dictionary_db_path: PathBuf,
@@ -103,110 +111,228 @@ fn spawn_panel_worker(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_nested_worker(
     dictionary_db_path: PathBuf,
-    nested_rx: mpsc::Receiver<NestedScanRequest>,
+    worker_rx: mpsc::Receiver<DictWorkerRequest>,
     nested_res_tx: mpsc::Sender<NestedScanResponse>,
+    nav_res_tx: mpsc::Sender<NavLookupResponse>,
     worker_nested_epoch: Arc<AtomicU64>,
-    worker_nested_app: slint::Weak<MementoApp>,
+    worker_nav_epoch: Arc<AtomicU64>,
+    worker_app: slint::Weak<MementoApp>,
 ) {
     std::thread::spawn(move || {
         let mut sig = crate::controller::dict::db_file_fingerprint(&dictionary_db_path);
         let mut dict = DictController::open(&dictionary_db_path).unwrap_or_default();
         let mut applied_cfg: Option<DictSearchConfig> = None;
-        while let Ok(mut req) = nested_rx.recv() {
-            while let Ok(newer) = nested_rx.try_recv() {
-                req = newer;
-            }
-            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
-                continue;
-            }
-            let cur_sig = crate::controller::dict::db_file_fingerprint(&dictionary_db_path);
-            if cur_sig != sig {
-                sig = cur_sig;
-                dict = DictController::open(&dictionary_db_path).unwrap_or_default();
-                applied_cfg = None;
-            }
-            if applied_cfg.as_ref() != Some(&req.search_config) {
-                req.search_config.apply_to(&mut dict);
-                applied_cfg = Some(req.search_config);
-            }
-
-            let mut hits = dict.search(&req.query).to_vec();
-            let match_units = dict.last_match_units();
-            let mut matched_char_count = utf16_units_to_char_count(&req.query, match_units);
-            if hits.is_empty() {
-                if let Some(first_ch) = req.query.chars().next() {
-                    if is_kanji_char(first_ch) {
-                        let ch_str = first_ch.to_string();
-                        let khits = dict.search_kanji(&ch_str).to_vec();
-                        if !khits.is_empty() {
-                            hits = khits;
-                            matched_char_count = 1;
+        while let Ok(first) = worker_rx.recv() {
+            let mut pending_scan: Option<NestedScanRequest> = None;
+            let mut pending_root_nav: Option<NavLookupRequest> = None;
+            let mut pending_nested_nav: Option<NavLookupRequest> = None;
+            {
+                let mut accept = |item: DictWorkerRequest| match item {
+                    DictWorkerRequest::NestedScan(req) => pending_scan = Some(req),
+                    DictWorkerRequest::NavLookup(req) => {
+                        if req.kind.is_nested() {
+                            pending_nested_nav = Some(req);
+                        } else {
+                            pending_root_nav = Some(req);
                         }
                     }
+                };
+                accept(first);
+                while let Ok(newer) = worker_rx.try_recv() {
+                    accept(newer);
                 }
-            } else if matched_char_count == 0 {
-                matched_char_count = hits
+            }
+
+            let ensure_dict = |dict: &mut DictController,
+                               sig: &mut crate::controller::dict::DbFileFingerprint,
+                               applied_cfg: &mut Option<DictSearchConfig>,
+                               cfg: &DictSearchConfig| {
+                let cur_sig = crate::controller::dict::db_file_fingerprint(&dictionary_db_path);
+                if cur_sig != *sig {
+                    *sig = cur_sig;
+                    *dict = DictController::open(&dictionary_db_path).unwrap_or_default();
+                    *applied_cfg = None;
+                }
+                if applied_cfg.as_ref() != Some(cfg) {
+                    cfg.apply_to(dict);
+                    *applied_cfg = Some(cfg.clone());
+                }
+            };
+
+            for nav_req in pending_root_nav.into_iter().chain(pending_nested_nav) {
+                let target_epoch = if nav_req.kind.is_nested() {
+                    &worker_nested_epoch
+                } else {
+                    &worker_nav_epoch
+                };
+                if nav_req.epoch != target_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+                ensure_dict(&mut dict, &mut sig, &mut applied_cfg, &nav_req.search_config);
+                let resp = execute_nav_lookup(&mut dict, nav_req);
+                if resp.epoch != target_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+                let _ = nav_res_tx.send(resp);
+                let _ = worker_app.upgrade_in_event_loop(move |app| {
+                    let _ = drain_nav_lookup_results_for_app(&app);
+                });
+            }
+
+            if let Some(req) = pending_scan {
+                if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+                ensure_dict(&mut dict, &mut sig, &mut applied_cfg, &req.search_config);
+
+                let mut hits = dict.search(&req.query).to_vec();
+                let match_units = dict.last_match_units();
+                let mut matched_char_count = utf16_units_to_char_count(&req.query, match_units);
+                if hits.is_empty() {
+                    if let Some(first_ch) = req.query.chars().next() {
+                        if is_kanji_char(first_ch) {
+                            let ch_str = first_ch.to_string();
+                            let khits = dict.search_kanji(&ch_str).to_vec();
+                            if !khits.is_empty() {
+                                hits = khits;
+                                matched_char_count = 1;
+                            }
+                        }
+                    }
+                } else if matched_char_count == 0 {
+                    matched_char_count = hits
+                        .first()
+                        .map(|h| h.expression.chars().count())
+                        .unwrap_or(1)
+                        .max(1);
+                }
+
+                if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                let headword = hits
                     .first()
-                    .map(|h| h.expression.chars().count())
-                    .unwrap_or(1)
-                    .max(1);
-            }
+                    .map(|h| h.expression.clone())
+                    .unwrap_or_default();
+                let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
+                let (term_meta_rows, term_pitch_details, kanji_frequencies) =
+                    collect_hits_term_and_kanji_meta(&dict, &hits);
 
-            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
-                continue;
-            }
-
-            let headword = hits
-                .first()
-                .map(|h| h.expression.clone())
-                .unwrap_or_default();
-            let reading = hits.first().map(|h| h.reading.clone()).unwrap_or_default();
-            let mut term_meta_rows = Vec::new();
-            let mut term_pitch_details = HashMap::new();
-            for h in &hits {
-                if !h.is_kanji
-                    && !term_meta_rows
-                        .iter()
-                        .any(|(e, r, _, _): &(String, String, _, _)| {
-                            e == &h.expression && r == &h.reading
-                        })
-                {
-                    let graphs = dict.get_pitch_graphs(&h.expression, &h.reading);
-                    let freqs = dict.get_frequencies(&h.expression, &h.reading);
-                    let details = dict.get_pitch_details(&h.expression, &h.reading);
-                    term_meta_rows.push((h.expression.clone(), h.reading.clone(), graphs, freqs));
-                    term_pitch_details.insert((h.expression.clone(), h.reading.clone()), details);
+                if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
+                    continue;
                 }
-            }
 
-            if req.epoch != worker_nested_epoch.load(Ordering::Acquire) {
-                continue;
+                let _ = nested_res_tx.send(NestedScanResponse {
+                    epoch: req.epoch,
+                    parent_depth: req.parent_depth,
+                    row_index: req.row_index,
+                    start_char: req.start_char,
+                    matched_char_count,
+                    cell_indices: req.cell_indices,
+                    anchor_x: req.anchor_x,
+                    anchor_y: req.anchor_y,
+                    locked: req.locked,
+                    hits,
+                    excluded_glossaries: req.excluded_glossaries,
+                    headword,
+                    reading,
+                    term_meta_rows,
+                    term_pitch_details,
+                    kanji_frequencies,
+                });
+                let _ = worker_app.upgrade_in_event_loop(move |app| {
+                    let _ = drain_nested_scan_results_for_app(&app);
+                });
             }
-
-            let _ = nested_res_tx.send(NestedScanResponse {
-                epoch: req.epoch,
-                parent_depth: req.parent_depth,
-                row_index: req.row_index,
-                start_char: req.start_char,
-                matched_char_count,
-                cell_indices: req.cell_indices,
-                anchor_x: req.anchor_x,
-                anchor_y: req.anchor_y,
-                locked: req.locked,
-                hits,
-                excluded_glossaries: req.excluded_glossaries,
-                headword,
-                reading,
-                term_meta_rows,
-                term_pitch_details,
-            });
-            let _ = worker_nested_app.upgrade_in_event_loop(move |app| {
-                let _ = drain_nested_scan_results_for_app(&app);
-            });
         }
     });
+}
+
+fn spawn_glossary_render_worker(
+    rx: mpsc::Receiver<GlossaryPreRenderBatch>,
+    res_tx: mpsc::Sender<GlossaryPreRenderDone>,
+    worker_epoch: Arc<AtomicU64>,
+    worker_app: slint::Weak<MementoApp>,
+    shared_font_collection: Option<slint::fontique_08::fontique::Collection>,
+) {
+    const WORKER_IDLE_ENGINE_DROP: Duration = Duration::from_secs(60);
+    let _ = std::thread::Builder::new()
+        .name("memento-glossary-prerender".into())
+        .spawn(move || {
+            let mut engine: Option<TextEngine> = None;
+            loop {
+                let mut batch = if engine.is_some() {
+                    match rx.recv_timeout(WORKER_IDLE_ENGINE_DROP) {
+                        Ok(b) => b,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            engine = None;
+                            crate::ui::release_os_memory();
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(b) => b,
+                        Err(_) => return,
+                    }
+                };
+                while let Ok(newer) = rx.try_recv() {
+                    batch = newer;
+                }
+                if batch.epoch != worker_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                let eng = engine.get_or_insert_with(|| {
+                    TextEngine::new_with_collection(shared_font_collection.clone())
+                });
+
+                for item in batch.items {
+                    if batch.epoch != worker_epoch.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Some(doc) = rasterize_structured_glossary_entry_with_engine(
+                        eng,
+                        &item.raw_glossary,
+                        &item.fallback_glossary,
+                        item.parsed_glossary.as_deref(),
+                        item.stylesheet,
+                        &item.detail_states,
+                        item.legacy_style,
+                        &item.dict_resource_dirs,
+                        item.dic_id,
+                        &item.dict_name,
+                        item.avail_width_px,
+                        item.selected,
+                        &item.theme,
+                        item.render_scale,
+                    ) else {
+                        continue;
+                    };
+                    if batch.epoch != worker_epoch.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if res_tx
+                        .send(GlossaryPreRenderDone {
+                            epoch: batch.epoch,
+                            cache_key: item.cache_key,
+                            doc,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let _ = worker_app.upgrade_in_event_loop(move |app| {
+                        let _ = drain_glossary_prerender_results_for_app(&app);
+                    });
+                }
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -772,6 +898,7 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
     pb.on_hide_tooltip(move || {
         if let Some(app) = b_tip_hide.app_weak.upgrade() {
             app.global::<PopupBridge>().set_tooltip_visible(false);
+            b_tip_hide.schedule_idle_memory_shrink_if_closed(&app);
         }
     });
 
@@ -1506,15 +1633,20 @@ pub fn install_rich_ui_bridges(
         app.as_weak(),
     );
 
-    let (nested_tx, nested_rx) = mpsc::channel::<NestedScanRequest>();
+    let (nested_tx, nested_rx) = mpsc::channel::<DictWorkerRequest>();
     let (nested_res_tx, raw_nested_res_rx) = mpsc::channel::<NestedScanResponse>();
     let nested_res_rx = Arc::new(Mutex::new(raw_nested_res_rx));
     let nested_epoch = Arc::new(AtomicU64::new(0));
+    let (nav_res_tx, raw_nav_res_rx) = mpsc::channel::<NavLookupResponse>();
+    let nav_res_rx = Arc::new(Mutex::new(raw_nav_res_rx));
+    let nav_epoch = Arc::new(AtomicU64::new(0));
     spawn_nested_worker(
         dictionary_db_path.to_path_buf(),
         nested_rx,
         nested_res_tx,
+        nav_res_tx,
         nested_epoch.clone(),
+        nav_epoch.clone(),
         app.as_weak(),
     );
 
@@ -1538,6 +1670,26 @@ pub fn install_rich_ui_bridges(
     );
 
     let has_event_loop_proxy = slint::invoke_from_event_loop(|| {}).is_ok();
+    let shared_font_collection = capture_shared_font_collection();
+    let (glossary_render_res_tx, raw_glossary_render_res_rx) =
+        mpsc::channel::<GlossaryPreRenderDone>();
+    let glossary_render_res_rx = Arc::new(Mutex::new(raw_glossary_render_res_rx));
+    let glossary_render_epoch = Arc::new(AtomicU64::new(0));
+    let glossary_render_tx = if has_event_loop_proxy {
+        let (tx, rx) = mpsc::channel::<GlossaryPreRenderBatch>();
+        spawn_glossary_render_worker(
+            rx,
+            glossary_render_res_tx,
+            glossary_render_epoch.clone(),
+            app.as_weak(),
+            shared_font_collection,
+        );
+        Some(tx)
+    } else {
+        drop(glossary_render_res_tx);
+        None
+    };
+
     let instance_id = NEXT_BRIDGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
     app.global::<PopupBridge>()
         .set_bridge_instance_id(instance_id);
@@ -1594,7 +1746,11 @@ pub fn install_rich_ui_bridges(
             pending_scan_utf16_start: None,
             pending_scan_sub_query: None,
             scan_timer: slint::Timer::default(),
+            idle_shrink_timer: slint::Timer::default(),
             subtitle_token_layout_cache: SubtitleTokenLayoutCache::default(),
+            pending_root_precomputed_meta: None,
+            last_observed_solo_width_px: None,
+            last_observed_col_width_px: None,
         }),
         panel_tx,
         panel_res_rx,
@@ -1609,6 +1765,11 @@ pub fn install_rich_ui_bridges(
         nested_tx,
         nested_res_rx,
         nested_epoch,
+        nav_res_rx,
+        nav_epoch,
+        glossary_render_tx,
+        glossary_render_res_rx,
+        glossary_render_epoch,
         no_event_loop_pump: (!has_event_loop_proxy).then(slint::Timer::default),
     });
 

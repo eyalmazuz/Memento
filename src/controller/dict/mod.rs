@@ -30,6 +30,7 @@ pub use self::db::{
 };
 pub use self::glossary::{
     format_glossary, parse_glossary_entry, parse_glossary_json_cached, parse_rich_glossary,
+    shrink_parsed_glossary_cache,
 };
 pub use self::query::{
     format_cloze_for_term, format_cloze_spans, format_tags, format_tags_with_notes,

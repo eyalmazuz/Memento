@@ -77,23 +77,6 @@ pub(crate) fn append_escaped(input: &[u16], output: &mut Vec<u16>, newlines_as_b
     }
 }
 
-/// `GlossaryBuilder::escapeHtml`, i.e. `QString::toHtmlEscaped` over raw
-/// QString code units. The replacement is *not* applied again to entities.
-pub fn escape_html(input: &[u16]) -> Vec<u16> {
-    let mut output = Vec::with_capacity(input.len());
-    append_escaped(input, &mut output, false);
-    output
-}
-
-/// The text path in `buildGlossary`, `addText` and both string variants of
-/// `addStructuredContentHelper`: HTML escape first, then replace LF with
-/// `<br>` (neither CR nor Unicode line separators become breaks).
-pub fn escape_html_lines(input: &[u16]) -> Vec<u16> {
-    let mut output = Vec::with_capacity(input.len());
-    append_escaped(input, &mut output, true);
-    output
-}
-
 /// Sanitizes a single CSS property value emitted inside a double-quoted HTML
 /// `style="..."` attribute: strips ASCII control chars and `;`/`{`/`}`
 /// declaration/block delimiters, converts `"` to `'`, and HTML-escapes `<`,
@@ -191,6 +174,7 @@ pub(crate) fn is_safe_href(href: &[u16]) -> bool {
 
 /// Format double matching Qt's `QString::number(val)` (format 'g', precision 6).
 pub fn format_g(value: f64, precision: u32) -> String {
+    use std::fmt::Write;
     if value.is_nan() {
         return "nan".to_string();
     }
@@ -208,13 +192,15 @@ pub fn format_g(value: f64, precision: u32) -> String {
     if exponent < -4 || exponent >= precision as i32 {
         let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
         let fraction = fraction.trim_end_matches('0');
-        let mantissa = if fraction.is_empty() {
-            whole.to_string()
-        } else {
-            format!("{whole}.{fraction}")
-        };
+        let mut out = String::with_capacity(mantissa.len() + 5);
+        out.push_str(whole);
+        if !fraction.is_empty() {
+            out.push('.');
+            out.push_str(fraction);
+        }
         let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
+        let _ = write!(out, "e{sign}{:02}", exponent.abs());
+        out
     } else {
         let decimals = (precision as i32 - 1 - exponent).max(0) as usize;
         let mut formatted = format!("{:.*}", decimals, value);
@@ -230,10 +216,44 @@ pub fn format_g(value: f64, precision: u32) -> String {
     }
 }
 
-pub fn qstring_number(value: f64) -> Vec<u16> {
-    format_g(value, 6).encode_utf16().collect()
+/// Appends `format_g(value, 6)` directly as UTF-16 code units without a temporary `Vec<u16>`.
+pub(crate) fn append_qstring_number(out: &mut Vec<u16>, value: f64) {
+    let formatted = format_g(value, 6);
+    push_ascii(out, &formatted);
 }
 
-pub fn qstring_number_i32(value: i32) -> Vec<u16> {
-    value.to_string().encode_utf16().collect()
+/// Appends an `i32` decimal representation directly as UTF-16 code units with zero heap allocations.
+pub(crate) fn append_i32_u16(out: &mut Vec<u16>, value: i32) {
+    let mut digits = [0u16; 12];
+    let mut pos = digits.len();
+    let mut mag = value.unsigned_abs();
+    loop {
+        pos -= 1;
+        digits[pos] = (b'0' + (mag % 10) as u8) as u16;
+        mag /= 10;
+        if mag == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        pos -= 1;
+        digits[pos] = b'-' as u16;
+    }
+    out.extend_from_slice(&digits[pos..]);
+}
+
+/// Appends a `u8` decimal representation directly as UTF-16 code units with zero heap allocations.
+pub(crate) fn append_u8_u16(out: &mut Vec<u16>, value: u8) {
+    let mut digits = [0u16; 3];
+    let mut pos = digits.len();
+    let mut n = value;
+    loop {
+        pos -= 1;
+        digits[pos] = (b'0' + (n % 10)) as u16;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[pos..]);
 }

@@ -49,6 +49,15 @@ pub use subtitle_layout::{
 };
 pub use tags::{extract_inline_structured_tags, suppress_redundant_tags, tag_category_hex_color};
 pub use text_engine::{
-    subtitle_cluster_at_point, subtitle_cluster_at_point_with_style, ShapedSubtitleToken,
-    SubtitleRenderStyle,
+    prewarm_subtitle_tokens, subtitle_cluster_at_point, subtitle_cluster_at_point_with_style,
+    ShapedSubtitleToken, SubtitleRenderStyle,
 };
+
+/// Hint the OS allocator to return freed heap pages (Linux glibc `malloc_trim(0)`).
+#[inline]
+pub fn release_os_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = libc::malloc_trim(0);
+    }
+}

@@ -178,7 +178,10 @@ impl WindowProcessor for RuntimeProcessor<'_> {
     }
 
     fn unload_model(&mut self) {
-        self.model = None;
+        if let Some(model) = self.model.take() {
+            drop(model);
+            crate::app::trim_os_heap();
+        }
     }
 
     fn reset_media_state(&mut self) {
@@ -272,6 +275,7 @@ pub(super) fn run_session(
         WorkerTiming::default(),
         &mut processor,
     );
+    processor.unload_model();
 }
 
 pub(super) fn run_session_loop<P: WindowProcessor>(

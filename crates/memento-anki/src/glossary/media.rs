@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::glossary::escape::{
-    append_escaped, ascii_to_u16, is_valid_image_rendering, push_ascii, qstring_number,
+    append_escaped, append_qstring_number, ascii_to_u16, is_valid_image_rendering, push_ascii,
 };
 use crate::json::{JsonObject, JsonValue};
 use crate::strings::is_valid_utf16;
@@ -183,7 +183,7 @@ pub(crate) fn add_image<F>(
     if let Some(JsonValue::Number(w)) = obj.get(KEY_WIDTH.as_slice()) {
         if w.is_finite() {
             push_ascii(out, " width=\"");
-            out.extend(qstring_number(*w));
+            append_qstring_number(out, *w);
             out.push(0x22);
         }
     }
@@ -191,7 +191,7 @@ pub(crate) fn add_image<F>(
     if let Some(JsonValue::Number(h)) = obj.get(KEY_HEIGHT.as_slice()) {
         if h.is_finite() {
             push_ascii(out, " height=\"");
-            out.extend(qstring_number(*h));
+            append_qstring_number(out, *h);
             out.push(0x22);
         }
     }
