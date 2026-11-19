@@ -524,12 +524,14 @@ fn find_notes_and_notes_info_bodies_and_64bit_replies()
                     ("Expression".to_owned(), "食べる".to_owned()),
                     ("ExpressionReading".to_owned(), "たべる".to_owned()),
                 ]),
+                sort_field: Some("Expression".to_owned()),
             },
             AnkiNoteInfo {
                 note_id: 1669909161239,
                 model_name: "Lapis".to_owned(),
                 tags: vec!["anime".to_owned()],
                 fields: HashMap::from([("Expression".to_owned(), "食べる".to_owned())]),
+                sort_field: None,
             },
         ]
     );
@@ -574,6 +576,188 @@ fn find_notes_and_notes_info_reject_malformed_result_shapes()
 }
 
 #[test]
+fn update_note_fields_omits_empty_media_arrays_and_includes_non_empty_media()
+{
+    let server = TestServer::start();
+    server.spawn(move |index, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        match index
+        {
+            0 => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "updateNoteFields",
+                        "version": 6,
+                        "params": {
+                            "note": {
+                                "id": 1669909161234_i64,
+                                "fields": {
+                                    "Sentence": "新しい例文",
+                                    "Glossary": "to eat"
+                                }
+                            }
+                        }
+                    }),
+                    "None and empty media slices must be omitted from updateNoteFields wire body"
+                );
+                assert!(body["params"]["note"].get("audio").is_none());
+                assert!(body["params"]["note"].get("picture").is_none());
+                assert!(body["params"]["note"].get("video").is_none());
+                Action::Respond(reply_of(Value::Null))
+            }
+            _ => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "updateNoteFields",
+                        "version": 6,
+                        "params": {
+                            "note": {
+                                "id": 1669909161234_i64,
+                                "fields": {
+                                    "Picture": "",
+                                    "SentenceAudio": "",
+                                    "Video": ""
+                                },
+                                "audio": [{ "data": "QUFB", "filename": "s.aac", "fields": ["SentenceAudio"] }],
+                                "picture": [{ "data": "QkJC", "filename": "p.jpg", "fields": ["Picture"] }],
+                                "video": [{ "data": "Q0ND", "filename": "v.mp4", "fields": ["Video"] }]
+                            }
+                        }
+                    })
+                );
+                Action::Respond(reply_of(Value::Null))
+            }
+        }
+    });
+
+    let client = AnkiClient::new(endpoint_for(&server));
+
+    // 1. Empty slices and None must all be omitted.
+    let mut fields = serde_json::Map::new();
+    fields.insert("Sentence".to_owned(), json!("新しい例文"));
+    fields.insert("Glossary".to_owned(), json!("to eat"));
+    client
+        .update_note_fields(1669909161234, fields, Some(&[]), None, Some(&[]))
+        .unwrap();
+
+    // 2. Non-empty audio/picture/video slices are serialized verbatim.
+    let mut media_fields = serde_json::Map::new();
+    media_fields.insert("Picture".to_owned(), json!(""));
+    media_fields.insert("SentenceAudio".to_owned(), json!(""));
+    media_fields.insert("Video".to_owned(), json!(""));
+    let audio = [json!({ "data": "QUFB", "filename": "s.aac", "fields": ["SentenceAudio"] })];
+    let picture = [json!({ "data": "QkJC", "filename": "p.jpg", "fields": ["Picture"] })];
+    let video = [json!({ "data": "Q0ND", "filename": "v.mp4", "fields": ["Video"] })];
+    client
+        .update_note_fields(
+            1669909161234,
+            media_fields,
+            Some(&audio),
+            Some(&picture),
+            Some(&video),
+        )
+        .unwrap();
+}
+
+#[test]
+fn update_note_fields_rejects_invalid_id_and_surfaces_remote_and_http_errors()
+{
+    let server = TestServer::start();
+    server.spawn(move |index, _| match index
+    {
+        0 => Action::Respond(json_reply(
+            &json!({ "error": "note was not found", "result": Value::Null }).to_string(),
+        )),
+        _ => Action::Respond(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ),
+    });
+
+    let client = AnkiClient::new(endpoint_for(&server));
+
+    // Zero / negative note IDs fail locally before sending HTTP.
+    assert!(matches!(
+        client.update_note_fields(0, serde_json::Map::new(), None, None, None),
+        Err(AnkiError::InvalidNoteId)
+    ));
+    assert!(matches!(
+        client.update_note_fields(-42, serde_json::Map::new(), None, None, None),
+        Err(AnkiError::InvalidNoteId)
+    ));
+
+    // Remote AnkiConnect error is surfaced cleanly.
+    let err = client
+        .update_note_fields(1669909161234, serde_json::Map::new(), None, None, None)
+        .unwrap_err();
+    assert!(matches!(err, AnkiError::Remote(ref m) if m == "note was not found"));
+
+    // HTTP status error is surfaced cleanly.
+    let err = client
+        .update_note_fields(1669909161234, serde_json::Map::new(), None, None, None)
+        .unwrap_err();
+    assert!(matches!(err, AnkiError::HttpStatus { status: 503, .. }));
+}
+
+#[test]
+fn add_tags_body_noop_validation_and_remote_error()
+{
+    let server = TestServer::start();
+    server.spawn(move |index, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        match index
+        {
+            0 => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "addTags",
+                        "version": 6,
+                        "params": {
+                            "notes": [1669909161234_i64, 1669909161239_i64],
+                            "tags": "memento anime"
+                        }
+                    })
+                );
+                Action::Respond(reply_of(Value::Null))
+            }
+            _ => Action::Respond(json_reply(
+                &json!({ "error": "cannot add tags", "result": Value::Null }).to_string(),
+            )),
+        }
+    });
+
+    let client = AnkiClient::new(endpoint_for(&server));
+
+    // Invalid IDs fail before touching the network.
+    assert!(matches!(
+        client.add_tags(&[1669909161234, 0], "memento"),
+        Err(AnkiError::InvalidNoteId)
+    ));
+    assert!(matches!(
+        client.add_tags(&[-5], "memento"),
+        Err(AnkiError::InvalidNoteId)
+    ));
+
+    // Empty notes or blank tags are local no-ops (no request sent to server).
+    client.add_tags(&[], "memento").unwrap();
+    client.add_tags(&[1669909161234], "   ").unwrap();
+
+    // Valid call sends exact AnkiConnect v6 wire payload (trimming surrounding whitespace).
+    client
+        .add_tags(&[1669909161234, 1669909161239], "  memento anime  ")
+        .unwrap();
+
+    // Remote error is surfaced.
+    let err = client
+        .add_tags(&[1669909161234], "memento")
+        .unwrap_err();
+    assert!(matches!(err, AnkiError::Remote(ref m) if m == "cannot add tags"));
+}
+
+#[test]
 fn forbidden_action_body_stays_outside_the_verb_set()
 {
     // The wire strings are exactly the constants in `ankiconnect.h`; the
@@ -585,6 +769,8 @@ fn forbidden_action_body_stays_outside_the_verb_set()
     assert_eq!(FieldNames.as_wire(), "modelFieldNames");
     assert_eq!(CanAddNotes.as_wire(), "canAddNotes");
     assert_eq!(AddNote.as_wire(), "addNote");
+    assert_eq!(UpdateNoteFields.as_wire(), "updateNoteFields");
+    assert_eq!(AddTags.as_wire(), "addTags");
     assert_eq!(FindNotes.as_wire(), "findNotes");
     assert_eq!(NotesInfo.as_wire(), "notesInfo");
     assert_eq!(GuiBrowse.as_wire(), "guiBrowse");

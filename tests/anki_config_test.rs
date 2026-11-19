@@ -6,11 +6,12 @@ use std::path::PathBuf;
 
 use memento_app::controller::anki::{
     apply_subtitle_cloze, build_entry_find_query, build_note_payload_from_profile,
-    create_cloze_sentence, default_note_fields, escape_anki_search_term, format_cloze,
-    format_cloze_with_hint, format_expression_furigana, format_glossary, format_nid_browse_query,
-    map_note_fields, normalize_anki_browse_target, populate_note_context_from_sqlite,
-    scope_dictionary_css, secondary_context_for_range, split_cloze, unavailable_profile_markers,
-    validate_json_payload, validate_note_payload, AnkiController, GlossaryDefinition,
+    create_cloze_sentence, default_note_fields, escape_anki_search_term, filter_subtitle_text,
+    format_cloze, format_cloze_with_hint, format_expression_furigana, format_glossary,
+    format_nid_browse_query, map_note_fields, merge_note_update, normalize_anki_browse_target,
+    populate_note_context_from_sqlite, scope_dictionary_css, secondary_context_for_range,
+    split_cloze, unavailable_profile_markers, validate_json_payload, validate_note_payload,
+    AnkiController, AnkiNoteContext, AnkiUpdateMode, EntryAnkiStatus, GlossaryDefinition,
     NoteFieldsContext, NotePayload,
 };
 use memento_app::controller::config::{
@@ -1596,4 +1597,390 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn entry_anki_status_primary_note_id_and_subtitle_filter_helpers() {
+    let empty_status = EntryAnkiStatus::default();
+    assert_eq!(empty_status.primary_note_id(), None);
+
+    let populated = EntryAnkiStatus {
+        can_add: false,
+        is_duplicate: true,
+        note_ids: vec![1669909161234, 1669909161239],
+        tags: vec!["memento".into()],
+        browse_query: "nid:1669909161234 or nid:1669909161239".into(),
+    };
+    assert_eq!(populated.primary_note_id(), Some(1669909161234));
+
+    // `filter_subtitle_text` applies `search/remove-regex` + `search/replace-lines` safely.
+    assert_eq!(
+        filter_subtitle_text("（笑い）今日は\nパンを食べる。", Some("（[^）]*）"), true, " "),
+        "今日は パンを食べる。"
+    );
+    // Invalid regex safely leaves text intact while still honoring `replace_lines`.
+    assert_eq!(
+        filter_subtitle_text("一行目\n二行目", Some("[unclosed"), true, ""),
+        "一行目二行目"
+    );
+    assert_eq!(
+        filter_subtitle_text("一行目\n二行目", None, false, " "),
+        "一行目\n二行目"
+    );
+
+    // Optional fields on `NoteFieldsContext` / `AnkiNoteContext` integrate with profile note building.
+    let mut ctx: AnkiNoteContext =
+        NoteFieldsContext::new("食べる", "たべる", "（笑い）今日は\nパンを食べる。");
+    ctx.subtitle_filter_regex = Some("（[^）]*）".into());
+    ctx.replace_lines = true;
+    ctx.replace_lines_with = " ".into();
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            ("Sentence".into(), "{sentence}".into()),
+            ("Cloze".into(), "{cloze-prefix}[{cloze-body}]{cloze-suffix}".into()),
+        ]),
+        tags: vec![],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+    let payload = build_note_payload_from_profile(&profile, &ctx).unwrap();
+    assert_eq!(payload.fields["Sentence"], "今日は パンを食べる。");
+    assert_eq!(payload.fields["Cloze"], "今日は パンを[食べる]。");
+}
+
+#[test]
+fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
+    use memento_net::anki::AnkiNoteInfo;
+
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            ("Sentence".into(), "{sentence}".into()),
+            ("MainDefinition".into(), "{glossary}".into()),
+            ("Picture".into(), "{screenshot}".into()),
+            ("SentenceAudio".into(), "{audio-media}".into()),
+            ("Notes".into(), "{clipboard}".into()),
+            ("NotOnModel".into(), "{title}".into()),
+        ]),
+        tags: vec!["memento".into(), "Mining".into(), "anime".into()],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+
+    let existing = AnkiNoteInfo {
+        note_id: 1669909161234,
+        model_name: "Lapis".into(),
+        tags: vec!["mining".into(), "leech".into()],
+        fields: HashMap::from([
+            ("Expression".into(), "食べる".into()),
+            ("Sentence".into(), "古い例文。".into()),
+            ("MainDefinition".into(), String::new()),
+            ("Picture".into(), "<img src=\"old.jpg\">".into()),
+            ("SentenceAudio".into(), String::new()),
+            ("Notes".into(), "personal note".into()),
+        ]),
+        sort_field: Some("Expression".into()),
+    };
+
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "新しい例文。")
+        .with_dictionary("JMdict")
+        .with_glossary_item("to eat");
+    ctx.clipboard = Some(String::new());
+    ctx.title = "Episode 1".into();
+    ctx.picture_attachments.push(serde_json::json!({
+        "data": "QkJC",
+        "filename": "new.jpg",
+        "fields": ["Picture"]
+    }));
+    ctx.audio_attachments.push(serde_json::json!({
+        "data": "QUFB",
+        "filename": "sent.aac",
+        "fields": ["SentenceAudio"]
+    }));
+    let payload = build_note_payload_from_profile(&profile, &ctx).unwrap();
+
+    // 1. OverwriteNonEmpty (default): updates non-empty fields + replaces Picture media,
+    //    NEVER wipes Notes with empty clipboard, preserves unchanged Expression sort field,
+    //    ignores NotOnModel, and deduplicates tags case-insensitively (`Mining` skipped).
+    assert_eq!(AnkiUpdateMode::default(), AnkiUpdateMode::OverwriteNonEmpty);
+    let overwrite = merge_note_update(&existing, &payload, &profile, AnkiUpdateMode::OverwriteNonEmpty);
+    assert!(!overwrite.fields.contains_key("Expression"), "unchanged sort field must be preserved");
+    assert!(!overwrite.fields.contains_key("Notes"), "populated field must never be wiped by empty template");
+    assert!(!overwrite.fields.contains_key("NotOnModel"), "fields absent from note model must be skipped");
+    assert_eq!(overwrite.fields["Sentence"], "新しい例文。");
+    assert!(overwrite.fields["MainDefinition"].as_str().unwrap().contains("to eat"));
+    assert_eq!(overwrite.fields["Picture"], "", "media-only field cleared so new picture replaces old");
+    assert_eq!(overwrite.picture.len(), 1);
+    assert_eq!(overwrite.audio.len(), 1);
+    assert_eq!(overwrite.new_tags, vec!["memento", "anime"]);
+
+    // 2. FillEmptyOnly: only fills empty MainDefinition and empty SentenceAudio;
+    //    leaves populated Sentence, Notes, and Picture untouched!
+    let fill = merge_note_update(&existing, &payload, &profile, AnkiUpdateMode::FillEmptyOnly);
+    assert!(!fill.fields.contains_key("Expression"));
+    assert!(!fill.fields.contains_key("Sentence"));
+    assert!(!fill.fields.contains_key("Notes"));
+    assert!(!fill.fields.contains_key("Picture"));
+    assert!(fill.fields["MainDefinition"].as_str().unwrap().contains("to eat"));
+    assert!(fill.picture.is_empty(), "existing Picture must not receive new attachment in FillEmptyOnly");
+    assert_eq!(fill.audio.len(), 1, "empty SentenceAudio must receive new attachment");
+    assert_eq!(fill.new_tags, vec!["memento", "anime"]);
+
+    // 3. AppendOrFill: appends Sentence with `<br>`, fills empty MainDefinition,
+    //    never appends to Expression sort field, and leaves Picture uncleared so Anki appends media!
+    let append = merge_note_update(&existing, &payload, &profile, AnkiUpdateMode::AppendOrFill);
+    assert!(!append.fields.contains_key("Expression"), "sort field must never be appended");
+    assert_eq!(append.fields["Sentence"], "古い例文。<br>新しい例文。");
+    assert!(append.fields["MainDefinition"].as_str().unwrap().contains("to eat"));
+    assert!(!append.fields.contains_key("Picture"), "AppendOrFill must keep existing Picture so media appends");
+    assert_eq!(append.picture.len(), 1);
+    assert_eq!(append.audio.len(), 1);
+}
+
+#[test]
+fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_adds_tags() {
+    use memento_app::controller::anki_media::NoteMediaInput;
+    use memento_app::controller::config::AudioSourceEntry;
+    use memento_net::anki::MediaFilePayload;
+    use memento_player::RawFrame;
+    use memento_setting::enums::AudioSourceType;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    // Local word audio file for `{audio}` capture
+    let audio_path = std::env::temp_dir().join(format!(
+        "memento-update-note-audio-{}.mp3",
+        std::process::id()
+    ));
+    fs::write(&audio_path, b"ID3updated-word-audio").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut recorded = Vec::new();
+        for step in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let body: serde_json::Value =
+                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            let action = body["action"].as_str().unwrap().to_owned();
+            recorded.push(action.clone());
+            let reply = match step {
+                0 => {
+                    assert_eq!(action, "notesInfo");
+                    assert_eq!(body["params"]["notes"], serde_json::json!([1669909161234_i64]));
+                    serde_json::json!({
+                        "error": null,
+                        "result": [{
+                            "noteId": 1669909161234_i64,
+                            "modelName": "Lapis",
+                            "tags": ["existing"],
+                            "fields": {
+                                "Expression": { "value": "食べる", "order": 0 },
+                                "Sentence": { "value": "古い文。", "order": 1 },
+                                "Glossary": { "value": "", "order": 2 },
+                                "Picture": { "value": "<img src=\"old.png\">", "order": 3 },
+                                "WordAudio": { "value": "", "order": 4 },
+                                "Notes": { "value": "keep me", "order": 5 }
+                            }
+                        }]
+                    })
+                    .to_string()
+                }
+                1 => {
+                    assert_eq!(action, "multi");
+                    let sub = &body["params"]["actions"][0];
+                    assert_eq!(sub["action"], "storeMediaFile");
+                    assert_eq!(sub["params"]["filename"], "gloss_img.png");
+                    serde_json::json!({ "error": null, "result": ["gloss_img.png"] }).to_string()
+                }
+                2 => {
+                    assert_eq!(action, "updateNoteFields");
+                    let note = &body["params"]["note"];
+                    assert_eq!(note["id"], 1669909161234_i64);
+                    assert!(note["fields"].get("Expression").is_none());
+                    assert!(note["fields"].get("Notes").is_none());
+                    assert_eq!(note["fields"]["Sentence"], "新しい文。");
+                    assert!(note["fields"]["Glossary"]
+                        .as_str()
+                        .unwrap()
+                        .contains("gloss_img.png"));
+                    assert_eq!(note["fields"]["Picture"], "");
+                    assert_eq!(note["audio"][0]["fields"][0], "WordAudio");
+                    assert_eq!(note["picture"][0]["fields"][0], "Picture");
+                    assert!(note.get("video").is_none());
+                    serde_json::json!({ "error": null, "result": null }).to_string()
+                }
+                _ => {
+                    assert_eq!(action, "addTags");
+                    assert_eq!(body["params"]["notes"], serde_json::json!([1669909161234_i64]));
+                    assert_eq!(body["params"]["tags"], "memento");
+                    serde_json::json!({ "error": null, "result": null }).to_string()
+                }
+            };
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(http.as_bytes()).unwrap();
+        }
+        recorded
+    });
+
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint {
+            hostname: "http://127.0.0.1".into(),
+            port,
+            api_key: None,
+            timeout: Some(Duration::from_secs(2)),
+            use_api_key: false,
+        },
+        deck: "Japanese".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            ("Sentence".into(), "{sentence}".into()),
+            ("Glossary".into(), "{glossary}".into()),
+            ("Picture".into(), "{screenshot}".into()),
+            ("WordAudio".into(), "{audio}".into()),
+            ("Notes".into(), "{clipboard}".into()),
+        ]),
+        tags: vec!["existing".into(), "memento".into()],
+        duplicate_policy: 1,
+        screenshot_type: 1,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+
+    let mut ctx = NoteFieldsContext::new("食べる", "たべる", "新しい文。");
+    ctx.clipboard = Some(String::new());
+    ctx.glossary_definitions.push(GlossaryDefinition {
+        dictionary_id: 1,
+        dictionary_name: "Jitendex".into(),
+        rendered_items: vec!["<span>to eat <img src=\"gloss_img.png\"></span>".into()],
+        media_files: vec![MediaFilePayload {
+            filename: "gloss_img.png".into(),
+            data_base64: "iVBORw0KGgo=".into(),
+        }],
+        ..Default::default()
+    });
+
+    let media_input = NoteMediaInput {
+        media: None,
+        subtitle_start: 0.0,
+        subtitle_end: 0.0,
+        context_start: 0.0,
+        context_end: 0.0,
+        screenshot: Some(RawFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![255; 16],
+        }),
+        screenshot_video: None,
+        subtitle_id: 0,
+        audio_sources: vec![AudioSourceEntry {
+            name: "Local".into(),
+            url: audio_path.to_string_lossy().into_owned(),
+            kind: AudioSourceType::AudioSourceTypeFile as i64,
+            md5: String::new(),
+        }],
+    };
+
+    let ctrl = AnkiController::new(profile.endpoint());
+    // Reject non-positive note ID before hitting the network.
+    assert!(ctrl
+        .update_existing_note(0, &profile, &ctx, AnkiUpdateMode::OverwriteNonEmpty)
+        .is_err());
+
+    let updated_id = ctrl
+        .update_existing_note_with_media(
+            1669909161234,
+            &profile,
+            &mut ctx,
+            media_input,
+            AnkiUpdateMode::OverwriteNonEmpty,
+        )
+        .unwrap();
+    let _ = fs::remove_file(&audio_path);
+    assert_eq!(updated_id, 1669909161234);
+    assert_eq!(
+        server.join().unwrap(),
+        vec!["notesInfo", "multi", "updateNoteFields", "addTags"]
+    );
+}
+
+#[test]
+fn update_existing_note_reports_missing_note_cleanly() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let reply = serde_json::json!({ "error": null, "result": [{}] }).to_string();
+        let http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(http.as_bytes()).unwrap();
+    });
+
+    let profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint {
+            hostname: "http://127.0.0.1".into(),
+            port,
+            api_key: None,
+            timeout: Some(Duration::from_secs(2)),
+            use_api_key: false,
+        },
+        deck: "Japanese".into(),
+        model: "Basic".into(),
+        field_templates: HashMap::from([("Expression".into(), "{expression}".into())]),
+        tags: vec![],
+        duplicate_policy: 1,
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+    let ctx = NoteFieldsContext::new("食べる", "たべる", "食べる。");
+    let ctrl = AnkiController::new(profile.endpoint());
+    let err = ctrl
+        .update_existing_note(999999, &profile, &ctx, AnkiUpdateMode::OverwriteNonEmpty)
+        .unwrap_err();
+    assert!(err.contains("999999"), "unexpected error: {err}");
+    server.join().unwrap();
 }
