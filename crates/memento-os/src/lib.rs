@@ -34,6 +34,17 @@ use std::sync::{
     OnceLock,
 };
 
+pub mod windows_fullscreen;
+
+pub use windows_fullscreen::{
+    capture_win32_window_snapshot, compute_windows_borderless_fullscreen_rect,
+    enter_windows_borderless_fullscreen, exit_windows_borderless_fullscreen, query_window_monitor,
+    restore_win32_normal_window_style, strip_win32_window_frame_styles, MonitorRect,
+    Win32WindowStyleSnapshot, WindowRect, WIN32_BORDERLESS_STRIP_EX_STYLE_MASK,
+    WIN32_BORDERLESS_STRIP_STYLE_MASK, WIN32_WS_MAXIMIZE,
+    WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX,
+};
+
 #[cfg(all(unix, not(target_os = "macos")))]
 use zbus::blocking::{fdo::DBusProxy, Connection, Proxy};
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -833,5 +844,45 @@ mod tests {
             ss.sync_playback(true, false, "Playing media");
         }
         assert_eq!(ss.inhibit_attempts(), 2);
+    }
+
+    #[test]
+    fn windows_borderless_fullscreen_rect_adds_one_pixel_preserving_monitor_offset() {
+        use super::{
+            compute_windows_borderless_fullscreen_rect, restore_win32_normal_window_style,
+            strip_win32_window_frame_styles, MonitorRect, WindowRect,
+            WIN32_BORDERLESS_STRIP_EX_STYLE_MASK, WIN32_BORDERLESS_STRIP_STYLE_MASK,
+            WIN32_WS_MAXIMIZE, WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX,
+        };
+
+        assert_eq!(WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX, 1);
+
+        let primary = MonitorRect::new(0, 0, 1920, 1080, 1.0);
+        assert_eq!(
+            compute_windows_borderless_fullscreen_rect(primary),
+            WindowRect::new(0, 0, 1920, 1081)
+        );
+
+        let left_monitor = MonitorRect::new(-2560, -120, 2560, 1440, 1.5);
+        assert_eq!(
+            compute_windows_borderless_fullscreen_rect(left_monitor),
+            WindowRect::new(-2560, -120, 2560, 1441)
+        );
+
+        // Include WS_MAXIMIZE alongside WS_VISIBLE | WS_OVERLAPPEDWINDOW.
+        let maximized_style = 0x10CF_0000u32 | WIN32_WS_MAXIMIZE;
+        let full_ex = 0x0004_0301u32;
+        let (stripped_style, stripped_ex) =
+            strip_win32_window_frame_styles(maximized_style, full_ex);
+        assert_eq!(stripped_style & WIN32_BORDERLESS_STRIP_STYLE_MASK, 0);
+        assert_eq!(stripped_style & WIN32_WS_MAXIMIZE, 0);
+        assert_ne!(stripped_style & 0x1000_0000, 0); // WS_VISIBLE preserved
+        assert_eq!(stripped_ex & WIN32_BORDERLESS_STRIP_EX_STYLE_MASK, 0);
+        assert_ne!(stripped_ex & 0x0004_0000, 0); // WS_EX_APPWINDOW preserved
+
+        // Restored style preserves chrome bits while clearing WS_MAXIMIZE before ShowWindow.
+        let restored = restore_win32_normal_window_style(maximized_style);
+        assert_eq!(restored & WIN32_WS_MAXIMIZE, 0);
+        assert_eq!(restored, 0x10CF_0000u32);
     }
 }
