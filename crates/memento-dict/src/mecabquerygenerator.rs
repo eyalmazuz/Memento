@@ -62,11 +62,17 @@ const MAX_QUERIES_PER_NODE: usize = 128;
 /// Maximum UTF-16 length of a concatenated compound MeCab lookup candidate.
 const MAX_COMPOUND_UTF16_UNITS: usize = 24;
 
+#[derive(Clone)]
+struct ExpandedQuery {
+    query: MeCabQuery,
+    span_tokens: usize,
+}
+
 fn expand_memoized(
     nodes: &[Node<'_>],
     start_index: usize,
     state: &mut [VisitState],
-    memo: &mut [Vec<MeCabQuery>],
+    memo: &mut [Vec<ExpandedQuery>],
 ) -> Option<()> {
     if start_index >= nodes.len() {
         return None;
@@ -106,13 +112,16 @@ fn expand_memoized(
     // Populate `memo` from the tail of the `bnext` chain back to `start_index`.
     for &idx in chain.iter().rev() {
         let node = nodes[idx];
-        let mut queries = Vec::new();
+        let mut queries: Vec<ExpandedQuery> = Vec::new();
 
         if node.deconj != ['*' as u16] {
-            queries.push(MeCabQuery {
-                deconj: node.deconj.to_vec(),
-                surface: node.surface.to_vec(),
-                surface_clean: node.surface_clean.to_vec(),
+            queries.push(ExpandedQuery {
+                query: MeCabQuery {
+                    deconj: node.deconj.to_vec(),
+                    surface: node.surface.to_vec(),
+                    surface_clean: node.surface_clean.to_vec(),
+                },
+                span_tokens: 1,
             });
         }
 
@@ -123,35 +132,41 @@ fn expand_memoized(
                 if queries.len() >= MAX_QUERIES_PER_NODE {
                     break;
                 }
-                if node.surface_clean.len() + suffix.deconj.len() > MAX_COMPOUND_UTF16_UNITS {
+                if node.surface_clean.len() + suffix.query.deconj.len() > MAX_COMPOUND_UTF16_UNITS
+                {
                     continue;
                 }
                 let mut deconj =
-                    Vec::with_capacity(node.surface_clean.len() + suffix.deconj.len());
+                    Vec::with_capacity(node.surface_clean.len() + suffix.query.deconj.len());
                 deconj.extend_from_slice(node.surface_clean);
-                deconj.extend_from_slice(&suffix.deconj);
-                let mut surface = Vec::with_capacity(node.surface.len() + suffix.surface.len());
+                deconj.extend_from_slice(&suffix.query.deconj);
+                let mut surface =
+                    Vec::with_capacity(node.surface.len() + suffix.query.surface.len());
                 surface.extend_from_slice(node.surface);
-                surface.extend_from_slice(&suffix.surface);
+                surface.extend_from_slice(&suffix.query.surface);
                 let mut clean =
-                    Vec::with_capacity(node.surface_clean.len() + suffix.surface_clean.len());
+                    Vec::with_capacity(node.surface_clean.len() + suffix.query.surface_clean.len());
                 clean.extend_from_slice(node.surface_clean);
-                clean.extend_from_slice(&suffix.surface_clean);
-                queries.push(MeCabQuery {
-                    deconj,
-                    surface,
-                    surface_clean: clean,
+                clean.extend_from_slice(&suffix.query.surface_clean);
+                queries.push(ExpandedQuery {
+                    query: MeCabQuery {
+                        deconj,
+                        surface,
+                        surface_clean: clean,
+                    },
+                    span_tokens: 1 + suffix.span_tokens,
                 });
             }
         }
 
         if let Some(bnext_index) = node.bnext {
-            let mut seen: HashSet<MeCabQuery> = queries.iter().cloned().collect();
+            let mut seen: HashSet<MeCabQuery> =
+                queries.iter().map(|eq| eq.query.clone()).collect();
             for sibling in &memo[bnext_index] {
                 if queries.len() >= MAX_QUERIES_PER_NODE {
                     break;
                 }
-                if seen.insert(sibling.clone()) {
+                if seen.insert(sibling.query.clone()) {
                     queries.push(sibling.clone());
                 }
             }
@@ -164,10 +179,10 @@ fn expand_memoized(
     Some(())
 }
 
-/// Returns `None` if the caller supplied invalid indexes or cyclic links.
-/// Real MeCab lattices are DAGs; memoization prevents exponential blowup on
-/// reconvergent multi-morpheme lattices.
-pub fn generate_queries(nodes: &[Node<'_>], start: Option<usize>) -> Option<Vec<MeCabQuery>> {
+fn generate_queries_with_spans(
+    nodes: &[Node<'_>],
+    start: Option<usize>,
+) -> Option<Vec<ExpandedQuery>> {
     let Some(start_index) = start else {
         return Some(Vec::new());
     };
@@ -178,6 +193,18 @@ pub fn generate_queries(nodes: &[Node<'_>], start: Option<usize>) -> Option<Vec<
     let mut memo = vec![Vec::new(); nodes.len()];
     expand_memoized(nodes, start_index, &mut state, &mut memo)?;
     Some(std::mem::take(&mut memo[start_index]))
+}
+
+/// Returns `None` if the caller supplied invalid indexes or cyclic links.
+/// Real MeCab lattices are DAGs; memoization prevents exponential blowup on
+/// reconvergent multi-morpheme lattices.
+pub fn generate_queries(nodes: &[Node<'_>], start: Option<usize>) -> Option<Vec<MeCabQuery>> {
+    Some(
+        generate_queries_with_spans(nodes, start)?
+            .into_iter()
+            .map(|eq| eq.query)
+            .collect(),
+    )
 }
 
 fn is_single_kana_only(s: &str) -> bool {
@@ -246,14 +273,10 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
 
     let total_tokens = tokens.len();
     let mut stages: Vec<EncodedStage> = Vec::with_capacity(total_tokens);
-    let mut cum_surface_u16: Vec<usize> = Vec::with_capacity(total_tokens);
-    let mut running_u16 = 0usize;
 
     for tok in tokens {
         let surface_u16: Vec<u16> = tok.surface.encode_utf16().collect();
         let surface_clean_u16: Vec<u16> = tok.surface_clean.encode_utf16().collect();
-        running_u16 += surface_u16.len();
-        cum_surface_u16.push(running_u16);
 
         let is_non_inflecting = matches!(tok.pos, "助詞" | "記号" | "補助記号" | "空白");
         let single_kana = is_single_kana_only(tok.surface_clean);
@@ -316,20 +339,20 @@ pub fn generate_candidates_from_tokens(tokens: &[TokenSpan<'_>]) -> Vec<Generate
         }
     }
 
-    let Some(raw_queries) = generate_queries(&nodes, Some(0)) else {
+    let Some(raw_queries) = generate_queries_with_spans(&nodes, Some(0)) else {
         return Vec::new();
     };
 
     let mut out = Vec::with_capacity(raw_queries.len());
-    for mq in raw_queries {
+    for ExpandedQuery {
+        query: mq,
+        span_tokens,
+    } in raw_queries
+    {
         if mq.deconj.is_empty() || mq.surface.is_empty() {
             continue;
         }
         let surface_u16_len = mq.surface.len();
-        let span_tokens = cum_surface_u16
-            .binary_search(&surface_u16_len)
-            .map(|k| k + 1)
-            .unwrap_or(2);
         let deconj = String::from_utf16_lossy(&mq.deconj);
         let surface = String::from_utf16_lossy(&mq.surface);
         let surface_clean = String::from_utf16_lossy(&mq.surface_clean);

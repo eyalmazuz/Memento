@@ -1,0 +1,80 @@
+import { MementoPalette } from "../palette.slint";
+import { ActionButton } from "buttons.slint";
+
+export component ModalDialog inherits Rectangle {
+    in property <string> title;
+    in property <color> title-color: MementoPalette.text;
+    in property <color> accent-border: MementoPalette.border-light;
+    in property <length> dialog-width: 460px;
+    in property <bool> dismiss-on-backdrop: true;
+    in property <string> cancel-text: "";
+    in property <string> primary-text: "OK";
+    in property <bool> primary-danger: false;
+    in property <bool> primary-enabled: true;
+    in property <bool> show-footer: true;
+    callback dismissed();
+    callback primary-clicked();
+
+    width: 100%;
+    height: 100%;
+    background: MementoPalette.scrim;
+
+    TouchArea {
+        clicked => {
+            if root.dismiss-on-backdrop {
+                root.dismissed();
+            }
+        }
+    }
+
+    Rectangle {
+        width: min(root.dialog-width, parent.width - 48px);
+        height: min(card-layout.preferred-height, parent.height - 48px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: MementoPalette.surface-elevated;
+        border-width: 1px;
+        border-color: root.accent-border;
+        border-radius: 12px;
+        drop-shadow-blur: 28px;
+        drop-shadow-color: MementoPalette.shadow;
+
+        // Absorb clicks inside the dialog surface so they don't dismiss the backdrop
+        TouchArea { }
+
+        card-layout := VerticalLayout {
+            width: parent.width;
+            padding: 20px;
+            spacing: 14px;
+
+            if root.title != "" : Text {
+                text: root.title;
+                color: root.title-color;
+                font-size: 16px;
+                font-weight: 700;
+                overflow: elide;
+            }
+
+            @children
+
+            if root.show-footer : HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+
+                if root.cancel-text != "" : ActionButton {
+                    text: root.cancel-text;
+                    ghost: true;
+                    clicked => { root.dismissed(); }
+                }
+
+                ActionButton {
+                    text: root.primary-text;
+                    primary: !root.primary-danger;
+                    danger: root.primary-danger;
+                    enabled: root.primary-enabled;
+                    clicked => { root.primary-clicked(); }
+                }
+            }
+        }
+    }
+}

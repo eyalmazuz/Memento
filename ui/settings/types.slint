@@ -1,0 +1,45 @@
+// Shared Slint data models for Options / Settings window.
+// Field layouts are consumed by ConfigController and integration tests — preserve field names & types.
+
+export struct SettingsField {
+    key: string,
+    label: string,
+    description: string,
+    kind: string, // "switch", "choice", "text", "font", "color", or "keybind"
+    value: string,
+    choices: [string],
+    enabled: bool,
+    visible: bool,
+    font-family: string,
+    font-size: string,
+    font-bold: bool,
+    font-italic: bool,
+    color-swatch: color,
+    color-a: int,
+    color-r: int,
+    color-g: int,
+    color-b: int,
+    conflict: string,
+}
+
+export struct SettingsGroup {
+    category: int,
+    title: string,
+    entry_id: string, // an audio-source index, or empty for ordinary sections
+    fields: [SettingsField],
+}
+
+export struct InstalledDictionaryRow {
+    id: int,
+    title: string,
+    disabled: bool,
+}
+
+export struct AsrModelStatusRow {
+    backend: string,
+    name: string,
+    path: string,
+    installed: bool,
+    selected: bool,
+    status-text: string,
+}

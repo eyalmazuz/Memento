@@ -1,0 +1,1008 @@
+import { ScrollView } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import {
+    DictResult,
+    PitchGraph,
+    PopupAudioSource,
+    PopupFreqStyle,
+    RichDerivationStep,
+    RichHeadwordChar,
+    RichKanjiDetail,
+    RichPitchGraph,
+    RichTagPill,
+    DictionaryText,
+    PopupBridge,
+    PopupLayout,
+} from "types.slint";
+
+// ── Shared Keyboard Focus Handler ───────────────────────────────────────────
+export component PopupKeyHandler inherits FocusScope {
+    callback close-requested();
+
+    width: 0px;
+    height: 0px;
+    enabled: PopupBridge.rich-enabled;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            if (PopupBridge.nested-depth > 0) {
+                PopupBridge.pop-nested-popup();
+                return accept;
+            }
+            root.close-requested();
+            return accept;
+        }
+        if ((event.modifiers.control || event.modifiers.meta)
+            && !event.modifiers.alt
+            && (event.text == "c" || event.text == "C")
+            && PopupBridge.selected-glossary-text != "")
+        {
+            PopupBridge.copy-selected-glossary();
+            return accept;
+        }
+        if (PopupBridge.popup-key-pressed(
+            event.text,
+            event.modifiers.control,
+            event.modifiers.shift,
+            event.modifiers.alt,
+            event.modifiers.meta
+        )) {
+            return accept;
+        }
+        reject
+    }
+    key-released(event) => {
+        PopupBridge.popup-key-released(
+            event.modifiers.control,
+            event.modifiers.shift,
+            event.modifiers.alt,
+            event.modifiers.meta
+        );
+        reject
+    }
+}
+
+// ── Shared Action Pill Button for Popup Headers ─────────────────────────────
+export component PopupActionButton inherits Rectangle {
+    in property <length> btn-width: 28px;
+    in property <length> btn-height: 28px;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    in property <length> icon-size: 16px;
+    in property <string> label: "";
+    in property <length> label-font-size: 14px;
+    in property <int> label-font-weight: 700;
+    in property <color> bg-normal: MementoPalette.button-bg;
+    in property <color> bg-hover: MementoPalette.button-hover;
+    in property <color> bg-pressed: MementoPalette.button-pressed;
+    in property <color> border-normal: MementoPalette.border;
+    in property <color> border-hover: MementoPalette.border-light;
+    in property <color> fg-color: MementoPalette.icon;
+    in property <color> fg-hover-color: MementoPalette.text;
+    in property <bool> enabled: true;
+    in property <string> tooltip: "";
+    callback clicked();
+    callback right-clicked();
+    callback request-tooltip(string);
+
+    width: root.btn-width;
+    height: root.btn-height;
+    border-radius: 5px;
+    border-width: 1px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    border-color: !root.enabled
+        ? root.border-normal
+        : (btn-touch.has-hover ? root.border-hover : root.border-normal);
+    background: !root.enabled
+        ? root.bg-normal
+        : (btn-touch.pressed
+            ? root.bg-pressed
+            : (btn-touch.has-hover ? root.bg-hover : root.bg-normal));
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    if root.has-icon : Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.icon-size;
+        height: root.icon-size;
+        source: root.icon;
+        colorize: btn-touch.has-hover && root.enabled ? root.fg-hover-color : root.fg-color;
+    }
+
+    if !root.has-icon && root.label != "" : DictionaryText {
+        text: root.label;
+        color: btn-touch.has-hover && root.enabled ? root.fg-hover-color : root.fg-color;
+        font-size: root.label-font-size;
+        font-weight: root.label-font-weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    btn-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+        pointer-event(event) => {
+            if (root.enabled && event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                root.right-clicked();
+            }
+        }
+        changed has-hover => {
+            if self.has-hover && root.tooltip != "" && PopupBridge.rich-enabled {
+                root.request-tooltip(root.tooltip);
+            } else if !self.has-hover && root.tooltip != "" && PopupBridge.rich-enabled {
+                PopupBridge.hide-tooltip();
+            }
+        }
+    }
+}
+
+// ── Category-Colored Tag Pill Badge (lazy tooltip coordinates) ──────────────
+export component RichTagPillBadge inherits Rectangle {
+    in property <RichTagPill> pill;
+    callback request-tooltip(string);
+
+    height: max(18px, PopupBridge.css-tag-font-size + 7px);
+    width: label.preferred-width + 12px;
+    background: root.pill.bg-color;
+    border-radius: 3px;
+
+    label := DictionaryText {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        text: root.pill.name;
+        font-family: PopupBridge.css-tag-font-family;
+        font-size: PopupBridge.css-tag-font-size;
+        font-weight: 700;
+        color: #FFFFFF;
+        vertical-alignment: center;
+    }
+
+    if root.pill.notes != "" : pill-touch := TouchArea {
+        mouse-cursor: help;
+        changed has-hover => {
+            if self.has-hover {
+                root.request-tooltip(root.pill.notes);
+            } else {
+                PopupBridge.hide-tooltip();
+            }
+        }
+    }
+}
+
+// ── Term-Level Deduplicated Tag Pill Row (#220) ─────────────────────────────
+export component TermTagPillRow inherits HorizontalLayout {
+    in property <int> res-index;
+    in property <int> scan-depth: 0;
+    in property <int> bridge-rev: 0;
+    callback request-tooltip(string);
+
+    spacing: 4px;
+    alignment: start;
+
+    for pill in (root.scan-depth == 0
+        ? PopupBridge.term-tag-pills(root.res-index, root.bridge-rev)
+        : PopupBridge.nested-term-tag-pills(root.scan-depth, root.res-index, root.bridge-rev)) : RichTagPillBadge {
+        pill: pill;
+        request-tooltip(notes) => { root.request-tooltip(notes); }
+    }
+}
+
+// ── Shared Term Header Leading Actions (`かな`, `字`, Audio, Browse Anki) ───
+export component TermLeadingActions inherits HorizontalLayout {
+    in property <DictResult> res;
+    in property <bool> show-kana: false;
+    in property <bool> show-browse: false;
+    in property <length> btn-size: 28px;
+    in property <length> icon-size: 16px;
+    callback kana-clicked();
+    callback kanji-clicked();
+    callback audio-clicked();
+    callback audio-right-clicked(length);
+    callback browse-clicked();
+    callback request-tooltip(string, length);
+
+    horizontal-stretch: 0;
+    alignment: end;
+
+    // `かな` reading-search toggle button
+    if root.show-kana : PopupActionButton {
+        property <bool> kana-active: PopupBridge.kana-reading-active && PopupBridge.active-kana-reading == root.res.reading;
+        btn-width: 34px;
+        btn-height: root.btn-size;
+        label: "かな";
+        label-font-size: 11px;
+        bg-normal: self.kana-active ? MementoPalette.teal-accent : MementoPalette.button-bg;
+        bg-hover: self.kana-active ? MementoPalette.teal-hover : MementoPalette.button-hover;
+        bg-pressed: self.kana-active ? MementoPalette.teal-pressed : MementoPalette.button-pressed;
+        border-normal: self.kana-active ? MementoPalette.teal-border : MementoPalette.border;
+        border-hover: self.kana-active ? MementoPalette.teal-border : MementoPalette.border-light;
+        fg-color: self.kana-active ? #FFFFFF : MementoPalette.icon;
+        fg-hover-color: #FFFFFF;
+        tooltip: "Search by kana reading";
+        clicked => { root.kana-clicked(); }
+        request-tooltip(tip) => { root.request-tooltip(tip, 180px); }
+    }
+
+    // `字` Kanji info button (matching filled surface pill)
+    if !root.res.is-kanji && root.res.has-kanji : PopupActionButton {
+        btn-width: root.btn-size;
+        btn-height: root.btn-size;
+        label: "字";
+        label-font-size: 15px;
+        label-font-weight: 600;
+        tooltip: "Kanji info";
+        clicked => { root.kanji-clicked(); }
+        request-tooltip(tip) => { root.request-tooltip(tip, 120px); }
+    }
+
+    // Audio play + right-click audio source menu
+    if !root.res.is-kanji : PopupActionButton {
+        btn-width: root.btn-size;
+        btn-height: root.btn-size;
+        has-icon: true;
+        icon: @image-url("../icons/volume-on.svg");
+        icon-size: root.icon-size;
+        tooltip: "Play audio (right-click for sources)";
+        clicked => { root.audio-clicked(); }
+        right-clicked => { root.audio-right-clicked(self.x); }
+        request-tooltip(tip) => { root.request-tooltip(tip, 220px); }
+    }
+
+    // Browse in Anki
+    if root.show-browse : PopupActionButton {
+        btn-width: root.btn-size;
+        btn-height: root.btn-size;
+        has-icon: true;
+        icon: @image-url("../icons/note-stack.svg");
+        icon-size: root.icon-size;
+        bg-normal: MementoPalette.accent-muted;
+        bg-hover: MementoPalette.accent-muted-hover;
+        bg-pressed: MementoPalette.accent-muted;
+        border-normal: #38BDF844;
+        border-hover: MementoPalette.cyan-accent;
+        fg-color: MementoPalette.cyan-text;
+        fg-hover-color: #E0F2FE;
+        tooltip: "Browse in Anki";
+        clicked => { root.browse-clicked(); }
+        request-tooltip(tip) => { root.request-tooltip(tip, 140px); }
+    }
+}
+
+// ── Shared Emerald Add-to-Anki Button ───────────────────────────────────────
+export component AnkiAddButton inherits Rectangle {
+    in property <length> btn-size: 28px;
+    callback clicked();
+    callback request-tooltip(string);
+
+    width: root.btn-size;
+    height: root.btn-size;
+    background: transparent;
+
+    PopupActionButton {
+        btn-width: root.btn-size;
+        btn-height: root.btn-size;
+        has-icon: true;
+        icon: @image-url("../icons/add.svg");
+        icon-size: 16px;
+        bg-normal: MementoPalette.success-bg;
+        bg-hover: MementoPalette.teal-accent;
+        bg-pressed: MementoPalette.teal-pressed;
+        border-normal: #10B98155;
+        border-hover: MementoPalette.teal-border;
+        fg-color: MementoPalette.success-text;
+        fg-hover-color: #FFFFFF;
+        tooltip: "Add to Anki";
+        clicked => { root.clicked(); }
+        request-tooltip(tip) => { root.request-tooltip(tip); }
+    }
+}
+
+// ── Existing Anki Note Tag Row (#346) ───────────────────────────────────────
+export component AnkiTagRow inherits HorizontalLayout {
+    in property <string> raw-tags;
+    callback request-tooltip(string);
+
+    property <[string]> split-tags: PopupBridge.split-anki-tags(root.raw-tags);
+    property <[string]> effective-tags: self.split-tags.length > 0 ? self.split-tags : [root.raw-tags];
+
+    spacing: 4px;
+    alignment: start;
+
+    for anki-tag in root.effective-tags : Rectangle {
+        height: 18px;
+        width: anki-tag-lbl.preferred-width + 12px;
+        background: PopupBridge.css-anki-tag-bg;
+        border-width: 1px;
+        border-color: PopupBridge.css-anki-tag-border;
+        border-radius: 3px;
+
+        anki-tag-lbl := DictionaryText {
+            x: 6px;
+            width: parent.width - 12px;
+            height: parent.height;
+            text: anki-tag;
+            font-size: 10px;
+            font-weight: 700;
+            color: PopupBridge.css-anki-tag-color;
+            vertical-alignment: center;
+        }
+
+        if PopupBridge.rich-enabled : TouchArea {
+            mouse-cursor: help;
+            changed has-hover => {
+                if self.has-hover {
+                    root.request-tooltip("Anki tag: " + anki-tag);
+                } else {
+                    PopupBridge.hide-tooltip();
+                }
+            }
+        }
+    }
+}
+
+// ── Per-Character Headword Cell (TouchArea mounted ONLY on kanji) ───────────
+component HeadwordCharCell inherits Rectangle {
+    in property <RichHeadwordChar> ch;
+    in property <length> font-size;
+    in property <color> text-color;
+    callback kanji-clicked(string);
+
+    private property <bool> hovered: false;
+
+    width: ch-text.preferred-width;
+    height: ch-text.preferred-height;
+    background: root.hovered ? MementoPalette.hover-bg : transparent;
+    border-radius: 3px;
+
+    ch-text := DictionaryText {
+        text: root.ch.text;
+        font-family: PopupBridge.css-headword-font-family;
+        font-size: root.font-size;
+        font-weight: 700;
+        color: root.hovered ? PopupBridge.css-link-color : root.text-color;
+    }
+
+    if root.ch.is-kanji : TouchArea {
+        mouse-cursor: pointer;
+        changed has-hover => { root.hovered = self.has-hover; }
+        clicked => { root.kanji-clicked(root.ch.text); }
+    }
+}
+
+export component HeadwordCharRow inherits VerticalLayout {
+    in property <string> expression;
+    in property <length> avail-width: 240px;
+    in property <length> font-size: PopupBridge.css-headword-size;
+    in property <color> text-color: PopupBridge.css-headword-color;
+    callback kanji-clicked(string);
+
+    spacing: 1px;
+
+    for hw-line in PopupBridge.headword-lines(root.expression, root.avail-width / 1px) : HorizontalLayout {
+        alignment: start;
+        spacing: 0px;
+        for ch in hw-line.chars : HeadwordCharCell {
+            ch: ch;
+            font-size: root.font-size;
+            text-color: root.text-color;
+            kanji-clicked(c) => { root.kanji-clicked(c); }
+        }
+    }
+}
+
+// ── Term Headword + Reading Block ───────────────────────────────────────────
+export component TermHeadwordBlock inherits VerticalLayout {
+    in property <DictResult> res;
+    in property <bool> nested: false;
+    in property <bool> compact: false;
+    in property <int> scan-depth: 0;
+    in property <int> bridge-rev: 0;
+    in property <length> avail-width: 240px;
+    in property <color> headword-color: PopupBridge.css-headword-color;
+    callback kanji-clicked(string);
+
+    property <length> hw-font-size: root.compact
+        ? max(16px, PopupBridge.css-headword-size - 2px)
+        : PopupBridge.css-headword-size;
+    property <length> kanji-font-size: PopupBridge.css-kanji-font-size > 0px
+        ? PopupBridge.css-kanji-font-size
+        : PopupBridge.css-headword-size * (root.nested ? 1.4 : 1.56);
+
+    horizontal-stretch: 1;
+    min-width: 0px;
+    preferred-width: 0px;
+    spacing: 2px;
+
+    if !root.res.is-kanji && root.res.reading != "" && root.res.reading != root.res.expression : DictionaryText {
+        text: root.res.reading;
+        height: self.preferred-height;
+        wrap: word-wrap;
+        font-family: PopupBridge.css-reading-font-family;
+        font-size: PopupBridge.css-reading-size;
+        color: PopupBridge.css-reading-color;
+    }
+
+    if PopupBridge.rich-enabled && !root.res.is-kanji : HeadwordCharRow {
+        expression: root.res.expression;
+        avail-width: root.avail-width;
+        font-size: root.hw-font-size;
+        text-color: root.headword-color;
+        kanji-clicked(c) => { root.kanji-clicked(c); }
+    }
+
+    if !PopupBridge.rich-enabled || root.res.is-kanji : DictionaryText {
+        text: root.res.expression;
+        height: self.preferred-height;
+        wrap: word-wrap;
+        font-family: root.res.is-kanji ? PopupBridge.css-kanji-font-family : PopupBridge.css-headword-font-family;
+        font-size: root.res.is-kanji ? root.kanji-font-size : root.hw-font-size;
+        font-weight: 700;
+        color: root.headword-color;
+    }
+}
+
+// ── Conjugation Derivation Chain (unified soft translucent capsule) ─────────
+export component TermDerivationRow inherits HorizontalLayout {
+    in property <[RichDerivationStep]> steps;
+    in property <string> compact-summary: "";
+    callback request-tooltip(string);
+
+    alignment: start;
+
+    if root.steps.length > 0 : Rectangle {
+        width: deriv-inner.preferred-width;
+        height: max(20px, PopupBridge.css-conj-font-size + 8px);
+        border-radius: 5px;
+        border-width: 1px;
+        border-color: #FFFFFF16;
+        background: #FFFFFF0C;
+
+        deriv-inner := HorizontalLayout {
+            padding-left: 7px;
+            padding-right: 7px;
+            spacing: 2px;
+            alignment: start;
+
+            DictionaryText {
+                text: "«";
+                font-family: PopupBridge.css-conj-font-family;
+                font-size: PopupBridge.css-conj-font-size;
+                color: #94A3B8CC;
+                vertical-alignment: center;
+            }
+
+            for step[step-idx] in root.steps : HorizontalLayout {
+                spacing: 2px;
+                alignment: start;
+
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: step-lbl.preferred-width + 8px;
+                        height: max(16px, PopupBridge.css-conj-font-size + 4px);
+                        border-radius: 3px;
+                        background: step-touch.has-hover ? #FFFFFF1E : transparent;
+                        animate background { duration: 100ms; }
+
+                        step-lbl := DictionaryText {
+                            x: 4px;
+                            height: parent.height;
+                            text: step.label;
+                            font-family: PopupBridge.css-conj-font-family;
+                            font-size: PopupBridge.css-conj-font-size;
+                            color: step-touch.has-hover ? #F8FAFC : #CBD5E1;
+                            vertical-alignment: center;
+                        }
+                        step-touch := TouchArea {
+                            mouse-cursor: step.description != "" ? help : default;
+                            changed has-hover => {
+                                if self.has-hover && step.description != "" {
+                                    root.request-tooltip(step.label + ": " + step.description);
+                                } else if !self.has-hover {
+                                    PopupBridge.hide-tooltip();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if step.has-arrow : DictionaryText {
+                    text: "←";
+                    font-family: PopupBridge.css-conj-font-family;
+                    font-size: PopupBridge.css-conj-font-size;
+                    color: #94A3B899;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    if root.steps.length == 0 && root.compact-summary != "" : Rectangle {
+        width: 22px;
+        height: 18px;
+        border-radius: 4px;
+        background: compact-deriv-touch.has-hover ? #FFFFFF1E : #FFFFFF0C;
+        border-width: 1px;
+        border-color: #FFFFFF16;
+        DictionaryText {
+            text: "ⓘ";
+            font-size: 12px;
+            color: PopupBridge.css-muted-color;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        compact-deriv-touch := TouchArea {
+            mouse-cursor: help;
+            changed has-hover => {
+                if self.has-hover {
+                    root.request-tooltip(root.compact-summary);
+                } else {
+                    PopupBridge.hide-tooltip();
+                }
+            }
+        }
+    }
+}
+
+// ── Wrapping Frequency Badge List ───────────────────────────────────────────
+export component FrequencyBadgeList inherits VerticalLayout {
+    in property <DictResult> res;
+    in property <bool> show-legacy-meta: false;
+    in property <string> jpdb-rank: "";
+    in property <string> freq-rank: "";
+    in property <string> pitch-accent: "";
+
+    spacing: 3px;
+
+    if root.show-legacy-meta && root.res.index == 1 && root.res.frequencies.length == 0
+        && (root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != "") : HorizontalLayout {
+        width: parent.width;
+        spacing: 6px;
+        alignment: start;
+        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: MementoPalette.success-text; font-size: 11px; }
+        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: MementoPalette.success-text; font-size: 11px; }
+        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: MementoPalette.badge-purple-text; font-size: 11px; }
+    }
+
+    if root.res.frequencies.length > 0 : VerticalLayout {
+        width: root.width;
+        spacing: 3px;
+        for line in PopupLayout.frequency-lines(root.res.frequencies, root.width / 1px) : HorizontalLayout {
+            width: root.width;
+            alignment: start;
+            spacing: 4px;
+            for frequency in line.entries : Rectangle {
+                property <PopupFreqStyle> fstyle: PopupBridge.rich-enabled
+                    ? PopupBridge.freq-badge-style(frequency.dictionary, PopupBridge.rich-revision)
+                    : { bg: PopupBridge.css-freq-bg, color: PopupBridge.css-freq-color };
+                width: min(frequency-label.preferred-width + 10px, parent.width);
+                height: max(18px, frequency-label.preferred-height + 2px);
+                background: self.fstyle.bg;
+                border-radius: 3px;
+                frequency-label := DictionaryText {
+                    x: 5px;
+                    width: parent.width - 10px;
+                    height: parent.height;
+                    text: frequency.dictionary + " " + frequency.value;
+                    font-size: PopupBridge.css-freq-font-size;
+                    color: parent.fstyle.color;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+// ── Pitch Accent Graph List (Rich + Fallback, using pre-cached rich graphs) ─
+export component PitchGraphList inherits VerticalLayout {
+    in property <[RichPitchGraph]> rich-pitches;
+    in property <[PitchGraph]> fallback-pitches;
+    in property <bool> allow-fallback: true;
+    in property <bool> compact: false;
+    callback request-tooltip(string);
+
+    property <length> row-h: root.compact ? 28px : 30px;
+    property <length> badge-h: root.compact ? 18px : 20px;
+
+    spacing: 4px;
+
+    // Rich pitch graphs with nasal (`゜`/ring) & devoice (dotted circle) markers
+    if PopupBridge.rich-enabled && root.rich-pitches.length > 0 : VerticalLayout {
+        width: parent.width;
+        spacing: 4px;
+        for pitch in root.rich-pitches : Rectangle {
+            width: parent.width;
+            height: root.row-h;
+            background: transparent;
+            HorizontalLayout {
+                width: parent.width;
+                height: root.row-h;
+                spacing: root.compact ? 6px : 8px;
+                alignment: start;
+
+                if PopupBridge.css-show-pitch-dict : Rectangle {
+                    height: root.badge-h;
+                    y: (root.row-h - self.height) / 2;
+                    width: min(pitch-dict-lbl.preferred-width + 10px, parent.width * 0.42);
+                    background: PopupBridge.pitch-dict-bg(pitch.dictionary, PopupBridge.rich-revision);
+                    border-radius: 3px;
+                    pitch-dict-lbl := DictionaryText {
+                        x: 5px;
+                        width: parent.width - 10px;
+                        height: parent.height;
+                        text: pitch.dictionary + " [" + pitch.position + "]";
+                        font-size: 10px;
+                        font-weight: 700;
+                        color: #FFFFFF;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                HorizontalLayout {
+                    width: self.preferred-width;
+                    height: root.row-h;
+                    horizontal-stretch: 0;
+                    spacing: 0px;
+                    for mora in pitch.mora : Rectangle {
+                        width: max(root.compact ? 18px : 20px, rich-mora-lbl.preferred-width + (root.compact ? 5px : 6px));
+                        height: root.row-h;
+                        Rectangle {
+                            x: 0px;
+                            y: mora.high ? 3px : 11px;
+                            width: parent.width;
+                            height: 1.5px;
+                            background: PopupBridge.css-pitch-color;
+                        }
+                        if mora.rises-after || mora.falls-after : Rectangle {
+                            x: parent.width - 1.5px;
+                            y: 3px;
+                            width: 1.5px;
+                            height: 9.5px;
+                            background: PopupBridge.css-pitch-color;
+                        }
+                        if mora.devoice : Image {
+                            x: (parent.width - 18px) / 2;
+                            y: root.compact ? 10px : 11px;
+                            width: 18px;
+                            height: 18px;
+                            source: PopupBridge.devoice-circle-image();
+                        }
+                        rich-mora-lbl := DictionaryText {
+                            text: mora.text;
+                            y: root.compact ? 12px : 13px;
+                            horizontal-alignment: center;
+                            width: parent.width;
+                            font-size: 11px;
+                            color: mora.devoice ? MementoPalette.danger-text : PopupBridge.css-text-color;
+                        }
+                        if mora.nasal : Rectangle {
+                            x: parent.width - 6px;
+                            y: root.compact ? 10px : 11px;
+                            width: 5px;
+                            height: 5px;
+                            border-radius: 2.5px;
+                            border-width: 1.2px;
+                            border-color: #FBBF24;
+                            background: PopupBridge.css-popup-bg;
+                        }
+                        if mora.nasal || mora.devoice : TouchArea {
+                            mouse-cursor: help;
+                            changed has-hover => {
+                                if self.has-hover {
+                                    root.request-tooltip(
+                                        mora.nasal && mora.devoice
+                                            ? "Nasalized & devoiced mora (鼻濁音・母音無声化)"
+                                            : (mora.nasal ? "Nasalized mora (鼻濁音 ゜)" : "Devoiced mora (母音無声化)")
+                                    );
+                                } else {
+                                    PopupBridge.hide-tooltip();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback pitch graphs when rich bridge has none or is disabled
+    if root.allow-fallback && (!PopupBridge.rich-enabled || root.rich-pitches.length == 0) && root.fallback-pitches.length > 0 : VerticalLayout {
+        width: parent.width;
+        spacing: 4px;
+        for pitch in root.fallback-pitches : Rectangle {
+            width: parent.width;
+            height: 28px;
+            background: transparent;
+            HorizontalLayout {
+                width: parent.width;
+                height: 28px;
+                spacing: 8px;
+                alignment: start;
+                DictionaryText {
+                    text: pitch.dictionary + " [" + pitch.position + "]";
+                    width: min(self.preferred-width, parent.width * 0.4);
+                    horizontal-stretch: 0;
+                    font-size: 11px;
+                    color: MementoPalette.badge-purple-text;
+                    vertical-alignment: center;
+                }
+                HorizontalLayout {
+                    width: self.preferred-width;
+                    height: 28px;
+                    horizontal-stretch: 0;
+                    spacing: 0px;
+                    for mora in pitch.mora : Rectangle {
+                        width: max(18px, mora-label.preferred-width + 3px);
+                        height: 28px;
+                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1px; background: PopupBridge.css-pitch-color; }
+                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: PopupBridge.css-pitch-color; }
+                        mora-label := DictionaryText {
+                            text: mora.text;
+                            y: 13px;
+                            horizontal-alignment: center;
+                            width: parent.width;
+                            font-size: 10px;
+                            color: PopupBridge.css-text-color;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── 3-Column Kanji Detail Card ──────────────────────────────────────────────
+export component KanjiDetailCard inherits VerticalLayout {
+    in property <RichKanjiDetail> detail;
+    in property <bool> selected: true;
+
+    spacing: 6px;
+
+    Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+
+    HorizontalLayout {
+        width: parent.width;
+        spacing: 8px;
+        DictionaryText { horizontal-stretch: 1; width: 0px; text: "Glossary"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+        DictionaryText { horizontal-stretch: 1; width: 0px; text: "Reading"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+        DictionaryText { horizontal-stretch: 1; width: 0px; text: "Statistics"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+    }
+
+    Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+
+    HorizontalLayout {
+        width: parent.width;
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            width: 0px;
+            spacing: 2px;
+            alignment: start;
+            for meaning[m-idx] in root.detail.meanings : DictionaryText {
+                width: parent.width;
+                text: (m-idx + 1) + ". " + meaning;
+                font-size: 13px;
+                color: root.selected ? PopupBridge.css-text-color : PopupBridge.css-muted-color;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            width: 0px;
+            spacing: 2px;
+            alignment: start;
+            for r-line in root.detail.readings : DictionaryText {
+                width: parent.width;
+                text: r-line;
+                font-size: 13px;
+                color: PopupBridge.css-text-color;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            width: 0px;
+            spacing: 3px;
+            alignment: start;
+            for stat in root.detail.stats : HorizontalLayout {
+                width: parent.width;
+                spacing: 4px;
+                DictionaryText {
+                    horizontal-stretch: 1;
+                    text: stat.label;
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: PopupBridge.css-muted-color;
+                    wrap: word-wrap;
+                }
+                DictionaryText {
+                    text: stat.value;
+                    font-size: 11px;
+                    color: PopupBridge.css-freq-color;
+                }
+            }
+        }
+    }
+
+    if PopupBridge.css-show-kanji-extra && root.detail.classifications.length > 0 : VerticalLayout {
+        spacing: 3px;
+        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+        DictionaryText { text: "Classifications"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+        for item in root.detail.classifications : HorizontalLayout {
+            spacing: 6px;
+            DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+            DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+        }
+    }
+
+    if PopupBridge.css-show-kanji-extra && root.detail.codepoints.length > 0 : VerticalLayout {
+        spacing: 3px;
+        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+        DictionaryText { text: "Codepoints"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+        for item in root.detail.codepoints : HorizontalLayout {
+            spacing: 6px;
+            DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+            DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+        }
+    }
+
+    if PopupBridge.css-show-kanji-extra && root.detail.indices.length > 0 : VerticalLayout {
+        spacing: 3px;
+        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+        DictionaryText { text: "Dictionary Indices"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+        for item in root.detail.indices : HorizontalLayout {
+            spacing: 6px;
+            DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+            DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+        }
+    }
+}
+
+// ── Floating Tooltip Overlay ────────────────────────────────────────────────
+export component FloatingTooltip inherits Rectangle {
+    in property <length> container-width: 480px;
+    in property <length> container-height: 500px;
+    in property <length> offset-x: 0px;
+    in property <length> offset-y: 0px;
+
+    property <length> tip-w: min(max(24px, root.container-width - 16px), tip-label.preferred-width + 16px);
+    property <length> tip-h: tip-label.preferred-height + 10px;
+    property <length> local-tip-x: PopupBridge.tooltip-x * 1px - root.offset-x;
+    property <length> local-tip-y: PopupBridge.tooltip-y * 1px - root.offset-y;
+
+    x: max(8px, min(root.container-width - self.tip-w - 8px, self.local-tip-x));
+    y: max(8px, min(root.container-height - self.tip-h - 8px, self.local-tip-y - self.tip-h - 6px));
+    width: self.tip-w;
+    height: self.tip-h;
+    background: MementoPalette.tooltip-bg;
+    border-width: 1px;
+    border-color: MementoPalette.border-light;
+    border-radius: 5px;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: MementoPalette.shadow;
+
+    tip-label := DictionaryText {
+        x: 8px;
+        y: 5px;
+        width: parent.width - 16px;
+        text: PopupBridge.tooltip-text;
+        font-size: 12px;
+        color: MementoPalette.text;
+        wrap: word-wrap;
+    }
+}
+
+// ── Floating Audio Source Picker Menu ───────────────────────────────────────
+export component AudioSourceMenu inherits Rectangle {
+    in property <length> menu-x: 210px;
+    in property <length> menu-y: 62px;
+    in property <[PopupAudioSource]> audio-sources;
+    in property <bool> loading: false;
+    in property <int> selected-source: -1;
+    callback dismissed();
+    callback source-picked(int);
+
+    background: transparent;
+
+    // Scrim catches outside clicks to close menu
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.dismissed(); }
+    }
+
+    Rectangle {
+        x: max(8px, min(parent.width - self.width - 8px, root.menu-x));
+        y: max(36px, min(parent.height - self.height - 8px, root.menu-y));
+        width: min(236px, max(160px, parent.width - 16px));
+        height: min(source-items.preferred-height + 12px, max(60px, parent.height - 75px));
+        background: MementoPalette.surface-elevated;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        border-radius: 7px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: MementoPalette.shadow;
+        clip: true;
+
+        ScrollView {
+            x: 6px;
+            y: 6px;
+            width: parent.width - 12px;
+            height: parent.height - 12px;
+
+            source-items := VerticalLayout {
+                x: 0px;
+                y: 0px;
+                width: parent.width - 6px;
+                height: self.preferred-height;
+                alignment: start;
+                spacing: 2px;
+
+                if root.loading : Rectangle {
+                    width: parent.width;
+                    height: 28px;
+                    DictionaryText {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: "Loading recordings…";
+                        font-size: 12px;
+                        color: MementoPalette.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                if !root.loading && root.audio-sources.length == 0 : Rectangle {
+                    width: parent.width;
+                    height: 30px;
+                    DictionaryText {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: "No audio sources available";
+                        font-size: 12px;
+                        color: MementoPalette.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                for source in root.audio-sources : Rectangle {
+                    width: parent.width;
+                    height: 30px;
+                    border-radius: 4px;
+                    background: source-touch.has-hover
+                        ? MementoPalette.hover-bg
+                        : (root.selected-source == source.index ? MementoPalette.accent-subtle : transparent);
+
+                    DictionaryText {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: (root.selected-source == source.index ? "✓  " : "   ") + source.name;
+                        font-size: 12px;
+                        font-weight: root.selected-source == source.index ? 700 : 400;
+                        color: root.selected-source == source.index ? MementoPalette.cyan-text : MementoPalette.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    source-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.source-picked(source.index); }
+                    }
+                }
+            }
+        }
+    }
+}

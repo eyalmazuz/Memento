@@ -33,7 +33,6 @@ libc = "=0.2.190"
 tempfile = "=3.27.0"
 glow = "=0.17.0"
 log = "=0.4.34"
-icu_provider = { version = "=2.3.1", features = ["logging"] }
 serde_json = "=1.0.154"
 url = "=2.5.8"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
@@ -42,7 +41,6 @@ parley = "=0.8.0"
 swash = "=0.2.10"
 resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
 webbrowser = "=1.2.4"
-zbus = "=4.4.0"
 
 memento-config = { path = "crates/memento-config" }
 memento-setting = { path = "crates/memento-setting" }
@@ -85,8 +83,12 @@ members = [
 ]
 
 [profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 debug-assertions = false
-overflow-checks = true
+overflow-checks = false
 
 # `cargo run` is also used for playback. Keep debug symbols/assertions while
 # optimizing the UI libraries' per-frame work.

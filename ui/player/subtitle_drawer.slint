@@ -1,0 +1,454 @@
+import { LineEdit, ListView } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { IconButton } from "../components/buttons.slint";
+import { MementoCheckBox } from "../components/controls.slint";
+import { SubEntry } from "types.slint";
+
+// ── Subtitle Drawer Panel ───────────────────────────────────────────────
+export component SubtitleDrawerPanel inherits Rectangle {
+    // A hidden drawer must not reserve space in the window layout.
+    min-height: 0px;
+    in property <[SubEntry]> entries;
+    in property <[SubEntry]> secondary-entries: [];
+    in property <bool> has-secondary: false;
+    in-out property <int> active-tab: 0; // 0: Primary, 1: Secondary
+    in-out property <string> search-text: "";
+    in property <int> current-match: 0;
+    in property <int> total-matches: 0;
+    in property <int> focused-match-row: -1;
+    in-out property <bool> show-timestamps: false;
+    in-out property <bool> ignore-whitespace: false;
+    in-out property <bool> auto-seek: false;
+    in property <color> bg-color: MementoPalette.surface-bg;
+    in property <color> text-color: MementoPalette.text;
+    in property <color> hover-color: MementoPalette.list-hover;
+    in property <color> selected-color: MementoPalette.accent-muted;
+    in property <color> selected-hover-color: MementoPalette.accent-muted-hover;
+    in property <string> primary-font-family: "";
+    in property <length> primary-font-size: 13px;
+    in property <bool> primary-font-bold: false;
+    in property <bool> primary-font-italic: false;
+    in property <string> secondary-font-family: "";
+    in property <length> secondary-font-size: 13px;
+    in property <bool> secondary-font-bold: false;
+    in property <bool> secondary-font-italic: false;
+    in-out property <bool> user-scrolling: false;
+    property <bool> programmatic-scroll: false;
+    out property <length> viewport-y: sub-list-view.viewport-y;
+    out property <bool> is-hovered:
+        drawer-bg-touch.has-hover
+        || prim-tab-touch.has-hover
+        || sec-tab-touch.has-hover
+        || time-toggle-touch.has-hover;
+
+    pure callback format-timestamp(float) -> string;
+    callback row-clicked(int, bool);
+    callback range-dragged(int, int, bool);
+    callback row-activated(int, float);
+    callback search-changed(string);
+    callback next-match();
+    callback prev-match();
+    callback tab-changed(int);
+    callback toggle-timestamps(bool);
+    callback ignore-whitespace-changed(bool);
+    callback auto-seek-changed(bool);
+    callback scroll-to-row(int);
+    callback scroll-to-offset(length, length, length);
+    callback focus-search();
+    callback user-scrolled();
+    callback close-requested();
+
+    scroll-to-offset(row-y, row-h, total-h) => {
+        let view-h = sub-list-view.visible-height > 0px
+            ? sub-list-view.visible-height
+            : max(200px, root.height - 112px);
+        let content-h = max(total-h, sub-list-view.viewport-height);
+        root.programmatic-scroll = true;
+        if content-h > view-h {
+            let target = -(row-y - (view-h - row-h) / 2);
+            let min-y = min(0px, view-h - content-h);
+            sub-list-view.viewport-y = max(min-y, min(0px, target));
+        } else {
+            sub-list-view.viewport-y = 0px;
+        }
+        root.programmatic-scroll = false;
+    }
+
+    scroll-to-row(row-idx) => {
+        let count = root.active-tab == 1 ? root.secondary-entries.length : root.entries.length;
+        if row-idx >= 0 && count > 0 {
+            let avg-row-h = sub-list-view.viewport-height > count * 24px
+                ? (sub-list-view.viewport-height / count)
+                : 24px;
+            root.scroll-to-offset(row-idx * avg-row-h, avg-row-h, count * avg-row-h);
+        }
+    }
+
+    focus-search => {
+        search-input.focus();
+        search-input.select-all();
+    }
+
+    background: root.bg-color;
+    border-width: 1px;
+    border-color: MementoPalette.border;
+
+    drawer-bg-touch := TouchArea {
+        width: 100%;
+        height: 100%;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 8px;
+
+            // Top 28px header: Primary / Secondary Tabs + Timestamps Toggle Pill + Close IconButton
+            HorizontalLayout {
+                height: 28px;
+                spacing: 6px;
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: root.active-tab == 0
+                        ? root.selected-color
+                        : (prim-tab-touch.has-hover ? root.hover-color : transparent);
+                    border-width: 1px;
+                    border-color: root.active-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border;
+                    animate background { duration: 100ms; }
+                    Text {
+                        text: "Primary";
+                        font-size: 12px;
+                        font-weight: root.active-tab == 0 ? 700 : 500;
+                        color: root.text-color;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    prim-tab-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if root.active-tab != 0 {
+                                root.user-scrolling = false;
+                                root.active-tab = 0;
+                                root.tab-changed(0);
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: root.active-tab == 1
+                        ? root.selected-color
+                        : (sec-tab-touch.has-hover ? root.hover-color : transparent);
+                    border-width: 1px;
+                    border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
+                    opacity: root.has-secondary || root.secondary-entries.length > 0 ? 1.0 : 0.65;
+                    animate background { duration: 100ms; }
+                    Text {
+                        text: "Secondary";
+                        font-size: 12px;
+                        font-weight: root.active-tab == 1 ? 700 : 500;
+                        color: root.text-color;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    sec-tab-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if root.active-tab != 1 {
+                                root.user-scrolling = false;
+                                root.active-tab = 1;
+                                root.tab-changed(1);
+                            }
+                        }
+                    }
+                }
+
+                // Inline toggle pill for showing/hiding cue timestamps
+                Rectangle {
+                    width: 58px;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: root.show-timestamps
+                        ? root.selected-color
+                        : (time-toggle-touch.has-hover ? root.hover-color : transparent);
+                    border-width: 1px;
+                    border-color: root.show-timestamps ? MementoPalette.cyan-accent : MementoPalette.border;
+                    accessible-role: checkbox;
+                    accessible-label: "Show timestamps";
+                    accessible-checked: root.show-timestamps;
+                    animate background { duration: 100ms; }
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: root.show-timestamps
+                                    ? MementoPalette.cyan-accent
+                                    : MementoPalette.text-muted;
+                            }
+                        }
+                        Text {
+                            text: "Time";
+                            font-size: 11px;
+                            font-weight: root.show-timestamps ? 700 : 500;
+                            color: root.text-color;
+                            vertical-alignment: center;
+                        }
+                    }
+                    time-toggle-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.show-timestamps = !root.show-timestamps;
+                            root.toggle-timestamps(root.show-timestamps);
+                        }
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                        icon: @image-url("../icons/close.svg");
+                        size: 28px;
+                        icon-size: 14px;
+                        tooltip: "Close subtitle list";
+                        tooltip-below: true;
+                        tooltip-align-right: true;
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            // Subtitle Cues List
+            sub-list-view := ListView {
+                vertical-stretch: 1;
+                // Mouse dragging marks subtitles; scrolling uses the wheel or bar.
+                mouse-drag-pan-enabled: false;
+                scrolled => {
+                    if !root.programmatic-scroll {
+                        root.user-scrolling = true;
+                        root.user-scrolled();
+                    }
+                }
+                // Exact element id `SubtitleDrawerPanel::sub-cue-row` required by tests/subtitle_ui_test.rs
+                for entry[idx] in (root.active-tab == 1 ? root.secondary-entries : root.entries) : sub-cue-row := Rectangle {
+                    height: max(24px, cue-text.preferred-height + 6px);
+                    border-radius: 4px;
+                    border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
+                    border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : MementoPalette.warning-border;
+                    background: entry.selected
+                        ? (d-touch.has-hover ? root.selected-hover-color : root.selected-color)
+                        : (entry.is_active
+                            ? MementoPalette.success-bg
+                            : (d-touch.has-hover ? root.hover-color : transparent));
+
+                    // Subtle row separation hairline
+                    if idx > 0 && !entry.selected && !entry.is_active && !entry.search-match : Rectangle {
+                        x: 8px;
+                        y: 0px;
+                        width: parent.width - 16px;
+                        height: 1px;
+                        background: MementoPalette.border;
+                        opacity: 0.45;
+                    }
+
+                    // Emerald indicator for active playing cue
+                    if entry.is_active : Rectangle {
+                        x: 2px;
+                        y: 3px;
+                        width: 3px;
+                        height: parent.height - 6px;
+                        background: MementoPalette.active-cue;
+                        border-radius: 1.5px;
+                    }
+
+                    HorizontalLayout {
+                        width: parent.width;
+                        height: parent.height;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 3px;
+                        padding-bottom: 3px;
+                        spacing: 8px;
+                        alignment: start;
+
+                        // Timecode (omitted completely when `show-timestamps` is false so cue text gets full width)
+                        if root.show-timestamps : Text {
+                            width: 50px;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            font-family: "monospace";
+                            font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
+                            font-weight: 600;
+                            color: entry.selected ? MementoPalette.success-text : root.text-color;
+                            opacity: entry.selected ? 1.0 : 0.72;
+                            text: root.format-timestamp(entry.start);
+                        }
+
+                        // Wrapped Multi-Line Cue Text
+                        cue-text := Text {
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            font-family: root.active-tab == 1 ? root.secondary-font-family : root.primary-font-family;
+                            font-size: root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size;
+                            font-weight: entry.is_active
+                                ? 700
+                                : ((root.active-tab == 1 ? root.secondary-font-bold : root.primary-font-bold) ? 700 : 400);
+                            font-italic: root.active-tab == 1 ? root.secondary-font-italic : root.primary-font-italic;
+                            color: root.text-color;
+                            wrap: word-wrap;
+                            text: entry.text;
+                        }
+                    }
+
+                    d-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: pointer;
+                        property <bool> extend-range: false;
+                        property <bool> dragging-range: false;
+                        property <int> drag-end: -1;
+                        scroll-event(event) => {
+                            root.user-scrolling = true;
+                            root.user-scrolled();
+                            return EventResult.reject;
+                        }
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                                self.extend-range = event.modifiers.shift;
+                                self.dragging-range = false;
+                                self.drag-end = idx;
+                            }
+                        }
+                        moved => {
+                            if self.pressed && root.active-tab == 0 {
+                                // TouchArea keeps the pointer grab outside its row.
+                                let end = min(root.entries.length - 1, max(0, idx + floor(self.mouse-y / self.height)));
+                                if end != self.drag-end {
+                                    root.user-scrolling = true;
+                                    root.user-scrolled();
+                                    root.range-dragged(idx, end, !self.dragging-range);
+                                    self.dragging-range = true;
+                                    self.drag-end = end;
+                                }
+                            }
+                        }
+                        clicked => {
+                            if !self.dragging-range && root.active-tab == 0 {
+                                root.row-clicked(idx, self.extend-range);
+                            }
+                        }
+                        double-clicked => {
+                            if !self.dragging-range {
+                                root.user-scrolling = false;
+                                root.row-activated(idx, entry.start);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Bottom Search Bar + Clear + Match Counter + Prev/Next IconButtons + MementoCheckBox options
+            VerticalLayout {
+                spacing: 6px;
+
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 4px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        search-input := LineEdit {
+                            placeholder-text: "Search subtitles (Ctrl+F)…";
+                            text <=> root.search-text;
+                            edited(val) => { root.search-changed(val); }
+                            accepted => { root.next-match(); }
+                        }
+                    }
+
+                    if root.search-text != "" : VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/close.svg");
+                            size: 26px;
+                            icon-size: 13px;
+                            tooltip: "Clear search";
+                            clicked => {
+                                root.search-text = "";
+                                root.search-changed("");
+                            }
+                        }
+                    }
+
+                    if root.search-text != "" : VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: root.total-matches > 0
+                                ? (root.current-match + " of " + root.total-matches)
+                                : "0 of 0";
+                            font-family: "monospace";
+                            font-size: 11px;
+                            color: root.total-matches > 0 ? MementoPalette.text-secondary : MementoPalette.text-muted;
+                            vertical-alignment: center;
+                            min-width: 42px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/arrow-up.svg");
+                            size: 26px;
+                            icon-size: 15px;
+                            enabled: root.total-matches > 0;
+                            tooltip: "Previous match";
+                            clicked => { root.prev-match(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/arrow-down.svg");
+                            size: 26px;
+                            icon-size: 15px;
+                            enabled: root.total-matches > 0;
+                            tooltip: "Next match";
+                            tooltip-align-right: true;
+                            clicked => { root.next-match(); }
+                        }
+                    }
+                }
+
+                // Ignore Whitespace & Auto Seek via shared MementoCheckBox (>= 24px hit targets)
+                HorizontalLayout {
+                    spacing: 14px;
+                    alignment: start;
+
+                    MementoCheckBox {
+                        label: "Ignore Whitespace";
+                        checked <=> root.ignore-whitespace;
+                        toggled(val) => { root.ignore-whitespace-changed(val); }
+                    }
+
+                    MementoCheckBox {
+                        label: "Auto Seek";
+                        checked <=> root.auto-seek;
+                        toggled(val) => { root.auto-seek-changed(val); }
+                    }
+                }
+            }
+        }
+    }
+}

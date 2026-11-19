@@ -160,11 +160,17 @@ fn hex_digit(ch: char) -> Option<u16> {
 /// alpha to opaque (`setRgb`'s default `alpha = 255` → 0xFFFF). Only the
 /// 4/8-digit-per-channel shapes enter raw 16-bit values directly.
 fn parse_hex(hex: &str) -> Option<Color> {
-    let digits: Option<Vec<u16>> = hex.chars().map(hex_digit).collect();
-    let digits = digits?;
+    let bytes = hex.as_bytes();
+    if !matches!(bytes.len(), 3 | 6 | 8 | 12 | 16) {
+        return None;
+    }
+    let mut digits = [0u16; 16];
+    for (dst, &b) in digits.iter_mut().zip(bytes) {
+        *dst = hex_digit(b as char)?;
+    }
     /* Byte widened into a quint16 channel: byte << 8 | byte. */
     let widen = |byte: u16| byte * 0x101;
-    match digits.len() {
+    match bytes.len() {
         3 => {
             let expand = |d: u16| d * 0x1111;
             Some(Color {
@@ -203,13 +209,21 @@ fn parse_hex(hex: &str) -> Option<Color> {
 }
 
 fn lookup_named(name: &str) -> Option<Color> {
-    // Names are ASCII in the Qt table; fold exactly as Qt's lookup does.
-    if !name.is_ascii() {
+    // Names are ASCII in the Qt table (longest is "lightgoldenrodyellow", 20 bytes).
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
         return None;
     }
-    let lowered = name.to_ascii_lowercase();
+    let mut buf = [0u8; 32];
+    for (dst, &b) in buf.iter_mut().zip(bytes) {
+        if !b.is_ascii() {
+            return None;
+        }
+        *dst = b.to_ascii_lowercase();
+    }
+    let lowered = &buf[..bytes.len()];
     let position = SORTED_NAMES
-        .binary_search_by(|entry| entry.0.cmp(lowered.as_str()))
+        .binary_search_by(|entry| entry.0.as_bytes().cmp(lowered))
         .ok()?;
     let (r, g, b) = SORTED_NAMES[position].1;
     Some(Color::rgb(r, g, b))
@@ -370,20 +384,20 @@ const SORTED_NAMES: &[(&str, (u8, u8, u8))] = &[
 
 // --- CSS function colors (Qt 6.8 CSS color parser subset) --------------------
 
-/// (name in lowercase, '(' text ')') when the text is exactly a function call.
-fn split_function_body(text: &str) -> Option<(String, &str)> {
+/// (function name slice, '(' text ')') when the text is exactly a function call.
+fn split_function_body(text: &str) -> Option<(&str, &str)> {
     let open = text.find('(')?;
     if open == 0 {
         return None;
     }
     let name = text[..open].trim();
-    if name.is_empty() || !name.chars().all(|ch| ch.is_ascii_alphabetic() || ch == '-') {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
         return None;
     }
     if !text.ends_with(')') {
         return None;
     }
-    Some((name.to_ascii_lowercase(), &text[open + 1..text.len() - 1]))
+    Some((name, &text[open + 1..text.len() - 1]))
 }
 
 /// One parsed function component: the numeric value, with the `%` (or `deg`)
@@ -424,23 +438,30 @@ fn parse_components(text: &str) -> Option<Vec<Component>> {
 
 /// `hsl(120deg)` and friends: a bare `deg` unit suffix on the hue.
 fn strip_suffix_case_inv_deg(text: &str) -> Option<&str> {
-    if text.len() >= 3 {
-        let (head, tail) = text.split_at(text.len() - 3);
-        if tail.eq_ignore_ascii_case("deg") {
-            return Some(head);
-        }
+    let bytes = text.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b"deg") {
+        // The last 3 bytes are ASCII, so `text.len() - 3` is guaranteed to be a UTF-8 char boundary.
+        Some(&text[..text.len() - 3])
+    } else {
+        None
     }
-    None
 }
 
 fn parse_function_color(text: &str) -> Option<Color> {
     let (name, body) = split_function_body(text)?;
     let components = parse_components(body)?;
-    match name.as_str() {
-        "rgb" | "rgba" => rgb_color(&components),
-        "hsl" | "hsla" => hsl_color(&components),
-        "hsv" | "hsva" | "hsb" | "hsba" => hsv_color(&components),
-        _ => None,
+    if name.eq_ignore_ascii_case("rgb") || name.eq_ignore_ascii_case("rgba") {
+        rgb_color(&components)
+    } else if name.eq_ignore_ascii_case("hsl") || name.eq_ignore_ascii_case("hsla") {
+        hsl_color(&components)
+    } else if name.eq_ignore_ascii_case("hsv")
+        || name.eq_ignore_ascii_case("hsva")
+        || name.eq_ignore_ascii_case("hsb")
+        || name.eq_ignore_ascii_case("hsba")
+    {
+        hsv_color(&components)
+    } else {
+        None
     }
 }
 
@@ -674,5 +695,10 @@ mod tests {
             Color::from_string("hsl(-240, 100%, 50%)").map(|c| c.name_hex_rgb()),
             Some("#00ff00".to_string())
         );
+        // Non-ASCII bytes ending inside a 3-byte window must never panic on char boundary slicing.
+        assert!(Color::from_string("hsl(あa, 0%, 0%)").is_none());
+        assert!(Color::from_string("rgb(日本語, 0, 0)").is_none());
+        assert!(Color::from_string("hsl(😀, 50%, 50%)").is_none());
+        assert!(Color::from_string("a".repeat(64).as_str()).is_none());
     }
 }

@@ -31,11 +31,17 @@ pub fn subtitle_valid_speed(current_speed: f64, new_speed: f64) -> bool {
 
 /// Converts a raw cue time to the media playback timeline (`raw_time * speed + delay`).
 pub fn subtitle_playback_time(raw_time: f64, speed: f64, delay: f64) -> f64 {
+    if !raw_time.is_finite() || !speed.is_finite() || speed <= 0.0 || !delay.is_finite() {
+        return 0.0;
+    }
     raw_time * speed + delay
 }
 
 /// Converts a media playback time to the raw cue timeline (`(playback_time - delay) / speed`).
 pub fn subtitle_raw_time(playback_time: f64, speed: f64, delay: f64) -> f64 {
+    if !playback_time.is_finite() || !speed.is_finite() || speed <= 0.0 || !delay.is_finite() {
+        return 0.0;
+    }
     (playback_time - delay) / speed
 }
 
@@ -43,6 +49,9 @@ impl AutoPauseState {
     /// Corrects auto-pause state on player position updates, matching
     /// `PlayerManager::handleAutoPausePosition(double position)`.
     pub fn update_position(&mut self, position: f64, speed: f64, delay: f64) {
+        if !position.is_finite() || !speed.is_finite() || speed <= 0.0 || !delay.is_finite() {
+            return;
+        }
         const SEEK_DELTA: f64 = 1.0;
         let start_time = self.start_time * speed + delay;
         let end_time = self.end_time * speed + delay;
@@ -71,6 +80,14 @@ impl AutoPauseState {
         duration: f64,
     ) -> Option<f64> {
         if !setting_enabled {
+            return None;
+        }
+        if !sub_start_time.is_finite()
+            || !sub_end_time.is_finite()
+            || !sub_speed.is_finite()
+            || sub_speed <= 0.0
+            || !sub_delay.is_finite()
+        {
             return None;
         }
 
@@ -108,14 +125,18 @@ impl AutoPauseState {
         }
 
         let raw_seek = self.end_time * sub_speed + sub_delay - 0.1;
+        if !raw_seek.is_finite() {
+            self.last_end_time = self.end_time;
+            self.start_time = 0.0;
+            self.end_time = 0.0;
+            self.already_paused = false;
+            return None;
+        }
         let lo = 0.0f64;
-        let hi = duration;
-        let clamped_seek = if raw_seek < lo {
-            lo
-        } else if hi < raw_seek {
-            hi
+        let clamped_seek = if duration.is_finite() && duration > 0.0 {
+            raw_seek.clamp(lo, duration)
         } else {
-            raw_seek
+            raw_seek.max(lo)
         };
 
         self.last_end_time = self.end_time;

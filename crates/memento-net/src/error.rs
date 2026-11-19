@@ -40,7 +40,7 @@ pub enum HttpError
     /// (e.g. missing an `http`/`https` scheme, userinfo present, bad port).
     Url(String),
 
-    /// A custom [`crate::http::Transport`] cannot connect to this HTTPS URL.
+    /// The transport could not provide TLS for this HTTPS URL.
     TlsUnsupported,
     /// A socket-level failure: connection refused/reset, DNS resolution,
     /// read/write timeouts (`WouldBlock`/`TimedOut`), or EOF in the wrong

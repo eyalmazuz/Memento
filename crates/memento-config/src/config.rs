@@ -223,7 +223,7 @@ impl Config {
     /// * present key → strict conversion, `Err` on a type mismatch.
     pub fn get<T: FromValue>(&self, key: &Key) -> ConfigResult<T> {
         let path = key.path();
-        match self.raw_at(&path) {
+        match self.raw_at(&path.group, &path.key) {
             Some(raw) => {
                 let value = decode_typed_value(key, raw).map_err(|reason| {
                     ConfigError::TypeMismatch {
@@ -261,11 +261,12 @@ impl Config {
     /// Typed read reporting the raw [`Value`]; `Ok(None)` when the key is
     /// absent.
     pub fn try_get_value(&self, key: &Key) -> ConfigResult<Option<Value>> {
-        match self.raw_at(&key.path()) {
+        let path = key.path();
+        match self.raw_at(&path.group, &path.key) {
             Some(raw) => {
                 decode_typed_value(key, raw).map(Some).map_err(|reason| {
                     ConfigError::TypeMismatch {
-                        key: key.path().to_string(),
+                        key: path.to_string(),
                         expected: key.value_type(&self.ctx),
                         found: None,
                         reason,
@@ -355,12 +356,12 @@ impl Config {
 
     // --------------------------------------------------------- raw/API
 
-    /// Raw read of a coordinate in canonical encoding, or `None`.
+    /// Raw read of a coordinate in canonical encoding, or `None` (zero-allocation).
     #[must_use]
-    pub fn raw_at(&self, path: &KeyPath) -> Option<&str> {
+    pub fn raw_at(&self, group: &str, key: &str) -> Option<&str> {
         self.map
-            .get(&path.group)
-            .and_then(|section| section.get(&path.key))
+            .get(group)
+            .and_then(|section| section.get(key))
             .map(String::as_str)
     }
 
@@ -376,7 +377,7 @@ impl Config {
     /// keys, otherwise it is inferred.
     #[must_use]
     pub fn get_at(&self, group: &str, key: &str) -> Option<Value> {
-        let raw = self.raw_at(&KeyPath::new(group, key))?;
+        let raw = self.raw_at(group, key)?;
         match crate::keys::lookup(group, key) {
             Some(typed_key) => decode_typed_value(&typed_key, raw)
                 .ok()
@@ -618,7 +619,12 @@ impl Config {
                 })
             }
         };
-        let doc = parse_document(&text)?;
+        Self::from_document_text(&text)
+    }
+
+    /// Parses canonical document text directly into a clean [`Config`] store.
+    pub fn from_document_text(text: &str) -> ConfigResult<Config> {
+        let doc = parse_document(text)?;
         let mut cfg = Config::from_document(doc);
         cfg.dirty = false;
         Ok(cfg)
@@ -674,7 +680,7 @@ impl Config {
                 .get(&path.group)
                 .and_then(|section| section.get(&path.key))
                 .map(String::as_str);
-            self_raw == persisted.raw_at(path)
+            self_raw == persisted.raw_at(&path.group, &path.key)
         };
         if persisted.changelog.len() > MAX_CHANGELOG_ENTRIES {
             let excess = persisted.changelog.len() - MAX_CHANGELOG_ENTRIES;
@@ -715,14 +721,7 @@ impl Config {
         };
         let legacy = crate::legacy_ini::parse_legacy_ini(&text)?;
         let mut cfg = Config::default_empty();
-        for (group, section) in legacy.sections {
-            for (key, raw) in section {
-                cfg.map
-                    .entry(group.clone())
-                    .or_default()
-                    .insert(key, raw);
-            }
-        }
+        cfg.map = legacy.sections;
         // a converted store is pending its first canonical save
         cfg.dirty = true;
         Ok(cfg)
@@ -744,19 +743,24 @@ impl Config {
             })?;
         }
 
-        if !self.pending.is_empty() {
-            self.revision += 1;
-            let entry = summarize(&self.pending, self.revision);
-            self.changelog.push(entry);
-            if self.changelog.len() > MAX_CHANGELOG_ENTRIES {
-                let excess = self.changelog.len() - MAX_CHANGELOG_ENTRIES;
-                self.changelog.drain(..excess);
+        let next_state = if !self.pending.is_empty() {
+            let next_revision = self.revision + 1;
+            let entry = summarize(&self.pending, next_revision);
+            let mut next_changelog = self.changelog.clone();
+            next_changelog.push(entry);
+            if next_changelog.len() > MAX_CHANGELOG_ENTRIES {
+                let excess = next_changelog.len() - MAX_CHANGELOG_ENTRIES;
+                next_changelog.drain(..excess);
             }
-            self.pending.clear();
-            self.dirty = false;
-        }
+            Some((next_revision, next_changelog))
+        } else {
+            None
+        };
 
-        let document = self.render_document();
+        let document = match &next_state {
+            Some((rev, log)) => self.render_document_with(*rev, log),
+            None => self.render_document(),
+        };
         let target = config_dir.join(file_name);
         let (temp, mut file) = create_unique_temp_config_file(config_dir, file_name)?;
         let mut cleanup = TempFileGuard {
@@ -780,6 +784,13 @@ impl Config {
             source,
         })?;
         cleanup.path = None;
+
+        if let Some((next_revision, next_changelog)) = next_state {
+            self.revision = next_revision;
+            self.changelog = next_changelog;
+            self.pending.clear();
+        }
+        self.dirty = false;
         Ok(())
     }
 
@@ -787,16 +798,20 @@ impl Config {
     /// sections are dropped (group-scope `remove` effect).
     #[must_use]
     pub fn render_document(&self) -> String {
+        self.render_document_with(self.revision, &self.changelog)
+    }
+
+    fn render_document_with(&self, revision: u64, changelog: &[ChangelogEntry]) -> String {
         let mut out = String::new();
         out.push_str(FORMAT_MAGIC);
         out.push('\n');
         out.push_str(REVISION_PREFIX);
-        out.push_str(&self.revision.to_string());
+        out.push_str(&revision.to_string());
         out.push('\n');
-        if !self.changelog.is_empty() {
+        if !changelog.is_empty() {
             out.push_str(CHANGELOG_PREFIX);
             out.push('\n');
-            for entry in &self.changelog {
+            for entry in changelog {
                 out.push_str(CHANGELOG_ROW_PREFIX);
                 out.push_str(&entry.to_row());
                 out.push('\n');
@@ -1014,17 +1029,12 @@ fn parse_document(text: &str) -> ConfigResult<RawDocument> {
     let mut header_done = false;
     let mut changelog_mode = false;
     let mut current_section: Option<String> = None;
-    for (idx, line) in text
-        .lines()
-        .map(|l| l.strip_suffix('\r').map(str::to_owned).unwrap_or_else(|| l.to_owned()))
-        .enumerate()
-    {
+    for (idx, raw_line) in text.lines().enumerate() {
         let line_no = idx + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         let line = if first_line {
             first_line = false;
-            line.strip_prefix('\u{FEFF}')
-                .map(str::to_owned)
-                .unwrap_or(line)
+            line.strip_prefix('\u{FEFF}').unwrap_or(line)
         } else {
             line
         };
@@ -1035,6 +1045,16 @@ fn parse_document(text: &str) -> ConfigResult<RawDocument> {
             }
             if trimmed == FORMAT_MAGIC {
                 continue;
+            }
+            if trimmed
+                .strip_prefix("# memento-config-store")
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            {
+                return Err(ConfigError::Format {
+                    message: format!(
+                        "unsupported configuration format header {trimmed:?} (expected {FORMAT_MAGIC:?})"
+                    ),
+                });
             }
             if let Some(rest) = trimmed.strip_prefix(REVISION_PREFIX) {
                 doc.revision = rest.trim().parse().ok();
@@ -1066,7 +1086,7 @@ fn parse_document(text: &str) -> ConfigResult<RawDocument> {
                 });
             };
             let heading = trimmed[1..end].trim();
-            let group = percent_decode_component(&heading);
+            let group = percent_decode_component(heading);
             doc.sections.entry(group.clone()).or_default();
             current_section = Some(group);
             continue;
@@ -1079,7 +1099,7 @@ fn parse_document(text: &str) -> ConfigResult<RawDocument> {
             });
         };
         let key = percent_decode_component(trimmed[..eq].trim());
-        let value = trimmed[eq + 1..].trim_end();
+        let value = trimmed[eq + 1..].trim();
         let Some(group) = current_section.clone() else {
             return Err(ConfigError::Parse {
                 file: "canonical",
@@ -1159,7 +1179,7 @@ impl<'a> Transaction<'a> {
 
     fn apply(&mut self, path: KeyPath, raw: Option<String>) -> ConfigResult<bool> {
         let existed = self.cfg.contains(&path);
-        let previous = self.cfg.raw_at(&path).map(str::to_owned);
+        let previous = self.cfg.raw_at(&path.group, &path.key).map(str::to_owned);
         let msg_removed = raw.is_none();
         let changed = self.cfg.apply_mutation(&path, raw);
         if changed {
@@ -1438,6 +1458,7 @@ mod tests {
     }
 
     // atomicity failure path: an unwritable dir leaves the target intact
+    #[cfg(unix)]
     #[test]
     fn atomic_save_failure_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -1445,21 +1466,25 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let target = dir.join("memento.conf");
         std::fs::write(&target, b"# previous state\n").expect("seed");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod read-only");
         // probe: skip when permissions cannot actually block us (root)
         let probe = dir.join(".probe");
         if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
             let _ = std::fs::remove_file(&probe);
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
-            .expect("chmod read-only");
         let mut cfg = Config::new(test_ctx());
         cfg.set(&Key::Search(SearchField::Delay), 1).expect("set");
         let result = cfg.save(&dir, "memento.conf");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
             .expect("restore permissions");
         assert!(result.is_err(), "expected an io error, got {result:?}");
+        assert!(cfg.is_dirty(), "failed save must keep dirty flag");
+        assert_eq!(cfg.revision(), 0, "failed save must not bump revision");
+        assert!(cfg.changelog().is_empty(), "failed save must not record changelog");
         let contents = std::fs::read_to_string(&target).expect("read");
         assert_eq!(contents, "# previous state\n", "target must be untouched");
         let leaked: Vec<_> = std::fs::read_dir(&dir)

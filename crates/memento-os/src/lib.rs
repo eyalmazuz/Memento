@@ -26,12 +26,14 @@
 //!   `zenity`/`kdialog` fallback.
 //! - `file://` URI and `text/uri-list` drag-and-drop path decoding.
 
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    OnceLock,
+    atomic::{AtomicU32, AtomicU64, Ordering},
+    mpsc, Arc, OnceLock,
 };
 
 pub mod windows_fullscreen;
@@ -51,8 +53,6 @@ use zbus::blocking::{fdo::DBusProxy, Connection, Proxy};
 use zbus::names::{BusName, InterfaceName, WellKnownName};
 #[cfg(all(unix, not(target_os = "macos")))]
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
-#[cfg(all(unix, not(target_os = "macos")))]
-use zbus_xml::Node;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const SERVICE: &str = "org.freedesktop.ScreenSaver";
@@ -88,13 +88,108 @@ fn session_connection() -> Option<&'static Connection> {
     Some(SESSION.get_or_init(|| connection))
 }
 
-// QDBusInterface introspects before looking up the service owner and caches
-// metadata after it sees this interface. The first lookup may activate a
-// D-Bus-activatable service; later lookups only need the owner check.
 #[cfg(all(unix, not(target_os = "macos")))]
-static METADATA_CACHED: AtomicBool = AtomicBool::new(false);
-
 static NEXT_PORTAL_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug)]
+enum ScreensaverRequest {
+    Inhibit(String),
+    Uninhibit,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Default, Debug)]
+struct LinuxScreensaverState {
+    cookie: AtomicU32,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug)]
+struct LinuxScreensaverWorker {
+    tx: mpsc::Sender<ScreensaverRequest>,
+    state: Arc<LinuxScreensaverState>,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl LinuxScreensaverWorker {
+    fn spawn() -> Option<Self> {
+        let (tx, rx) = mpsc::channel::<ScreensaverRequest>();
+        let state = Arc::new(LinuxScreensaverState::default());
+        let worker_state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("memento-screensaver".to_owned())
+            .spawn(move || run_linux_screensaver_worker(rx, worker_state))
+            .ok()?;
+        Some(Self { tx, state })
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_linux_screensaver_worker(
+    rx: mpsc::Receiver<ScreensaverRequest>,
+    state: Arc<LinuxScreensaverState>,
+) {
+    let mut cached_proxy: Option<Proxy<'static>> = None;
+    let mut cookie: u32 = 0;
+
+    while let Ok(first) = rx.recv() {
+        // Coalesce rapid queued toggles so only the latest desired state hits D-Bus.
+        let mut latest = first;
+        while let Ok(next) = rx.try_recv() {
+            latest = next;
+        }
+
+        match latest {
+            ScreensaverRequest::Inhibit(reason) => {
+                if cookie != 0 {
+                    continue;
+                }
+                if cached_proxy.is_none() {
+                    if let Some(conn) = session_connection() {
+                        cached_proxy = Proxy::new(conn, SERVICE, PATH, INTERFACE).ok();
+                    }
+                }
+                if let Some(proxy) = cached_proxy.as_ref() {
+                    match proxy.call::<_, _, u32>("Inhibit", &(APPLICATION_ID, reason.as_str())) {
+                        Ok(new_cookie) if new_cookie != 0 => {
+                            cookie = new_cookie;
+                            state.cookie.store(new_cookie, Ordering::Release);
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            // Drop cached proxy in case the bus or service restarted/vanished.
+                            cached_proxy = None;
+                        }
+                    }
+                }
+            }
+            ScreensaverRequest::Uninhibit => {
+                if cookie != 0 {
+                    if cached_proxy.is_none() {
+                        if let Some(conn) = session_connection() {
+                            cached_proxy = Proxy::new(conn, SERVICE, PATH, INTERFACE).ok();
+                        }
+                    }
+                    if let Some(proxy) = cached_proxy.as_ref() {
+                        if proxy.call::<_, _, ()>("UnInhibit", &(cookie,)).is_err() {
+                            cached_proxy = None;
+                        }
+                    }
+                    cookie = 0;
+                    state.cookie.store(0, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    if cookie != 0 {
+        if let Some(proxy) = cached_proxy.as_ref() {
+            let _: zbus::Result<()> = proxy.call("UnInhibit", &(cookie,));
+        }
+        state.cookie.store(0, Ordering::Release);
+    }
+}
 
 #[derive(Default, Debug)]
 pub struct Screensaver {
@@ -102,33 +197,10 @@ pub struct Screensaver {
     cookie: u32,
     last_active_request: Option<bool>,
     inhibit_attempts: u64,
-}
-
-// Qt's QDBusInterface::isValid() checks whether the service currently owns
-// its bus name, NOT whether the requested interface appears in introspection.
-// When another interface is exported at the path, Qt still attempts the call,
-// and UnInhibit clears the cookie even if the call fails.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn screen_saver_proxy(connection: &Connection) -> Option<Proxy<'_>> {
-    let proxy = Proxy::new(connection, SERVICE, PATH, INTERFACE).ok()?;
-    if !METADATA_CACHED.load(Ordering::Relaxed) {
-        if let Ok(xml) = proxy.introspect() {
-            if let Ok(node) = Node::try_from(xml.as_str()) {
-                if node
-                    .interfaces()
-                    .iter()
-                    .any(|interface| interface.name().as_str() == INTERFACE)
-                {
-                    METADATA_CACHED.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-    let bus = DBusProxy::new(connection).ok()?;
-    if !bus.name_has_owner(BusName::try_from(SERVICE).ok()?).ok()? {
-        return None;
-    }
-    Some(proxy)
+    #[cfg(all(unix, not(target_os = "macos")))]
+    requested_inhibited: bool,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    worker: Option<LinuxScreensaverWorker>,
 }
 
 #[cfg(target_os = "windows")]
@@ -184,18 +256,64 @@ impl Screensaver {
         Self::default()
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn worker_cookie(&self) -> u32 {
+        self.worker
+            .as_ref()
+            .map_or(0, |worker| worker.state.cookie.load(Ordering::Acquire))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn send_linux_request(&mut self, mut request: ScreensaverRequest) {
+        if let Some(worker) = self.worker.as_ref() {
+            match worker.tx.send(request) {
+                Ok(()) => return,
+                Err(mpsc::SendError(returned)) => {
+                    // Worker exited unexpectedly; respawn and retry once.
+                    self.worker = None;
+                    request = returned;
+                }
+            }
+        }
+        if let Some(worker) = LinuxScreensaverWorker::spawn() {
+            let _ = worker.tx.send(request);
+            self.worker = Some(worker);
+        }
+    }
+
     pub fn is_inhibited(&self) -> bool {
-        self.inhibited
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            return self.inhibited || (self.requested_inhibited && self.worker_cookie() != 0);
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            self.inhibited
+        }
     }
 
     pub fn cookie(&self) -> u32 {
-        self.cookie
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            if self.cookie != 0 {
+                return self.cookie;
+            }
+            if self.requested_inhibited {
+                return self.worker_cookie();
+            }
+            return 0;
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            self.cookie
+        }
     }
 
     pub fn inhibit_attempts(&self) -> u64 {
         self.inhibit_attempts
     }
 
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     fn apply_inhibit_reply(&mut self, reply: Option<u32>) {
         if let Some(cookie) = reply {
             if cookie != 0 {
@@ -207,20 +325,22 @@ impl Screensaver {
 
     pub fn inhibit(&mut self, reason: &str) {
         self.last_active_request = Some(true);
-        if self.inhibited {
-            return;
-        }
-        self.inhibit_attempts = self.inhibit_attempts.saturating_add(1);
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            let reply = session_connection()
-                .and_then(screen_saver_proxy)
-                .and_then(|proxy| {
-                    proxy
-                        .call::<_, _, u32>("Inhibit", &(APPLICATION_ID, reason))
-                        .ok()
-                });
-            self.apply_inhibit_reply(reply);
+            if self.inhibited || self.requested_inhibited {
+                return;
+            }
+            self.inhibit_attempts = self.inhibit_attempts.saturating_add(1);
+            self.requested_inhibited = true;
+            self.send_linux_request(ScreensaverRequest::Inhibit(reason.to_owned()));
+            return;
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            if self.inhibited {
+                return;
+            }
+            self.inhibit_attempts = self.inhibit_attempts.saturating_add(1);
         }
         #[cfg(target_os = "windows")]
         {
@@ -279,18 +399,23 @@ impl Screensaver {
 
     pub fn uninhibit(&mut self) {
         self.last_active_request = Some(false);
-        if !self.inhibited {
-            return;
-        }
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            if self.cookie != 0 {
-                if let Some(connection) = session_connection() {
-                    if let Some(proxy) = screen_saver_proxy(connection) {
-                        let _: zbus::Result<()> = proxy.call("UnInhibit", &(self.cookie,));
-                    }
+            let had_request = self.inhibited || self.requested_inhibited;
+            self.inhibited = false;
+            self.cookie = 0;
+            self.requested_inhibited = false;
+            if had_request {
+                if let Some(worker) = self.worker.as_ref() {
+                    let _ = worker.tx.send(ScreensaverRequest::Uninhibit);
                 }
-                self.cookie = 0;
+            }
+            return;
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            if !self.inhibited {
+                return;
             }
         }
         #[cfg(target_os = "windows")]
@@ -309,7 +434,10 @@ impl Screensaver {
                 self.cookie = 0;
             }
         }
-        self.inhibited = false;
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            self.inhibited = false;
+        }
     }
 
     /// Synchronize screensaver inhibition with active playback (`!paused && file_loaded`).
@@ -486,8 +614,7 @@ fn hex_val(byte: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decode a URI component into raw UTF-8 string.
-pub fn percent_decode(input: &str) -> String {
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -502,7 +629,81 @@ pub fn percent_decode(input: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// Percent-decode a URI component into raw UTF-8 string.
+pub fn percent_decode(input: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(input)).into_owned()
+}
+
+fn strip_file_scheme(input: &str) -> Option<&str> {
+    input
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("file://"))
+        .map(|_| &input[7..])
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn decode_windows_file_uri_parts(authority: &str, path_part: &str) -> Option<PathBuf> {
+    if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+        let decoded = percent_decode(path_part);
+        if decoded.is_empty() {
+            return None;
+        }
+        // 4-slash UNC form: `file:////server/share/file` -> `\\server\share\file`.
+        if let Some(unc_tail) = decoded.strip_prefix("//") {
+            if unc_tail.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(format!(
+                "\\\\{}",
+                unc_tail.replace('/', "\\")
+            )));
+        }
+        let stripped = decoded.strip_prefix('/').unwrap_or(&decoded);
+        return (!stripped.is_empty()).then(|| PathBuf::from(stripped));
+    }
+
+    let decoded_auth = percent_decode(authority);
+    let decoded_path = percent_decode(path_part);
+    // Tolerate non-standard 2-slash drive URIs like `file://C:/Users/file.mkv`.
+    let auth_bytes = decoded_auth.as_bytes();
+    if auth_bytes.len() == 2 && auth_bytes[0].is_ascii_alphabetic() && auth_bytes[1] == b':' {
+        let mut combined = decoded_auth;
+        combined.push_str(&decoded_path);
+        return Some(PathBuf::from(combined));
+    }
+
+    // Standard RFC 8089 Windows UNC URI: `file://server/share/path` -> `\\server\share\path`.
+    if decoded_auth.is_empty() {
+        return None;
+    }
+    let mut unc = String::with_capacity(2 + decoded_auth.len() + decoded_path.len());
+    unc.push_str("\\\\");
+    unc.push_str(&decoded_auth);
+    for ch in decoded_path.chars() {
+        unc.push(if ch == '/' { '\\' } else { ch });
+    }
+    Some(PathBuf::from(unc))
+}
+
+#[cfg(unix)]
+fn decode_unix_file_uri_parts(authority: &str, path_part: &str) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+        let decoded = percent_decode_bytes(path_part);
+        return (!decoded.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(&decoded)));
+    }
+
+    // Remote host authority on Unix: preserve as POSIX `//host/path` with raw percent-decoded bytes.
+    let mut bytes = Vec::with_capacity(2 + authority.len() + path_part.len());
+    bytes.extend_from_slice(b"//");
+    bytes.extend_from_slice(&percent_decode_bytes(authority));
+    bytes.extend_from_slice(&percent_decode_bytes(path_part));
+    Some(PathBuf::from(OsStr::from_bytes(&bytes)))
 }
 
 /// Decode a `file://` URI or plain path into a [`PathBuf`].
@@ -511,15 +712,25 @@ pub fn decode_file_uri(uri_or_path: &str) -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(rest) = trimmed.strip_prefix("file://localhost") {
-        let decoded = percent_decode(rest);
-        return (!decoded.is_empty()).then(|| PathBuf::from(decoded));
-    }
-    if let Some(rest) = trimmed.strip_prefix("file://") {
-        let decoded = percent_decode(rest);
+    if let Some(after_scheme) = strip_file_scheme(trimmed) {
+        let (authority, path_part) = match after_scheme.find('/') {
+            Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+            None => (after_scheme, ""),
+        };
         #[cfg(target_os = "windows")]
-        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded).to_owned();
-        return (!decoded.is_empty()).then(|| PathBuf::from(decoded));
+        {
+            return decode_windows_file_uri_parts(authority, path_part);
+        }
+        #[cfg(unix)]
+        {
+            return decode_unix_file_uri_parts(authority, path_part);
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            let _ = authority;
+            let decoded = percent_decode(path_part);
+            return (!decoded.is_empty()).then(|| PathBuf::from(decoded));
+        }
     }
     Some(PathBuf::from(trimmed))
 }
@@ -660,6 +871,53 @@ pub fn open_files_via_portal(_options: &FileDialogOptions) -> Result<Vec<PathBuf
     Err("XDG Desktop Portal is only supported on Linux/Unix".to_owned())
 }
 
+fn parse_newline_separated_paths(stdout: &[u8]) -> Vec<PathBuf> {
+    stdout
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            #[cfg(unix)]
+            {
+                use std::ffi::OsStr;
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(OsStr::from_bytes(line))
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from(String::from_utf8_lossy(line).into_owned())
+            }
+        })
+        .collect()
+}
+
+fn build_kdialog_args(options: &FileDialogOptions) -> Vec<String> {
+    let mut kdialog_args = vec!["--title".to_owned(), options.title.clone()];
+    if options.multiple {
+        kdialog_args.push("--multiple".to_owned());
+        kdialog_args.push("--separate-output".to_owned());
+    }
+    kdialog_args.push("--getopenfilename".to_owned());
+    kdialog_args.push(
+        options
+            .initial_dir
+            .as_deref()
+            .and_then(Path::to_str)
+            .unwrap_or(".")
+            .to_owned(),
+    );
+    let filters = options.filters();
+    if !filters.is_empty() {
+        let filter_arg = filters
+            .into_iter()
+            .map(|filter| format!("{} ({})", filter.label, filter.patterns.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        kdialog_args.push(filter_arg);
+    }
+    kdialog_args
+}
+
 fn open_files_cli_fallback(options: &FileDialogOptions) -> Vec<PathBuf> {
     let mut zenity_args = vec![
         "--file-selection".to_owned(),
@@ -686,29 +944,15 @@ fn open_files_cli_fallback(options: &FileDialogOptions) -> Vec<PathBuf> {
 
     if let Ok(output) = Command::new("zenity").args(&zenity_args).output() {
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return parse_uri_list(&stdout);
+            return parse_newline_separated_paths(&output.stdout);
         }
         return Vec::new();
     }
 
-    let mut kdialog_args = vec![
-        "--getopenfilename".to_owned(),
-        options
-            .initial_dir
-            .as_deref()
-            .and_then(Path::to_str)
-            .unwrap_or(".")
-            .to_owned(),
-    ];
-    if options.multiple {
-        kdialog_args.push("--multiple".to_owned());
-        kdialog_args.push("--separate-output".to_owned());
-    }
+    let kdialog_args = build_kdialog_args(options);
     if let Ok(output) = Command::new("kdialog").args(&kdialog_args).output() {
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return parse_uri_list(&stdout);
+            return parse_newline_separated_paths(&output.stdout);
         }
     }
     Vec::new()
@@ -743,7 +987,8 @@ pub fn open_files_async(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_file_uri, parse_uri_list, percent_decode, portal_request_path,
+        build_kdialog_args, decode_file_uri, decode_windows_file_uri_parts,
+        parse_newline_separated_paths, parse_uri_list, percent_decode, portal_request_path,
         sanitize_portal_sender, FileDialogKind, FileDialogOptions, Screensaver,
     };
     use std::path::PathBuf;
@@ -807,6 +1052,66 @@ mod tests {
                 PathBuf::from("/tmp/ep 1.ja.srt"),
             ]
         );
+
+        // Case-insensitive scheme and localhost authority
+        assert_eq!(
+            decode_file_uri("FILE:///home/user/ep%2002.mkv"),
+            Some(PathBuf::from("/home/user/ep 02.mkv"))
+        );
+        assert_eq!(
+            decode_file_uri("File://LOCALHOST/tmp/sub.srt"),
+            Some(PathBuf::from("/tmp/sub.srt"))
+        );
+        assert_eq!(decode_file_uri("file://"), None);
+        assert_eq!(decode_file_uri("file://localhost"), None);
+
+        // Windows UNC & drive-letter decoding
+        assert_eq!(
+            decode_windows_file_uri_parts("server", "/share/dir/ep%2001.mkv"),
+            Some(PathBuf::from(r"\\server\share\dir\ep 01.mkv"))
+        );
+        assert_eq!(
+            decode_windows_file_uri_parts("", "//server/share/ep%2001.mkv"),
+            Some(PathBuf::from(r"\\server\share\ep 01.mkv"))
+        );
+        assert_eq!(
+            decode_windows_file_uri_parts("", "/C:/Users/Anime%2001.mkv"),
+            Some(PathBuf::from("C:/Users/Anime 01.mkv"))
+        );
+        assert_eq!(
+            decode_windows_file_uri_parts("LOCALHOST", "/D:/sub.srt"),
+            Some(PathBuf::from("D:/sub.srt"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_file_uri_and_cli_paths_preserve_raw_non_utf8_bytes_and_special_names() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let decoded = decode_file_uri("file:///tmp/raw_%82%A0_%FF.mkv").unwrap();
+        assert_eq!(decoded.as_os_str().as_bytes(), b"/tmp/raw_\x82\xA0_\xFF.mkv");
+
+        // Raw CLI dialog output preserves `#`, `%20`, leading spaces, and non-UTF-8 bytes.
+        let cli_stdout = b"#ep1.mkv\n/tmp/100%20literal.mkv\r\n/tmp/\x82\xA0.srt\n\n";
+        let paths = parse_newline_separated_paths(cli_stdout);
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0].as_os_str().as_bytes(), b"#ep1.mkv");
+        assert_eq!(paths[1].as_os_str().as_bytes(), b"/tmp/100%20literal.mkv");
+        assert_eq!(paths[2].as_os_str().as_bytes(), b"/tmp/\x82\xA0.srt");
+    }
+
+    #[test]
+    fn kdialog_args_include_title_and_file_filters() {
+        let opts = FileDialogOptions::subtitles_only(Some(PathBuf::from("/tmp")));
+        let args = build_kdialog_args(&opts);
+        assert_eq!(args[0], "--title");
+        assert_eq!(args[1], opts.title);
+        assert_eq!(args[2], "--getopenfilename");
+        assert_eq!(args[3], "/tmp");
+        assert!(args[4].contains("Subtitle Files ("));
+        assert!(args[4].contains("*.ass"));
+        assert!(args[4].contains("All Files (*)"));
     }
 
     #[test]

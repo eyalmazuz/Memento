@@ -1,0 +1,434 @@
+import { MementoPalette } from "../palette.slint";
+import { MementoSlider } from "../components/controls.slint";
+import { ChapterMark } from "types.slint";
+
+component OscIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> active: false;
+    in property <bool> emphasized: false;
+    in property <length> size: 32px;
+    in property <length> icon-size: 16px;
+    in property <string> tooltip: "";
+    in property <bool> tooltip-align-right: false;
+    out property <bool> hovered: touch.has-hover;
+    callback clicked();
+    callback activity();
+    callback interacted();
+
+    width: root.size;
+    height: root.size;
+    border-radius: root.emphasized ? 7px : 6px;
+    border-width: 1px;
+    background: touch.pressed
+        ? MementoPalette.active-bg
+        : (root.active
+            ? MementoPalette.accent-muted
+            : (touch.has-hover
+                ? MementoPalette.hover-bg
+                : (root.emphasized ? MementoPalette.button-bg : transparent)));
+    border-color: root.active
+        ? MementoPalette.cyan-accent
+        : (touch.has-hover
+            ? MementoPalette.border-light
+            : (root.emphasized ? MementoPalette.border : transparent));
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.icon-size;
+        height: root.icon-size;
+        source: root.icon;
+        colorize: root.active ? MementoPalette.cyan-text : MementoPalette.icon;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+        clicked => { root.clicked(); }
+    }
+
+    if root.tooltip != "" && touch.has-hover : Rectangle {
+        x: root.tooltip-align-right
+            ? parent.width - self.width
+            : (parent.width - self.width) / 2;
+        y: -self.height - 8px;
+        width: tip-lbl.preferred-width + 14px;
+        height: 24px;
+        border-radius: 5px;
+        background: MementoPalette.tooltip-bg;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        tip-lbl := Text {
+            text: root.tooltip;
+            color: MementoPalette.text;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── OSC Bottom Controls Bar ─────────────────────────────────────────────
+export component PlayerOscBar inherits Rectangle {
+    in property <bool> playing: false;
+    in property <float> position: 0.0;
+    in property <float> duration: 0.0;
+    in property <float> volume: 100.0;
+    in property <float> volume-max: 100.0;
+    in property <bool> is-muted: false;
+    in property <string> current-time: "00:00";
+    in property <string> duration-time: "00:00";
+    in property <bool> is-fullscreen: false;
+    in property <bool> sub-drawer-open: false;
+    in property <bool> ocr-enabled: false;
+    in property <[float]> chapters: [];
+    in property <[ChapterMark]> chapter-marks: [];
+
+    property <bool> ocr-btn-hovered: false;
+    out property <bool> timeline-hovered: slider-touch.has-hover || slider-touch.pressed;
+    // Stored imperatively from `slider-touch` pointer events (not reactive bindings on
+    // `slider-touch.width`), so evaluating the timeline hover preview's `Text` never
+    // triggers `PlayerOscBar`'s `HorizontalLayout` and re-enters `sharedparley`'s
+    // `font_context().borrow_mut()` when `current-time` changes during a seek.
+    out property <float> hover-time: 0.0;
+    out property <length> hover-x: 0px;
+    out property <bool> is-hovered:
+        bar-touch.has-hover || btn-skip-prev.hovered || btn-sub-prev.hovered
+        || btn-play.hovered || btn-sub-next.hovered || btn-skip-next.hovered
+        || slider-touch.has-hover || slider-touch.pressed
+        || btn-vol.hovered || btn-sub-drawer.hovered
+        || root.ocr-btn-hovered || btn-fs.hovered;
+
+    function update-hover() {
+        if root.duration > 0.0 && slider-touch.width > 0px {
+            let clamped-x = max(0px, min(slider-touch.width, slider-touch.mouse-x));
+            let ratio = max(0.0, min(1.0, clamped-x / slider-touch.width));
+            root.hover-x = timeline-slot.x + clamped-x;
+            root.hover-time = root.duration * ratio;
+        }
+    }
+
+    callback toggle-play();
+    callback seek(float);
+    callback subtitle-seek(int);
+    callback playlist-prev();
+    callback playlist-next();
+    callback toggle-mute();
+    callback volume-changed(float);
+    callback toggle-sub-list();
+    callback start-ocr();
+    callback toggle-fullscreen();
+    callback timeline-hover-moved(float);
+    callback activity();
+    callback interacted();
+
+    height: 50px;
+    background: MementoPalette.osc-bg;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: MementoPalette.border-light;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: MementoPalette.shadow;
+
+    bar-touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+
+        // Left: Logical transport order [|<] [<<] [Play/Pause] [>>] [>|] + Current Time
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            spacing: 3px;
+
+            VerticalLayout {
+                alignment: center;
+                btn-skip-prev := OscIconButton {
+                    icon: @image-url("../icons/skip-previous.svg");
+                    tooltip: "Previous file";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.playlist-prev(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-sub-prev := OscIconButton {
+                    icon: @image-url("../icons/fast-rewind.svg");
+                    tooltip: "Previous subtitle";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.subtitle-seek(-1); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-play := OscIconButton {
+                    size: 34px;
+                    icon-size: 18px;
+                    emphasized: true;
+                    icon: root.playing ? @image-url("../icons/pause.svg") : @image-url("../icons/play.svg");
+                    tooltip: root.playing ? "Pause" : "Play";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.toggle-play(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-sub-next := OscIconButton {
+                    icon: @image-url("../icons/fast-forward.svg");
+                    tooltip: "Next subtitle";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.subtitle-seek(1); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-skip-next := OscIconButton {
+                    icon: @image-url("../icons/skip-next.svg");
+                    tooltip: "Next file";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.playlist-next(); }
+                }
+            }
+
+            // Fixed-width current timestamp so timeline never jitters horizontally
+            VerticalLayout {
+                alignment: center;
+                padding-left: 6px;
+                Text {
+                    text: root.current-time;
+                    font-family: "monospace";
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: MementoPalette.text;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    min-width: 56px;
+                }
+            }
+        }
+
+        // Center: Vertically-centered Segmented Timeline Slider
+        timeline-slot := Rectangle {
+            horizontal-stretch: 1;
+            min-width: 120px;
+            background: transparent;
+
+            timeline := Rectangle {
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                width: parent.width;
+                height: 24px;
+
+                track := Rectangle {
+                    property <bool> hot: slider-touch.has-hover || slider-touch.pressed;
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    height: self.hot ? 7px : 5px;
+                    border-radius: self.height / 2;
+                    background: MementoPalette.track-bg;
+                    animate height { duration: 100ms; }
+
+                    // Cyan Progress Fill
+                    progress-fill := Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: max(0px, min(parent.width, parent.width * (root.position / max(1.0, root.duration))));
+                        height: parent.height;
+                        border-radius: parent.border-radius;
+                        background: MementoPalette.cyan-accent;
+                    }
+
+                    // Chapter tick marks
+                    for ch-time in root.chapters : Rectangle {
+                        visible: root.duration > 0.0 && ch-time > 0.0 && ch-time < root.duration;
+                        x: parent.width * (ch-time / max(1.0, root.duration));
+                        y: 0px;
+                        width: 2px;
+                        height: parent.height;
+                        background: MementoPalette.window-bg;
+                    }
+
+                    // Scrubber Knob with subtle hover/drag scale & accent ring
+                    if root.duration > 0.0 : Rectangle {
+                        property <length> knob-sz: (slider-touch.has-hover || slider-touch.pressed) ? 14px : 11px;
+                        width: self.knob-sz;
+                        height: self.knob-sz;
+                        x: max(0px, min(parent.width - self.width, progress-fill.width - self.width / 2));
+                        y: (parent.height - self.height) / 2;
+                        border-radius: self.width / 2;
+                        background: #FFFFFF;
+                        border-width: (slider-touch.has-hover || slider-touch.pressed) ? 2px : 0px;
+                        border-color: MementoPalette.cyan-accent;
+                        drop-shadow-blur: 5px;
+                        drop-shadow-color: #00000088;
+                        animate width { duration: 100ms; }
+                        animate height { duration: 100ms; }
+                    }
+                }
+
+                // Exact element id `PlayerOscBar::slider-touch` required by tests/timeline_seek_test.rs
+                slider-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    mouse-cursor: pointer;
+                    changed has-hover => {
+                        if self.has-hover && root.duration > 0.0 && self.width > 0px {
+                            root.update-hover();
+                            root.timeline-hover-moved(root.hover-time);
+                        }
+                    }
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move {
+                            root.activity();
+                            if root.duration > 0.0 && self.width > 0px {
+                                root.update-hover();
+                                root.timeline-hover-moved(root.hover-time);
+                            }
+                        } else if event.kind == PointerEventKind.down {
+                            root.interacted();
+                            root.update-hover();
+                        }
+                    }
+                    moved => {
+                        if root.duration > 0.0 && self.width > 0px {
+                            root.update-hover();
+                            root.timeline-hover-moved(root.hover-time);
+                            if (self.pressed) {
+                                root.seek(root.hover-time);
+                            }
+                        }
+                    }
+                    clicked => {
+                        if root.duration > 0.0 && self.width > 0px {
+                            root.update-hover();
+                            root.seek(root.hover-time);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Right: Duration, Volume, Subtitle Drawer, OCR, Fullscreen (all centered on one centerline)
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            spacing: 4px;
+
+            VerticalLayout {
+                alignment: center;
+                padding-right: 4px;
+                Text {
+                    text: root.duration-time;
+                    font-family: "monospace";
+                    font-size: 12px;
+                    font-weight: 600;
+                    color: MementoPalette.text-secondary;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    min-width: 56px;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-vol := OscIconButton {
+                    icon: (!root.is-muted && root.volume > 0.0)
+                        ? @image-url("../icons/volume-on.svg")
+                        : @image-url("../icons/volume-off.svg");
+                    tooltip: root.is-muted ? "Unmute" : "Mute";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.toggle-mute(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                MementoSlider {
+                    width: 74px;
+                    minimum: 0.0;
+                    maximum: max(100.0, root.volume-max);
+                    value: root.is-muted ? 0.0 : root.volume;
+                    accent: MementoPalette.cyan-accent;
+                    changed(val) => {
+                        root.interacted();
+                        root.activity();
+                        root.volume-changed(val);
+                    }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                padding-right: 4px;
+                Text {
+                    text: (root.is-muted ? 0 : round(root.volume)) + "%";
+                    font-family: "monospace";
+                    font-size: 11px;
+                    color: MementoPalette.text-secondary;
+                    horizontal-alignment: right;
+                    vertical-alignment: center;
+                    min-width: 34px;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-sub-drawer := OscIconButton {
+                    icon: @image-url("../icons/list.svg");
+                    active: root.sub-drawer-open;
+                    tooltip: root.sub-drawer-open ? "Hide subtitle list" : "Show subtitle list";
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.toggle-sub-list(); }
+                }
+            }
+
+            if root.ocr-enabled : VerticalLayout {
+                alignment: center;
+                ocr-btn := OscIconButton {
+                    icon: @image-url("../icons/eye.svg");
+                    tooltip: "OCR region";
+                    changed hovered => { root.ocr-btn-hovered = self.hovered; }
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.start-ocr(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                btn-fs := OscIconButton {
+                    icon: root.is-fullscreen
+                        ? @image-url("../icons/fullscreen-exit.svg")
+                        : @image-url("../icons/fullscreen.svg");
+                    tooltip: root.is-fullscreen ? "Exit fullscreen" : "Fullscreen";
+                    tooltip-align-right: true;
+                    activity => { root.activity(); }
+                    interacted => { root.interacted(); }
+                    clicked => { root.toggle-fullscreen(); }
+                }
+            }
+        }
+    }
+}

@@ -1,6 +1,6 @@
 //! Model-registry, path-resolution, and URL helpers for Whisper ASR.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `WhisperController::MODEL_PREFIX`.
 pub const MODEL_PREFIX: &str = "ggml-";
@@ -142,8 +142,7 @@ pub fn resolve_model_path(
         }
     }
 
-    let bare_filename = file_name(path) == path;
-    if bare_filename {
+    if is_bare_filename(path) {
         let last = filenames.last().map(String::as_str).unwrap_or(path);
         return join_dir(&model_dir, last);
     }
@@ -151,7 +150,13 @@ pub fn resolve_model_path(
 }
 
 fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(std::path::is_separator).next().unwrap_or(path)
+}
+
+fn is_bare_filename(path: &str) -> bool {
+    !path.is_empty()
+        && !path.chars().any(std::path::is_separator)
+        && !matches!(Path::new(path).components().next(), Some(Component::Prefix(_)))
 }
 
 fn join_dir(dir: &str, name: &str) -> String {
@@ -160,9 +165,11 @@ fn join_dir(dir: &str, name: &str) -> String {
     }
     let base = if dir.is_empty() { "." } else { dir };
     if name.is_empty() {
-        let trimmed = base.trim_end_matches('/');
+        let trimmed = base.trim_end_matches(std::path::is_separator);
         return if trimmed.is_empty() {
-            "/".to_string()
+            std::path::MAIN_SEPARATOR_STR.to_string()
+        } else if cfg!(windows) && trimmed.len() == 2 && trimmed.ends_with(':') {
+            format!("{trimmed}{}", std::path::MAIN_SEPARATOR)
         } else {
             trimmed.to_string()
         };
@@ -174,27 +181,47 @@ fn to_absolute_path(path: &str) -> String {
     let base = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(path)
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => PathBuf::from(path),
+        }
     };
-    let mut components: Vec<String> = Vec::new();
-    for segment in base.to_string_lossy().split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            components.pop();
-        } else {
-            components.push(segment.to_string());
+    let mut cleaned = PathBuf::new();
+    for component in base.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(cleaned.components().next_back(), Some(Component::Normal(_))) {
+                    cleaned.pop();
+                } else if cleaned.as_os_str().is_empty()
+                    || matches!(
+                        cleaned.components().next_back(),
+                        Some(Component::ParentDir)
+                    )
+                {
+                    cleaned.push(component);
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                cleaned.push(component.as_os_str());
+            }
         }
     }
-    let cleaned = format!("/{}", components.join("/"));
-    if path.ends_with('/') && path != "/" && cleaned != "/" {
-        format!("{cleaned}/")
-    } else {
-        cleaned
+    let mut out = cleaned.to_string_lossy().into_owned();
+    let had_trailing_sep = path
+        .chars()
+        .next_back()
+        .is_some_and(std::path::is_separator);
+    if had_trailing_sep
+        && !out.is_empty()
+        && !out
+            .chars()
+            .next_back()
+            .is_some_and(std::path::is_separator)
+    {
+        out.push(std::path::MAIN_SEPARATOR);
     }
+    out
 }
 
 fn dedupe_keep_first(entries: &mut Vec<String>) {
@@ -260,6 +287,11 @@ mod tests {
             models.join("missing.bin").to_string_lossy()
         );
         assert_eq!(resolve_model_path("/abs/custom.bin", &[MODEL_SUFFIX], &root_str), "/abs/custom.bin");
+
+        let rel_resolved = resolve_model_path("sub/../custom.bin", &[MODEL_SUFFIX], &root_str);
+        assert!(Path::new(&rel_resolved).is_absolute());
+        assert!(rel_resolved.ends_with("custom.bin"));
+        assert!(!rel_resolved.contains(".."));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -3,14 +3,21 @@
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx", test))]
 use memento_asr::audio::wavreader::{read_pcm16_wav_bytes, SAMPLE_RATE_16K};
 use memento_player::mpv::ffi as mpv;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::fs;
-#[cfg(all(target_os = "linux", any(feature = "asr-whisper", feature = "asr-onnx", test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "asr-whisper", feature = "asr-onnx", test)
+))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// Default maximum wall-clock duration for a background libmpv encode job.
+pub const DEFAULT_ENCODE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An immutable snapshot of the media and selected mpv audio track. Capture it
 /// on the UI thread with `MpvInstance::capture_encode_context` before starting.
@@ -80,7 +87,7 @@ impl Drop for MpvHandle {
     }
 }
 
-fn mpv_error(status: i32) -> String {
+fn mpv_error(status: c_int) -> String {
     let message = unsafe { mpv::mpv_error_string(status) };
     if message.is_null() {
         format!("libmpv error {status}")
@@ -251,20 +258,100 @@ fn build_anki_video_clip_options(
     Ok(options)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EncodeEventAction {
+    Continue,
+    Finished,
+    Failed(String),
+}
+
+fn classify_encode_event(
+    event_id: mpv::mpv_event_id,
+    end_file: Option<(mpv::mpv_end_file_reason, c_int)>,
+    media_path: &str,
+    context: &str,
+) -> EncodeEventAction {
+    if event_id == mpv::MPV_EVENT_NONE {
+        return EncodeEventAction::Continue;
+    }
+    if event_id == mpv::MPV_EVENT_QUEUE_OVERFLOW {
+        return EncodeEventAction::Failed(format!("libmpv {context} event queue overflowed."));
+    }
+    if event_id == mpv::MPV_EVENT_SHUTDOWN {
+        return EncodeEventAction::Failed(format!(
+            "libmpv shut down before completing {context} for '{media_path}'."
+        ));
+    }
+    if event_id == mpv::MPV_EVENT_END_FILE {
+        let Some((reason, error)) = end_file else {
+            return EncodeEventAction::Failed(format!(
+                "libmpv returned an empty end-file event during {context}."
+            ));
+        };
+        if reason == mpv::MPV_END_FILE_REASON_REDIRECT {
+            return EncodeEventAction::Continue;
+        }
+        if error < 0 {
+            return EncodeEventAction::Failed(format!(
+                "libmpv failed {context} for '{media_path}': {}",
+                mpv_error(error)
+            ));
+        }
+        if reason != mpv::MPV_END_FILE_REASON_EOF {
+            return EncodeEventAction::Failed(format!(
+                "libmpv ended {context} early (reason {reason})"
+            ));
+        }
+        return EncodeEventAction::Finished;
+    }
+    EncodeEventAction::Continue
+}
+
+fn check_abort_or_timeout(
+    abort: Option<&AtomicBool>,
+    deadline: Option<(Duration, Option<Instant>)>,
+    context: &str,
+) -> Result<Option<Duration>, String> {
+    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(format!("{context} canceled."));
+    }
+    let Some((limit, target)) = deadline else {
+        return Ok(None);
+    };
+    if limit.is_zero() {
+        return Err(format!(
+            "libmpv {context} timed out after {:.1}s.",
+            limit.as_secs_f64()
+        ));
+    }
+    if let Some(target) = target {
+        let remaining = target.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "libmpv {context} timed out after {:.1}s.",
+                limit.as_secs_f64()
+            ));
+        }
+        return Ok(Some(remaining));
+    }
+    Ok(None)
+}
+
 fn run_encode_job(
     media_path: &str,
     options: &[(&str, String)],
     load_options: &str,
     abort: Option<&AtomicBool>,
+    timeout: Option<Duration>,
     context: &str,
 ) -> Result<(), String> {
-    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        return Err(format!("{context} canceled."));
-    }
+    let deadline = timeout.map(|limit| (limit, Instant::now().checked_add(limit)));
+    check_abort_or_timeout(abort, deadline, context)?;
+
     let input = CString::new(media_path.as_bytes())
         .map_err(|_| "Media path contains an invalid NUL byte.".to_owned())?;
-    let load_options_c = CString::new(load_options.as_bytes())
-        .map_err(|_| format!("Invalid {context} options."))?;
+    let load_options_c =
+        CString::new(load_options.as_bytes()).map_err(|_| format!("Invalid {context} options."))?;
 
     let handle = unsafe { mpv::mpv_create() };
     if handle.is_null() {
@@ -294,9 +381,7 @@ fn run_encode_job(
             mpv_error(status)
         ));
     }
-    if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-        return Err(format!("{context} canceled."));
-    }
+    check_abort_or_timeout(abort, deadline, context)?;
 
     let api_version = unsafe { mpv::mpv_client_api_version() };
     // mpv_client_api_version() packs (major << 16) | minor; loadfile gained its
@@ -316,46 +401,30 @@ fn run_encode_job(
     }
 
     loop {
-        if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return Err(format!("{context} canceled."));
-        }
-        let event = unsafe { mpv::mpv_wait_event(handle.0, 0.1) };
+        let wait_secs = check_abort_or_timeout(abort, deadline, context)?
+            .map_or(0.1, |remaining| remaining.as_secs_f64().min(0.1));
+        let event = unsafe { mpv::mpv_wait_event(handle.0, wait_secs) };
         if event.is_null() {
             return Err(format!("libmpv returned no event during {context}."));
         }
         let event_id = unsafe { (*event).event_id };
-        if event_id == mpv::MPV_EVENT_NONE {
-            continue;
-        }
-        if event_id == mpv::MPV_EVENT_QUEUE_OVERFLOW {
-            return Err(format!("libmpv {context} event queue overflowed."));
-        }
-        if event_id == mpv::MPV_EVENT_END_FILE {
+        let end_file = if event_id == mpv::MPV_EVENT_END_FILE {
             let end_file_ptr = unsafe { (*event).data as *const mpv::mpv_event_end_file };
-            if end_file_ptr.is_null() {
-                return Err(format!(
-                    "libmpv returned an empty end-file event during {context}."
-                ));
+            (!end_file_ptr.is_null()).then(|| {
+                let info = unsafe { &*end_file_ptr };
+                (info.reason, info.error)
+            })
+        } else {
+            None
+        };
+        match classify_encode_event(event_id, end_file, media_path, context) {
+            EncodeEventAction::Continue => continue,
+            EncodeEventAction::Finished => {
+                // Terminate and flush the encoder handle before inspecting the output.
+                drop(handle);
+                return Ok(());
             }
-            let end_file = unsafe { &*end_file_ptr };
-            if end_file.reason == mpv::MPV_END_FILE_REASON_REDIRECT {
-                continue;
-            }
-            if end_file.error < 0 {
-                return Err(format!(
-                    "libmpv failed {context} for '{media_path}': {}",
-                    mpv_error(end_file.error)
-                ));
-            }
-            if end_file.reason != mpv::MPV_END_FILE_REASON_EOF {
-                return Err(format!(
-                    "libmpv ended {context} early (reason {})",
-                    end_file.reason
-                ));
-            }
-            // Terminate and flush the encoder handle before inspecting the output.
-            drop(handle);
-            return Ok(());
+            EncodeEventAction::Failed(message) => return Err(message),
         }
     }
 }
@@ -368,7 +437,29 @@ pub fn extract_clip_audio(
     end: f64,
     normalize_db: Option<f64>,
 ) -> Result<Vec<u8>, String> {
+    extract_clip_audio_with_cancel(
+        media,
+        start,
+        end,
+        normalize_db,
+        None,
+        Some(DEFAULT_ENCODE_TIMEOUT),
+    )
+}
+
+/// Extract a high-quality stereo `.aac` audio clip with optional cooperative
+/// cancellation and timeout bounds.
+pub fn extract_clip_audio_with_cancel(
+    media: &MediaContext,
+    start: f64,
+    end: f64,
+    normalize_db: Option<f64>,
+    abort: Option<&AtomicBool>,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, String> {
     validate_audio_clip_args(media, start, end)?;
+    let deadline = timeout.map(|limit| (limit, Instant::now().checked_add(limit)));
+    check_abort_or_timeout(abort, deadline, "Anki audio clip encoding")?;
     let temporary = create_temp_aac_path()?;
     let output = temporary.path.to_string_lossy().into_owned();
     let options = build_anki_audio_clip_options(media, &output, normalize_db, false)?;
@@ -377,7 +468,8 @@ pub fn extract_clip_audio(
         &media.path,
         &options,
         &load_options,
-        None,
+        abort,
+        timeout,
         "Anki audio clip encoding",
     )?;
     if !temporary.path.is_file() {
@@ -399,8 +491,27 @@ pub fn extract_clip_wav(
     end: f64,
     normalize_db: Option<f64>,
 ) -> Result<Vec<u8>, String> {
-    let abort = AtomicBool::new(false);
-    let wav = extract_audio(media, start, end, &abort, normalize_db)?;
+    extract_clip_wav_with_cancel(
+        media,
+        start,
+        end,
+        normalize_db,
+        None,
+        Some(DEFAULT_ENCODE_TIMEOUT),
+    )
+}
+
+/// Extract a 16 kHz mono WAV clip with optional cooperative cancellation and
+/// timeout bounds.
+pub fn extract_clip_wav_with_cancel(
+    media: &MediaContext,
+    start: f64,
+    end: f64,
+    normalize_db: Option<f64>,
+    abort: Option<&AtomicBool>,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, String> {
+    let wav = extract_audio_with_cancel(media, start, end, abort, normalize_db, timeout)?;
     fs::read(&wav.path).map_err(|error| format!("Could not read extracted note audio: {error}"))
 }
 
@@ -414,6 +525,33 @@ pub fn extract_clip_mp4(
     subtitles: bool,
     normalize_db: Option<f64>,
 ) -> Result<Vec<u8>, String> {
+    extract_clip_mp4_with_cancel(
+        media,
+        subtitle_id,
+        start,
+        end,
+        audio,
+        subtitles,
+        normalize_db,
+        None,
+        Some(DEFAULT_ENCODE_TIMEOUT),
+    )
+}
+
+/// Encode an Anki MP4 video attachment with optional cooperative cancellation
+/// and timeout bounds.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_clip_mp4_with_cancel(
+    media: &MediaContext,
+    subtitle_id: i64,
+    start: f64,
+    end: f64,
+    audio: bool,
+    subtitles: bool,
+    normalize_db: Option<f64>,
+    abort: Option<&AtomicBool>,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, String> {
     if media.path.is_empty()
         || !start.is_finite()
         || !end.is_finite()
@@ -422,16 +560,12 @@ pub fn extract_clip_mp4(
     {
         return Err("Could not extract Anki video: media path or clip range is invalid".into());
     }
+    let deadline = timeout.map(|limit| (limit, Instant::now().checked_add(limit)));
+    check_abort_or_timeout(abort, deadline, "Anki video encoding")?;
     let temporary = create_temp_mp4_path()?;
     let output = temporary.path.to_string_lossy().into_owned();
-    let options = build_anki_video_clip_options(
-        media,
-        subtitle_id,
-        audio,
-        subtitles,
-        normalize_db,
-        &output,
-    )?;
+    let options =
+        build_anki_video_clip_options(media, subtitle_id, audio, subtitles, normalize_db, &output)?;
     let load_options = build_loadfile_options(
         start,
         end,
@@ -442,7 +576,8 @@ pub fn extract_clip_mp4(
         &media.path,
         &options,
         &load_options,
-        None,
+        abort,
+        timeout,
         "Anki video encoding",
     )?;
     if !temporary.path.is_file() {
@@ -459,7 +594,10 @@ pub fn extract_clip_mp4(
     Ok(bytes)
 }
 
-#[cfg(all(target_os = "linux", any(feature = "asr-whisper", feature = "asr-onnx", test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "asr-whisper", feature = "asr-onnx", test)
+))]
 fn create_memfd_wav() -> Option<(fs::File, String)> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let fd = unsafe { libc::memfd_create(c"memento-asr-pcm".as_ptr(), libc::MFD_CLOEXEC) };
@@ -503,6 +641,7 @@ pub(super) fn extract_audio_samples(
             &options,
             &load_options,
             Some(abort),
+            Some(DEFAULT_ENCODE_TIMEOUT),
             "audio extraction",
         )?;
         memfd
@@ -523,6 +662,7 @@ pub(super) fn extract_audio_samples(
     read_pcm16_wav_bytes(&bytes, SAMPLE_RATE_16K as u32)
 }
 
+#[cfg(any(feature = "asr-whisper", feature = "asr-onnx", test))]
 pub(super) fn extract_audio(
     media: &MediaContext,
     start: f64,
@@ -530,10 +670,27 @@ pub(super) fn extract_audio(
     abort: &AtomicBool,
     normalize_db: Option<f64>,
 ) -> Result<TempMediaFile, String> {
+    extract_audio_with_cancel(
+        media,
+        start,
+        end,
+        Some(abort),
+        normalize_db,
+        Some(DEFAULT_ENCODE_TIMEOUT),
+    )
+}
+
+fn extract_audio_with_cancel(
+    media: &MediaContext,
+    start: f64,
+    end: f64,
+    abort: Option<&AtomicBool>,
+    normalize_db: Option<f64>,
+    timeout: Option<Duration>,
+) -> Result<TempMediaFile, String> {
     validate_audio_clip_args(media, start, end)?;
-    if abort.load(Ordering::Acquire) {
-        return Err("Audio extraction canceled.".into());
-    }
+    let deadline = timeout.map(|limit| (limit, Instant::now().checked_add(limit)));
+    check_abort_or_timeout(abort, deadline, "audio extraction")?;
     let temporary = create_temp_wav_path()?;
     let output = temporary.path.to_string_lossy().into_owned();
     let options = build_anki_audio_clip_options(media, &output, normalize_db, true)?;
@@ -542,7 +699,8 @@ pub(super) fn extract_audio(
         &media.path,
         &options,
         &load_options,
-        Some(abort),
+        abort,
+        timeout,
         "audio extraction",
     )?;
     if !temporary.path.is_file() {
@@ -563,6 +721,97 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn classify_encode_event_handles_shutdown_overflow_and_end_file_reasons() {
+        assert_eq!(
+            classify_encode_event(mpv::MPV_EVENT_NONE, None, "/tmp/a.mkv", "encode"),
+            EncodeEventAction::Continue
+        );
+        let shutdown = classify_encode_event(mpv::MPV_EVENT_SHUTDOWN, None, "/tmp/a.mkv", "encode");
+        assert!(
+            matches!(shutdown, EncodeEventAction::Failed(ref msg) if msg.contains("shut down")),
+            "MPV_EVENT_SHUTDOWN must terminate encode loop cleanly: {shutdown:?}"
+        );
+        let overflow =
+            classify_encode_event(mpv::MPV_EVENT_QUEUE_OVERFLOW, None, "/tmp/a.mkv", "encode");
+        assert!(matches!(overflow, EncodeEventAction::Failed(ref msg) if msg.contains("overflow")));
+        assert_eq!(
+            classify_encode_event(
+                mpv::MPV_EVENT_END_FILE,
+                Some((mpv::MPV_END_FILE_REASON_REDIRECT, 0)),
+                "/tmp/a.mkv",
+                "encode"
+            ),
+            EncodeEventAction::Continue
+        );
+        assert_eq!(
+            classify_encode_event(
+                mpv::MPV_EVENT_END_FILE,
+                Some((mpv::MPV_END_FILE_REASON_EOF, 0)),
+                "/tmp/a.mkv",
+                "encode"
+            ),
+            EncodeEventAction::Finished
+        );
+        let early = classify_encode_event(
+            mpv::MPV_EVENT_END_FILE,
+            Some((mpv::MPV_END_FILE_REASON_STOP, 0)),
+            "/tmp/a.mkv",
+            "encode",
+        );
+        assert!(matches!(early, EncodeEventAction::Failed(ref msg) if msg.contains("early")));
+    }
+
+    #[test]
+    fn cancel_and_zero_timeout_abort_encode_helpers_immediately() {
+        let valid = MediaContext::new("/tmp/movie.mkv", 1);
+        let aborted = AtomicBool::new(true);
+
+        let err = extract_clip_audio_with_cancel(
+            &valid,
+            0.0,
+            1.0,
+            None,
+            Some(&aborted),
+            Some(DEFAULT_ENCODE_TIMEOUT),
+        )
+        .unwrap_err();
+        assert!(err.contains("canceled"), "unexpected error: {err}");
+
+        let err = extract_clip_mp4_with_cancel(
+            &valid,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            None,
+            Some(&aborted),
+            Some(DEFAULT_ENCODE_TIMEOUT),
+        )
+        .unwrap_err();
+        assert!(err.contains("canceled"), "unexpected error: {err}");
+
+        let err =
+            extract_clip_audio_with_cancel(&valid, 0.0, 1.0, None, None, Some(Duration::ZERO))
+                .unwrap_err();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+
+        let err = extract_clip_mp4_with_cancel(
+            &valid,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            None,
+            None,
+            Some(Duration::ZERO),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
     }
 
     #[test]
@@ -587,8 +836,8 @@ mod tests {
     #[test]
     fn anki_aac_clip_arg_builder_uses_explicit_aid_native_rate_and_aac() {
         let media = MediaContext::new("https://example.com/video.mp4", 2);
-        let options = build_anki_audio_clip_options(&media, "/tmp/clip.aac", Some(-16.5), false)
-            .unwrap();
+        let options =
+            build_anki_audio_clip_options(&media, "/tmp/clip.aac", Some(-16.5), false).unwrap();
         assert_eq!(option_value(&options, "aid"), Some("2"));
         assert_eq!(option_value(&options, "oac"), Some("aac"));
         assert_eq!(option_value(&options, "ytdl"), Some("yes"));
@@ -628,13 +877,18 @@ mod tests {
             build_anki_video_clip_options(&zero_aid, 1, true, false, None, "/tmp/clip.mp4")
                 .is_err()
         );
-        assert!(build_anki_video_clip_options(&zero_aid, 0, true, true, None, "/tmp/clip.mp4").is_err());
+        assert!(
+            build_anki_video_clip_options(&zero_aid, 0, true, true, None, "/tmp/clip.mp4").is_err()
+        );
 
         let valid = MediaContext::new("/tmp/movie.mkv", 1);
         assert!(validate_audio_clip_args(&valid, -0.3, 1.0).is_err());
         assert!(validate_audio_clip_args(&valid, -0.001, 1.0).is_err());
         assert!(validate_audio_clip_args(&valid, -0.0, 1.0).is_ok());
-        assert_eq!(build_loadfile_options(-0.0, 1.0, Some(1), None), "start=0.000,end=1.000,aid=1");
+        assert_eq!(
+            build_loadfile_options(-0.0, 1.0, Some(1), None),
+            "start=0.000,end=1.000,aid=1"
+        );
         assert!(extract_clip_audio(&valid, -0.3, 1.0, None).is_err());
         assert!(extract_clip_wav(&valid, -0.3, 1.0, None).is_err());
         assert!(extract_clip_mp4(&valid, 1, -0.3, 1.0, false, false, None).is_err());

@@ -163,8 +163,7 @@ pub fn token_spans(text: &[u16]) -> Vec<TokenSpan> {
 }
 
 #[cfg(test)]
-mod tests
-{
+mod tests {
     use super::*;
 
     #[test]
@@ -217,11 +216,19 @@ mod tests
 
     #[test]
     fn spans_basic_scan() {
-        let text = String::from("x{a}y{b{c}d").encode_utf16().collect::<Vec<_>>();
+        let text = String::from("x{a}y{b{c}d")
+            .encode_utf16()
+            .collect::<Vec<_>>();
         let spans = token_spans(&text);
         assert_eq!(spans.len(), 2);
-        assert_eq!(String::from_utf16_lossy(&text[spans[0].start..spans[0].end]), "{a}");
-        assert_eq!(String::from_utf16_lossy(&text[spans[1].start..spans[1].end]), "{b{c}");
+        assert_eq!(
+            String::from_utf16_lossy(&text[spans[0].start..spans[0].end]),
+            "{a}"
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&text[spans[1].start..spans[1].end]),
+            "{b{c}"
+        );
     }
 
     #[test]

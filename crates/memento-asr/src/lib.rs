@@ -7,8 +7,8 @@
 //! implementation by golden-vector tests before any consumer is switched
 //! over. See `docs/rust-port-plan.md` for the module roadmap.
 
-/// Port of `asr/asrcontroller.cpp`'s subtitle cue book and window/seek
-/// planning.
+/// Port of `asr/asrcontroller.cpp`'s subtitle segment adjustment and cue
+/// validation helpers.
 pub mod asrcontroller;
 
 pub mod audio {
@@ -25,6 +25,7 @@ pub mod whisper {
 }
 
 pub mod onnx {
+    pub(crate) mod json;
     /// Port of `asr/onnx/onnxtokenizer.{h,cpp}`
     pub mod onnxtokenizer;
     /// Port of `asr/onnx/onnxmodelconfig.{h,cpp}`

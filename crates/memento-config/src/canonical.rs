@@ -112,7 +112,7 @@ fn needs_quotes(s: &str) -> bool {
     if matches!(first, b' ' | b'\t') || matches!(last, b' ' | b'\t') {
         return true;
     }
-    if matches!(first, b'[' | b'{' | b'+' | b'-' | b'#') {
+    if matches!(first, b'[' | b'{' | b'+' | b'-' | b'#' | b'@') {
         return true;
     }
     bytes.iter().any(|&b| {
@@ -262,6 +262,8 @@ pub fn decode_int(raw: &str) -> Result<i64, String> {
 fn check_sign_magnitude(sign: i64, magnitude: u64, raw: &str) -> Result<i64, String> {
     if sign >= 0 {
         i64::try_from(magnitude).map_err(|_| format!("integer out of range: {raw:?}"))
+    } else if magnitude == i64::MIN.unsigned_abs() {
+        Ok(i64::MIN)
     } else {
         i64::try_from(magnitude)
             .ok()
@@ -644,7 +646,10 @@ pub fn decode_strings(raw: &str) -> Result<Vec<String>, String> {
         return Ok(items);
     }
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        let body = &trimmed[1..trimmed.len() - 1];
+        let body = trimmed[1..trimmed.len() - 1].trim();
+        if body.is_empty() {
+            return Ok(Vec::new());
+        }
         return Ok(split_elements(body)
             .into_iter()
             .map(|e| decode_element_string(&e))
@@ -680,6 +685,24 @@ pub fn decode_ints(raw: &str) -> Result<Vec<i64>, String> {
         .collect()
 }
 
+fn find_unquoted_eq(pair: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, c) in pair.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '=' if !in_quotes => return Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn decode_map(raw: &str) -> Result<BTreeMap<String, String>, String> {
     let trimmed = raw.trim();
     if trimmed == "{}" {
@@ -688,19 +711,21 @@ fn decode_map(raw: &str) -> Result<BTreeMap<String, String>, String> {
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
         return Err(format!("not a map: {raw:?}"));
     }
-    let body = &trimmed[1..trimmed.len() - 1];
+    let body = trimmed[1..trimmed.len() - 1].trim();
+    if body.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let mut map = BTreeMap::new();
     for pair in split_elements(body) {
         if pair.is_empty() {
             continue;
         }
-        let eq = pair
-            .find('=')
+        let eq = find_unquoted_eq(&pair)
             .ok_or_else(|| format!("map entry without '=': {pair:?}"))?;
         let key_part = pair[..eq].trim();
         let value_part = pair[eq + 1..].trim();
         let key = match parse_quoted(key_part, false)? {
-            Some(text) => unescape_body(&text, false),
+            Some(text) => text,
             None => key_part.to_owned(),
         };
         map.insert(key, decode_element_string(value_part));
@@ -768,6 +793,8 @@ pub fn decode_value_inferred(raw: &str) -> Value {
 
 // ------------------------------------------------------- percent encoding
 
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
 /// Percent-encodes a section header or key name: every byte that is not a
 /// plain ASCII `0-9 a-z A-Z _ - . /` byte, plus `%` itself, is written as
 /// `%XX` with uppercase hex over the UTF-8 bytes.
@@ -777,7 +804,9 @@ pub fn percent_encode_component(name: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push('%');
+            out.push(HEX_UPPER[(b >> 4) as usize] as char);
+            out.push(HEX_UPPER[(b & 0x0F) as usize] as char);
         }
     }
     out

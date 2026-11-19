@@ -14,13 +14,17 @@ use memento_ass::{
 use memento_player::mpv::PlaybackState;
 use slint::{ComponentHandle, Model, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
-use crate::controller::subtitles::subtitle_furigana_parts;
+use crate::controller::subtitles::{cached_subtitle_furigana_parts, prewarm_subtitle_furigana};
 use crate::ui::{
     AssHighlightPatch, AssLineHitbox, AssRubyItem, MementoApp, SubtitleOverlayBridge,
 };
 
 /// Minimum interval between animated-geometry (`\move` / geometry `\t`) layout re-probes (~15 Hz).
 const ANIMATED_PROBE_INTERVAL: Duration = Duration::from_millis(66);
+/// Poll interval while waiting for background MeCab prewarm to populate ASS furigana cache.
+const FURIGANA_CACHE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Stop re-polling furigana cache for the same revision after this window (e.g. MeCab unavailable).
+const FURIGANA_CACHE_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Returns true if an `mpv` subtitle track codec is ASS/SSA.
 pub fn is_ass_subtitle_codec(codec: &str) -> bool {
@@ -119,7 +123,7 @@ pub fn build_ass_ruby_items(
     layout: &AssFrameLayout,
     transform: &ViewportTransform,
     furigana_ratio: f32,
-    parts_provider: impl Fn(&str) -> Option<Vec<(String, String)>>,
+    mut parts_provider: impl FnMut(&str) -> Option<Vec<(String, String)>>,
 ) -> Vec<AssRubyItem> {
     let mut items = Vec::new();
     let ratio = furigana_ratio.clamp(0.25, 0.75);
@@ -160,7 +164,11 @@ pub fn build_ass_ruby_items(
                 }
                 let mut min_x = f32::INFINITY;
                 let mut max_x = f32::NEG_INFINITY;
-                for c in &ev.chars[line.char_start..line.char_end] {
+                let line_chars = ev
+                    .chars
+                    .get(line.char_start..line.char_end)
+                    .unwrap_or(&[]);
+                for c in line_chars {
                     if c.byte_offset >= b0 && c.byte_offset < b1 && c.has_ink {
                         min_x = min_x.min(c.x);
                         max_x = max_x.max(c.x + c.w);
@@ -239,12 +247,27 @@ pub struct AssOverlayController {
     hovered_lines: HashSet<(i32, i32)>,
     active_lookup: Option<AssActiveLookup>,
     last_furigana_key: Option<(u64, bool, u32)>,
+    furigana_requested_revision: Option<u64>,
+    furigana_request_started_at: Option<Instant>,
+    furigana_last_poll_at: Option<Instant>,
+    last_logged_error: Option<String>,
 }
 
 impl Default for AssOverlayController {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn clear_slint_overlay_state(sb: &SubtitleOverlayBridge, clear_native_active: bool) {
+    if clear_native_active {
+        sb.set_ass_native_active(false);
+    }
+    sb.set_ass_line_hitboxes(Rc::new(VecModel::from(Vec::<AssLineHitbox>::new())).into());
+    sb.set_ass_highlight_patches(Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into());
+    sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
+    sb.set_ass_anchor_active(false);
+    sb.set_ass_hovered(false);
 }
 
 impl AssOverlayController {
@@ -263,6 +286,10 @@ impl AssOverlayController {
             hovered_lines: HashSet::new(),
             active_lookup: None,
             last_furigana_key: None,
+            furigana_requested_revision: None,
+            furigana_request_started_at: None,
+            furigana_last_poll_at: None,
+            last_logged_error: None,
         }
     }
 
@@ -282,6 +309,21 @@ impl AssOverlayController {
         self.active_lookup.as_ref()
     }
 
+    fn log_error_once(&mut self, context: &str, err: &str) {
+        let msg = format!("[memento-ass] {context}: {err}");
+        if self.last_logged_error.as_deref() != Some(msg.as_str()) {
+            eprintln!("{msg}");
+            self.last_logged_error = Some(msg);
+        }
+    }
+
+    fn reset_furigana_tracking(&mut self) {
+        self.last_furigana_key = None;
+        self.furigana_requested_revision = None;
+        self.furigana_request_started_at = None;
+        self.furigana_last_poll_at = None;
+    }
+
     /// Replace embedded MKV memory fonts (`ass_add_font`) and schedule re-probe on next sync.
     pub fn set_memory_fonts(&mut self, fonts: Vec<MkvFontAttachment>) {
         self.loaded_fonts = fonts;
@@ -293,23 +335,23 @@ impl AssOverlayController {
     pub fn clear_for_new_media(&mut self, app: &MementoApp) {
         self.loaded_fonts.clear();
         self.font_generation = self.font_generation.wrapping_add(1);
+        if let Some(engine) = self.engine.as_mut() {
+            if let Err(err) = engine.load_memory_fonts(&[]) {
+                eprintln!("[memento-ass] failed to release libass memory fonts: {err}");
+            }
+            self.applied_font_generation = self.font_generation;
+        }
         self.last_probe_key = None;
         self.last_animated_probe_at = None;
         self.layout = None;
         self.layout_revision = self.layout_revision.wrapping_add(1);
         self.hovered_lines.clear();
         self.active_lookup = None;
-        self.last_furigana_key = None;
+        self.reset_furigana_tracking();
+        self.last_logged_error = None;
         self.active = false;
         let sb = app.global::<SubtitleOverlayBridge>();
-        sb.set_ass_native_active(false);
-        sb.set_ass_line_hitboxes(Rc::new(VecModel::from(Vec::<AssLineHitbox>::new())).into());
-        sb.set_ass_highlight_patches(
-            Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
-        );
-        sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
-        sb.set_ass_anchor_active(false);
-        sb.set_ass_hovered(false);
+        clear_slint_overlay_state(&sb, true);
     }
 
     /// Synchronize native ASS state, hitboxes, highlight re-projection, and furigana from
@@ -334,17 +376,8 @@ impl AssOverlayController {
                 self.last_probe_key = None;
                 self.hovered_lines.clear();
                 self.active_lookup = None;
-                self.last_furigana_key = None;
-                sb.set_ass_native_active(false);
-                sb.set_ass_line_hitboxes(
-                    Rc::new(VecModel::from(Vec::<AssLineHitbox>::new())).into(),
-                );
-                sb.set_ass_highlight_patches(
-                    Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
-                );
-                sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
-                sb.set_ass_anchor_active(false);
-                sb.set_ass_hovered(false);
+                self.reset_furigana_tracking();
+                clear_slint_overlay_state(&sb, true);
             }
             return;
         }
@@ -369,27 +402,20 @@ impl AssOverlayController {
                 self.last_animated_probe_at = None;
                 self.hovered_lines.clear();
                 self.active_lookup = None;
-                self.last_furigana_key = None;
-                sb.set_ass_line_hitboxes(
-                    Rc::new(VecModel::from(Vec::<AssLineHitbox>::new())).into(),
-                );
-                sb.set_ass_highlight_patches(
-                    Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
-                );
-                sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
-                sb.set_ass_anchor_active(false);
-                sb.set_ass_hovered(false);
+                self.reset_furigana_tracking();
+                clear_slint_overlay_state(&sb, false);
             }
             return;
         }
 
-        let probe_key = (
-            extradata.to_string(),
-            trimmed_full.to_string(),
-            params.clone(),
-            self.font_generation,
-        );
-        let static_changed = self.last_probe_key.as_ref() != Some(&probe_key);
+        // Borrowed comparison against `last_probe_key` avoids cloning `extradata`,
+        // `ass_full`, and `MpvAssParams` on steady-state 60 Hz playback ticks.
+        let static_changed = !self.last_probe_key.as_ref().is_some_and(|prev| {
+            prev.0 == extradata
+                && prev.1 == trimmed_full
+                && &prev.2 == params
+                && prev.3 == self.font_generation
+        });
         let animated_due = !static_changed
             && !paused
             && self
@@ -404,57 +430,109 @@ impl AssOverlayController {
             let cue_text_changed = self
                 .last_probe_key
                 .as_ref()
-                .is_none_or(|prev| prev.1 != probe_key.1 || prev.0 != probe_key.0);
+                .is_none_or(|prev| prev.1 != trimmed_full || prev.0 != extradata);
 
-            if let Ok(engine) = self.ensure_engine_ready(params) {
-                if let Ok(layout) = engine.probe_active_events(extradata, trimmed_full, now_ms) {
-                    self.layout = Some(layout);
-                    self.layout_revision = self.layout_revision.wrapping_add(1);
-                    self.last_probe_key = Some(probe_key);
-                    self.last_animated_probe_at = Some(Instant::now());
+            match self.ensure_engine_ready(params) {
+                Ok(engine) => match engine.probe_active_events(extradata, trimmed_full, now_ms) {
+                    Ok(layout) => {
+                        self.last_logged_error = None;
+                        self.layout = Some(layout);
+                        self.layout_revision = self.layout_revision.wrapping_add(1);
+                        if static_changed {
+                            self.last_probe_key = Some((
+                                extradata.to_string(),
+                                trimmed_full.to_string(),
+                                params.clone(),
+                                self.font_generation,
+                            ));
+                        }
+                        self.last_animated_probe_at = Some(Instant::now());
 
-                    if cue_text_changed {
-                        self.hovered_lines.clear();
-                        self.active_lookup = None;
-                        sb.set_ass_hovered(false);
-                        sb.set_ass_highlight_patches(
-                            Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
-                        );
-                        sb.set_ass_anchor_active(false);
-                    }
-                    self.push_hitboxes(app, &transform);
-                    if !cue_text_changed {
-                        if let Some(lookup) = self.active_lookup.clone() {
-                            self.rebuild_highlight_for_lookup(app, &lookup, &transform);
+                        if cue_text_changed {
+                            self.hovered_lines.clear();
+                            self.active_lookup = None;
+                            sb.set_ass_hovered(false);
+                            sb.set_ass_highlight_patches(
+                                Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
+                            );
+                            sb.set_ass_anchor_active(false);
+                        }
+                        self.push_hitboxes(app, &transform);
+                        if !cue_text_changed {
+                            if let Some(lookup) = self.active_lookup.clone() {
+                                self.rebuild_highlight_for_lookup(app, &lookup, &transform);
+                            }
                         }
                     }
-                }
+                    Err(err) => self.log_error_once("probe_active_events failed", &err),
+                },
+                Err(err) => self.log_error_once("ensure_engine_ready failed", &err),
             }
         } else if viewport_changed && self.layout.is_some() {
             self.push_hitboxes(app, &transform);
             if let Some(lookup) = self.active_lookup.clone() {
                 self.rebuild_highlight_for_lookup(app, &lookup, &transform);
             }
-            self.last_furigana_key = None;
+            self.reset_furigana_tracking();
         }
 
-        // Optional Alt+A furigana over ASS lines.
+        // Optional Alt+A furigana over ASS lines (strictly non-blocking on the UI thread).
         let furigana_visible = app.get_furigana_visible();
         let furi_key = (self.layout_revision, furigana_visible, furigana_ratio.to_bits());
         if self.last_furigana_key != Some(furi_key) {
-            self.last_furigana_key = Some(furi_key);
-            if furigana_visible {
-                if let Some(layout) = self.layout.as_ref() {
-                    let items = build_ass_ruby_items(layout, &transform, furigana_ratio, |text| {
-                        subtitle_furigana_parts(text).ok()
-                    });
-                    sb.set_ass_ruby_items(Rc::new(VecModel::from(items)).into());
-                } else {
+            if !furigana_visible {
+                self.last_furigana_key = Some(furi_key);
+                self.furigana_requested_revision = None;
+                self.furigana_request_started_at = None;
+                self.furigana_last_poll_at = None;
+                if sb.get_ass_ruby_items().row_count() > 0 {
                     sb.set_ass_ruby_items(
                         Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into(),
                     );
                 }
-            } else if sb.get_ass_ruby_items().row_count() > 0 {
+            } else if let Some(layout) = self.layout.as_ref() {
+                let already_requested =
+                    self.furigana_requested_revision == Some(self.layout_revision);
+                let poll_due = !already_requested
+                    || self
+                        .furigana_last_poll_at
+                        .map_or(true, |t| t.elapsed() >= FURIGANA_CACHE_POLL_INTERVAL);
+                if poll_due {
+                    let mut missing_texts: Vec<String> = Vec::new();
+                    let items = build_ass_ruby_items(layout, &transform, furigana_ratio, |text| {
+                        if let Some(parts) = cached_subtitle_furigana_parts(text) {
+                            Some(parts)
+                        } else {
+                            if !missing_texts.iter().any(|s| s == text) {
+                                missing_texts.push(text.to_owned());
+                            }
+                            None
+                        }
+                    });
+                    sb.set_ass_ruby_items(Rc::new(VecModel::from(items)).into());
+                    if missing_texts.is_empty() {
+                        self.last_furigana_key = Some(furi_key);
+                        self.furigana_requested_revision = None;
+                        self.furigana_request_started_at = None;
+                        self.furigana_last_poll_at = None;
+                    } else {
+                        let now = Instant::now();
+                        self.furigana_last_poll_at = Some(now);
+                        if !already_requested {
+                            self.furigana_requested_revision = Some(self.layout_revision);
+                            self.furigana_request_started_at = Some(now);
+                            prewarm_subtitle_furigana(missing_texts);
+                        } else if self
+                            .furigana_request_started_at
+                            .is_some_and(|t| t.elapsed() >= FURIGANA_CACHE_POLL_TIMEOUT)
+                        {
+                            // MeCab unavailable or timed out for this revision: stop polling.
+                            self.last_furigana_key = Some(furi_key);
+                        }
+                    }
+                }
+            } else {
+                self.last_furigana_key = Some(furi_key);
                 sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
             }
         }
@@ -468,9 +546,15 @@ impl AssOverlayController {
             self.engine = Some(AssLayoutEngine::new()?);
             self.applied_font_generation = u64::MAX;
         }
-        let engine = self.engine.as_mut().unwrap();
+        let Some(engine) = self.engine.as_mut() else {
+            return Err("ASS layout engine failed to initialize".to_owned());
+        };
         if self.applied_font_generation != self.font_generation {
-            engine.load_memory_fonts(&self.loaded_fonts)?;
+            let fonts = std::mem::take(&mut self.loaded_fonts);
+            if let Err(err) = engine.load_memory_fonts(&fonts) {
+                self.loaded_fonts = fonts;
+                return Err(err);
+            }
             self.applied_font_generation = self.font_generation;
         }
         engine.configure(params);
@@ -679,10 +763,10 @@ impl AssOverlayController {
         sb.set_ass_highlight_patches(Rc::new(VecModel::from(patches)).into());
         if let Some(anchor) = union_rect {
             let (ax, ay, aw, ah) = transform.frame_rect_to_logical(anchor);
-            sb.set_ass_anchor_x(ax);
-            sb.set_ass_anchor_top(ay);
-            sb.set_ass_anchor_bottom(ay + ah);
-            sb.set_ass_anchor_width(aw);
+            sb.set_ass_anchor_x(ax.round());
+            sb.set_ass_anchor_top(ay.round());
+            sb.set_ass_anchor_bottom((ay + ah).round());
+            sb.set_ass_anchor_width(aw.round());
             sb.set_ass_anchor_active(true);
         }
     }

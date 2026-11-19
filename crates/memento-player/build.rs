@@ -2,24 +2,33 @@
 
 use std::path::{Path, PathBuf};
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 fn main() {
     for name in ["MPV_SDK", "MPV_INCLUDE_DIR", "MPV_LIB_DIR"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let include = if let Some(prefix) = std::env::var_os("MPV_SDK") {
-        let prefix = PathBuf::from(prefix);
+    let include = if let Some(prefix) = env_path("MPV_SDK") {
         let include = if prefix.join("mpv/client.h").is_file() {
             prefix.clone()
         } else {
             prefix.join("include")
         };
-        link_sdk(&include);
+        link_sdk(Some(&prefix), &include);
         include
-    } else if let Some(include) = std::env::var_os("MPV_INCLUDE_DIR") {
-        let include = PathBuf::from(include);
-        link_sdk(&include);
+    } else if let Some(include) = env_path("MPV_INCLUDE_DIR") {
+        link_sdk(None, &include);
         include
     } else {
+        if let Some(lib_dir) = env_path("MPV_LIB_DIR") {
+            let lib_name = detect_mpv_lib_name(&lib_dir).unwrap_or("mpv");
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            println!("cargo:rustc-link-lib={lib_name}");
+        }
         let library = pkg_config::Config::new().probe("mpv").unwrap_or_else(|error| {
             panic!("libmpv development files were not found. Install your system's libmpv development package and pkg-config, then run cargo build again. For a custom SDK set MPV_SDK.\n{error}")
         });
@@ -59,26 +68,54 @@ fn main() {
         .expect("could not write libmpv bindings");
 }
 
-fn link_sdk(include: &Path) {
-    let library_dir = std::env::var_os("MPV_LIB_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let prefix = include.parent()?;
-            ["lib", "lib64"]
-                .into_iter()
-                .map(|name| prefix.join(name))
-                .find(|dir| {
-                    ["libmpv.so", "libmpv.dylib", "libmpv.dll.a", "mpv.lib"]
-                        .iter()
-                        .any(|name| dir.join(name).is_file())
-                })
-        });
-    if let Some(directory) = library_dir {
-        println!("cargo:rustc-link-search=native={}", directory.display());
-        println!("cargo:rustc-link-lib=mpv");
-    } else {
-        pkg_config::Config::new()
-            .probe("mpv")
-            .expect("cannot find libmpv beside the selected headers; set MPV_LIB_DIR");
+fn detect_mpv_lib_name(dir: &Path) -> Option<&'static str> {
+    const STANDARD_NAMES: &[&str] = &[
+        "libmpv.so",
+        "libmpv.dylib",
+        "libmpv.dll.a",
+        "mpv.dll.a",
+        "mpv.lib",
+        "libmpv.a",
+    ];
+    if STANDARD_NAMES.iter().any(|name| dir.join(name).is_file()) {
+        return Some("mpv");
     }
+    if dir.join("libmpv.lib").is_file() {
+        return Some("libmpv");
+    }
+    None
+}
+
+fn link_sdk(sdk_root: Option<&Path>, include: &Path) {
+    if let Some(directory) = env_path("MPV_LIB_DIR") {
+        let lib_name = detect_mpv_lib_name(&directory).unwrap_or("mpv");
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        println!("cargo:rustc-link-lib={lib_name}");
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(root) = sdk_root {
+        candidates.push(root.to_path_buf());
+        candidates.push(root.join("lib"));
+        candidates.push(root.join("lib64"));
+        candidates.push(root.join("x86_64"));
+    }
+    if let Some(parent) = include.parent() {
+        candidates.push(parent.to_path_buf());
+        candidates.push(parent.join("lib"));
+        candidates.push(parent.join("lib64"));
+    }
+
+    for directory in candidates {
+        if let Some(lib_name) = detect_mpv_lib_name(&directory) {
+            println!("cargo:rustc-link-search=native={}", directory.display());
+            println!("cargo:rustc-link-lib={lib_name}");
+            return;
+        }
+    }
+
+    pkg_config::Config::new()
+        .probe("mpv")
+        .expect("cannot find libmpv beside the selected headers; set MPV_LIB_DIR");
 }

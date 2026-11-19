@@ -330,6 +330,10 @@ pub struct ElementRenderState {
     /// Resolved font size inherited by child content.
     pub font_pixel_size: f64,
 
+    /// Explicit numeric font size resolved from matched CSS rules or inline
+    /// `style.fontSize`, avoiding formatting to `"<px>px"` and reparsing.
+    pub font_size_px: Option<f64>,
+
     /// Resolved text color inherited by child content.
     pub text_color: String,
     pub painted_background_color: String,
@@ -367,6 +371,7 @@ impl Default for ElementRenderState {
             width_policy: WidthPolicy::Natural,
             margin_flow: MarginFlow::Inline,
             font_pixel_size: 0.0,
+            font_size_px: None,
             text_color: String::new(),
             painted_background_color: String::new(),
             text_direction: LayoutDirection::LeftToRight,

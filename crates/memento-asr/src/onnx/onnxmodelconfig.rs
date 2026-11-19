@@ -41,10 +41,12 @@
 //!   followed) and `QFileInfo::isFile` (regular file or symlink to one, i.e.
 //!   `Path::is_file`).
 
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::audio::melfrontend::MelFrontendConfig;
+use crate::onnx::json::{
+    contains, read_json_object, to_double, to_int, to_integer, to_string_qt,
+};
 
 /// C++: `enum class OnnxAsrArchitecture`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,88 +107,6 @@ impl Default for OnnxModelConfig {
             no_speech_token_id: 1,
             ctc_blank_token_id: -1,
         }
-    }
-}
-
-/// C++: `QJsonValue::toInteger(defaultValue)` — only whole numbers
-/// representable as qint64 convert. In particular a fractional JSON number
-/// must not silently truncate, and a JSON integer above 2^53 must not be
-/// rounded through f64 before conversion.
-fn to_integer(value: Option<&serde_json::Value>, default: i64) -> i64 {
-    let Some(serde_json::Value::Number(number)) = value else {
-        return default;
-    };
-    if let Some(integer) = number.as_i64() {
-        return integer;
-    }
-    let Some(double) = number.as_f64() else {
-        return default;
-    };
-    if double.is_finite()
-        && double.fract() == 0.0
-        && double >= i64::MIN as f64
-        && double < 9_223_372_036_854_775_808.0
-    {
-        double as i64
-    } else {
-        default
-    }
-}
-
-/// C++: `QJsonValue::toInt(defaultValue)` rejects non-integral and
-/// out-of-i32-range values rather than narrowing a qint64 modulo 2^32.
-fn to_int(value: Option<&serde_json::Value>, default: i32) -> i32 {
-    i32::try_from(to_integer(value, default as i64)).unwrap_or(default)
-}
-
-/// C++: `QJsonValue::toDouble(defaultValue)`.
-fn to_double(value: Option<&serde_json::Value>, default: f64) -> f64 {
-    match value {
-        Some(serde_json::Value::Number(number)) => {
-            let double = number.as_f64().unwrap_or(f64::INFINITY);
-            if double.is_finite() {
-                double
-            } else {
-                default
-            }
-        }
-        _ => default,
-    }
-}
-
-/// C++: `QJsonValue::toString()` — empty string when the value is not a
-/// string.
-fn to_string_qt(value: Option<&serde_json::Value>) -> String {
-    value
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned()
-}
-
-/// C++: `QJsonObject::contains(key)`.
-fn contains(object: &serde_json::Value, key: &str) -> bool {
-    object.get(key).is_some()
-}
-
-/// C++: `readJsonObject(path)` in the anonymous namespace — an empty object
-/// is returned (without any error) when the file cannot be opened or is not a
-/// JSON object.
-fn read_json_object(path: &Path) -> serde_json::Value {
-    fn empty_object() -> serde_json::Value {
-        serde_json::Value::Object(serde_json::Map::new())
-    }
-    let Ok(bytes) = fs::read(path) else {
-        return empty_object();
-    };
-    // QJsonDocument::fromJson skips a leading UTF-8 byte-order mark.
-    let bytes: &[u8] = bytes
-        .strip_prefix(&[0xEF, 0xBB, 0xBF])
-        .unwrap_or_else(|| bytes.as_slice());
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(root) if root.is_object() => root,
-        // Mirrors the C++ `!doc.isObject()` half: failures yield an empty
-        // object silently.
-        _ => empty_object(),
     }
 }
 

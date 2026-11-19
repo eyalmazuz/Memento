@@ -3,6 +3,11 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/msg_cb_shim.c");
+    cc::Build::new()
+        .file("src/msg_cb_shim.c")
+        .compile("memento_ass_msg_cb_shim");
+
     for var in ["ASS_SDK", "ASS_LIB_DIR"] {
         println!("cargo:rerun-if-env-changed={var}");
     }

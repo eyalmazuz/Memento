@@ -183,31 +183,32 @@ impl ArgbColor {
             return Err("color value cannot be empty".to_owned());
         }
         if let Some(hex) = trimmed.strip_prefix('#') {
-            return match hex.len() {
+            let bytes = hex.as_bytes();
+            return match bytes.len() {
                 3 => {
-                    let r = parse_hex_nibble(hex.as_bytes()[0])? * 17;
-                    let g = parse_hex_nibble(hex.as_bytes()[1])? * 17;
-                    let b = parse_hex_nibble(hex.as_bytes()[2])? * 17;
+                    let r = parse_hex_nibble(bytes[0])? * 17;
+                    let g = parse_hex_nibble(bytes[1])? * 17;
+                    let b = parse_hex_nibble(bytes[2])? * 17;
                     Ok(Self::new(255, r, g, b))
                 }
                 4 => {
-                    let a = parse_hex_nibble(hex.as_bytes()[0])? * 17;
-                    let r = parse_hex_nibble(hex.as_bytes()[1])? * 17;
-                    let g = parse_hex_nibble(hex.as_bytes()[2])? * 17;
-                    let b = parse_hex_nibble(hex.as_bytes()[3])? * 17;
+                    let a = parse_hex_nibble(bytes[0])? * 17;
+                    let r = parse_hex_nibble(bytes[1])? * 17;
+                    let g = parse_hex_nibble(bytes[2])? * 17;
+                    let b = parse_hex_nibble(bytes[3])? * 17;
                     Ok(Self::new(a, r, g, b))
                 }
                 6 => {
-                    let r = parse_hex_byte(&hex[0..2])?;
-                    let g = parse_hex_byte(&hex[2..4])?;
-                    let b = parse_hex_byte(&hex[4..6])?;
+                    let r = parse_hex_byte(bytes[0], bytes[1])?;
+                    let g = parse_hex_byte(bytes[2], bytes[3])?;
+                    let b = parse_hex_byte(bytes[4], bytes[5])?;
                     Ok(Self::new(255, r, g, b))
                 }
                 8 => {
-                    let a = parse_hex_byte(&hex[0..2])?;
-                    let r = parse_hex_byte(&hex[2..4])?;
-                    let g = parse_hex_byte(&hex[4..6])?;
-                    let b = parse_hex_byte(&hex[6..8])?;
+                    let a = parse_hex_byte(bytes[0], bytes[1])?;
+                    let r = parse_hex_byte(bytes[2], bytes[3])?;
+                    let g = parse_hex_byte(bytes[4], bytes[5])?;
+                    let b = parse_hex_byte(bytes[6], bytes[7])?;
                     Ok(Self::new(a, r, g, b))
                 }
                 _ => Err(format!(
@@ -255,14 +256,16 @@ impl fmt::Display for ArgbColor {
 }
 
 fn parse_hex_nibble(byte: u8) -> Result<u8, String> {
-    (byte as char)
-        .to_digit(16)
-        .map(|v| v as u8)
-        .ok_or_else(|| format!("invalid hex digit {:?}", byte as char))
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!("invalid hex digit byte 0x{byte:02x}")),
+    }
 }
 
-fn parse_hex_byte(pair: &str) -> Result<u8, String> {
-    u8::from_str_radix(pair, 16).map_err(|_| format!("invalid hex byte {pair:?}"))
+fn parse_hex_byte(hi: u8, lo: u8) -> Result<u8, String> {
+    Ok((parse_hex_nibble(hi)? << 4) | parse_hex_nibble(lo)?)
 }
 
 #[cfg(test)]

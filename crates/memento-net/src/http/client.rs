@@ -18,79 +18,25 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! The blocking HTTP/1.1 client: fixed request canonicalization, redirect
-//! following with loop detection, and the byte-level streaming hook.
-//!
-//! TLS is provided by rustls using the Mozilla WebPKI root set, with normal
-//! certificate-chain and server-name validation. HTTPS is never retried as
-//! plaintext. The default transport handles both HTTP and HTTPS; custom
-//! [`Transport`] implementations remain available for other connection
-//! policies.
+//! Blocking HTTP/1.1 client backed by `ureq` (with rustls + WebPKI roots),
+//! enforcing redirect loop detection, HTTPS downgrade rejection, cross-origin
+//! credential stripping, and SSRF redirect guards.
 
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, OnceLock};
+use std::io;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
-
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use crate::error::{HttpError, HttpResult};
 
+use super::headers::Headers;
 use super::request::{Method, Request};
 use super::response::Response;
-use super::url::Url;
+use super::url::{Scheme, Url};
 
-/// A duplex socket the HTTP codec runs over.
-pub trait SingleStream: Read + Write {}
-impl<T: Read + Write> SingleStream for T {}
-
-/// Connection factory. Custom transports can replace the built-in TCP plus
-/// rustls transport when a different network policy is required.
-pub trait Transport
-{
-    /// Opens a stream to `url`'s authority. `io_timeout` (when set) applies
-    /// to both the TCP connect and every subsequent read/write.
-    fn connect(&self, url: &Url, io_timeout: Option<Duration>)
-        -> HttpResult<Box<dyn SingleStream>>;
-}
-
-/// The default transport: TCP with rustls for HTTPS and validated WebPKI roots.
-pub struct TcpTransport
-{
-    connect_timeout: Option<Duration>,
-}
-
-impl TcpTransport
-{
-    pub fn new(connect_timeout: Option<Duration>) -> Self
-    {
-        Self { connect_timeout }
-    }
-}
-
-fn tls_config() -> Arc<ClientConfig> {
-    static CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
-    // Use bundled `webpki_roots` (`rustls-native-certs` is absent from Cargo.lock
-    // so offline and reproducible builds remain self-contained).
-    Arc::clone(CLIENT_CONFIG.get_or_init(|| {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    }))
-}
-
-fn server_name(host: &str) -> HttpResult<ServerName<'static>> {
-    if let Ok(address) = host.parse::<IpAddr>() {
-        return Ok(ServerName::IpAddress(address.into()));
-    }
-    ServerName::try_from(host.to_owned())
-        .map_err(|err| HttpError::Url(format!("invalid TLS server name {host:?}: {err}")))
-}
+/// Default TCP/TLS connect timeout when none is specified.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default transfer timeout when none is specified.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn effective_connect_timeout(
     connect_timeout: Option<Duration>,
@@ -105,73 +51,10 @@ fn effective_connect_timeout(
     }
 }
 
-impl Transport for TcpTransport
-{
-    fn connect(&self, url: &Url, io_timeout: Option<Duration>) -> HttpResult<Box<dyn SingleStream>>
-    {
-        let port = url.port_or_default();
-        let addrs: Vec<SocketAddr> = (url.host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(HttpError::Io)?
-            .collect();
-        if addrs.is_empty()
-        {
-            return Err(HttpError::Io(std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                format!("could not resolve {}:{}", url.host, port),
-            )));
-        }
-
-        let mut last_err: Option<std::io::Error> = None;
-        for addr in &addrs
-        {
-            let timeout = effective_connect_timeout(self.connect_timeout, io_timeout);
-            let attempt = match timeout
-            {
-                Some(timeout) => TcpStream::connect_timeout(addr, timeout),
-                None => TcpStream::connect(addr),
-            };
-            match attempt
-            {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    if let Some(timeout) = io_timeout
-                    {
-                        stream
-                            .set_read_timeout(Some(timeout))
-                            .map_err(HttpError::Io)?;
-                        stream
-                            .set_write_timeout(Some(timeout))
-                            .map_err(HttpError::Io)?;
-                    }
-                    return match url.scheme
-                    {
-                        super::url::Scheme::Http => Ok(Box::new(stream)),
-                        super::url::Scheme::Https => {
-                            let server_name = server_name(&url.host)?;
-                            let connection = ClientConnection::new(tls_config(), server_name)
-                                .map_err(std::io::Error::other)
-                                .map_err(HttpError::Io)?;
-                            Ok(Box::new(StreamOwned::new(connection, stream)))
-                        }
-                    };
-                }
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(HttpError::Io(last_err.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "connect failed")
-        })))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct HttpClientConfig
 {
-    /// Per-operation read/write/connect cap. `None` (the default) blocks
-    /// forever, mirroring the un-timed download path in
-    /// `DownloadManager::download`; the AnkiConnect constant `5000 ms` from
-    /// `AnkiClient` lives in the `anki` module, not here.
+    /// Per-phase request/response/body timeout cap.
     pub timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub follow_redirects: bool,
@@ -185,8 +68,8 @@ impl Default for HttpClientConfig
     fn default() -> Self
     {
         Self {
-            timeout: None,
-            connect_timeout: None,
+            timeout: Some(DEFAULT_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
             follow_redirects: true,
             max_redirects: 5,
             max_header_bytes: 64 * 1024,
@@ -197,7 +80,7 @@ impl Default for HttpClientConfig
 pub struct HttpClient
 {
     config: HttpClientConfig,
-    transport: Box<dyn Transport>,
+    agent: ureq::Agent,
 }
 
 impl Default for HttpClient
@@ -212,15 +95,34 @@ impl HttpClient
 {
     pub fn new(config: HttpClientConfig) -> Self
     {
-        let transport = TcpTransport::new(config.connect_timeout);
-        Self::with_transport(config, Box::new(transport))
+        let timeout = config.timeout;
+        Self::with_phase_timeouts(config, timeout, timeout)
     }
 
-    /// Installs a custom transport, for example when an application needs
-    /// a proxy or a platform-specific connection policy.
-    pub fn with_transport(config: HttpClientConfig, transport: Box<dyn Transport>) -> Self
+    pub(crate) fn with_phase_timeouts(
+        config: HttpClientConfig,
+        response_timeout: Option<Duration>,
+        body_timeout: Option<Duration>,
+    ) -> Self
     {
-        Self { config, transport }
+        let connect_timeout =
+            effective_connect_timeout(config.connect_timeout, response_timeout.or(config.timeout));
+        let ureq_config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_response_header_size(config.max_header_bytes)
+            .max_idle_connections(0)
+            .accept_encoding("identity")
+            .user_agent(ureq::config::AutoHeaderValue::None)
+            .accept(ureq::config::AutoHeaderValue::None)
+            .timeout_connect(connect_timeout)
+            .timeout_send_request(response_timeout)
+            .timeout_send_body(body_timeout)
+            .timeout_recv_response(response_timeout)
+            .timeout_recv_body(body_timeout)
+            .build();
+        let agent = ureq::Agent::new_with_config(ureq_config);
+        Self { config, agent }
     }
 
     pub fn config(&self) -> &HttpClientConfig
@@ -228,24 +130,28 @@ impl HttpClient
         &self.config
     }
 
-    pub fn transport(&self) -> &dyn Transport
-    {
-        self.transport.as_ref()
-    }
-
-    /// Sends a request, following redirects (301/302 and non-HEAD 303 → GET,
-    /// 307/308 → same method/body) within the configured limits. Loop
+    /// Sends a request, following redirects (301/302 and non-HEAD 303 -> GET,
+    /// 307/308 -> same method/body) within the configured limits. Loop
     /// detection includes the initial request target.
     pub fn send(&self, request: &Request) -> HttpResult<Response>
     {
+        self.send_with_timeout(request, None)
+    }
+
+    pub(crate) fn send_with_timeout(
+        &self,
+        request: &Request,
+        timeout_override: Option<Option<Duration>>,
+    ) -> HttpResult<Response>
+    {
         let mut current = request.clone();
-        let started_remote = !is_local_or_loopback_host(&current.url.host);
+        let started_remote = !is_local_or_loopback_url(&current.url);
         let mut visited: Vec<String> = vec![current.url.key()];
         let mut redirects = 0usize;
 
         loop
         {
-            let response = self.send_once(&current)?;
+            let response = self.send_once_with_timeout(&current, timeout_override)?;
             if !Self::is_redirect(response.status()) || !self.config.follow_redirects
             {
                 return Ok(response);
@@ -263,106 +169,158 @@ impl HttpClient
                 .header("location")
                 .ok_or_else(|| HttpError::Protocol("redirect without Location".into()))?
                 .to_owned();
-            // The response owns the previous connection; drop it before the
-            // next exchange.
-            let next_url = current.url.resolve_relative(&location)?;
-
-            if current.url.scheme == super::url::Scheme::Https
-                && next_url.scheme == super::url::Scheme::Http
-            {
-                return Err(HttpError::Protocol(
-                    "refusing HTTPS to HTTP downgrade redirect".into(),
-                ));
-            }
-            if is_link_local_host(&next_url.host)
-                || ((started_remote || !is_local_or_loopback_host(&current.url.host))
-                    && is_restricted_redirect_target(&next_url))
-            {
-                return Err(HttpError::Protocol(format!(
-                    "refusing redirect to restricted host {:?}",
-                    next_url.host
-                )));
-            }
-
-            let next_key = next_url.key();
-            if visited.contains(&next_key)
-            {
-                return Err(HttpError::RedirectLoop);
-            }
-            visited.push(next_key);
-
-            let method = if response.status() == 303 && current.method != Method::Head
-            {
-                Method::Get
-            }
-            else if (current.method == Method::Post || current.method == Method::Put)
-                && (response.status() == 301 || response.status() == 302)
-            {
-                Method::Get
-            }
-            else
-            {
-                current.method
-            };
-
-            let body = if method == current.method
-            {
-                current.body.clone()
-            }
-            else
-            {
-                None
-            };
-            let dropped_body = current.body.is_some() && body.is_none();
-            let same_origin = same_origin(&current.url, &next_url);
-            let mut next_headers = super::headers::Headers::new();
-            for (name, value) in current.headers.iter()
-            {
-                if name.eq_ignore_ascii_case("host")
-                {
-                    continue;
-                }
-                if !same_origin
-                    && (name.eq_ignore_ascii_case("authorization")
-                        || name.eq_ignore_ascii_case("cookie"))
-                {
-                    continue;
-                }
-                if dropped_body
-                    && (name.eq_ignore_ascii_case("content-length")
-                        || name.eq_ignore_ascii_case("transfer-encoding")
-                        || name.eq_ignore_ascii_case("content-type"))
-                {
-                    continue;
-                }
-                next_headers.insert(name, value);
-            }
+            let status = response.status();
             drop(response);
 
-            current = Request {
-                method,
-                url: next_url,
-                headers: next_headers,
-                body,
-            };
+            current = prepare_redirect(&current, status, &location, started_remote, &mut visited)?;
         }
     }
 
     /// One request/response exchange, no redirects.
     pub fn send_once(&self, request: &Request) -> HttpResult<Response>
     {
-        let wire = request.canonical_wire()?;
-        let mut stream = self
-            .transport
-            .connect(&request.url, self.config.timeout)?;
-        stream.write_all(&wire).map_err(HttpError::Io)?;
-        stream.flush().map_err(HttpError::Io)?;
+        self.send_once_with_timeout(request, None)
+    }
+
+    fn send_once_with_timeout(
+        &self,
+        request: &Request,
+        timeout_override: Option<Option<Duration>>,
+    ) -> HttpResult<Response>
+    {
+        let mut builder = ureq::http::Request::builder()
+            .method(request.method.to_http())
+            .uri(request.url.as_str());
+
+        for (name, value) in request.headers.iter()
+        {
+            if name.eq_ignore_ascii_case("host") && value != request.url.host_header()
+            {
+                return Err(HttpError::Protocol(format!(
+                    "Host header {value:?} does not match URL host {:?}",
+                    request.url.host_header()
+                )));
+            }
+            if name.eq_ignore_ascii_case("content-length")
+            {
+                let declared: usize = value
+                    .parse()
+                    .map_err(|_| HttpError::Protocol("bad user Content-Length".into()))?;
+                if Some(declared) != request.body.as_ref().map(Vec::len)
+                {
+                    return Err(HttpError::Protocol(
+                        "user Content-Length does not match body length".into(),
+                    ));
+                }
+            }
+            builder = builder.header(name, value);
+        }
+
+        if !request.headers.contains("connection")
+        {
+            builder = builder.header("Connection", "keep-alive");
+        }
+
         let is_head = request.method == Method::Head;
-        Response::decode(
-            Box::new(Conn(stream)),
-            self.config.max_header_bytes,
-            is_head,
-        )
+        match request.body.as_deref()
+        {
+            Some(bytes) => self.run_http_request(builder, bytes, timeout_override, is_head),
+            None => self.run_http_request(builder, (), timeout_override, is_head),
+        }
+    }
+
+    fn run_http_request(
+        &self,
+        builder: ureq::http::request::Builder,
+        body: impl ureq::AsSendBody,
+        timeout_override: Option<Option<Duration>>,
+        is_head: bool,
+    ) -> HttpResult<Response>
+    {
+        let mut http_req = builder
+            .body(body)
+            .map_err(|err| HttpError::Protocol(err.to_string()))?;
+
+        if let Some(override_timeout) = timeout_override
+        {
+            let connect =
+                effective_connect_timeout(self.config.connect_timeout, override_timeout);
+            http_req = self
+                .agent
+                .configure_request(http_req)
+                .timeout_connect(connect)
+                .timeout_send_request(override_timeout)
+                .timeout_send_body(override_timeout)
+                .timeout_recv_response(override_timeout)
+                .timeout_recv_body(override_timeout)
+                .build();
+        }
+
+        let raw_resp = self
+            .agent
+            .run(http_req)
+            .map_err(|err| self.map_ureq_error(err))?;
+
+        Response::from_ureq(raw_resp, is_head)
+    }
+
+    fn map_ureq_error(&self, err: ureq::Error) -> HttpError
+    {
+        match err
+        {
+            ureq::Error::Io(io_err) => HttpError::Io(io_err),
+            ureq::Error::Timeout(timeout) => HttpError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("request timed out ({timeout})"),
+            )),
+            ureq::Error::HostNotFound => HttpError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "host not found",
+            )),
+            ureq::Error::ConnectionFailed => HttpError::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "connection failed",
+            )),
+            ureq::Error::ConnectProxyFailed(msg) => {
+                HttpError::Io(io::Error::other(format!("CONNECT proxy failed: {msg}")))
+            }
+            ureq::Error::Rustls(tls_err) => {
+                HttpError::Io(io::Error::other(format!("TLS error: {tls_err}")))
+            }
+            ureq::Error::Tls(msg) => HttpError::Io(io::Error::other(format!("TLS error: {msg}"))),
+            ureq::Error::Pem(pem_err) => {
+                HttpError::Io(io::Error::other(format!("TLS PEM error: {pem_err:?}")))
+            }
+            ureq::Error::TlsRequired => HttpError::TlsUnsupported,
+            ureq::Error::BadUri(msg) | ureq::Error::RequireHttpsOnly(msg) => HttpError::Url(msg),
+            ureq::Error::InvalidProxyUrl => HttpError::Url("invalid proxy URL".to_owned()),
+            ureq::Error::LargeResponseHeader(got, limit) => HttpError::Protocol(format!(
+                "header block exceeds size limit ({got} > {limit})"
+            )),
+            ureq::Error::Protocol(proto) => {
+                let msg = proto.to_string();
+                if msg.contains("http parse fail")
+                {
+                    HttpError::Protocol(format!("malformed status line or headers ({msg})"))
+                }
+                else
+                {
+                    HttpError::Protocol(msg)
+                }
+            }
+            ureq::Error::Http(http_err) => HttpError::Protocol(http_err.to_string()),
+            ureq::Error::TooManyRedirects => HttpError::TooManyRedirects {
+                limit: self.config.max_redirects,
+            },
+            ureq::Error::RedirectFailed => HttpError::Protocol("redirect failed".to_owned()),
+            ureq::Error::BodyExceedsLimit(limit) => {
+                HttpError::Protocol(format!("body exceeds size limit ({limit})"))
+            }
+            ureq::Error::StatusCode(code) => {
+                HttpError::Protocol(format!("unexpected HTTP status {code}"))
+            }
+            other => HttpError::Io(io::Error::other(other.to_string())),
+        }
     }
 
     const fn is_redirect(status: u16) -> bool
@@ -371,10 +329,99 @@ impl HttpClient
     }
 }
 
+fn prepare_redirect(
+    current: &Request,
+    status: u16,
+    location: &str,
+    started_remote: bool,
+    visited: &mut Vec<String>,
+) -> HttpResult<Request>
+{
+    let next_url = current.url.resolve_relative(location)?;
+
+    if current.url.scheme() == Scheme::Https && next_url.scheme() == Scheme::Http
+    {
+        return Err(HttpError::Protocol(
+            "refusing HTTPS to HTTP downgrade redirect".into(),
+        ));
+    }
+    if is_link_local_url(&next_url)
+        || ((started_remote || !is_local_or_loopback_url(&current.url))
+            && is_restricted_redirect_target(&next_url))
+    {
+        return Err(HttpError::Protocol(format!(
+            "refusing redirect to restricted host {:?}",
+            next_url.host_str()
+        )));
+    }
+
+    let next_key = next_url.key();
+    if visited.contains(&next_key)
+    {
+        return Err(HttpError::RedirectLoop);
+    }
+    visited.push(next_key);
+
+    let method = if status == 303 && current.method != Method::Head
+    {
+        Method::Get
+    }
+    else if (current.method == Method::Post || current.method == Method::Put)
+        && (status == 301 || status == 302)
+    {
+        Method::Get
+    }
+    else
+    {
+        current.method
+    };
+
+    let body = if method == current.method
+    {
+        current.body.clone()
+    }
+    else
+    {
+        None
+    };
+    let dropped_body = current.body.is_some() && body.is_none();
+    let same_origin = same_origin(&current.url, &next_url);
+
+    let mut next_headers = Headers::new();
+    for (name, value) in current.headers.iter()
+    {
+        if name.eq_ignore_ascii_case("host")
+        {
+            continue;
+        }
+        if !same_origin
+            && (name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("cookie"))
+        {
+            continue;
+        }
+        if dropped_body
+            && (name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("transfer-encoding")
+                || name.eq_ignore_ascii_case("content-type"))
+        {
+            continue;
+        }
+        next_headers.insert(name, value);
+    }
+
+    Ok(Request {
+        method,
+        url: next_url,
+        headers: next_headers,
+        body,
+    })
+}
+
 fn same_origin(left: &Url, right: &Url) -> bool
 {
-    left.scheme == right.scheme
-        && left.host.eq_ignore_ascii_case(&right.host)
+    left.scheme() == right.scheme()
+        && left.host_str().eq_ignore_ascii_case(right.host_str())
         && left.port_or_default() == right.port_or_default()
 }
 
@@ -411,28 +458,35 @@ fn ip_is_link_local(ip: IpAddr) -> bool
     }
 }
 
-fn is_local_or_loopback_host(host: &str) -> bool
+fn is_local_or_loopback_url(url: &Url) -> bool
 {
-    is_localhost_name(host)
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(ip_is_loopback_or_unspecified)
+    match url.host()
+    {
+        ::url::Host::Domain(domain) => is_localhost_name(domain),
+        ::url::Host::Ipv4(v4) => ip_is_loopback_or_unspecified(IpAddr::V4(v4)),
+        ::url::Host::Ipv6(v6) => ip_is_loopback_or_unspecified(IpAddr::V6(v6)),
+    }
 }
 
-fn is_link_local_host(host: &str) -> bool
+fn is_link_local_url(url: &Url) -> bool
 {
-    host.parse::<IpAddr>().is_ok_and(ip_is_link_local)
+    match url.host()
+    {
+        ::url::Host::Domain(_) => false,
+        ::url::Host::Ipv4(v4) => ip_is_link_local(IpAddr::V4(v4)),
+        ::url::Host::Ipv6(v6) => ip_is_link_local(IpAddr::V6(v6)),
+    }
 }
 
 fn is_restricted_redirect_target(url: &Url) -> bool
 {
-    if is_local_or_loopback_host(&url.host) || is_link_local_host(&url.host)
+    if is_local_or_loopback_url(url) || is_link_local_url(url)
     {
         return true;
     }
-    if url.host.parse::<IpAddr>().is_err()
+    if let ::url::Host::Domain(domain) = url.host()
     {
-        if let Ok(addrs) = (url.host.as_str(), url.port_or_default()).to_socket_addrs()
+        if let Ok(addrs) = (domain, url.port_or_default()).to_socket_addrs()
         {
             for addr in addrs
             {
@@ -447,33 +501,19 @@ fn is_restricted_redirect_target(url: &Url) -> bool
     false
 }
 
-/// Adapts the transport's boxed stream into the reader `Response::decode`
-/// consumes. Needed because two different trait objects
-/// (`Box<dyn SingleStream>` → `Box<dyn Read>`) do not coerce; this is the
-/// delegation, no unsafe.
-struct Conn(Box<dyn SingleStream>);
-
-impl Read for Conn
-{
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize>
-    {
-        self.0.read(out)
-    }
-}
-
 #[cfg(test)]
 mod tests
 {
     use super::*;
 
     #[test]
-    fn defaults_are_conservative()
+    fn defaults_are_bounded_and_conservative()
     {
         let config = HttpClientConfig::default();
         assert!(config.follow_redirects);
         assert_eq!(config.max_redirects, 5);
-        assert!(config.connect_timeout.is_none());
-        assert!(config.timeout.is_none());
+        assert_eq!(config.connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
+        assert_eq!(config.timeout, Some(DEFAULT_TIMEOUT));
         assert_eq!(config.max_header_bytes, 64 * 1024);
     }
 
@@ -485,109 +525,38 @@ mod tests
         assert!(!HttpClient::is_redirect(200));
         assert!(!HttpClient::is_redirect(304));
     }
+
     #[test]
     fn transfer_timeout_caps_tcp_connect_timeout()
     {
         let short = Duration::from_secs(5);
         let long = Duration::from_secs(10);
-        assert_eq!(effective_connect_timeout(Some(long), Some(short)), Some(short));
-        assert_eq!(effective_connect_timeout(Some(short), Some(long)), Some(short));
+        assert_eq!(
+            effective_connect_timeout(Some(long), Some(short)),
+            Some(short)
+        );
+        assert_eq!(
+            effective_connect_timeout(Some(short), Some(long)),
+            Some(short)
+        );
         assert_eq!(effective_connect_timeout(Some(long), None), Some(long));
         assert_eq!(effective_connect_timeout(None, Some(short)), Some(short));
-    }
-
-    #[derive(Clone)]
-    struct ArcScriptedTransport
-    {
-        responses: Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>,
-        captured: Arc<std::sync::Mutex<Vec<String>>>,
-        connected_hosts: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl ArcScriptedTransport
-    {
-        fn new(responses: Vec<Vec<u8>>) -> Self
-        {
-            Self {
-                responses: Arc::new(std::sync::Mutex::new(responses.into())),
-                captured: Arc::new(std::sync::Mutex::new(Vec::new())),
-                connected_hosts: Arc::new(std::sync::Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    struct ArcStream
-    {
-        captured: Arc<std::sync::Mutex<Vec<String>>>,
-        response: std::io::Cursor<Vec<u8>>,
-        written: Vec<u8>,
-    }
-
-    impl Read for ArcStream
-    {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
-        {
-            self.response.read(buf)
-        }
-    }
-
-    impl Write for ArcStream
-    {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>
-        {
-            self.written.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()>
-        {
-            if !self.written.is_empty()
-            {
-                self.captured
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&self.written).into_owned());
-                self.written.clear();
-            }
-            Ok(())
-        }
-    }
-
-    impl Transport for ArcScriptedTransport
-    {
-        fn connect(
-            &self,
-            url: &Url,
-            _io_timeout: Option<Duration>,
-        ) -> HttpResult<Box<dyn SingleStream>>
-        {
-            self.connected_hosts.lock().unwrap().push(url.host.clone());
-            let bytes = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_default();
-            Ok(Box::new(ArcStream {
-                captured: Arc::clone(&self.captured),
-                response: std::io::Cursor::new(bytes),
-                written: Vec::new(),
-            }))
-        }
     }
 
     #[test]
     fn blocks_https_to_http_downgrade_redirect()
     {
-        let transport = ArcScriptedTransport::new(vec![
-            b"HTTP/1.1 302 Found\r\nLocation: http://example.test/insecure\r\nContent-Length: 0\r\n\r\n"
-                .to_vec(),
-        ]);
-        let client = HttpClient::with_transport(HttpClientConfig::default(), Box::new(transport.clone()));
         let req = Request::get(Url::parse("https://example.test/start").unwrap());
-        let err = client.send(&req).unwrap_err();
+        let mut visited = vec![req.url.key()];
+        let err = prepare_redirect(
+            &req,
+            302,
+            "http://example.test/insecure",
+            true,
+            &mut visited,
+        )
+        .unwrap_err();
         assert!(matches!(err, HttpError::Protocol(_)));
-        assert_eq!(transport.connected_hosts.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -601,36 +570,19 @@ mod tests
             "http://169.254.169.254/latest/meta-data/",
         ]
         {
-            let raw = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n"
-            );
-            let transport = ArcScriptedTransport::new(vec![raw.into_bytes()]);
-            let client = HttpClient::with_transport(
-                HttpClientConfig::default(),
-                Box::new(transport.clone()),
-            );
             let req = Request::get(Url::parse("http://remote.example.test/file").unwrap());
-            let err = client.send(&req).unwrap_err();
+            let mut visited = vec![req.url.key()];
+            let err = prepare_redirect(&req, 302, target, true, &mut visited).unwrap_err();
             assert!(
                 matches!(err, HttpError::Protocol(_)),
                 "expected SSRF redirect block for {target}, got {err:?}"
             );
-            assert_eq!(transport.connected_hosts.lock().unwrap().len(), 1);
         }
     }
 
     #[test]
     fn strips_auth_and_cookie_on_cross_origin_redirect_and_clears_host_and_content_length()
     {
-        let transport = ArcScriptedTransport::new(vec![
-            b"HTTP/1.1 303 See Other\r\nLocation: https://other.example.test/done\r\nContent-Length: 0\r\n\r\n"
-                .to_vec(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
-        ]);
-        let client = HttpClient::with_transport(
-            HttpClientConfig::default(),
-            Box::new(transport.clone()),
-        );
         let req = Request::post(
             Url::parse("https://auth.example.test/submit").unwrap(),
             b"{}".to_vec(),
@@ -641,17 +593,23 @@ mod tests
         .header("Cookie", "session=xyz")
         .header("X-Custom", "keep");
 
-        let mut resp = client.send(&req).unwrap();
-        assert_eq!(resp.read_all(64).unwrap(), b"ok");
+        let mut visited = vec![req.url.key()];
+        let next = prepare_redirect(
+            &req,
+            303,
+            "https://other.example.test/done",
+            true,
+            &mut visited,
+        )
+        .unwrap();
 
-        let sent = transport.captured.lock().unwrap();
-        assert_eq!(sent.len(), 2);
-        let redirected = &sent[1];
-        assert!(redirected.starts_with("GET /done HTTP/1.1\r\n"));
-        assert!(redirected.contains("Host: other.example.test\r\n"));
-        assert!(!redirected.contains("Authorization"));
-        assert!(!redirected.contains("Cookie"));
-        assert!(!redirected.contains("Content-Length"));
-        assert!(redirected.contains("X-Custom: keep\r\n"));
+        assert_eq!(next.method, Method::Get);
+        assert!(next.body.is_none());
+        assert_eq!(next.url.as_str(), "https://other.example.test/done");
+        assert!(!next.headers.contains("Host"));
+        assert!(!next.headers.contains("Authorization"));
+        assert!(!next.headers.contains("Cookie"));
+        assert!(!next.headers.contains("Content-Length"));
+        assert_eq!(next.headers.get("X-Custom"), Some("keep"));
     }
 }

@@ -1,5 +1,5 @@
 import { MementoPalette } from "palette.slint";
-import { ListView, LineEdit, Button, CheckBox, ComboBox, Slider, ScrollView } from "std-widgets.slint";
+import { ActionButton } from "components/buttons.slint";
 import { SettingsWindow } from "settings.slint";
 import { AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection } from "anki_help.slint";
 import {
@@ -12,8 +12,14 @@ import {
     SubtitleWord, SubtitleLine, InteractiveSubtitleToken, SubtitleOverlayBridge,
     AssLineHitbox, AssHighlightPatch, AssRubyItem,
 } from "subtitle_overlay.slint";
+import { SubEntry, PlayerTrack, ChapterMark } from "player/types.slint";
+import { PlayerOscBar } from "player/osc_bar.slint";
+import { TopMenuBar, MenuDropdown } from "player/menu_bar.slint";
+import { SubtitleDrawerPanel } from "player/subtitle_drawer.slint";
+import { AboutModal, OpenUrlModal } from "player/modals.slint";
 
 export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection }
+export { SubEntry, PlayerTrack, ChapterMark }
 export {
     PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult, PopupLayout,
@@ -23,1521 +29,6 @@ export {
 export {
     SubtitleWord, SubtitleLine, SubtitleOverlayBridge,
     AssLineHitbox, AssHighlightPatch, AssRubyItem,
-}
-
-export struct SubEntry {
-    id: int,
-    start: float,
-    end: float,
-    text: string,
-    selected: bool,
-    is_active: bool,
-    search_match: bool,
-}
-
-export struct PlayerTrack {
-    id: int,
-    label: string,
-    selected: bool,
-}
-
-export struct ChapterMark {
-    time: float,
-    title: string,
-}
-
-// ── OSC Bottom Controls Bar ─────────────────────────────────────────────
-component PlayerOscBar inherits Rectangle {
-    in property <bool> playing: false;
-    in property <float> position: 0.0;
-    in property <float> duration: 0.0;
-    in property <float> volume: 100.0;
-    in property <float> volume-max: 100.0;
-    in property <bool> is-muted: false;
-    in property <string> current-time: "00:00";
-    in property <string> duration-time: "00:00";
-    in property <bool> is-fullscreen: false;
-    in property <bool> ocr-enabled: false;
-    in property <[float]> chapters: [];
-    in property <[ChapterMark]> chapter-marks: [];
-
-    property <bool> ocr-btn-hovered: false;
-    out property <bool> timeline-hovered: slider-touch.has-hover || slider-touch.pressed;
-    // Stored imperatively from `slider-touch` pointer events (not reactive bindings on
-    // `slider-touch.width`), so evaluating the timeline hover preview's `Text` never
-    // triggers `PlayerOscBar`'s `HorizontalLayout` and re-enters `sharedparley`'s
-    // `font_context().borrow_mut()` when `current-time` changes during a seek.
-    out property <float> hover-time: 0.0;
-    out property <length> hover-x: 0px;
-    out property <bool> is-hovered:
-        bar-touch.has-hover || p-touch.has-hover || sp-touch.has-hover
-        || rw-touch.has-hover || ff-touch.has-hover || sn-touch.has-hover
-        || slider-touch.has-hover || slider-touch.pressed
-        || vol-touch.has-hover || sub-t-touch.has-hover
-        || root.ocr-btn-hovered || fs-touch.has-hover;
-
-    function update-hover() {
-        if root.duration > 0.0 && slider-touch.width > 0px {
-            let clamped-x = max(0px, min(slider-touch.width, slider-touch.mouse-x));
-            let ratio = max(0.0, min(1.0, clamped-x / slider-touch.width));
-            root.hover-x = timeline.x + clamped-x;
-            root.hover-time = root.duration * ratio;
-        }
-    }
-
-    callback toggle-play();
-    callback seek(float);
-    callback subtitle-seek(int);
-    callback playlist-prev();
-    callback playlist-next();
-    callback toggle-mute();
-    callback volume-changed(float);
-    callback toggle-sub-list();
-    callback start-ocr();
-    callback toggle-fullscreen();
-    callback timeline-hover-moved(float);
-    callback activity();
-    callback interacted();
-
-    height: 50px;
-    background: MementoPalette.osc-bg;
-    border-radius: 8px;
-    border-width: 1px;
-    border-color: MementoPalette.border;
-    drop-shadow-blur: 12px;
-    drop-shadow-color: #00000066;
-
-    bar-touch := TouchArea {
-        pointer-event(event) => {
-            if event.kind == PointerEventKind.move { root.activity(); }
-            else if event.kind == PointerEventKind.down { root.interacted(); }
-        }
-    }
-
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 12px;
-
-        // Left transport controls
-        HorizontalLayout {
-            horizontal-stretch: 0;
-            spacing: 4px;
-            alignment: center;
-
-            // Play / Pause
-            btn-play := Rectangle {
-                width: 32px;
-                height: 32px;
-                border-radius: 4px;
-                background: p-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 16px;
-                    height: 16px;
-                    source: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
-                    colorize: MementoPalette.icon;
-                }
-                p-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.toggle-play(); }
-                }
-            }
-
-            // Previous playlist item
-            Rectangle {
-                width: 30px;
-                height: 30px;
-                border-radius: 4px;
-                background: sp-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 14px;
-                    height: 14px;
-                    source: @image-url("icons/skip-previous.svg");
-                    colorize: MementoPalette.icon;
-                }
-                sp-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.playlist-prev(); }
-                }
-            }
-
-            // Previous subtitle cue
-            Rectangle {
-                width: 30px;
-                height: 30px;
-                border-radius: 4px;
-                background: rw-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 14px;
-                    height: 14px;
-                    source: @image-url("icons/fast-rewind.svg");
-                    colorize: MementoPalette.icon;
-                }
-                rw-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.subtitle-seek(-1); }
-                }
-            }
-
-            // Next subtitle cue
-            Rectangle {
-                width: 30px;
-                height: 30px;
-                border-radius: 4px;
-                background: ff-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 14px;
-                    height: 14px;
-                    source: @image-url("icons/fast-forward.svg");
-                    colorize: MementoPalette.icon;
-                }
-                ff-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.subtitle-seek(1); }
-                }
-            }
-
-            // Next playlist item
-            Rectangle {
-                width: 30px;
-                height: 30px;
-                border-radius: 4px;
-                background: sn-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 14px;
-                    height: 14px;
-                    source: @image-url("icons/skip-next.svg");
-                    colorize: MementoPalette.icon;
-                }
-                sn-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.playlist-next(); }
-                }
-            }
-
-            // Current Time label
-            Text {
-                text: root.current-time;
-                font-size: 12px;
-                color: MementoPalette.text;
-                vertical-alignment: center;
-                min-width: 45px;
-            }
-        }
-
-        // Center: Segmented Timeline Slider
-        timeline := Rectangle {
-            height: 24px;
-            horizontal-stretch: 1;
-            min-width: 120px;
-
-            track := Rectangle {
-                y: (parent.height - self.height) / 2;
-                width: parent.width;
-                height: 6px;
-                border-radius: 3px;
-                background: MementoPalette.dark ? #3E3E4C : #CBD5E1;
-
-                // Cyan Progress Bar
-                progress-fill := Rectangle {
-                    x: 0;
-                    y: 0;
-                    width: max(0px, min(parent.width, parent.width * (root.position / max(1.0, root.duration))));
-                    height: parent.height;
-                    border-radius: 3px;
-                    background: MementoPalette.cyan-accent;
-                }
-
-                // Chapter tick marks
-                for ch-time in root.chapters : Rectangle {
-                    visible: root.duration > 0.0 && ch-time > 0.0 && ch-time < root.duration;
-                    x: parent.width * (ch-time / max(1.0, root.duration));
-                    y: 0px;
-                    width: 2px;
-                    height: parent.height;
-                    background: MementoPalette.window-bg;
-                }
-
-                // White Scrubber Knob
-                if root.duration > 0.0 : Rectangle {
-                    x: max(0px, min(parent.width - 12px, progress-fill.width - 6px));
-                    y: (parent.height - 12px) / 2;
-                    width: 12px;
-                    height: 12px;
-                    border-radius: 6px;
-                    background: #FFFFFF;
-                    drop-shadow-blur: 4px;
-                    drop-shadow-color: #00000088;
-                }
-            }
-
-            slider-touch := TouchArea {
-                width: 100%;
-                height: 100%;
-                mouse-cursor: pointer;
-                changed has-hover => {
-                    if self.has-hover && root.duration > 0.0 && self.width > 0px {
-                        root.update-hover();
-                        root.timeline-hover-moved(root.hover-time);
-                    }
-                }
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move {
-                        root.activity();
-                        if root.duration > 0.0 && self.width > 0px {
-                            root.update-hover();
-                            root.timeline-hover-moved(root.hover-time);
-                        }
-                    } else if event.kind == PointerEventKind.down {
-                        root.interacted();
-                        root.update-hover();
-                    }
-                }
-                moved => {
-                    if root.duration > 0.0 && self.width > 0px {
-                        root.update-hover();
-                        root.timeline-hover-moved(root.hover-time);
-                        if (self.pressed) {
-                            root.seek(root.hover-time);
-                        }
-                    }
-                }
-                clicked => {
-                    if root.duration > 0.0 && self.width > 0px {
-                        root.update-hover();
-                        root.seek(root.hover-time);
-                    }
-                }
-            }
-        }
-
-        // Right: Remaining time, Volume, Subtitle Drawer, Fullscreen
-        HorizontalLayout {
-            horizontal-stretch: 0;
-            spacing: 8px;
-            alignment: center;
-
-            // Duration label
-            Text {
-                text: root.duration-time;
-                font-size: 12px;
-                color: MementoPalette.text;
-                vertical-alignment: center;
-            }
-
-            // Volume Icon / Mute Toggle Button
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 4px;
-                background: vol-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 16px;
-                    height: 16px;
-                    source: (!root.is-muted && root.volume > 0.0) ? @image-url("icons/volume-on.svg") : @image-url("icons/volume-off.svg");
-                    colorize: MementoPalette.icon;
-                }
-                vol-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.toggle-mute(); }
-                }
-            }
-
-            // Mini Volume Slider (supports >100% boost via volume-max)
-            Slider {
-                width: 70px;
-                minimum: 0.0;
-                maximum: max(100.0, root.volume-max);
-                value: root.is-muted ? 0.0 : root.volume;
-                changed(val) => { root.interacted(); root.activity(); root.volume-changed(val); }
-            }
-
-            // Volume % Label
-            Text {
-                text: (root.is-muted ? 0 : round(root.volume)) + "%";
-                font-size: 11px;
-                color: MementoPalette.text-secondary;
-                vertical-alignment: center;
-                min-width: 36px;
-            }
-
-            // Subtitle Drawer Toggle Button
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 4px;
-                background: sub-t-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 16px;
-                    height: 16px;
-                    source: @image-url("icons/list.svg");
-                    colorize: MementoPalette.icon;
-                }
-                sub-t-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.toggle-sub-list(); }
-                }
-            }
-
-            if root.ocr-enabled : Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 4px;
-                background: ocr-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 16px;
-                    height: 16px;
-                    source: @image-url("icons/eye.svg");
-                    colorize: MementoPalette.icon;
-                }
-                ocr-touch := TouchArea {
-                    changed has-hover => { root.ocr-btn-hovered = self.has-hover; }
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.start-ocr(); }
-                }
-            }
-
-            // Fullscreen Toggle Button
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                border-radius: 4px;
-                background: fs-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                Image {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    width: 15px;
-                    height: 15px;
-                    source: root.is-fullscreen ? @image-url("icons/fullscreen-exit.svg") : @image-url("icons/fullscreen.svg");
-                    colorize: MementoPalette.icon;
-                }
-                fs-touch := TouchArea {
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.activity(); }
-                        else if event.kind == PointerEventKind.down { root.interacted(); }
-                    }
-                    clicked => { root.toggle-fullscreen(); }
-                }
-            }
-        }
-    }
-}
-
-// ── Subtitle Drawer Panel ───────────────────────────────────────────────
-component SubtitleDrawerPanel inherits Rectangle {
-    // A hidden drawer must not reserve space in the window layout.
-    min-height: 0px;
-    in property <[SubEntry]> entries;
-    in property <[SubEntry]> secondary-entries: [];
-    in property <bool> has-secondary: false;
-    in-out property <int> active-tab: 0; // 0: Primary, 1: Secondary
-    in-out property <string> search-text: "";
-    in property <int> current-match: 0;
-    in property <int> total-matches: 0;
-    in property <int> focused-match-row: -1;
-    in-out property <bool> show-timestamps: false;
-    in-out property <bool> ignore-whitespace: false;
-    in-out property <bool> auto-seek: false;
-    in property <color> bg-color: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
-    in property <color> text-color: MementoPalette.text;
-    in property <color> hover-color: MementoPalette.list-hover;
-    in property <color> selected-color: #1E2D3D;
-    in property <color> selected-hover-color: #2A3B4C;
-    in property <string> primary-font-family: "";
-    in property <length> primary-font-size: 13px;
-    in property <bool> primary-font-bold: false;
-    in property <bool> primary-font-italic: false;
-    in property <string> secondary-font-family: "";
-    in property <length> secondary-font-size: 13px;
-    in property <bool> secondary-font-bold: false;
-    in property <bool> secondary-font-italic: false;
-    in-out property <bool> user-scrolling: false;
-    property <bool> programmatic-scroll: false;
-    out property <length> viewport-y: sub-list-view.viewport-y;
-    out property <bool> is-hovered:
-        drawer-bg-touch.has-hover
-        || prim-tab-touch.has-hover
-        || sec-tab-touch.has-hover
-        || time-toggle-touch.has-hover
-        || prev-m-touch.has-hover
-        || next-m-touch.has-hover
-        || ignore-ws-touch.has-hover
-        || auto-seek-touch.has-hover;
-
-    pure callback format-timestamp(float) -> string;
-    callback row-clicked(int, bool);
-    callback range-dragged(int, int, bool);
-    callback row-activated(int, float);
-    callback search-changed(string);
-    callback next-match();
-    callback prev-match();
-    callback tab-changed(int);
-    callback toggle-timestamps(bool);
-    callback ignore-whitespace-changed(bool);
-    callback auto-seek-changed(bool);
-    callback scroll-to-row(int);
-    callback scroll-to-offset(length, length, length);
-    callback focus-search();
-    callback user-scrolled();
-
-    scroll-to-offset(row-y, row-h, total-h) => {
-        let view-h = sub-list-view.visible-height > 0px
-            ? sub-list-view.visible-height
-            : max(200px, root.height - 112px);
-        let content-h = max(total-h, sub-list-view.viewport-height);
-        root.programmatic-scroll = true;
-        if content-h > view-h {
-            let target = -(row-y - (view-h - row-h) / 2);
-            let min-y = min(0px, view-h - content-h);
-            sub-list-view.viewport-y = max(min-y, min(0px, target));
-        } else {
-            sub-list-view.viewport-y = 0px;
-        }
-        root.programmatic-scroll = false;
-    }
-
-    scroll-to-row(row-idx) => {
-        let count = root.active-tab == 1 ? root.secondary-entries.length : root.entries.length;
-        if row-idx >= 0 && count > 0 {
-            let avg-row-h = sub-list-view.viewport-height > count * 24px
-                ? (sub-list-view.viewport-height / count)
-                : 24px;
-            root.scroll-to-offset(row-idx * avg-row-h, avg-row-h, count * avg-row-h);
-        }
-    }
-
-    focus-search => {
-        search-input.focus();
-        search-input.select-all();
-    }
-
-    background: root.bg-color;
-    border-width: 1px;
-    border-color: MementoPalette.border;
-
-    drawer-bg-touch := TouchArea {
-        width: 100%;
-        height: 100%;
-
-        VerticalLayout {
-            padding: 10px;
-            spacing: 8px;
-
-            // Top 28px header: Primary / Secondary Tabs + Inline Timestamps Toggle Pill
-            HorizontalLayout {
-                height: 28px;
-                spacing: 6px;
-
-                Rectangle {
-                    horizontal-stretch: 1;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: root.active-tab == 0
-                        ? root.selected-color
-                        : (prim-tab-touch.has-hover ? root.hover-color : transparent);
-                    border-width: 1px;
-                    border-color: root.active-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border;
-                    Text {
-                        text: "Primary";
-                        font-size: 12px;
-                        font-weight: root.active-tab == 0 ? 700 : 500;
-                        color: root.text-color;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    prim-tab-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            if root.active-tab != 0 {
-                                root.user-scrolling = false;
-                                root.active-tab = 0;
-                                root.tab-changed(0);
-                            }
-                        }
-                    }
-                }
-
-                Rectangle {
-                    horizontal-stretch: 1;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: root.active-tab == 1
-                        ? root.selected-color
-                        : (sec-tab-touch.has-hover ? root.hover-color : transparent);
-                    border-width: 1px;
-                    border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
-                    opacity: root.has-secondary || root.secondary-entries.length > 0 ? 1.0 : 0.65;
-                    Text {
-                        text: "Secondary";
-                        font-size: 12px;
-                        font-weight: root.active-tab == 1 ? 700 : 500;
-                        color: root.text-color;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    sec-tab-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            if root.active-tab != 1 {
-                                root.user-scrolling = false;
-                                root.active-tab = 1;
-                                root.tab-changed(1);
-                            }
-                        }
-                    }
-                }
-
-                // Inline toggle pill for showing/hiding cue timestamps
-                Rectangle {
-                    width: 60px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: root.show-timestamps
-                        ? root.selected-color
-                        : (time-toggle-touch.has-hover ? root.hover-color : transparent);
-                    border-width: 1px;
-                    border-color: root.show-timestamps ? MementoPalette.cyan-accent : MementoPalette.border;
-                    accessible-role: checkbox;
-                    accessible-label: "Show timestamps";
-                    accessible-checked: root.show-timestamps;
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 4px;
-                        padding-left: 6px;
-                        padding-right: 6px;
-                        VerticalLayout {
-                            alignment: center;
-                            Rectangle {
-                                width: 6px;
-                                height: 6px;
-                                border-radius: 3px;
-                                background: root.show-timestamps
-                                    ? MementoPalette.cyan-accent
-                                    : MementoPalette.text-muted;
-                            }
-                        }
-                        Text {
-                            text: "Time";
-                            font-size: 11px;
-                            font-weight: root.show-timestamps ? 700 : 500;
-                            color: root.text-color;
-                            vertical-alignment: center;
-                        }
-                    }
-                    time-toggle-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.show-timestamps = !root.show-timestamps;
-                            root.toggle-timestamps(root.show-timestamps);
-                        }
-                    }
-                }
-            }
-
-            // Subtitle Cues List (starts at y = 30 + 10 + 28 + 8 = 76px)
-            sub-list-view := ListView {
-                vertical-stretch: 1;
-                // Mouse dragging marks subtitles; scrolling uses the wheel or bar.
-                mouse-drag-pan-enabled: false;
-                scrolled => {
-                    if !root.programmatic-scroll {
-                        root.user-scrolling = true;
-                        root.user-scrolled();
-                    }
-                }
-                for entry[idx] in (root.active-tab == 1 ? root.secondary-entries : root.entries) : sub-cue-row := Rectangle {
-                    height: max(24px, cue-text.preferred-height + 6px);
-                    border-radius: 3px;
-                    border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
-                    border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : #C29D4B;
-                    background: entry.selected
-                        ? (d-touch.has-hover ? root.selected-hover-color : root.selected-color)
-                        : (entry.is_active
-                            ? #134E4A
-                            : (d-touch.has-hover ? root.hover-color : transparent));
-
-                    // Subtle row separation hairline
-                    if idx > 0 && !entry.selected && !entry.is_active && !entry.search-match : Rectangle {
-                        x: 8px;
-                        y: 0px;
-                        width: parent.width - 16px;
-                        height: 1px;
-                        background: MementoPalette.border;
-                        opacity: 0.45;
-                    }
-
-                    // Emerald indicator for active playing cue
-                    if entry.is_active : Rectangle {
-                        x: 2px;
-                        y: 3px;
-                        width: 3px;
-                        height: parent.height - 6px;
-                        background: MementoPalette.active-cue;
-                        border-radius: 1.5px;
-                    }
-
-                    HorizontalLayout {
-                        width: parent.width;
-                        height: parent.height;
-                        padding-left: 8px;
-                        padding-right: 8px;
-                        padding-top: 3px;
-                        padding-bottom: 3px;
-                        spacing: 8px;
-                        alignment: start;
-
-                        // Timecode (omitted completely when `show-timestamps` is false so cue text gets full width)
-                        if root.show-timestamps : Text {
-                            width: 50px;
-                            horizontal-alignment: left;
-                            vertical-alignment: center;
-                            font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
-                            font-weight: 600;
-                            color: entry.selected ? #6EE7B7 : root.text-color;
-                            opacity: entry.selected ? 1.0 : 0.72;
-                            text: root.format-timestamp(entry.start);
-                        }
-
-                        // Wrapped Multi-Line Cue Text
-                        cue-text := Text {
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            font-family: root.active-tab == 1 ? root.secondary-font-family : root.primary-font-family;
-                            font-size: root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size;
-                            font-weight: entry.is_active
-                                ? 700
-                                : ((root.active-tab == 1 ? root.secondary-font-bold : root.primary-font-bold) ? 700 : 400);
-                            font-italic: root.active-tab == 1 ? root.secondary-font-italic : root.primary-font-italic;
-                            color: root.text-color;
-                            wrap: word-wrap;
-                            text: entry.text;
-                        }
-                    }
-
-                    d-touch := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        mouse-cursor: pointer;
-                        property <bool> extend-range: false;
-                        property <bool> dragging-range: false;
-                        property <int> drag-end: -1;
-                        scroll-event(event) => {
-                            root.user-scrolling = true;
-                            root.user-scrolled();
-                            return EventResult.reject;
-                        }
-                        pointer-event(event) => {
-                            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
-                                self.extend-range = event.modifiers.shift;
-                                self.dragging-range = false;
-                                self.drag-end = idx;
-                            }
-                        }
-                        moved => {
-                            if self.pressed && root.active-tab == 0 {
-                                // TouchArea keeps the pointer grab outside its row.
-                                let end = min(root.entries.length - 1, max(0, idx + floor(self.mouse-y / self.height)));
-                                if end != self.drag-end {
-                                    root.user-scrolling = true;
-                                    root.user-scrolled();
-                                    root.range-dragged(idx, end, !self.dragging-range);
-                                    self.dragging-range = true;
-                                    self.drag-end = end;
-                                }
-                            }
-                        }
-                        clicked => {
-                            if !self.dragging-range && root.active-tab == 0 {
-                                root.row-clicked(idx, self.extend-range);
-                            }
-                        }
-                        double-clicked => {
-                            if !self.dragging-range {
-                                root.user-scrolling = false;
-                                root.row-activated(idx, entry.start);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Bottom Search Bar + X of Y Counter + Up/Down Navigation + Search Options
-            VerticalLayout {
-                spacing: 6px;
-
-                HorizontalLayout {
-                    height: 30px;
-                    spacing: 6px;
-                    alignment: center;
-
-                    search-input := LineEdit {
-                        horizontal-stretch: 1;
-                        placeholder-text: "Search subtitles (Ctrl+F)…";
-                        text <=> root.search-text;
-                        edited(val) => { root.search-changed(val); }
-                        accepted => { root.next-match(); }
-                    }
-
-                    if root.search-text != "" : Text {
-                        text: root.total-matches > 0
-                            ? (root.current-match + " of " + root.total-matches)
-                            : "0 of 0";
-                        font-size: 11px;
-                        color: root.text-color;
-                        opacity: 0.78;
-                        vertical-alignment: center;
-                        min-width: 44px;
-                        horizontal-alignment: center;
-                    }
-
-                    Rectangle {
-                        width: 24px;
-                        height: 24px;
-                        border-radius: 4px;
-                        background: prev-m-touch.has-hover ? root.hover-color : transparent;
-                        Image {
-                            x: 4px;
-                            y: 4px;
-                            width: 16px;
-                            height: 16px;
-                            source: @image-url("icons/arrow-up.svg");
-                            colorize: root.text-color;
-                        }
-                        prev-m-touch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.prev-match(); }
-                        }
-                    }
-
-                    Rectangle {
-                        width: 24px;
-                        height: 24px;
-                        border-radius: 4px;
-                        background: next-m-touch.has-hover ? root.hover-color : transparent;
-                        Image {
-                            x: 4px;
-                            y: 4px;
-                            width: 16px;
-                            height: 16px;
-                            source: @image-url("icons/arrow-down.svg");
-                            colorize: root.text-color;
-                        }
-                        next-m-touch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.next-match(); }
-                        }
-                    }
-                }
-
-                // Ignore Whitespace & Auto Seek search checkboxes
-                HorizontalLayout {
-                    height: 22px;
-                    spacing: 12px;
-                    alignment: start;
-
-                    Rectangle {
-                        height: 22px;
-                        width: ignore-ws-row.preferred-width + 8px;
-                        border-radius: 4px;
-                        background: ignore-ws-touch.has-hover ? root.hover-color : transparent;
-                        accessible-role: checkbox;
-                        accessible-label: "Ignore Whitespace";
-                        accessible-checked: root.ignore-whitespace;
-                        ignore-ws-row := HorizontalLayout {
-                            x: 4px;
-                            height: 100%;
-                            spacing: 6px;
-                            alignment: start;
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 14px;
-                                    height: 14px;
-                                    border-radius: 3px;
-                                    border-width: 1px;
-                                    border-color: root.ignore-whitespace ? MementoPalette.cyan-accent : MementoPalette.border-light;
-                                    background: root.ignore-whitespace ? MementoPalette.cyan-accent : transparent;
-                                    if root.ignore-whitespace : Text {
-                                        text: "✓";
-                                        font-size: 10px;
-                                        font-weight: 700;
-                                        color: #000000;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
-                            Text {
-                                text: "Ignore Whitespace";
-                                font-size: 11px;
-                                color: root.text-color;
-                                opacity: 0.9;
-                                vertical-alignment: center;
-                            }
-                        }
-                        ignore-ws-touch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.ignore-whitespace = !root.ignore-whitespace;
-                                root.ignore-whitespace-changed(root.ignore-whitespace);
-                            }
-                        }
-                    }
-
-                    Rectangle {
-                        height: 22px;
-                        width: auto-seek-row.preferred-width + 8px;
-                        border-radius: 4px;
-                        background: auto-seek-touch.has-hover ? root.hover-color : transparent;
-                        accessible-role: checkbox;
-                        accessible-label: "Auto Seek";
-                        accessible-checked: root.auto-seek;
-                        auto-seek-row := HorizontalLayout {
-                            x: 4px;
-                            height: 100%;
-                            spacing: 6px;
-                            alignment: start;
-                            VerticalLayout {
-                                alignment: center;
-                                Rectangle {
-                                    width: 14px;
-                                    height: 14px;
-                                    border-radius: 3px;
-                                    border-width: 1px;
-                                    border-color: root.auto-seek ? MementoPalette.cyan-accent : MementoPalette.border-light;
-                                    background: root.auto-seek ? MementoPalette.cyan-accent : transparent;
-                                    if root.auto-seek : Text {
-                                        text: "✓";
-                                        font-size: 10px;
-                                        font-weight: 700;
-                                        color: #000000;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
-                            Text {
-                                text: "Auto Seek";
-                                font-size: 11px;
-                                color: root.text-color;
-                                opacity: 0.9;
-                                vertical-alignment: center;
-                            }
-                        }
-                        auto-seek-touch := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.auto-seek = !root.auto-seek;
-                                root.auto-seek-changed(root.auto-seek);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── Top Native Menu Bar ─────────────────────────────────────────────────
-component TopMenuBar inherits Rectangle {
-    in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
-    out property <bool> is-hovered:
-        top-touch.has-hover || m0-t.has-hover || m1-t.has-hover
-        || m2-t.has-hover || m3-t.has-hover || m4-t.has-hover;
-    callback activity();
-    callback interacted();
-
-    height: 30px;
-    background: MementoPalette.surface-bg;
-    border-color: MementoPalette.border;
-
-    top-touch := TouchArea {
-        pointer-event(event) => {
-            if event.kind == PointerEventKind.move { root.activity(); }
-            else if event.kind == PointerEventKind.down { root.interacted(); }
-        }
-    }
-
-    HorizontalLayout {
-        padding-left: 8px;
-        spacing: 2px;
-        alignment: start;
-
-        // Media
-        m0 := Rectangle {
-            width: 56px;
-            height: 26px;
-            border-radius: 4px;
-            background: root.open-menu == 0 ? MementoPalette.active-bg : (m0-t.has-hover ? MementoPalette.hover-bg : transparent);
-            Text {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                text: "Media";
-                font-size: 12px;
-                color: MementoPalette.text;
-            }
-            m0-t := TouchArea {
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
-                }
-                clicked => { root.open-menu = root.open-menu == 0 ? -1 : 0; }
-            }
-        }
-
-        // Audio
-        m1 := Rectangle {
-            width: 56px;
-            height: 26px;
-            border-radius: 4px;
-            background: root.open-menu == 1 ? MementoPalette.active-bg : (m1-t.has-hover ? MementoPalette.hover-bg : transparent);
-            Text {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                text: "Audio";
-                font-size: 12px;
-                color: MementoPalette.text;
-            }
-            m1-t := TouchArea {
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
-                }
-                clicked => { root.open-menu = root.open-menu == 1 ? -1 : 1; }
-            }
-        }
-
-        // Subtitle
-        m2 := Rectangle {
-            width: 66px;
-            height: 26px;
-            border-radius: 4px;
-            background: root.open-menu == 2 ? MementoPalette.active-bg : (m2-t.has-hover ? MementoPalette.hover-bg : transparent);
-            Text {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                text: "Subtitle";
-                font-size: 12px;
-                color: MementoPalette.text;
-            }
-            m2-t := TouchArea {
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
-                }
-                clicked => { root.open-menu = root.open-menu == 2 ? -1 : 2; }
-            }
-        }
-
-        // Tools
-        m3 := Rectangle {
-            width: 56px;
-            height: 26px;
-            border-radius: 4px;
-            background: root.open-menu == 3 ? MementoPalette.active-bg : (m3-t.has-hover ? MementoPalette.hover-bg : transparent);
-            Text {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                text: "Tools";
-                font-size: 12px;
-                color: MementoPalette.text;
-            }
-            m3-t := TouchArea {
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
-                }
-                clicked => { root.open-menu = root.open-menu == 3 ? -1 : 3; }
-            }
-        }
-
-        // Settings
-        m4 := Rectangle {
-            width: 68px;
-            height: 26px;
-            border-radius: 4px;
-            background: root.open-menu == 4 ? MementoPalette.active-bg : (m4-t.has-hover ? MementoPalette.hover-bg : transparent);
-            Text {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                text: "Settings";
-                font-size: 12px;
-                color: MementoPalette.text;
-            }
-            m4-t := TouchArea {
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.activity(); }
-                    else if event.kind == PointerEventKind.down { root.interacted(); }
-                }
-                clicked => { root.open-menu = root.open-menu == 4 ? -1 : 4; }
-            }
-        }
-    }
-}
-
-// ── Dropdown Menu Item ──────────────────────────────────────────────────
-component DropdownItem inherits Rectangle {
-    in property <string> text: "";
-    in property <string> shortcut: "";
-    in property <bool> checkable: false;
-    in property <bool> checked: false;
-    in property <bool> has-submenu: false;
-    in property <bool> is-disabled: false;
-    callback clicked();
-
-    height: 30px;
-    border-radius: 4px;
-    background: root.is-disabled ? transparent : (touch.has-hover ? MementoPalette.hover-bg : transparent);
-
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 8px;
-        alignment: space-between;
-
-        HorizontalLayout {
-            spacing: 6px;
-            alignment: start;
-            horizontal-stretch: 1;
-
-            if root.checkable : Text {
-                width: 14px;
-                text: root.checked ? "✓" : "";
-                font-size: 11px;
-                font-weight: 700;
-                color: MementoPalette.cyan-accent;
-                vertical-alignment: center;
-            }
-
-            Text {
-                text: root.text;
-                font-size: 12px;
-                color: root.is-disabled ? MementoPalette.text-muted : MementoPalette.text;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-        }
-
-        HorizontalLayout {
-            spacing: 6px;
-            alignment: end;
-
-            if root.shortcut != "" : Text {
-                text: root.shortcut;
-                font-size: 11px;
-                color: MementoPalette.text-secondary;
-                vertical-alignment: center;
-            }
-
-            if root.has-submenu : Text {
-                text: "›";
-                font-size: 14px;
-                font-weight: 700;
-                color: MementoPalette.text-secondary;
-                vertical-alignment: center;
-            }
-        }
-    }
-
-    touch := TouchArea {
-        enabled: !root.is-disabled;
-        mouse-cursor: root.is-disabled ? default : pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
-// ── Dropdown Menu Separator ─────────────────────────────────────────────
-component DropdownSeparator inherits Rectangle {
-    height: 9px;
-    Rectangle {
-        y: 4px;
-        height: 1px;
-        background: MementoPalette.border;
-    }
-}
-
-// ── Dropdown Menus Overlay ──────────────────────────────────────────────
-component MenuDropdown inherits Rectangle {
-    in property <int> menu-index: -1;
-    in-out property <int> submenu-index: -1; // 0 Recent, 1 Size/Position, 2 Secondary, 3 Primary, 4 Anki profile
-    in property <[PlayerTrack]> audio-tracks: [];
-    in property <[PlayerTrack]> subtitle-tracks: [];
-    in property <[string]> recent-files: [];
-    in property <[string]> recent-file-labels: [];
-    in property <[string]> anki-profiles: [];
-    in property <int> audio-id: 0;
-    in property <int> primary-sid: 0;
-    in property <int> secondary-sid: 0;
-    in property <string> anki-profile: "";
-    in property <bool> anki-enabled: false;
-    in property <bool> asr-enabled: false;
-    in property <bool> furigana-enabled: false;
-    in property <bool> asr-running: false;
-    in property <bool> asr-track-selected: false;
-    in property <bool> ocr-enabled: false;
-    in property <bool> auto-pause: false;
-    in property <bool> subtitles-visible: true;
-    in property <bool> furigana-visible: false;
-    in property <string> key-open-file: "";
-    in property <string> key-open-url: "";
-    in property <string> key-show-search: "";
-    in property <string> key-show-sub-list: "";
-    in property <string> key-start-ocr: "";
-    in property <string> key-sub-auto-pause: "";
-    in property <string> key-sub-show: "";
-    in property <string> key-sub-furigana: "";
-    in property <string> key-sub-increase-size: "";
-    in property <string> key-sub-decrease-size: "";
-    in property <string> key-sub-move-up: "";
-    in property <string> key-sub-move-down: "";
-
-    callback open-file();
-    callback open-url();
-    callback add-subtitle();
-    callback open-recent(string);
-    callback clear-recent();
-    callback select-audio-track(int);
-    callback select-subtitle-track(int);
-    callback select-secondary-subtitle-track(int);
-    callback select-asr();
-    callback auto-pause-changed(bool);
-    callback adjust-subtitle-scale(float);
-    callback adjust-subtitle-offset(float);
-    callback subtitles-visible-changed(bool);
-    callback furigana-visible-changed(bool);
-    callback toggle-search();
-    callback toggle-sub-drawer();
-    callback start-ocr();
-    callback open-options();
-    callback open-config();
-    callback check-updates();
-    callback show-about();
-    callback select-anki-profile(string);
-    callback close-menu();
-
-    changed menu-index => { root.submenu-index = -1; }
-
-    visible: root.menu-index >= 0;
-    x: root.menu-index == 0 ? 8px :
-       root.menu-index == 1 ? 66px :
-       root.menu-index == 2 ? 124px :
-       root.menu-index == 3 ? 192px : 250px;
-    y: 30px;
-    width: root.menu-index == 1 ? (root.audio-tracks.length > 0 ? 210px : 140px) :
-           root.menu-index == 2 ? 220px :
-           root.menu-index == 3 ? 180px : 200px;
-    height: menu-content.preferred-height;
-    background: MementoPalette.card-bg;
-    border-width: 1px;
-    border-color: MementoPalette.border;
-    border-radius: 6px;
-    drop-shadow-blur: 16px;
-    drop-shadow-color: #00000088;
-
-    menu-content := VerticalLayout {
-        padding: 6px;
-        spacing: 2px;
-
-        // Media: recent files are the only submenu; their paths stay intact.
-        if root.menu-index == 0 : VerticalLayout {
-            spacing: 2px;
-            DropdownItem {
-                text: "Open File…";
-                shortcut: root.key-open-file;
-                clicked => { root.open-file(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Open URL…";
-                shortcut: root.key-open-url;
-                clicked => { root.open-url(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Recent";
-                has-submenu: true;
-                is-disabled: root.recent-files.length == 0;
-                clicked => { root.submenu-index = root.submenu-index == 0 ? -1 : 0; }
-            }
-        }
-
-        // Audio tracks, including the mpv "None" track (SID 0).
-        if root.menu-index == 1 : VerticalLayout {
-            spacing: 2px;
-            DropdownItem {
-                text: "None";
-                checkable: true;
-                checked: root.audio-id == 0;
-                clicked => { root.select-audio-track(0); root.close-menu(); }
-            }
-            for track[index] in root.audio-tracks : DropdownItem {
-                text: track.label;
-                checkable: true;
-                checked: track.id == root.audio-id;
-                clicked => { root.select-audio-track(track.id); root.close-menu(); }
-            }
-        }
-
-        // Subtitle controls plus independently selectable primary/secondary tracks.
-        if root.menu-index == 2 : VerticalLayout {
-            spacing: 2px;
-            DropdownItem {
-                text: "Auto Pause";
-                shortcut: root.key-sub-auto-pause;
-                checkable: true;
-                checked: root.auto-pause;
-                clicked => { root.auto-pause-changed(!root.auto-pause); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Size and Position";
-                has-submenu: true;
-                clicked => { root.submenu-index = root.submenu-index == 1 ? -1 : 1; }
-            }
-            DropdownSeparator {}
-            DropdownItem {
-                text: "Show Subtitles";
-                shortcut: root.key-sub-show;
-                checkable: true;
-                checked: root.subtitles-visible;
-                clicked => { root.subtitles-visible-changed(!root.subtitles-visible); root.close-menu(); }
-            }
-            if root.furigana-enabled : DropdownItem {
-                text: "Show Furigana";
-                shortcut: root.key-sub-furigana;
-                checkable: true;
-                checked: root.furigana-visible;
-                clicked => { root.furigana-visible-changed(!root.furigana-visible); root.close-menu(); }
-            }
-            DropdownSeparator {}
-            DropdownItem {
-                text: "Add Subtitle…";
-                clicked => { root.add-subtitle(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Second Track";
-                has-submenu: true;
-                clicked => { root.submenu-index = root.submenu-index == 2 ? -1 : 2; }
-            }
-            DropdownItem {
-                text: "Primary Track";
-                has-submenu: true;
-                clicked => { root.submenu-index = root.submenu-index == 3 ? -1 : 3; }
-            }
-        }
-
-        // Search, subtitle list, and OCR are the only real Tools actions.
-        if root.menu-index == 3 : VerticalLayout {
-            spacing: 2px;
-            DropdownItem {
-                text: "Show Search";
-                shortcut: root.key-show-search;
-                clicked => { root.toggle-search(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Show Subtitle List";
-                shortcut: root.key-show-sub-list;
-                clicked => { root.toggle-sub-drawer(); root.close-menu(); }
-            }
-            if root.ocr-enabled : DropdownItem {
-                text: "Start OCR";
-                shortcut: root.key-start-ocr;
-                clicked => { root.start-ocr(); root.close-menu(); }
-            }
-        }
-
-        // Settings: profiles are model-driven and update actions are delegated.
-        if root.menu-index == 4 : VerticalLayout {
-            spacing: 2px;
-            if root.anki-enabled : DropdownItem {
-                text: "Anki Profile";
-                has-submenu: true;
-                clicked => { root.submenu-index = root.submenu-index == 4 ? -1 : 4; }
-            }
-            DropdownItem {
-                text: "Options…";
-                shortcut: "Ctrl+,";
-                clicked => { root.open-options(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Open Config";
-                clicked => { root.open-config(); root.close-menu(); }
-            }
-            DropdownItem {
-                text: "Check for Updates";
-                clicked => { root.check-updates(); root.close-menu(); }
-            }
-            DropdownSeparator {}
-            DropdownItem {
-                text: "About Memento";
-                clicked => { root.show-about(); root.close-menu(); }
-            }
-        }
-    }
-
-    // Dynamic Recent, Size/Position, track, and Anki profile flyouts.
-    if root.submenu-index >= 0 : Rectangle {
-        x: parent.width - 4px;
-        y: root.submenu-index == 0 ? 58px :
-           root.submenu-index == 1 ? 34px :
-           root.submenu-index == 2 ? max(10px, parent.height - self.height - 30px) :
-           root.submenu-index == 3 ? max(10px, parent.height - self.height) : 6px;
-        width: root.submenu-index == 0 ? 380px : 260px;
-        height: root.submenu-index == 0 ? max(44px, min(360px, (root.recent-files.length == 0 ? 1 : root.recent-files.length + 2) * 30px + 14px)) :
-                root.submenu-index == 1 ? 134px :
-                root.submenu-index == 2 ? max(44px, min(300px, (root.subtitle-tracks.length + 1) * 30px + 14px)) :
-                root.submenu-index == 3 ? max(44px, min(300px, (root.subtitle-tracks.length + (root.asr-enabled ? 2 : 1)) * 30px + 14px)) :
-                max(44px, min(300px, max(1, root.anki-profiles.length) * 30px + 14px));
-        background: MementoPalette.card-bg;
-        border-width: 1px;
-        border-color: MementoPalette.border;
-        border-radius: 6px;
-        drop-shadow-blur: 16px;
-        drop-shadow-color: #00000088;
-
-        ScrollView {
-            VerticalLayout {
-                padding: 6px;
-                spacing: 2px;
-
-                if root.submenu-index == 0 : VerticalLayout {
-                    spacing: 2px;
-                    if root.recent-files.length == 0 : DropdownItem {
-                        text: "No recent files";
-                        is-disabled: true;
-                    }
-                    for file[index] in root.recent-files : DropdownItem {
-                        text: index < root.recent-file-labels.length && root.recent-file-labels[index] != ""
-                            ? root.recent-file-labels[index]
-                            : file;
-                        clicked => { root.open-recent(file); root.close-menu(); }
-                    }
-                    DropdownSeparator {}
-                    DropdownItem {
-                        text: "Clear Recents";
-                        clicked => { root.clear-recent(); root.close-menu(); }
-                    }
-                }
-
-                if root.submenu-index == 1 : VerticalLayout {
-                    spacing: 2px;
-                    DropdownItem {
-                        text: "Increase Size";
-                        shortcut: root.key-sub-increase-size;
-                        clicked => { root.adjust-subtitle-scale(0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Decrease Size";
-                        shortcut: root.key-sub-decrease-size;
-                        clicked => { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Move Up";
-                        shortcut: root.key-sub-move-up;
-                        clicked => { root.adjust-subtitle-offset(0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Move Down";
-                        shortcut: root.key-sub-move-down;
-                        clicked => { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
-                    }
-                }
-
-                if root.submenu-index == 2 : VerticalLayout {
-                    spacing: 2px;
-                    DropdownItem {
-                        text: "None";
-                        checkable: true;
-                        checked: root.secondary-sid == 0;
-                        clicked => { root.select-secondary-subtitle-track(0); root.close-menu(); }
-                    }
-                    for track[index] in root.subtitle-tracks : DropdownItem {
-                        text: track.label;
-                        checkable: true;
-                        checked: track.id == root.secondary-sid;
-                        is-disabled: track.id == root.primary-sid;
-                        clicked => {
-                            if (track.id != root.primary-sid) {
-                                root.select-secondary-subtitle-track(track.id);
-                                root.close-menu();
-                            }
-                        }
-                    }
-                }
-
-                if root.submenu-index == 3 : VerticalLayout {
-                    spacing: 2px;
-                    DropdownItem {
-                        text: "None";
-                        checkable: true;
-                        checked: root.primary-sid == 0 && !root.asr-track-selected;
-                        clicked => { root.select-subtitle-track(0); root.close-menu(); }
-                    }
-                    if root.asr-enabled : DropdownItem {
-                        text: root.asr-running ? "ASR subtitles…" : "ASR subtitles";
-                        checkable: true;
-                        checked: root.asr-track-selected;
-                        clicked => { root.select-asr(); root.close-menu(); }
-                    }
-                    for track[index] in root.subtitle-tracks : DropdownItem {
-                        text: track.label;
-                        checkable: true;
-                        checked: track.id == root.primary-sid && !root.asr-track-selected;
-                        is-disabled: track.id == root.secondary-sid;
-                        clicked => {
-                            if (track.id != root.secondary-sid) {
-                                root.select-subtitle-track(track.id);
-                                root.close-menu();
-                            }
-                        }
-                    }
-                }
-
-                if root.submenu-index == 4 : VerticalLayout {
-                    spacing: 2px;
-                    for profile[index] in root.anki-profiles : DropdownItem {
-                        text: profile;
-                        checkable: true;
-                        checked: profile == root.anki-profile;
-                        clicked => { root.select-anki-profile(profile); root.close-menu(); }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ── Main Memento Application Window ─────────────────────────────────────
@@ -1717,11 +208,11 @@ export component MementoApp inherits Window {
     in-out property <bool> sub-list-show-timestamps: false;
     in-out property <bool> subtitle-search-ignore-whitespace: false;
     in-out property <bool> subtitle-search-auto-seek: false;
-    in-out property <color> sub-list-bg-color: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
+    in-out property <color> sub-list-bg-color: MementoPalette.surface-bg;
     in-out property <color> sub-list-text-color: MementoPalette.text;
     in-out property <color> sub-list-hover-color: MementoPalette.list-hover;
-    in-out property <color> sub-list-selected-color: #1E2D3D;
-    in-out property <color> sub-list-selected-hover-color: #2A3B4C;
+    in-out property <color> sub-list-selected-color: MementoPalette.accent-muted;
+    in-out property <color> sub-list-selected-hover-color: MementoPalette.accent-muted-hover;
     in-out property <string> sub-list-primary-font-family: "";
     in-out property <length> sub-list-primary-font-size: 13px;
     in-out property <bool> sub-list-primary-font-bold: false;
@@ -1922,8 +413,7 @@ export component MementoApp inherits Window {
 
     changed url-dialog-open => {
         if root.url-dialog-open {
-            url-line-edit.focus();
-            url-line-edit.select-all();
+            url-modal.focus-input();
         } else {
             f-scope.focus();
         }
@@ -1987,6 +477,11 @@ export component MementoApp inherits Window {
         height: 100%;
 
         capture-key-pressed(event) => {
+            // Escape immediately closes open top-level dropdown menus
+            if (event.text == Key.Escape && menu-bar.open-menu >= 0) {
+                menu-bar.open-menu = -1;
+                return accept;
+            }
             // Route bare modifier keys to PopupBridge first while the dictionary popup is open so
             // recursive glossary scanning works regardless of which FocusScope currently has focus.
             if (root.dict-open && PopupBridge.rich-enabled
@@ -2088,6 +583,7 @@ export component MementoApp inherits Window {
                 return accept;
             }
             if (event.text == Key.Escape) {
+                if (menu-bar.open-menu >= 0) { menu-bar.open-menu = -1; return accept; }
                 if (root.ocr-mode) { root.ocr-mode = false; return accept; }
                 if (root.update-dialog-open) {
                     if (root.update-dialog-opt-in) {
@@ -2238,58 +734,46 @@ export component MementoApp inherits Window {
                         double-clicked => { root.toggle-fullscreen(); }
                     }
 
-                    // Empty / Placeholder state
+                    // Branded Empty / Placeholder State
                     if root.duration <= 0.0 : VerticalLayout {
                         alignment: center;
-                        spacing: 12px;
+                        spacing: 14px;
 
                         HorizontalLayout {
                             alignment: center;
                             Image {
-                                width: 64px;
-                                height: 64px;
-                                source: @image-url("icons/window.svg");
-                                colorize: MementoPalette.icon-muted;
+                                width: 68px;
+                                height: 68px;
+                                source: @image-url("../res/memento.svg");
+                                image-fit: contain;
                             }
                         }
                         Text {
                             text: "Memento";
                             font-size: 26px;
                             font-weight: 700;
-                            color: #E2E8F0;
+                            color: MementoPalette.text;
                             horizontal-alignment: center;
                         }
                         Text {
                             text: "Open a video file (Ctrl+O) or drag and drop media to start";
-                            font-size: 14px;
-                            color: #94A3B8;
+                            font-size: 13.5px;
+                            color: MementoPalette.text-secondary;
                             horizontal-alignment: center;
                         }
                         HorizontalLayout {
                             alignment: center;
-                            Rectangle {
-                                width: 140px;
-                                height: 36px;
-                                border-radius: 6px;
-                                background: MementoPalette.cyan-accent;
-                                Text {
-                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                                    text: "Open Media…";
-                                    font-weight: 700;
-                                    color: #000000;
-                                }
-                                TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => { root.open-file(); }
-                                }
+                            padding-top: 4px;
+                            ActionButton {
+                                text: "Open Media…";
+                                primary: true;
+                                clicked => { root.open-file(); }
                             }
                         }
                     }
 
                     // Invisible hover bridge between active primary subtitles (subtitle-box or active ASS anchor)
                     // and YomitanPopup so moving the cursor between subtitle and yomi-card keeps hover-pause active.
-                    // Placed BEFORE subtitle overlays and yomi-card in z-order and sized to the exact 12px gap
-                    // so it never overlaps subtitle tokens or the popup card.
                     hover-bridge := TouchArea {
                         property <bool> anchor-vis: SubtitleOverlayBridge.ass-native-active
                             ? (root.ass-overlay-visible && SubtitleOverlayBridge.ass-anchor-active)
@@ -2316,8 +800,6 @@ export component MementoApp inherits Window {
                     }
 
                     // Native ASS/SSA Interactive Overlay (above video-motion, strictly below yomi-card).
-                    // Only individual AssLineHitbox TouchAreas capture pointer input; areas outside
-                    // subtitle lines pass clicks, scrolls, and double-clicks straight through to video-motion.
                     ass-overlay := Rectangle {
                         visible: root.ass-overlay-visible;
                         width: parent.width;
@@ -2382,7 +864,7 @@ export component MementoApp inherits Window {
                                 width: max(ruby.width, ruby-txt.preferred-width + 6px);
                                 height: ruby-txt.preferred-height + 2px;
                                 border-radius: 3px;
-                                background: #000000A8;
+                                background: MementoPalette.scrim;
                                 ruby-txt := Text {
                                     x: (parent.width - self.preferred-width) / 2;
                                     y: 1px;
@@ -2390,7 +872,7 @@ export component MementoApp inherits Window {
                                     font-size: ruby.font-size;
                                     font-weight: 700;
                                     font-family: "Noto Sans CJK JP";
-                                    color: #F8FAFC;
+                                    color: MementoPalette.text;
                                     wrap: no-wrap;
                                 }
                             }
@@ -2538,9 +1020,7 @@ export component MementoApp inherits Window {
                         }
                     }
 
-                    // Floating Yomitan Dictionary Card
-                    // Anchored horizontally to hovered word (`popup-offset-x` or active ASS anchor) and
-                    // clamped above/below active primary subtitles so it NEVER covers active subtitles.
+                    // Floating Yomitan Dictionary Card (integer-rounded geometry preserved for 1:1 sharpness)
                     yomi-card := YomitanPopup {
                         property <bool> has-sub-anchor: SubtitleOverlayBridge.ass-native-active
                             ? (root.ass-overlay-visible && SubtitleOverlayBridge.ass-anchor-active)
@@ -2558,23 +1038,23 @@ export component MementoApp inherits Window {
                         property <length> space-below: max(0px, parent.height - self.sub-bottom - 22px);
                         property <bool> place-below: self.has-sub-anchor && self.space-above < 220px && self.space-below > self.space-above;
 
-                        width: min(
+                        width: round(min(
                             PopupBridge.css-popup-width > 0px ? PopupBridge.css-popup-width : root.popup-configured-width,
                             parent.width - 40px
-                        );
-                        height: min(
+                        ) / 1px) * 1px;
+                        height: round(min(
                             PopupBridge.css-popup-height > 0px ? PopupBridge.css-popup-height : root.popup-configured-height,
                             self.has-sub-anchor
                                 ? max(80px, self.place-below ? self.space-below : self.space-above)
                                 : (parent.height - 80px)
-                        );
-                        x: min(
+                        ) / 1px) * 1px;
+                        x: round(min(
                             parent.width - self.width - 20px,
                             max(20px, self.anchor-center-x - self.width / 2)
-                        );
-                        y: self.place-below
+                        ) / 1px) * 1px;
+                        y: round((self.place-below
                             ? min(parent.height - self.height - 10px, self.sub-bottom + 12px)
-                            : max(10px, self.sub-top - self.height - 12px);
+                            : max(10px, self.sub-top - self.height - 12px)) / 1px) * 1px;
                         is-open: root.dict-open;
                         render-nested-inline: false;
                         anki-enabled: root.anki-enabled;
@@ -2604,13 +1084,13 @@ export component MementoApp inherits Window {
                         open-rich-link(link) => { root.open-glossary-link(link); }
                     }
 
-                    // Yomitan-style floating recursive child popup (full configured size, viewport-clamped)
+                    // Yomitan-style floating recursive child popup (integer-rounded geometry preserved)
                     nested-yomi-card := NestedYomitanPopup {
                         is-open: root.dict-open;
-                        viewport-width: parent.width;
-                        viewport-height: parent.height;
-                        parent-x: yomi-card.x;
-                        parent-y: yomi-card.y;
+                        viewport-width: round(parent.width / 1px) * 1px;
+                        viewport-height: round(parent.height / 1px) * 1px;
+                        parent-x: round(yomi-card.x / 1px) * 1px;
+                        parent-y: round(yomi-card.y / 1px) * 1px;
                         configured-width: root.popup-configured-width;
                         configured-height: root.popup-configured-height;
                         anki-enabled: root.anki-enabled;
@@ -2626,6 +1106,37 @@ export component MementoApp inherits Window {
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
                         close-parent-requested => { root.dismiss-definition(); }
+                    }
+
+                    // Status Toast (content-fit pill centered over video-area with opacity fade)
+                    status-toast := Rectangle {
+                        property <bool> active: root.status-message != "";
+                        opacity: self.active ? 1.0 : 0.0;
+                        animate opacity { duration: 150ms; }
+                        visible: self.active || self.opacity > 0.01;
+                        width: min(max(160px, toast-lbl.preferred-width + 32px), parent.width - 48px);
+                        height: max(36px, toast-lbl.preferred-height + 16px);
+                        x: (parent.width - self.width) / 2;
+                        y: parent.height - 112px;
+                        background: MementoPalette.surface-elevated;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: MementoPalette.border-light;
+                        drop-shadow-blur: 16px;
+                        drop-shadow-color: MementoPalette.shadow;
+
+                        toast-lbl := Text {
+                            x: 16px;
+                            width: parent.width - 32px;
+                            height: parent.height;
+                            text: root.status-message;
+                            color: MementoPalette.text;
+                            font-size: 12.5px;
+                            font-weight: 500;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
                     }
 
                     // Bottom OSC Bar (Floating, 50px)
@@ -2646,6 +1157,7 @@ export component MementoApp inherits Window {
                         current-time: root.current-time;
                         duration-time: root.duration-time;
                         is-fullscreen: root.is-fullscreen;
+                        sub-drawer-open: root.sub-drawer-open;
                         ocr-enabled: root.ocr-enabled;
                         chapters: root.chapters;
                         chapter-marks: root.chapter-marks;
@@ -2673,12 +1185,12 @@ export component MementoApp inherits Window {
                         height: preview-col.preferred-height + 16px;
                         x: max(16px, min(parent.width - self.width - 16px, osc.x + osc.hover-x - self.width / 2));
                         y: max(10px, osc.y - self.height - 8px);
-                        background: MementoPalette.card-bg;
+                        background: MementoPalette.surface-elevated;
                         border-width: 1px;
                         border-color: MementoPalette.border-light;
-                        border-radius: 6px;
-                        drop-shadow-blur: 12px;
-                        drop-shadow-color: #00000099;
+                        border-radius: 8px;
+                        drop-shadow-blur: 14px;
+                        drop-shadow-color: MementoPalette.shadow;
 
                         preview-col := VerticalLayout {
                             x: 10px;
@@ -2708,6 +1220,7 @@ export component MementoApp inherits Window {
 
                             Text {
                                 text: root.format-timestamp(min(root.duration, osc.hover-time));
+                                font-family: "monospace";
                                 font-size: 12px;
                                 font-weight: 700;
                                 color: MementoPalette.text;
@@ -2751,9 +1264,9 @@ export component MementoApp inherits Window {
                             y: min(ocr-touch.pressed-y, ocr-touch.mouse-y);
                             width: max(1px, max(ocr-touch.pressed-x, ocr-touch.mouse-x) - self.x);
                             height: max(1px, max(ocr-touch.pressed-y, ocr-touch.mouse-y) - self.y);
-                            background: #21a5bb33;
+                            background: MementoPalette.accent-subtle;
                             border-width: 2px;
-                            border-color: #21a5bb;
+                            border-color: MementoPalette.cyan-accent;
                         }
                     }
                 }
@@ -2800,6 +1313,7 @@ export component MementoApp inherits Window {
                             background: split-v-touch.pressed || split-v-touch.has-hover
                                 ? MementoPalette.cyan-accent
                                 : MementoPalette.border;
+                            animate background { duration: 100ms; }
                             split-v-touch := TouchArea {
                                 width: 100%;
                                 height: 100%;
@@ -2860,18 +1374,45 @@ export component MementoApp inherits Window {
                             ignore-whitespace-changed(enabled) => { root.subtitle-search-ignore-whitespace-changed(enabled); }
                             auto-seek-changed(enabled) => { root.subtitle-search-auto-seek-changed(enabled); }
                             user-scrolled => { root.subtitle-drawer-user-scrolled(); }
+                            close-requested => { root.sub-drawer-open = false; f-scope.focus(); }
                         }
                     }
 
-                    // Left-edge draggable width resize handle for sidebar
+                    // Left-edge draggable width resize handle (8px hit target over 1px divider + hover grip pill)
                     Rectangle {
-                        x: 0px;
+                        x: -3px;
                         y: 0px;
-                        width: 4px;
+                        width: 8px;
                         height: parent.height;
-                        background: split-h-touch.pressed || split-h-touch.has-hover
-                            ? MementoPalette.cyan-accent
-                            : transparent;
+                        background: transparent;
+
+                        // 1px visual divider line
+                        Rectangle {
+                            x: 3px;
+                            y: 0px;
+                            width: 1px;
+                            height: parent.height;
+                            background: split-h-touch.pressed || split-h-touch.has-hover
+                                ? MementoPalette.cyan-accent
+                                : MementoPalette.border;
+                            animate background { duration: 100ms; }
+                        }
+
+                        // Subtle centered grip pill on hover/drag
+                        Rectangle {
+                            x: 2px;
+                            y: (parent.height - self.height) / 2;
+                            width: 3px;
+                            height: 36px;
+                            border-radius: 1.5px;
+                            background: split-h-touch.pressed || split-h-touch.has-hover
+                                ? MementoPalette.cyan-accent
+                                : MementoPalette.border-light;
+                            opacity: split-h-touch.pressed || split-h-touch.has-hover ? 1.0 : 0.45;
+                            animate opacity { duration: 120ms; }
+                            animate background { duration: 100ms; }
+                        }
+
                         split-h-touch := TouchArea {
                             width: 100%;
                             height: 100%;
@@ -2901,6 +1442,7 @@ export component MementoApp inherits Window {
         // Dropdown Menus Overlay
         menu-drop := MenuDropdown {
             menu-index: menu-bar.open-menu;
+            max-dropdown-height: max(160px, root.height - 48px);
             audio-tracks: root.audio-tracks;
             subtitle-tracks: root.subtitle-tracks;
             recent-files: root.recent-files;
@@ -2960,225 +1502,38 @@ export component MementoApp inherits Window {
             close-menu => { menu-bar.open-menu = -1; root.osc-activity(); }
         }
 
-        if root.status-message != "" : Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: parent.height - 112px;
-            width: min(650px, parent.width - 40px);
-            height: 42px;
-            background: #252b2ee8;
-            border-radius: 5px;
-            border-width: 1px;
-            border-color: #48535a;
-            Text {
-                text: root.status-message;
-                color: white;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: parent.width - 16px;
-                height: parent.height;
-                x: 8px;
-                overflow: elide;
-            }
-        }
-
-        // Open Stream URL Clipboard Modal
-        Rectangle {
+        // Open Stream URL Modal (standardized onto ModalDialog)
+        url-modal := OpenUrlModal {
             visible: root.url-dialog-open;
-            width: 100%;
-            height: 100%;
-            background: #00000099;
-            TouchArea {
-                enabled: root.url-dialog-open;
-                clicked => {
-                    root.url-dialog-open = false;
-                    f-scope.focus();
-                }
+            dialog-enabled: root.url-dialog-open;
+            url-text <=> root.url-dialog-text;
+            dismissed => {
+                root.url-dialog-open = false;
+                f-scope.focus();
             }
-            Rectangle {
-                width: 440px;
-                height: 165px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                background: MementoPalette.surface-bg;
-                border-color: MementoPalette.border-light;
-                border-width: 1px;
-                border-radius: 7px;
-                drop-shadow-blur: 20px;
-                drop-shadow-color: #000000AA;
-                // Click-shield so clicking inside the dialog does not close it
-                TouchArea {
-                    enabled: root.url-dialog-open;
-                }
-                VerticalLayout {
-                    padding: 18px;
-                    spacing: 12px;
-                    Text {
-                        text: "Open Stream";
-                        color: MementoPalette.text;
-                        font-size: 18px;
-                        font-weight: 700;
-                    }
-                    url-line-edit := LineEdit {
-                        enabled: root.url-dialog-open;
-                        placeholder-text: "Enter URL";
-                        text <=> root.url-dialog-text;
-                        accepted(val) => {
-                            root.url-dialog-open = false;
-                            root.open-url-submitted(val);
-                            f-scope.focus();
-                        }
-                    }
-                    HorizontalLayout {
-                        alignment: end;
-                        spacing: 8px;
-                        Button {
-                            text: "Cancel";
-                            clicked => {
-                                root.url-dialog-open = false;
-                                f-scope.focus();
-                            }
-                        }
-                        Button {
-                            text: "OK";
-                            clicked => {
-                                let url = root.url-dialog-text;
-                                root.url-dialog-open = false;
-                                root.open-url-submitted(url);
-                                f-scope.focus();
-                            }
-                        }
-                    }
-                }
+            submitted(val) => {
+                root.url-dialog-open = false;
+                root.open-url-submitted(val);
+                f-scope.focus();
             }
         }
 
-        // About Memento Modal (with click-shield, embedded res/memento.svg logo, and non-blocking links)
-        if root.about-open : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: #00000099;
-            TouchArea {
-                clicked => {
-                    root.about-open = false;
-                    f-scope.focus();
-                }
+        // About Memento Modal (standardized onto ModalDialog)
+        if root.about-open : AboutModal {
+            app-version: root.app-version;
+            dismissed => {
+                root.about-open = false;
+                f-scope.focus();
             }
-            about-card := Rectangle {
-                width: 420px;
-                height: 255px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                background: MementoPalette.surface-bg;
-                border-color: MementoPalette.border-light;
-                border-width: 1px;
-                border-radius: 8px;
-                drop-shadow-blur: 20px;
-                drop-shadow-color: #000000AA;
-                // Click-shield prevents clicks inside the modal card from dismissing the modal
-                TouchArea {}
-                VerticalLayout {
-                    padding: 20px;
-                    spacing: 10px;
-                    alignment: center;
-
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 14px;
-                        Image {
-                            width: 56px;
-                            height: 56px;
-                            source: @image-url("../res/memento.svg");
-                            image-fit: contain;
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-                            Text {
-                                text: "Memento";
-                                color: MementoPalette.text;
-                                font-size: 28px;
-                                font-weight: 700;
-                            }
-                            Text {
-                                text: "Version " + root.app-version;
-                                color: MementoPalette.text-secondary;
-                                font-size: 13px;
-                            }
-                        }
-                    }
-
-                    Text {
-                        text: "An mpv-based video player for studying Japanese";
-                        color: MementoPalette.text;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Copyright © Ripose · GPLv2-Only";
-                        color: MementoPalette.text-secondary;
-                        horizontal-alignment: center;
-                        font-size: 12px;
-                    }
-
-                    HorizontalLayout {
-                        alignment: center;
-                        spacing: 20px;
-                        Rectangle {
-                            width: 90px;
-                            height: 24px;
-                            border-radius: 4px;
-                            background: site-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                            Text {
-                                text: "Project Site";
-                                color: MementoPalette.cyan-accent;
-                                font-size: 13px;
-                                font-weight: 600;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            site-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.open-external-link("https://ripose-jp.github.io/Memento/"); }
-                            }
-                        }
-                        Rectangle {
-                            width: 70px;
-                            height: 24px;
-                            border-radius: 4px;
-                            background: gh-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                            Text {
-                                text: "GitHub";
-                                color: MementoPalette.cyan-accent;
-                                font-size: 13px;
-                                font-weight: 600;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            gh-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.open-external-link("https://github.com/ripose-jp/Memento"); }
-                            }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        alignment: center;
-                        Button {
-                            text: "Close";
-                            clicked => {
-                                root.about-open = false;
-                                f-scope.focus();
-                            }
-                        }
-                    }
-                }
-            }
+            open-link(url) => { root.open-external-link(url); }
         }
 
         // Update Check & First-Launch Auto-Update Opt-In Modal
+        // Matches ModalDialog tokens/geometry while keeping exact `MementoApp::update-*` test IDs.
         if root.update-dialog-open : Rectangle {
             width: 100%;
             height: 100%;
-            background: #000000CC;
+            background: MementoPalette.scrim;
             TouchArea {
                 clicked => {
                     if root.update-dialog-opt-in {
@@ -3192,15 +1547,15 @@ export component MementoApp inherits Window {
             }
             update-card := Rectangle {
                 width: min(460px, parent.width - 48px);
-                height: update-col.preferred-height;
+                height: min(update-col.preferred-height, parent.height - 48px);
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                background: MementoPalette.surface-bg;
+                background: MementoPalette.surface-elevated;
                 border-color: MementoPalette.border-light;
                 border-width: 1px;
-                border-radius: 10px;
+                border-radius: 12px;
                 drop-shadow-blur: 28px;
-                drop-shadow-color: #000000CC;
+                drop-shadow-color: MementoPalette.shadow;
                 // Click-shield prevents clicks inside the dialog from dismissing it
                 TouchArea {}
                 // Subtle top accent highlight
@@ -3214,7 +1569,7 @@ export component MementoApp inherits Window {
                 }
                 update-col := VerticalLayout {
                     width: parent.width;
-                    padding: 24px;
+                    padding: 22px;
                     spacing: 14px;
 
                     HorizontalLayout {
@@ -3223,20 +1578,23 @@ export component MementoApp inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             alignment: start;
-                            Rectangle {
-                                width: 28px;
-                                height: 28px;
-                                border-radius: 7px;
-                                background: #38A3E524;
-                                border-width: 1px;
-                                border-color: #38A3E566;
-                                Text {
-                                    text: "↻";
-                                    color: MementoPalette.cyan-accent;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    border-radius: 7px;
+                                    background: MementoPalette.accent-subtle;
+                                    border-width: 1px;
+                                    border-color: MementoPalette.cyan-accent;
+                                    Text {
+                                        text: "↻";
+                                        color: MementoPalette.cyan-accent;
+                                        font-size: 15px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                             Text {
@@ -3247,26 +1605,29 @@ export component MementoApp inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        if !root.update-dialog-opt-in && root.update-dialog-release-tag != "" : Rectangle {
-                            height: 24px;
-                            width: tag-lbl.preferred-width + 16px;
-                            border-radius: 12px;
-                            background: MementoPalette.list-selected;
-                            border-width: 1px;
-                            border-color: MementoPalette.cyan-accent;
-                            tag-lbl := Text {
-                                text: root.update-dialog-release-tag;
-                                color: MementoPalette.cyan-accent;
-                                font-size: 12px;
-                                font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                        if !root.update-dialog-opt-in && root.update-dialog-release-tag != "" : VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                height: 24px;
+                                width: tag-lbl.preferred-width + 16px;
+                                border-radius: 12px;
+                                background: MementoPalette.accent-muted;
+                                border-width: 1px;
+                                border-color: MementoPalette.cyan-accent;
+                                tag-lbl := Text {
+                                    text: root.update-dialog-release-tag;
+                                    color: MementoPalette.cyan-text;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                     }
 
                     update-message-box := Rectangle {
-                        width: update-card.width - 48px;
+                        width: update-card.width - 44px;
                         height: update-message-text.preferred-height;
                         update-message-text := Text {
                             width: parent.width;
@@ -3282,21 +1643,21 @@ export component MementoApp inherits Window {
                         background: MementoPalette.border;
                     }
 
+                    // Opt-in footer: [No] [Yes (primary)]
                     if root.update-dialog-opt-in : HorizontalLayout {
                         alignment: end;
                         spacing: 10px;
-                        update-btn-no := Button {
-                            min-width: 84px;
-                            height: 32px;
+                        update-btn-no := ActionButton {
+                            width: 88px;
                             text: "No";
+                            ghost: true;
                             clicked => {
                                 root.update-opt-in-responded(false);
                                 f-scope.focus();
                             }
                         }
-                        update-btn-yes := Button {
-                            min-width: 84px;
-                            height: 32px;
+                        update-btn-yes := ActionButton {
+                            width: 88px;
                             text: "Yes";
                             primary: true;
                             clicked => {
@@ -3306,26 +1667,26 @@ export component MementoApp inherits Window {
                         }
                     }
 
+                    // Release footer: [Dismiss] [Open GitHub Releases (primary)]
                     if !root.update-dialog-opt-in : HorizontalLayout {
                         alignment: end;
                         spacing: 10px;
-                        if root.update-dialog-release-url != "" && (root.update-dialog-release-tag != "" || root.update-dialog-title == "Update Check Failed") : update-btn-releases := Button {
-                            min-width: 84px;
-                            height: 32px;
-                            text: "Open GitHub Releases";
-                            primary: root.update-dialog-release-tag != "";
-                            clicked => {
-                                root.open-external-link(root.update-dialog-release-url);
-                            }
-                        }
-                        update-btn-dismiss := Button {
-                            min-width: 84px;
-                            height: 32px;
+                        update-btn-dismiss := ActionButton {
+                            width: 96px;
                             text: "Dismiss";
+                            ghost: root.update-dialog-release-url != "" && root.update-dialog-release-tag != "";
+                            primary: root.update-dialog-release-tag == "";
                             clicked => {
                                 root.update-dialog-open = false;
                                 root.update-dialog-dismissed();
                                 f-scope.focus();
+                            }
+                        }
+                        if root.update-dialog-release-url != "" && (root.update-dialog-release-tag != "" || root.update-dialog-title == "Update Check Failed") : update-btn-releases := ActionButton {
+                            text: "Open GitHub Releases";
+                            primary: root.update-dialog-release-tag != "";
+                            clicked => {
+                                root.open-external-link(root.update-dialog-release-url);
                             }
                         }
                     }

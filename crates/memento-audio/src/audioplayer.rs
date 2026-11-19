@@ -24,29 +24,6 @@ pub const AUDIO_CACHE_CAPACITY: usize = 10;
 /// Maximum accepted pronunciation audio payload size (32 MiB).
 pub const MAX_AUDIO_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
-/// 0: unavailable or cached hash matches; 1: play cached; 2: download.
-#[no_mangle]
-pub extern "C" fn memento_audio_cache_action(
-    mpv_ready: bool,
-    cached: bool,
-    hashes_equal: bool,
-) -> i32 {
-    if !mpv_ready {
-        0
-    } else if !cached {
-        2
-    } else if hashes_equal {
-        0
-    } else {
-        1
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn memento_audio_cache_evict(cached_count: usize) -> bool {
-    cached_count >= AUDIO_CACHE_CAPACITY
-}
-
 /// Validates an HTTP `Content-Type` header for a pronunciation audio download.
 ///
 /// Rejects obvious non-audio error documents (`text/*`, `image/*`, JSON, HTML/XML,
@@ -181,10 +158,25 @@ pub fn detect_audio_extension(
         return ".webm";
     }
     if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
-        if (bytes[1] & 0x06) == 0x00 {
-            return ".aac";
+        // ADTS AAC uses a 12-bit syncword (0xFFF) with layer bits `00` (0xF0/0xF1/0xF8/0xF9).
+        if (bytes[1] & 0xF6) == 0xF0 {
+            let valid_sample_rate = bytes.len() < 3 || ((bytes[2] >> 2) & 0x0F) < 13;
+            if valid_sample_rate {
+                return ".aac";
+            }
         }
-        return ".mp3";
+        // MPEG Audio Layer II/III (MP3): reject reserved version (`01`), reject Layer I (`11`,
+        // which collides with UTF-16 LE BOM `0xFF 0xFE` and `0xFF 0xFF`), and reject invalid
+        // bitrate (`0xF`) or reserved sample-rate (`0x3`) fields in byte 2.
+        let version = bytes[1] & 0x18;
+        let layer = bytes[1] & 0x06;
+        if version != 0x08 && matches!(layer, 0x02 | 0x04) {
+            let valid_header =
+                bytes.len() < 3 || ((bytes[2] & 0xF0) != 0xF0 && (bytes[2] & 0x0C) != 0x0C);
+            if valid_header {
+                return ".mp3";
+            }
+        }
     }
 
     if let Some(raw_ct) = content_type {
@@ -301,28 +293,8 @@ impl<T> AudioCache<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_audio_extension, memento_audio_cache_action, memento_audio_cache_evict,
-        validate_audio_bytes, validate_audio_content_type, AudioCache, AUDIO_CACHE_CAPACITY,
+        detect_audio_extension, validate_audio_bytes, validate_audio_content_type, AudioCache,
     };
-
-    #[test]
-    fn cache_action_preserves_availability_and_hash_decisions() {
-        assert_eq!(memento_audio_cache_action(false, false, false), 0);
-        assert_eq!(memento_audio_cache_action(false, true, false), 0);
-        assert_eq!(memento_audio_cache_action(false, true, true), 0);
-        assert_eq!(memento_audio_cache_action(true, false, false), 2);
-        assert_eq!(memento_audio_cache_action(true, false, true), 2);
-        assert_eq!(memento_audio_cache_action(true, true, false), 1);
-        assert_eq!(memento_audio_cache_action(true, true, true), 0);
-    }
-
-    #[test]
-    fn cache_evict_at_capacity() {
-        assert!(!memento_audio_cache_evict(0));
-        assert!(!memento_audio_cache_evict(AUDIO_CACHE_CAPACITY - 1));
-        assert!(memento_audio_cache_evict(AUDIO_CACHE_CAPACITY));
-        assert!(memento_audio_cache_evict(AUDIO_CACHE_CAPACITY + 1));
-    }
 
     #[test]
     fn content_type_and_payload_validation_rejects_html_json_and_empty_bodies() {
@@ -373,6 +345,24 @@ mod tests {
         assert_eq!(detect_audio_extension(b"raw", Some("audio/ogg"), "https://a/x"), ".ogg");
         assert_eq!(detect_audio_extension(b"raw", None, "https://a/word.wav?k=1"), ".wav");
         assert_eq!(detect_audio_extension(b"raw", None, "https://a/unknown"), ".mp3");
+
+        // Valid MP3 & ADTS AAC frame sync headers.
+        assert_eq!(detect_audio_extension(b"\xFF\xFB\x90\x00", None, "https://a/x.ogg"), ".mp3");
+        assert_eq!(detect_audio_extension(b"\xFF\xF1\x50\x80", None, "https://a/x.mp3"), ".aac");
+
+        // UTF-16 LE BOM (0xFF 0xFE) and 0xFF 0xFF must not falsely match MP3 frame sync.
+        assert_eq!(
+            detect_audio_extension(b"\xFF\xFE<\x00h\x00", Some("audio/ogg"), "https://a/x"),
+            ".ogg"
+        );
+        assert_eq!(
+            detect_audio_extension(b"\xFF\xFE\x00\x00", None, "https://a/clip.wav"),
+            ".wav"
+        );
+        assert_eq!(
+            detect_audio_extension(b"\xFF\xFF\x00\x00", None, "https://a/clip.flac"),
+            ".flac"
+        );
     }
 
     #[test]

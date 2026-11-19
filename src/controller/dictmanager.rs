@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use memento_dict::sqlite_db::{self, rusqlite};
 use memento_dict::yomidbbuilder::{self, YomiError};
+
+use crate::controller::dict::invalidate_shared_readonly_db;
 
 /// An installed dictionary row read from Memento's Yomitan database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,12 +71,35 @@ impl Error for DictionaryManagerError {
     }
 }
 
-/// Owns the Yomi database operations used by the dictionary settings.
-/// Dictionary ordering is deliberately left to the caller's configuration.
-pub struct DictionaryManager {
+fn shared_mutation_lock(database_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = std::fs::canonicalize(database_path).unwrap_or_else(|_| database_path.to_path_buf());
+    let mut map = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    if map.len() > 32 {
+        map.retain(|_, weak| weak.strong_count() > 0);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    map.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+struct DictionaryManagerInner {
     database_path: PathBuf,
     resources_path: PathBuf,
-    mutation_lock: Mutex<()>,
+    mutation_lock: Arc<Mutex<()>>,
+}
+
+/// Owns the Yomi database operations used by the dictionary settings.
+/// Cheaply cloneable via `Arc` with per-database cross-thread mutation serialization.
+#[derive(Clone)]
+pub struct DictionaryManager {
+    inner: Arc<DictionaryManagerInner>,
 }
 
 impl DictionaryManager {
@@ -106,17 +132,26 @@ impl DictionaryManager {
             source,
         })?;
 
+        let mutation_lock = shared_mutation_lock(&database_path);
         Ok(Self {
-            database_path,
-            resources_path,
-            mutation_lock: Mutex::new(()),
+            inner: Arc::new(DictionaryManagerInner {
+                database_path,
+                resources_path,
+                mutation_lock,
+            }),
         })
+    }
+
+    /// Returns a shared `Arc<Self>` handle for passing into background worker threads.
+    pub fn into_shared(self) -> Arc<Self> {
+        Arc::new(self)
     }
 
     /// Read the installed dictionary rows from the database, including each
     /// dictionary's current enabled/disabled state.
     pub fn list_dictionaries(&self) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
         let _guard = self
+            .inner
             .mutation_lock
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
@@ -126,7 +161,7 @@ impl DictionaryManager {
     fn list_dictionaries_unlocked(
         &self,
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
-        let conn = sqlite_db::open_read_only_connection(&self.database_path)
+        let conn = sqlite_db::open_read_only_connection(&self.inner.database_path)
             .map_err(DictionaryManagerError::Sqlite)?;
         let mut statement = conn
             .prepare(
@@ -168,18 +203,20 @@ impl DictionaryManager {
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
         let archive_path = validate_path(archive_path.as_ref())?;
         let _guard = self
+            .inner
             .mutation_lock
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
         yomidbbuilder::process_dictionary(
             &archive_path,
-            &self.database_path,
-            &self.resources_path,
+            &self.inner.database_path,
+            &self.inner.resources_path,
         )
         .map_err(|source| DictionaryManagerError::Yomi {
             operation: "add the dictionary archive",
             source,
         })?;
+        invalidate_shared_readonly_db(&self.inner.database_path);
         self.list_dictionaries_unlocked()
     }
 
@@ -206,16 +243,21 @@ impl DictionaryManager {
         id: i64,
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
         let _guard = self
+            .inner
             .mutation_lock
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
         self.require_installed(id)?;
-        yomidbbuilder::delete_dictionary(id, &self.database_path, &self.resources_path).map_err(
-            |source| DictionaryManagerError::Yomi {
-                operation: "delete the dictionary",
-                source,
-            },
-        )?;
+        yomidbbuilder::delete_dictionary(
+            id,
+            &self.inner.database_path,
+            &self.inner.resources_path,
+        )
+        .map_err(|source| DictionaryManagerError::Yomi {
+            operation: "delete the dictionary",
+            source,
+        })?;
+        invalidate_shared_readonly_db(&self.inner.database_path);
         self.list_dictionaries_unlocked()
     }
 
@@ -225,14 +267,15 @@ impl DictionaryManager {
         enabled: bool,
     ) -> Result<Vec<InstalledDictionary>, DictionaryManagerError> {
         let _guard = self
+            .inner
             .mutation_lock
             .lock()
             .map_err(|_| DictionaryManagerError::MutationLockPoisoned)?;
         self.require_installed(id)?;
         let result = if enabled {
-            yomidbbuilder::enable_dictionary(id, &self.database_path)
+            yomidbbuilder::enable_dictionary(id, &self.inner.database_path)
         } else {
-            yomidbbuilder::disable_dictionary(id, &self.database_path)
+            yomidbbuilder::disable_dictionary(id, &self.inner.database_path)
         };
         result.map_err(|source| DictionaryManagerError::Yomi {
             operation: if enabled {
@@ -242,6 +285,7 @@ impl DictionaryManager {
             },
             source,
         })?;
+        invalidate_shared_readonly_db(&self.inner.database_path);
         self.list_dictionaries_unlocked()
     }
 
@@ -249,7 +293,7 @@ impl DictionaryManager {
         if id <= 0 {
             return Err(DictionaryManagerError::InvalidDictionaryId(id));
         }
-        let conn = sqlite_db::open_read_only_connection(&self.database_path)
+        let conn = sqlite_db::open_read_only_connection(&self.inner.database_path)
             .map_err(DictionaryManagerError::Sqlite)?;
         let mut statement = conn
             .prepare("SELECT 1 FROM directory WHERE dic_id = ?1 LIMIT 1;")
@@ -325,11 +369,10 @@ mod tests {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len() as u16;
 
-            // Local file header
             buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
             buf.extend_from_slice(&20u16.to_le_bytes());
             buf.extend_from_slice(&0u16.to_le_bytes());
-            buf.extend_from_slice(&0u16.to_le_bytes()); // store
+            buf.extend_from_slice(&0u16.to_le_bytes());
             buf.extend_from_slice(&0u16.to_le_bytes());
             buf.extend_from_slice(&0u16.to_le_bytes());
             buf.extend_from_slice(&crc.to_le_bytes());
@@ -340,7 +383,6 @@ mod tests {
             buf.extend_from_slice(name_bytes);
             buf.extend_from_slice(data);
 
-            // Central directory header
             central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
             central.extend_from_slice(&20u16.to_le_bytes());
             central.extend_from_slice(&20u16.to_le_bytes());
@@ -364,7 +406,6 @@ mod tests {
         let cd_size = central.len() as u32;
         let count = entries.len() as u16;
         buf.extend_from_slice(&central);
-        // End of central directory
         buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());

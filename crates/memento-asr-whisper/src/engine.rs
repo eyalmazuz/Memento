@@ -60,20 +60,8 @@ use crate::whisper_sys as sys;
 
 /// C++: `static constexpr const char *LANGUAGE_JAPANESE = "ja";`
 pub const LANGUAGE_JAPANESE: &str = "ja";
-/// C++: `static constexpr int WAV_HEADER_SIZE = 12;`
-const WAV_HEADER_SIZE: usize = 12;
-/// C++: `static constexpr int WAV_CHUNK_HEADER_SIZE = 8;`
-const WAV_CHUNK_HEADER_SIZE: usize = 8;
 /// C++: `static constexpr int WHISPER_TIME_SCALE = 100;`
 pub const WHISPER_TIME_SCALE: i64 = 100;
-/// C++: `static constexpr quint16 WAV_FORMAT_PCM = 1;`
-const WAV_FORMAT_PCM: u16 = 1;
-/// C++: `static constexpr quint16 WAV_BITS_PER_SAMPLE = 16;`
-const WAV_BITS_PER_SAMPLE: u16 = 16;
-/// C++: `static constexpr quint16 WAV_CHANNELS = 1;`
-const WAV_CHANNELS: u16 = 1;
-/// C++: `constexpr int BYTES_PER_SAMPLE = WAV_BITS_PER_SAMPLE / 8;`
-const BYTES_PER_SAMPLE: usize = WAV_BITS_PER_SAMPLE as usize / 8;
 
 /// C++ failure string from `WhisperModel::transcribe` (null model branch).
 pub const ERR_MODEL_INIT: &str = "Whisper could not initialize the selected model.";
@@ -186,109 +174,6 @@ pub struct RegexValidateBridge {
     pub user_data: *mut c_void,
 }
 
-/// C++: `read_u16`
-fn read_u16(data: &[u8]) -> u16 {
-    u16::from_le_bytes([data[0], data[1]])
-}
-
-/// C++: `read_u32`
-fn read_u32(data: &[u8]) -> u32 {
-    u32::from_le_bytes([data[0], data[1], data[2], data[3]])
-}
-
-/// C++: `read_whisper_wav(path, error)` — reads a 16 kHz mono PCM16 WAV into
-/// normalized `[-1, 1]` floats. `Err` carries the byte-identical C++ failure
-/// string (`qWarning` side effect lives on the C++ side of the bridge).
-pub fn read_whisper_wav(path: &Path) -> Result<Vec<f32>, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err("Could not open the extracted audio file.".to_string()),
-    };
-
-    if bytes.len() < WAV_HEADER_SIZE {
-        return Err(format!(
-            "The extracted WAV is truncated ({} bytes).",
-            bytes.len()
-        ));
-    }
-    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        // Qt: QString::fromLatin1(bytes.first(12).toHex(' ')) — lowercase
-        // hex, space separated (same as AsrAudio::readPcm16Wav, verified by
-        // asr_rust_bridge_test.cpp).
-        let header_hex: Vec<String> = bytes[..12].iter().map(|b| format!("{b:02x}")).collect();
-        return Err(format!(
-            "The extracted audio is not RIFF/WAVE (header {}).",
-            header_hex.join(" ")
-        ));
-    }
-
-    let mut format: u16 = 0;
-    let mut channels: u16 = 0;
-    let mut sample_rate: u32 = 0;
-    let mut block_align: u16 = 0;
-    let mut bits_per_sample: u16 = 0;
-    let mut pcm_data: Option<&[u8]> = None;
-
-    let mut offset = WAV_HEADER_SIZE;
-    while offset
-        .checked_add(WAV_CHUNK_HEADER_SIZE)
-        .is_some_and(|end| end <= bytes.len())
-    {
-        let chunk = &bytes[offset..];
-        let id = &chunk[0..4];
-        let size = read_u32(&chunk[4..8]) as usize;
-        offset += WAV_CHUNK_HEADER_SIZE;
-
-        let Some(chunk_end) = offset.checked_add(size) else {
-            return Err("The extracted WAV file is truncated.".to_string());
-        };
-        if chunk_end > bytes.len() {
-            return Err("The extracted WAV file is truncated.".to_string());
-        }
-
-        if id == b"fmt " && size >= 16 {
-            let fmt = &bytes[offset..chunk_end];
-            format = read_u16(&fmt[0..2]);
-            channels = read_u16(&fmt[2..4]);
-            sample_rate = read_u32(&fmt[4..8]);
-            block_align = read_u16(&fmt[12..14]);
-            bits_per_sample = read_u16(&fmt[14..16]);
-        } else if id == b"data" {
-            // Last "data" chunk wins, mirroring `pcmData = bytes.mid(...)`.
-            pcm_data = Some(&bytes[offset..chunk_end]);
-        }
-
-        let Some(next_offset) = chunk_end.checked_add(size % 2) else {
-            break;
-        };
-        offset = next_offset;
-    }
-
-    const EXPECTED_SAMPLE_RATE: u32 = sys::WHISPER_SAMPLE_RATE;
-    if format != WAV_FORMAT_PCM
-        || channels != WAV_CHANNELS
-        || sample_rate != EXPECTED_SAMPLE_RATE
-        || block_align != WAV_CHANNELS * BYTES_PER_SAMPLE as u16
-        || bits_per_sample != WAV_BITS_PER_SAMPLE
-        || pcm_data.map_or(true, |data| data.is_empty())
-    {
-        return Err("The extracted WAV is not 16 kHz mono PCM16.".to_string());
-    }
-    let pcm_data = pcm_data.expect("checked as present above");
-
-    if pcm_data.len() < BYTES_PER_SAMPLE {
-        return Err("The extracted WAV contains no audio samples.".to_string());
-    }
-
-    let samples = pcm_data.len() / BYTES_PER_SAMPLE;
-    let mut output = Vec::with_capacity(samples);
-    for i in 0..samples {
-        let value = read_u16(&pcm_data[i * BYTES_PER_SAMPLE..]) as i16;
-        output.push(value as f32 / 32768.0f32);
-    }
-    Ok(output)
-}
-
 /// C++: `timestamp_to_seconds(timestamp)`.
 ///
 /// Kept for mirror completeness and unit-test coverage; the bridge hands raw
@@ -374,14 +259,82 @@ fn c_string_from_bytes(bytes: &[u8]) -> CString {
     CString::new(prefix).expect("the prefix contains no NUL bytes")
 }
 
+/// Detect Rust `regex` syntax that C++11 `std::regex` (ECMAScript) rejects by
+/// throwing `std::regex_error` across the whisper.cpp FFI boundary.
+///
+/// Rejects Rust-only inline flags / named captures (`(?...` other than `(?:`),
+/// Unicode property escapes (`\p{...}`, `\P{...}`), and braced hex/Unicode
+/// escapes (`\x{...}`, `\u{...}`).
+fn has_unsupported_cpp_regex_syntax(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_char_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 2 < bytes.len()
+                    && matches!(bytes[i + 1], b'p' | b'P' | b'x' | b'u')
+                    && bytes[i + 2] == b'{'
+                {
+                    return true;
+                }
+                i += 2;
+                continue;
+            }
+            b'[' if !in_char_class => {
+                in_char_class = true;
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'^' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b']' {
+                    i += 1;
+                }
+                continue;
+            }
+            b']' if in_char_class => {
+                in_char_class = false;
+            }
+            b'(' if !in_char_class => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'?' {
+                    // ECMAScript std::regex supports `(?:...)` (and lookaheads
+                    // `(?=...)`/`(?!...)`, which Rust's `regex` rejects below).
+                    // Reject all other `(?` constructs (e.g. `(?i)`, `(?P<...>)`,
+                    // `(?<...>)`) so C++ std::regex does not throw across FFI.
+                    if bytes.get(i + 2) != Some(&b':') {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Resolve the whisper.cpp thread count: explicit positive counts are used as
+/// requested, while `<= 0` ("auto") defaults to `available_parallelism().min(4)`
+/// (fallback `4`) rather than single-threaded execution.
+fn resolve_thread_count(threads: i32) -> i32 {
+    if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4) as i32)
+            .unwrap_or(4)
+    }
+}
+
 /// Validate the optional Whisper suppression pattern and turn accepted bytes
 /// into the NUL-terminated pointer expected by whisper.cpp.
 ///
 /// The C++ bridge's `std::regex` validator is authoritative when present:
 /// whisper.cpp uses ECMAScript regex syntax (including lookarounds and
 /// backreferences), which Rust's `regex` crate does not support. Standalone
-/// callers have no C++ validator, so use `regex` as a conservative malformed
-/// pattern check in that case.
+/// callers have no C++ validator, so use `regex` together with an ECMAScript
+/// compatibility guard so Rust-only syntax cannot throw `std::regex_error`
+/// across the FFI boundary.
 fn validated_suppress_regex(
     pattern: &str,
     warning: Option<&WarningBridge>,
@@ -401,6 +354,14 @@ fn validated_suppress_regex(
                 validator.user_data,
             )
         }
+    } else if has_unsupported_cpp_regex_syntax(pattern) {
+        emit_warning(
+            warning,
+            &format!(
+                "Invalid whisper suppress regex '{pattern}': syntax is unsupported by C++ std::regex"
+            ),
+        );
+        false
     } else {
         match regex::Regex::new(pattern) {
             Ok(_) => true,
@@ -439,7 +400,10 @@ pub unsafe fn transcribe(
     warning: Option<&WarningBridge>,
     regex_validate: Option<&RegexValidateBridge>,
 ) -> EngineStatus {
-    let samples = match read_whisper_wav(audio_path) {
+    let samples = match memento_asr::audio::wavreader::read_pcm16_wav_path(
+        audio_path,
+        sys::WHISPER_SAMPLE_RATE,
+    ) {
         Ok(samples) if !samples.is_empty() => samples,
         Ok(_) => {
             // Defensive C++ branch: empty result without an error message.
@@ -584,7 +548,7 @@ pub unsafe fn transcribe_samples(
     };
     let mut params = sys::whisper_full_default_params(strategy);
 
-    params.n_threads = max(1, options.threads);
+    params.n_threads = resolve_thread_count(options.threads);
 
     // C++: empty QString => "ja", otherwise `.toUtf8()`.
     let language = if options.language.is_empty() {
@@ -744,25 +708,100 @@ mod tests {
     }
 
     #[test]
-    fn read_whisper_wav_rejects_garbage_header() {
+    fn standalone_validator_rejects_rust_only_regex_syntax() {
+        let rejected = [
+            "(?i)hello",
+            "(?m:^foo$)",
+            "(?P<word>[a-z]+)",
+            "(?<word>[a-z]+)",
+            r"\p{Hiragana}+",
+            r"\P{ASCII}",
+            r"[\p{L}]+",
+            r"\u{3042}",
+            r"\x{41}",
+        ];
+        for pattern in rejected {
+            assert!(
+                regex::Regex::new(pattern).is_ok(),
+                "fixture {pattern:?} should be accepted by Rust regex"
+            );
+            assert!(
+                validated_suppress_regex(pattern, None, None).is_none(),
+                "Rust-only pattern {pattern:?} must be rejected before FFI"
+            );
+        }
+
+        let accepted = [
+            r"^\[_extra_token_[0-9]+\]$",
+            "(?:foo|bar)+",
+            r"\(?literal\)",
+            r"[(?]",
+        ];
+        for pattern in accepted {
+            let out = validated_suppress_regex(pattern, None, None)
+                .unwrap_or_else(|| panic!("ECMAScript-compatible {pattern:?} should be accepted"));
+            assert_eq!(out.to_bytes(), pattern.as_bytes());
+        }
+    }
+
+    #[test]
+    fn resolve_thread_count_defaults_to_capped_parallelism_when_non_positive() {
+        let auto = resolve_thread_count(0);
+        assert!((1..=4).contains(&auto), "auto threads out of range: {auto}");
+        assert_eq!(resolve_thread_count(-2), auto);
+        assert_eq!(resolve_thread_count(1), 1);
+        assert_eq!(resolve_thread_count(6), 6);
+    }
+
+    #[test]
+    fn transcribe_wav_rejects_garbage_header() {
         let dir = std::env::temp_dir().join("memento-whisper-engine-tests");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("garbage.wav");
         std::fs::write(&path, [0xACu8; 32]).expect("write fixture");
-        let error = read_whisper_wav(&path).expect_err("garbage must fail");
+        let status = unsafe {
+            transcribe(
+                std::ptr::null_mut(),
+                &path,
+                &TranscribeOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
         assert_eq!(
-            error,
-            "The extracted audio is not RIFF/WAVE (header ac ac ac ac ac ac ac ac \
-             ac ac ac ac)."
+            status,
+            EngineStatus::Failed {
+                message: "The extracted audio is not RIFF/WAVE (header ac ac ac ac ac ac ac ac \
+                 ac ac ac ac)."
+                    .to_string(),
+                warn: true,
+            }
         );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn read_whisper_wav_rejects_missing_file() {
-        let error = read_whisper_wav(Path::new("/nonexistent/memento/audio.wav"))
-            .expect_err("missing file must fail");
-        assert_eq!(error, "Could not open the extracted audio file.");
+    fn transcribe_wav_rejects_missing_file() {
+        let status = unsafe {
+            transcribe(
+                std::ptr::null_mut(),
+                Path::new("/nonexistent/memento/audio.wav"),
+                &TranscribeOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            status,
+            EngineStatus::Failed {
+                message: "Could not open the extracted audio file.".to_string(),
+                warn: true,
+            }
+        );
     }
 
     #[test]
@@ -788,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn read_whisper_wav_rejects_overflowing_chunk_size() {
+    fn transcribe_wav_rejects_overflowing_chunk_size() {
         let dir = std::env::temp_dir().join("memento-whisper-engine-tests");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("overflow-chunk.wav");
@@ -800,8 +839,24 @@ mod tests {
         wav.extend_from_slice(&u32::MAX.to_le_bytes());
         wav.extend_from_slice(&[0u8; 16]);
         std::fs::write(&path, &wav).expect("write fixture");
-        let error = read_whisper_wav(&path).expect_err("overflowing chunk size must fail");
-        assert_eq!(error, "The extracted WAV file is truncated.");
+        let status = unsafe {
+            transcribe(
+                std::ptr::null_mut(),
+                &path,
+                &TranscribeOptions::default(),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            status,
+            EngineStatus::Failed {
+                message: "The extracted WAV file is truncated.".to_string(),
+                warn: true,
+            }
+        );
         let _ = std::fs::remove_file(&path);
     }
 

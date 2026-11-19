@@ -18,13 +18,8 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! Blocking, Qt-free HTTP/1.1 core for Memento.
-//!
-//! HTTP/1.1 request canonicalization, response head parsing, Content-Length
-//! and chunked body decoding, redirect following, and a byte-level streaming
-//! hook ([`Response::stream_chunks`] plus [`std::io::Read`]) for downloads.
-//! The built-in transport secures HTTPS with rustls and WebPKI root
-//! validation; custom transports may supply other network policies.
+//! Blocking, Qt-free HTTP/1.1 core for Memento backed by `ureq` (with rustls
+//! + WebPKI roots) and `url`.
 
 pub mod client;
 pub mod headers;
@@ -32,7 +27,7 @@ pub mod request;
 pub mod response;
 pub mod url;
 
-pub use client::{HttpClient, HttpClientConfig, TcpTransport, Transport};
+pub use client::{HttpClient, HttpClientConfig};
 pub use headers::Headers;
 pub use request::{Method, Request};
 pub use response::Response;

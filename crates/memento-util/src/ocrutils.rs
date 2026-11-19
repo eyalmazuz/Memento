@@ -293,7 +293,8 @@ pub fn resolve_venv_python(
     let is_win_drive_root = is_windows
         && result.len() == 3
         && result[1] == COLON
-        && (result[0] as u8).is_ascii_alphabetic();
+        && result[2] == SLASH
+        && u8::try_from(result[0]).is_ok_and(|b| b.is_ascii_alphabetic());
 
     if result.len() > 1 && result.last() == Some(&SLASH) && !is_win_drive_root {
         result.pop();
@@ -305,6 +306,53 @@ pub fn resolve_venv_python(
     }
 
     result.extend_from_slice(sub_path);
+    Some(result)
+}
+
+/// Native UTF-8 version of [`resolve_venv_python`]: resolves the virtual-environment
+/// Python executable path matching `QDir(venv).filePath(VENV_PYTHON)`.
+///
+/// Returns `None` if `python_exec_is_set` is `true` or `venv` is empty.
+pub fn resolve_venv_python_str(
+    python_exec_is_set: bool,
+    venv: &str,
+    is_windows: bool,
+) -> Option<String> {
+    if python_exec_is_set || venv.is_empty() {
+        return None;
+    }
+
+    let sub_path = if is_windows {
+        "Scripts/python.exe"
+    } else {
+        "bin/python"
+    };
+
+    let mut result = String::with_capacity(venv.len() + 1 + sub_path.len());
+    if is_windows {
+        for ch in venv.chars() {
+            result.push(if ch == '\\' { '/' } else { ch });
+        }
+    } else {
+        result.push_str(venv);
+    }
+
+    let bytes = result.as_bytes();
+    let is_win_drive_root = is_windows
+        && bytes.len() == 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/';
+
+    if result.len() > 1 && result.ends_with('/') && !is_win_drive_root {
+        result.pop();
+    }
+
+    if !result.ends_with('/') {
+        result.push('/');
+    }
+
+    result.push_str(sub_path);
     Some(result)
 }
 
@@ -491,6 +539,33 @@ mod tests {
         check("\\\\server\\share\\venv", "//server/share/venv/Scripts/python.exe");
         check("/tmp/venv", "/tmp/venv/Scripts/python.exe");
         check("/tmp/venv/", "/tmp/venv/Scripts/python.exe");
+        // Non-ASCII code unit 0x3041 ('ぁ') has low byte 0x41 ('A') and must not truncate as a drive letter.
+        check("ぁ:/", "ぁ:/Scripts/python.exe");
+    }
+
+    #[test]
+    fn resolve_venv_python_str_matches_utf16_variants() {
+        assert_eq!(resolve_venv_python_str(true, "/tmp/venv", false), None);
+        assert_eq!(resolve_venv_python_str(false, "", false), None);
+        for (input, is_windows) in [
+            ("/tmp/venv", false),
+            ("/tmp/venv/", false),
+            ("/tmp/venv//", false),
+            ("/", false),
+            ("//", false),
+            ("relative/path/", false),
+            ("C:\\venv", true),
+            ("C:\\venv\\", true),
+            ("C:\\", true),
+            ("C:/", true),
+            ("C:", true),
+            ("ぁ:/", true),
+            ("\\\\server\\share\\venv", true),
+        ] {
+            let utf16 = resolve_venv_python(false, &u16_str(input), is_windows).unwrap();
+            let utf8 = resolve_venv_python_str(false, input, is_windows).unwrap();
+            assert_eq!(utf8, String::from_utf16_lossy(&utf16), "mismatch for {input}");
+        }
     }
 
     #[test]

@@ -1029,7 +1029,10 @@ mod ui_dialogs_settings_and_modifier_tests {
                 .find_all();
             assert!(
                 !cards.is_empty() && !rows.is_empty() && !descs.is_empty(),
-                "{label}: expected settings-card, field-row, and field-desc elements"
+                "{label}: expected settings-card, field-row, and field-desc elements (cards={}, rows={}, descs={})",
+                cards.len(),
+                rows.len(),
+                descs.len(),
             );
 
             for (idx, desc) in descs.iter().enumerate() {
@@ -1127,7 +1130,31 @@ mod ui_dialogs_settings_and_modifier_tests {
                 .collect();
             settings.window().set_size(slint::LogicalSize::new(w, 680.0));
             settings.set_settings_groups(Rc::new(VecModel::from(subtitle_only)).into());
+            // Scroll the settings body so the bottom ASS-native description row is inside the 680px viewport
+            // (FontPickerControl is a 2-row 260px stacked control so the 10-row Subtitle card scrolls at 680px).
+            i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(16));
+            let scroll_pos = slint::LogicalPosition::new(w * 0.6, 340.0);
+            settings.window().dispatch_event(
+                slint::platform::WindowEvent::PointerMoved {
+                    position: scroll_pos,
+                },
+            );
+            settings.window().dispatch_event(
+                slint::platform::WindowEvent::PointerScrolled {
+                    position: scroll_pos,
+                    delta_x: 0.0,
+                    delta_y: -160.0,
+                },
+            );
             assert_all_descriptions_contained(&format!("interface-subtitle-only-{w}x680"));
+            // Restore scroll position to top before next category/width iteration.
+            settings.window().dispatch_event(
+                slint::platform::WindowEvent::PointerScrolled {
+                    position: scroll_pos,
+                    delta_x: 0.0,
+                    delta_y: 160.0,
+                },
+            );
 
             settings.window().set_size(slint::LogicalSize::new(w, 1600.0));
             settings.set_active_category(9);

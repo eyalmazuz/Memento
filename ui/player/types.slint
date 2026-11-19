@@ -1,0 +1,22 @@
+// Shared player data structs re-exported by ui/app.slint.
+
+export struct SubEntry {
+    id: int,
+    start: float,
+    end: float,
+    text: string,
+    selected: bool,
+    is_active: bool,
+    search_match: bool,
+}
+
+export struct PlayerTrack {
+    id: int,
+    label: string,
+    selected: bool,
+}
+
+export struct ChapterMark {
+    time: float,
+    title: string,
+}

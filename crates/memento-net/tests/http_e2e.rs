@@ -86,30 +86,61 @@ fn plain_success_round_trip_captures_the_request_canonical_form()
 #[test]
 fn chunked_response_streams_piecewise_before_completion()
 {
-    let server = TestServer::start();
-    server.spawn(|_, _| {
-        let mut wire = response_head(
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (chunk1_seen_tx, chunk1_seen_rx) = mpsc::channel();
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let mut req_buf = [0u8; 4096];
+        let _ = stream.read(&mut req_buf);
+
+        // Send response head + first chunk only; hold back the second chunk
+        // until the client's streaming callback has observed the first chunk.
+        let mut first = response_head(
             "HTTP/1.1 200 OK",
-            "Transfer-Encoding: chunked\r\nX-Stream: yes",
+            "Transfer-Encoding: chunked\r\nX-Stream: yes\r\nConnection: close",
         )
         .into_bytes();
-        wire.extend_from_slice(b"4\r\naaaa\r\n5\r\nbbbbb\r\n0\r\n\r\n");
-        Action::Respond(wire)
+        first.extend_from_slice(b"4\r\naaaa\r\n");
+        stream.write_all(&first).unwrap();
+        stream.flush().unwrap();
+
+        chunk1_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client must deliver first chunk before stream completes");
+
+        stream.write_all(b"5\r\nbbbbb\r\n0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
     });
 
-    let url = server.url("/stream");
+    let url = format!("http://{}:{}/stream", addr.ip(), addr.port());
     let mut response =
         client().send(&Request::get(Url::parse(&url).unwrap())).unwrap();
     assert_eq!(response.header("transfer-encoding").unwrap(), "chunked");
     assert_eq!(response.header("x-stream").unwrap(), "yes");
 
     let mut collected = Vec::new();
+    let mut notified = false;
     let total = response
         .stream_chunks(&mut |chunk| {
             collected.push(chunk.to_vec());
+            if !notified
+            {
+                notified = true;
+                let _ = chunk1_seen_tx.send(());
+            }
             Ok(())
         })
         .unwrap();
+    server_thread.join().unwrap();
     assert_eq!(total, 9);
     assert_eq!(
         collected.iter().map(Vec::as_slice).collect::<Vec<_>>(),

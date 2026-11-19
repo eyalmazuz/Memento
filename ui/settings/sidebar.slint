@@ -1,0 +1,252 @@
+import { LineEdit } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { IconButton } from "../components/buttons.slint";
+
+component SidebarGroupLabel inherits Text {
+    color: MementoPalette.text-muted;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    height: 22px;
+    vertical-alignment: bottom;
+}
+
+component SidebarItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected;
+    in property <bool> dirty: false;
+    callback clicked();
+
+    height: 34px;
+    border-radius: 7px;
+    background: root.selected
+        ? MementoPalette.accent-muted
+        : (touch.pressed
+            ? MementoPalette.active-bg
+            : (touch.has-hover ? MementoPalette.hover-bg : transparent));
+
+    animate background { duration: 100ms; }
+
+    // Left vertical accent pill on active category
+    if root.selected : Rectangle {
+        x: 3px;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: parent.height - 14px;
+        border-radius: 2px;
+        background: MementoPalette.cyan-accent;
+    }
+
+    Image {
+        x: 14px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        source: root.icon;
+        colorize: root.selected ? MementoPalette.cyan-text : MementoPalette.icon-muted;
+    }
+
+    Text {
+        x: 39px;
+        y: 0px;
+        width: parent.width - (root.dirty ? 58px : 48px);
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? MementoPalette.text : MementoPalette.text-secondary;
+        font-size: 13px;
+        font-weight: root.selected ? 700 : 500;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // Unsaved changes dot
+    if root.dirty : Rectangle {
+        x: parent.width - 16px;
+        y: (parent.height - self.height) / 2;
+        width: 6px;
+        height: 6px;
+        border-radius: 3px;
+        background: MementoPalette.warning;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component SettingsSidebar inherits Rectangle {
+    in property <int> active-category;
+    in property <bool> ocr-built: false;
+    in property <bool> asr-available: false;
+    in property <[bool]> dirty-categories: [];
+    in-out property <string> search-query: "";
+    callback select-category(int);
+    callback search-changed(string);
+
+    public function focus-search() {
+        search-box.focus();
+    }
+
+    width: 232px;
+    background: MementoPalette.sidebar-bg;
+
+    VerticalLayout {
+        padding-top: 14px;
+        padding-bottom: 14px;
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 3px;
+
+        // Sidebar Brand Header
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-bottom: 10px;
+            spacing: 10px;
+            alignment: start;
+
+            VerticalLayout {
+                alignment: center;
+                Image {
+                    width: 26px;
+                    height: 26px;
+                    source: @image-url("../../res/memento.svg");
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 0px;
+                Text {
+                    text: "Options";
+                    color: MementoPalette.text;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Memento Preferences";
+                    color: MementoPalette.text-muted;
+                    font-size: 10.5px;
+                }
+            }
+        }
+
+        // Quick Settings Filter / Search Box
+        HorizontalLayout {
+            padding-left: 2px;
+            padding-right: 2px;
+            padding-bottom: 8px;
+            spacing: 4px;
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                search-box := LineEdit {
+                    text <=> root.search-query;
+                    placeholder-text: "Filter settings… (Ctrl+F)";
+                    edited(q) => { root.search-changed(q); }
+                }
+            }
+
+            if root.search-query != "" : VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: @image-url("../icons/close.svg");
+                    size: 26px;
+                    icon-size: 13px;
+                    tooltip: "Clear filter";
+                    tooltip-below: true;
+                    tooltip-align-right: true;
+                    clicked => {
+                        root.search-query = "";
+                        root.search-changed("");
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: MementoPalette.border; }
+
+        HorizontalLayout { padding-left: 10px; padding-top: 6px; SidebarGroupLabel { text: "STUDY & MINING"; } }
+        SidebarItem {
+            label: "Anki Integration";
+            icon: @image-url("../icons/anki.svg");
+            selected: root.search-query == "" && root.active-category == 0;
+            dirty: root.dirty-categories[0];
+            clicked => { root.select-category(0); }
+        }
+        SidebarItem {
+            label: "Dictionary";
+            icon: @image-url("../icons/dictionary.svg");
+            selected: root.search-query == "" && root.active-category == 4;
+            dirty: root.dirty-categories[4];
+            clicked => { root.select-category(4); }
+        }
+        SidebarItem {
+            label: "Search";
+            icon: @image-url("../icons/search.svg");
+            selected: root.search-query == "" && root.active-category == 9;
+            dirty: root.dirty-categories[9];
+            clicked => { root.select-category(9); }
+        }
+        SidebarItem {
+            label: "Audio Sources";
+            icon: @image-url("../icons/volume-on.svg");
+            selected: root.search-query == "" && root.active-category == 2;
+            dirty: root.dirty-categories[2];
+            clicked => { root.select-category(2); }
+        }
+
+        HorizontalLayout { padding-left: 10px; padding-top: 10px; SidebarGroupLabel { text: "PLAYER & UI"; } }
+        SidebarItem {
+            label: "Interface";
+            icon: @image-url("../icons/window.svg");
+            selected: root.search-query == "" && root.active-category == 5;
+            dirty: root.dirty-categories[5];
+            clicked => { root.select-category(5); }
+        }
+        SidebarItem {
+            label: "Behavior";
+            icon: @image-url("../icons/gear.svg");
+            selected: root.search-query == "" && root.active-category == 3;
+            dirty: root.dirty-categories[3];
+            clicked => { root.select-category(3); }
+        }
+        SidebarItem {
+            label: "Keybinds";
+            icon: @image-url("../icons/keyboard.svg");
+            selected: root.search-query == "" && root.active-category == 6;
+            dirty: root.dirty-categories[6];
+            clicked => { root.select-category(6); }
+        }
+        SidebarItem {
+            label: "Application";
+            icon: @image-url("../icons/settings.svg");
+            selected: root.search-query == "" && root.active-category == 1;
+            dirty: root.dirty-categories[1];
+            clicked => { root.select-category(1); }
+        }
+
+        if root.ocr-built || root.asr-available : HorizontalLayout {
+            padding-left: 10px;
+            padding-top: 10px;
+            SidebarGroupLabel { text: "RECOGNITION"; }
+        }
+        if root.asr-available : SidebarItem {
+            label: "ASR (Speech)";
+            icon: @image-url("../icons/mic.svg");
+            selected: root.search-query == "" && root.active-category == 8;
+            dirty: root.dirty-categories[8];
+            clicked => { root.select-category(8); }
+        }
+        if root.ocr-built : SidebarItem {
+            label: "OCR";
+            icon: @image-url("../icons/eye.svg");
+            selected: root.search-query == "" && root.active-category == 7;
+            dirty: root.dirty-categories[7];
+            clicked => { root.select-category(7); }
+        }
+
+        Rectangle { vertical-stretch: 1; background: transparent; }
+    }
+}

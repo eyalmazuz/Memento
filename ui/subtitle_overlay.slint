@@ -1,3 +1,5 @@
+import { MementoPalette } from "palette.slint";
+
 export struct SubtitleWord {
     text: string,
     reading: string,
@@ -156,6 +158,7 @@ export component InteractiveSubtitleToken inherits Rectangle {
         y: glyph.y;
         width: glyph.width;
         height: glyph.height;
+        border-radius: 3px;
         background: #38a6d6;
     }
 
@@ -176,8 +179,8 @@ export component InteractiveSubtitleToken inherits Rectangle {
         wrap: no-wrap;
         font-size: root.type-size * 0.5;
         font-family: "Noto Sans CJK JP";
-        color: #E2E8F0;
-        x: (parent.width - self.preferred-width) / 2;
+        color: MementoPalette.icon;
+        x: round((parent.width - self.preferred-width) / 2 / 1px) * 1px;
         y: max(0px, root.ruby-space - self.preferred-height);
     }
 
@@ -187,12 +190,12 @@ export component InteractiveSubtitleToken inherits Rectangle {
         width: self.preferred-width;
         height: self.preferred-height;
         wrap: no-wrap;
-        x: (parent.width - self.preferred-width) / 2;
+        x: round((parent.width - self.preferred-width) / 2 / 1px) * 1px;
         y: root.ruby-space;
         font-size: root.type-size;
         font-weight: 700;
         font-family: "Noto Sans CJK JP";
-        color: white;
+        color: MementoPalette.text;
     }
 
     token-focus := FocusScope {

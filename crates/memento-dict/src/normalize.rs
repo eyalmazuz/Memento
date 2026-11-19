@@ -102,6 +102,9 @@ pub fn expand_prolonged_vowels(text: &str) -> Vec<String> {
         if ch == 'ゆ' && chars.get(i + 1) == Some(&'ー') {
             let mut next_partials = Vec::with_capacity((partials.len() * 2).min(MAX_PROLONGED_VARIANTS));
             for base in &partials {
+                if next_partials.len() >= MAX_PROLONGED_VARIANTS {
+                    break;
+                }
                 let mut v_iu = base.clone();
                 v_iu.push_str("いう");
                 next_partials.push(v_iu);
@@ -122,10 +125,10 @@ pub fn expand_prolonged_vowels(text: &str) -> Vec<String> {
             if !vowels.is_empty() {
                 let mut next_partials =
                     Vec::with_capacity((partials.len() * vowels.len()).min(MAX_PROLONGED_VARIANTS));
-                for base in &partials {
+                'outer: for base in &partials {
                     for &v in vowels {
                         if next_partials.len() >= MAX_PROLONGED_VARIANTS {
-                            break;
+                            break 'outer;
                         }
                         let mut candidate = base.clone();
                         candidate.push(v);

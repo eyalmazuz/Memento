@@ -21,10 +21,11 @@
 //! Persistent in-process `libmecab` (`libloading`) tagger with a warm piped
 //! `mecab` subprocess daemon fallback.
 
+use std::borrow::Cow;
 use std::ffi::{c_char, c_void, CStr};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 type MecabNew2Fn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type MecabSparseToStr2Fn =
@@ -167,18 +168,27 @@ impl LibMecabTagger {
         let mut c_arg: Vec<u8> = tagger_arg.iter().copied().filter(|&b| b != 0).collect();
         c_arg.push(0);
 
-        let tagger = unsafe { (mecab_new2)(c_arg.as_ptr() as *const c_char) };
-        if tagger.is_null() {
-            let err_msg = unsafe {
-                let err_ptr = (mecab_strerror)(std::ptr::null_mut());
-                if err_ptr.is_null() {
-                    "unknown mecab_new2 error".to_string()
-                } else {
-                    CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
-                }
-            };
-            return Err(format!("mecab_new2 returned null: {err_msg}"));
-        }
+        // `mecab_new2` stores initialization error strings in a non-thread-safe
+        // global buffer inside `libmecab` read by `mecab_strerror(NULL)`.
+        // Serialize tagger creation + global error reads across threads.
+        let tagger = {
+            let _init_guard = MECAB_INIT_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let tagger = unsafe { (mecab_new2)(c_arg.as_ptr() as *const c_char) };
+            if tagger.is_null() {
+                let err_msg = unsafe {
+                    let err_ptr = (mecab_strerror)(std::ptr::null_mut());
+                    if err_ptr.is_null() {
+                        "unknown mecab_new2 error".to_string()
+                    } else {
+                        CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(format!("mecab_new2 returned null: {err_msg}"));
+            }
+            tagger
+        };
 
         Ok(Self {
             tagger,
@@ -208,8 +218,11 @@ impl LibMecabTagger {
                 continue;
             }
             buf.clear();
+            // Replace embedded NUL bytes with ASCII space instead of deleting them
+            // so MeCab never glues tokens across a NUL byte and desynchronizes
+            // downstream surface alignment against the original text.
             if line.as_bytes().contains(&0) {
-                buf.extend(line.bytes().filter(|&b| b != 0));
+                buf.extend(line.bytes().map(|b| if b == 0 { b' ' } else { b }));
             } else {
                 buf.extend_from_slice(line.as_bytes());
             }
@@ -252,9 +265,12 @@ impl LibMecabTagger {
         }
         let clean: String = text
             .chars()
-            .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+            .map(|c| match c {
+                '\r' | '\n' | '\0' => ' ',
+                other => other,
+            })
             .collect();
-        if clean.is_empty() {
+        if clean.bytes().all(|b| b == b' ') {
             return Ok(Vec::new());
         }
         if n == 1 || self.mecab_nbest_sparse_tostr2.is_none() {
@@ -366,7 +382,10 @@ impl PipedMecabDaemon {
     fn parse_single_line(&mut self, line: &str) -> Result<String, String> {
         let clean: String = line
             .chars()
-            .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+            .map(|c| match c {
+                '\r' | '\n' | '\0' => ' ',
+                other => other,
+            })
             .collect();
         if clean.is_empty() {
             return Ok(String::new());
@@ -464,7 +483,44 @@ impl MecabBackend {
     }
 }
 
-static GLOBAL_MECAB: OnceLock<Mutex<Option<MecabBackend>>> = OnceLock::new();
+enum MecabInit<B = MecabBackend> {
+    Uninitialized,
+    Ready(B),
+    Unavailable(String),
+}
+
+impl<B> MecabInit<B> {
+    fn get_or_init_with<F>(&mut self, init: F) -> Result<&mut B, String>
+    where
+        F: FnOnce() -> Result<B, String>,
+    {
+        if matches!(self, Self::Uninitialized) {
+            *self = match init() {
+                Ok(backend) => Self::Ready(backend),
+                Err(err) => Self::Unavailable(err),
+            };
+        }
+        match self {
+            Self::Ready(backend) => Ok(backend),
+            Self::Unavailable(err) => Err(err.clone()),
+            Self::Uninitialized => unreachable!(),
+        }
+    }
+}
+
+static MECAB_INIT_LOCK: Mutex<()> = Mutex::new(());
+static GLOBAL_MECAB: Mutex<MecabInit> = Mutex::new(MecabInit::Uninitialized);
+
+/// Drop the process-wide cached MeCab backend (unloading `libmecab` or
+/// terminating and reaping the piped `mecab` daemon) and reset the cache so a
+/// subsequent parse re-initializes cleanly.
+pub fn unload_mecab() {
+    let mut guard = match GLOBAL_MECAB.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = MecabInit::Uninitialized;
+}
 
 fn split_eos_blocks(raw: &str) -> Vec<String> {
     let mut blocks = Vec::new();
@@ -489,18 +545,18 @@ fn split_eos_blocks(raw: &str) -> Vec<String> {
 
 /// Parse `text` using the process-wide warm MeCab backend (preferring in-process
 /// `libmecab` via `libloading`, falling back to a persistent piped `mecab` daemon).
+///
+/// Initialization failure is cached as unavailable so callers do not repeatedly
+/// probe shared libraries or spawn subprocesses; call [`unload_mecab`] to reset.
 pub fn parse_mecab(text: &str) -> Result<String, String> {
     if text.is_empty() {
         return Ok(String::new());
     }
-    let mutex = GLOBAL_MECAB.get_or_init(|| Mutex::new(MecabBackend::init().ok()));
-    let mut guard = mutex
+    let mut guard = GLOBAL_MECAB
         .lock()
         .map_err(|_| "MeCab mutex poisoned".to_string())?;
-    if guard.is_none() {
-        *guard = Some(MecabBackend::init()?);
-    }
-    guard.as_mut().unwrap().parse(text)
+    let backend = guard.get_or_init_with(MecabBackend::init)?;
+    backend.parse(text)
 }
 
 /// Parse `text` into up to `n` N-best `EOS`-terminated lattice path blocks using
@@ -509,14 +565,11 @@ pub fn mecab_nbest_lines(text: &str, n: usize) -> Result<Vec<String>, String> {
     if text.is_empty() || n == 0 {
         return Ok(Vec::new());
     }
-    let mutex = GLOBAL_MECAB.get_or_init(|| Mutex::new(MecabBackend::init().ok()));
-    let mut guard = mutex
+    let mut guard = GLOBAL_MECAB
         .lock()
         .map_err(|_| "MeCab mutex poisoned".to_string())?;
-    if guard.is_none() {
-        *guard = Some(MecabBackend::init()?);
-    }
-    guard.as_mut().unwrap().parse_nbest(text, n)
+    let backend = guard.get_or_init_with(MecabBackend::init)?;
+    backend.parse_nbest(text, n)
 }
 
 fn clean_feature_atom(field: &str) -> Option<&str> {
@@ -645,8 +698,7 @@ pub fn parse_mecab_lookup_tokens(text: &str, output: &str) -> Vec<MecabLookupTok
         let raw_reading =
             crate::furiganaparser::extract_surface_reading_from_fields(&surface_clean, &fields);
         let reading = if !raw_reading.is_empty() && raw_reading != "*" {
-            let units: Vec<u16> = raw_reading.encode_utf16().collect();
-            String::from_utf16_lossy(&crate::furiganaparser::katakana_to_hiragana(&units))
+            crate::furiganaparser::katakana_to_hiragana_str(&raw_reading)
         } else {
             String::new()
         };
@@ -715,6 +767,25 @@ pub fn parse_mecab_lookup_tokens(text: &str, output: &str) -> Vec<MecabLookupTok
     tokens
 }
 
+fn sanitize_lookup_query(text: &str) -> Cow<'_, str> {
+    // Substitute non-BMP Joyo `𠮟` (U+20B9F) with BMP `叱` (U+53F1) and replace
+    // line breaks / NUL bytes with spaces (never deleting them) so MeCab keeps
+    // token boundaries aligned against the original `text`.
+    if text.contains(['𠮟', '\n', '\r', '\0']) {
+        Cow::Owned(
+            text.chars()
+                .map(|c| match c {
+                    '𠮟' => '叱',
+                    '\r' | '\n' | '\0' => ' ',
+                    other => other,
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Tokenize `text` for dictionary lookup using the warm in-process `libmecab` tagger
 /// (or piped `mecab` daemon fallback), supporting both IPADic and UniDic feature layouts.
 pub fn mecab_tokenize_for_lookup(text: &str) -> Result<Vec<MecabLookupToken>, String> {
@@ -722,24 +793,8 @@ pub fn mecab_tokenize_for_lookup(text: &str) -> Result<Vec<MecabLookupToken>, St
         return Ok(Vec::new());
     }
 
-    // Substitute non-BMP Joyo `𠮟` (U+20B9F) with BMP `叱` (U+53F1) for MeCab lookup
-    // while `parse_mecab_lookup_tokens` slices exact original spans from `text`.
-    let sanitized: String;
-    let query_ref = if text.contains('𠮟') || text.contains('\n') || text.contains('\r') {
-        sanitized = text
-            .chars()
-            .map(|c| match c {
-                '𠮟' => '叱',
-                '\r' | '\n' => ' ',
-                other => other,
-            })
-            .collect();
-        sanitized.as_str()
-    } else {
-        text
-    };
-
-    let output = parse_mecab(query_ref)?;
+    let query = sanitize_lookup_query(text);
+    let output = parse_mecab(&query)?;
     Ok(parse_mecab_lookup_tokens(text, &output))
 }
 
@@ -893,5 +948,49 @@ mod tests {
             avg_micros < 1000.0,
             "mecab_tokenize_for_lookup must run under 1ms (1000us), took {avg_micros:.2}us"
         );
+    }
+
+    #[test]
+    fn mecab_init_caches_unavailable_and_allows_reset() {
+        let mut state: MecabInit<u32> = MecabInit::Uninitialized;
+        let mut calls = 0usize;
+        let err1 = state
+            .get_or_init_with(|| {
+                calls += 1;
+                Err("missing mecab".to_string())
+            })
+            .unwrap_err();
+        let err2 = state
+            .get_or_init_with(|| {
+                calls += 1;
+                Ok(42)
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1, "Unavailable must be cached without re-probing");
+        assert_eq!(err1, "missing mecab");
+        assert_eq!(err2, "missing mecab");
+
+        state = MecabInit::Uninitialized;
+        let val = state
+            .get_or_init_with(|| {
+                calls += 1;
+                Ok(99)
+            })
+            .unwrap();
+        assert_eq!(*val, 99);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn nul_byte_is_replaced_with_space_preserving_alignment() {
+        assert_eq!(&*sanitize_lookup_query("食\0べる"), "食 べる");
+        let mecab_out =
+            "食\t名詞,一般,*,*,*,*,食,ショク,ショク\nべる\t名詞,一般,*,*,*,*,べる,ベル,ベル\nEOS\n";
+        let tokens = parse_mecab_lookup_tokens("食\0べる", mecab_out);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].surface, "食");
+        assert_eq!(tokens[0].surface_clean, "食");
+        assert_eq!(tokens[1].surface, "\0べる");
+        assert_eq!(tokens[1].surface_clean, "べる");
     }
 }

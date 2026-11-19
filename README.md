@@ -58,12 +58,12 @@ The default build includes video playback, dictionaries, MeCab furigana/lookup, 
 
 **Arch Linux:**
 ```bash
-sudo pacman -S --needed base-devel clang pkgconf mpv sqlite
+sudo pacman -S --needed base-devel clang pkgconf mpv libass sqlite
 ```
 
 **Debian / Ubuntu:**
 ```bash
-sudo apt install build-essential libclang-dev pkg-config libmpv-dev libsqlite3-dev
+sudo apt install build-essential libclang-dev pkg-config libmpv-dev libass-dev libsqlite3-dev
 ```
 
 **Recommended runtime extras:**
@@ -145,8 +145,14 @@ Import `.zip` dictionaries directly in **Settings → Dictionaries** (drag-and-d
 * Press **`Ctrl+L`** (default) to select a screen region on the video for instant OCR + dictionary lookup.
 
 ### MeCab (Furigana & Compound Matching)
-* Built in automatically — no Cargo feature flag required.
-* Just install `mecab` along with an IPADic or UniDic dictionary on your system; Memento loads `libmecab` in-process (or falls back to the `mecab` CLI) with sub-millisecond warm lookups.
+* Built in automatically — no Cargo feature flag required, and Memento does not bundle a MeCab dictionary in the repo.
+* Both **IPADic** (smallest/easiest via distro packages) and **UniDic** *(recommended for noticeably more accurate modern readings and compound lookup)* are detected and supported automatically.
+* **Install MeCab + a dictionary:**
+  * **Debian / Ubuntu (IPADic):** `sudo apt install mecab libmecab2 mecab-ipadic-utf8`
+  * **Arch Linux:** install `mecab` + `mecab-ipadic` (or `unidic`) from the AUR
+  * **UniDic via Python (any distro):** `pip install unidic && python -m unidic download`
+* **Selecting your dictionary:** Memento loads `libmecab` in-process (falling back to the `mecab` CLI) using whatever `dicdir` is configured in `/etc/mecabrc` (or the `$MECABRC` environment variable). If you install UniDic via Python or have multiple dictionaries installed, set `dicdir = /path/to/unidic/dicdir` in `/etc/mecabrc` (run `python -c "import unidic; print(unidic.DICDIR)"` to find the path).
+* **Enabling furigana:** Turn on **Show furigana over subtitles** in **Settings → Search** (or toggle it from the Subtitle menu / shortcut). Without MeCab installed, subtitles still work normally without furigana.
 
 ---
 

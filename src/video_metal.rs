@@ -25,10 +25,10 @@
 //! - Primary `IoSurfaceOpenGlBridge` mode: renders `libmpv` frames into a
 //!   triple-buffered ring (`METAL_FRAME_SLOT_COUNT = 3`) of `IOSurface` objects
 //!   bound to OpenGL `GL_TEXTURE_RECTANGLE` FBOs via `CGLTexImageIOSurface2D`,
-//!   retains retired resize generations until worker teardown so Metal never
-//!   observes an in-flight `IOSurface` being destroyed, and wraps each published
-//!   `IOSurface` in a cached `MTLTexture` (`MTLPixelFormatBGRA8Unorm` or
-//!   `MTLPixelFormatRGBA16Float`).
+//!   retains retired resize generations across a bounded grace window so Metal never
+//!   observes an in-flight `IOSurface` being destroyed without leaking across resizes,
+//!   and wraps each published `IOSurface` in a cached `MTLTexture`
+//!   (`MTLPixelFormatBGRA8Unorm` or `MTLPixelFormatRGBA16Float`).
 //! - Optional `NativeMetalLayer` mode: configures a `CAMetalLayer` with HiDPI
 //!   `contentsScale`, clamped drawable dimensions, EDR/HDR pixel formats, and
 //!   `mpv` `vo=gpu-next` / `gpu-api=vulkan` / `gpu-context=macvk` (MoltenVK)
@@ -37,8 +37,18 @@
 //! All geometry, pixel-format, ring-buffer, cache, and option-planning logic is
 //! platform-independent so it compiles and is thoroughly tested on Linux as well.
 
+use std::collections::VecDeque;
+
 /// Triple-buffered IOSurface slot count matching upstream `MpvMetalRenderer`.
 pub const METAL_FRAME_SLOT_COUNT: usize = 3;
+
+/// Number of published frames a retired resize generation is kept so in-flight
+/// Metal/GPU commands finish sampling it before reclamation.
+pub const METAL_RETIRED_GENERATION_GRACE_FRAMES: u64 = METAL_FRAME_SLOT_COUNT as u64;
+
+/// Maximum number of retired resize generations retained concurrently so rapid
+/// resize storms remain bounded even before new frames publish.
+pub const METAL_MAX_RETIRED_GENERATIONS: usize = 2;
 
 /// Maximum 2D texture dimension supported by Apple Silicon / modern Metal GPUs.
 pub const MTL_MAX_TEXTURE_DIMENSION_2D: u32 = 16_384;
@@ -244,7 +254,8 @@ impl MetalLayerGeometry {
             return Err("Metal physical pixel dimensions must be positive".to_owned());
         }
         let scale = sanitize_contents_scale(contents_scale);
-        let (drawable_width, drawable_height) = clamp_metal_drawable_size(pixel_width, pixel_height);
+        let (drawable_width, drawable_height) =
+            clamp_metal_drawable_size(pixel_width, pixel_height);
         Ok(Self {
             logical_width: drawable_width as f64 / scale,
             logical_height: drawable_height as f64 / scale,
@@ -288,7 +299,11 @@ pub struct IoSurfaceDescriptor {
 }
 
 impl IoSurfaceDescriptor {
-    pub fn for_size(width: u32, height: u32, pixel_format: MetalPixelFormat) -> Result<Self, String> {
+    pub fn for_size(
+        width: u32,
+        height: u32,
+        pixel_format: MetalPixelFormat,
+    ) -> Result<Self, String> {
         if width == 0 || height == 0 {
             return Err("IOSurface dimensions must be positive".to_owned());
         }
@@ -427,20 +442,29 @@ pub struct MetalFrameSlot<S> {
     pub serial: u64,
 }
 
+#[derive(Debug)]
+struct RetiredGeneration<S> {
+    retired_at_serial: u64,
+    slots: Vec<MetalFrameSlot<S>>,
+}
+
 /// Platform-independent state machine for upstream Memento's triple-buffered
 /// IOSurface producer ring (`MpvMetalRenderer::Impl`).
 ///
 /// Guarantees:
 /// - Allocates `METAL_FRAME_SLOT_COUNT` (3) targets per active generation.
-/// - Retains retired resize generations until explicit shutdown drain so Metal
-///   never samples an `IOSurface` freed while GPU commands are in flight.
+/// - Retains retired resize generations across a bounded grace window
+///   ([`METAL_RETIRED_GENERATION_GRACE_FRAMES`] frames, capped at
+///   [`METAL_MAX_RETIRED_GENERATIONS`]) so Metal never samples an `IOSurface`
+///   freed while GPU commands are in flight, without leaking unbounded memory
+///   across resize storms.
 /// - Assigns monotonic frame serials on publication.
 #[derive(Debug)]
 pub struct MetalSurfaceRing<S> {
     requested_size: Option<(u32, u32)>,
     active_size: Option<(u32, u32)>,
     slots: Vec<MetalFrameSlot<S>>,
-    retired_generations: Vec<Vec<MetalFrameSlot<S>>>,
+    retired_generations: VecDeque<RetiredGeneration<S>>,
     latest_frame: Option<usize>,
     write_frame: Option<usize>,
     next_serial: u64,
@@ -460,7 +484,7 @@ impl<S> MetalSurfaceRing<S> {
             requested_size: None,
             active_size: None,
             slots: Vec::new(),
-            retired_generations: Vec::new(),
+            retired_generations: VecDeque::new(),
             latest_frame: None,
             write_frame: None,
             next_serial: 1,
@@ -554,7 +578,17 @@ impl<S> MetalSurfaceRing<S> {
         }
         if !self.slots.is_empty() {
             let old = std::mem::replace(&mut self.slots, new_slots);
-            self.retired_generations.push(old);
+            self.retired_generations.push_back(RetiredGeneration {
+                retired_at_serial: self.next_serial,
+                slots: old,
+            });
+            while self.retired_generations.len() > METAL_MAX_RETIRED_GENERATIONS {
+                if let Some(evicted) = self.retired_generations.pop_front() {
+                    for slot in evicted.slots {
+                        cleanup_partial(slot);
+                    }
+                }
+            }
         } else {
             self.slots = new_slots;
         }
@@ -604,6 +638,30 @@ impl<S> MetalSurfaceRing<S> {
         Some((slot, size))
     }
 
+    /// Reclaim retired resize generations that are no longer in flight on the GPU.
+    ///
+    /// Pops generations from the front while the retired queue exceeds
+    /// [`METAL_MAX_RETIRED_GENERATIONS`] or at least
+    /// [`METAL_RETIRED_GENERATION_GRACE_FRAMES`] frames have been published since
+    /// retirement, returning their slots for GL/IOSurface cleanup and
+    /// [`MetalTextureCache`] eviction.
+    pub fn reclaim_retired(&mut self) -> Vec<MetalFrameSlot<S>> {
+        let mut reclaimed = Vec::new();
+        while let Some(front) = self.retired_generations.front() {
+            let over_cap = self.retired_generations.len() > METAL_MAX_RETIRED_GENERATIONS;
+            let past_grace = self.next_serial.saturating_sub(front.retired_at_serial)
+                >= METAL_RETIRED_GENERATION_GRACE_FRAMES;
+            if over_cap || past_grace {
+                if let Some(mut generation) = self.retired_generations.pop_front() {
+                    reclaimed.append(&mut generation.slots);
+                }
+            } else {
+                break;
+            }
+        }
+        reclaimed
+    }
+
     /// Drain all active and retired frame slots during worker shutdown.
     ///
     /// Call only AFTER `mpv_render_context_free()` has completed on the worker
@@ -612,7 +670,7 @@ impl<S> MetalSurfaceRing<S> {
         let mut all = Vec::new();
         all.append(&mut self.slots);
         for mut generation in self.retired_generations.drain(..) {
-            all.append(&mut generation);
+            all.append(&mut generation.slots);
         }
         self.active_size = None;
         self.latest_frame = None;
@@ -664,6 +722,54 @@ impl<S, T> MetalTextureCache<S, T> {
         let texture = create(surface)?;
         self.entries.push((surface, texture));
         Ok(&self.entries.last().expect("just pushed").1)
+    }
+
+    /// Evict every cached entry whose surface matches `should_evict`, invoking
+    /// `destroy` for each evicted `(surface, texture)` pair and returning the
+    /// number of evicted entries.
+    pub fn evict_where(
+        &mut self,
+        mut should_evict: impl FnMut(&S) -> bool,
+        mut destroy: impl FnMut(S, T),
+    ) -> usize {
+        let mut evicted = 0usize;
+        let mut i = 0usize;
+        while i < self.entries.len() {
+            if should_evict(&self.entries[i].0) {
+                let (surface, texture) = self.entries.swap_remove(i);
+                destroy(surface, texture);
+                evicted += 1;
+            } else {
+                i += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Evict all cached Metal textures whose backing surface is listed in `surfaces`.
+    pub fn evict_surfaces(&mut self, surfaces: &[S], destroy: impl FnMut(S, T)) -> usize
+    where
+        S: PartialEq,
+    {
+        if surfaces.is_empty() {
+            return 0;
+        }
+        self.evict_where(|s| surfaces.contains(s), destroy)
+    }
+
+    /// Evict all cached Metal textures backed by any reclaimed slot in `retired`.
+    pub fn evict_retired_slots(
+        &mut self,
+        retired: &[MetalFrameSlot<S>],
+        destroy: impl FnMut(S, T),
+    ) -> usize
+    where
+        S: PartialEq,
+    {
+        if retired.is_empty() {
+            return 0;
+        }
+        self.evict_where(|s| retired.iter().any(|slot| &slot.surface == s), destroy)
     }
 
     /// Destroy all cached Metal texture wrappers during shutdown.
@@ -1090,8 +1196,7 @@ pub mod native {
             return Err("CAMetalLayer pointer is null".to_owned());
         }
         let sel_scale = sel_registerName(c"setContentsScale:".as_ptr());
-        let msg_scale: extern "C" fn(Id, Sel, f64) =
-            std::mem::transmute(objc_msgSend as *const ());
+        let msg_scale: extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc_msgSend as *const ());
         msg_scale(ca_metal_layer, sel_scale, geometry.contents_scale);
 
         let sel_size = sel_registerName(c"setDrawableSize:".as_ptr());
@@ -1107,8 +1212,7 @@ pub mod native {
         );
 
         let sel_fmt = sel_registerName(c"setPixelFormat:".as_ptr());
-        let msg_fmt: extern "C" fn(Id, Sel, usize) =
-            std::mem::transmute(objc_msgSend as *const ());
+        let msg_fmt: extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc_msgSend as *const ());
         msg_fmt(
             ca_metal_layer,
             sel_fmt,
@@ -1161,4 +1265,229 @@ pub mod native {
 #[cfg(target_os = "macos")]
 pub fn is_metal_device_available() -> bool {
     native::probe_system_metal_device()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_slot(next_surface_id: &mut u64, idx: usize) -> MetalFrameSlot<u64> {
+        *next_surface_id += 1;
+        MetalFrameSlot {
+            surface: *next_surface_id,
+            gl_texture: (*next_surface_id as u32) * 10 + idx as u32,
+            gl_framebuffer: (*next_surface_id as u32) * 100 + idx as u32,
+            serial: 0,
+        }
+    }
+
+    #[test]
+    fn resize_storm_bounds_retired_generations_and_evicts_oldest() {
+        let mut ring: MetalSurfaceRing<u64> = MetalSurfaceRing::new();
+        let mut next_id = 0u64;
+        let mut evicted_surfaces = Vec::new();
+
+        // Initial generation (surfaces 1..=3).
+        ring.recreate_generation(
+            640,
+            360,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |slot| evicted_surfaces.push(slot.surface),
+        )
+        .unwrap();
+        assert_eq!(ring.retired_generation_count(), 0);
+        assert!(evicted_surfaces.is_empty());
+
+        // 5 consecutive resizes with zero frames published between them.
+        for step in 1..=5u32 {
+            ring.recreate_generation(
+                640 + step * 16,
+                360 + step * 9,
+                |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+                |slot| evicted_surfaces.push(slot.surface),
+            )
+            .unwrap();
+            assert!(
+                ring.retired_generation_count() <= METAL_MAX_RETIRED_GENERATIONS,
+                "retired count exceeded cap at step {step}"
+            );
+        }
+
+        // 5 retirements with cap=2 -> oldest 3 generations (surfaces 1..=9) evicted FIFO.
+        assert_eq!(
+            ring.retired_generation_count(),
+            METAL_MAX_RETIRED_GENERATIONS
+        );
+        assert_eq!(evicted_surfaces, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // Shutdown drains active (3) + remaining 2 retired generations (6) = 9 slots.
+        let mut drained: Vec<u64> = ring
+            .drain_for_shutdown()
+            .into_iter()
+            .map(|s| s.surface)
+            .collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![10, 11, 12, 13, 14, 15, 16, 17, 18]);
+    }
+
+    #[test]
+    fn reclaim_retired_waits_for_grace_frames_and_reclaims_staggered_generations() {
+        let mut ring: MetalSurfaceRing<u64> = MetalSurfaceRing::new();
+        let mut next_id = 0u64;
+
+        // Generation 0 (surfaces 1, 2, 3).
+        ring.recreate_generation(
+            1280,
+            720,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |_| {},
+        )
+        .unwrap();
+        let (idx, _) = ring.begin_write_slot().unwrap();
+        assert_eq!(ring.publish_slot(idx), Some(1));
+
+        // Resize -> generation 0 retired at next_serial=2.
+        ring.recreate_generation(
+            1600,
+            900,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(ring.retired_generation_count(), 1);
+        assert!(ring.reclaim_retired().is_empty());
+
+        // Publish grace - 1 frames on generation 1; generation 0 must still be kept.
+        for _ in 0..(METAL_RETIRED_GENERATION_GRACE_FRAMES - 1) {
+            let (idx, _) = ring.begin_write_slot().unwrap();
+            ring.publish_slot(idx).unwrap();
+            assert!(ring.reclaim_retired().is_empty());
+        }
+        assert_eq!(ring.retired_generation_count(), 1);
+
+        // Resize again -> generation 1 retired at next_serial=4 while generation 0 waits 1 more frame.
+        ring.recreate_generation(
+            1920,
+            1080,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(ring.retired_generation_count(), 2);
+
+        // Publishing 1 frame satisfies generation 0's grace window, leaving generation 1 intact.
+        let (idx, _) = ring.begin_write_slot().unwrap();
+        ring.publish_slot(idx).unwrap();
+        let reclaimed_gen0: Vec<u64> = ring
+            .reclaim_retired()
+            .into_iter()
+            .map(|s| s.surface)
+            .collect();
+        assert_eq!(reclaimed_gen0, vec![1, 2, 3]);
+        assert_eq!(ring.retired_generation_count(), 1);
+
+        // Publishing 2 more frames satisfies generation 1's grace window.
+        for _ in 0..(METAL_RETIRED_GENERATION_GRACE_FRAMES - 1) {
+            let (idx, _) = ring.begin_write_slot().unwrap();
+            ring.publish_slot(idx).unwrap();
+        }
+        let reclaimed_gen1: Vec<u64> = ring
+            .reclaim_retired()
+            .into_iter()
+            .map(|s| s.surface)
+            .collect();
+        assert_eq!(reclaimed_gen1, vec![4, 5, 6]);
+        assert_eq!(ring.retired_generation_count(), 0);
+        assert!(ring.reclaim_retired().is_empty());
+    }
+
+    #[test]
+    fn texture_cache_evict_retired_slots_surfaces_and_predicate() {
+        let mut ring: MetalSurfaceRing<u64> = MetalSurfaceRing::new();
+        let mut cache: MetalTextureCache<u64, String> = MetalTextureCache::new();
+        let mut next_id = 9u64;
+
+        // Populate generation 0 (surfaces 10, 11, 12) and cache all 3 textures.
+        ring.recreate_generation(
+            1280,
+            720,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |_| {},
+        )
+        .unwrap();
+        for _ in 0..METAL_FRAME_SLOT_COUNT {
+            let (idx, _) = ring.begin_write_slot().unwrap();
+            ring.publish_slot(idx).unwrap();
+            let surface = ring.latest_published().unwrap().0.surface;
+            cache
+                .get_or_create(surface, |s| Ok::<_, ()>(format!("tex_{s}")))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), METAL_FRAME_SLOT_COUNT);
+
+        // Resize to generation 1 (surfaces 13, 14, 15) and publish enough frames to reclaim gen 0.
+        ring.recreate_generation(
+            1920,
+            1080,
+            |_w, _h, idx| Ok::<_, ()>(make_slot(&mut next_id, idx)),
+            |_| {},
+        )
+        .unwrap();
+        for _ in 0..METAL_RETIRED_GENERATION_GRACE_FRAMES {
+            let (idx, _) = ring.begin_write_slot().unwrap();
+            ring.publish_slot(idx).unwrap();
+            let surface = ring.latest_published().unwrap().0.surface;
+            cache
+                .get_or_create(surface, |s| Ok::<_, ()>(format!("tex_{s}")))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), METAL_FRAME_SLOT_COUNT * 2);
+
+        let reclaimed = ring.reclaim_retired();
+        assert_eq!(reclaimed.len(), METAL_FRAME_SLOT_COUNT);
+
+        let mut destroyed = Vec::new();
+        let evicted = cache.evict_retired_slots(&reclaimed, |s, t| destroyed.push((s, t)));
+        assert_eq!(evicted, METAL_FRAME_SLOT_COUNT);
+        assert_eq!(cache.len(), METAL_FRAME_SLOT_COUNT);
+        destroyed.sort_by_key(|(s, _)| *s);
+        assert_eq!(
+            destroyed,
+            vec![
+                (10, "tex_10".to_owned()),
+                (11, "tex_11".to_owned()),
+                (12, "tex_12".to_owned()),
+            ]
+        );
+
+        // Active generation textures remain cached without re-creation.
+        for surface in [13u64, 14, 15] {
+            let tex = cache
+                .get_or_create(surface, |_| -> Result<String, &'static str> {
+                    Err("unexpected cache miss")
+                })
+                .unwrap();
+            assert_eq!(tex, &format!("tex_{surface}"));
+        }
+
+        // Empty slice and unmatched surfaces are no-ops.
+        assert_eq!(cache.evict_retired_slots(&[], |_, _| {}), 0);
+        assert_eq!(cache.evict_surfaces(&[999], |_, _| {}), 0);
+
+        // Direct surface and predicate evictions remove only matching entries.
+        let mut evicted_ids = Vec::new();
+        assert_eq!(
+            cache.evict_surfaces(&[13, 999], |s, _| evicted_ids.push(s)),
+            1
+        );
+        assert_eq!(evicted_ids, vec![13]);
+        assert_eq!(cache.len(), 2);
+
+        assert_eq!(
+            cache.evict_where(|s| *s == 15, |s, _| evicted_ids.push(s)),
+            1
+        );
+        assert_eq!(evicted_ids, vec![13, 15]);
+        assert_eq!(cache.len(), 1);
+    }
 }

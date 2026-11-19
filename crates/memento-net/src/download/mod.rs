@@ -41,7 +41,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -49,7 +49,15 @@ use memento_setting::models::download_progress_update;
 use memento_setting::models::download_speed;
 
 use crate::error::HttpError;
-use crate::http::{HttpClient, Request, Url};
+use crate::http::{HttpClient, HttpClientConfig, Request, Url};
+
+/// Default TCP/TLS connect timeout for model-file downloads.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default request/response-header timeout for model-file downloads.
+pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default total transfer timeout for model-file downloads: generous enough
+/// for multi-hundred-MB ASR models while never blocking unboundedly.
+pub const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The per-chunk progress payload. `speed_bps` comes straight from the
 /// ported `memento_setting::models::download_speed`.
@@ -211,7 +219,16 @@ impl Default for Downloader
 {
     fn default() -> Self
     {
-        Self::new(HttpClient::default())
+        let config = HttpClientConfig {
+            timeout: Some(DEFAULT_DOWNLOAD_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            ..HttpClientConfig::default()
+        };
+        Self::new(HttpClient::with_phase_timeouts(
+            config,
+            Some(DEFAULT_RESPONSE_TIMEOUT),
+            Some(DEFAULT_DOWNLOAD_TIMEOUT),
+        ))
     }
 }
 
@@ -297,7 +314,23 @@ impl Downloader
         {
             return Err(DownloadError::Io(error));
         }
-        stream_result.map_err(DownloadError::Network)?;
+        if let Err(err) = stream_result
+        {
+            if err.kind() == io::ErrorKind::UnexpectedEof
+            {
+                if let Some(expected) = response.content_length()
+                {
+                    if received < expected
+                    {
+                        return Err(DownloadError::IncompleteBody {
+                            received,
+                            expected,
+                        });
+                    }
+                }
+            }
+            return Err(DownloadError::Network(err));
+        }
 
         if let Some(expected) = response.content_length()
         {
@@ -487,6 +520,65 @@ mod tests
             assert!(
                 matches!(err, DownloadError::Status { status, .. } if !(200..300).contains(&status)),
                 "expected Status error for {status_line}, got {err:?}"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let _ = fs::remove_dir_all(&dir);
+            let _ = handle.join();
+        }
+    }
+
+    #[test]
+    fn default_downloader_sets_bounded_sensible_timeouts()
+    {
+        let dl = Downloader::default();
+        assert_eq!(dl.http.config().connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
+        assert_eq!(dl.http.config().timeout, Some(DEFAULT_DOWNLOAD_TIMEOUT));
+    }
+
+    #[test]
+    fn truncated_content_length_response_returns_incomplete_body()
+    {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        for (body_sent, expected_received) in [(&b""[..], 0u64), (&b"abcd"[..], 4u64)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let payload = body_sent.to_vec();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+                resp.extend_from_slice(&payload);
+                let _ = stream.write_all(&resp);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            });
+
+            let dir = std::env::temp_dir().join(format!(
+                "memento-dl-trunc-test-{}-{}",
+                std::process::id(),
+                NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("trunc.bin");
+            let url = format!("http://{}:{}/trunc.bin", addr.ip(), addr.port());
+            let err = Downloader::default()
+                .download(&url, &target, |_| Ok(()))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DownloadError::IncompleteBody {
+                        received,
+                        expected: 10
+                    } if received == expected_received
+                ),
+                "expected IncompleteBody({expected_received}/10), got {err:?}"
             );
             assert!(!target.exists());
             assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);

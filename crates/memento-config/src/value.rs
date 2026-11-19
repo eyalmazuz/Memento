@@ -140,7 +140,7 @@ impl FromValue for bool {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Bool(v) => Ok(*v),
-            other => Err((other.value_type(), ValueType::Bool)),
+            other => Err((ValueType::Bool, other.value_type())),
         }
     }
 
@@ -156,7 +156,7 @@ macro_rules! int_impls {
                 match value {
                     Value::Int(v) => <$t>::try_from(*v)
                         .map_err(|_| (ValueType::Int, ValueType::Int)),
-                    other => Err((other.value_type(), ValueType::Int)),
+                    other => Err((ValueType::Int, other.value_type())),
                 }
             }
 
@@ -179,7 +179,7 @@ impl FromValue for f64 {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Real(v) => Ok(*v),
-            other => Err((other.value_type(), ValueType::Real)),
+            other => Err((ValueType::Real, other.value_type())),
         }
     }
 
@@ -198,7 +198,7 @@ impl FromValue for String {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Text(v) => Ok(v.clone()),
-            other => Err((other.value_type(), ValueType::Text)),
+            other => Err((ValueType::Text, other.value_type())),
         }
     }
 
@@ -223,7 +223,7 @@ impl FromValue for Vec<String> {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Strings(v) => Ok(v.clone()),
-            other => Err((other.value_type(), ValueType::Strings)),
+            other => Err((ValueType::Strings, other.value_type())),
         }
     }
 
@@ -242,7 +242,7 @@ impl FromValue for Vec<i64> {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Ints(v) => Ok(v.clone()),
-            other => Err((other.value_type(), ValueType::Ints)),
+            other => Err((ValueType::Ints, other.value_type())),
         }
     }
 
@@ -261,7 +261,7 @@ impl FromValue for BTreeMap<String, String> {
     fn from_value(value: &Value) -> Result<Self, (ValueType, ValueType)> {
         match value {
             Value::Map(v) => Ok(v.clone()),
-            other => Err((other.value_type(), ValueType::Map)),
+            other => Err((ValueType::Map, other.value_type())),
         }
     }
 

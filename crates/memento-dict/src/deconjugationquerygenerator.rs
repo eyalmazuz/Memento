@@ -1,6 +1,8 @@
 //! Pure search-query deduplication and Yomitan rule bitmask helpers from
 //! `deconjugationquerygenerator.cpp`.
 
+use std::collections::HashMap;
+
 use crate::deconjugator::{deconjugate, format_derivation_chain, ConjugationInfo, WordForm};
 
 pub const RULE_V5: u8 = 1;
@@ -90,27 +92,37 @@ pub const fn rule_matches_entry(query_rule_mask: u8, entry_rule_mask: u8) -> boo
 
 pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<DeconjugationQuery> {
     let mut result: Vec<DeconjugationQuery> = Vec::new();
+    let mut by_base: HashMap<Vec<u16>, Vec<usize>> = HashMap::new();
     for info in infos {
         let filter = rule_for_info(&info);
-        let (derivation, derivation_descriptions) = format_derivation_chain(&info.derivations);
-        if let Some(existing) = result.iter_mut().find(|query| {
-            query.deconj == info.base
-                && ((query.rule_mask & filter != 0)
-                    || query.derivation_display == info.derivation_display)
-        }) {
+        let existing_idx = by_base.get(&info.base).and_then(|indices| {
+            indices.iter().copied().find(|&idx| {
+                let query = &result[idx];
+                (query.rule_mask & filter != 0)
+                    || query.derivation_display == info.derivation_display
+            })
+        });
+        if let Some(idx) = existing_idx {
+            let existing = &mut result[idx];
             existing.rule_mask |= filter;
             if !existing
                 .rule_derivations
                 .iter()
                 .any(|(m, _, _)| (*m & filter) == filter)
             {
+                let (derivation, derivation_descriptions) =
+                    format_derivation_chain(&info.derivations);
                 existing
                     .rule_derivations
                     .push((filter, derivation, derivation_descriptions));
             }
         } else {
+            let (derivation, derivation_descriptions) =
+                format_derivation_chain(&info.derivations);
             let rule_derivations =
                 vec![(filter, derivation.clone(), derivation_descriptions.clone())];
+            let idx = result.len();
+            let base_key = info.base.clone();
             result.push(DeconjugationQuery {
                 deconj: info.base,
                 surface: info.conjugated,
@@ -121,6 +133,7 @@ pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<Deconjuga
                 derivation_descriptions,
                 rule_derivations,
             });
+            by_base.entry(base_key).or_default().push(idx);
         }
     }
     result

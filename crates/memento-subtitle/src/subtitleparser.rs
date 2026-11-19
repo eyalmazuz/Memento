@@ -3,10 +3,6 @@
 //! at the Qt boundary; parser decisions and subtitle values live here.
 
 use std::cmp::Ordering;
-// Workspace MSRV is 1.77; LazyLock only stabilized in 1.80.
-use std::sync::OnceLock;
-
-use regex::Regex;
 
 use crate::subtitleentry::SubtitleEntry;
 
@@ -17,32 +13,202 @@ pub enum Format {
     Vtt,
 }
 
-fn expression(cell: &'static OnceLock<Regex>, pattern: &'static str) -> &'static Regex {
-    cell.get_or_init(|| Regex::new(pattern).expect("fixed subtitle regex is valid"))
+fn strip_ascii_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
 }
 
-fn ass_style() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    expression(&REGEX, r"\{[^}]*\}")
+/// Update ASS vector drawing mode (`\p<scale>`) from override tags inside `{...}`.
+/// Drawing mode is active when `<scale> > 0` (e.g. `\p1`, `\p2`, `\p4`) and disabled
+/// by `\p0`, bare `\p`, or a non-positive scale. Ignores unrelated tags such as `\pos` or `\pbo`.
+fn update_ass_drawing_mode(block: &str, in_drawing: &mut bool) {
+    let bytes = block.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        i += 1; // skip '\\'
+        if i >= bytes.len() || bytes[i] != b'p' {
+            continue;
+        }
+        let after_p = i + 1;
+        if after_p >= bytes.len() || bytes[after_p] == b'\\' {
+            // Bare `\p` turns drawing mode off (scale 0).
+            *in_drawing = false;
+            i = after_p;
+            continue;
+        }
+        let mut j = after_p;
+        let mut negative = false;
+        if bytes[j] == b'-' {
+            negative = true;
+            j += 1;
+        } else if bytes[j] == b'+' {
+            j += 1;
+        }
+        let digit_start = j;
+        let mut has_nonzero = false;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            if bytes[j] != b'0' {
+                has_nonzero = true;
+            }
+            j += 1;
+        }
+        if j > digit_start {
+            *in_drawing = !negative && has_nonzero;
+            i = j;
+        } else {
+            i = after_p;
+        }
+    }
 }
 
-fn ass_newline() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    expression(&REGEX, r"\\[nN]")
+/// Strip `{...}` ASS override blocks, omit vector drawing payloads while `\p<scale>` (`scale > 0`)
+/// is active, and replace `\n`/`\N` with `'\n'`.
+fn strip_ass_formatting(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut in_drawing = false;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(rel_end) = input[i + 1..].find('}') {
+                let block = &input[i + 1..i + 1 + rel_end];
+                update_ass_drawing_mode(block, &mut in_drawing);
+                i += rel_end + 2;
+                continue;
+            }
+        }
+        if in_drawing {
+            if let Some(next_brace) = input[i..].find('{') {
+                if next_brace == 0 {
+                    // Unclosed '{' while in drawing mode: omit the remainder.
+                    break;
+                }
+                i += next_brace;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && matches!(bytes[i + 1], b'n' | b'N') {
+            out.push('\n');
+            i += 2;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b'\\' {
+            i += 1;
+        }
+        out.push_str(&input[start..i]);
+    }
+    out
 }
 
-fn srt_style() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    expression(&REGEX, r"</?[biu]>|\{/?[biu]\}|</?font.*?>|\{\\an?[0-9]\}")
+/// Match an SRT style tag at the start of `bytes`:
+/// `</?[biu]>`, `{/?[biu]}`, `</?font.*?>` (single-line), or `{\an?[0-9]}` (ASCII digit).
+fn match_srt_tag(bytes: &[u8]) -> Option<usize> {
+    match *bytes.first()? {
+        b'<' => {
+            let mut j = 1;
+            if bytes.get(j) == Some(&b'/') {
+                j += 1;
+            }
+            if let (Some(&tag), Some(&b'>')) = (bytes.get(j), bytes.get(j + 1)) {
+                if matches!(tag, b'b' | b'i' | b'u' | b'B' | b'I' | b'U') {
+                    return Some(j + 2);
+                }
+            }
+            if bytes
+                .get(j..j + 4)
+                .is_some_and(|w| w.eq_ignore_ascii_case(b"font"))
+            {
+                let mut k = j + 4;
+                while k < bytes.len() && bytes[k] != b'\n' {
+                    if bytes[k] == b'>' {
+                        return Some(k + 1);
+                    }
+                    k += 1;
+                }
+            }
+            None
+        }
+        b'{' => {
+            let mut j = 1;
+            if bytes.get(j) == Some(&b'/') {
+                j += 1;
+            }
+            if let (Some(&tag), Some(&b'}')) = (bytes.get(j), bytes.get(j + 1)) {
+                if matches!(tag, b'b' | b'i' | b'u' | b'B' | b'I' | b'U') {
+                    return Some(j + 2);
+                }
+            }
+            if bytes.get(1) == Some(&b'\\') && bytes.get(2) == Some(&b'a') {
+                let mut k = 3;
+                if bytes.get(k) == Some(&b'n') {
+                    k += 1;
+                }
+                if bytes.get(k).is_some_and(u8::is_ascii_digit) && bytes.get(k + 1) == Some(&b'}') {
+                    return Some(k + 2);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
-fn vtt_tags() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    expression(&REGEX, r"<[^>]*>")
+fn strip_srt_style(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(skip) = match_srt_tag(&bytes[i..]) {
+            i += skip;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'<' && bytes[i] != b'{' {
+            i += 1;
+        }
+        out.push_str(&input[start..i]);
+    }
+    out
+}
+
+/// Strip `<...>` WebVTT cue tags.
+fn strip_vtt_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(rel_end) = input[i + 1..].find('>') {
+                i += rel_end + 2;
+                continue;
+            }
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'<' {
+            i += 1;
+        }
+        out.push_str(&input[start..i]);
+    }
+    out
 }
 
 fn is_pcre2_ascii_space(ch: char) -> bool {
     matches!(ch, '\t' | '\n' | '\x0b' | '\x0c' | '\r' | ' ')
+}
+
+fn is_blank_line(line: &str) -> bool {
+    line.chars().all(is_pcre2_ascii_space)
 }
 
 fn split_pcre2_whitespace(text: &str) -> Vec<&str> {
@@ -59,26 +225,64 @@ fn qt_to_i32(value: &str) -> Option<i32> {
 }
 
 fn timecode_to_double(timecode: &str) -> Option<f64> {
-    let pieces: Vec<&str> = timecode.trim().split([':', '.', ',']).collect();
-    if pieces.len() != 3 && pieces.len() != 4 {
+    let trimmed = timecode.trim();
+    let (hms_part, frac_part) = match trimmed.rfind(['.', ',']) {
+        Some(sep_idx) => {
+            let before = &trimmed[..sep_idx];
+            let after = &trimmed[sep_idx + 1..];
+            if before.contains(['.', ',']) || after.contains(':') {
+                return None;
+            }
+            (before, Some(after))
+        }
+        None => (trimmed, None),
+    };
+
+    let fraction = match frac_part {
+        None => 0.0,
+        Some(frac) => {
+            let frac_clean = frac.split_once('\0').map_or(frac, |(prefix, _)| prefix);
+            let frac_trimmed = frac_clean.trim_matches(is_pcre2_ascii_space);
+            if frac_trimmed.is_empty() || !frac_trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            match frac_trimmed.len() {
+                1 => {
+                    let value = frac_trimmed.parse::<i32>().ok()?;
+                    value as f64 * 0.1
+                }
+                2 => {
+                    let value = frac_trimmed.parse::<i32>().ok()?;
+                    value as f64 * 0.01
+                }
+                3 => {
+                    let value = frac_trimmed.parse::<i32>().ok()?;
+                    value as f64 * 0.001
+                }
+                _ => {
+                    let mut frac_val = 0.0f64;
+                    let mut scale = 0.1f64;
+                    for b in frac_trimmed.bytes().take(9) {
+                        frac_val += (b - b'0') as f64 * scale;
+                        scale *= 0.1;
+                    }
+                    frac_val
+                }
+            }
+        }
+    };
+
+    let mut parts = hms_part.split(':');
+    let p0 = parts.next()?;
+    let p1 = parts.next()?;
+    let p2 = parts.next();
+    if parts.next().is_some() {
         return None;
     }
-    let frac = pieces[pieces.len() - 1];
-    let fraction = match frac.encode_utf16().count() {
-        2 => {
-            let value = qt_to_i32(frac)?;
-            if !(0..=99).contains(&value) { return None; }
-            value as f64 * 0.01
-        }
-        3 => {
-            let value = qt_to_i32(frac)?;
-            if !(0..=999).contains(&value) { return None; }
-            value as f64 * 0.001
-        }
-        _ => return None,
+    let (hours, minutes, seconds) = match p2 {
+        Some(s) => (Some(qt_to_i32(p0)?), qt_to_i32(p1)?, qt_to_i32(s)?),
+        None => (None, qt_to_i32(p0)?, qt_to_i32(p1)?),
     };
-    let seconds = qt_to_i32(pieces[pieces.len() - 2])?;
-    let minutes = qt_to_i32(pieces[pieces.len() - 3])?;
     if !(0..=59).contains(&seconds) || !(0..=59).contains(&minutes) {
         return None;
     }
@@ -87,9 +291,10 @@ fn timecode_to_double(timecode: &str) -> Option<f64> {
     value += fraction;
     value += seconds as f64;
     value += (minutes * 60) as f64;
-    if pieces.len() == 4 {
-        let hours = qt_to_i32(pieces[0])?;
-        if hours < 0 { return None; }
+    if let Some(hours) = hours {
+        if hours < 0 {
+            return None;
+        }
         value += hours as f64 * 3600.0;
     }
     Some(value)
@@ -164,10 +369,15 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         let clean = line.trim().trim_start_matches('\u{feff}');
         clean.eq_ignore_ascii_case("[Script Info]")
     });
-    if !has_script_info && !lines.iter().any(|line| line.trim().eq_ignore_ascii_case("[Events]")) {
+    let is_events_header = |line: &&str| {
+        line.trim()
+            .trim_start_matches('\u{feff}')
+            .eq_ignore_ascii_case("[Events]")
+    };
+    if !has_script_info && !lines.iter().any(is_events_header) {
         return Err(());
     }
-    let Some(events) = lines.iter().position(|line| line.trim().eq_ignore_ascii_case("[Events]")) else {
+    let Some(events) = lines.iter().position(is_events_header) else {
         return Ok(Vec::new());
     };
     let mut format_idx = None;
@@ -176,20 +386,16 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         if trimmed.starts_with('[') {
             break;
         }
-        if trimmed.to_ascii_lowercase().starts_with("format:") {
+        if strip_ascii_prefix_ignore_case(trimmed, "format:").is_some() {
             format_idx = Some(events + 1 + i);
             break;
         }
     }
     let Some(format_idx) = format_idx else { return Ok(Vec::new()); };
     let format_line = lines[format_idx].trim();
-    let spec = if let Some(spec) = format_line.strip_prefix("Format: ") {
-        spec
-    } else if let Some(spec) = format_line.strip_prefix("Format:") {
-        spec.trim_start()
-    } else {
-        return Err(());
-    };
+    let spec = strip_ascii_prefix_ignore_case(format_line, "format:")
+        .ok_or(())?
+        .trim_start();
     let fields: Vec<&str> = spec.split(',').collect();
     let (mut start_at, mut end_at, mut text_at) = (None, None, None);
     for (i, field) in fields.iter().enumerate() {
@@ -210,13 +416,12 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         if trimmed.starts_with('[') {
             break;
         }
-        let dialogue = if let Some(d) = trimmed.strip_prefix("Dialogue: ") {
-            d
-        } else if let Some(d) = trimmed.strip_prefix("Dialogue:") {
-            d.trim_start()
-        } else {
+        let Some(rest) = strip_ascii_prefix_ignore_case(trimmed, "dialogue:") else {
             continue;
         };
+        let dialogue = rest
+            .strip_prefix(' ')
+            .unwrap_or_else(|| rest.trim_start());
         let columns: Vec<&str> = dialogue.split(',').collect();
         if columns.len() < fields.len() { continue; }
         let (Some(start), Some(end)) = (timecode_to_double(columns[start_at]), timecode_to_double(columns[end_at])) else {
@@ -224,8 +429,7 @@ fn parse_ass(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         };
         if start < 0.0 || end < start { continue; }
         let joined = columns[text_at..].join(",");
-        let unstyled = ass_style().replace_all(&joined, "");
-        let content = ass_newline().replace_all(&unstyled, "\n");
+        let content = strip_ass_formatting(&joined);
         if !content.trim().is_empty() {
             output.push(entry(&content, start, end));
         }
@@ -244,20 +448,27 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
     let mut index = 0;
     let mut subtitles: Vec<NumberedEntry> = Vec::new();
     while index < lines.len() {
-        let mut line = lines[index];
+        let mut line = if index == 0 {
+            lines[index].trim_start_matches('\u{feff}')
+        } else {
+            lines[index]
+        };
         index += 1;
-        while index < lines.len() && line.is_empty() {
+        while is_blank_line(line) {
+            if index == lines.len() {
+                break;
+            }
             line = lines[index];
             index += 1;
         }
         // QTextStream::atEnd is checked after the position line. A file
         // containing only a position without a following line is ignored.
-        if index == lines.len() { break; }
+        if is_blank_line(line) || index == lines.len() { break; }
         let position = line.trim().parse::<u32>().map_err(|_| ())?;
         let position = i32::try_from(position).map_err(|_| ())?;
         let timing = split_pcre2_whitespace(lines[index]);
         index += 1;
-        if timing.len() != 3 || timing[1] != "-->" { return Err(()); }
+        if timing.len() < 3 || timing[1] != "-->" { return Err(()); }
         let start = timecode_to_double(timing[0]).ok_or(())?;
         let end = timecode_to_double(timing[2]).ok_or(())?;
         if start < 0.0 || end < start { return Err(()); }
@@ -266,12 +477,12 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         while index < lines.len() {
             let line = lines[index];
             index += 1;
-            if line.is_empty() { break; }
+            if is_blank_line(line) { break; }
             text.push_str(line);
             text.push('\n');
         }
         text.pop();
-        let content = srt_style().replace_all(&text, "");
+        let content = strip_srt_style(&text);
         if !content.trim().is_empty() {
             subtitles.push(NumberedEntry { position, subtitle: entry(&content, start, end) });
         }
@@ -283,7 +494,13 @@ fn parse_srt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
 }
 
 fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
-    if lines.is_empty() || !lines[0].starts_with("WEBVTT") { return Err(()); }
+    if lines.is_empty()
+        || !lines[0]
+            .trim_start_matches('\u{feff}')
+            .starts_with("WEBVTT")
+    {
+        return Err(());
+    }
     let mut index = 1;
     while index < lines.len() {
         let line = lines[index];
@@ -322,12 +539,12 @@ fn parse_vtt(lines: &[&str]) -> Result<Vec<SubtitleEntry>, ()> {
         while index < lines.len() {
             let line = lines[index];
             index += 1;
-            if line.is_empty() { break; }
+            if is_blank_line(line) { break; }
             text.push_str(line);
             text.push('\n');
         }
         text.pop();
-        let content = vtt_tags().replace_all(&text, "");
+        let content = strip_vtt_tags(&text);
         if !content.trim().is_empty() {
             output.push(entry(&content, start, end));
         }
@@ -470,5 +687,47 @@ mod tests {
             "1\n00:00:01\u{0000}ignored,00 --> 00:00:02,00\ncue\n",
         ).unwrap();
         assert_eq!(nul_terminated[0].start, 1.0);
+    }
+
+    #[test]
+    fn srt_and_vtt_strip_utf8_bom() {
+        let srt = "\u{feff}1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+        let srt_res = parse(Format::Srt, srt).unwrap();
+        assert_eq!(srt_res.len(), 1);
+        assert_eq!(String::from_utf16(&srt_res[0].text).unwrap(), "hello");
+
+        let vtt = "\u{feff}WEBVTT\n\n00:01.000 --> 00:02.000\nworld\n";
+        let vtt_res = parse(Format::Vtt, vtt).unwrap();
+        assert_eq!(vtt_res.len(), 1);
+        assert_eq!(String::from_utf16(&vtt_res[0].text).unwrap(), "world");
+    }
+
+    #[test]
+    fn ass_handles_case_insensitive_headers_and_filters_drawing_commands() {
+        let input = "[Script Info]\n[Events]\nformat: Start, End, Text\n\
+            dialogue: 0:00:01.00,0:00:02.00,{\\pos(10,20)\\pbo-3}keep\n\
+            DIALOGUE: 0:00:02.00,0:00:03.00,{\\p1}m 0 0 l 100 0 100 100\n\
+            Dialogue: 0:00:03.00,0:00:04.00,{\\p2}m 0 0 l 50 50{\\p0}visible{\\p4}m 1 1\n\
+            Dialogue: 0:00:04.00,0:00:05.00,{\\p0}plain\n";
+        let res = parse(Format::Ass, input).unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(String::from_utf16(&res[0].text).unwrap(), "keep");
+        assert_eq!(String::from_utf16(&res[1].text).unwrap(), "visible");
+        assert_eq!(String::from_utf16(&res[2].text).unwrap(), "plain");
+    }
+
+    #[test]
+    fn srt_supports_extended_timing_flexible_timecodes_and_whitespace_separators() {
+        let input = "\
+1\n0:00:01.5 --> 0:00:02.750 X1:100 X2:600 Y1:400 Y2:480\n<font color=\"#fff\">first</font>\n   \n\
+2\n00:00:03 --> 00:00:04,500 align:center\n{i}second{/i}\n\t\n";
+        let res = parse(Format::Srt, input).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(String::from_utf16(&res[0].text).unwrap(), "first");
+        assert_eq!(res[0].start, 1.5);
+        assert_eq!(res[0].end, 2.75);
+        assert_eq!(String::from_utf16(&res[1].text).unwrap(), "second");
+        assert_eq!(res[1].start, 3.0);
+        assert_eq!(res[1].end, 4.5);
     }
 }

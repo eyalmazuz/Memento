@@ -17,6 +17,17 @@
 
 use std::os::raw::{c_char, c_int, c_void};
 
+/// Platform-native ONNX Runtime path character type (`ORTCHAR_T` in
+/// `onnxruntime_c_api.h`): UTF-16 `wchar_t` (`u16`) on Windows and `char`
+/// (`c_char`) on Unix/non-Windows targets.
+#[cfg(windows)]
+pub type OrtChar = u16;
+/// Platform-native ONNX Runtime path character type (`ORTCHAR_T` in
+/// `onnxruntime_c_api.h`): UTF-16 `wchar_t` (`u16`) on Windows and `char`
+/// (`c_char`) on Unix/non-Windows targets.
+#[cfg(not(windows))]
+pub type OrtChar = c_char;
+
 /// Generic placeholder for C function-pointer typedef parameters that the
 /// engine never invokes.
 pub type OrtCallback = Option<unsafe extern "system" fn()>;
@@ -96,14 +107,14 @@ pub struct OrtApi {
     pub CreateEnvWithCustomLogger: unsafe extern "system" fn(OrtCallback, *mut c_void, c_int, *const c_char, *mut *mut OrtEnv) -> *mut OrtStatus,
     pub EnableTelemetryEvents: unsafe extern "system" fn(*const OrtEnv) -> *mut OrtStatus,
     pub DisableTelemetryEvents: unsafe extern "system" fn(*const OrtEnv) -> *mut OrtStatus,
-    pub CreateSession: unsafe extern "system" fn(*const OrtEnv, *const c_char, *const OrtSessionOptions, *mut *mut OrtSession) -> *mut OrtStatus,
+    pub CreateSession: unsafe extern "system" fn(*const OrtEnv, *const OrtChar, *const OrtSessionOptions, *mut *mut OrtSession) -> *mut OrtStatus,
     pub CreateSessionFromArray: unsafe extern "system" fn(*const OrtEnv, *const c_void, usize, *const OrtSessionOptions, *mut *mut OrtSession) -> *mut OrtStatus,
     pub Run: unsafe extern "system" fn(*mut OrtSession, *const OrtRunOptions, *const *const c_char, *const *const OrtValue, usize, *const *const c_char, usize, *mut *mut OrtValue) -> *mut OrtStatus,
     pub CreateSessionOptions: unsafe extern "system" fn(*mut *mut OrtSessionOptions) -> *mut OrtStatus,
-    pub SetOptimizedModelFilePath: unsafe extern "system" fn(*mut OrtSessionOptions, *const c_char) -> *mut OrtStatus,
+    pub SetOptimizedModelFilePath: unsafe extern "system" fn(*mut OrtSessionOptions, *const OrtChar) -> *mut OrtStatus,
     pub CloneSessionOptions: unsafe extern "system" fn(*const OrtSessionOptions, *mut *mut OrtSessionOptions) -> *mut OrtStatus,
     pub SetSessionExecutionMode: unsafe extern "system" fn(*mut OrtSessionOptions, c_int) -> *mut OrtStatus,
-    pub EnableProfiling: unsafe extern "system" fn(*mut OrtSessionOptions, *const c_char) -> *mut OrtStatus,
+    pub EnableProfiling: unsafe extern "system" fn(*mut OrtSessionOptions, *const OrtChar) -> *mut OrtStatus,
     pub DisableProfiling: unsafe extern "system" fn(*mut OrtSessionOptions) -> *mut OrtStatus,
     pub EnableMemPattern: unsafe extern "system" fn(*mut OrtSessionOptions) -> *mut OrtStatus,
     pub DisableMemPattern: unsafe extern "system" fn(*mut OrtSessionOptions) -> *mut OrtStatus,

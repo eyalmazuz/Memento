@@ -71,6 +71,18 @@ impl Default for MelFrontendConfig {
     }
 }
 
+/// Selects which attention mask buffer(s) [`MelFrontend::extract_with_mask`]
+/// allocates and populates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionMaskKind {
+    /// Populate only `attention_mask_int64`.
+    Int64,
+    /// Populate only `attention_mask_bool`.
+    Bool,
+    /// Populate both `attention_mask_int64` and `attention_mask_bool`.
+    Both,
+}
+
 /// C++: `AsrAudio::MelFeatureOutput`
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MelFeatureOutput {
@@ -368,6 +380,8 @@ pub struct MelFrontend {
     padded_window: Vec<f32>,
     /// Row-major [nMels, numFreqBins] where numFreqBins = nFft / 2 + 1
     mel_filters: Vec<f32>,
+    /// Half-open non-zero frequency bin range `(k_start, k_end)` per mel row.
+    mel_filter_ranges: Vec<(usize, usize)>,
     fft_plan: FftPlan,
 }
 
@@ -378,6 +392,7 @@ impl MelFrontend {
             config,
             padded_window: Vec::new(),
             mel_filters: Vec::new(),
+            mel_filter_ranges: Vec::new(),
             fft_plan: FftPlan::new(config.n_fft),
         };
         this.init_window();
@@ -419,6 +434,7 @@ impl MelFrontend {
             0
         };
         self.mel_filters = vec![0.0f32; count];
+        self.mel_filter_ranges.clear();
 
         let f_min = 0.0;
         let f_max = (self.config.sample_rate as f64) / 2.0;
@@ -440,6 +456,8 @@ impl MelFrontend {
                 (k as f64) * (self.config.sample_rate as f64) / (self.config.n_fft as f64);
         }
 
+        self.mel_filter_ranges.reserve(n_mels as usize);
+        let num_bins_usize = num_bins as usize;
         for m in 0..n_mels as usize {
             let f_left = mel_pts[m];
             let f_center = mel_pts[m + 1];
@@ -448,19 +466,41 @@ impl MelFrontend {
             let diff_upper = (f_right - f_center).max(1e-12);
             let enorm = 2.0 / (f_right - f_left).max(1e-12);
 
-            let row = m * (num_bins as usize);
-            for k in 0..num_bins as usize {
+            let row = m * num_bins_usize;
+            let mut k_start = num_bins_usize;
+            let mut k_end = 0usize;
+            for k in 0..num_bins_usize {
                 let freq = fft_freqs[k];
                 let lower = (freq - f_left) / diff_lower;
                 let upper = (f_right - freq) / diff_upper;
-                let weight = lower.min(upper).max(0.0) * enorm;
-                self.mel_filters[row + k] = weight as f32;
+                let weight = (lower.min(upper).max(0.0) * enorm) as f32;
+                self.mel_filters[row + k] = weight;
+                if weight != 0.0 {
+                    if k_start == num_bins_usize {
+                        k_start = k;
+                    }
+                    k_end = k + 1;
+                }
             }
+            if k_start > k_end {
+                k_start = 0;
+            }
+            self.mel_filter_ranges.push((k_start, k_end));
         }
     }
 
     /// C++: `MelFrontend::extract(const float *samples, size_t numSamples) const`
     pub fn extract(&self, samples: &[f32]) -> MelFeatureOutput {
+        self.extract_with_mask(samples, AttentionMaskKind::Both)
+    }
+
+    /// Like [`Self::extract`], but only allocates and populates the requested
+    /// attention mask buffer(s) to avoid allocating an unused mask format.
+    pub fn extract_with_mask(
+        &self,
+        samples: &[f32],
+        mask_kind: AttentionMaskKind,
+    ) -> MelFeatureOutput {
         let num_samples = samples.len();
         let mut out = MelFeatureOutput {
             n_mels: self.config.n_mels.max(0) as i64,
@@ -474,28 +514,26 @@ impl MelFrontend {
             return out;
         }
 
-        // 1. Pre-emphasis filter: y[0] = x[0], y[t] = x[t] - preemphasis * x[t-1]
-        let mut preemph = vec![0.0f32; num_samples];
+        // 1 & 2. Pre-emphasis filter applied directly into the center-padded
+        //        buffer (matching torch.stft(..., pad_mode="constant")).
+        let pad = (self.config.n_fft / 2) as usize;
+        let padded_len = num_samples + 2 * pad;
+        let mut padded = vec![0.0f32; padded_len];
+        let dst = &mut padded[pad..pad + num_samples];
         if self.config.preemphasis > 0.0 {
-            preemph[0] = samples[0];
+            let coeff = self.config.preemphasis;
+            dst[0] = samples[0];
             for i in 1..num_samples {
-                preemph[i] = samples[i] - self.config.preemphasis * samples[i - 1];
+                dst[i] = samples[i] - coeff * samples[i - 1];
             }
         } else {
-            preemph.copy_from_slice(samples);
+            dst.copy_from_slice(samples);
         }
-
-        // 2. Center constant zero-padding of n_fft / 2 on both sides
-        //    (matching torch.stft(..., pad_mode="constant"))
-        let pad = self.config.n_fft / 2;
-        let padded_len = num_samples + (2 * pad) as usize;
-        let mut padded = vec![0.0f32; padded_len];
-        padded[(pad as usize)..(pad as usize + num_samples)].copy_from_slice(&preemph);
 
         let n_fft = self.config.n_fft;
         let hop = self.config.hop_length;
 
-        // C++: totalFrames = 1 + (paddedLen - nFft) / nFft-independent hop
+        // C++: totalFrames = 1 + (paddedLen - nFft) / hop
         // (size_t division; paddedLen >= nFft holds because numSamples >= 1)
         let total_frames = 1 + ((padded_len - n_fft as usize) / hop as usize) as i64;
         let valid_frames = total_frames.min((num_samples as i64) / (hop as i64));
@@ -503,24 +541,37 @@ impl MelFrontend {
             return out;
         }
 
+        let total_usize = total_frames as usize;
+        let valid_usize = valid_frames as usize;
+        let n_mels_usize = self.config.n_mels as usize;
+
         out.num_frames = total_frames;
         out.valid_frames = valid_frames;
-        out.features = vec![0.0f32; total_frames as usize * self.config.n_mels as usize];
-        out.attention_mask_int64 = vec![0i64; total_frames as usize];
-        out.attention_mask_bool = vec![0u8; total_frames as usize];
+        out.features = vec![0.0f32; total_usize * n_mels_usize];
 
-        for t in 0..valid_frames as usize {
-            out.attention_mask_int64[t] = 1;
-            out.attention_mask_bool[t] = 1;
+        match mask_kind {
+            AttentionMaskKind::Int64 => {
+                out.attention_mask_int64 = vec![0i64; total_usize];
+                out.attention_mask_int64[..valid_usize].fill(1);
+            }
+            AttentionMaskKind::Bool => {
+                out.attention_mask_bool = vec![0u8; total_usize];
+                out.attention_mask_bool[..valid_usize].fill(1);
+            }
+            AttentionMaskKind::Both => {
+                out.attention_mask_int64 = vec![0i64; total_usize];
+                out.attention_mask_bool = vec![0u8; total_usize];
+                out.attention_mask_int64[..valid_usize].fill(1);
+                out.attention_mask_bool[..valid_usize].fill(1);
+            }
         }
 
-        // 3. STFT power spectrum + Slaney Mel filterbank + log compression
-        let num_bins = n_fft / 2 + 1;
-        let n_mels = self.config.n_mels;
+        // 3. STFT power spectrum + sparse Slaney Mel filterbank + log compression
+        let num_bins = (n_fft / 2 + 1) as usize;
         let mut fft_buf = vec![Complex32::new(0.0, 0.0); n_fft as usize];
-        let mut power_spec = vec![0.0f32; num_bins as usize];
+        let mut power_spec = vec![0.0f32; num_bins];
 
-        for t in 0..total_frames as usize {
+        for t in 0..total_usize {
             let frame_start = t * hop as usize;
             self.fft_plan.compute_power_spectrum(
                 &padded[frame_start..frame_start + n_fft as usize],
@@ -529,52 +580,63 @@ impl MelFrontend {
                 &mut power_spec,
             );
 
-            let mel_frame = t as usize * n_mels as usize;
-            for m in 0..n_mels as usize {
-                let filter_row = m as usize * num_bins as usize;
+            let mel_frame = t * n_mels_usize;
+            for m in 0..n_mels_usize {
+                let (k_start, k_end) = self.mel_filter_ranges[m];
+                let filter_row = m * num_bins;
+                let filter_slice = &self.mel_filters[filter_row + k_start..filter_row + k_end];
+                let power_slice = &power_spec[k_start..k_end];
                 let mut sum = 0.0f32;
-                for k in 0..num_bins as usize {
-                    sum += self.mel_filters[filter_row + k] * power_spec[k];
+                for (&w, &p) in filter_slice.iter().zip(power_slice.iter()) {
+                    sum += w * p;
                 }
                 out.features[mel_frame + m] = (sum.max(0.0) + self.config.log_zero_guard).ln();
             }
         }
 
-        // 4. Per-feature normalization over validFrames
-        //    (with Bessel's correction: divisor validFrames - 1)
+        // 4. Per-feature normalization over validFrames (t-outer, m-inner for
+        //    sequential row-major cache locality, preserving exact per-m f64
+        //    summation order and Bessel's correction: divisor validFrames - 1).
         if self.config.normalize_per_feature && valid_frames > 1 {
-            for m in 0..n_mels as usize {
-                let mut sum = 0.0f64;
-                for t in 0..valid_frames as usize {
-                    sum += out.features[t * (n_mels as usize) + m] as f64;
-                }
-                let mean = sum / (valid_frames as f64);
-
-                let mut sq_diff_sum = 0.0f64;
-                for t in 0..valid_frames as usize {
-                    let diff = out.features[t * (n_mels as usize) + m] as f64 - mean;
-                    sq_diff_sum += diff * diff;
-                }
-                let variance = sq_diff_sum / ((valid_frames - 1) as f64);
-                let inv_std =
-                    (1.0 / (f64::sqrt(variance) + self.config.norm_epsilon as f64)) as f32;
-                let mean_f = mean as f32;
-
-                for t in 0..valid_frames as usize {
-                    let val = out.features[t * (n_mels as usize) + m];
-                    out.features[t * (n_mels as usize) + m] = (val - mean_f) * inv_std;
-                }
-                for t in valid_frames as usize..total_frames as usize {
-                    out.features[t * (n_mels as usize) + m] = 0.0;
+            let mut means = vec![0.0f64; n_mels_usize];
+            for t in 0..valid_usize {
+                let row = &out.features[t * n_mels_usize..(t + 1) * n_mels_usize];
+                for m in 0..n_mels_usize {
+                    means[m] += row[m] as f64;
                 }
             }
-        } else {
-            for t in valid_frames as usize..total_frames as usize {
-                for m in 0..n_mels as usize {
-                    out.features[t * (n_mels as usize) + m] = 0.0;
+            let valid_f64 = valid_frames as f64;
+            for mean in &mut means {
+                *mean /= valid_f64;
+            }
+
+            let mut sq_diff_sums = vec![0.0f64; n_mels_usize];
+            for t in 0..valid_usize {
+                let row = &out.features[t * n_mels_usize..(t + 1) * n_mels_usize];
+                for m in 0..n_mels_usize {
+                    let diff = row[m] as f64 - means[m];
+                    sq_diff_sums[m] += diff * diff;
+                }
+            }
+
+            let denom = (valid_frames - 1) as f64;
+            let eps = self.config.norm_epsilon as f64;
+            let mut mean_f = vec![0.0f32; n_mels_usize];
+            let mut inv_std = vec![0.0f32; n_mels_usize];
+            for m in 0..n_mels_usize {
+                let variance = sq_diff_sums[m] / denom;
+                inv_std[m] = (1.0 / (f64::sqrt(variance) + eps)) as f32;
+                mean_f[m] = means[m] as f32;
+            }
+
+            for t in 0..valid_usize {
+                let row = &mut out.features[t * n_mels_usize..(t + 1) * n_mels_usize];
+                for m in 0..n_mels_usize {
+                    row[m] = (row[m] - mean_f[m]) * inv_std[m];
                 }
             }
         }
+        out.features[valid_usize * n_mels_usize..total_usize * n_mels_usize].fill(0.0);
 
         out
     }
@@ -677,18 +739,20 @@ impl MelFrontend {
         }
 
         // Split any span exceeding maxUtteranceSec at lowest energy valleys.
-        // Precondition: `curStart` only ever increases (bestFrame >=
-        // curStart + minSplitFrames), so `endFrame - curStart` cannot wrap.
+        // Capping `min_split_frames` at `max_frames / 2` guarantees
+        // `search_start <= search_end` even for short `max_utterance_sec` in
+        // `[2.0, 4.0)` while preserving exact `100`-frame behavior for `>= 4.0`.
         let max_frames = (max_utterance_sec.max(2.0) * 50.0) as usize;
-        let min_split_frames = (2.0 * 50.0) as usize;
+        let min_split_frames = ((2.0 * 50.0) as usize).min(max_frames / 2);
 
         for span in &raw_spans {
             let mut cur_start = span.start_frame;
             while span.end_frame - cur_start > max_frames {
                 let search_start = cur_start + min_split_frames;
-                let search_end = (span.end_frame - min_split_frames).min(cur_start + max_frames);
+                let search_end =
+                    (span.end_frame - min_split_frames).min(cur_start.saturating_add(max_frames));
                 let mut best_frame = search_end;
-                let mut min_window_energy = 1e9f32;
+                let mut min_window_energy = f32::INFINITY;
 
                 for f in search_start..=search_end {
                     // 5-frame (100 ms) local energy average
@@ -811,6 +875,78 @@ mod tests {
             let empty = bad.extract(&samples);
             assert_eq!(empty.num_frames, 0);
             assert!(empty.features.is_empty());
+        }
+    }
+
+    #[test]
+    fn sparse_mel_ranges_and_selective_attention_mask_allocation() {
+        let frontend = MelFrontend::new(MelFrontendConfig::default());
+        let num_bins = (frontend.config.n_fft / 2 + 1) as usize;
+        assert_eq!(frontend.mel_filter_ranges.len(), frontend.config.n_mels as usize);
+        for (m, &(k_start, k_end)) in frontend.mel_filter_ranges.iter().enumerate() {
+            assert!(k_start <= k_end && k_end <= num_bins);
+            let row = &frontend.mel_filters[m * num_bins..(m + 1) * num_bins];
+            for (k, &w) in row.iter().enumerate() {
+                if k < k_start || k >= k_end {
+                    assert_eq!(w, 0.0, "non-zero weight outside sparse range at m={m}, k={k}");
+                }
+            }
+        }
+
+        let samples: Vec<f32> = (0..8000)
+            .map(|i| (2.0 * PI * 440.0 * (i as f64) / 16000.0).sin() as f32 * 0.4)
+            .collect();
+        let both = frontend.extract(&samples);
+        let only_i64 = frontend.extract_with_mask(&samples, AttentionMaskKind::Int64);
+        let only_bool = frontend.extract_with_mask(&samples, AttentionMaskKind::Bool);
+
+        assert_eq!(only_i64.features, both.features);
+        assert_eq!(only_i64.attention_mask_int64, both.attention_mask_int64);
+        assert!(only_i64.attention_mask_bool.is_empty());
+
+        assert_eq!(only_bool.features, both.features);
+        assert!(only_bool.attention_mask_int64.is_empty());
+        assert_eq!(only_bool.attention_mask_bool, both.attention_mask_bool);
+    }
+
+    #[test]
+    fn segment_speech_utterances_handles_short_max_utterance_split() {
+        // 3.0 s of continuous speech with an energy dip near 1.5 s.
+        let sample_rate = 16000;
+        let total_samples = sample_rate * 3;
+        let samples: Vec<f32> = (0..total_samples)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                let amp = if (1.4..=1.6).contains(&t) { 0.05 } else { 0.3 };
+                ((2.0 * PI * 300.0 * t).sin() * amp) as f32
+            })
+            .collect();
+
+        for max_sec in [2.0, 2.5, 3.0] {
+            let spans = MelFrontend::segment_speech_utterances(&samples, sample_rate as i32, max_sec);
+            assert!(!spans.is_empty(), "expected speech spans for max_sec={max_sec}");
+            for span in &spans {
+                let dur = span.end_sec - span.start_sec;
+                assert!(
+                    dur <= max_sec + 1e-6,
+                    "span duration {dur} exceeded max_sec={max_sec}"
+                );
+                assert!(
+                    dur >= 0.99,
+                    "short-split produced a tiny sliver ({dur}s) for max_sec={max_sec}"
+                );
+            }
+        }
+
+        // Regression test: 101 frames (2.02 s) split at max_utterance_sec = 2.0
+        // previously inverted `search_start > search_end` and emitted a 0.02 s sliver.
+        let sliver_samples = &samples[..sample_rate * 101 / 50];
+        let sliver_spans =
+            MelFrontend::segment_speech_utterances(sliver_samples, sample_rate as i32, 2.0);
+        assert_eq!(sliver_spans.len(), 2);
+        for span in &sliver_spans {
+            let dur = span.end_sec - span.start_sec;
+            assert!((0.99..=2.0 + 1e-6).contains(&dur), "unexpected span duration {dur}");
         }
     }
 }

@@ -1,0 +1,668 @@
+import { MementoPalette } from "../palette.slint";
+import {
+    DictResult,
+    PopupDictStyle,
+    RichGlossaryRender,
+    RichKanjiDetail,
+    DictionaryText,
+    PopupBridge,
+} from "types.slint";
+import { KanjiDetailCard, RichTagPillBadge } from "term_widgets.slint";
+
+export component DefinitionEntryBody inherits Rectangle {
+    in property <DictResult> res;
+    in property <int> scan-depth: 0;
+    in property <int> bridge-rev: PopupBridge.rich-revision;
+    in property <bool> is-solo: false;
+    in property <bool> show-anki-checkbox: true;
+    in property <length> tooltip-base-x: 12px;
+    // Content-space y inside ScrollView (never reactively bound to viewport-y!)
+    in property <length> content-base-y: 0px;
+    in property <length> scan-offset-x: 0px;
+    in property <length> scan-offset-y: 0px;
+    out property <bool> collapsible: gloss-wrap.cached-rich-doc.collapsible;
+    out property <length> collapsed-height: gloss-wrap.cached-rich-doc.collapsed-height;
+    out property <int> total-lines: gloss-wrap.cached-rich-doc.total-lines;
+    callback read-scroll-y() -> length;
+    callback toggle-select-definition(int);
+    callback open-rich-link(string);
+    callback focus-glossary();
+
+    property <PopupDictStyle> dstyle: PopupBridge.rich-enabled
+        ? PopupBridge.dict-entry-style(root.res.dict-name, root.is-solo, PopupBridge.rich-revision)
+        : {
+            badge-bg: PopupBridge.css-dict-badge-bg,
+            badge-color: PopupBridge.css-dict-badge-color,
+            card-bg: #00000000,
+            card-border: #00000000,
+            card-border-width: 0px,
+            card-radius: 0px,
+            card-padding: 0px,
+            glossary-opacity: 1.0,
+            glossary-hover-opacity: 1.0,
+            glossary-solo-opacity: 1.0,
+        };
+    property <bool> rich-hovered: false;
+    property <bool> select-hovered: false;
+    property <bool> expand-hovered: false;
+    property <bool> card-hovered: card-hover.has-hover || root.rich-hovered || root.select-hovered || root.expand-hovered;
+    private property <bool> pointer-over-link: false;
+    property <float> active-glossary-opacity: root.is-solo
+        ? root.dstyle.glossary-solo-opacity
+        : (root.card-hovered ? root.dstyle.glossary-hover-opacity : root.dstyle.glossary-opacity);
+    property <length> pad: root.dstyle.card-padding;
+
+    changed card-hovered => {
+        if root.scan-depth > 0 {
+            PopupBridge.nested-body-hover-changed(self.card-hovered);
+        }
+    }
+
+    background: root.dstyle.card-bg;
+    border-color: root.dstyle.card-border;
+    border-width: root.dstyle.card-border-width;
+    border-radius: root.dstyle.card-radius;
+    preferred-height: entry-inner.preferred-height + root.pad * 2;
+    min-height: entry-inner.preferred-height + root.pad * 2;
+
+    // Background hover sensor so hovering card padding/header also triggers hover-to-reveal.
+    card-hover := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                if (root.scan-depth > 0) {
+                    root.focus-glossary();
+                    PopupBridge.lock-nested-popup();
+                } else if (PopupBridge.nested-depth > 0) {
+                    PopupBridge.dismiss-all-nested-popups();
+                }
+            }
+        }
+    }
+
+    entry-inner := VerticalLayout {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - root.pad * 2;
+        height: self.preferred-height;
+        spacing: 4px;
+
+        // Header row: 24x24px Anki checkbox hit target + vertically centered POS & Dictionary badges
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            if root.show-anki-checkbox : VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    background: transparent;
+
+                    Rectangle {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 16px;
+                        height: 16px;
+                        border-width: 1.5px;
+                        border-color: root.res.selected
+                            ? MementoPalette.teal-border
+                            : (select-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.text-secondary);
+                        border-radius: 4px;
+                        background: root.res.selected
+                            ? MementoPalette.teal-accent
+                            : (select-touch.has-hover ? MementoPalette.hover-bg : transparent);
+
+                        animate background { duration: 100ms; }
+                        animate border-color { duration: 100ms; }
+
+                        if root.res.selected : Path {
+                            width: 10px;
+                            height: 10px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            viewbox-x: 0;
+                            viewbox-y: 0;
+                            viewbox-width: 12;
+                            viewbox-height: 12;
+                            stroke: #FFFFFF;
+                            stroke-width: 2px;
+                            stroke-line-cap: round;
+                            stroke-line-join: round;
+                            MoveTo { x: 2; y: 6.2; }
+                            LineTo { x: 4.8; y: 9; }
+                            LineTo { x: 10; y: 3; }
+                        }
+                    }
+
+                    select-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: pointer;
+                        changed has-hover => { root.select-hovered = self.has-hover; }
+                        clicked => {
+                            if root.scan-depth > 0 {
+                                PopupBridge.lock-nested-popup();
+                            }
+                            root.toggle-select-definition(root.res.index - 1);
+                        }
+                    }
+                }
+            }
+
+            if PopupBridge.rich-enabled : VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 4px;
+                    for pill in (root.scan-depth == 0
+                        ? PopupBridge.def-tag-pills(root.res.index, root.bridge-rev)
+                        : PopupBridge.nested-def-tag-pills(root.scan-depth, root.res.index, root.bridge-rev)) : RichTagPillBadge {
+                        pill: pill;
+                        request-tooltip(notes) => {
+                            PopupBridge.show-tooltip(
+                                notes,
+                                (root.scan-offset-x + root.tooltip-base-x + 12px) / 1px,
+                                (root.scan-offset-y + root.read-scroll-y() + root.content-base-y + 24px) / 1px
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Fallback Part of Speech badge(s) when rich bridge is not active
+            if !PopupBridge.rich-enabled && root.res.pos-tags != "" : VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: max(18px, PopupBridge.css-tag-font-size + 7px);
+                    background: MementoPalette.surface-elevated;
+                    border-radius: 3px;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        DictionaryText {
+                            text: root.res.pos-tags;
+                            font-family: PopupBridge.css-tag-font-family;
+                            font-size: PopupBridge.css-tag-font-size;
+                            font-weight: 600;
+                            color: MementoPalette.icon;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Dictionary Source Badge
+            if root.res.dict-name != "" : VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: max(18px, PopupBridge.css-tag-font-size + 7px);
+                    background: root.dstyle.badge-bg;
+                    border-radius: 3px;
+                    HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 7px;
+                        DictionaryText {
+                            text: root.res.dict-name;
+                            font-family: PopupBridge.css-tag-font-family;
+                            font-size: PopupBridge.css-tag-font-size;
+                            font-weight: 700;
+                            color: root.dstyle.badge-color;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Glossary body (respects per-dictionary opacity / hover-to-reveal)
+        gloss-wrap := VerticalLayout {
+            property <RichKanjiDetail> cached-kanji-detail: root.res.is-kanji && PopupBridge.rich-enabled
+                ? (root.scan-depth == 0
+                    ? PopupBridge.kanji-detail(root.res.index, root.bridge-rev)
+                    : PopupBridge.nested-kanji-detail(root.scan-depth, root.res.index, root.bridge-rev))
+                : { valid: false };
+            property <bool> has-rich-kanji: root.res.is-kanji && PopupBridge.rich-enabled && self.cached-kanji-detail.valid;
+            property <RichGlossaryRender> cached-rich-doc: !root.res.is-kanji && PopupBridge.rich-enabled
+                ? (root.scan-depth == 0
+                    ? PopupBridge.render-glossary(
+                        root.res.index,
+                        self.width / 1px,
+                        root.res.selected,
+                        root.bridge-rev,
+                        PopupBridge.selection-revision
+                    )
+                    : PopupBridge.nested-render-glossary(
+                        root.scan-depth,
+                        root.res.index,
+                        self.width / 1px,
+                        root.res.selected,
+                        root.bridge-rev,
+                        PopupBridge.selection-revision
+                    ))
+                : { has-rich: false };
+            property <bool> has-rich-glossary: !root.res.is-kanji && PopupBridge.rich-enabled && self.cached-rich-doc.has-rich;
+
+            width: parent.width;
+            spacing: 4px;
+            opacity: root.active-glossary-opacity;
+            animate opacity { duration: 120ms; }
+
+            // 3-Column Kanji Detail View
+            if gloss-wrap.has-rich-kanji : KanjiDetailCard {
+                width: parent.width;
+                detail: gloss-wrap.cached-kanji-detail;
+                selected: root.res.selected;
+            }
+
+            // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs,
+            // mouse selection, recursive hover-scan, and per-dictionary collapsible line clamping)
+            if gloss-wrap.has-rich-glossary : rich-container := VerticalLayout {
+                property <RichGlossaryRender> rich-doc: gloss-wrap.cached-rich-doc;
+                property <bool> is-collapsed: self.rich-doc.collapsible && !self.rich-doc.expanded;
+                width: parent.width;
+                spacing: 2px;
+
+                rich-surface := Rectangle {
+                    visible: rich-container.rich-doc.has-rich;
+                    width: parent.width;
+                    height: !rich-container.rich-doc.has-rich
+                        ? 0px
+                        : (rich-container.is-collapsed ? rich-container.rich-doc.collapsed-height : rich-container.rich-doc.height-px * 1px);
+                    clip: true;
+                    background: transparent;
+
+                    for scan-rect in rich-container.rich-doc.scan-highlight-rects : Rectangle {
+                        x: scan-rect.x-px * 1px;
+                        y: scan-rect.y-px * 1px;
+                        width: scan-rect.w-px * 1px;
+                        height: scan-rect.h-px * 1px;
+                        background: #38a6d699;
+                        border-radius: 3px;
+                    }
+
+                    for sel-rect in rich-container.rich-doc.selection-rects : Rectangle {
+                        x: sel-rect.x-px * 1px;
+                        y: sel-rect.y-px * 1px;
+                        width: sel-rect.w-px * 1px;
+                        height: sel-rect.h-px * 1px;
+                        background: #38a6d666;
+                        border-radius: 2px;
+                    }
+
+                    if rich-container.rich-doc.has-rich : Image {
+                        x: 0px;
+                        y: 0px;
+                        width: rich-container.rich-doc.width-px * 1px;
+                        height: rich-container.rich-doc.height-px * 1px;
+                        source: rich-container.rich-doc.rendered;
+                        image-fit: fill;
+                        image-rendering: pixelated;
+                    }
+
+                    if rich-container.is-collapsed : Rectangle {
+                        x: 0px;
+                        y: max(0px, parent.height - 22px);
+                        width: parent.width;
+                        height: min(22px, parent.height);
+                        background: @linear-gradient(180deg, #00000000 0%, PopupBridge.css-popup-bg 100%);
+                    }
+
+                    if rich-container.rich-doc.has-rich : rich-touch := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-cursor: root.pointer-over-link ? pointer : text;
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.focus-glossary();
+                                if (root.scan-depth == 0) {
+                                    PopupBridge.glossary-pointer-down(
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else {
+                                    PopupBridge.nested-glossary-pointer-down(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                                root.focus-glossary();
+                                let sy = root.read-scroll-y();
+                                PopupBridge.glossary-scan-middle-click(
+                                    root.scan-depth,
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    (root.scan-offset-x + root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
+                                    (root.scan-offset-y + sy + root.content-base-y + root.pad + gloss-wrap.y + rich-container.y + rich-surface.y + self.mouse-y) / 1px
+                                );
+                            } else if (event.kind == PointerEventKind.move) {
+                                if (self.pressed) {
+                                    root.pointer-over-link = false;
+                                    if (root.scan-depth == 0) {
+                                        PopupBridge.glossary-pointer-drag(
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    } else {
+                                        PopupBridge.nested-glossary-pointer-drag(
+                                            root.scan-depth,
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    }
+                                } else {
+                                    root.focus-glossary();
+                                    root.pointer-over-link = root.scan-depth == 0
+                                        ? PopupBridge.glossary-cursor-is-pointer(
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        )
+                                        : PopupBridge.nested-glossary-cursor-is-pointer(
+                                            root.scan-depth,
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        );
+                                    let sy = root.read-scroll-y();
+                                    PopupBridge.glossary-scan-hover(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px,
+                                        (root.scan-offset-x + root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
+                                        (root.scan-offset-y + sy + root.content-base-y + root.pad + gloss-wrap.y + rich-container.y + rich-surface.y + self.mouse-y) / 1px,
+                                        event.modifiers.control,
+                                        event.modifiers.shift,
+                                        event.modifiers.alt,
+                                        event.modifiers.meta
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                if (root.scan-depth == 0) {
+                                    PopupBridge.glossary-pointer-up(
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                } else {
+                                    PopupBridge.nested-glossary-pointer-up(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                                }
+                            } else if (event.kind == PointerEventKind.cancel) {
+                                root.pointer-over-link = false;
+                                PopupBridge.hide-tooltip();
+                                PopupBridge.glossary-scan-leave(root.scan-depth, root.res.index);
+                            }
+                        }
+                        double-clicked => {
+                            root.focus-glossary();
+                            if (root.scan-depth == 0) {
+                                PopupBridge.glossary-double-clicked(
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px
+                                );
+                            } else {
+                                PopupBridge.nested-glossary-double-clicked(
+                                    root.scan-depth,
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px
+                                );
+                            }
+                        }
+                        changed has-hover => {
+                            root.rich-hovered = self.has-hover;
+                            if self.has-hover {
+                                root.focus-glossary();
+                                root.pointer-over-link = root.scan-depth == 0
+                                    ? PopupBridge.glossary-cursor-is-pointer(
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    )
+                                    : PopupBridge.nested-glossary-cursor-is-pointer(
+                                        root.scan-depth,
+                                        root.res.index,
+                                        self.mouse-x / 1px,
+                                        self.mouse-y / 1px
+                                    );
+                            } else {
+                                root.pointer-over-link = false;
+                                PopupBridge.hide-tooltip();
+                                PopupBridge.glossary-scan-leave(root.scan-depth, root.res.index);
+                            }
+                        }
+                    }
+                }
+
+                if rich-container.rich-doc.collapsible : collapse-toggle-bar := Rectangle {
+                    width: parent.width;
+                    height: 22px;
+                    border-radius: 3px;
+                    background: expand-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                    animate background { duration: 100ms; }
+
+                    Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: 1px;
+                        background: PopupBridge.css-divider-color;
+                        opacity: 0.65;
+                    }
+
+                    HorizontalLayout {
+                        x: 4px;
+                        y: 0px;
+                        width: parent.width - 8px;
+                        height: parent.height;
+                        spacing: 3px;
+                        alignment: start;
+
+                        VerticalLayout {
+                            alignment: center;
+                            Image {
+                                width: 14px;
+                                height: 14px;
+                                source: rich-container.rich-doc.expanded
+                                    ? @image-url("../icons/arrow-drop-up.svg")
+                                    : @image-url("../icons/arrow-drop-down.svg");
+                                colorize: PopupBridge.css-link-color;
+                            }
+                        }
+
+                        DictionaryText {
+                            text: rich-container.rich-doc.expanded
+                                ? "Show less"
+                                : ("Show more (" + rich-container.rich-doc.total-lines + " lines)");
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: PopupBridge.css-link-color;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    expand-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        changed has-hover => { root.expand-hovered = self.has-hover; }
+                        clicked => {
+                            if root.scan-depth > 0 {
+                                PopupBridge.lock-nested-popup();
+                            }
+                            PopupBridge.toggle-definition-expanded(root.scan-depth, root.res.index);
+                        }
+                    }
+                }
+            }
+
+            // Fallback Definition Meaning Text (when rich surface is not rendered for this row)
+            if !gloss-wrap.has-rich-kanji
+                && !gloss-wrap.has-rich-glossary
+                && root.res.glossary-blocks.length > 0 : VerticalLayout
+            {
+                width: parent.width;
+                spacing: 4px;
+                for block in root.res.glossary-blocks : Rectangle {
+                    width: parent.width;
+                    height: rich-text.preferred-height + 2px;
+                    rich-text := DictionaryText {
+                        width: parent.width;
+                        height: self.preferred-height;
+                        text: block.kind == 2 ? "◦  " + block.text : block.text;
+                        wrap: word-wrap;
+                        font-size: block.kind == 1 ? max(11px, PopupBridge.css-glossary-font-size - 1.5px) : PopupBridge.css-glossary-font-size;
+                        font-weight: block.kind == 1 ? 700 : 400;
+                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? #D8C9FC : PopupBridge.css-text-color;
+                    }
+                    if block.href != "" : TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
+                                root.open-rich-link(block.href);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !gloss-wrap.has-rich-kanji
+                && !gloss-wrap.has-rich-glossary
+                && root.res.glossary-blocks.length == 0 : DictionaryText
+            {
+                width: parent.width;
+                text: root.res.glossary;
+                font-size: PopupBridge.css-glossary-font-size;
+                font-weight: 400;
+                color: root.res.selected ? PopupBridge.css-text-color : PopupBridge.css-muted-color;
+                wrap: word-wrap;
+                height: self.preferred-height;
+            }
+
+            // Japanese Example Sentence (fallback)
+            if !gloss-wrap.has-rich-glossary
+                && root.res.example-ja != "" : HorizontalLayout
+            {
+                width: parent.width;
+                spacing: 5px;
+                Rectangle {
+                    width: 16px;
+                    Image { y: 4px; width: 16px; height: 11px; source: @image-url("../icons/flag-jp.svg"); }
+                }
+                DictionaryText {
+                    text: root.res.example-ja;
+                    font-size: 13px;
+                    color: PopupBridge.css-text-color;
+                    wrap: word-wrap;
+                    height: self.preferred-height;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // English Example Translation (fallback)
+            if !gloss-wrap.has-rich-glossary
+                && root.res.example-en != "" : HorizontalLayout
+            {
+                width: parent.width;
+                spacing: 5px;
+                Rectangle {
+                    width: 16px;
+                    Image { y: 4px; width: 16px; height: 11px; source: @image-url("../icons/flag-gb.svg"); }
+                }
+                DictionaryText {
+                    text: root.res.example-en;
+                    font-size: 12px;
+                    color: PopupBridge.css-muted-color;
+                    wrap: word-wrap;
+                    height: self.preferred-height;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // Notes / Explanations (fallback)
+            if !gloss-wrap.has-rich-kanji
+                && root.res.notes != "" : DictionaryText
+            {
+                width: parent.width;
+                text: "Note: " + root.res.notes;
+                font-size: 12px;
+                color: PopupBridge.css-muted-color;
+                wrap: word-wrap;
+                height: self.preferred-height;
+            }
+        }
+    }
+}
+
+// ── Responsive 2-Column Definition Card Grid (integer-rounded for crisp text) ─
+export component DefinitionCardGrid inherits VerticalLayout {
+    in property <[DictResult]> all-results;
+    in property <int> term-start-index;
+    in property <int> scan-depth: 0;
+    in property <int> bridge-rev: 0;
+    in property <bool> show-anki-checkbox: true;
+    in property <length> base-x: 12px;
+    in property <length> content-base-y: 0px;
+    in property <length> scan-offset-x: 0px;
+    in property <length> scan-offset-y: 0px;
+    callback read-scroll-y() -> length;
+    callback toggle-select-definition(int);
+    callback open-rich-link(string);
+    callback focus-glossary();
+
+    spacing: PopupBridge.css-definition-gap;
+
+    for grid-row in PopupBridge.definition-grid-rows(root.all-results, root.term-start-index) : grid-row-box := HorizontalLayout {
+        property <length> col-gap: round(PopupBridge.css-definition-gap / 1px) * 1px;
+        property <length> col-w: max(120px, floor((root.width - self.col-gap) / 2px) * 1px);
+        width: root.width;
+        spacing: self.col-gap;
+        alignment: start;
+
+        DefinitionEntryBody {
+            width: grid-row.is-solo ? floor(root.width / 1px) * 1px : grid-row-box.col-w;
+            res: grid-row.left;
+            scan-depth: root.scan-depth;
+            bridge-rev: root.bridge-rev;
+            is-solo: grid-row.is-solo;
+            show-anki-checkbox: root.show-anki-checkbox;
+            tooltip-base-x: round(root.base-x / 1px) * 1px;
+            content-base-y: root.content-base-y + grid-row-box.y;
+            scan-offset-x: root.scan-offset-x;
+            scan-offset-y: root.scan-offset-y;
+            read-scroll-y => { root.read-scroll-y() }
+            toggle-select-definition(i) => { root.toggle-select-definition(i); }
+            open-rich-link(href) => { root.open-rich-link(href); }
+            focus-glossary => { root.focus-glossary(); }
+        }
+
+        if grid-row.has-right : DefinitionEntryBody {
+            width: grid-row-box.col-w;
+            res: grid-row.right;
+            scan-depth: root.scan-depth;
+            bridge-rev: root.bridge-rev;
+            is-solo: false;
+            show-anki-checkbox: root.show-anki-checkbox;
+            tooltip-base-x: round((root.base-x + grid-row-box.col-w + grid-row-box.col-gap) / 1px) * 1px;
+            content-base-y: root.content-base-y + grid-row-box.y;
+            scan-offset-x: root.scan-offset-x;
+            scan-offset-y: root.scan-offset-y;
+            read-scroll-y => { root.read-scroll-y() }
+            toggle-select-definition(i) => { root.toggle-select-definition(i); }
+            open-rich-link(href) => { root.open-rich-link(href); }
+            focus-glossary => { root.focus-glossary(); }
+        }
+    }
+}

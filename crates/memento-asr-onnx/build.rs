@@ -8,9 +8,12 @@ use std::{
 
 const VERSION: &str = "1.22.0";
 const PINNED_MAJOR_MINOR: &str = "1.22";
+const MIN_ORT_API_VERSION: u32 = 22;
 
 struct OrtLibMatch {
     best_file: PathBuf,
+    windows_import_lib: Option<PathBuf>,
+    windows_dll: Option<PathBuf>,
     has_pinned_minor: bool,
     has_linker_name: bool,
     has_soname: bool,
@@ -23,6 +26,7 @@ fn main() {
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     let found_dir = if let Some(directory) =
         env::var_os("ORT_LIB_LOCATION").filter(|v| !v.is_empty())
@@ -45,7 +49,27 @@ fn main() {
         .canonicalize()
         .expect("ONNX Runtime library directory does not exist");
 
-    let ort_link_dir = prepare_ort_link_dir(&out, &found_dir, &target_os);
+    let lib_match = find_ort_library_in_dir(&found_dir, &target_os).unwrap_or_else(|| {
+        panic!(
+            "No ONNX Runtime library found in {} for target OS '{target_os}'.",
+            found_dir.display()
+        )
+    });
+    if let Some(api_version) = detect_ort_api_version(&found_dir, &lib_match) {
+        assert!(
+            api_version >= MIN_ORT_API_VERSION,
+            "ONNX Runtime in {} provides API version {api_version}, but memento-asr-onnx requires ORT API version >= {MIN_ORT_API_VERSION} (ONNX Runtime >= {VERSION}).",
+            found_dir.display()
+        );
+    }
+    if target_os == "windows" && target_env == "msvc" && lib_match.windows_import_lib.is_none() {
+        panic!(
+            "ONNX Runtime in {} is missing import library 'onnxruntime.lib' required to link on Windows MSVC.",
+            found_dir.display()
+        );
+    }
+
+    let ort_link_dir = prepare_ort_link_dir(&out, &found_dir, &target_os, &lib_match);
     if let Some(ref link_dir) = ort_link_dir {
         println!("cargo:rustc-link-search=native={}", link_dir.display());
     }
@@ -121,6 +145,8 @@ fn find_ort_library_in_dir(dir: &Path, target_os: &str) -> Option<OrtLibMatch> {
     let entries = fs::read_dir(dir).ok()?;
     let mut candidates: Vec<(bool, u8, String, PathBuf)> = Vec::new();
     let mut has_pinned_minor = false;
+    let mut windows_import_lib: Option<PathBuf> = None;
+    let mut windows_dll: Option<PathBuf> = None;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -137,12 +163,28 @@ fn find_ort_library_in_dir(dir: &Path, target_os: &str) -> Option<OrtLibMatch> {
         if pinned {
             has_pinned_minor = true;
         }
+        if target_os == "windows" {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if name.eq_ignore_ascii_case("onnxruntime.lib") {
+                windows_import_lib = Some(canon);
+            } else if name.eq_ignore_ascii_case("onnxruntime.dll") {
+                windows_dll = Some(canon);
+            }
+        }
         let rank = file_specificity_rank(name, target_os);
         candidates.push((pinned, rank, name.to_owned(), path));
     }
 
     if candidates.is_empty() {
         return None;
+    }
+
+    if target_os == "windows" && windows_dll.is_none() {
+        if let Some(sibling_dll) = dir.parent().map(|p| p.join("bin/onnxruntime.dll")) {
+            if sibling_dll.is_file() {
+                windows_dll = Some(sibling_dll.canonicalize().unwrap_or(sibling_dll));
+            }
+        }
     }
 
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| b.2.cmp(&a.2)));
@@ -156,7 +198,7 @@ fn find_ort_library_in_dir(dir: &Path, target_os: &str) -> Option<OrtLibMatch> {
                 || dir.join("libonnxruntime.dylib").is_file(),
         ),
         "windows" => (
-            dir.join("onnxruntime.lib").is_file() || dir.join("onnxruntime.dll").is_file(),
+            dir.join("onnxruntime.lib").is_file(),
             dir.join("onnxruntime.dll").is_file(),
         ),
         _ => (
@@ -167,10 +209,129 @@ fn find_ort_library_in_dir(dir: &Path, target_os: &str) -> Option<OrtLibMatch> {
 
     Some(OrtLibMatch {
         best_file,
+        windows_import_lib,
+        windows_dll,
         has_pinned_minor,
         has_linker_name,
         has_soname,
     })
+}
+
+fn parse_ort_api_version_header(path: &Path) -> Option<u32> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("#define") else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        if parts.next() == Some("ORT_API_VERSION") {
+            if let Some(val) = parts.next() {
+                let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(ver) = digits.parse::<u32>() {
+                    return Some(ver);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_major_minor_from_str(s: &str) -> Option<(u32, u32)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start_maj = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'.' {
+                let maj = s[start_maj..i].parse::<u32>().ok();
+                i += 1;
+                let start_min = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if start_min < i {
+                    if let (Some(maj), Ok(min)) = (maj, s[start_min..i].parse::<u32>()) {
+                        if maj >= 1 {
+                            return Some((maj, min));
+                        }
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn api_version_from_major_minor(major: u32, minor: u32) -> u32 {
+    if major > 1 {
+        MIN_ORT_API_VERSION.max(minor)
+    } else {
+        minor
+    }
+}
+
+fn detect_ort_api_version(dir: &Path, lib_match: &OrtLibMatch) -> Option<u32> {
+    // 1. Authoritative: `#define ORT_API_VERSION <N>` in sibling C API headers.
+    let mut header_candidates = vec![dir.join("include/onnxruntime_c_api.h")];
+    if let Some(parent) = dir.parent() {
+        header_candidates.push(parent.join("include/onnxruntime_c_api.h"));
+        header_candidates.push(parent.join("include/onnxruntime/onnxruntime_c_api.h"));
+        header_candidates
+            .push(parent.join("include/onnxruntime/core/session/onnxruntime_c_api.h"));
+    }
+    for header in header_candidates {
+        if header.is_file() {
+            if let Some(ver) = parse_ort_api_version_header(&header) {
+                return Some(ver);
+            }
+        }
+    }
+
+    // 2. Versioned shared library filename (canonicalized symlink target).
+    if let Some(file_name) = lib_match.best_file.file_name().and_then(|n| n.to_str()) {
+        if let Some((maj, min)) = parse_major_minor_from_str(file_name) {
+            return Some(api_version_from_major_minor(maj, min));
+        }
+    }
+
+    // 3. Python `onnxruntime` package metadata (`../version_info.py`).
+    if let Some(parent) = dir.parent() {
+        let version_info = parent.join("version_info.py");
+        if let Ok(content) = fs::read_to_string(&version_info) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("version") || trimmed.starts_with("__version__") {
+                    if let Some((_, rhs)) = trimmed.split_once('=') {
+                        if let Some((maj, min)) = parse_major_minor_from_str(rhs) {
+                            return Some(api_version_from_major_minor(maj, min));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Official archive directory name (e.g. `onnxruntime-win-x64-1.22.0/lib`).
+    for candidate in [Some(dir), dir.parent()] {
+        if let Some(name) = candidate
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if name.contains("onnxruntime") {
+                if let Some((maj, min)) = parse_major_minor_from_str(name) {
+                    return Some(api_version_from_major_minor(maj, min));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn ensure_link_or_copy(target: &Path, link_path: &Path) {
@@ -213,8 +374,12 @@ fn ensure_link_or_copy(target: &Path, link_path: &Path) {
         .expect("could not link or copy ONNX Runtime library into OUT_DIR/ort-link");
 }
 
-fn prepare_ort_link_dir(out: &Path, found_dir: &Path, target_os: &str) -> Option<PathBuf> {
-    let lib_match = find_ort_library_in_dir(found_dir, target_os)?;
+fn prepare_ort_link_dir(
+    out: &Path,
+    found_dir: &Path,
+    target_os: &str,
+    lib_match: &OrtLibMatch,
+) -> Option<PathBuf> {
     if lib_match.has_linker_name && lib_match.has_soname {
         return None;
     }
@@ -230,7 +395,22 @@ fn prepare_ort_link_dir(out: &Path, found_dir: &Path, target_os: &str) -> Option
             );
         }
         "windows" => {
-            ensure_link_or_copy(&lib_match.best_file, &link_dir.join("onnxruntime.dll"));
+            if let Some(ref import_lib) = lib_match.windows_import_lib {
+                ensure_link_or_copy(import_lib, &link_dir.join("onnxruntime.lib"));
+            }
+            if let Some(ref dll) = lib_match.windows_dll {
+                ensure_link_or_copy(dll, &link_dir.join("onnxruntime.dll"));
+            }
+            let providers_shared = found_dir.join("onnxruntime_providers_shared.dll");
+            if providers_shared.is_file() {
+                let target = providers_shared
+                    .canonicalize()
+                    .unwrap_or(providers_shared);
+                ensure_link_or_copy(
+                    &target,
+                    &link_dir.join("onnxruntime_providers_shared.dll"),
+                );
+            }
         }
         _ => {
             ensure_link_or_copy(&lib_match.best_file, &link_dir.join("libonnxruntime.so"));
@@ -445,6 +625,15 @@ fn probe_local_or_system_runtime(target_os: &str) -> Option<PathBuf> {
     let mut fallback: Option<PathBuf> = None;
     for dir in candidates {
         if let Some(lib_match) = find_ort_library_in_dir(&dir, target_os) {
+            if target_os == "windows" && lib_match.windows_import_lib.is_none() {
+                continue;
+            }
+            let Some(api_version) = detect_ort_api_version(&dir, &lib_match) else {
+                continue;
+            };
+            if api_version < MIN_ORT_API_VERSION {
+                continue;
+            }
             if lib_match.has_pinned_minor {
                 return Some(dir);
             }

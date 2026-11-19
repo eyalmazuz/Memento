@@ -18,13 +18,7 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! Smallest URL subset Memento actually speaks: absolute `http`/`https`
-//! URLs on AnkiConnect and the model-file hosts, plus relative resolution
-//! for `Location` headers during redirects.
-//!
-//! No percent-decoding of the path happens — the path/query is forwarded to
-//! the request target byte-for-byte, so callers must hand over encoded
-//! URLs (same contract as `QUrl::toString()` inputs in the C++ code).
+//! Thin `http`/`https` URL wrapper backed by the `url` crate.
 
 use std::fmt;
 
@@ -49,205 +43,64 @@ impl Scheme
     }
 }
 
-/// A parsed absolute URL. The host keeps the case handed to it (the C++
-/// code never canonicalizes hosts either) and IPv6 literals are stored
-/// without brackets.
+/// A parsed absolute `http` or `https` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url
 {
-    pub scheme: Scheme,
-    pub host: String,
-    host_is_ipv6: bool,
-    pub port: Option<u16>,
-    /// Path plus query as it will appear in the request target
-    /// (e.g. `/foo?bar=baz`). Always starts with `/`; `?`-only URLs are
-    /// resolved to `original-path?query`.
-    pub path_query: String,
+    inner: ::url::Url,
+    scheme: Scheme,
 }
 
 impl Url
 {
     pub fn parse(input: &str) -> HttpResult<Self>
     {
-        let no_fragment = match input.find('#')
-        {
-            Some(idx) => &input[..idx],
-            None => input,
-        };
-
-        let (scheme, rest) = if let Some(rest) = no_fragment.strip_prefix("http://")
-        {
-            (Scheme::Http, rest)
-        }
-        else if let Some(rest) = no_fragment.strip_prefix("https://")
-        {
-            (Scheme::Https, rest)
-        }
-        else
-        {
-            return Err(HttpError::Url(format!(
-                "missing http/https scheme: {input:?}"
-            )));
-        };
-
-        let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-        let (authority, target) = rest.split_at(authority_end);
-        let host_port = Self::parse_authority(authority)?;
-
-        let path_query = if target.is_empty() || target.starts_with('?')
-        {
-            // `http://host?x=1` and `http://host?x` have no explicit path;
-            // the request target needs one.
-            if target.is_empty()
-            {
-                "/".to_owned()
-            }
-            else
-            {
-                format!("/{}", target)
-            }
-        }
-        else
-        {
-            target.to_owned()
-        };
-        if path_query.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            return Err(HttpError::Url("URL contains spaces or control bytes".into()));
-        }
-
-        Ok(Self {
-            scheme,
-            host: host_port.0,
-            host_is_ipv6: host_port.1,
-            port: host_port.2,
-            path_query,
-        })
-    }
-
-    fn parse_authority(
-        authority: &str,
-    ) -> HttpResult<(String, bool, Option<u16>)>
-    {
-        if authority.is_empty()
-        {
-            return Err(HttpError::Url("empty host".into()));
-        }
-        if authority.chars().any(|c| c.is_control() || c.is_whitespace())
+        // Reject raw control bytes / whitespace before WHATWG parsing, which
+        // would otherwise silently strip ASCII tabs and newlines.
+        if input.chars().any(|c| c.is_control() || c.is_whitespace())
         {
             return Err(HttpError::Url(
-                "URL authority contains whitespace or control bytes".into(),
+                "URL contains whitespace or control bytes".into(),
             ));
         }
-        if authority.contains('@')
+
+        let parsed = ::url::Url::parse(input)
+            .map_err(|err| HttpError::Url(format!("{err}: {input:?}")))?;
+        Self::from_parsed(parsed)
+    }
+
+    fn from_parsed(mut parsed: ::url::Url) -> HttpResult<Self>
+    {
+        let scheme = match parsed.scheme()
+        {
+            "http" => Scheme::Http,
+            "https" => Scheme::Https,
+            other => {
+                return Err(HttpError::Url(format!(
+                    "unsupported scheme {other:?} (expected http or https)"
+                )));
+            }
+        };
+
+        if !parsed.username().is_empty() || parsed.password().is_some()
         {
             return Err(HttpError::Url("userinfo in URL is not supported".into()));
         }
-
-        let (host_part, port_part, ipv6) =
-            if let Some(inner) = authority.strip_prefix('[')
-            {
-                let close = inner
-                    .find(']')
-                    .ok_or_else(|| HttpError::Url("unterminated IPv6 literal".into()))?;
-                let host = &inner[..close];
-                let rest = &inner[close + 1..];
-                match rest.strip_prefix(':')
-                {
-                    Some(port) => (host, Some(port), true),
-                    None if rest.is_empty() => (host, None, true),
-                    None => {
-                        return Err(HttpError::Url("junk after IPv6 literal".into()))
-                    }
-                }
-            }
-            else
-            {
-                match authority.rfind(':')
-                {
-                    Some(idx) => (
-                        &authority[..idx],
-                        Some(&authority[idx + 1..]),
-                        false,
-                    ),
-                    None => (authority, None, false),
-                }
-            };
-
-        if host_part.is_empty()
+        if parsed.host().is_none()
         {
             return Err(HttpError::Url("empty host".into()));
         }
-        if host_part.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            return Err(HttpError::Url(
-                "URL host contains whitespace or control bytes".into(),
-            ));
-        }
-        if !ipv6 && (host_part.contains('[') || host_part.contains(']') || host_part.contains(':'))
-        {
-            return Err(HttpError::Url("invalid character in URL host".into()));
-        }
-        if ipv6 && host_part.parse::<std::net::Ipv6Addr>().is_err()
-        {
-            return Err(HttpError::Url("invalid IPv6 literal in URL".into()));
-        }
 
-        let port = match port_part
-        {
-            Some("") => None,
-            Some(digits) if digits.bytes().all(|b| b.is_ascii_digit()) => {
-                let parsed: u32 = digits
-                    .parse()
-                    .map_err(|_| HttpError::Url("bad port".into()))?;
-                let port = u16::try_from(parsed)
-                    .map_err(|_| HttpError::Url("port out of range".into()))?;
-                Some(port)
-            }
-            Some(_) => return Err(HttpError::Url("bad port".into())),
-            None => None,
-        };
-
-        Ok((host_part.to_owned(), ipv6, port))
+        parsed.set_fragment(None);
+        Ok(Self {
+            inner: parsed,
+            scheme,
+        })
     }
 
-    pub fn port_or_default(&self) -> u16
+    pub const fn scheme(&self) -> Scheme
     {
-        self.port.unwrap_or_else(|| self.scheme.default_port())
-    }
-
-    /// Value of the `Host` header for this URL: IPv6 literals regain their
-    /// brackets, and a non-default port is written explicitly (matching
-    /// what Qt puts into the `Host` header for `http://host:8765`).
-    pub fn host_header(&self) -> String
-    {
-        let mut value = if self.host_is_ipv6 {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let default = self.scheme.default_port();
-        if let Some(port) = self.port
-        {
-            if port != default
-            {
-                value.push(':');
-                value.push_str(&port.to_string());
-            }
-        }
-        value
-    }
-
-    /// Stable identity used for redirect loop detection and key comparisons.
-    pub fn key(&self) -> String
-    {
-        format!(
-            "{}://{}:{}{}",
-            self.scheme_str(),
-            self.host_header(),
-            self.port_or_default(),
-            self.path_query
-        )
+        self.scheme
     }
 
     pub const fn scheme_str(&self) -> &'static str
@@ -259,79 +112,98 @@ impl Url
         }
     }
 
-    /// Resolves a `Location` header value against this URL, accepting the
-    /// forms Memento's model-file hosts emit in practice: absolute URLs,
-    /// scheme-relative `//host/path`, absolute paths `/x`, query-only
-    /// `?x`, and relative `x`/`../x` references.
+    pub fn as_str(&self) -> &str
+    {
+        self.inner.as_str()
+    }
+
+    pub fn as_url(&self) -> &::url::Url
+    {
+        &self.inner
+    }
+
+    pub fn host(&self) -> ::url::Host<&str>
+    {
+        self.inner
+            .host()
+            .expect("validated http/https URL always has a host")
+    }
+
+    pub fn host_str(&self) -> &str
+    {
+        self.inner
+            .host_str()
+            .expect("validated http/https URL always has a host")
+    }
+
+    pub fn port(&self) -> Option<u16>
+    {
+        self.inner.port()
+    }
+
+    pub fn port_or_default(&self) -> u16
+    {
+        self.inner
+            .port_or_known_default()
+            .unwrap_or_else(|| self.scheme.default_port())
+    }
+
+    /// Value of the `Host` header for this URL: IPv6 literals include brackets
+    /// and non-default ports are written explicitly.
+    pub fn host_header(&self) -> String
+    {
+        let host = self.host_str();
+        match self.inner.port()
+        {
+            Some(port) if port != self.scheme.default_port() => format!("{host}:{port}"),
+            _ => host.to_owned(),
+        }
+    }
+
+    pub fn path_query(&self) -> String
+    {
+        match self.inner.query()
+        {
+            Some(q) => format!("{}?{q}", self.inner.path()),
+            None => self.inner.path().to_owned(),
+        }
+    }
+
+    /// Stable identity used for redirect loop detection and key comparisons.
+    pub fn key(&self) -> String
+    {
+        format!(
+            "{}://{}:{}{}",
+            self.scheme_str(),
+            self.host_str().to_ascii_lowercase(),
+            self.port_or_default(),
+            self.path_query(),
+        )
+    }
+
+    /// Resolves a `Location` header value against this URL (absolute URLs,
+    /// scheme-relative `//host/path`, absolute paths `/x`, query-only `?x`,
+    /// and relative `x`/`../x` references).
     pub fn resolve_relative(&self, location: &str) -> HttpResult<Self>
     {
         if location.chars().any(|c| c.is_control())
         {
-            return Err(HttpError::Url("redirect location contains control bytes".into()));
+            return Err(HttpError::Url(
+                "redirect location contains control bytes".into(),
+            ));
         }
         let location = location.trim();
-
-        if location.starts_with("http://") || location.starts_with("https://")
+        if location.chars().any(|c| c.is_whitespace())
         {
-            return Self::parse(location);
+            return Err(HttpError::Url(
+                "redirect location contains whitespace".into(),
+            ));
         }
-
-        if let Some(rest) = location.strip_prefix("//")
-        {
-            let rebuilt = format!("{}://{}", self.scheme_str(), rest);
-            return Self::parse(&rebuilt);
-        }
-
-        let rebuilt = if location.starts_with('/')
-        {
-            format!("{}://{}{}", self.scheme_str(), self.authority_url(), location)
-        }
-        else if location.starts_with('?')
-        {
-            let path = self.path_query.split('?').next().unwrap_or("/");
-            format!("{}://{}{}{}", self.scheme_str(), self.authority_url(), path, location)
-        }
-        else
-        {
-            // Relative reference: merge against the base directory (the
-            // path without its last segment), then fold dot segments.
-            let base_path = self.path_query.split('?').next().unwrap_or("/");
-            let base = if let Some(idx) = base_path.rfind('/')
-            {
-                &base_path[..=idx]
-            }
-            else
-            {
-                "/"
-            };
-            let (loc_path, loc_query) = match location.find('?')
-            {
-                Some(idx) => (&location[..idx], &location[idx..]),
-                None => (location, ""),
-            };
-            let merged = remove_dot_segments(&format!("{base}{loc_path}"));
-            format!(
-                "{}://{}{}{}",
-                self.scheme_str(),
-                self.authority_url(),
-                merged,
-                loc_query
-            )
-        };
-
-        Self::parse(&rebuilt)
-    }
-
-    fn authority_url(&self) -> String
-    {
-        let mut value = if self.host_is_ipv6 {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        value.push(':');
-        value.push_str(&self.port_or_default().to_string());
-        value
+        let joined = self
+            .inner
+            .join(location)
+            .map_err(|err| HttpError::Url(format!("invalid redirect location {location:?}: {err}")))?;
+        Self::from_parsed(joined)
     }
 }
 
@@ -339,41 +211,8 @@ impl fmt::Display for Url
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
     {
-        write!(
-            f,
-            "{}://{}{}",
-            self.scheme_str(),
-            self.authority_url(),
-            self.path_query
-        )
+        f.write_str(self.inner.as_str())
     }
-}
-
-/// Folds `.` and `..` path segments the way RFC 3986 `remove_dot_segments`
-/// does (empty segments and slashes are collapsed, `..` beyond the root
-/// stops at the root).
-fn remove_dot_segments(path: &str) -> String
-{
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in path.split('/')
-    {
-        match segment
-        {
-            "." => {}
-            ".." => {
-                if segments.len() > 1
-                {
-                    segments.pop();
-                }
-            }
-            other => segments.push(other),
-        }
-    }
-    if segments.is_empty()
-    {
-        return "/".to_owned();
-    }
-    segments.join("/")
 }
 
 #[cfg(test)]
@@ -406,9 +245,17 @@ mod tests
     {
         let base = Url::parse("https://example.com/dir/page?next=/other/sub").unwrap();
         let resolved = base.resolve_relative("rel.html").unwrap();
-        assert_eq!(resolved.path_query, "/dir/rel.html");
+        assert_eq!(resolved.path_query(), "/dir/rel.html");
 
         let resolved_with_query = base.resolve_relative("../item.bin?from=/a/b").unwrap();
-        assert_eq!(resolved_with_query.path_query, "/item.bin?from=/a/b");
+        assert_eq!(resolved_with_query.path_query(), "/item.bin?from=/a/b");
+    }
+
+    #[test]
+    fn rejects_userinfo_and_non_http_schemes()
+    {
+        assert!(Url::parse("http://user:pass@example.com/").is_err());
+        assert!(Url::parse("ftp://example.com/file").is_err());
+        assert!(Url::parse("example.com/no-scheme").is_err());
     }
 }

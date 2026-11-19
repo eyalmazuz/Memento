@@ -156,8 +156,6 @@ pub const fn compute_windows_borderless_fullscreen_rect(monitor: MonitorRect) ->
 
 #[cfg(target_os = "windows")]
 mod win32_ffi {
-    use std::ffi::c_void;
-
     pub type Hwnd = isize;
     pub type Hmonitor = isize;
     pub type Bool = i32;
@@ -165,12 +163,15 @@ mod win32_ffi {
     pub const GWL_STYLE: i32 = -16;
     pub const GWL_EXSTYLE: i32 = -20;
 
+    pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+
     pub const SW_SHOWNORMAL: i32 = 1;
     pub const SW_SHOWMAXIMIZED: i32 = 3;
 
     pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
     pub const HWND_TOP: Hwnd = 0;
+    pub const HWND_TOPMOST: Hwnd = -1;
     pub const HWND_NOTOPMOST: Hwnd = -2;
 
     pub const SWP_NOSIZE: u32 = 0x0001;
@@ -268,7 +269,6 @@ mod win32_ffi {
     }
 
     pub fn validate_hwnd(hwnd: isize) -> Result<Hwnd, String> {
-        let _ = std::ptr::null::<c_void>();
         if hwnd == 0 {
             Err("Win32 HWND must be non-null".to_owned())
         } else {
@@ -406,6 +406,26 @@ pub fn enter_windows_borderless_fullscreen(
             win32_ffi::SWP_FRAMECHANGED | win32_ffi::SWP_NOOWNERZORDER | win32_ffi::SWP_SHOWWINDOW,
         );
         if ok == 0 {
+            let restored_style = restore_win32_normal_window_style(snapshot.style);
+            let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, restored_style as i32);
+            let _ =
+                win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE, snapshot.ex_style as i32);
+            let _ = win32_ffi::SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                win32_ffi::SWP_NOMOVE
+                    | win32_ffi::SWP_NOSIZE
+                    | win32_ffi::SWP_NOZORDER
+                    | win32_ffi::SWP_NOOWNERZORDER
+                    | win32_ffi::SWP_FRAMECHANGED,
+            );
+            if snapshot.was_maximized {
+                let _ = win32_ffi::ShowWindow(hwnd, win32_ffi::SW_SHOWMAXIMIZED);
+            }
             return Err("SetWindowPos failed entering Windows borderless fullscreen".to_owned());
         }
     }
@@ -430,27 +450,33 @@ pub fn exit_windows_borderless_fullscreen(
 ) -> Result<(), String> {
     let hwnd = win32_ffi::validate_hwnd(hwnd)?;
     let restored_style = restore_win32_normal_window_style(snapshot.style);
+    let insert_after = if (snapshot.ex_style & win32_ffi::WS_EX_TOPMOST) != 0 {
+        win32_ffi::HWND_TOPMOST
+    } else {
+        win32_ffi::HWND_NOTOPMOST
+    };
     unsafe {
+        let prev_style = win32_ffi::GetWindowLongW(hwnd, win32_ffi::GWL_STYLE);
+        let prev_ex_style = win32_ffi::GetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE);
         let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, restored_style as i32);
         let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE, snapshot.ex_style as i32);
         let rect = snapshot.normal_rect;
         let ok = if !rect.is_empty() {
             win32_ffi::SetWindowPos(
                 hwnd,
-                win32_ffi::HWND_NOTOPMOST,
+                insert_after,
                 rect.x,
                 rect.y,
                 rect.width as i32,
                 rect.height as i32,
                 win32_ffi::SWP_FRAMECHANGED
-                    | win32_ffi::SWP_NOZORDER
                     | win32_ffi::SWP_NOOWNERZORDER
                     | win32_ffi::SWP_SHOWWINDOW,
             )
         } else {
             win32_ffi::SetWindowPos(
                 hwnd,
-                win32_ffi::HWND_NOTOPMOST,
+                insert_after,
                 0,
                 0,
                 0,
@@ -458,12 +484,26 @@ pub fn exit_windows_borderless_fullscreen(
                 win32_ffi::SWP_NOMOVE
                     | win32_ffi::SWP_NOSIZE
                     | win32_ffi::SWP_FRAMECHANGED
-                    | win32_ffi::SWP_NOZORDER
                     | win32_ffi::SWP_NOOWNERZORDER
                     | win32_ffi::SWP_SHOWWINDOW,
             )
         };
         if ok == 0 {
+            let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, prev_style);
+            let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE, prev_ex_style);
+            let _ = win32_ffi::SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                win32_ffi::SWP_NOMOVE
+                    | win32_ffi::SWP_NOSIZE
+                    | win32_ffi::SWP_NOZORDER
+                    | win32_ffi::SWP_NOOWNERZORDER
+                    | win32_ffi::SWP_FRAMECHANGED,
+            );
             return Err(
                 "SetWindowPos failed restoring windowed geometry from borderless fullscreen"
                     .to_owned(),

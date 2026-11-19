@@ -138,24 +138,30 @@ fn merge_multiline_rows(text: &str) -> ConfigResult<Vec<String>> {
         .collect();
     let mut idx = 0;
     while idx < raw_rows.len() {
-        let mut row = raw_rows[idx].to_owned();
-        if idx == 0 {
-            row = row.strip_prefix('\u{FEFF}').map(str::to_owned).unwrap_or(row);
-        }
-        if needs_continuation(&row) {
+        let initial = if idx == 0 {
+            raw_rows[idx].strip_prefix('\u{FEFF}').unwrap_or(raw_rows[idx])
+        } else {
+            raw_rows[idx]
+        };
+        let mut row = initial.to_owned();
+        if initial_quote_unclosed(&row) {
+            let mut in_quotes = true;
             let start_line = idx + 1;
             let mut j = idx + 1;
             while j < raw_rows.len() {
                 let next = raw_rows[j];
                 row.push('\n');
                 row.push_str(next);
+                // Joining with '\n' consumes any trailing escape from the previous line.
+                let mut escaped = false;
+                advance_quote_state(next, &mut in_quotes, &mut escaped);
                 idx = j;
-                if !needs_continuation(&row) {
+                if !in_quotes {
                     break;
                 }
                 j += 1;
             }
-            if needs_continuation(&row) {
+            if in_quotes {
                 return Err(ConfigError::Parse {
                     file: "legacy-ini",
                     line: start_line,
@@ -169,32 +175,38 @@ fn merge_multiline_rows(text: &str) -> ConfigResult<Vec<String>> {
     Ok(rows)
 }
 
-/// True when the value part of a `key=value` row opens with `"` and does
-/// not contain the closing quote.
-fn needs_continuation(row: &str) -> bool {
-    let find_eq = match row.find('=') {
-        Some(pos) => pos,
-        None => return false,
+/// True when `row` is a non-comment `key=value` row whose value opens with `"`
+/// and does not close on the same line.
+fn initial_quote_unclosed(row: &str) -> bool {
+    let trimmed = row.trim_start();
+    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return false;
+    }
+    let Some(find_eq) = row.find('=') else {
+        return false;
     };
     let value = row[find_eq + 1..].trim_start();
     if !value.starts_with('"') {
         return false;
     }
-    // unescaped quotes count
+    let mut in_quotes = false;
     let mut escaped = false;
-    let mut count = 0usize;
-    for c in value.chars() {
-        if c == '\\' && !escaped {
-            escaped = true;
+    advance_quote_state(value, &mut in_quotes, &mut escaped);
+    in_quotes
+}
+
+fn advance_quote_state(segment: &str, in_quotes: &mut bool, escaped: &mut bool) {
+    for b in segment.bytes() {
+        if *escaped {
+            *escaped = false;
             continue;
         }
-        let was_escaped = escaped;
-        escaped = false;
-        if c == '"' && !was_escaped {
-            count += 1;
+        if b == b'\\' {
+            *escaped = true;
+        } else if b == b'"' {
+            *in_quotes = !*in_quotes;
         }
     }
-    count % 2 == 1
 }
 
 /// Walks the logical rows and populates the parser.
@@ -308,10 +320,14 @@ fn decode_and_store(
 
 /// Applies QSettings' INI string escapes before the value is re-encoded in
 /// the canonical format. This is separate from the stricter canonical codec.
+///
+/// Accumulates UTF-16 code units so Qt `\xHHHH` / octal surrogate pairs
+/// (e.g. `\xd83d\xde00`) decode back to their Unicode scalar value instead
+/// of pairs of U+FFFD replacement characters.
 fn decode_qt_ini_text(raw: &str) -> String {
     let raw = raw.trim();
     let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(raw.len());
+    let mut out: Vec<u16> = Vec::with_capacity(raw.len());
     let mut pos = 0;
     let mut quoted = false;
 
@@ -335,18 +351,18 @@ fn decode_qt_ini_text(raw: &str) -> String {
                     break;
                 };
                 pos += 1;
-                let decoded = match escaped {
-                    b'a' => Some('\u{0007}'),
-                    b'b' => Some('\u{0008}'),
-                    b'f' => Some('\u{000c}'),
-                    b'n' => Some('\n'),
-                    b'r' => Some('\r'),
-                    b't' => Some('\t'),
-                    b'v' => Some('\u{000b}'),
-                    b'"' => Some('"'),
-                    b'?' => Some('?'),
-                    b'\'' => Some('\''),
-                    b'\\' => Some('\\'),
+                let decoded: Option<u16> = match escaped {
+                    b'a' => Some(0x0007),
+                    b'b' => Some(0x0008),
+                    b'f' => Some(0x000c),
+                    b'n' => Some(b'\n' as u16),
+                    b'r' => Some(b'\r' as u16),
+                    b't' => Some(b'\t' as u16),
+                    b'v' => Some(0x000b),
+                    b'"' => Some(b'"' as u16),
+                    b'?' => Some(b'?' as u16),
+                    b'\'' => Some(b'\'' as u16),
+                    b'\\' => Some(b'\\' as u16),
                     b'x' => {
                         let start = pos;
                         let mut value = 0u16;
@@ -357,7 +373,7 @@ fn decode_qt_ini_text(raw: &str) -> String {
                             value = value.wrapping_shl(4) | digit as u16;
                             pos += 1;
                         }
-                        (pos != start).then(|| char::from_u32(value as u32).unwrap_or('\u{fffd}'))
+                        (pos != start).then_some(value)
                     }
                     b'0'..=b'7' => {
                         let mut value = (escaped - b'0') as u16;
@@ -368,7 +384,7 @@ fn decode_qt_ini_text(raw: &str) -> String {
                             value = value.wrapping_shl(3) | (digit - b'0') as u16;
                             pos += 1;
                         }
-                        Some(char::from_u32(value as u32).unwrap_or('\u{fffd}'))
+                        Some(value)
                     }
                     b'\n' | b'\r' => {
                         if bytes.get(pos).is_some_and(|&next| {
@@ -380,18 +396,19 @@ fn decode_qt_ini_text(raw: &str) -> String {
                     }
                     _ => None,
                 };
-                if let Some(c) = decoded {
-                    out.push(c);
+                if let Some(unit) = decoded {
+                    out.push(unit);
                 }
             }
             _ => {
                 let c = raw[pos..].chars().next().expect("position is within the string");
-                out.push(c);
+                let mut encoded = [0u16; 2];
+                out.extend_from_slice(c.encode_utf16(&mut encoded));
                 pos += c.len_utf8();
             }
         }
     }
-    out
+    String::from_utf16_lossy(&out)
 }
 
 fn decode_declared_value(raw: &str, ty: ValueType) -> Result<Value, String> {

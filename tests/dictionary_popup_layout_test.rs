@@ -2832,19 +2832,19 @@ mod rich_popup_phase4_tests {
         )
         .expect("supersampled doc with SVG should render");
 
-        // Default render_scale is 2.0x physical pixels while logical width_px/height_px stay 1:1 logical!
+        // Default render_scale is 1.0x native physical pixels while logical width_px/height_px stay 1:1 logical!
         let img_size = doc.image.size();
         assert_eq!(
             img_size.width,
-            (doc.width_px * 2.0).round() as u32,
-            "default glossary pixmap must supersample width at 2.0x (img_w={}, logical_w={})",
+            doc.width_px.round() as u32,
+            "default glossary pixmap must rasterize at 1.0x physical width (img_w={}, logical_w={})",
             img_size.width,
             doc.width_px
         );
         assert_eq!(
             img_size.height,
-            (doc.height_px * 2.0).round() as u32,
-            "default glossary pixmap must supersample height at 2.0x (img_h={}, logical_h={})",
+            doc.height_px.round() as u32,
+            "default glossary pixmap must rasterize at 1.0x physical height (img_h={}, logical_h={})",
             img_size.height,
             doc.height_px
         );
@@ -2876,7 +2876,7 @@ mod rich_popup_phase4_tests {
         }
 
         // Verify live window ScaleFactorChanged updates GlossaryDocCacheKey (scale_quarter) cleanly:
-        // 1.0 -> 2.0x, 2.0 -> 2.0x, 2.5 -> 2.5x, 3.5 -> clamped 3.0x, while logical metrics stay constant.
+        // 1.0 -> 1.0x, 1.25 -> 1.25x, 2.0 -> 2.0x, 2.5 -> 2.5x, 3.5 -> clamped 3.0x, while logical metrics stay constant.
         let app = MementoApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
@@ -2889,7 +2889,13 @@ mod rich_popup_phase4_tests {
         let pb = app.global::<PopupBridge>();
 
         let mut logical_baseline: Option<(f32, f32)> = None;
-        for (win_scale, expected_render_scale) in [(1.0f32, 2.0f32), (2.0, 2.0), (2.5, 2.5), (3.5, 3.0)] {
+        for (win_scale, expected_render_scale) in [
+            (1.0f32, 1.0f32),
+            (1.25, 1.25),
+            (2.0, 2.0),
+            (2.5, 2.5),
+            (3.5, 3.0),
+        ] {
             app.window().dispatch_event(
                 slint::platform::WindowEvent::ScaleFactorChanged {
                     scale_factor: win_scale,

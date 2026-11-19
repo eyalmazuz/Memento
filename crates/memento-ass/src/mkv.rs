@@ -5,13 +5,14 @@
 //!   `S_TEXT/SSA`, `S_TEXT/UTF8` (SRT), and `S_TEXT/WEBVTT` without invoking external binaries.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 
-use crate::parser::{format_ass_timecode, strip_ass_dialogue_text};
+use crate::parser::{parse_events_format, strip_ass_dialogue_text, write_ass_timecode};
 
 // EBML / Matroska element IDs (raw big-endian VINT including marker bit).
 const ID_EBML: u32 = 0x1A45_DFA3;
@@ -35,9 +36,11 @@ const ID_CODEC_ID: u32 = 0x86;
 const ID_CODEC_PRIVATE: u32 = 0x63A2;
 const ID_FLAG_DEFAULT: u32 = 0x88;
 const ID_FLAG_FORCED: u32 = 0x55AA;
+const ID_DEFAULT_DURATION: u32 = 0x23E3_83;
 
 const ID_CONTENT_ENCODINGS: u32 = 0x6D80;
 const ID_CONTENT_ENCODING: u32 = 0x6240;
+const ID_CONTENT_ENCODING_ORDER: u32 = 0x5031;
 const ID_CONTENT_ENCODING_SCOPE: u32 = 0x5032;
 const ID_CONTENT_ENCODING_TYPE: u32 = 0x5033;
 const ID_CONTENT_COMPRESSION: u32 = 0x5034;
@@ -59,9 +62,12 @@ const ID_BLOCK_DURATION: u32 = 0x9B;
 
 const TRACK_TYPE_SUBTITLE: u64 = 0x11;
 const MAX_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_FONT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CODEC_PRIVATE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BLOCK_BYTES: u64 = 4 * 1024 * 1024;
-const BUF_READER_CAPACITY: usize = 256 * 1024;
+/// Small buffer for EBML headers/VINTs so skipping multi-GB video/audio blocks does
+/// not pull hundreds of KiB of media payloads into userspace on every block header.
+const HEADER_BUF_CAPACITY: usize = 2048;
 
 /// Subtitle codec identified from Matroska `CodecID`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,49 +156,94 @@ pub struct ExtractedSubtitleTrack {
 
 impl ExtractedSubtitleTrack {
     /// Reconstruct a complete standalone `.ass` document combining `CodecPrivate` and all
-    /// extracted cues as `Dialogue:` lines.
+    /// extracted cues as `Dialogue:` lines respecting the `[Events]` `Format:` column order.
     pub fn to_ass_document(&self) -> String {
         let header = self.info.codec_private_utf8();
-        let mut out = String::with_capacity(header.len() + self.cues.len() * 96);
-        out.push_str(header.trim_end());
-        out.push('\n');
+        let format = parse_events_format(&header);
+        let cap = header
+            .len()
+            .saturating_add(self.cues.len().saturating_mul(96))
+            .saturating_add(128);
+        let mut out = String::with_capacity(cap);
+        let trimmed_header = header.trim_end();
+        if !trimmed_header.is_empty() {
+            out.push_str(trimmed_header);
+            out.push('\n');
+        }
 
-        let has_events = header
-            .lines()
-            .any(|l| l.trim().eq_ignore_ascii_case("[Events]"));
-        if !has_events {
-            out.push_str(
-                "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-            );
-        } else {
-            let has_format = header
-                .lines()
-                .skip_while(|l| !l.trim().eq_ignore_ascii_case("[Events]"))
-                .skip(1)
-                .any(|l| l.trim().to_ascii_lowercase().starts_with("format:"));
-            if !has_format {
-                out.push_str(
-                    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-                );
+        let mut in_events = false;
+        let mut last_section_is_events = false;
+        let mut last_events_has_format = false;
+        for raw_line in header.lines() {
+            let line = raw_line.trim().trim_start_matches('\u{feff}');
+            if line.starts_with('[') && line.ends_with(']') {
+                in_events = line.eq_ignore_ascii_case("[Events]");
+                last_section_is_events = in_events;
+                if in_events {
+                    last_events_has_format = false;
+                }
+                continue;
+            }
+            if in_events && line.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("format:")) {
+                last_events_has_format = true;
             }
         }
 
+        let write_format_line = |buf: &mut String| {
+            buf.push_str("Format: ");
+            for (idx, col) in format.columns.iter().enumerate() {
+                if idx > 0 {
+                    buf.push_str(", ");
+                }
+                buf.push_str(col);
+            }
+            buf.push('\n');
+        };
+
+        if !last_section_is_events {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("[Events]\n");
+            write_format_line(&mut out);
+        } else if !last_events_has_format {
+            write_format_line(&mut out);
+        }
+
         for cue in &self.cues {
-            let start_tc = format_ass_timecode(cue.start_ms);
-            let end_tc = format_ass_timecode(cue.end_ms.max(cue.start_ms));
-            out.push_str(&format!(
-                "Dialogue: {},{},{},{},{},{},{},{},{},{}\n",
-                cue.layer,
-                start_tc,
-                end_tc,
-                cue.style,
-                cue.name,
-                cue.margin_l,
-                cue.margin_r,
-                cue.margin_v,
-                cue.effect,
-                cue.raw_text,
-            ));
+            let end_ms = cue.end_ms.max(cue.start_ms);
+            out.push_str("Dialogue: ");
+            for (idx, col) in format.columns.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if idx == format.text_idx {
+                    out.push_str(&cue.raw_text);
+                } else if Some(idx) == format.layer_idx {
+                    if col.eq_ignore_ascii_case("Marked") {
+                        let _ = write!(out, "Marked={}", cue.layer);
+                    } else {
+                        let _ = write!(out, "{}", cue.layer);
+                    }
+                } else if Some(idx) == format.start_idx {
+                    write_ass_timecode(&mut out, cue.start_ms);
+                } else if Some(idx) == format.end_idx {
+                    write_ass_timecode(&mut out, end_ms);
+                } else if Some(idx) == format.style_idx {
+                    out.push_str(&cue.style);
+                } else if Some(idx) == format.name_idx {
+                    out.push_str(&cue.name);
+                } else if Some(idx) == format.margin_l_idx {
+                    let _ = write!(out, "{}", cue.margin_l);
+                } else if Some(idx) == format.margin_r_idx {
+                    let _ = write!(out, "{}", cue.margin_r);
+                } else if Some(idx) == format.margin_v_idx {
+                    let _ = write!(out, "{}", cue.margin_v);
+                } else if Some(idx) == format.effect_idx {
+                    out.push_str(&cue.effect);
+                }
+            }
+            let _ = writeln!(out);
         }
         out
     }
@@ -207,6 +258,7 @@ enum ContentCompression {
 
 #[derive(Debug, Clone)]
 struct TrackEncoding {
+    order: u64,
     scope: u64,
     compression: ContentCompression,
 }
@@ -215,6 +267,7 @@ struct TrackEncoding {
 struct InternalTrackMeta {
     info: MkvSubtitleTrackInfo,
     encodings: Vec<TrackEncoding>,
+    default_duration_ns: Option<u64>,
 }
 
 /// Extract all embedded font attachments from a Matroska container (`< 5 ms` via `SeekHead`).
@@ -257,7 +310,7 @@ pub fn extract_mkv_subtitle_track(
 
     let mut cues = Vec::new();
     let cluster_start = meta.first_cluster_pos.unwrap_or(seg.data_start);
-    reader.seek(SeekFrom::Start(cluster_start))?;
+    reader.seek_to(cluster_start);
 
     let ts_scale = meta.timestamp_scale;
     while stream_pos(&mut reader)? < seg.end_pos {
@@ -274,7 +327,7 @@ pub fn extract_mkv_subtitle_track(
         // Advance cleanly to next top-level element inside Segment.
         let cur = stream_pos(&mut reader)?;
         if hdr.size.is_some() && cur != elem_end {
-            reader.seek(SeekFrom::Start(elem_end))?;
+            reader.seek_to(elem_end);
         }
     }
 
@@ -313,16 +366,16 @@ fn normalize_plain_subtitle_text(text: &str) -> String {
 /// simultaneous dialogue lines required by `libass` rendering). For SRT/WebVTT
 /// tracks, identical normalized `plain_text` within 10ms is deduplicated.
 fn dedup_extracted_cues(cues: &mut Vec<MkvSubtitleCue>, is_ass: bool) {
-    const TIME_EPS_MS: i64 = 10;
+    const TIME_EPS_MS: u64 = 10;
     let mut kept: Vec<MkvSubtitleCue> = Vec::with_capacity(cues.len());
     for cue in cues.drain(..) {
         let is_dup = kept
             .iter()
             .rev()
-            .take_while(|prev| cue.start_ms.saturating_sub(prev.start_ms) <= TIME_EPS_MS)
+            .take_while(|prev| cue.start_ms.abs_diff(prev.start_ms) <= TIME_EPS_MS)
             .any(|prev| {
-                (cue.start_ms - prev.start_ms).abs() <= TIME_EPS_MS
-                    && (cue.end_ms - prev.end_ms).abs() <= TIME_EPS_MS
+                cue.start_ms.abs_diff(prev.start_ms) <= TIME_EPS_MS
+                    && cue.end_ms.abs_diff(prev.end_ms) <= TIME_EPS_MS
                     && if is_ass {
                         cue.layer == prev.layer
                             && cue.style == prev.style
@@ -338,70 +391,141 @@ fn dedup_extracted_cues(cues: &mut Vec<MkvSubtitleCue>, is_ass: bool) {
     *cues = kept;
 }
 
-/// Zero-syscall position tracking wrapper around `BufReader<File>` so scanning
-/// tens of thousands of Matroska `SimpleBlock`s avoids `lseek(SEEK_CUR)` per element
-/// while keeping `BufReader`'s 256 KB buffer hot via `seek_relative`.
+/// Position-tracking file reader with a small header buffer and lazy direct seeks.
+///
+/// Small EBML element headers and VINTs are served out of a 2 KiB buffer, while large
+/// skips (video/audio frames) jump directly via `pread` (Unix) or lazy `File::seek`
+/// without copying multi-GB media payloads through a large `BufReader` into userspace.
+/// Large payload reads (`>= HEADER_BUF_CAPACITY`, e.g. embedded fonts) bypass the
+/// small buffer and read straight into the caller's slice.
 struct TrackedReader {
-    inner: BufReader<File>,
+    file: File,
+    file_len: u64,
     pos: u64,
+    buf_start: u64,
+    buf_len: usize,
+    buf: [u8; HEADER_BUF_CAPACITY],
+    #[cfg(not(unix))]
+    kernel_pos: u64,
 }
 
 impl TrackedReader {
     fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
         Ok(Self {
-            inner: BufReader::with_capacity(BUF_READER_CAPACITY, file),
+            file,
+            file_len,
             pos: 0,
+            buf_start: 0,
+            buf_len: 0,
+            buf: [0u8; HEADER_BUF_CAPACITY],
+            #[cfg(not(unix))]
+            kernel_pos: 0,
         })
     }
 
+    /// Move the logical stream position directly with zero syscalls; the next read
+    /// will hit the small header buffer if in range or issue a positioned read directly.
     #[inline]
-    fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
-        if offset == 0 {
-            return Ok(());
+    fn seek_to(&mut self, target: u64) {
+        self.pos = target;
+    }
+
+    fn read_file_at(
+        file: &mut File,
+        #[cfg(not(unix))] kernel_pos: &mut u64,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            loop {
+                match file.read_at(dst, offset) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
         }
-        let new_pos = (self.pos as i128)
-            .checked_add(offset as i128)
-            .filter(|&p| p >= 0)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?;
-        self.inner.seek_relative(offset)?;
-        self.pos = new_pos as u64;
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            if *kernel_pos != offset {
+                *kernel_pos = file.seek(SeekFrom::Start(offset))?;
+            }
+            loop {
+                match file.read(dst) {
+                    Ok(n) => {
+                        *kernel_pos = kernel_pos.saturating_add(n as u64);
+                        return Ok(n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 }
 
 impl Read for TrackedReader {
     #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.pos += n as u64;
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let buf_end = self.buf_start.saturating_add(self.buf_len as u64);
+        if self.pos >= self.buf_start && self.pos < buf_end {
+            let off = (self.pos - self.buf_start) as usize;
+            let avail = self.buf_len - off;
+            let n = avail.min(out.len());
+            out[..n].copy_from_slice(&self.buf[off..off + n]);
+            self.pos = self.pos.saturating_add(n as u64);
+            return Ok(n);
+        }
+        if out.len() >= HEADER_BUF_CAPACITY {
+            let n = Self::read_file_at(
+                &mut self.file,
+                #[cfg(not(unix))]
+                &mut self.kernel_pos,
+                self.pos,
+                out,
+            )?;
+            self.pos = self.pos.saturating_add(n as u64);
+            return Ok(n);
+        }
+        let filled = Self::read_file_at(
+            &mut self.file,
+            #[cfg(not(unix))]
+            &mut self.kernel_pos,
+            self.pos,
+            &mut self.buf,
+        )?;
+        self.buf_start = self.pos;
+        self.buf_len = filled;
+        if filled == 0 {
+            return Ok(0);
+        }
+        let n = filled.min(out.len());
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.pos = self.pos.saturating_add(n as u64);
         Ok(n)
     }
 }
 
 impl Seek for TrackedReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            SeekFrom::Start(target) => {
-                let delta = (target as i128) - (self.pos as i128);
-                if let Ok(d64) = i64::try_from(delta) {
-                    self.seek_relative(d64)?;
-                    return Ok(self.pos);
-                }
-                let p = self.inner.seek(SeekFrom::Start(target))?;
-                self.pos = p;
-                Ok(p)
-            }
-            SeekFrom::Current(delta) => {
-                self.seek_relative(delta)?;
-                Ok(self.pos)
-            }
-            SeekFrom::End(off) => {
-                let p = self.inner.seek(SeekFrom::End(off))?;
-                self.pos = p;
-                Ok(p)
-            }
-        }
+        let new_pos = match pos {
+            SeekFrom::Start(target) => target,
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range")
+            })?,
+            SeekFrom::End(off) => self.file_len.checked_add_signed(off).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file")
+            })?,
+        };
+        self.pos = new_pos;
+        Ok(new_pos)
     }
 
     #[inline]
@@ -495,6 +619,7 @@ fn scan_segment_metadata(
     let mut timestamp_scale: u64 = 1_000_000;
     let mut tracks: Vec<InternalTrackMeta> = Vec::new();
     let mut fonts: Vec<MkvFontAttachment> = Vec::new();
+    let mut total_font_bytes: u64 = 0;
     let mut first_cluster_pos: Option<u64> = None;
 
     let mut visited_offsets: HashSet<u64> = HashSet::new();
@@ -503,7 +628,7 @@ fn scan_segment_metadata(
     let mut saw_tracks = false;
     let mut saw_attachments = false;
 
-    reader.seek(SeekFrom::Start(seg.data_start))?;
+    reader.seek_to(seg.data_start);
 
     // 1. Scan leading top-level elements before the first Cluster.
     while stream_pos(reader)? < seg.end_pos {
@@ -527,7 +652,7 @@ fn scan_segment_metadata(
                 saw_tracks = true;
             }
             ID_ATTACHMENTS if want_fonts => {
-                parse_attachments(reader, elem_end, &mut fonts)?;
+                parse_attachments(reader, elem_end, &mut fonts, &mut total_font_bytes)?;
                 saw_attachments = true;
             }
             ID_CLUSTER => {
@@ -540,7 +665,7 @@ fn scan_segment_metadata(
         if hdr.size.is_none() {
             break;
         }
-        reader.seek(SeekFrom::Start(elem_end))?;
+        reader.seek_to(elem_end);
     }
 
     // 2. Follow SeekHead entries (including chained secondary SeekHeads) to find any
@@ -564,7 +689,7 @@ fn scan_segment_metadata(
             continue;
         }
 
-        reader.seek(SeekFrom::Start(abs_pos))?;
+        reader.seek_to(abs_pos);
         let Some(hdr) = read_element_header(reader, seg.end_pos)? else {
             continue;
         };
@@ -582,7 +707,7 @@ fn scan_segment_metadata(
                 saw_tracks = true;
             }
             ID_ATTACHMENTS if want_fonts && !saw_attachments => {
-                parse_attachments(reader, elem_end, &mut fonts)?;
+                parse_attachments(reader, elem_end, &mut fonts, &mut total_font_bytes)?;
                 saw_attachments = true;
             }
             _ => {}
@@ -694,7 +819,7 @@ fn parse_tracks<R: Read + Seek>(
                         entry.info.codec_private = decoded;
                     }
                 }
-                sub_index += 1;
+                sub_index = sub_index.saturating_add(1);
                 out.push(entry);
             }
         }
@@ -718,6 +843,7 @@ fn parse_track_entry<R: Read + Seek>(
     let mut language_bcp47: Option<String> = None;
     let mut default = true; // Matroska spec default for FlagDefault is 1.
     let mut forced = false;
+    let mut default_duration_ns: Option<u64> = None;
     let mut codec_private: Vec<u8> = Vec::new();
     let mut encodings: Vec<TrackEncoding> = Vec::new();
 
@@ -744,8 +870,16 @@ fn parse_track_entry<R: Read + Seek>(
             }
             ID_FLAG_DEFAULT if sz <= 8 => default = read_uint(reader, sz as usize)? != 0,
             ID_FLAG_FORCED if sz <= 8 => forced = read_uint(reader, sz as usize)? != 0,
+            ID_DEFAULT_DURATION if sz <= 8 => {
+                let v = read_uint(reader, sz as usize)?;
+                if v > 0 {
+                    default_duration_ns = Some(v);
+                }
+            }
             ID_CODEC_PRIVATE if sz <= MAX_CODEC_PRIVATE_BYTES => {
-                codec_private = read_exact_vec(reader, sz as usize)?;
+                if let Ok(len) = usize::try_from(sz) {
+                    codec_private = read_exact_vec(reader, len)?;
+                }
             }
             ID_CONTENT_ENCODINGS => {
                 parse_content_encodings(reader, child_end, &mut encodings)?;
@@ -775,6 +909,7 @@ fn parse_track_entry<R: Read + Seek>(
             codec_private,
         },
         encodings,
+        default_duration_ns,
     }))
 }
 
@@ -789,6 +924,7 @@ fn parse_content_encodings<R: Read + Seek>(
         };
         let child_end = element_end_pos(hdr.data_start, hdr.size, end_pos);
         if hdr.id == ID_CONTENT_ENCODING {
+            let mut order: u64 = 0; // Matroska spec default for ContentEncodingOrder is 0.
             let mut scope: u64 = 1;
             let mut enc_type: u64 = 0;
             let mut compression: Option<ContentCompression> = None;
@@ -800,6 +936,9 @@ fn parse_content_encodings<R: Read + Seek>(
                 let sub_end = element_end_pos(sub.data_start, sub.size, child_end);
                 let sz = sub_end.saturating_sub(sub.data_start);
                 match sub.id {
+                    ID_CONTENT_ENCODING_ORDER if sz <= 8 => {
+                        order = read_uint(reader, sz as usize)?;
+                    }
                     ID_CONTENT_ENCODING_SCOPE if sz <= 8 => {
                         scope = read_uint(reader, sz as usize)?;
                     }
@@ -817,6 +956,7 @@ fn parse_content_encodings<R: Read + Seek>(
             }
             if enc_type == 0 {
                 out.push(TrackEncoding {
+                    order,
                     scope,
                     compression: compression.unwrap_or(ContentCompression::Zlib),
                 });
@@ -826,6 +966,7 @@ fn parse_content_encodings<R: Read + Seek>(
             reader.seek(SeekFrom::Start(child_end))?;
         }
     }
+    out.sort_by_key(|e| e.order);
     Ok(())
 }
 
@@ -866,10 +1007,9 @@ fn apply_track_encodings(
     max_output_bytes: u64,
 ) -> io::Result<Vec<u8>> {
     let mut buf = data.to_vec();
-    // Matroska specifies decoding in reverse order of ContentEncodingOrder.
-    for enc in encodings.iter().rev() {
+    let apply_one = |buf: &mut Vec<u8>, enc: &TrackEncoding| -> io::Result<()> {
         if (enc.scope & scope_mask) == 0 {
-            continue;
+            return Ok(());
         }
         match &enc.compression {
             ContentCompression::Zlib => {
@@ -885,7 +1025,7 @@ fn apply_track_encodings(
                         ),
                     ));
                 }
-                buf = out;
+                *buf = out;
             }
             ContentCompression::HeaderStripping(prefix) => {
                 let total = (prefix.len() as u64).saturating_add(buf.len() as u64);
@@ -897,10 +1037,10 @@ fn apply_track_encodings(
                         ),
                     ));
                 }
-                let mut out = Vec::with_capacity(prefix.len() + buf.len());
+                let mut out = Vec::with_capacity(prefix.len().saturating_add(buf.len()));
                 out.extend_from_slice(prefix);
-                out.extend_from_slice(&buf);
-                buf = out;
+                out.extend_from_slice(buf);
+                *buf = out;
             }
             ContentCompression::Unsupported(algo) => {
                 return Err(io::Error::new(
@@ -908,6 +1048,20 @@ fn apply_track_encodings(
                     format!("Unsupported Matroska ContentCompAlgo {algo}"),
                 ));
             }
+        }
+        Ok(())
+    };
+
+    // Matroska specifies decoding from highest ContentEncodingOrder down to lowest.
+    if encodings.windows(2).all(|w| w[0].order <= w[1].order) {
+        for enc in encodings.iter().rev() {
+            apply_one(&mut buf, enc)?;
+        }
+    } else {
+        let mut indices: Vec<usize> = (0..encodings.len()).collect();
+        indices.sort_by(|&a, &b| encodings[b].order.cmp(&encodings[a].order).then_with(|| b.cmp(&a)));
+        for idx in indices {
+            apply_one(&mut buf, &encodings[idx])?;
         }
     }
     Ok(buf)
@@ -917,6 +1071,7 @@ fn parse_attachments<R: Read + Seek>(
     reader: &mut R,
     end_pos: u64,
     out: &mut Vec<MkvFontAttachment>,
+    total_font_bytes: &mut u64,
 ) -> io::Result<()> {
     while stream_pos(reader)? < end_pos {
         let Some(hdr) = read_element_header(reader, end_pos)? else {
@@ -949,13 +1104,20 @@ fn parse_attachments<R: Read + Seek>(
 
             if is_font_attachment(&file_name, &mime_type) {
                 if let Some((offset, sz)) = data_span {
-                    reader.seek(SeekFrom::Start(offset))?;
-                    let data = read_exact_vec(reader, sz as usize)?;
-                    out.push(MkvFontAttachment {
-                        file_name,
-                        mime_type,
-                        data,
-                    });
+                    if let (Some(new_total), Ok(len)) =
+                        (total_font_bytes.checked_add(sz), usize::try_from(sz))
+                    {
+                        if new_total <= MAX_TOTAL_FONT_BYTES {
+                            reader.seek(SeekFrom::Start(offset))?;
+                            let data = read_exact_vec(reader, len)?;
+                            *total_font_bytes = new_total;
+                            out.push(MkvFontAttachment {
+                                file_name,
+                                mime_type,
+                                data,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1006,7 +1168,7 @@ fn parse_cluster_for_track(
         // If this Cluster had unknown size, encountering another top-level Segment child
         // terminates the Cluster cleanly: rewind so the outer Segment loop sees it.
         if is_top_level_segment_element(hdr.id) {
-            reader.seek(SeekFrom::Start(elem_start))?;
+            reader.seek_to(elem_start);
             break;
         }
 
@@ -1018,12 +1180,12 @@ fn parse_cluster_for_track(
                 cluster_ts = read_uint(reader, sz as usize)?;
             }
             ID_SIMPLE_BLOCK if sz >= 4 && sz <= MAX_BLOCK_BYTES => {
-                // Fast-path skip: read only the leading TrackNumber VINT before touching
-                // multi-kilobyte video/audio frame payloads!
+                // Fast-path skip: read only the leading TrackNumber VINT before jumping
+                // directly past multi-kilobyte video/audio frame payloads.
                 if let Some((trk, vint_len)) = read_data_vint(reader)? {
-                    if vint_len <= sz as usize {
+                    if let Some(rem) = usize::try_from(sz).ok().and_then(|s| s.checked_sub(vint_len))
+                    {
                         if trk == target.info.track_number {
-                            let rem = (sz as usize) - vint_len;
                             let rest = read_exact_vec(reader, rem)?;
                             decode_block_rest(
                                 &rest,
@@ -1034,10 +1196,7 @@ fn parse_cluster_for_track(
                                 cues,
                             );
                         } else {
-                            let skip = (child_end as i64) - (stream_pos(reader)? as i64);
-                            if skip != 0 {
-                                reader.seek_relative(skip)?;
-                            }
+                            reader.seek_to(child_end);
                         }
                         continue;
                     }
@@ -1049,10 +1208,8 @@ fn parse_cluster_for_track(
             _ => {}
         }
 
-        let cur = stream_pos(reader)?;
-        if cur != child_end {
-            let skip = (child_end as i64) - (cur as i64);
-            reader.seek_relative(skip)?;
+        if stream_pos(reader)? != child_end {
+            reader.seek_to(child_end);
         }
     }
     Ok(())
@@ -1079,10 +1236,13 @@ fn parse_block_group(
         match hdr.id {
             ID_BLOCK if sz >= 4 && sz <= MAX_BLOCK_BYTES => {
                 if let Some((trk, vint_len)) = read_data_vint(reader)? {
-                    if vint_len <= sz as usize && trk == target.info.track_number {
-                        let rem = (sz as usize) - vint_len;
-                        matching_block = Some(read_exact_vec(reader, rem)?);
-                        continue;
+                    if trk == target.info.track_number {
+                        if let Some(rem) =
+                            usize::try_from(sz).ok().and_then(|s| s.checked_sub(vint_len))
+                        {
+                            matching_block = Some(read_exact_vec(reader, rem)?);
+                            continue;
+                        }
                     }
                 }
             }
@@ -1092,10 +1252,8 @@ fn parse_block_group(
             _ => {}
         }
 
-        let cur = stream_pos(reader)?;
-        if cur != child_end {
-            let skip = (child_end as i64) - (cur as i64);
-            reader.seek_relative(skip)?;
+        if stream_pos(reader)? != child_end {
+            reader.seek_to(child_end);
         }
     }
 
@@ -1127,24 +1285,44 @@ fn decode_block_rest(
     if rest.len() < 3 {
         return;
     }
-    let rel_ts = i16::from_be_bytes([rest[0], rest[1]]) as i64;
+    let rel_ts = i16::from_be_bytes([rest[0], rest[1]]) as i128;
     let flags = rest[2];
     let lacing = (flags >> 1) & 0x03;
 
-    let start_ticks = (cluster_ts as i64).saturating_add(rel_ts);
+    let start_ticks = (cluster_ts as i128).saturating_add(rel_ts);
     let start_ms = ticks_to_ms(start_ticks, timestamp_scale);
-    let dur_ms = duration_ticks
-        .map(|d| ticks_to_ms(d as i64, timestamp_scale))
-        .unwrap_or(0);
-    let end_ms = start_ms + dur_ms;
+    let dur_ms = match duration_ticks {
+        Some(d) => ticks_to_ms(d as i128, timestamp_scale),
+        None => target
+            .default_duration_ns
+            .map(|ns| (ns / 1_000_000).min(i64::MAX as u64) as i64)
+            .unwrap_or(0),
+    };
+    let end_ms = start_ms.saturating_add(dur_ms);
 
     let frames: Vec<&[u8]> = if lacing == 0 {
         vec![&rest[3..]]
     } else {
         split_laced_frames(&rest[3..], lacing)
     };
+    let laced_with_default_dur =
+        duration_ticks.is_none() && frames.len() > 1 && target.default_duration_ns.is_some();
 
-    for raw_frame in frames {
+    for (frame_idx, raw_frame) in frames.into_iter().enumerate() {
+        let (frame_start_ms, frame_end_ms) = if laced_with_default_dur {
+            let def_ns = target.default_duration_ns.unwrap_or(0) as u128;
+            let idx_u128 = frame_idx as u128;
+            let off_start = (def_ns.saturating_mul(idx_u128) / 1_000_000).min(i64::MAX as u128) as i64;
+            let off_end = (def_ns.saturating_mul(idx_u128.saturating_add(1)) / 1_000_000)
+                .min(i64::MAX as u128) as i64;
+            (
+                start_ms.saturating_add(off_start),
+                start_ms.saturating_add(off_end),
+            )
+        } else {
+            (start_ms, end_ms)
+        };
+
         let decoded_owned;
         let payload: &[u8] = if target.encodings.is_empty() {
             raw_frame
@@ -1160,16 +1338,16 @@ fn decode_block_rest(
 
         let text = String::from_utf8_lossy(payload);
         if target.info.codec.is_ass_or_ssa() {
-            if let Some(cue) = parse_mkv_ass_block(&text, start_ms, end_ms) {
+            if let Some(cue) = parse_mkv_ass_block(&text, frame_start_ms, frame_end_ms) {
                 cues.push(cue);
             }
         } else {
             let normalized = normalize_plain_subtitle_text(&text);
             cues.push(MkvSubtitleCue {
-                read_order: cues.len() as i64,
+                read_order: i64::try_from(cues.len()).unwrap_or(i64::MAX),
                 layer: 0,
-                start_ms,
-                end_ms,
+                start_ms: frame_start_ms,
+                end_ms: frame_end_ms,
                 style: String::new(),
                 name: String::new(),
                 margin_l: 0,
@@ -1228,7 +1406,7 @@ fn split_laced_frames<'a>(data: &'a [u8], lacing: u8) -> Vec<&'a [u8]> {
     if data.is_empty() {
         return Vec::new();
     }
-    let frame_count = data[0] as usize + 1;
+    let frame_count = (data[0] as usize).saturating_add(1);
     let body = &data[1..];
     match lacing {
         // Fixed-size lacing
@@ -1253,8 +1431,14 @@ fn split_laced_frames<'a>(data: &'a [u8], lacing: u8) -> Vec<&'a [u8]> {
                         return Vec::new();
                     }
                     let b = body[pos] as usize;
-                    pos += 1;
-                    sz += b;
+                    pos = match pos.checked_add(1) {
+                        Some(p) => p,
+                        None => return Vec::new(),
+                    };
+                    sz = match sz.checked_add(b) {
+                        Some(v) if v <= body.len() => v,
+                        _ => return Vec::new(),
+                    };
                     if b < 255 {
                         break;
                     }
@@ -1270,21 +1454,58 @@ fn split_laced_frames<'a>(data: &'a [u8], lacing: u8) -> Vec<&'a [u8]> {
             let Some((first_sz, len)) = decode_vint_slice(&body[pos..]) else {
                 return Vec::new();
             };
-            pos += len;
-            let mut prev = first_sz as i64;
-            sizes.push(first_sz as usize);
+            pos = match pos.checked_add(len) {
+                Some(p) if p <= body.len() => p,
+                _ => return Vec::new(),
+            };
+            let Ok(first_usize) = usize::try_from(first_sz) else {
+                return Vec::new();
+            };
+            if first_usize > body.len() {
+                return Vec::new();
+            }
+            let Ok(mut prev) = i64::try_from(first_sz) else {
+                return Vec::new();
+            };
+            sizes.push(first_usize);
 
             for _ in 1..frame_count.saturating_sub(1) {
                 let Some((raw, l)) = decode_vint_slice(&body[pos..]) else {
                     return Vec::new();
                 };
-                pos += l;
-                let bias = (1i64 << (7 * l - 1)) - 1;
-                prev += raw as i64 - bias;
-                if prev < 0 {
+                pos = match pos.checked_add(l) {
+                    Some(p) if p <= body.len() => p,
+                    _ => return Vec::new(),
+                };
+                let Some(shift) = l.checked_mul(7).and_then(|v| v.checked_sub(1)) else {
+                    return Vec::new();
+                };
+                let Ok(shift_u32) = u32::try_from(shift) else {
+                    return Vec::new();
+                };
+                let Some(bias) = 1i64.checked_shl(shift_u32).and_then(|v| v.checked_sub(1)) else {
+                    return Vec::new();
+                };
+                let Ok(raw_i64) = i64::try_from(raw) else {
+                    return Vec::new();
+                };
+                let Some(delta) = raw_i64.checked_sub(bias) else {
+                    return Vec::new();
+                };
+                let Some(next_prev) = prev.checked_add(delta) else {
+                    return Vec::new();
+                };
+                if next_prev < 0 {
                     return Vec::new();
                 }
-                sizes.push(prev as usize);
+                let Ok(sz_usize) = usize::try_from(next_prev) else {
+                    return Vec::new();
+                };
+                if sz_usize > body.len() {
+                    return Vec::new();
+                }
+                prev = next_prev;
+                sizes.push(sz_usize);
             }
             slice_frames_by_sizes(&body[pos..], &sizes)
         }
@@ -1293,7 +1514,7 @@ fn split_laced_frames<'a>(data: &'a [u8], lacing: u8) -> Vec<&'a [u8]> {
 }
 
 fn slice_frames_by_sizes<'a>(mut rem: &'a [u8], sizes: &[usize]) -> Vec<&'a [u8]> {
-    let mut frames = Vec::with_capacity(sizes.len() + 1);
+    let mut frames = Vec::with_capacity(sizes.len().saturating_add(1));
     for &sz in sizes {
         if sz > rem.len() {
             return Vec::new();
@@ -1325,9 +1546,9 @@ fn decode_vint_slice(buf: &[u8]) -> Option<(u64, usize)> {
 }
 
 #[inline]
-fn ticks_to_ms(ticks: i64, timestamp_scale: u64) -> i64 {
-    let ns = (ticks as i128).saturating_mul(timestamp_scale as i128);
-    (ns / 1_000_000) as i64
+fn ticks_to_ms(ticks: i128, timestamp_scale: u64) -> i64 {
+    let ns = ticks.saturating_mul(timestamp_scale as i128);
+    (ns / 1_000_000).clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 #[inline]
@@ -1405,7 +1626,15 @@ fn read_element_size<R: Read>(reader: &mut R) -> io::Result<Option<Option<u64>>>
     let Some((val, len)) = read_data_vint(reader)? else {
         return Ok(None);
     };
-    let all_ones = (1u64 << (7 * len)) - 1;
+    if len == 0 || len > 8 {
+        return Ok(None);
+    }
+    let Some(all_ones) = 1u64
+        .checked_shl((len * 7) as u32)
+        .and_then(|v| v.checked_sub(1))
+    else {
+        return Ok(None);
+    };
     if val == all_ones {
         Ok(Some(None)) // Unknown-size sentinel (e.g. Segment / Cluster).
     } else {
@@ -1445,6 +1674,12 @@ fn read_data_vint<R: Read>(reader: &mut R) -> io::Result<Option<(u64, usize)>> {
 fn read_uint<R: Read>(reader: &mut R, len: usize) -> io::Result<u64> {
     if len == 0 {
         return Ok(0);
+    }
+    if len > 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("EBML uint length {len} exceeds 8 bytes"),
+        ));
     }
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf[..len])?;
@@ -1513,6 +1748,7 @@ mod tests {
         let decoded = apply_track_encodings(
             &compressed,
             &[TrackEncoding {
+                order: 0,
                 scope: 1,
                 compression: ContentCompression::Zlib,
             }],
@@ -1526,6 +1762,7 @@ mod tests {
         let bomb_err = apply_track_encodings(
             &compressed,
             &[TrackEncoding {
+                order: 0,
                 scope: 1,
                 compression: ContentCompression::Zlib,
             }],
@@ -1538,6 +1775,7 @@ mod tests {
         let stripped = apply_track_encodings(
             b"World",
             &[TrackEncoding {
+                order: 0,
                 scope: 1,
                 compression: ContentCompression::HeaderStripping(b"Hello ".to_vec()),
             }],
@@ -1546,6 +1784,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stripped, b"Hello World");
+
+        // ContentEncodingOrder: order 0 = HeaderStripping("0,0,"), order 1 = Zlib.
+        // Even if listed out-of-order (order 1 before order 0), decoding must run
+        // order 1 (zlib) first, then order 0 (prepend header).
+        let mut enc2 = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc2.write_all(b"Default,,0,0,0,,Ordered").unwrap();
+        let layered = enc2.finish().unwrap();
+        let out_of_order = [
+            TrackEncoding {
+                order: 1,
+                scope: 1,
+                compression: ContentCompression::Zlib,
+            },
+            TrackEncoding {
+                order: 0,
+                scope: 1,
+                compression: ContentCompression::HeaderStripping(b"0,0,".to_vec()),
+            },
+        ];
+        let decoded_ordered =
+            apply_track_encodings(&layered, &out_of_order, 1, MAX_BLOCK_BYTES).unwrap();
+        assert_eq!(decoded_ordered, b"0,0,Default,,0,0,0,,Ordered");
     }
 
     #[test]
@@ -1612,5 +1872,90 @@ mod tests {
         assert_eq!(ass.len(), 2);
         assert_eq!(ass[0].raw_text, "{\\pos(212,437)}えっ？");
         assert_eq!(ass[1].raw_text, "{\\pos(672,497)}えっ？");
+
+        // Extreme i64::MIN / i64::MAX timestamps must not panic via subtraction overflow.
+        let mut extreme = vec![
+            make_cue(0, i64::MIN, i64::MIN, "a", "a"),
+            make_cue(1, i64::MAX, i64::MAX, "a", "a"),
+        ];
+        dedup_extracted_cues(&mut extreme, false);
+        assert_eq!(extreme.len(), 2);
+    }
+
+    #[test]
+    fn default_duration_and_custom_events_format_and_hostile_lacing() {
+        // DefaultDuration (2.5s = 2_500_000_000 ns) applies when BlockDuration is absent.
+        let target = InternalTrackMeta {
+            info: MkvSubtitleTrackInfo {
+                track_number: 3,
+                subtitle_index: 0,
+                codec_id: "S_TEXT/UTF8".to_string(),
+                codec: MkvSubtitleCodec::Srt,
+                name: None,
+                language: None,
+                default: true,
+                forced: false,
+                codec_private: Vec::new(),
+            },
+            encodings: Vec::new(),
+            default_duration_ns: Some(2_500_000_000),
+        };
+        let mut block = vec![0x00, 0x0A, 0x00]; // rel_ts = +10 ticks, flags = 0 (no lacing)
+        block.extend_from_slice(b"Hello");
+        let mut cues = Vec::new();
+        decode_block_rest(&block, 1_000, None, 1_000_000, &target, &mut cues);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].start_ms, 1_010);
+        assert_eq!(cues[0].end_ms, 3_510);
+
+        // Explicit BlockDuration overrides DefaultDuration.
+        let mut cues_explicit = Vec::new();
+        decode_block_rest(&block, 1_000, Some(500), 1_000_000, &target, &mut cues_explicit);
+        assert_eq!(cues_explicit[0].end_ms, 1_510);
+
+        // to_ass_document respects custom [Events] Format: (including SSA Marked & subset cols).
+        let custom_header = "\
+[Script Info]
+ScriptType: v4.00
+
+[Events]
+Format: Marked, Start, End, Style, Text
+";
+        let track = ExtractedSubtitleTrack {
+            info: MkvSubtitleTrackInfo {
+                track_number: 1,
+                subtitle_index: 0,
+                codec_id: "S_TEXT/SSA".to_string(),
+                codec: MkvSubtitleCodec::Ssa,
+                name: None,
+                language: None,
+                default: true,
+                forced: false,
+                codec_private: custom_header.as_bytes().to_vec(),
+            },
+            cues: vec![MkvSubtitleCue {
+                read_order: 0,
+                layer: 2,
+                start_ms: 1_000,
+                end_ms: 4_000,
+                style: "Main".to_string(),
+                name: "Alice".to_string(),
+                margin_l: 0,
+                margin_r: 0,
+                margin_v: 0,
+                effect: String::new(),
+                raw_text: "Hi, there!".to_string(),
+                plain_text: "Hi, there!".to_string(),
+            }],
+        };
+        let doc = track.to_ass_document();
+        assert!(doc.contains("Dialogue: Marked=2,0:00:01.00,0:00:04.00,Main,Hi, there!\n"));
+
+        // Hostile EBML lacing payload with huge VINT sizes must return empty without panic.
+        let hostile_ebml = [0x03, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(split_laced_frames(&hostile_ebml, 3).is_empty());
+        // Hostile Xiph lacing with huge 255 run must return empty without panic.
+        let hostile_xiph = [0x02, 0xFF, 0xFF, 0xFF, 0x01];
+        assert!(split_laced_frames(&hostile_xiph, 1).is_empty());
     }
 }

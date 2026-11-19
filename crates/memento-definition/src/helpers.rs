@@ -70,9 +70,17 @@ pub fn format_pixel_size(size: f64) -> String {
 pub fn normalize_list_marker(marker: &str) -> String {
     let raw = crate::qstring::trimmed(marker);
     if let Some(unquoted) = unquote_css_string(raw) {
-        return unquoted.replace('"', "'");
+        return if unquoted.contains('"') {
+            unquoted.replace('"', "'")
+        } else {
+            unquoted
+        };
     }
-    raw.replace('"', "'")
+    if raw.contains('"') {
+        raw.replace('"', "'")
+    } else {
+        raw.to_string()
+    }
 }
 
 pub(crate) fn unquote_css_string(value: &str) -> Option<String> {

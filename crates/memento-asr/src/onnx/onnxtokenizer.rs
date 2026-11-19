@@ -52,6 +52,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use crate::onnx::json::{strip_utf8_bom, to_integer, to_string_qt};
+
 /// C++: `QString::fromUtf8("\xE2\x96\x81")` — U+2581 LOWER ONE EIGHTH BLOCK
 /// used by SentencePiece / Metaspace.
 const METASPACE: &str = "\u{2581}";
@@ -59,6 +61,10 @@ const METASPACE: &str = "\u{2581}";
 /// Qt's `QJsonParseError::errorString()` for `NoError`, used when the document
 /// parses but is not an object.
 const PARSE_NO_ERROR: &str = "no error occurred";
+
+/// Upper bound on accepted vocabulary token IDs to prevent unbounded
+/// allocations from malformed `tokenizer.json` files.
+const MAX_TOKEN_ID: usize = 1_000_000;
 
 /// C++: `OnnxTokenizer` (private members mirror the C++ class layout).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -68,60 +74,42 @@ pub struct OnnxTokenizer {
     special_token_ids: HashSet<i64>,
 }
 
-/// C++: `QJsonValue::toInteger(defaultValue)` — accept only whole,
-/// representable integers and retain the precision of 64-bit JSON numbers.
-fn to_integer(value: Option<&serde_json::Value>, default: i64) -> i64 {
-    let Some(serde_json::Value::Number(number)) = value else {
-        return default;
-    };
-    if let Some(integer) = number.as_i64() {
-        return integer;
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
-    let Some(double) = number.as_f64() else {
-        return default;
-    };
-    if double.is_finite()
-        && double.fract() == 0.0
-        && double >= i64::MIN as f64
-        && double < 9_223_372_036_854_775_808.0
-    {
-        double as i64
-    } else {
-        default
-    }
-}
-
-/// C++: `QJsonValue::toString()` — empty string when the value is not a
-/// string.
-fn to_string_qt(value: Option<&serde_json::Value>) -> String {
-    value
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned()
 }
 
 /// C++: `parseByteFallbackToken` in the anonymous namespace.
 ///
-/// Matches `"<0xXX>"` (length 6, character-based like `QString::size()`).
-fn parse_byte_fallback_token(token: &str, out_byte: &mut u8) -> bool {
-    let chars: Vec<char> = token.chars().collect();
-    if chars.len() != 6 || !token.starts_with("<0x") || !token.ends_with('>') {
-        return false;
+/// Matches `"<0xXX>"` (6 ASCII bytes with two hex digits) without allocating.
+#[inline]
+fn parse_byte_fallback_token(token: &str) -> Option<u8> {
+    let bytes = token.as_bytes();
+    if bytes.len() != 6
+        || bytes[0] != b'<'
+        || bytes[1] != b'0'
+        || bytes[2] != b'x'
+        || bytes[5] != b'>'
+    {
+        return None;
     }
-    // C++: token.mid(3, 2).toUInt(&ok, 16) with the digits at positions 3..4.
-    let Some(high) = chars[3].to_digit(16) else {
-        return false;
-    };
-    let Some(low) = chars[4].to_digit(16) else {
-        return false;
-    };
-    let val = high * 16 + low;
-    // Guard kept verbatim from the C++ code.
-    if val > 0xFF {
-        return false;
-    }
-    *out_byte = val as u8;
-    true
+    let high = hex_nibble(bytes[3])?;
+    let low = hex_nibble(bytes[4])?;
+    Some((high << 4) | low)
+}
+
+fn validate_token_id(id: i64) -> Result<usize, String> {
+    usize::try_from(id)
+        .ok()
+        .filter(|&index| index <= MAX_TOKEN_ID)
+        .ok_or_else(|| {
+            format!("Token ID {id} in tokenizer.json exceeds maximum ({MAX_TOKEN_ID}).")
+        })
 }
 
 impl OnnxTokenizer {
@@ -155,13 +143,9 @@ impl OnnxTokenizer {
             format!("Could not open tokenizer.json: {}", path.display())
         })?;
 
-        // QJsonDocument::fromJson skips a leading UTF-8 byte-order mark.
-        let contents = if let Some(rest) = contents.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-            rest.to_vec()
-        } else {
-            contents
-        };
-        let root: serde_json::Value = match serde_json::from_slice(&contents) {
+        // QJsonDocument::fromJson skips a leading UTF-8 byte-order mark without copying.
+        let payload = strip_utf8_bom(&contents);
+        let root: serde_json::Value = match serde_json::from_slice(payload) {
             Ok(root) => root,
             // Divergence from C++, documented: the C++ embeds
             // `QJsonParseError::errorString()` here (e.g. "invalid buffer;
@@ -177,6 +161,10 @@ impl OnnxTokenizer {
             ));
         }
 
+        let mut id_to_token: Vec<String> = Vec::new();
+        let mut token_to_id: HashMap<String, i64> = HashMap::new();
+        let mut special_token_ids: HashSet<i64> = HashSet::new();
+
         let vocab_value = root
             .get("model")
             .and_then(serde_json::Value::as_object)
@@ -186,29 +174,43 @@ impl OnnxTokenizer {
             // BPE object format. Two passes exactly like the C++ code: the
             // first determines maxId, the second assigns; with this shape the
             // JSON object iteration order cannot affect the result.
-            let mut max_id: i64 = -1;
+            let mut max_id: Option<usize> = None;
             for value in vocab_obj.values() {
                 let id = to_integer(Some(value), -1);
                 if id >= 0 {
-                    max_id = max_id.max(id);
+                    let index = validate_token_id(id)?;
+                    max_id = Some(max_id.map_or(index, |cur| cur.max(index)));
                 }
             }
-            if max_id >= 0 {
-                self.id_to_token
-                    .resize(max_id as usize + 1, String::new());
-                self.token_to_id.reserve(max_id as usize + 1);
+            if let Some(max_index) = max_id {
+                let new_len = max_index
+                    .checked_add(1)
+                    .ok_or_else(|| "Vocabulary size overflow in tokenizer.json.".to_string())?;
+                id_to_token.resize(new_len, String::new());
+                token_to_id.reserve(vocab_obj.len().min(new_len));
                 for (key, value) in vocab_obj {
                     let id = to_integer(Some(value), -1);
-                    if id >= 0 && (id as usize) < self.id_to_token.len() {
-                        self.id_to_token[id as usize] = key.clone();
-                        self.token_to_id.insert(key.clone(), id);
+                    if let Ok(index) = usize::try_from(id) {
+                        if index < id_to_token.len() {
+                            id_to_token[index] = key.clone();
+                            token_to_id.insert(key.clone(), id);
+                        }
                     }
                 }
             }
         } else if let Some(serde_json::Value::Array(vocab_arr)) = vocab_value {
             // Unigram / SentencePiece array format: [ ["token", score], ... ]
-            self.id_to_token.resize(vocab_arr.len(), String::new());
-            self.token_to_id.reserve(vocab_arr.len());
+            let max_vocab_len = MAX_TOKEN_ID
+                .checked_add(1)
+                .ok_or_else(|| "Vocabulary size overflow in tokenizer.json.".to_string())?;
+            if vocab_arr.len() > max_vocab_len {
+                return Err(format!(
+                    "Vocabulary size {} in tokenizer.json exceeds maximum ({max_vocab_len}).",
+                    vocab_arr.len()
+                ));
+            }
+            id_to_token.resize(vocab_arr.len(), String::new());
+            token_to_id.reserve(vocab_arr.len());
             for (i, entry) in vocab_arr.iter().enumerate() {
                 let token = match entry {
                     // Non-empty array: token is entry[0].toString()
@@ -223,8 +225,8 @@ impl OnnxTokenizer {
                     // inserted into the id map, exactly like the C++ code.
                     _ => String::new(),
                 };
-                self.id_to_token[i] = token.clone();
-                self.token_to_id.insert(token, i as i64);
+                id_to_token[i] = token.clone();
+                token_to_id.insert(token, i as i64);
             }
         }
 
@@ -247,21 +249,27 @@ impl OnnxTokenizer {
             if id < 0 {
                 continue;
             }
-            let index = id as usize;
-            if index >= self.id_to_token.len() {
-                self.id_to_token.resize(index + 1, String::new());
+            let index = validate_token_id(id)?;
+            let required_len = index
+                .checked_add(1)
+                .ok_or_else(|| "Vocabulary size overflow in tokenizer.json.".to_string())?;
+            if required_len > id_to_token.len() {
+                id_to_token.resize(required_len, String::new());
             }
-            self.id_to_token[index] = content.clone();
-            self.token_to_id.insert(content, id);
+            id_to_token[index] = content.clone();
+            token_to_id.insert(content, id);
             if special {
-                self.special_token_ids.insert(id);
+                special_token_ids.insert(id);
             }
         }
 
-        if self.id_to_token.is_empty() {
+        if id_to_token.is_empty() {
             return Err("No vocabulary entries found in tokenizer.json.".to_string());
         }
 
+        self.id_to_token = id_to_token;
+        self.token_to_id = token_to_id;
+        self.special_token_ids = special_token_ids;
         Ok(())
     }
 
@@ -270,12 +278,18 @@ impl OnnxTokenizer {
         self.token_to_id.get(token).copied().unwrap_or(fallback)
     }
 
+    /// Borrowed counterpart to [`Self::id_to_token`], returning `None` for
+    /// out-of-range ids without allocating a `String`.
+    pub fn id_to_token_str(&self, id: i64) -> Option<&str> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.id_to_token.get(index))
+            .map(String::as_str)
+    }
+
     /// C++: `idToToken(id)` — empty string for out-of-range ids.
     pub fn id_to_token(&self, id: i64) -> String {
-        match usize::try_from(id).ok().and_then(|index| self.id_to_token.get(index)) {
-            Some(token) => token.clone(),
-            None => String::new(),
-        }
+        self.id_to_token_str(id).unwrap_or("").to_owned()
     }
 
     /// C++: `isSpecialToken(id)`.
@@ -290,15 +304,12 @@ impl OnnxTokenizer {
         let mut utf8_bytes: Vec<u8> = Vec::with_capacity(ids.len().saturating_mul(4));
 
         for &id in ids {
-            let Some(index) = usize::try_from(id).ok().filter(|&index| index < self.id_to_token.len())
-            else {
+            let Some(token) = self.id_to_token_str(id) else {
                 continue;
             };
             if skip_special_tokens && self.special_token_ids.contains(&id) {
                 continue;
             }
-
-            let token = self.id_to_token[index].as_str();
             if token.is_empty() {
                 continue;
             }
@@ -315,25 +326,30 @@ impl OnnxTokenizer {
                 continue;
             }
 
-            let mut raw_byte = 0u8;
-            if parse_byte_fallback_token(token, &mut raw_byte) {
+            if let Some(raw_byte) = parse_byte_fallback_token(token) {
                 utf8_bytes.push(raw_byte);
                 continue;
             }
 
-            let replaced = token.replace(METASPACE, " ");
-            utf8_bytes.extend_from_slice(replaced.as_bytes());
+            // Stream U+2581 (METASPACE) -> ASCII space directly without
+            // allocating an intermediate `String` per token.
+            let mut first = true;
+            for part in token.split(METASPACE) {
+                if !first {
+                    utf8_bytes.push(b' ');
+                }
+                first = false;
+                utf8_bytes.extend_from_slice(part.as_bytes());
+            }
         }
 
+        // C++: `if (decoded.startsWith(' ')) decoded.remove(0, 1);` — exactly
+        // ONE leading space is removed. Stripping ASCII 0x20 before UTF-8
+        // decoding is equivalent and avoids a second String allocation.
+        let slice = utf8_bytes.strip_prefix(b" ").unwrap_or(&utf8_bytes);
         // QString::fromUtf8 equivalent. Qt's decoder replaces invalid
         // sequences with U+FFFD, as does from_utf8_lossy.
-        let decoded = String::from_utf8_lossy(&utf8_bytes).into_owned();
-        // C++: `if (decoded.startsWith(' ')) decoded.remove(0, 1);` — exactly
-        // ONE leading space is removed.
-        match decoded.strip_prefix(' ') {
-            Some(rest) => rest.to_owned(),
-            None => decoded,
-        }
+        String::from_utf8_lossy(slice).into_owned()
     }
 
     /// C++: `buildCohereAsrPrompt(language = "ja", punctuation = true)`.
@@ -376,5 +392,72 @@ impl OnnxTokenizer {
             no_ts_id,
             no_diarize_id,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "memento_asr_tok_{label}_{}_{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn parse_byte_fallback_handles_valid_and_invalid_tokens() {
+        assert_eq!(parse_byte_fallback_token("<0x00>"), Some(0x00));
+        assert_eq!(parse_byte_fallback_token("<0xE3>"), Some(0xE3));
+        assert_eq!(parse_byte_fallback_token("<0xff>"), Some(0xFF));
+        assert_eq!(parse_byte_fallback_token("<0x100>"), None);
+        assert_eq!(parse_byte_fallback_token("<0xG1>"), None);
+        assert_eq!(parse_byte_fallback_token("<0A1>"), None);
+        assert_eq!(parse_byte_fallback_token("<0xあ>"), None);
+    }
+
+    #[test]
+    fn load_rejects_oversized_token_ids_and_supports_bom_and_borrowed_lookup() {
+        let path = unique_temp_file("bom_and_cap");
+        let mut with_bom = vec![0xEF, 0xBB, 0xBF];
+        with_bom.extend_from_slice(r#"{"model":{"vocab":{"▁hello":0,"▁world":1}}}"#.as_bytes());
+        fs::write(&path, &with_bom).unwrap();
+
+        let mut tok = OnnxTokenizer::new();
+        tok.load(&path).expect("BOM-prefixed tokenizer must load");
+        assert_eq!(tok.id_to_token_str(0), Some("▁hello"));
+        assert_eq!(tok.id_to_token_str(1), Some("▁world"));
+        assert_eq!(tok.id_to_token_str(-1), None);
+        assert_eq!(tok.id_to_token_str(2), None);
+        assert_eq!(tok.decode(&[0, 1], true), "hello world");
+
+        // BPE vocab token ID above MAX_TOKEN_ID must be rejected without OOM.
+        fs::write(
+            &path,
+            format!(r#"{{"model":{{"vocab":{{"huge":{}}}}}}}"#, MAX_TOKEN_ID + 1),
+        )
+        .unwrap();
+        assert!(tok.load(&path).is_err());
+        assert!(!tok.is_loaded());
+
+        // added_tokens ID above MAX_TOKEN_ID must also be rejected and leave tokenizer empty.
+        fs::write(
+            &path,
+            format!(
+                r#"{{"model":{{"vocab":{{"ok":0}}}},"added_tokens":[{{"id":{},"content":"bad","special":true}}]}}"#,
+                MAX_TOKEN_ID + 1
+            ),
+        )
+        .unwrap();
+        assert!(tok.load(&path).is_err());
+        assert!(!tok.is_loaded());
+
+        let _ = fs::remove_file(&path);
     }
 }

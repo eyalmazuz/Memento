@@ -15,4 +15,5 @@ libc = "=0.2.190"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
 [build-dependencies]
+cc = "1"
 pkg-config = "0.3"

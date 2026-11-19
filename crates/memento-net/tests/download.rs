@@ -233,11 +233,7 @@ fn incomplete_body_is_reported_and_not_renamed()
             assert_eq!(received, 0);
             assert_eq!(expected, 10);
         }
-        Err(DownloadError::Network(_)) => {
-            // EOF could surface before the length check; either way the
-            // exchange failed without renaming.
-        }
-        other => panic!("expected an incomplete-body error, got {other:?}"),
+        other => panic!("expected IncompleteBody error, got {other:?}"),
     }
     assert!(fs::read(&target).is_err(), "target must not exist");
     assert!(

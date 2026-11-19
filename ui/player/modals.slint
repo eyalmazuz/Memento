@@ -1,0 +1,135 @@
+import { LineEdit } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { ModalDialog } from "../components/modal.slint";
+
+export component OpenUrlModal inherits ModalDialog {
+    in-out property <string> url-text: "";
+    in property <bool> dialog-enabled: true;
+    callback submitted(string);
+
+    public function focus-input() {
+        url-line-edit.focus();
+        url-line-edit.select-all();
+    }
+
+    title: "Open Stream";
+    dialog-width: 440px;
+    cancel-text: "Cancel";
+    primary-text: "OK";
+    primary-clicked => {
+        root.submitted(root.url-text);
+    }
+
+    url-line-edit := LineEdit {
+        enabled: root.dialog-enabled;
+        placeholder-text: "Enter stream URL (https://…)";
+        text <=> root.url-text;
+        accepted(val) => {
+            root.submitted(val);
+        }
+    }
+}
+
+export component AboutModal inherits ModalDialog {
+    in property <string> app-version: "";
+    callback open-link(string);
+
+    title: "";
+    dialog-width: 420px;
+    primary-text: "Close";
+    primary-clicked => { root.dismissed(); }
+
+    VerticalLayout {
+        spacing: 10px;
+        alignment: center;
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 14px;
+            VerticalLayout {
+                alignment: center;
+                Image {
+                    width: 56px;
+                    height: 56px;
+                    source: @image-url("../../res/memento.svg");
+                    image-fit: contain;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: "Memento";
+                    color: MementoPalette.text;
+                    font-size: 26px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Version " + root.app-version;
+                    color: MementoPalette.text-secondary;
+                    font-size: 13px;
+                }
+            }
+        }
+
+        Text {
+            text: "An mpv-based video player for studying Japanese";
+            color: MementoPalette.text;
+            font-size: 13px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: "Copyright © Ripose · GPLv2-Only";
+            color: MementoPalette.text-muted;
+            horizontal-alignment: center;
+            font-size: 12px;
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 16px;
+
+            Rectangle {
+                width: site-lbl.preferred-width + 18px;
+                height: 28px;
+                border-radius: 6px;
+                background: site-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                animate background { duration: 100ms; }
+                site-lbl := Text {
+                    text: "Project Site";
+                    color: MementoPalette.cyan-accent;
+                    font-size: 13px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                site-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.open-link("https://ripose-jp.github.io/Memento/"); }
+                }
+            }
+
+            Rectangle {
+                width: gh-lbl.preferred-width + 18px;
+                height: 28px;
+                border-radius: 6px;
+                background: gh-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                animate background { duration: 100ms; }
+                gh-lbl := Text {
+                    text: "GitHub";
+                    color: MementoPalette.cyan-accent;
+                    font-size: 13px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                gh-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.open-link("https://github.com/ripose-jp/Memento"); }
+                }
+            }
+        }
+    }
+}

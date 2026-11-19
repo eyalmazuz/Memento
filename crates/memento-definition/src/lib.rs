@@ -18,47 +18,36 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-//! Standalone Rust port of `structuredrichtext_css.cpp`, the layout routines
-//! in `structuredrichtext_layout.cpp`, and the structured-content renderer in
-//! `structuredrichtext_content.cpp`. Qt-owned screen, style, color, detail,
-//! image-resource and locale inputs enter through the C ABI.
+//! Standalone Rust structured-content CSS & layout engine for Memento.
 //!
-//! Behavior mirror notes:
-//! - All text is modelled as [`String`]. QString is UTF-16 internally; when a
-//!   C++ algorithm observes UTF-16 code-unit counts or code-unit slicing, the
-//!   port tracks UTF-16 units explicitly and says so in a `PORT-NOTE`.
-//!   Integration must convert `QString` values (unpaired surrogates excepted,
-//!   which never occur in structured content CSS) through UTF-8.
-//! - `QMap` output order (sorted keys) is modelled with [`BTreeMap`];
-//!   `QHash`/`QSet` order is never depended on by this engine, so
-//!   [`std::collections::HashMap`]/[`std::collections::HashSet`] are used and
-//!   any resulting output is sorted explicitly.
+//! Provides a native UTF-8 CSS stylesheet parser ([`parse_stylesheet`]), CSS
+//! selector matching and value resolution ([`Renderer`]), box-model layout
+//! calculation, and structured-content helpers operating directly on
+//! [`serde_json::Value`].
 
 pub mod color;
 pub mod content;
 pub mod css;
 pub mod element;
 pub mod helpers;
-pub mod json;
 pub mod layout;
 pub mod qstring;
 
 pub use color::Color;
-pub use css::{split_css_tokens, Renderer};
 pub use content::{
-    anchor_needs_custom_handling, append_direct_content_values, contains_raised_content,
-    contains_ruby, has_inline_box_style, is_inline_box_label, is_inline_structured_content,
-    split_ruby_content, structured_content_text, DetailsState, LegacyGlossaryStyle, RubyParts,
+    anchor_needs_custom_handling_value, append_direct_content_values_value,
+    contains_raised_content_value, contains_ruby_value, has_inline_box_style_value,
+    is_inline_box_label_value, is_inline_structured_content_value, split_ruby_content_value,
+    structured_content_text_value, DetailsState, LegacyGlossaryStyle, RubyValueParts,
 };
+pub use css::{parse_stylesheet, split_css_tokens, Renderer};
 pub use element::{
-    BorderSide, BoxStyle, Context, CssAttributeOperator, CssAttributeSelector,
-    CssCombinator, CssDeclaration, CssDeclarations, CssPseudoClass,
-    CssPseudoClassSelector, CssPseudoElement, CssRule, CssSelectorPart,
-    ElementLayout, ElementRenderState, LayoutDirection, MarginFlow, ParsedStylesheet,
-    ScreenMetrics, SiblingState, StructuredElement, StructuredList, WidthPolicy,
+    BorderSide, BoxStyle, Context, CssAttributeOperator, CssAttributeSelector, CssCombinator,
+    CssDeclaration, CssDeclarations, CssPseudoClass, CssPseudoClassSelector, CssPseudoElement,
+    CssRule, CssSelectorPart, ElementLayout, ElementRenderState, LayoutDirection, MarginFlow,
+    ParsedStylesheet, ScreenMetrics, SiblingState, StructuredElement, StructuredList, WidthPolicy,
 };
 pub use layout::{
-    css_box_side_value, css_font_size_to_pixels_with_font, default_list_marker,
-    font_pixel_size, is_zero_spacing, list_marker,
+    css_box_side_value, css_font_size_to_pixels_with_font, default_list_marker, font_pixel_size,
+    is_zero_spacing, list_marker,
 };
-pub use json::Json;

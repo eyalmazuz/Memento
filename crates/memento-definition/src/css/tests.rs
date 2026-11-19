@@ -400,12 +400,20 @@ fn declarations_render_sorted_and_skip_metadata() {
 fn resolve_value_passthrough_and_cache() {
     let renderer = Renderer::new();
     let mut ctx = Context::default();
-    // No var/calc/color-mix/gradient: returned untouched (L514-526).
-    assert_eq!(renderer.resolve_css_value("10px red", &mut ctx), "10px red");
-    // Raw (untrimmed) value is the cache key (L472, L500).
-    assert!(ctx.resolved_css_values.contains_key("10px red"));
+    // No '(' -> fast-paths without allocating/polluting resolved_css_values.
+    assert_eq!(renderer.resolve_css_value(" 10px red ", &mut ctx), "10px red");
+    assert!(!ctx.resolved_css_values.contains_key(" 10px red "));
+    // Values with '(' populate the cache keyed by the raw (untrimmed) input.
+    assert_eq!(
+        renderer.resolve_css_value(" var(--missing, 10px) ", &mut ctx),
+        "10px"
+    );
+    assert!(ctx.resolved_css_values.contains_key(" var(--missing, 10px) "));
     // A second call returns the cached result.
-    assert_eq!(renderer.resolve_css_value("10px red", &mut ctx), "10px red");
+    assert_eq!(
+        renderer.resolve_css_value(" var(--missing, 10px) ", &mut ctx),
+        "10px"
+    );
 }
 
 #[test]
@@ -506,6 +514,20 @@ fn resolve_variables_fail_after_the_loop_budget() {
     let value = "var(--x, red) ".repeat(31);
     let value = value.trim_end();
     assert_eq!(renderer.resolve_css_value(value, &mut ctx), "red ".repeat(31).trim_end());
+
+    // Deep nesting beyond MAX_VARIABLE_DEPTH / remaining budget fails cleanly without stack overflow.
+    let mut deep = String::from("red");
+    for _ in 0..40 {
+        deep = format!("var(--x, {deep})");
+    }
+    assert_eq!(renderer.resolve_css_variables(&deep, &ctx), "");
+
+    // Branching var() expansion shares a single remaining budget (no exponential blowup).
+    let mut branching = String::from("var(--x, red)");
+    for _ in 0..8 {
+        branching = format!("var(--x, {branching} {branching})");
+    }
+    assert_eq!(renderer.resolve_css_variables(&branching, &ctx), "");
 }
 
 /* --- resolveCssCalculations (L604-658) + resolveCssCalc (L775-798) -------- */
@@ -657,6 +679,44 @@ fn color_mix_failures() {
     assert_eq!(
         renderer.resolve_color_mix("color-mix(red 0%, blue 0%)"),
         ""
+    );
+    // Non-ASCII UTF-8 strings shorter or crossing byte offset 10 must never panic.
+    assert_eq!(renderer.resolve_color_mix("日本語日本語)"), "");
+    assert_eq!(renderer.resolve_color_mix("あ)"), "");
+    assert_eq!(renderer.resolve_color_mix("color-mix)"), "");
+}
+
+#[test]
+fn structured_style_iterates_present_keys_preserves_precedence_and_numeric_font_size() {
+    let renderer = Renderer::new();
+    let mut ctx = Context::default();
+    ctx.parent_font_pixel_size = 16.0;
+    ctx.root_font_pixel_size = 16.0;
+
+    let style_val: serde_json::Value = serde_json::json!({
+        "fontSize": "1.5em",
+        "background": "red",
+        "backgroundColor": "blue",
+        "borderRadius": "4px",
+        "clipPath": "circle(50%)",
+        "margin": "1px",
+        "marginTop": 2.0,
+        "wordBreak": "keep-all",
+        "whiteSpace": "normal",
+        "textDecorationLine": ["underline", "line-through"]
+    });
+    let mut state = crate::element::ElementRenderState::default();
+    renderer.add_structured_style_value(&style_val, &mut ctx, &mut state);
+    assert_eq!(state.font_pixel_size, 24.0);
+    assert_eq!(state.font_size_px, Some(24.0));
+    assert_eq!(state.declarations.get("background-color").map(String::as_str), Some("blue"));
+    assert_eq!(state.declarations.get("border-radius").map(String::as_str), Some("50%"));
+    assert_eq!(state.declarations.get("margin-top").map(String::as_str), Some("2em"));
+    assert_eq!(state.declarations.get("margin-bottom").map(String::as_str), Some("1px"));
+    assert_eq!(state.declarations.get("white-space").map(String::as_str), Some("normal"));
+    assert_eq!(
+        state.declarations.get("text-decoration").map(String::as_str),
+        Some("underline line-through")
     );
 }
 

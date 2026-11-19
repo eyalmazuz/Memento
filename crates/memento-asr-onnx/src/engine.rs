@@ -52,11 +52,13 @@
 //!   releases them.
 
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
-use memento_asr::audio::melfrontend::MelFrontend;
+use memento_asr::audio::melfrontend::{AttentionMaskKind, MelFrontend};
 use memento_asr::audio::wavreader;
 use memento_asr::onnx::onnxmodelconfig::{OnnxAsrArchitecture, OnnxModelConfig};
 use memento_asr::onnx::onnxtokenizer::OnnxTokenizer;
@@ -158,6 +160,44 @@ struct InitState {
     load_error: String,
 }
 
+/// Immutable list of NUL-terminated ORT tensor names paired with their stable
+/// `*const c_char` pointer array for zero-allocation `OrtApi::Run`.
+struct CachedOrtNames {
+    _owned: Box<[CString]>,
+    ptrs: Box<[*const c_char]>,
+}
+
+// SAFETY: `ptrs` points exclusively into the heap buffers owned by `_owned`,
+// which are never mutated or reallocated after construction.
+unsafe impl Send for CachedOrtNames {}
+unsafe impl Sync for CachedOrtNames {}
+
+impl CachedOrtNames {
+    fn empty() -> Self {
+        Self {
+            _owned: Box::new([]),
+            ptrs: Box::new([]),
+        }
+    }
+
+    fn new(names: Vec<CString>) -> Self {
+        let owned = names.into_boxed_slice();
+        let ptrs = owned
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            _owned: owned,
+            ptrs,
+        }
+    }
+
+    fn as_ptrs(&self) -> &[*const c_char] {
+        &self.ptrs
+    }
+}
+
 /// Fully initialized engine state; becomes immutable once stored (mirrors the
 /// C++ members after `initializeSessions()` completes).
 struct Initialized {
@@ -170,6 +210,12 @@ struct Initialized {
     num_decoder_heads: i64,
     num_decoder_head_dim: i64,
     frontend: MelFrontend,
+    encoder_input_names: CachedOrtNames,
+    encoder_output_names: CachedOrtNames,
+    decoder_input_names: CachedOrtNames,
+    decoder_output_names: CachedOrtNames,
+    ctc_input_names: CachedOrtNames,
+    ctc_output_names: CachedOrtNames,
 }
 
 /// Owned ONNX Runtime session handles (one architecture is populated).
@@ -342,17 +388,32 @@ impl Engine {
         }
 
         // C++ `if (m_initFuture.isValid()) m_initFuture.waitForFinished();` —
-        // the future exists exactly when the constructor succeeded.
+        // the future exists exactly when the constructor succeeded. Poll
+        // `should_abort()` via `wait_timeout` so cancellation unblocks waits
+        // on slow initialization.
         if self.config_valid {
+            const INIT_WAIT_POLL: Duration = Duration::from_millis(25);
             let mut state = self
                 .init_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             while !state.done {
+                drop(state);
+                if should_abort() {
+                    return Ok(false);
+                }
                 state = self
-                    .init_done
-                    .wait(state)
+                    .init_state
+                    .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.done {
+                    break;
+                }
+                let (next_state, _) = self
+                    .init_done
+                    .wait_timeout(state, INIT_WAIT_POLL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next_state;
             }
         }
 
@@ -458,17 +519,23 @@ impl Engine {
         let mut num_decoder_layers: i32 = 4;
         let mut num_decoder_heads: i64 = 8;
         let mut num_decoder_head_dim: i64 = 128;
+        let mut encoder_input_names = CachedOrtNames::empty();
+        let mut encoder_output_names = CachedOrtNames::empty();
+        let mut decoder_input_names = CachedOrtNames::empty();
+        let mut decoder_output_names = CachedOrtNames::empty();
+        let mut ctc_input_names = CachedOrtNames::empty();
+        let mut ctc_output_names = CachedOrtNames::empty();
 
         match config.architecture {
             OnnxAsrArchitecture::EncoderDecoder => {
                 let encoder = SessionHandle::create(
                     env,
-                    &path_to_cstring(&config.encoder_onnx_path)?,
+                    &OrtPath::from_path(&config.encoder_onnx_path)?,
                     &session_options,
                 )?;
                 let decoder = SessionHandle::create(
                     env,
-                    &path_to_cstring(&config.decoder_onnx_path)?,
+                    &OrtPath::from_path(&config.decoder_onnx_path)?,
                     &session_options,
                 )?;
 
@@ -512,13 +579,48 @@ impl Engine {
                     num_decoder_layers = max_layer_index + 1;
                 }
 
+                // Pre-build NUL-terminated input/output name tables once per session.
+                encoder_input_names = CachedOrtNames::new(vec![
+                    to_cstring("input_features".to_string())?,
+                    to_cstring("attention_mask".to_string())?,
+                ]);
+
+                let mut enc_out = Vec::with_capacity(1 + 2 * num_decoder_layers as usize);
+                enc_out.push(to_cstring("encoder_attention_mask".to_string())?);
+                for layer in 0..num_decoder_layers {
+                    enc_out.push(to_cstring(format!("cross_key.{layer}"))?);
+                    enc_out.push(to_cstring(format!("cross_value.{layer}"))?);
+                }
+                encoder_output_names = CachedOrtNames::new(enc_out);
+
+                let mut dec_in = Vec::with_capacity(2 + 4 * num_decoder_layers as usize);
+                dec_in.push(to_cstring("input_ids".to_string())?);
+                dec_in.push(to_cstring("encoder_attention_mask".to_string())?);
+                for layer in 0..num_decoder_layers {
+                    dec_in.push(to_cstring(format!("cross_key.{layer}"))?);
+                    dec_in.push(to_cstring(format!("cross_value.{layer}"))?);
+                }
+                for layer in 0..num_decoder_layers {
+                    dec_in.push(to_cstring(format!("past_key.{layer}"))?);
+                    dec_in.push(to_cstring(format!("past_value.{layer}"))?);
+                }
+                decoder_input_names = CachedOrtNames::new(dec_in);
+
+                let mut dec_out = Vec::with_capacity(1 + 2 * num_decoder_layers as usize);
+                dec_out.push(to_cstring("logits".to_string())?);
+                for layer in 0..num_decoder_layers {
+                    dec_out.push(to_cstring(format!("present_key.{layer}"))?);
+                    dec_out.push(to_cstring(format!("present_value.{layer}"))?);
+                }
+                decoder_output_names = CachedOrtNames::new(dec_out);
+
                 sessions.encoder = Some(encoder);
                 sessions.decoder = Some(decoder);
             }
             OnnxAsrArchitecture::Ctc => {
                 let ctc = SessionHandle::create(
                     env,
-                    &path_to_cstring(&config.ctc_onnx_path)?,
+                    &OrtPath::from_path(&config.ctc_onnx_path)?,
                     &session_options,
                 )?;
 
@@ -535,6 +637,17 @@ impl Engine {
                             shape_info.element_type()? == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
                     }
                 }
+
+                ctc_input_names = CachedOrtNames::new(vec![
+                    to_cstring("input_features".to_string())?,
+                    to_cstring("attention_mask".to_string())?,
+                ]);
+                let output_count = ctc.output_count()?;
+                let mut ctc_out: Vec<CString> = Vec::with_capacity(output_count);
+                for index in 0..output_count {
+                    ctc_out.push(to_cstring(ctc.output_name(index, &allocator)?)?);
+                }
+                ctc_output_names = CachedOrtNames::new(ctc_out);
 
                 sessions.ctc = Some(ctc);
             }
@@ -563,6 +676,12 @@ impl Engine {
             num_decoder_heads,
             num_decoder_head_dim,
             frontend,
+            encoder_input_names,
+            encoder_output_names,
+            decoder_input_names,
+            decoder_output_names,
+            ctc_input_names,
+            ctc_output_names,
         })
     }
 
@@ -599,45 +718,15 @@ impl Engine {
             return Err("ONNX ASR sessions are not initialized.".to_string());
         };
 
-        // Encoder output names: ["encoder_attention_mask", "cross_key.0",
-        // "cross_value.0", ...].
-        let mut encoder_output_names: Vec<CString> = Vec::new();
-        encoder_output_names.push(to_cstring("encoder_attention_mask".to_string())?);
-        for layer in 0..initialized.num_decoder_layers {
-            encoder_output_names.push(to_cstring(format!("cross_key.{layer}"))?);
-            encoder_output_names.push(to_cstring(format!("cross_value.{layer}"))?);
-        }
-        let encoder_output_ptrs = cstring_ptrs(&encoder_output_names);
-
-        // Decoder input names: ["input_ids", "encoder_attention_mask",
-        // "cross_key.N", "cross_value.N", ..., "past_key.N", "past_value.N", ...].
-        let mut decoder_input_names: Vec<CString> = Vec::new();
-        decoder_input_names.push(to_cstring("input_ids".to_string())?);
-        decoder_input_names.push(to_cstring("encoder_attention_mask".to_string())?);
-        for layer in 0..initialized.num_decoder_layers {
-            decoder_input_names.push(to_cstring(format!("cross_key.{layer}"))?);
-            decoder_input_names.push(to_cstring(format!("cross_value.{layer}"))?);
-        }
-        for layer in 0..initialized.num_decoder_layers {
-            decoder_input_names.push(to_cstring(format!("past_key.{layer}"))?);
-            decoder_input_names.push(to_cstring(format!("past_value.{layer}"))?);
-        }
-        let decoder_input_ptrs = cstring_ptrs(&decoder_input_names);
-
-        // Decoder output names: ["logits", "present_key.N", "present_value.N", ...].
-        let mut decoder_output_names: Vec<CString> = Vec::new();
-        decoder_output_names.push(to_cstring("logits".to_string())?);
-        for layer in 0..initialized.num_decoder_layers {
-            decoder_output_names.push(to_cstring(format!("present_key.{layer}"))?);
-            decoder_output_names.push(to_cstring(format!("present_value.{layer}"))?);
-        }
-        let decoder_output_ptrs = cstring_ptrs(&decoder_output_names);
-
-        let encoder_input_names = [
-            to_cstring("input_features".to_string())?,
-            to_cstring("attention_mask".to_string())?,
-        ];
-        let encoder_input_ptrs = cstring_ptrs(&encoder_input_names);
+        let encoder_input_ptrs = initialized.encoder_input_names.as_ptrs();
+        let encoder_output_ptrs = initialized.encoder_output_names.as_ptrs();
+        let decoder_input_ptrs = initialized.decoder_input_names.as_ptrs();
+        let decoder_output_ptrs = initialized.decoder_output_names.as_ptrs();
+        let mask_kind = if initialized.encoder_mask_is_bool {
+            AttentionMaskKind::Bool
+        } else {
+            AttentionMaskKind::Int64
+        };
 
         for utterance in &utterances {
             if should_abort() {
@@ -645,7 +734,9 @@ impl Engine {
             }
 
             let utterance_samples = &samples[utterance.start_sample..utterance.end_sample];
-            let mel = initialized.frontend.extract(utterance_samples);
+            let mel = initialized
+                .frontend
+                .extract_with_mask(utterance_samples, mask_kind);
             if mel.num_frames <= 0 || mel.valid_frames <= 0 {
                 continue;
             }
@@ -683,16 +774,18 @@ impl Engine {
 
             let encoder_outputs = run(
                 encoder,
-                &encoder_input_ptrs,
+                encoder_input_ptrs,
                 &encoder_input_ptrs_slice,
-                &encoder_output_ptrs,
+                encoder_output_ptrs,
             )?;
 
             if should_abort() {
                 return Ok(false);
             }
 
-            // Initialize the empty self-attention KV cache [1, heads, 0, headDim].
+            // Initialize the empty self-attention KV cache [1, heads, 0, headDim]
+            // using a non-null, properly aligned dummy pointer that outlives `past_kv`.
+            let mut empty_kv_dummy: [f32; 1] = [0.0];
             let empty_kv_shape = [
                 1i64,
                 initialized.num_decoder_heads,
@@ -704,7 +797,7 @@ impl Engine {
             for _ in 0..2 * initialized.num_decoder_layers {
                 past_kv.push(create_tensor(
                     &mem_info,
-                    std::ptr::null_mut(),
+                    empty_kv_dummy.as_mut_ptr() as *mut c_void,
                     0,
                     &empty_kv_shape,
                     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
@@ -727,6 +820,8 @@ impl Engine {
 
             let mut step_ids: Vec<i64> = prompt_ids.clone();
             let mut generated_tokens: Vec<i64> = Vec::with_capacity(max_new_tokens as usize);
+            let mut decoder_input_ptrs_slice: Vec<*const OrtValue> =
+                Vec::with_capacity(1 + encoder_outputs.len() + past_kv.len());
 
             for _step in 0..max_new_tokens {
                 if should_abort() {
@@ -734,64 +829,28 @@ impl Engine {
                 }
 
                 let ids_shape = [1i64, step_ids.len() as i64];
-                let mut decoder_inputs: Vec<ValueHandle> =
-                    Vec::with_capacity(2 + 4 * initialized.num_decoder_layers as usize);
-                decoder_inputs.push(create_tensor(
+                let input_ids_tensor = create_tensor(
                     &mem_info,
                     step_ids.as_ptr() as *mut c_void,
                     step_ids.len() * std::mem::size_of::<i64>(),
                     &ids_shape,
                     ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
-                )?);
+                )?;
 
-                // Share encoder_attention_mask and cross_key/cross_value
-                // without copying buffer data.
-                for source in &encoder_outputs {
-                    let shape_info = source.type_and_shape()?;
-                    let element_type = shape_info.element_type()?;
-                    let shape = shape_info.dimensions()?;
-                    let element_count = shape_info.element_count()?;
-                    let element_size = match element_type {
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL => 1usize,
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => 2usize,
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-                        | ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => 4usize,
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => 8usize,
-                        other => {
-                            return Err(format!(
-                                "unsupported encoder output tensor element type {other}"
-                            ));
-                        }
-                    };
-                    let byte_count = element_count
-                        .checked_mul(element_size)
-                        .ok_or_else(|| "encoder output tensor byte count overflow".to_string())?;
-                    let data = source.mutable_data()?;
-                    if byte_count > 0 && data.is_null() {
-                        return Err("encoder output tensor data pointer is null".to_string());
-                    }
-                    decoder_inputs.push(create_tensor(
-                        &mem_info,
-                        data,
-                        byte_count,
-                        &shape,
-                        element_type,
-                    )?);
-                }
-
-                for kv in past_kv.drain(..) {
-                    decoder_inputs.push(kv);
-                }
-                let decoder_input_ptrs_slice: Vec<*const OrtValue> =
-                    decoder_inputs.iter().map(ValueHandle::as_ptr).collect();
+                // Pass encoder_outputs raw `*const OrtValue` pointers directly
+                // across autoregressive steps instead of recreating tensor views.
+                decoder_input_ptrs_slice.clear();
+                decoder_input_ptrs_slice.push(input_ids_tensor.as_ptr());
+                decoder_input_ptrs_slice.extend(encoder_outputs.iter().map(ValueHandle::as_ptr));
+                decoder_input_ptrs_slice.extend(past_kv.iter().map(ValueHandle::as_ptr));
 
                 let mut decoder_outputs = run(
                     decoder,
-                    &decoder_input_ptrs,
+                    decoder_input_ptrs,
                     &decoder_input_ptrs_slice,
-                    &decoder_output_ptrs,
+                    decoder_output_ptrs,
                 )?;
-                drop(decoder_inputs);
+                drop(input_ids_tensor);
 
                 // Extract logits [1, seqLen, vocabSize] and find the argmax of
                 // the last position.
@@ -867,7 +926,12 @@ impl Engine {
         should_abort: &dyn Fn() -> bool,
         on_segment: &mut dyn FnMut(f64, f64, &str) -> bool,
     ) -> Result<bool, String> {
-        let mel = initialized.frontend.extract(samples);
+        let mask_kind = if initialized.ctc_mask_is_bool {
+            AttentionMaskKind::Bool
+        } else {
+            AttentionMaskKind::Int64
+        };
+        let mel = initialized.frontend.extract_with_mask(samples, mask_kind);
         if mel.num_frames <= 0 || mel.valid_frames <= 0 {
             return Ok(true);
         }
@@ -907,23 +971,14 @@ impl Engine {
             )?);
         }
 
-        let ctc_input_names = [
-            to_cstring("input_features".to_string())?,
-            to_cstring("attention_mask".to_string())?,
-        ];
-        let ctc_input_ptrs = cstring_ptrs(&ctc_input_names);
-
-        let allocator = AllocatorHandle::default_options()?;
-        let output_count = ctc.output_count()?;
-        let mut ctc_output_names: Vec<CString> = Vec::with_capacity(output_count);
-        for index in 0..output_count {
-            ctc_output_names.push(to_cstring(ctc.output_name(index, &allocator)?)?);
-        }
-        let ctc_output_ptrs = cstring_ptrs(&ctc_output_names);
-
         let ctc_input_ptrs_slice: Vec<*const OrtValue> =
             ctc_inputs.iter().map(ValueHandle::as_ptr).collect();
-        let ctc_outputs = run(ctc, &ctc_input_ptrs, &ctc_input_ptrs_slice, &ctc_output_ptrs)?;
+        let ctc_outputs = run(
+            ctc,
+            initialized.ctc_input_names.as_ptrs(),
+            &ctc_input_ptrs_slice,
+            initialized.ctc_output_names.as_ptrs(),
+        )?;
 
         if should_abort() {
             return Ok(false);
@@ -1036,9 +1091,9 @@ impl Engine {
                 current_tokens.push(best_id);
                 last_non_blank_frame = frame;
 
-                let token_string = initialized.tokenizer.id_to_token(best_id);
+                let token_str = initialized.tokenizer.id_to_token_str(best_id).unwrap_or("");
                 let current_duration = (frame - cue_start_frame + 1) as f64 * frame_sec;
-                if current_duration >= 1.0 && ends_with_japanese_sentence_punctuation(&token_string)
+                if current_duration >= 1.0 && ends_with_japanese_sentence_punctuation(token_str)
                 {
                     if !flush_ctc_cue(
                         initialized,
@@ -1176,11 +1231,12 @@ fn atoi_saturating(text: &str) -> i32 {
     signed.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
-/// `static_cast<int>(double)` as produced by x86-64 `cvttsd2si`: NaN and
-/// out-of-range values yield `INT_MIN` (the "integer indefinite" result).
+/// `static_cast<int>(double)` as produced by x86-64 `cvttsd2si`: NaN,
+/// infinities, and out-of-range values yield `INT_MIN` (the "integer
+/// indefinite" result).
 fn double_to_i32_x86(value: f64) -> i32 {
     let truncated = value.trunc();
-    if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+    if !truncated.is_finite() || truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
         i32::MIN
     } else {
         truncated as i32
@@ -1202,22 +1258,54 @@ fn to_cstring(name: String) -> Result<CString, String> {
     CString::new(name).map_err(|_| "ONNX Runtime name contains a NUL byte".to_string())
 }
 
-fn path_to_cstring(path: &Path) -> Result<CString, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| "ONNX model path contains a NUL byte".to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        CString::new(path.to_string_lossy().as_bytes().to_vec())
-            .map_err(|_| "ONNX model path contains a NUL byte".to_string())
-    }
-}
+/// Platform-native NUL-terminated path buffer for ONNX Runtime C API functions
+/// taking `const ORTCHAR_T*` (`u16` on Windows, `c_char` on non-Windows).
+struct OrtPath(Vec<OrtChar>);
 
-fn cstring_ptrs(names: &[CString]) -> Vec<*const c_char> {
-    names.iter().map(|name| name.as_ptr()).collect()
+impl OrtPath {
+    fn from_path(path: &Path) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let mut wide: Vec<u16> = Vec::new();
+            for unit in path.as_os_str().encode_wide() {
+                if unit == 0 {
+                    return Err("ONNX model path contains a NUL byte".to_string());
+                }
+                wide.push(unit);
+            }
+            wide.push(0);
+            Ok(Self(wide))
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            if bytes.contains(&0) {
+                return Err("ONNX model path contains a NUL byte".to_string());
+            }
+            let mut chars: Vec<OrtChar> = Vec::with_capacity(bytes.len() + 1);
+            chars.extend(bytes.iter().map(|&b| b as OrtChar));
+            chars.push(0);
+            Ok(Self(chars))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let lossy = path.to_string_lossy();
+            let bytes = lossy.as_bytes();
+            if bytes.contains(&0) {
+                return Err("ONNX model path contains a NUL byte".to_string());
+            }
+            let mut chars: Vec<OrtChar> = Vec::with_capacity(bytes.len() + 1);
+            chars.extend(bytes.iter().map(|&b| b as OrtChar));
+            chars.push(0);
+            Ok(Self(chars))
+        }
+    }
+
+    fn as_ptr(&self) -> *const OrtChar {
+        self.0.as_ptr()
+    }
 }
 
 /// RAII wrapper over `OrtEnv*`. The underlying environment is a process-wide
@@ -1229,6 +1317,7 @@ unsafe impl Sync for EnvHandle {}
 
 static API: OnceLock<ApiHandle> = OnceLock::new();
 static ENV: OnceLock<EnvHandle> = OnceLock::new();
+static ENV_INIT: Mutex<()> = Mutex::new(());
 
 struct ApiHandle(*const OrtApi);
 unsafe impl Send for ApiHandle {}
@@ -1263,21 +1352,34 @@ fn get_api(ort_api_version: u32) -> Result<&'static OrtApi, String> {
     Ok(unsafe { &*handle.0 })
 }
 
-/// C++ `sharedOrtEnv()`.
-fn get_env(_api: &'static OrtApi) -> Result<*const OrtEnv, String> {
+/// C++ `sharedOrtEnv()` — serialized initialization with lock-free `OnceLock`
+/// reads so concurrent threads can never create duplicate `OrtEnv` instances.
+fn get_env(api: &'static OrtApi) -> Result<*const OrtEnv, String> {
+    if let Some(env) = ENV.get() {
+        return Ok(env.0);
+    }
+    let _guard = ENV_INIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(env) = ENV.get() {
         return Ok(env.0);
     }
     let log_id = b"MementoOnnxAsr\0";
     let mut env: *mut OrtEnv = std::ptr::null_mut();
     check(unsafe {
-        (api().CreateEnv)(
+        (api.CreateEnv)(
             ORT_LOGGING_LEVEL_WARNING,
             log_id.as_ptr() as *const c_char,
             &mut env,
         )
     })?;
+    if env.is_null() {
+        return Err("ONNX Runtime CreateEnv returned a null environment".to_string());
+    }
     let handle = ENV.get_or_init(|| EnvHandle(env));
+    if handle.0 != env {
+        unsafe { (api.ReleaseEnv)(env) };
+    }
     Ok(handle.0)
 }
 
@@ -1301,21 +1403,56 @@ fn check(status: *mut OrtStatus) -> Result<(), String> {
     Err(message)
 }
 
+/// RAII guard for the provider array returned by `OrtApi::GetAvailableProviders`.
+struct AvailableProvidersGuard {
+    api: &'static OrtApi,
+    providers: *mut *mut c_char,
+    count: c_int,
+}
+
+impl AvailableProvidersGuard {
+    fn release(mut self) -> Result<(), String> {
+        let providers = std::mem::replace(&mut self.providers, std::ptr::null_mut());
+        if providers.is_null() {
+            return Ok(());
+        }
+        check(unsafe { (self.api.ReleaseAvailableProviders)(providers, self.count) })
+    }
+}
+
+impl Drop for AvailableProvidersGuard {
+    fn drop(&mut self) {
+        if !self.providers.is_null() {
+            let status =
+                unsafe { (self.api.ReleaseAvailableProviders)(self.providers, self.count) };
+            if !status.is_null() {
+                unsafe { (self.api.ReleaseStatus)(status) };
+            }
+        }
+    }
+}
+
 /// C++ `Ort::GetAvailableProviders()`.
-fn available_providers(_api: &'static OrtApi) -> Result<Vec<String>, String> {
-    let api = api();
+fn available_providers(api: &'static OrtApi) -> Result<Vec<String>, String> {
     let mut providers: *mut *mut c_char = std::ptr::null_mut();
     let mut count: c_int = 0;
     check(unsafe { (api.GetAvailableProviders)(&mut providers, &mut count) })?;
+    let guard = AvailableProvidersGuard {
+        api,
+        providers,
+        count,
+    };
     let count_usize = count.max(0) as usize;
     let mut result = Vec::with_capacity(count_usize);
-    for index in 0..count_usize {
-        let provider = unsafe { *providers.add(index) };
-        if !provider.is_null() {
-            result.push(unsafe { CStr::from_ptr(provider) }.to_string_lossy().into_owned());
+    if !providers.is_null() {
+        for index in 0..count_usize {
+            let provider = unsafe { *providers.add(index) };
+            if !provider.is_null() {
+                result.push(unsafe { CStr::from_ptr(provider) }.to_string_lossy().into_owned());
+            }
         }
     }
-    check(unsafe { (api.ReleaseAvailableProviders)(providers, count) })?;
+    guard.release()?;
     Ok(result)
 }
 
@@ -1448,10 +1585,14 @@ impl Drop for TensorShapeInfoHandle {
 /// `OrtTensorTypeAndShapeInfo` borrowed from an `OrtTypeInfo`: the C++ API's
 /// `TypeInfo::GetTensorTypeAndShapeInfo()` returns a
 /// `ConstTensorTypeAndShapeInfo` — an `Unowned` view owned by the TypeInfo —
-/// so it must not be released separately.
-struct BorrowedTensorShapeInfoHandle(*const OrtTensorTypeAndShapeInfo);
+/// so it must not be released separately and cannot outlive its parent
+/// [`TypeInfoHandle`].
+struct BorrowedTensorShapeInfoHandle<'a>(
+    *const OrtTensorTypeAndShapeInfo,
+    PhantomData<&'a TypeInfoHandle>,
+);
 
-impl TensorShapeInfoAccessors for BorrowedTensorShapeInfoHandle {
+impl TensorShapeInfoAccessors for BorrowedTensorShapeInfoHandle<'_> {
     fn shape_info_ptr(&self) -> *const OrtTensorTypeAndShapeInfo {
         self.0
     }
@@ -1461,15 +1602,15 @@ impl TensorShapeInfoAccessors for BorrowedTensorShapeInfoHandle {
 struct TypeInfoHandle(*mut OrtTypeInfo);
 
 impl TypeInfoHandle {
-    /// C++ `TypeInfo::GetTensorTypeAndShapeInfo()` (borrowed view; stays
-    /// valid as long as this TypeInfoHandle is alive).
-    fn tensor_shape_info(&self) -> Result<BorrowedTensorShapeInfoHandle, String> {
-        let mut shape_info: *const OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
+    /// C++ `TypeInfo::GetTensorTypeAndShapeInfo()` (borrowed view; tied to
+    /// `&self` via `PhantomData` so it cannot outlive this `TypeInfoHandle`).
+    fn tensor_shape_info(&self) -> Result<BorrowedTensorShapeInfoHandle<'_>, String> {
+        let mut shape_info: *const OrtTensorTypeAndShapeInfo = std::ptr::null();
         check(unsafe { (api().CastTypeInfoToTensorInfo)(self.0, &mut shape_info) })?;
         if shape_info.is_null() {
             return Err("ONNX Runtime type info is not a tensor".to_string());
         }
-        Ok(BorrowedTensorShapeInfoHandle(shape_info))
+        Ok(BorrowedTensorShapeInfoHandle(shape_info, PhantomData))
     }
 }
 
@@ -1477,6 +1618,38 @@ impl Drop for TypeInfoHandle {
     fn drop(&mut self) {
         if !self.0.is_null() {
             unsafe { (api().ReleaseTypeInfo)(self.0) };
+        }
+    }
+}
+
+/// RAII guard for buffers allocated through an `OrtAllocator` (e.g. session
+/// input/output names) so memory is released even on early returns or panics.
+struct OrtAllocatedPtr<'a> {
+    allocator: &'a AllocatorHandle,
+    ptr: *mut c_void,
+}
+
+impl<'a> OrtAllocatedPtr<'a> {
+    fn new(allocator: &'a AllocatorHandle, ptr: *mut c_void) -> Self {
+        Self { allocator, ptr }
+    }
+
+    fn free(mut self) -> Result<(), String> {
+        let ptr = std::mem::replace(&mut self.ptr, std::ptr::null_mut());
+        if ptr.is_null() {
+            return Ok(());
+        }
+        check(unsafe { (api().AllocatorFree)(self.allocator.0, ptr) })
+    }
+}
+
+impl Drop for OrtAllocatedPtr<'_> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let status = unsafe { (api().AllocatorFree)(self.allocator.0, self.ptr) };
+            if !status.is_null() {
+                unsafe { (api().ReleaseStatus)(status) };
+            }
         }
     }
 }
@@ -1490,7 +1663,7 @@ unsafe impl Sync for SessionHandle {}
 impl SessionHandle {
     fn create(
         env: *const OrtEnv,
-        path: &CStr,
+        path: &OrtPath,
         options: &SessionOptionsHandle,
     ) -> Result<Self, String> {
         let mut session: *mut OrtSession = std::ptr::null_mut();
@@ -1516,8 +1689,12 @@ impl SessionHandle {
     fn input_name(&self, index: usize, allocator: &AllocatorHandle) -> Result<String, String> {
         let mut name: *mut c_char = std::ptr::null_mut();
         check(unsafe { (api().SessionGetInputName)(self.0, index, allocator.0, &mut name) })?;
+        let guard = OrtAllocatedPtr::new(allocator, name as *mut c_void);
+        if name.is_null() {
+            return Err("ONNX Runtime returned a null input name".to_string());
+        }
         let result = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-        check(unsafe { (api().AllocatorFree)(allocator.0, name as *mut c_void) })?;
+        guard.free()?;
         Ok(result)
     }
 
@@ -1525,8 +1702,12 @@ impl SessionHandle {
     fn output_name(&self, index: usize, allocator: &AllocatorHandle) -> Result<String, String> {
         let mut name: *mut c_char = std::ptr::null_mut();
         check(unsafe { (api().SessionGetOutputName)(self.0, index, allocator.0, &mut name) })?;
+        let guard = OrtAllocatedPtr::new(allocator, name as *mut c_void);
+        if name.is_null() {
+            return Err("ONNX Runtime returned a null output name".to_string());
+        }
         let result = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-        check(unsafe { (api().AllocatorFree)(allocator.0, name as *mut c_void) })?;
+        guard.free()?;
         Ok(result)
     }
 
@@ -1611,8 +1792,8 @@ fn run(
     inputs: &[*const OrtValue],
     output_names: &[*const c_char],
 ) -> Result<Vec<ValueHandle>, String> {
-    let mut outputs: Vec<*mut OrtValue> = vec![std::ptr::null_mut(); output_names.len()];
-    check(unsafe {
+    let mut raw_outputs: Vec<*mut OrtValue> = vec![std::ptr::null_mut(); output_names.len()];
+    let status = unsafe {
         (api().Run)(
             session.0,
             std::ptr::null(),
@@ -1621,10 +1802,17 @@ fn run(
             inputs.len(),
             output_names.as_ptr(),
             output_names.len(),
-            outputs.as_mut_ptr(),
+            raw_outputs.as_mut_ptr(),
         )
-    })?;
-    Ok(outputs.into_iter().map(ValueHandle).collect())
+    };
+    // Wrap every output slot in RAII handles before checking `status` so any
+    // partially written `OrtValue*` outputs are released on error.
+    let outputs: Vec<ValueHandle> = raw_outputs.into_iter().map(ValueHandle).collect();
+    check(status)?;
+    if outputs.iter().any(|value| value.0.is_null()) {
+        return Err("ONNX Runtime Run returned a null output tensor".to_string());
+    }
+    Ok(outputs)
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -2013,5 +2201,82 @@ mod tests {
             ..whisper_cfg
         })
         .is_err());
+    }
+
+    #[test]
+    fn double_to_i32_x86_handles_nan_infinities_and_bounds() {
+        assert_eq!(double_to_i32_x86(f64::NAN), i32::MIN);
+        assert_eq!(double_to_i32_x86(f64::INFINITY), i32::MIN);
+        assert_eq!(double_to_i32_x86(f64::NEG_INFINITY), i32::MIN);
+        assert_eq!(double_to_i32_x86(i32::MAX as f64 + 1.0), i32::MIN);
+        assert_eq!(double_to_i32_x86(i32::MIN as f64 - 1.0), i32::MIN);
+        assert_eq!(double_to_i32_x86(i32::MAX as f64), i32::MAX);
+        assert_eq!(double_to_i32_x86(i32::MIN as f64), i32::MIN);
+        assert_eq!(double_to_i32_x86(42.9), 42);
+        assert_eq!(double_to_i32_x86(-42.9), -42);
+    }
+
+    #[test]
+    fn ort_path_encodes_and_rejects_embedded_nul() {
+        let encoded = OrtPath::from_path(Path::new("model/encoder.onnx")).unwrap();
+        assert_eq!(encoded.0.last(), Some(&0));
+        assert!(!encoded.as_ptr().is_null());
+        assert!(OrtPath::from_path(Path::new("bad\0path.onnx")).is_err());
+    }
+
+    #[test]
+    fn cached_ort_names_keeps_valid_c_strings_after_move() {
+        let names = CachedOrtNames::new(vec![
+            to_cstring("input_ids".to_string()).unwrap(),
+            to_cstring("logits".to_string()).unwrap(),
+        ]);
+        let moved = names;
+        let ptrs = moved.as_ptrs();
+        assert_eq!(ptrs.len(), 2);
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptrs[0]) }.to_str().unwrap(),
+            "input_ids"
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(ptrs[1]) }.to_str().unwrap(),
+            "logits"
+        );
+    }
+
+    #[test]
+    fn transcribe_samples_aborts_while_waiting_for_init_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let engine = Arc::new(Engine {
+            options: Options {
+                use_gpu: false,
+                gpu_device: 0,
+                threads: 1,
+                punctuation: true,
+            },
+            config_valid: true,
+            sample_rate: 16000,
+            staged: Mutex::new(None),
+            init_state: Mutex::new(InitState {
+                done: false,
+                load_error: String::new(),
+            }),
+            init_done: Condvar::new(),
+            initialized: OnceLock::new(),
+            inference: Mutex::new(()),
+        });
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_trigger = Arc::clone(&abort);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            abort_trigger.store(true, Ordering::Release);
+        });
+        let result = engine.transcribe_samples(
+            &[0.1f32, -0.1],
+            "ja",
+            &|| abort.load(Ordering::Acquire),
+            &mut |_, _, _| true,
+        );
+        trigger.join().unwrap();
+        assert_eq!(result, Ok(false));
     }
 }

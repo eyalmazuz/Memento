@@ -21,6 +21,8 @@
 
 //! QString/QChar/QColor value-semantics helpers shared by the CSS engine port.
 
+use std::borrow::Cow;
+
 use unicode_general_category::{get_general_category, GeneralCategory};
 
 /// Whitespace per `QChar::isSpace()`: separators (Zs, Zl, Zp) plus \t \n \v \f \r.
@@ -54,6 +56,18 @@ pub fn to_lower(text: &str) -> String {
         }
     }
     result
+}
+
+/// `QString::toLower()`, borrowing when the input is already lowercase ASCII.
+pub fn to_lower_cow(text: &str) -> Cow<'_, str> {
+    if text
+        .bytes()
+        .all(|b| b.is_ascii() && !b.is_ascii_uppercase())
+    {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(to_lower(text))
+    }
 }
 
 /// `QChar::toLower()` for one BMP code point: the single-character (simple) lowercase.
@@ -91,53 +105,21 @@ pub fn is_qchar_upper(ch: char) -> bool {
         && ch.is_uppercase()
 }
 
-/// UTF-16 code-unit length of a string (QString::size()).
-pub fn utf16_size(text: &str) -> usize {
-    text.chars().map(char::len_utf16).sum()
-}
+// --- ASCII whitespace & case-insensitive helpers ----------------------------
 
-// --- PCRE2-flavored helpers (QRegularExpression ports) ----------------------
-
-/// PCRE2 `\s` without the Unicode-properties option: ASCII whitespace only.
+/// ASCII whitespace (`' '`, `\t`, `\n`, `\r`, `\v`, `\f`).
 #[inline]
 pub fn is_pcre_space(ch: char) -> bool {
     matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000B}' | '\u{000C}')
 }
 
-/// PCRE2 `\d` without the Unicode-properties option: ASCII digits.
-#[inline]
-pub fn is_pcre_digit(ch: char) -> bool {
-    ch.is_ascii_digit()
-}
-
-/// PCRE2 `[A-Za-z]` (the function-name capture) or, case-insensitively, the
-/// `[a-z%]` unit class of the calc pattern.
-#[inline]
-pub fn is_css_function_char(ch: char) -> bool {
-    ch.is_ascii_lowercase() || ch.is_ascii_uppercase() || ch == '-'
-}
-
-#[inline]
-pub fn is_css_unit_char(ch: char) -> bool {
-    ch.is_ascii_lowercase() || ch.is_ascii_uppercase() || ch == '%'
-}
-
-/// PCRE2 `\w` for `\b` without the Unicode-properties option.
-#[inline]
-pub fn is_pcre_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || is_css_function_char(ch)
-}
-
-/// Case-insensitive search for an ASCII needle, matching QString's Unicode
-/// case-fold comparison. Rust returns a UTF-8 byte offset so callers can slice
-/// at the returned boundary.
-///
-/// Qt applies simple folding to the same-length search window; only BMP
-/// characters whose single-code-point fold is ASCII can match this needle.
-pub fn find_ascii_ci(text: &str, needle: &str, from: usize) -> Option<usize> {
+/// Case-insensitive search for an ASCII needle, returning `(start, end)` UTF-8
+/// byte offsets so callers can slice safely even when non-ASCII BMP characters
+/// (such as U+017F LONG S or U+212A KELVIN SIGN) participate in the match.
+pub fn find_ascii_ci_span(text: &str, needle: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     if needle.is_empty() {
-        return (from <= bytes.len()).then_some(from);
+        return (from <= bytes.len() && text.is_char_boundary(from)).then_some((from, from));
     }
     if !needle.is_ascii() || from > bytes.len() {
         return None;
@@ -152,7 +134,7 @@ pub fn find_ascii_ci(text: &str, needle: &str, from: usize) -> Option<usize> {
                 .zip(needle.bytes())
                 .all(|(a, b)| fold_byte(*a) == fold_byte(b))
             {
-                return Some(start);
+                return Some((start, start + needle.len()));
             }
         }
         return None;
@@ -161,10 +143,16 @@ pub fn find_ascii_ci(text: &str, needle: &str, from: usize) -> Option<usize> {
     text.char_indices()
         .filter(|(start, _)| *start >= from)
         .find_map(|(start, _)| {
+            let mut end = start;
             let mut chars = text[start..].chars();
-            needle.bytes()
-                .all(|expected| chars.next().and_then(fold_qchar_ascii) == Some(fold_byte(expected)))
-                .then_some(start)
+            for expected in needle.bytes() {
+                let ch = chars.next()?;
+                if fold_qchar_ascii(ch) != Some(fold_byte(expected)) {
+                    return None;
+                }
+                end += ch.len_utf8();
+            }
+            Some((start, end))
         })
 }
 
@@ -186,30 +174,78 @@ fn fold_qchar_ascii(ch: char) -> Option<u8> {
     }
 }
 
-/// QString::startsWith(needle, Qt::CaseInsensitive) for ASCII needles.
-pub fn starts_with_ascii_ci(text: &str, needle: &str) -> bool {
+/// Strip an ASCII prefix case-insensitively (using QString simple folding),
+/// returning the remaining UTF-8 slice at a guaranteed char boundary.
+pub fn strip_prefix_ascii_ci<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
     if !needle.is_ascii() {
-        return false;
+        return None;
     }
     if text.is_ascii() {
-        return text.len() >= needle.len()
-            && text
-                .as_bytes()
+        if text.len() >= needle.len()
+            && text.as_bytes()[..needle.len()]
                 .iter()
                 .zip(needle.bytes())
-                .all(|(a, b)| fold_byte(*a) == fold_byte(b));
+                .all(|(a, b)| fold_byte(*a) == fold_byte(b))
+        {
+            return Some(&text[needle.len()..]);
+        }
+        return None;
     }
+    let mut end = 0usize;
     let mut chars = text.chars();
-    needle.bytes()
-        .all(|expected| chars.next().and_then(fold_qchar_ascii) == Some(fold_byte(expected)))
+    for expected in needle.bytes() {
+        let ch = chars.next()?;
+        if fold_qchar_ascii(ch) != Some(fold_byte(expected)) {
+            return None;
+        }
+        end += ch.len_utf8();
+    }
+    Some(&text[end..])
 }
 
-/// QString::contains(needle, Qt::CaseInsensitive) for ASCII needles.
+/// Strip an ASCII suffix case-insensitively (using QString simple folding),
+/// returning the leading UTF-8 slice at a guaranteed char boundary.
+pub fn strip_suffix_ascii_ci<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
+    if !needle.is_ascii() {
+        return None;
+    }
+    if needle.is_empty() {
+        return Some(text);
+    }
+    if text.is_ascii() {
+        let start = text.len().checked_sub(needle.len())?;
+        if text.as_bytes()[start..]
+            .iter()
+            .zip(needle.bytes())
+            .all(|(a, b)| fold_byte(*a) == fold_byte(b))
+        {
+            return Some(&text[..start]);
+        }
+        return None;
+    }
+    let mut rev = text.char_indices().rev();
+    let mut cut = text.len();
+    for expected in needle.bytes().rev() {
+        let (idx, ch) = rev.next()?;
+        if fold_qchar_ascii(ch) != Some(fold_byte(expected)) {
+            return None;
+        }
+        cut = idx;
+    }
+    Some(&text[..cut])
+}
+
+/// QString::startsWith(needle, Qt::CaseInsensitive) for ASCII needles.
+pub fn starts_with_ascii_ci(text: &str, needle: &str) -> bool {
+    strip_prefix_ascii_ci(text, needle).is_some()
+}
+
+/// Case-insensitive substring check for ASCII needles.
 pub fn contains_ascii_ci(text: &str, needle: &str) -> bool {
-    find_ascii_ci(text, needle, 0).is_some()
+    find_ascii_ci_span(text, needle, 0).is_some()
 }
 
-/// QString::compare(other, Qt::CaseInsensitive) == 0 for ASCII needles.
+/// Case-insensitive equality for ASCII needles.
 pub fn equals_ascii_ci(text: &str, needle: &str) -> bool {
     if !needle.is_ascii() {
         return false;
@@ -223,66 +259,23 @@ pub fn equals_ascii_ci(text: &str, needle: &str) -> bool {
         && chars.next().is_none()
 }
 
-/// QString::startsWith / contains (case sensitive); byte-based, exact.
-pub fn starts_with_cs(text: &str, needle: &str) -> bool {
-    text.starts_with(needle)
-}
-
 // --- double parsing / formatting -------------------------------------------
 
 /// QString::toDouble (C-locale): optional sign, digits with optional fraction
 /// and optional exponent. Returns None when malformed (ignoring that Qt also
 /// accepts inf/nan spellings, which CSS never feeds here).
 pub fn c_double(text: &str) -> Option<f64> {
-    let mut chars = text.chars().peekable();
-    let mut cleaned = String::with_capacity(text.len() + 4);
-    if matches!(chars.peek(), Some('+') | Some('-')) {
-        cleaned.push(chars.next().unwrap());
-    }
-    let mut had_digits = false;
-    while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
-        cleaned.push(chars.next().unwrap());
-        had_digits = true;
-    }
-    if chars.peek() == Some(&'.') {
-        cleaned.push(chars.next().unwrap());
-        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
-            cleaned.push(chars.next().unwrap());
-            had_digits = true;
-        }
-    }
-    if !had_digits {
+    let bytes = text.as_bytes();
+    let first = match bytes.first() {
+        Some(b'+' | b'-') => bytes.get(1),
+        other => other,
+    };
+    // Reject `inf`, `infinity`, `nan` spellings accepted by `f64::from_str`;
+    // every valid finite decimal literal begins with an ASCII digit or '.'.
+    if !matches!(first, Some(b'0'..=b'9' | b'.')) {
         return None;
     }
-    // Optional exponent: [eE] [+-]? digit+ (QString::toDouble accepts exponents;
-    // the CSS regex captures never contain one, but JSON literals do).
-    if matches!(chars.peek(), Some('e') | Some('E')) {
-        cleaned.push('e');
-        chars.next();
-        if matches!(chars.peek(), Some('+') | Some('-')) {
-            cleaned.push(chars.next().unwrap());
-        }
-        let mut exponent_digits = 0;
-        while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
-            cleaned.push(chars.next().unwrap());
-            exponent_digits += 1;
-        }
-        if exponent_digits == 0 {
-            return None;
-        }
-    }
-    if chars.next().is_some() {
-        return None;
-    }
-    // Rust rejects a trailing bare "." where C accepts it as zero fraction.
-    if cleaned.ends_with('.') {
-        cleaned.pop();
-    }
-    if cleaned.starts_with('.') || cleaned.starts_with("+.") || cleaned.starts_with("-.") {
-        let insert_at = usize::from(!cleaned.starts_with('.'));
-        cleaned.insert(insert_at, '0');
-    }
-    cleaned.parse::<f64>().ok()
+    text.parse::<f64>().ok()
 }
 
 /// QString::number(double): printf %g with precision 6 (C locale).
@@ -408,21 +401,40 @@ mod tests {
         assert_eq!(c_double("12px"), None);
         assert_eq!(c_double(""), None);
         assert_eq!(c_double("."), None);
+        assert_eq!(c_double("+."), None);
+        assert_eq!(c_double("-."), None);
         assert_eq!(c_double("1e"), None);
+        assert_eq!(c_double("inf"), None);
+        assert_eq!(c_double("-inf"), None);
+        assert_eq!(c_double("+Infinity"), None);
+        assert_eq!(c_double("NaN"), None);
+        assert_eq!(c_double("+.5"), Some(0.5));
+        assert_eq!(c_double("-.5"), Some(-0.5));
     }
 
     #[test]
-    fn qt_case_insensitive_search_handles_simple_unicode_case_folding() {
-        assert_eq!(find_ascii_ci("hello Var( x)", "var(", 0), Some(6));
-        assert_eq!(find_ascii_ci("hello Var( x)", "var(", 7), None);
+    fn strip_prefix_and_suffix_ascii_ci_handle_multibyte_utf8_boundaries() {
+        assert_eq!(strip_prefix_ascii_ci("COLOR-MIX(red, blue)", "color-mix("), Some("red, blue)"));
+        assert_eq!(strip_prefix_ascii_ci("日本語日本語)", "color-mix("), None);
+        assert_eq!(strip_prefix_ascii_ci("ſT(x)", "st("), Some("x)"));
+        assert_eq!(strip_suffix_ascii_ci("120DEG", "deg"), Some("120"));
+        assert_eq!(strip_suffix_ascii_ci("あa", "deg"), None);
+        assert_eq!(strip_suffix_ascii_ci("日本語deg", "deg"), Some("日本語"));
+        assert_eq!(strip_suffix_ascii_ci("x!IMPORTANT", "!important"), Some("x"));
+        assert_eq!(strip_suffix_ascii_ci("日本語!im", "!important"), None);
+    }
+
+    #[test]
+    fn case_insensitive_search_handles_simple_unicode_case_folding() {
+        assert_eq!(find_ascii_ci_span("hello Var( x)", "var(", 0), Some((6, 10)));
+        assert_eq!(find_ascii_ci_span("hello Var( x)", "var(", 7), None);
         assert!(starts_with_ascii_ci("VAR(", "var("));
         assert!(contains_ascii_ci("a GRADIENT(b)", "gradient("));
         assert!(equals_ascii_ci("Keep-All", "keep-all"));
         assert!(!equals_ascii_ci("keep-al", "keep-all"));
-        // QString compares with Unicode case folding, not toLower().
-        assert!(!starts_with_ascii_ci("İN(", "in(")); // full fold expands
+        assert!(!starts_with_ascii_ci("İN(", "in("));
         assert!(starts_with_ascii_ci("ſT(", "st("));
-        assert_eq!(find_ascii_ci("😀ſT(", "st(", 0), Some(4));
+        assert_eq!(find_ascii_ci_span("😀ſT(", "st(", 0), Some((4, 8)));
         assert!(equals_ascii_ci("KEEP", "keep"));
     }
 

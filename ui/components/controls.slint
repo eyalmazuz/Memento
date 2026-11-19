@@ -1,0 +1,249 @@
+import { MementoPalette } from "../palette.slint";
+
+export component MementoSwitch inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    border-width: 1px;
+    border-color: root.checked
+        ? MementoPalette.teal-border
+        : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+    background: root.checked
+        ? (touch.has-hover && root.enabled ? MementoPalette.teal-hover : MementoPalette.teal-accent)
+        : MementoPalette.track-bg;
+
+    animate background { duration: 120ms; }
+    animate border-color { duration: 120ms; }
+
+    Rectangle {
+        x: root.checked ? 21px : 3px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: #FFFFFF;
+        drop-shadow-blur: 3px;
+        drop-shadow-color: #00000044;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        enabled: root.enabled;
+        clicked => {
+            if root.enabled {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+}
+
+export component MementoCheckBox inherits Rectangle {
+    in-out property <bool> checked: false;
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    height: max(24px, row.preferred-height);
+    width: max(24px, row.preferred-width);
+    background: transparent;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    row := HorizontalLayout {
+        spacing: root.label != "" ? 8px : 0px;
+        alignment: start;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border-width: 1.5px;
+                border-color: root.checked
+                    ? MementoPalette.teal-border
+                    : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+                background: root.checked
+                    ? MementoPalette.teal-accent
+                    : (touch.has-hover && root.enabled ? MementoPalette.hover-bg : MementoPalette.surface-bg);
+
+                animate background { duration: 100ms; }
+                animate border-color { duration: 100ms; }
+
+                if root.checked : Path {
+                    width: 12px;
+                    height: 12px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 12;
+                    viewbox-height: 12;
+                    stroke: #FFFFFF;
+                    stroke-width: 2px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                    MoveTo { x: 2; y: 6.2; }
+                    LineTo { x: 4.8; y: 9; }
+                    LineTo { x: 10; y: 3; }
+                }
+            }
+        }
+
+        if root.label != "" : Text {
+            text: root.label;
+            color: MementoPalette.text;
+            font-size: 13px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+}
+
+export component MementoSlider inherits Rectangle {
+    in-out property <float> value: 0;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <bool> enabled: true;
+    in property <color> accent: MementoPalette.cyan-accent;
+    callback changed(float);
+
+    private property <float> span: max(0.0001, root.maximum - root.minimum);
+    private property <float> ratio: clamp((root.value - root.minimum) / root.span, 0.0, 1.0);
+
+    function set-from-x(px: length) {
+        let usable = max(1px, root.width - 14px);
+        let frac = clamp((px - 7px) / usable, 0.0, 1.0);
+        let next = root.minimum + frac * root.span;
+        root.value = next;
+        root.changed(next);
+    }
+
+    height: 24px;
+    min-width: 80px;
+    background: transparent;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    // Track
+    Rectangle {
+        x: 7px;
+        y: (parent.height - self.height) / 2;
+        width: max(0px, parent.width - 14px);
+        height: 6px;
+        border-radius: 3px;
+        background: MementoPalette.track-bg;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width * root.ratio;
+            height: parent.height;
+            border-radius: 3px;
+            background: root.accent;
+        }
+    }
+
+    // Thumb
+    Rectangle {
+        x: (parent.width - self.width) * root.ratio;
+        y: (parent.height - self.height) / 2;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        background: #FFFFFF;
+        border-width: (touch.has-hover || touch.pressed) && root.enabled ? 2px : 1.5px;
+        border-color: root.accent;
+        drop-shadow-blur: 4px;
+        drop-shadow-color: #00000066;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        pointer-event(event) => {
+            if !root.enabled {
+                return;
+            }
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                root.set-from-x(self.mouse-x);
+            }
+        }
+        moved => {
+            if root.enabled && self.pressed {
+                root.set-from-x(self.mouse-x);
+            }
+        }
+    }
+}
+
+export component SectionHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> subtitle: "";
+    in property <color> accent: MementoPalette.cyan-accent;
+
+    padding-left: 2px;
+    padding-right: 2px;
+    spacing: 12px;
+    alignment: space-between;
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        horizontal-stretch: 1;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 0;
+            Rectangle {
+                width: 3px;
+                height: 14px;
+                border-radius: 2px;
+                background: root.accent;
+            }
+        }
+
+        Text {
+            text: root.title;
+            font-size: 13.5px;
+            font-weight: 700;
+            color: MementoPalette.text;
+            vertical-alignment: center;
+        }
+
+        if root.subtitle != "" : Text {
+            text: "· " + root.subtitle;
+            font-size: 12px;
+            color: MementoPalette.text-muted;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 0;
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            @children
+        }
+    }
+}

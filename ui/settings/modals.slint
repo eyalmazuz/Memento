@@ -1,0 +1,326 @@
+import { LineEdit } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { MementoSlider } from "../components/controls.slint";
+import { ModalDialog } from "../components/modal.slint";
+
+component CheckerboardBackdrop inherits Rectangle {
+    background: MementoPalette.checker-dark;
+    clip: true;
+
+    for row in [0, 1, 2, 3, 4, 5] : Rectangle {
+        x: 0px;
+        y: row * 8px;
+        width: parent.width;
+        height: 8px;
+        background: transparent;
+        for col in [0, 1, 2, 3, 4, 5, 6, 7, 8] : Rectangle {
+            x: col * 8px;
+            y: 0px;
+            width: 8px;
+            height: 8px;
+            background: mod(row + col, 2) == 0 ? MementoPalette.checker-light : transparent;
+        }
+    }
+}
+
+export component ColorPickerModal inherits ModalDialog {
+    in property <string> color-key;
+    in property <string> color-label;
+    in-out property <int> color-a: 255;
+    in-out property <int> color-r: 255;
+    in-out property <int> color-g: 255;
+    in-out property <int> color-b: 255;
+    in-out property <string> color-hex: "#FFFFFFFF";
+    callback apply-color(string, int, int, int, int);
+    callback hex-input-edited(string);
+
+    pure function hex-digit(n: int) -> string {
+        n == 0 ? "0" : n == 1 ? "1" : n == 2 ? "2" : n == 3 ? "3"
+        : n == 4 ? "4" : n == 5 ? "5" : n == 6 ? "6" : n == 7 ? "7"
+        : n == 8 ? "8" : n == 9 ? "9" : n == 10 ? "A" : n == 11 ? "B"
+        : n == 12 ? "C" : n == 13 ? "D" : n == 14 ? "E" : "F"
+    }
+
+    pure function hex-byte(v: int) -> string {
+        let c = clamp(v, 0, 255);
+        hex-digit(floor(c / 16)) + hex-digit(mod(c, 16))
+    }
+
+    pure function format-argb(a: int, r: int, g: int, b: int) -> string {
+        "#" + hex-byte(a) + hex-byte(r) + hex-byte(g) + hex-byte(b)
+    }
+
+    title: "Pick Color · " + root.color-label;
+    dialog-width: 452px;
+    cancel-text: "Cancel";
+    primary-text: "Apply Color";
+    primary-clicked => {
+        root.apply-color(
+            root.color-key,
+            root.color-a,
+            root.color-r,
+            root.color-g,
+            root.color-b,
+        );
+    }
+
+    // Live Preview + Editable Hex (#AARRGGBB)
+    HorizontalLayout {
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 68px;
+                height: 46px;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: MementoPalette.border-light;
+                clip: true;
+
+                CheckerboardBackdrop {
+                    width: parent.width;
+                    height: parent.height;
+                }
+
+                Rectangle {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                    border-radius: 7px;
+                    background: Colors.rgba(
+                        root.color-r / 255.0,
+                        root.color-g / 255.0,
+                        root.color-b / 255.0,
+                        root.color-a / 255.0,
+                    );
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            horizontal-stretch: 1;
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: "Hex";
+                    color: MementoPalette.text-secondary;
+                    font-size: 12px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+                LineEdit {
+                    width: 132px;
+                    text <=> root.color-hex;
+                    placeholder-text: "#AARRGGBB";
+                    edited(val) => { root.hex-input-edited(val); }
+                    accepted(val) => { root.hex-input-edited(val); }
+                }
+            }
+
+            Text {
+                text: "RGBA (" + root.color-r + ", " + root.color-g + ", " + root.color-b + ", " + root.color-a + ")";
+                color: MementoPalette.text-muted;
+                font-family: "monospace";
+                font-size: 11.5px;
+            }
+        }
+    }
+
+    // Channel Sliders
+    VerticalLayout {
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text { width: 48px; text: "Red"; color: #F87171; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+            MementoSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: 255;
+                accent: #F87171;
+                value: root.color-r;
+                changed(val) => {
+                    root.color-r = Math.round(val);
+                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
+                }
+            }
+            Text { width: 32px; text: root.color-r + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text { width: 48px; text: "Green"; color: #4ADE80; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+            MementoSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: 255;
+                accent: #4ADE80;
+                value: root.color-g;
+                changed(val) => {
+                    root.color-g = Math.round(val);
+                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
+                }
+            }
+            Text { width: 32px; text: root.color-g + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text { width: 48px; text: "Blue"; color: #60A5FA; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+            MementoSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: 255;
+                accent: #60A5FA;
+                value: root.color-b;
+                changed(val) => {
+                    root.color-b = Math.round(val);
+                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
+                }
+            }
+            Text { width: 32px; text: root.color-b + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            Text { width: 48px; text: "Alpha"; color: MementoPalette.text-secondary; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+            MementoSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: 255;
+                accent: MementoPalette.cyan-accent;
+                value: root.color-a;
+                changed(val) => {
+                    root.color-a = Math.round(val);
+                    root.color-hex = root.format-argb(root.color-a, root.color-r, root.color-g, root.color-b);
+                }
+            }
+            Text { width: 32px; text: root.color-a + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+        }
+    }
+
+    // Preset Swatches with checkerboard backdrop, hover ring, and selected ring
+    VerticalLayout {
+        spacing: 6px;
+        Text {
+            text: "Presets";
+            color: MementoPalette.text-muted;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        HorizontalLayout {
+            spacing: 7px;
+            alignment: start;
+            for swatch in [
+                { a: 255, r: 255, g: 255, b: 255, c: #FFFFFFFF },
+                { a: 255, r: 0,   g: 0,   b: 0,   c: #000000FF },
+                { a: 0,   r: 0,   g: 0,   b: 0,   c: #00000000 },
+                { a: 160, r: 0,   g: 0,   b: 0,   c: #000000A0 },
+                { a: 255, r: 255, g: 224, b: 102, c: #FFE066FF },
+                { a: 255, r: 56,  g: 189, b: 248, c: #38BDF8FF },
+                { a: 255, r: 26,  g: 59,  b: 92,  c: #1A3B5CFF },
+                { a: 255, r: 41,  g: 90,  b: 138, c: #295A8AFF },
+                { a: 255, r: 237, g: 107, b: 114, c: #ED6B72FF },
+            ] : Rectangle {
+                property <bool> is-selected: root.color-a == swatch.a
+                    && root.color-r == swatch.r
+                    && root.color-g == swatch.g
+                    && root.color-b == swatch.b;
+
+                width: 34px;
+                height: 26px;
+                border-radius: 6px;
+                border-width: is-selected ? 2px : 1px;
+                border-color: is-selected
+                    ? MementoPalette.cyan-accent
+                    : (sw-touch.has-hover ? MementoPalette.cyan-hover : MementoPalette.border-light);
+                background: transparent;
+                clip: true;
+
+                CheckerboardBackdrop {
+                    x: 1px;
+                    y: 1px;
+                    width: parent.width - 2px;
+                    height: parent.height - 2px;
+                }
+
+                Rectangle {
+                    x: is-selected ? 2px : 1px;
+                    y: is-selected ? 2px : 1px;
+                    width: parent.width - (is-selected ? 4px : 2px);
+                    height: parent.height - (is-selected ? 4px : 2px);
+                    border-radius: 4px;
+                    background: swatch.c;
+                }
+
+                sw-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.color-a = swatch.a;
+                        root.color-r = swatch.r;
+                        root.color-g = swatch.g;
+                        root.color-b = swatch.b;
+                        root.color-hex = root.format-argb(swatch.a, swatch.r, swatch.g, swatch.b);
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AudioHelpModal inherits ModalDialog {
+    title: "Audio Sources Help";
+    dialog-width: 540px;
+    primary-text: "OK";
+
+    Text {
+        text: "Source Name: The name of the audio source as it will appear in Memento.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
+        color: MementoPalette.text-secondary;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}
+
+export component AnkiConnectionModal inherits ModalDialog {
+    in property <bool> ok: false;
+    in property <string> message: "";
+
+    title: root.ok ? "✔ Connected to Anki" : "✖ Connection Failed";
+    title-color: root.ok ? MementoPalette.success-text : MementoPalette.danger-text;
+    accent-border: root.ok ? MementoPalette.success : MementoPalette.danger;
+    dialog-width: 420px;
+    primary-text: "OK";
+
+    Text {
+        text: root.message;
+        color: MementoPalette.text-secondary;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}
+
+export component ConfirmDeleteModal inherits ModalDialog {
+    in property <string> item-title: "";
+    in property <string> detail-text: "";
+
+    title: root.item-title;
+    title-color: MementoPalette.text;
+    accent-border: MementoPalette.danger;
+    dialog-width: 420px;
+    cancel-text: "Cancel";
+    primary-text: "Delete";
+    primary-danger: true;
+
+    Text {
+        text: root.detail-text;
+        color: MementoPalette.text-secondary;
+        font-size: 13px;
+        wrap: word-wrap;
+    }
+}

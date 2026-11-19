@@ -98,23 +98,20 @@ where
                 value: "yes".to_owned(),
             });
         } else if let Some(rest) = arg.strip_prefix("--") {
-            if let Some(negated) = rest.strip_prefix("no-") {
-                if let Some((name, val)) = negated.split_once('=') {
+            if let Some((name, val)) = rest.split_once('=') {
+                if !name.is_empty() {
                     out.global_options.push(CliOption {
                         name: name.to_owned(),
-                        value: format!("{val}=no"),
+                        value: val.to_owned(),
                     });
-                } else {
+                }
+            } else if let Some(negated) = rest.strip_prefix("no-") {
+                if !negated.is_empty() {
                     out.global_options.push(CliOption {
                         name: negated.to_owned(),
                         value: "no".to_owned(),
                     });
                 }
-            } else if let Some((name, val)) = rest.split_once('=') {
-                out.global_options.push(CliOption {
-                    name: name.to_owned(),
-                    value: val.to_owned(),
-                });
             } else if !rest.is_empty() {
                 out.global_options.push(CliOption {
                     name: rest.to_owned(),
@@ -198,10 +195,9 @@ pub fn args_valid(args: &[Vec<u16>]) -> bool {
     depth == 0
 }
 
-/// Insert double quotes immediately after the first `=`, then at the end.
-///
-/// Like `MpvController::quoteArg`, this neither escapes existing quotes nor
-/// alters the code units before or after the first equals sign.
+/// Quote the value after the first `=` with double quotes, escaping embedded
+/// `"` and `\` characters so mpv's `loadfile` option parser never breaks on
+/// values containing quotes or trailing backslashes.
 pub fn quote_arg(arg: &[u16]) -> Vec<u16> {
     let Some(index) = arg.iter().position(|&unit| unit == b'=' as u16) else {
         return arg.to_vec();
@@ -210,7 +206,12 @@ pub fn quote_arg(arg: &[u16]) -> Vec<u16> {
     let mut quoted = Vec::with_capacity(arg.len() + 2);
     quoted.extend_from_slice(&arg[..=index]);
     quoted.push(b'"' as u16);
-    quoted.extend_from_slice(&arg[index + 1..]);
+    for &unit in &arg[index + 1..] {
+        if unit == b'"' as u16 || unit == b'\\' as u16 {
+            quoted.push(b'\\' as u16);
+        }
+        quoted.push(unit);
+    }
     quoted.push(b'"' as u16);
     quoted
 }
@@ -408,7 +409,16 @@ mod tests {
         let raw = [0xd800, b'=' as u16, 0xdc00, b'=' as u16, b'"' as u16];
         assert_eq!(
             quote_arg(&raw),
-            [0xd800, b'=' as u16, b'"' as u16, 0xdc00, b'=' as u16, b'"' as u16, b'"' as u16]
+            [
+                0xd800,
+                b'=' as u16,
+                b'"' as u16,
+                0xdc00,
+                b'=' as u16,
+                b'\\' as u16,
+                b'"' as u16,
+                b'"' as u16,
+            ]
         );
         assert_eq!(quote_arg(&[0xd800, 0xdc00]), [0xd800, 0xdc00]);
 
@@ -500,6 +510,15 @@ mod tests {
         assert_eq!(
             parse_args(["memento", "--{", "a.mkv"]),
             Err(ParseArgsError::InvalidBrackets)
+        );
+
+        let negated_eq = parse_args(["memento", "--no-flag=yes", "--no-"]).unwrap();
+        assert_eq!(
+            negated_eq.global_options,
+            vec![CliOption {
+                name: "no-flag".into(),
+                value: "yes".into(),
+            }]
         );
     }
 }

@@ -24,10 +24,23 @@ fn trim_whitespace(unit: u16) -> bool {
 }
 
 
-/// Generate longest-to-shortest UTF-16 prefixes and whitespace-free variants.
+/// Returns `true` if `end` falls between the high and low surrogate of a valid UTF-16 pair.
+#[inline]
+fn splits_surrogate_pair(text: &[u16], end: usize) -> bool {
+    end > 0
+        && end < text.len()
+        && (0xD800..=0xDBFF).contains(&text[end - 1])
+        && (0xDC00..=0xDFFF).contains(&text[end])
+}
+
+/// Generate longest-to-shortest UTF-16 prefixes and whitespace-free variants
+/// without splitting valid UTF-16 surrogate pairs.
 pub fn generate_queries(text: &[u16]) -> Vec<ExactQuery> {
     let mut result = Vec::new();
     for end in (1..=text.len()).rev() {
+        if splits_surrogate_pair(text, end) {
+            continue;
+        }
         let prefix = &text[..end];
         result.push(ExactQuery { deconj: prefix.to_vec(), surface_override: None });
         if prefix.iter().any(|unit| regex_whitespace(*unit)) &&
@@ -73,11 +86,17 @@ mod tests {
     }
 
     #[test]
-    fn splitting_surrogate_pair_matches_qstring_chop() {
+    fn does_not_split_surrogate_pair() {
         let input: Vec<u16> = "😀".encode_utf16().collect();
         let result = generate_queries(&input);
+        assert_eq!(result.len(), 1);
         assert_eq!(result[0].deconj, input);
-        assert_eq!(result[1].deconj, vec![input[0]]);
+
+        let cjk_ext: Vec<u16> = "𠮟る".encode_utf16().collect();
+        let res_ext = generate_queries(&cjk_ext);
+        assert_eq!(res_ext.len(), 2);
+        assert_eq!(String::from_utf16(&res_ext[0].deconj).unwrap(), "𠮟る");
+        assert_eq!(String::from_utf16(&res_ext[1].deconj).unwrap(), "𠮟");
     }
 
     #[test]

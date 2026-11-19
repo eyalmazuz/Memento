@@ -130,7 +130,7 @@ fn main() {
                 probe_cached_source(&out).unwrap_or_else(|| download_source(&out))
             };
             let openmp = env_flag("MEMENTO_WHISPER_OPENMP").unwrap_or(true);
-            let portable = env_flag("MEMENTO_WHISPER_PORTABLE").unwrap_or(false);
+            let portable = env_flag("MEMENTO_WHISPER_PORTABLE").unwrap_or(true);
             let native = env_flag("MEMENTO_WHISPER_NATIVE").unwrap_or(false);
             let metal = is_macos;
             let accelerate = is_macos;
@@ -153,16 +153,17 @@ fn main() {
                 .define("GGML_CUDA", if cuda { "ON" } else { "OFF" })
                 .define("GGML_VULKAN", if vulkan { "ON" } else { "OFF" });
 
-            // Enable standard modern x86_64 SIMD (AVX/AVX2/FMA/F16C) by default,
-            // matching ggml's own non-native x86_64 baseline instead of bare SSE2.
-            // Set MEMENTO_WHISPER_PORTABLE=1 to restrict strictly to CARGO_CFG_TARGET_FEATURE.
+            // Default to a portable baseline: do not force AVX2/FMA/BMI2/F16C
+            // unconditionally on x86_64. Only enable SIMD extensions declared in
+            // CARGO_CFG_TARGET_FEATURE unless MEMENTO_WHISPER_NATIVE=1 (or
+            // MEMENTO_WHISPER_PORTABLE=0) is explicitly requested.
             if !native {
                 let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
                 let has_feature = |feature: &str| {
                     target_features.split(',').any(|value| value == feature)
                 };
                 let enable_x86_simd = is_x86_64 && !portable;
-                for (option, feature, default_x86_64) in [
+                for (option, feature, opt_in_x86_64) in [
                     ("GGML_SSE42", "sse4.2", true),
                     ("GGML_AVX", "avx", true),
                     ("GGML_AVX2", "avx2", true),
@@ -171,7 +172,7 @@ fn main() {
                     ("GGML_F16C", "f16c", true),
                     ("GGML_AVX512", "avx512f", false),
                 ] {
-                    let enabled = (enable_x86_simd && default_x86_64) || has_feature(feature);
+                    let enabled = (enable_x86_simd && opt_in_x86_64) || has_feature(feature);
                     config.define(option, if enabled { "ON" } else { "OFF" });
                 }
             }

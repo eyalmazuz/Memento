@@ -1,0 +1,285 @@
+import { LineEdit, ListView } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { IconButton, ToggleChip } from "../components/buttons.slint";
+import { DictResult, DictionaryText, PopupBridge } from "types.slint";
+
+// ── Manual Dictionary Search Panel ──────────────────────────────────────────
+export component DictionarySearchPanel inherits Rectangle {
+    in property <[DictResult]> results;
+    in-out property <string> query: "";
+    callback search-changed(string);
+    callback lookup(string);
+    callback close();
+
+    private property <[DictResult]> active-results: PopupBridge.rich-enabled ? PopupBridge.panel-results : root.results;
+    private property <string> active-query: PopupBridge.rich-enabled ? PopupBridge.panel-query : root.query;
+    private property <bool> is-searching: PopupBridge.rich-enabled && PopupBridge.panel-searching;
+
+    background: MementoPalette.surface-bg;
+    border-width: 1px;
+    border-color: MementoPalette.border;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // Header: icon + title + aligned `かな` toggle + IconButton close
+        HorizontalLayout {
+            height: 28px;
+            spacing: 6px;
+            alignment: start;
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Image {
+                    width: 15px;
+                    height: 15px;
+                    source: @image-url("../icons/search.svg");
+                    colorize: MementoPalette.icon-muted;
+                }
+            }
+
+            Text {
+                text: "Search";
+                font-size: 14px;
+                font-weight: 700;
+                color: MementoPalette.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            if PopupBridge.rich-enabled : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                ToggleChip {
+                    text: "かな";
+                    chip-width: 38px;
+                    active: PopupBridge.panel-kana-only;
+                    clicked => { PopupBridge.panel-toggle-kana-only(); }
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                IconButton {
+                    icon: @image-url("../icons/close.svg");
+                    size: 28px;
+                    icon-size: 15px;
+                    clicked => { root.close(); }
+                }
+            }
+        }
+
+        // Search input row with inline clear button
+        HorizontalLayout {
+            spacing: 4px;
+
+            if PopupBridge.rich-enabled : LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: PopupBridge.panel-kana-only ? "Search by reading (かな)…" : "Search Japanese…";
+                text <=> PopupBridge.panel-query;
+                edited(value) => { PopupBridge.panel-search-requested(value); }
+            }
+
+            if !PopupBridge.rich-enabled : LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: "Search Japanese…";
+                text <=> root.query;
+                edited(value) => { root.search-changed(value); }
+            }
+
+            if root.active-query != "" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                IconButton {
+                    icon: @image-url("../icons/clear.svg");
+                    size: 28px;
+                    icon-size: 15px;
+                    tint: MementoPalette.icon-muted;
+                    clicked => {
+                        if PopupBridge.rich-enabled {
+                            PopupBridge.panel-query = "";
+                            PopupBridge.panel-search-requested("");
+                        } else {
+                            root.query = "";
+                            root.search-changed("");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Async search status indicator
+        if root.is-searching : HorizontalLayout {
+            height: 18px;
+            spacing: 6px;
+            alignment: start;
+
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: MementoPalette.cyan-accent;
+                }
+            }
+
+            DictionaryText {
+                text: "Searching…";
+                font-size: 11px;
+                color: MementoPalette.text-secondary;
+                vertical-alignment: center;
+            }
+        }
+
+        // Empty prompt & "No results" states
+        if root.active-results.length == 0 && !root.is-searching : Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            VerticalLayout {
+                width: parent.width;
+                height: parent.height;
+                padding: 16px;
+                spacing: 8px;
+                alignment: center;
+
+                HorizontalLayout {
+                    alignment: center;
+                    Image {
+                        width: 26px;
+                        height: 26px;
+                        source: root.active-query == ""
+                            ? @image-url("../icons/dictionary.svg")
+                            : @image-url("../icons/search.svg");
+                        colorize: MementoPalette.text-muted;
+                        opacity: 0.65;
+                    }
+                }
+
+                DictionaryText {
+                    text: root.active-query == ""
+                        ? "Search dictionaries"
+                        : ("No results for \"" + root.active-query + "\"");
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: MementoPalette.text-secondary;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                DictionaryText {
+                    text: root.active-query == ""
+                        ? "Type Japanese, kana, or English to look up terms."
+                        : "Try checking the spelling or toggling かな reading mode.";
+                    font-size: 11.5px;
+                    color: MementoPalette.text-muted;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // Variable-height result cards with subtle hairlines
+        if root.active-results.length > 0 : ListView {
+            vertical-stretch: 1;
+
+            for hit[index] in root.active-results : Rectangle {
+                height: min(
+                    156px,
+                    max(
+                        58px,
+                        header-row.preferred-height
+                        + (hit.dict-name != "" ? 16px : 0px)
+                        + gloss-txt.preferred-height
+                        + 24px
+                    )
+                );
+                clip: true;
+                border-radius: 6px;
+                background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
+                animate background { duration: 100ms; }
+
+                // Subtle hairline divider between cards
+                if index > 0 && !result-touch.has-hover : Rectangle {
+                    x: 8px;
+                    y: 0px;
+                    width: parent.width - 16px;
+                    height: 1px;
+                    background: MementoPalette.border;
+                    opacity: 0.7;
+                }
+
+                VerticalLayout {
+                    width: parent.width;
+                    height: parent.height;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 7px;
+                    padding-bottom: 8px;
+                    spacing: 3px;
+
+                    header-row := HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        DictionaryText {
+                            text: hit.expression;
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: MementoPalette.text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        if hit.reading != "" && hit.reading != hit.expression : DictionaryText {
+                            text: hit.reading;
+                            font-size: 12px;
+                            color: MementoPalette.text-secondary;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    dict-lbl := DictionaryText {
+                        height: hit.dict-name != "" ? 16px : 0px;
+                        visible: hit.dict-name != "";
+                        text: hit.dict-name;
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: MementoPalette.teal-text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    gloss-txt := DictionaryText {
+                        text: hit.glossary;
+                        font-size: 12px;
+                        color: MementoPalette.icon;
+                        wrap: word-wrap;
+                        overflow: elide;
+                        vertical-stretch: 1;
+                        vertical-alignment: top;
+                    }
+                }
+
+                result-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if PopupBridge.rich-enabled {
+                            PopupBridge.panel-lookup-requested(hit.expression);
+                        } else {
+                            root.lookup(hit.expression);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

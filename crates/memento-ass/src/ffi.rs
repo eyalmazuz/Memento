@@ -5,7 +5,7 @@
 
 #![allow(non_camel_case_types, dead_code)]
 
-use std::ffi::{c_char, c_double, c_int, c_longlong, c_uchar, c_void};
+use std::ffi::{c_char, c_double, c_int, c_longlong, c_uchar};
 
 #[repr(C)]
 pub struct ASS_Library {
@@ -67,31 +67,16 @@ pub struct ASS_Image {
     pub kind: c_int,
 }
 
-/// Quiet message callback matching libass's `void (*msg_cb)(int, const char *, va_list, void *)`.
-///
-/// The callback ignores all parameters and returns immediately without inspecting `va_list`,
-/// preventing libass diagnostic spam to stderr during frequent per-cue hitbox probes.
-pub unsafe extern "C" fn silent_message_cb(
-    _level: c_int,
-    _fmt: *const c_char,
-    _args: *mut c_void,
-    _data: *mut c_void,
-) {
-}
-
 extern "C" {
+    /// Install a no-op C `va_list` message callback on `priv_` via `ass_set_message_cb`
+    /// (implemented in `src/msg_cb_shim.c` so the platform's exact C `va_list` ABI is used).
+    pub fn memento_ass_silence_library(priv_: *mut ASS_Library);
+
     pub fn ass_library_version() -> c_int;
     pub fn ass_library_init() -> *mut ASS_Library;
     pub fn ass_library_done(priv_: *mut ASS_Library);
     pub fn ass_set_fonts_dir(priv_: *mut ASS_Library, fonts_dir: *const c_char);
     pub fn ass_set_extract_fonts(priv_: *mut ASS_Library, extract: c_int);
-    pub fn ass_set_message_cb(
-        priv_: *mut ASS_Library,
-        msg_cb: Option<
-            unsafe extern "C" fn(c_int, *const c_char, *mut c_void, *mut c_void),
-        >,
-        data: *mut c_void,
-    );
     pub fn ass_add_font(
         library: *mut ASS_Library,
         name: *const c_char,

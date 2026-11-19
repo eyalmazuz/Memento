@@ -1,5 +1,7 @@
 import { MementoPalette } from "palette.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
+import { FilterChip, IconButton, TabPill } from "components/buttons.slint";
+import { SectionHeader } from "components/controls.slint";
 
 export struct HelpArgument {
     name: string,
@@ -19,101 +21,21 @@ export struct HelpSection {
     markers: [HelpMarker],
 }
 
-component TabPill inherits Rectangle {
-    in property <string> label;
-    in property <string> badge: "";
-    in property <bool> active: false;
-    callback clicked();
-
-    height: 34px;
-    border-radius: 7px;
-    background: root.active
-        ? (MementoPalette.dark ? #1E2D3D : #E0F2FE)
-        : (touch.has-hover ? MementoPalette.hover-bg : transparent);
-    border-width: 1px;
-    border-color: root.active
-        ? MementoPalette.cyan-accent
-        : transparent;
-
-    HorizontalLayout {
-        padding-left: 14px;
-        padding-right: 14px;
-        spacing: 7px;
-        alignment: center;
-
-        Text {
-            text: root.label;
-            color: root.active ? (MementoPalette.dark ? #FFFFFF : #0369A1) : MementoPalette.text-secondary;
-            font-size: 13px;
-            font-weight: root.active ? 700 : 500;
-            vertical-alignment: center;
-        }
-
-        if root.badge != "" : Rectangle {
-            height: 18px;
-            width: max(22px, badge-lbl.preferred-width + 10px);
-            border-radius: 9px;
-            background: root.active
-                ? (MementoPalette.dark ? #0EA5E933 : #BAE6FD)
-                : (MementoPalette.dark ? #2B313C : #E2E8F0);
-            badge-lbl := Text {
-                text: root.badge;
-                color: root.active ? (MementoPalette.dark ? #7DD3FC : #0369A1) : MementoPalette.text-muted;
-                font-size: 10px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-    }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
-component FilterChip inherits Rectangle {
-    in property <string> label;
-    in property <bool> active: false;
-    callback clicked();
-
-    height: 26px;
-    width: chip-lbl.preferred-width + 20px;
-    border-radius: 13px;
-    background: root.active
-        ? (MementoPalette.dark ? #0D8269 : #0D9488)
-        : (touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-bg);
-    border-width: 1px;
-    border-color: root.active ? #14B8A6 : MementoPalette.border-light;
-
-    chip-lbl := Text {
-        text: root.label;
-        color: root.active ? #FFFFFF : MementoPalette.text-secondary;
-        font-size: 11px;
-        font-weight: root.active ? 700 : 500;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
-}
-
 component CodeExampleChip inherits Rectangle {
     in property <string> snippet;
     callback clicked(string);
 
     height: 28px;
-    width: code-row.preferred-width + 20px;
+    width: code-row.preferred-width;
     border-radius: 6px;
-    background: touch.has-hover
-        ? (MementoPalette.dark ? #1B3044 : #E0F2FE)
-        : (MementoPalette.dark ? #12161E : #F1F5F9);
+    background: touch.pressed
+        ? MementoPalette.accent-muted-hover
+        : (touch.has-hover ? MementoPalette.accent-muted : MementoPalette.card-inset);
     border-width: 1px;
     border-color: touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
 
     code-row := HorizontalLayout {
         padding-left: 10px;
@@ -123,18 +45,22 @@ component CodeExampleChip inherits Rectangle {
 
         Text {
             text: root.snippet;
-            color: MementoPalette.dark ? #7DD3FC : #0369A1;
+            color: MementoPalette.cyan-text;
             font-family: "monospace";
             font-size: 12px;
             font-weight: 700;
             vertical-alignment: center;
         }
         Text {
-            text: touch.has-hover ? "Copy" : "";
-            color: MementoPalette.text-muted;
+            width: 28px;
+            text: "Copy";
+            color: MementoPalette.cyan-text;
             font-size: 10px;
             font-weight: 600;
+            horizontal-alignment: right;
             vertical-alignment: center;
+            opacity: touch.has-hover ? 0.9 : 0.0;
+            animate opacity { duration: 120ms; }
         }
     }
 
@@ -153,7 +79,7 @@ component SyntaxCard inherits Rectangle {
 
     background: MementoPalette.card-bg;
     border-width: 1px;
-    border-color: MementoPalette.border;
+    border-color: MementoPalette.card-border;
     border-radius: 10px;
 
     VerticalLayout {
@@ -172,20 +98,23 @@ component SyntaxCard inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            if root.badge != "" : Rectangle {
-                height: 20px;
-                width: b-lbl.preferred-width + 14px;
-                border-radius: 10px;
-                background: MementoPalette.dark ? #0D826933 : #CCFBF1;
-                border-width: 1px;
-                border-color: MementoPalette.dark ? #14B8A666 : #5EEAD4;
-                b-lbl := Text {
-                    text: root.badge;
-                    color: MementoPalette.dark ? #5EEAD4 : #0F766E;
-                    font-size: 10px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+            if root.badge != "" : VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: 20px;
+                    width: b-lbl.preferred-width + 14px;
+                    border-radius: 10px;
+                    background: MementoPalette.teal-muted;
+                    border-width: 1px;
+                    border-color: MementoPalette.teal-border;
+                    b-lbl := Text {
+                        text: root.badge;
+                        color: MementoPalette.teal-text;
+                        font-size: 10px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
@@ -216,7 +145,7 @@ component MarkerCard inherits Rectangle {
 
     background: MementoPalette.card-bg;
     border-width: 1px;
-    border-color: MementoPalette.border;
+    border-color: MementoPalette.card-border;
     border-radius: 9px;
 
     VerticalLayout {
@@ -227,16 +156,19 @@ component MarkerCard inherits Rectangle {
             alignment: space-between;
             spacing: 8px;
 
-            // Clickable marker pill copies `{name}`
+            // Clickable marker pill copies `{name}` without width jitter on hover
             marker-pill := Rectangle {
                 height: 26px;
-                width: pill-row.preferred-width + 18px;
+                width: pill-row.preferred-width;
                 border-radius: 6px;
-                background: pill-touch.has-hover
-                    ? (MementoPalette.dark ? #1E3A5F : #BAE6FD)
-                    : (MementoPalette.dark ? #141923 : #E2E8F0);
+                background: pill-touch.pressed
+                    ? MementoPalette.accent-muted-hover
+                    : (pill-touch.has-hover ? MementoPalette.accent-muted : MementoPalette.card-inset);
                 border-width: 1px;
                 border-color: pill-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
+
+                animate background { duration: 100ms; }
+                animate border-color { duration: 100ms; }
 
                 pill-row := HorizontalLayout {
                     padding-left: 9px;
@@ -246,18 +178,22 @@ component MarkerCard inherits Rectangle {
 
                     Text {
                         text: "{" + root.marker.name + "}";
-                        color: MementoPalette.dark ? #7DD3FC : #0369A1;
+                        color: MementoPalette.cyan-text;
                         font-family: "monospace";
                         font-size: 13px;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
                     Text {
-                        text: pill-touch.has-hover ? "Copy" : "";
-                        color: MementoPalette.text-muted;
+                        width: 28px;
+                        text: "Copy";
+                        color: MementoPalette.cyan-text;
                         font-size: 10px;
                         font-weight: 600;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        opacity: pill-touch.has-hover ? 0.9 : 0.0;
+                        animate opacity { duration: 120ms; }
                     }
                 }
 
@@ -267,20 +203,23 @@ component MarkerCard inherits Rectangle {
                 }
             }
 
-            if root.marker.arguments.length > 0 : Rectangle {
-                height: 22px;
-                width: arg-cnt.preferred-width + 14px;
-                border-radius: 11px;
-                background: MementoPalette.dark ? #262C38 : #E2E8F0;
-                arg-cnt := Text {
-                    text: root.marker.arguments.length == 1
-                        ? "1 argument"
-                        : root.marker.arguments.length + " arguments";
-                    color: MementoPalette.text-muted;
-                    font-size: 10px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+            if root.marker.arguments.length > 0 : VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    height: 22px;
+                    width: arg-cnt.preferred-width + 14px;
+                    border-radius: 11px;
+                    background: MementoPalette.track-bg;
+                    arg-cnt := Text {
+                        text: root.marker.arguments.length == 1
+                            ? "1 argument"
+                            : root.marker.arguments.length + " arguments";
+                        color: MementoPalette.text-secondary;
+                        font-size: 10px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
@@ -293,7 +232,7 @@ component MarkerCard inherits Rectangle {
         }
 
         if root.marker.arguments.length > 0 : Rectangle {
-            background: MementoPalette.dark ? #151820 : #F8FAFC;
+            background: MementoPalette.card-inset;
             border-width: 1px;
             border-color: MementoPalette.border;
             border-radius: 7px;
@@ -312,19 +251,22 @@ component MarkerCard inherits Rectangle {
                         spacing: 8px;
                         alignment: start;
 
-                        Rectangle {
-                            height: 20px;
-                            width: arg-name.preferred-width + 12px;
-                            border-radius: 4px;
-                            background: MementoPalette.dark ? #1E293B : #E0F2FE;
-                            arg-name := Text {
-                                text: argument.name;
-                                color: MementoPalette.dark ? #93C5FD : #0369A1;
-                                font-family: "monospace";
-                                font-size: 11px;
-                                font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                height: 20px;
+                                width: arg-name.preferred-width + 12px;
+                                border-radius: 4px;
+                                background: MementoPalette.accent-muted;
+                                arg-name := Text {
+                                    text: argument.name;
+                                    color: MementoPalette.badge-blue-text;
+                                    font-family: "monospace";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
 
@@ -365,8 +307,6 @@ export component AnkiHelpWindow inherits Window {
     in-out property <string> search-query: "";
     in-out property <string> copied-notice: "";
 
-    in property <[HelpMarker]> term-markers;
-    in property <[HelpMarker]> kanji-markers;
     in property <[HelpSection]> term-sections;
     in property <[HelpSection]> kanji-sections;
     in property <[string]> term-section-names;
@@ -376,341 +316,468 @@ export component AnkiHelpWindow inherits Window {
 
     callback search-changed(string);
     callback copy-marker(string);
+    callback close();
 
-    VerticalLayout {
-        spacing: 0px;
+    changed active-tab => {
+        help-scroll.viewport-y = 0px;
+    }
 
-        // Top Header + Tabs + Filter
-        Rectangle {
-            background: MementoPalette.surface-bg;
+    root-focus := FocusScope {
+        width: 100%;
+        height: 100%;
 
-            VerticalLayout {
-                padding-left: 20px;
-                padding-right: 20px;
-                padding-top: 16px;
-                padding-bottom: 12px;
-                spacing: 12px;
+        key-pressed(event) => {
+            if event.modifiers.control
+                && (event.text == "f" || event.text == "F" || event.text == "\u{0006}") {
+                search-input.focus();
+                return accept;
+            }
+            if event.text == Key.Escape {
+                if root.search-query != "" {
+                    root.search-query = "";
+                    root.search-changed("");
+                } else {
+                    root.close();
+                }
+                return accept;
+            }
+            return reject;
+        }
 
-                HorizontalLayout {
-                    alignment: space-between;
+        VerticalLayout {
+            spacing: 0px;
+
+            // Top Header + Tabs + Filter
+            Rectangle {
+                background: MementoPalette.surface-bg;
+
+                VerticalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    padding-top: 16px;
+                    padding-bottom: 12px;
                     spacing: 12px;
 
-                    VerticalLayout {
-                        spacing: 2px;
-                        horizontal-stretch: 1;
-                        Text {
-                            text: "Anki Integration Help";
-                            color: MementoPalette.text;
-                            font-size: 19px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "Click any {marker} badge to copy it straight to your clipboard.";
-                            color: MementoPalette.text-muted;
-                            font-size: 12px;
-                        }
-                    }
-
-                    if root.copied-notice != "" : Rectangle {
-                        height: 28px;
-                        width: copied-lbl.preferred-width + 20px;
-                        border-radius: 14px;
-                        background: #064E3B;
-                        border-width: 1px;
-                        border-color: #10B981;
-                        copied-lbl := Text {
-                            text: root.copied-notice;
-                            color: #A7F3D0;
-                            font-size: 11px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
                     HorizontalLayout {
-                        spacing: 6px;
-                        alignment: end;
-                        search-input := LineEdit {
-                            width: 240px;
-                            text <=> root.search-query;
-                            placeholder-text: "Filter markers…";
-                            edited(q) => {
-                                if q != "" && root.active-tab == 0 {
-                                    root.active-tab = 1;
-                                }
-                                root.search-changed(q);
-                            }
-                        }
-                        if root.search-query != "" : Rectangle {
-                            width: 28px;
-                            height: 28px;
-                            border-radius: 6px;
-                            background: clr-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-bg;
-                            border-width: 1px;
-                            border-color: MementoPalette.border-light;
+                        alignment: space-between;
+                        spacing: 12px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
                             Text {
-                                text: "×";
-                                color: MementoPalette.text-secondary;
-                                font-size: 14px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                                text: "Anki Integration Help";
+                                color: MementoPalette.text;
+                                font-size: 19px;
+                                font-weight: 700;
                             }
-                            clr-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    root.search-query = "";
-                                    root.search-changed("");
+                            Text {
+                                text: "Click any {marker} badge to copy it straight to your clipboard. Press Ctrl+F to filter.";
+                                color: MementoPalette.text-muted;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+                        }
+
+                        if root.copied-notice != "" : VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                height: 28px;
+                                width: copied-lbl.preferred-width + 20px;
+                                border-radius: 14px;
+                                background: MementoPalette.success-bg;
+                                border-width: 1px;
+                                border-color: MementoPalette.success;
+                                copied-lbl := Text {
+                                    text: root.copied-notice;
+                                    color: MementoPalette.success-text;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: end;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    search-input := LineEdit {
+                                        width: 240px;
+                                        text <=> root.search-query;
+                                        placeholder-text: "Filter markers… (Ctrl+F)";
+                                        edited(q) => {
+                                            root.search-changed(q);
+                                        }
+                                    }
+                                }
+
+                                if root.search-query != "" : VerticalLayout {
+                                    alignment: center;
+                                    IconButton {
+                                        icon: @image-url("icons/close.svg");
+                                        size: 28px;
+                                        icon-size: 14px;
+                                        tooltip: "Clear filter";
+                                        tooltip-below: true;
+                                        tooltip-align-right: true;
+                                        clicked => {
+                                            root.search-query = "";
+                                            root.search-changed("");
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Main Tab Strip
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
+                    // Main Tab Strip
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
 
-                    TabPill {
-                        label: "Overview & Syntax";
-                        active: root.active-tab == 0;
-                        clicked => { root.active-tab = 0; }
+                        TabPill {
+                            label: "Overview & Syntax";
+                            active: root.active-tab == 0;
+                            clicked => { root.active-tab = 0; }
+                        }
+                        TabPill {
+                            label: "Term Markers";
+                            badge: root.term-total-count + "";
+                            active: root.active-tab == 1;
+                            clicked => { root.active-tab = 1; }
+                        }
+                        TabPill {
+                            label: "Kanji Markers";
+                            badge: root.kanji-total-count + "";
+                            active: root.active-tab == 2;
+                            clicked => { root.active-tab = 2; }
+                        }
                     }
-                    TabPill {
-                        label: "Term Markers";
-                        badge: root.term-total-count + "";
-                        active: root.active-tab == 1;
-                        clicked => { root.active-tab = 1; }
-                    }
-                    TabPill {
-                        label: "Kanji Markers";
-                        badge: root.kanji-total-count + "";
-                        active: root.active-tab == 2;
-                        clicked => { root.active-tab = 2; }
-                    }
-                }
 
-                // Category Sub-filter Strip (Term Markers)
-                if root.active-tab == 1 : HorizontalLayout {
-                    spacing: 6px;
-                    alignment: start;
+                    // Category Sub-filter Strip (Term Markers — wraps onto 2 rows at narrow widths without layout loops)
+                    if root.active-tab == 1 : Rectangle {
+                        property <bool> compact-wrap: root.width < 680px;
+                        height: compact-wrap ? 58px : 26px;
 
-                    FilterChip {
-                        label: "All Sections";
-                        active: root.active-term-section == -1;
-                        clicked => { root.active-term-section = -1; }
-                    }
-                    for name[idx] in root.term-section-names : FilterChip {
-                        label: name;
-                        active: root.active-term-section == idx;
-                        clicked => { root.active-term-section = idx; }
-                    }
-                }
+                        if !compact-wrap : HorizontalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: 26px;
+                            spacing: 6px;
+                            alignment: start;
 
-                // Category Sub-filter Strip (Kanji Markers)
-                if root.active-tab == 2 : HorizontalLayout {
-                    spacing: 6px;
-                    alignment: start;
+                            FilterChip {
+                                label: "All Sections";
+                                active: root.active-term-section == -1;
+                                clicked => {
+                                    root.active-term-section = -1;
+                                    help-scroll.viewport-y = 0px;
+                                }
+                            }
+                            for name[idx] in root.term-section-names : FilterChip {
+                                label: name;
+                                active: root.active-term-section == idx;
+                                clicked => {
+                                    root.active-term-section = idx;
+                                    help-scroll.viewport-y = 0px;
+                                }
+                            }
+                        }
 
-                    FilterChip {
-                        label: "All Sections";
-                        active: root.active-kanji-section == -1;
-                        clicked => { root.active-kanji-section = -1; }
+                        if compact-wrap : VerticalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: 58px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                HorizontalLayout {
+                                    padding-right: 6px;
+                                    FilterChip {
+                                        label: "All Sections";
+                                        active: root.active-term-section == -1;
+                                        clicked => {
+                                            root.active-term-section = -1;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                                for name[idx] in root.term-section-names : HorizontalLayout {
+                                    padding-right: idx < 2 ? 6px : 0px;
+                                    if idx < 2 : FilterChip {
+                                        label: name;
+                                        active: root.active-term-section == idx;
+                                        clicked => {
+                                            root.active-term-section = idx;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                for name[idx] in root.term-section-names : HorizontalLayout {
+                                    padding-right: idx >= 2 ? 6px : 0px;
+                                    if idx >= 2 : FilterChip {
+                                        label: name;
+                                        active: root.active-term-section == idx;
+                                        clicked => {
+                                            root.active-term-section = idx;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    for name[idx] in root.kanji-section-names : FilterChip {
-                        label: name;
-                        active: root.active-kanji-section == idx;
-                        clicked => { root.active-kanji-section = idx; }
+
+                    // Category Sub-filter Strip (Kanji Markers — wraps onto 2 rows at narrow widths without layout loops)
+                    if root.active-tab == 2 : Rectangle {
+                        property <bool> compact-wrap: root.width < 660px;
+                        height: compact-wrap ? 58px : 26px;
+
+                        if !compact-wrap : HorizontalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: 26px;
+                            spacing: 6px;
+                            alignment: start;
+
+                            FilterChip {
+                                label: "All Sections";
+                                active: root.active-kanji-section == -1;
+                                clicked => {
+                                    root.active-kanji-section = -1;
+                                    help-scroll.viewport-y = 0px;
+                                }
+                            }
+                            for name[idx] in root.kanji-section-names : FilterChip {
+                                label: name;
+                                active: root.active-kanji-section == idx;
+                                clicked => {
+                                    root.active-kanji-section = idx;
+                                    help-scroll.viewport-y = 0px;
+                                }
+                            }
+                        }
+
+                        if compact-wrap : VerticalLayout {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: 58px;
+                            spacing: 6px;
+
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                HorizontalLayout {
+                                    padding-right: 6px;
+                                    FilterChip {
+                                        label: "All Sections";
+                                        active: root.active-kanji-section == -1;
+                                        clicked => {
+                                            root.active-kanji-section = -1;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                                for name[idx] in root.kanji-section-names : HorizontalLayout {
+                                    padding-right: idx < 2 ? 6px : 0px;
+                                    if idx < 2 : FilterChip {
+                                        label: name;
+                                        active: root.active-kanji-section == idx;
+                                        clicked => {
+                                            root.active-kanji-section = idx;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                for name[idx] in root.kanji-section-names : HorizontalLayout {
+                                    padding-right: idx >= 2 ? 6px : 0px;
+                                    if idx >= 2 : FilterChip {
+                                        label: name;
+                                        active: root.active-kanji-section == idx;
+                                        clicked => {
+                                            root.active-kanji-section = idx;
+                                            help-scroll.viewport-y = 0px;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        Rectangle { height: 1px; background: MementoPalette.border; }
+            Rectangle { height: 1px; background: MementoPalette.border; }
 
-        // Tab Body
-        ScrollView {
-            vertical-stretch: 1;
+            // Centered Scrollable Tab Body (scrollbar width reserved)
+            help-scroll := ScrollView {
+                vertical-stretch: 1;
 
-            VerticalLayout {
-                width: min(parent.width - 12px, 920px);
-                padding-left: 20px;
-                padding-right: 20px;
-                padding-top: 16px;
-                padding-bottom: 24px;
-                spacing: 14px;
-                alignment: start;
+                Rectangle {
+                    width: max(0px, help-scroll.width - 12px);
+                    height: content-col.preferred-height;
 
-                // ── Tab 0: Overview & Syntax ───────────────────────────────
-                if root.active-tab == 0 : VerticalLayout {
-                    spacing: 14px;
+                    content-col := VerticalLayout {
+                        width: min(parent.width, 920px);
+                        x: (parent.width - self.width) / 2;
+                        padding-left: 20px;
+                        padding-right: 20px;
+                        padding-top: 16px;
+                        padding-bottom: 24px;
+                        spacing: 14px;
+                        alignment: start;
 
-                    SyntaxCard {
-                        title: "Basic Markers";
-                        badge: "{name}";
-                        body: "Wrap a marker name in curly braces inside any Anki field mapping. When Memento exports a card, each marker is replaced with live data from the active subtitle, lookup popup, or video frame.";
-                        examples: [
-                            "{expression}",
-                            "{furigana}",
-                            "{subtitle}",
-                            "{glossary}",
-                        ];
-                        copy-snippet(s) => { root.copy-marker(s); }
-                    }
+                        // ── Tab 0: Overview & Syntax ───────────────────────────────
+                        if root.active-tab == 0 : VerticalLayout {
+                            spacing: 14px;
 
-                    SyntaxCard {
-                        title: "Marker Arguments";
-                        badge: ": key = value";
-                        body: "Some markers accept arguments after a colon (:). Separate multiple arguments with commas (,). For example, you can target a single dictionary ID (shown in Options → Dictionary) or cap screenshot dimensions.";
-                        examples: [
-                            "{glossary : dict = 1}",
-                            "{frequencies : min-value = true, value-only = true}",
-                            "{screenshot : max-width = 1280, max-height = 720}",
-                            "{video : source = context, subtitles = false}",
-                        ];
-                        copy-snippet(s) => { root.copy-marker(s); }
-                    }
+                            SyntaxCard {
+                                title: "Basic Markers";
+                                badge: "{name}";
+                                body: "Wrap a marker name in curly braces inside any Anki field mapping. When Memento exports a card, each marker is replaced with live data from the active subtitle, lookup popup, or video frame.";
+                                examples: [
+                                    "{expression}",
+                                    "{furigana}",
+                                    "{subtitle}",
+                                    "{glossary}",
+                                ];
+                                copy-snippet(s) => { root.copy-marker(s); }
+                            }
 
-                    SyntaxCard {
-                        title: "Fallback Chains";
-                        badge: "a | b";
-                        body: "Separate alternatives with a pipe (|) to fall back gracefully when earlier values are empty. Evaluation stops at the first non-empty result — ideal for preferring selected glossary text or your clipboard before falling back to full definitions.";
-                        examples: [
-                            "{selection | clipboard}",
-                            "{selection | clipboard | glossary : dict = 1}",
-                            "{audio | audio-media}",
-                        ];
-                        copy-snippet(s) => { root.copy-marker(s); }
-                    }
+                            SyntaxCard {
+                                title: "Marker Arguments";
+                                badge: ": key = value";
+                                body: "Some markers accept arguments after a colon (:). Separate multiple arguments with commas (,). For example, you can target a single dictionary ID (shown in Options → Dictionary) or cap screenshot dimensions.";
+                                examples: [
+                                    "{glossary : dict = 1}",
+                                    "{frequencies : min-value = true, value-only = true}",
+                                    "{screenshot : max-width = 1280, max-height = 720}",
+                                    "{video : source = context, subtitles = false}",
+                                ];
+                                copy-snippet(s) => { root.copy-marker(s); }
+                            }
 
-                    SyntaxCard {
-                        title: "Context Selection & One-Click Presets";
-                        badge: "Tips";
-                        body: "Click or drag across rows in the Subtitle List drawer (or Shift-click a range) to mark multi-line context for {context}, {context-2}, {audio-context}, {video}, and {cloze-prefix}/{cloze-suffix}. Need a fast starting point? Use the one-click Lapis, Kiku, Senren, Animecards, or JPMN preset buttons right under Term Notes in Options → Anki Integration.";
-                        examples: [
-                            "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
-                            "{audio-context}",
-                        ];
-                        copy-snippet(s) => { root.copy-marker(s); }
-                    }
-                }
+                            SyntaxCard {
+                                title: "Fallback Chains";
+                                badge: "a | b";
+                                body: "Separate alternatives with a pipe (|) to fall back gracefully when earlier values are empty. Evaluation stops at the first non-empty result — ideal for preferring selected glossary text or your clipboard before falling back to full definitions.";
+                                examples: [
+                                    "{selection | clipboard}",
+                                    "{selection | clipboard | glossary : dict = 1}",
+                                    "{audio | audio-media}",
+                                ];
+                                copy-snippet(s) => { root.copy-marker(s); }
+                            }
 
-                // ── Tab 1: Term Markers ────────────────────────────────────
-                if root.active-tab == 1 : VerticalLayout {
-                    spacing: 18px;
-
-                    if root.term-sections.length == 0 : Rectangle {
-                        height: 80px;
-                        border-radius: 10px;
-                        background: MementoPalette.card-bg;
-                        border-width: 1px;
-                        border-color: MementoPalette.border;
-                        Text {
-                            text: "No term markers match \"" + root.search-query + "\".";
-                            color: MementoPalette.text-muted;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                            SyntaxCard {
+                                title: "Context Selection & One-Click Presets";
+                                badge: "Tips";
+                                body: "Click or drag across rows in the Subtitle List drawer (or Shift-click a range) to mark multi-line context for {context}, {context-2}, {audio-context}, {video}, and {cloze-prefix}/{cloze-suffix}. Need a fast starting point? Use the one-click Lapis, Kiku, Senren, Animecards, or JPMN preset buttons right under Term Notes in Options → Anki Integration.";
+                                examples: [
+                                    "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
+                                    "{audio-context}",
+                                ];
+                                copy-snippet(s) => { root.copy-marker(s); }
+                            }
                         }
-                    }
 
-                    for section[s-idx] in root.term-sections : VerticalLayout {
-                        spacing: 10px;
-                        visible: root.active-term-section == -1 || root.active-term-section == s-idx;
+                        // ── Tab 1: Term Markers ────────────────────────────────────
+                        if root.active-tab == 1 : VerticalLayout {
+                            spacing: 18px;
 
-                        if (root.active-term-section == -1 || root.active-term-section == s-idx) && section.markers.length > 0 : VerticalLayout {
-                            spacing: 10px;
-
-                            HorizontalLayout {
-                                spacing: 10px;
-                                alignment: start;
-                                Rectangle {
-                                    width: 3px;
-                                    height: 18px;
-                                    border-radius: 2px;
-                                    background: MementoPalette.cyan-accent;
-                                }
+                            if root.term-sections.length == 0 : Rectangle {
+                                height: 80px;
+                                border-radius: 10px;
+                                background: MementoPalette.card-bg;
+                                border-width: 1px;
+                                border-color: MementoPalette.card-border;
                                 Text {
-                                    text: section.title;
-                                    color: MementoPalette.text;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: "· " + section.subtitle;
+                                    text: "No term markers match \"" + root.search-query + "\".";
                                     color: MementoPalette.text-muted;
-                                    font-size: 12px;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
                                     vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
                                 }
                             }
 
-                            for marker in section.markers : MarkerCard {
-                                marker: marker;
-                                copy-marker(s) => { root.copy-marker(s); }
-                            }
-                        }
-                    }
-                }
-
-                // ── Tab 2: Kanji Markers ───────────────────────────────────
-                if root.active-tab == 2 : VerticalLayout {
-                    spacing: 18px;
-
-                    if root.kanji-sections.length == 0 : Rectangle {
-                        height: 80px;
-                        border-radius: 10px;
-                        background: MementoPalette.card-bg;
-                        border-width: 1px;
-                        border-color: MementoPalette.border;
-                        Text {
-                            text: "No kanji markers match \"" + root.search-query + "\".";
-                            color: MementoPalette.text-muted;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    for section[s-idx] in root.kanji-sections : VerticalLayout {
-                        spacing: 10px;
-                        visible: root.active-kanji-section == -1 || root.active-kanji-section == s-idx;
-
-                        if (root.active-kanji-section == -1 || root.active-kanji-section == s-idx) && section.markers.length > 0 : VerticalLayout {
-                            spacing: 10px;
-
-                            HorizontalLayout {
+                            for section[s-idx] in root.term-sections : VerticalLayout {
                                 spacing: 10px;
-                                alignment: start;
-                                Rectangle {
-                                    width: 3px;
-                                    height: 18px;
-                                    border-radius: 2px;
-                                    background: #14B8A6;
+                                visible: root.active-term-section == -1 || root.active-term-section == s-idx;
+
+                                if (root.active-term-section == -1 || root.active-term-section == s-idx) && section.markers.length > 0 : VerticalLayout {
+                                    spacing: 10px;
+
+                                    SectionHeader {
+                                        title: section.title;
+                                        subtitle: section.subtitle;
+                                        accent: MementoPalette.cyan-accent;
+                                    }
+
+                                    for marker in section.markers : MarkerCard {
+                                        marker: marker;
+                                        copy-marker(s) => { root.copy-marker(s); }
+                                    }
                                 }
+                            }
+                        }
+
+                        // ── Tab 2: Kanji Markers ───────────────────────────────────
+                        if root.active-tab == 2 : VerticalLayout {
+                            spacing: 18px;
+
+                            if root.kanji-sections.length == 0 : Rectangle {
+                                height: 80px;
+                                border-radius: 10px;
+                                background: MementoPalette.card-bg;
+                                border-width: 1px;
+                                border-color: MementoPalette.card-border;
                                 Text {
-                                    text: section.title;
-                                    color: MementoPalette.text;
-                                    font-size: 15px;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: "· " + section.subtitle;
+                                    text: "No kanji markers match \"" + root.search-query + "\".";
                                     color: MementoPalette.text-muted;
-                                    font-size: 12px;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
                                     vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
                                 }
                             }
 
-                            for marker in section.markers : MarkerCard {
-                                marker: marker;
-                                copy-marker(s) => { root.copy-marker(s); }
+                            for section[s-idx] in root.kanji-sections : VerticalLayout {
+                                spacing: 10px;
+                                visible: root.active-kanji-section == -1 || root.active-kanji-section == s-idx;
+
+                                if (root.active-kanji-section == -1 || root.active-kanji-section == s-idx) && section.markers.length > 0 : VerticalLayout {
+                                    spacing: 10px;
+
+                                    SectionHeader {
+                                        title: section.title;
+                                        subtitle: section.subtitle;
+                                        accent: MementoPalette.teal-border;
+                                    }
+
+                                    for marker in section.markers : MarkerCard {
+                                        marker: marker;
+                                        copy-marker(s) => { root.copy-marker(s); }
+                                    }
+                                }
                             }
                         }
                     }

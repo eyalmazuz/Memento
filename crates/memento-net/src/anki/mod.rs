@@ -44,8 +44,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use memento_anki::client::{
-    check_ankiconnect_version, format_endpoint_url, normalize_hostname,
-    validate_reply_json, validate_typed_result, ReplyValidation, TypedReplyKind,
+    check_ankiconnect_version, validate_typed_result, ReplyValidation, TypedReplyKind,
     TypedReplyStatus, VersionCheckResult,
 };
 
@@ -55,6 +54,10 @@ use crate::http::{HttpClient, HttpClientConfig, Request, Url};
 /// Mirrors `AnkiClient`'s `m_manager.setTransferTimeout(TIMEOUT)` with
 /// `TIMEOUT = 5000`.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Raised transfer timeout for bulk media uploads (`storeMediaFile` via
+/// `multi`) so large audio/video/image payloads do not hit the 5 s RPC default.
+pub const MEDIA_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Re-exported from the ported validation core (`ankiclient.cpp`'s
 /// `MIN_ANKICONNECT_VERSION`).
@@ -278,22 +281,44 @@ impl AnkiRequest
 
     /// Builds the JSON body exactly the way `AnkiClient::makeRequest` does:
     /// `action`, then `version: 6`, then an optional `key`, then an
-    /// optional `params` object.
-    pub fn to_json(&self) -> Value
+    /// optional `params` object, moving owned fields without cloning `params`.
+    pub fn to_json(self) -> Value
     {
-        let mut message = json!({
-            "action": self.action,
-            "version": self.version,
-        });
+        let mut message = serde_json::Map::with_capacity(4);
+        message.insert("action".to_owned(), Value::String(self.action));
+        message.insert("version".to_owned(), Value::from(self.version));
+        if let Some(key) = self.key
+        {
+            message.insert("key".to_owned(), Value::String(key));
+        }
+        if let Some(params) = self.params
+        {
+            message.insert("params".to_owned(), params);
+        }
+        Value::Object(message)
+    }
+
+    /// Serializes the request directly to JSON bytes by borrowing its fields
+    /// without cloning `params`.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error>
+    {
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(br#"{"action":"#);
+        serde_json::to_writer(&mut buf, &self.action)?;
+        buf.extend_from_slice(br#","version":"#);
+        serde_json::to_writer(&mut buf, &self.version)?;
         if let Some(key) = &self.key
         {
-            message["key"] = json!(key);
+            buf.extend_from_slice(br#","key":"#);
+            serde_json::to_writer(&mut buf, key)?;
         }
         if let Some(params) = &self.params
         {
-            message["params"] = params.clone();
+            buf.extend_from_slice(br#","params":"#);
+            serde_json::to_writer(&mut buf, params)?;
         }
-        message
+        buf.push(b'}');
+        Ok(buf)
     }
 }
 
@@ -311,6 +336,7 @@ impl AnkiClient
     {
         let config = HttpClientConfig {
             timeout: endpoint.timeout,
+            connect_timeout: endpoint.timeout,
             ..HttpClientConfig::default()
         };
         Self::with_transport(endpoint, HttpClient::new(config))
@@ -329,14 +355,12 @@ impl AnkiClient
         &self.endpoint
     }
 
-    /// `hostname:port` composition through the ported
-    /// `normalize_hostname` + `format_endpoint_url` (`makeRequest`
-    /// URL formation).
+    /// Composes the AnkiConnect endpoint URL from `hostname` and `port`,
+    /// wrapping bare IPv6 literals in `[...]`, preserving explicit schemes,
+    /// explicit ports in `hostname`, and paths/queries cleanly.
     pub fn endpoint_url(&self) -> String
     {
-        let normalized = normalize_hostname(&u16_of(&self.endpoint.hostname));
-        let port = self.endpoint.port.to_string();
-        String::from_utf16_lossy(&format_endpoint_url(&normalized, &u16_of(&port)))
+        compose_endpoint_url(&self.endpoint.hostname, self.endpoint.port)
     }
 
     fn endpoint_request(&self, action: AnkiAction, params: Option<Value>) -> AnkiResult<Request>
@@ -350,7 +374,8 @@ impl AnkiClient
         // `Url::parse` canonicalizes a pathless URL to `/`, while preserving
         // any path already present in the profile URL as Qt does.
         let url = Url::parse(&self.endpoint_url()).map_err(http_transport_err)?;
-        let body = serde_json::to_vec(&request.to_json())
+        let body = request
+            .to_json_bytes()
             .map_err(|err| AnkiError::Transport(err.to_string()))?;
         Ok(
             Request::post(url, body).header("Content-Type", "application/json"),
@@ -358,7 +383,7 @@ impl AnkiClient
     }
 
     /// One `makeRequest(processReply)` cycle: sends the action, validates
-    /// the frame with the ported validation, and returns the decoded
+    /// the frame directly on `serde_json::Value`, and returns the decoded
     /// `result` value.
     pub fn request(
         &self,
@@ -366,8 +391,21 @@ impl AnkiClient
         params: Option<Value>,
     ) -> AnkiResult<Value>
     {
+        self.request_with_timeout(action, params, None)
+    }
+
+    fn request_with_timeout(
+        &self,
+        action: AnkiAction,
+        params: Option<Value>,
+        timeout_override: Option<Option<Duration>>,
+    ) -> AnkiResult<Value>
+    {
         let request = self.endpoint_request(action, params)?;
-        let response = self.http.send(&request).map_err(anki_http_err)?;
+        let mut response = self
+            .http
+            .send_with_timeout(&request, timeout_override)
+            .map_err(anki_http_err)?;
         if !(200..300).contains(&response.status())
         {
             return Err(AnkiError::HttpStatus {
@@ -375,27 +413,12 @@ impl AnkiClient
                 reason: response.reason().to_owned(),
             });
         }
-        let mut response = response;
         let bytes = response
             .read_all(MAX_REPLY_BYTES)
             .map_err(anki_body_err)?;
         let frame: Value =
             serde_json::from_slice(&bytes).map_err(anki_json_err)?;
-
-        // Reuse the ported reply-shape validator over the UTF-16-shaped
-        // value it was authored against.
-        let qjson = to_qjson(&frame);
-        match validate_reply_json(&qjson)
-        {
-            ReplyValidation::Ok => Ok(frame
-                .get("result")
-                .cloned()
-                .unwrap_or(Value::Null)),
-            ReplyValidation::HasErrorString => {
-                Err(AnkiError::Remote(qt_string_of(frame.get("error"))))
-            }
-            status => Err(AnkiError::Frame(status)),
-        }
+        validate_reply_frame(frame)
     }
 
     /// `version` as a strictly numeric result (the `requestInt` shape).
@@ -547,8 +570,14 @@ impl AnkiClient
     /// `storeMediaFile` inside `multi` (the `addMedia` flow): the caller
     /// supplies pre-base64-encoded payloads (encoding is
     /// `memento-util`/`FileUtils::toBase64` business).
+    /// Short-circuits without touching the network when `files` is empty, and
+    /// raises the transfer timeout to at least [`MEDIA_UPLOAD_TIMEOUT`].
     pub fn store_media_files(&self, files: &[MediaFilePayload]) -> AnkiResult<Vec<String>>
     {
+        if files.is_empty()
+        {
+            return Ok(Vec::new());
+        }
         let actions: Vec<Value> = files
             .iter()
             .map(|file| {
@@ -562,8 +591,17 @@ impl AnkiClient
             })
             .collect();
         let params = json!({ "actions": actions });
-        let result = self
-            .request_typed(TypedReplyKind::AddMedia, AnkiAction::Multi, Some(params))?;
+        let media_timeout = self
+            .http
+            .config()
+            .timeout
+            .map(|configured| configured.max(MEDIA_UPLOAD_TIMEOUT));
+        let result = self.request_typed_with_timeout(
+            TypedReplyKind::AddMedia,
+            AnkiAction::Multi,
+            Some(params),
+            Some(media_timeout),
+        )?;
         as_string_list(&result)
             .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
     }
@@ -628,13 +666,133 @@ impl AnkiClient
         params: Option<Value>,
     ) -> AnkiResult<Value>
     {
-        let result = self.request(action, params)?;
+        self.request_typed_with_timeout(kind, action, params, None)
+    }
+
+    fn request_typed_with_timeout(
+        &self,
+        kind: TypedReplyKind,
+        action: AnkiAction,
+        params: Option<Value>,
+        timeout_override: Option<Option<Duration>>,
+    ) -> AnkiResult<Value>
+    {
+        let result = self.request_with_timeout(action, params, timeout_override)?;
         let status = typed_status(kind, &result);
         match status
         {
             TypedReplyStatus::Success | TypedReplyStatus::EmptySuccess => Ok(result),
             other => Err(AnkiError::Typed(other)),
         }
+    }
+}
+
+fn validate_reply_frame(frame: Value) -> AnkiResult<Value>
+{
+    match frame
+    {
+        Value::Null => Err(AnkiError::Frame(ReplyValidation::NotJson)),
+        Value::Object(mut obj) => {
+            if obj.len() != 2
+            {
+                return Err(AnkiError::Frame(ReplyValidation::UnexpectedFieldCount));
+            }
+            let Some(error_val) = obj.get("error")
+            else
+            {
+                return Err(AnkiError::Frame(ReplyValidation::MissingErrorField));
+            };
+            if !obj.contains_key("result")
+            {
+                return Err(AnkiError::Frame(ReplyValidation::MissingResultField));
+            }
+            if !error_val.is_null()
+            {
+                return Err(AnkiError::Remote(qt_string_of(Some(error_val))));
+            }
+            Ok(obj.remove("result").unwrap_or(Value::Null))
+        }
+        _ => Err(AnkiError::Frame(ReplyValidation::NotObject)),
+    }
+}
+
+fn compose_endpoint_url(hostname: &str, port: u16) -> String
+{
+    let raw = hostname.trim();
+    if raw.is_empty()
+    {
+        return format!("http://:{port}");
+    }
+
+    let (scheme, after_scheme) = match raw.find("://")
+    {
+        Some(idx) if !raw[..idx].contains(['/', '?', '#', '[', ']']) => {
+            (&raw[..idx], &raw[idx + 3..])
+        }
+        _ => ("http", raw),
+    };
+
+    let authority_end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let (authority, rest) = after_scheme.split_at(authority_end);
+
+    let (normalized_authority, has_explicit_port) = if authority.starts_with('[')
+    {
+        if let Some(close) = authority.rfind(']')
+        {
+            let tail = &authority[close + 1..];
+            if let Some(port_part) = tail.strip_prefix(':')
+            {
+                if port_part.is_empty()
+                {
+                    (authority[..=close].to_owned(), false)
+                }
+                else
+                {
+                    (authority.to_owned(), true)
+                }
+            }
+            else
+            {
+                (authority.to_owned(), false)
+            }
+        }
+        else
+        {
+            (authority.to_owned(), false)
+        }
+    }
+    else if authority.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        (format!("[{authority}]"), false)
+    }
+    else if let Some((host_part, port_part)) = authority.rsplit_once(':')
+    {
+        if !host_part.contains(':') && port_part.is_empty()
+        {
+            (host_part.to_owned(), false)
+        }
+        else if !host_part.contains(':')
+            && port_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            (authority.to_owned(), true)
+        }
+        else
+        {
+            (authority.to_owned(), false)
+        }
+    }
+    else
+    {
+        (authority.to_owned(), false)
+    };
+
+    if has_explicit_port
+    {
+        format!("{scheme}://{normalized_authority}{rest}")
+    }
+    else
+    {
+        format!("{scheme}://{normalized_authority}:{port}{rest}")
     }
 }
 
@@ -999,6 +1157,65 @@ mod tests {
             ..AnkiEndpoint::default()
         };
         assert_eq!(endpoint.api_key_sent(), Some(""));
+    }
+
+    #[test]
+    fn endpoint_url_handles_ipv6_explicit_port_scheme_and_path()
+    {
+        use super::AnkiClient;
+
+        let make = |hostname: &str, port: u16| {
+            AnkiClient::new(AnkiEndpoint {
+                hostname: hostname.to_owned(),
+                port,
+                ..AnkiEndpoint::default()
+            })
+            .endpoint_url()
+        };
+
+        assert_eq!(make("http://localhost", 8765), "http://localhost:8765");
+        assert_eq!(make("localhost", 8765), "http://localhost:8765");
+        assert_eq!(make("::1", 8765), "http://[::1]:8765");
+        assert_eq!(make("[::1]", 8765), "http://[::1]:8765");
+        assert_eq!(make("http://::1", 8765), "http://[::1]:8765");
+        assert_eq!(make("http://::1/anki", 8765), "http://[::1]:8765/anki");
+        assert_eq!(make("http://[::1]/anki", 8765), "http://[::1]:8765/anki");
+        assert_eq!(make("http://[::1]:9000/anki", 8765), "http://[::1]:9000/anki");
+        assert_eq!(make("https://anki.example.com/api", 8765), "https://anki.example.com:8765/api");
+        assert_eq!(make("http://localhost:9000/api?k=1", 8765), "http://localhost:9000/api?k=1");
+        assert_eq!(make("localhost:9000", 8765), "http://localhost:9000");
+        assert_eq!(make("http://localhost/", 8765), "http://localhost:8765/");
+        assert_eq!(make("http://localhost:", 8765), "http://localhost:8765");
+        assert_eq!(make("http://[::1]:", 8765), "http://[::1]:8765");
+    }
+
+    #[test]
+    fn anki_request_to_json_and_bytes_match()
+    {
+        use super::AnkiRequest;
+        let req = AnkiRequest {
+            action: "addNote".to_owned(),
+            version: 6,
+            key: Some("secret".to_owned()),
+            params: Some(json!({ "note": { "deckName": "Default" } })),
+        };
+        let bytes = req.to_json_bytes().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let owned = req.to_json();
+        assert_eq!(parsed, owned);
+    }
+
+    #[test]
+    fn empty_store_media_files_short_circuits_without_network()
+    {
+        use super::AnkiClient;
+        // Unreachable port 1: proves no HTTP request is issued.
+        let client = AnkiClient::new(AnkiEndpoint {
+            hostname: "http://127.0.0.1".to_owned(),
+            port: 1,
+            ..AnkiEndpoint::default()
+        });
+        assert_eq!(client.store_media_files(&[]).unwrap(), Vec::<String>::new());
     }
 
 }

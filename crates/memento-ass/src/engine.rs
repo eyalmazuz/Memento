@@ -10,7 +10,8 @@ use std::ptr;
 use crate::ffi;
 use crate::mkv::MkvFontAttachment;
 use crate::parser::{
-    build_probe_script, decode_color_id, AssDialogueLine, AssScriptInfo, ParsedChar, ParsedEvent,
+    build_clean_script_with_parsed, build_probe_script_with_parsed, decode_color_id,
+    AssDialogueLine, AssScriptInfo, ParsedChar, ParsedEvent, ParsedExtradata,
 };
 
 /// Mirrors `mpv`'s `--sub-ass-override` option.
@@ -420,25 +421,18 @@ pub struct AssFrameLayout {
     /// True if any active event has `\move(...)` or geometry-changing `\t(...)` requiring
     /// periodic re-probing while playing.
     pub has_animated_geometry: bool,
+    /// Precomputed topmost-first event indices (higher `Layer`, then later script order).
+    hit_order: Vec<usize>,
 }
 
 impl AssFrameLayout {
     /// Hit-test a coordinate in **framebuffer pixels** (`0..frame_w`, `0..frame_h`) in O(log N)
     /// per overlapping visual line, respecting ASS `Layer` + script draw order (topmost first).
     pub fn hit_test(&self, fx: f32, fy: f32) -> Option<AssHitTestResult> {
-        let mut order: Vec<usize> = (0..self.events.len()).collect();
-        // Higher Layer renders on top; on equal Layer, later script order renders on top.
-        order.sort_by(|&a, &b| {
-            let ea = &self.events[a];
-            let eb = &self.events[b];
-            eb.dialogue
-                .layer
-                .cmp(&ea.dialogue.layer)
-                .then_with(|| eb.event_index.cmp(&ea.event_index))
-        });
-
-        for ev_idx in order {
-            let ev = &self.events[ev_idx];
+        for &ev_idx in &self.hit_order {
+            let Some(ev) = self.events.get(ev_idx) else {
+                continue;
+            };
             if ev.is_drawing_only || ev.lines.is_empty() {
                 continue;
             }
@@ -476,8 +470,8 @@ impl AssFrameLayout {
             return None;
         }
 
-        // Visual lines are horizontally ordered along `hit_x1`: binary search in O(log N).
-        let rel_idx = slice.partition_point(|c| c.hit_x1 <= fx);
+        // Visual lines are strictly non-decreasing along `hit_x1`: binary search in O(log N).
+        let rel_idx = slice.partition_point(|c| c.hit_x1 < fx);
         let rel_idx = rel_idx.min(slice.len() - 1);
         let char_index = line.char_start + rel_idx;
         let c = &ev.chars[char_index];
@@ -663,7 +657,19 @@ impl RgbaPatch {
     }
 }
 
-/// Owns a `libass` `ASS_Library` + `ASS_Renderer` + cached clean `ASS_Track` for
+struct CachedProbe {
+    ass_full: String,
+    clean_ass: String,
+    valid_start_ms: i64,
+    valid_end_ms: i64,
+    script_info: AssScriptInfo,
+    events: Vec<ParsedEvent>,
+    total_probed_chars: usize,
+    color_id_map_len: usize,
+    probe_track: *mut ffi::ASS_Track,
+}
+
+/// Owns a `libass` `ASS_Library` + `ASS_Renderer` + cached clean/probe `ASS_Track`s for
 /// high-speed hitbox probing and highlight-patch rendering.
 pub struct AssLayoutEngine {
     library: *mut ffi::ASS_Library,
@@ -672,8 +678,13 @@ pub struct AssLayoutEngine {
     configured: bool,
     fonts_initialized: bool,
     loaded_font_count: usize,
+    cached_extradata_raw: String,
+    cached_extradata: Option<ParsedExtradata>,
     cached_clean_ass: String,
     cached_clean_track: *mut ffi::ASS_Track,
+    cached_probe: Option<CachedProbe>,
+    clean_matches_cached_probe: bool,
+    scratch_accum: Vec<f32>,
 }
 
 // SAFETY: `AssLayoutEngine` exclusively owns its `ASS_Library`, `ASS_Renderer`, and
@@ -689,7 +700,7 @@ impl AssLayoutEngine {
             if library.is_null() {
                 return Err("ass_library_init() returned NULL".to_string());
             }
-            ffi::ass_set_message_cb(library, Some(ffi::silent_message_cb), ptr::null_mut());
+            ffi::memento_ass_silence_library(library);
             ffi::ass_set_extract_fonts(library, 1);
 
             let renderer = ffi::ass_renderer_init(library);
@@ -707,8 +718,13 @@ impl AssLayoutEngine {
                 configured: false,
                 fonts_initialized: false,
                 loaded_font_count: 0,
+                cached_extradata_raw: String::new(),
+                cached_extradata: None,
                 cached_clean_ass: String::new(),
                 cached_clean_track: ptr::null_mut(),
+                cached_probe: None,
+                clean_matches_cached_probe: false,
+                scratch_accum: Vec::new(),
             };
             engine.apply_params_unconditional();
             Ok(engine)
@@ -732,7 +748,10 @@ impl AssLayoutEngine {
     /// rebuilt and reconfigured after registering the new font payloads.
     pub fn load_memory_fonts(&mut self, fonts: &[MkvFontAttachment]) -> Result<(), String> {
         unsafe {
-            self.clear_cached_clean_track();
+            self.clear_cached_tracks();
+            if self.scratch_accum.capacity() > 1024 * 1024 {
+                self.scratch_accum = Vec::new();
+            }
             if !self.renderer.is_null() {
                 ffi::ass_renderer_done(self.renderer);
                 self.renderer = ptr::null_mut();
@@ -848,6 +867,33 @@ impl AssLayoutEngine {
             self.cached_clean_track = ptr::null_mut();
         }
         self.cached_clean_ass.clear();
+        self.clean_matches_cached_probe = false;
+    }
+
+    fn clear_cached_probe(&mut self) {
+        if let Some(cp) = self.cached_probe.take() {
+            if !cp.probe_track.is_null() {
+                unsafe {
+                    ffi::ass_free_track(cp.probe_track);
+                }
+            }
+        }
+        self.clean_matches_cached_probe = false;
+    }
+
+    fn clear_cached_tracks(&mut self) {
+        self.clear_cached_probe();
+        self.clear_cached_clean_track();
+    }
+
+    fn ensure_parsed_extradata(&mut self, extradata: &str) -> &ParsedExtradata {
+        if self.cached_extradata.is_none() || self.cached_extradata_raw != extradata {
+            self.clear_cached_probe();
+            self.cached_extradata_raw.clear();
+            self.cached_extradata_raw.push_str(extradata);
+            self.cached_extradata = Some(ParsedExtradata::parse(extradata));
+        }
+        self.cached_extradata.as_ref().unwrap()
     }
 
     fn ensure_clean_track(&mut self, clean_ass: &str) -> Result<*mut ffi::ASS_Track, String> {
@@ -883,7 +929,8 @@ impl AssLayoutEngine {
 
     /// Run a single color-ID-instrumented `ass_render_frame` pass to compute exact
     /// per-event / per-character screen-space hitboxes, AND cache the matching clean
-    /// `ASS_Track` so subsequent hover [`render_highlight_patch`] calls run in ~0.1 ms.
+    /// `ASS_Track` (and probe `ASS_Track` for animated re-probes) so subsequent hover
+    /// [`render_highlight_patch`] and animated re-probe calls stay fast.
     ///
     /// - `extradata`: ASS header (`[Script Info]`, `[V4+ Styles]`, optional `[Events]`) or full `.ass`.
     /// - `ass_full`: Active `Dialogue:` lines (e.g. from `mpv`'s `sub-text/ass-full`). Pass `""`
@@ -898,21 +945,75 @@ impl AssLayoutEngine {
         if self.renderer.is_null() {
             return Err("libass renderer is not initialized".to_string());
         }
-        let probe = build_probe_script(extradata, ass_full, now_ms);
+        let now = now_ms.max(0);
+        let _ = self.ensure_parsed_extradata(extradata);
 
-        // Cache the clean track eagerly (fast & keeps subsequent highlight renders lock-free).
-        let _ = self.ensure_clean_track(&probe.clean_ass);
+        let cache_hit = self.cached_probe.as_ref().is_some_and(|cp| {
+            now >= cp.valid_start_ms
+                && now < cp.valid_end_ms
+                && cp.ass_full == ass_full
+        });
 
-        let mut raw_bboxes: Vec<Option<PixelRect>> = vec![None; probe.color_id_map.len()];
+        if !cache_hit {
+            self.clear_cached_probe();
+            let parsed = self.cached_extradata.as_ref().unwrap();
+            let probe = build_probe_script_with_parsed(parsed, extradata, ass_full, now_ms);
 
-        if probe.total_probed_chars > 0 {
-            let probe_track = self.read_track_from_str(&probe.probe_ass)?;
+            // Cache the clean track eagerly (fast & keeps subsequent highlight renders lock-free).
+            let _ = self.ensure_clean_track(&probe.clean_ass);
+
+            let probe_track = if probe.total_probed_chars > 0 {
+                self.read_track_from_str(&probe.probe_ass)?
+            } else {
+                ptr::null_mut()
+            };
+
+            let (valid_start_ms, valid_end_ms) = if ass_full.trim().is_empty() {
+                (now, now.saturating_add(1))
+            } else {
+                let mut vs = 0i64;
+                let mut ve = i64::MAX;
+                for ev in &probe.events {
+                    if ev.dialogue.start_ms <= now && now < ev.dialogue.end_ms {
+                        vs = vs.max(ev.dialogue.start_ms.max(0));
+                        ve = ve.min(ev.dialogue.end_ms);
+                    } else {
+                        vs = now;
+                        ve = now.saturating_add(1);
+                        break;
+                    }
+                }
+                (vs, ve)
+            };
+
+            self.cached_probe = Some(CachedProbe {
+                ass_full: ass_full.to_string(),
+                clean_ass: probe.clean_ass,
+                valid_start_ms,
+                valid_end_ms,
+                script_info: probe.script_info,
+                events: probe.events,
+                total_probed_chars: probe.total_probed_chars,
+                color_id_map_len: probe.color_id_map.len(),
+                probe_track,
+            });
+            self.clean_matches_cached_probe = !self.cached_clean_track.is_null();
+        } else if !self.clean_matches_cached_probe || self.cached_clean_track.is_null() {
+            let clean_ass = self.cached_probe.as_ref().unwrap().clean_ass.clone();
+            let _ = self.ensure_clean_track(&clean_ass);
+            self.clean_matches_cached_probe = !self.cached_clean_track.is_null();
+        }
+
+        let cp = self.cached_probe.as_ref().unwrap();
+        let mut raw_bboxes: Vec<Option<PixelRect>> = vec![None; cp.color_id_map_len];
+
+        if cp.total_probed_chars > 0 && !cp.probe_track.is_null() {
             let mut change: c_int = 0;
             unsafe {
                 let mut img = ffi::ass_render_frame(
                     self.renderer,
-                    probe_track,
-                    probe.probe_now_ms as libc::c_longlong,
+                    cp.probe_track,
+                    now as libc::c_longlong,
                     &mut change,
                 );
                 while !img.is_null() {
@@ -929,8 +1030,8 @@ impl AssLayoutEngine {
                             let rect = PixelRect {
                                 min_x: node.dst_x,
                                 min_y: node.dst_y,
-                                max_x: node.dst_x + node.w,
-                                max_y: node.dst_y + node.h,
+                                max_x: node.dst_x.saturating_add(node.w),
+                                max_y: node.dst_y.saturating_add(node.h),
                             };
                             raw_bboxes[idx] = Some(match raw_bboxes[idx] {
                                 Some(prev) => prev.union(rect),
@@ -940,16 +1041,15 @@ impl AssLayoutEngine {
                     }
                     img = node.next;
                 }
-                ffi::ass_free_track(probe_track);
             }
         }
 
         let mut combined_plain_text = String::new();
         let mut global_utf16_cursor: usize = 0;
-        let mut active_events = Vec::with_capacity(probe.events.len());
+        let mut active_events = Vec::with_capacity(cp.events.len());
         let mut any_animated = false;
 
-        for pe in probe.events {
+        for pe in &cp.events {
             if pe.has_animated_geometry {
                 any_animated = true;
             }
@@ -975,14 +1075,26 @@ impl AssLayoutEngine {
             active_events.push(ev);
         }
 
+        let mut hit_order: Vec<usize> = (0..active_events.len()).collect();
+        // Higher Layer renders on top; on equal Layer, later script order renders on top.
+        hit_order.sort_by(|&a, &b| {
+            let ea = &active_events[a];
+            let eb = &active_events[b];
+            eb.dialogue
+                .layer
+                .cmp(&ea.dialogue.layer)
+                .then_with(|| eb.event_index.cmp(&ea.event_index))
+        });
+
         Ok(AssFrameLayout {
             frame_w: self.params.frame_w,
             frame_h: self.params.frame_h,
-            now_ms: probe.probe_now_ms,
-            script_info: probe.script_info,
+            now_ms: now,
+            script_info: cp.script_info.clone(),
             events: active_events,
             combined_plain_text,
             has_animated_geometry: any_animated,
+            hit_order,
         })
     }
 
@@ -1010,7 +1122,7 @@ impl AssLayoutEngine {
     }
 
     /// Render a cropped straight-RGBA8 patch directly from `(extradata, ass_full)` (reusing the
-    /// cached clean track whenever unchanged).
+    /// cached parsed extradata and clean track whenever unchanged, without building a probe script).
     pub fn render_clean_patch(
         &mut self,
         extradata: &str,
@@ -1021,9 +1133,13 @@ impl AssLayoutEngine {
         if self.renderer.is_null() {
             return Err("libass renderer is not initialized".to_string());
         }
-        let probe = build_probe_script(extradata, ass_full, now_ms);
-        let track = self.ensure_clean_track(&probe.clean_ass)?;
-        Ok(self.render_track_patch(track, crop_rect, probe.probe_now_ms))
+        let now = now_ms.max(0);
+        let clean_ass = {
+            let parsed = self.ensure_parsed_extradata(extradata);
+            build_clean_script_with_parsed(parsed, extradata, ass_full, now_ms)
+        };
+        let track = self.ensure_clean_track(&clean_ass)?;
+        Ok(self.render_track_patch(track, crop_rect, now))
     }
 
     /// Render the full framebuffer (`frame_w × frame_h`) of `(extradata, ass_full)` as straight
@@ -1044,7 +1160,7 @@ impl AssLayoutEngine {
     }
 
     fn render_track_patch(
-        &self,
+        &mut self,
         track: *mut ffi::ASS_Track,
         crop_rect: AssHighlightRect,
         now_ms: i64,
@@ -1059,6 +1175,26 @@ impl AssLayoutEngine {
 
         let w = (x1 - x0) as u32;
         let h = (y1 - y0) as u32;
+        let Some(pixel_count) = (w as usize).checked_mul(h as usize) else {
+            return RgbaPatch {
+                x: x0 as u32,
+                y: y0 as u32,
+                width: 0,
+                height: 0,
+                rgba: Vec::new(),
+                has_visible_pixels: false,
+            };
+        };
+        let Some(accum_len) = pixel_count.checked_mul(4) else {
+            return RgbaPatch {
+                x: x0 as u32,
+                y: y0 as u32,
+                width: 0,
+                height: 0,
+                rgba: Vec::new(),
+                has_visible_pixels: false,
+            };
+        };
         if self.renderer.is_null() || w == 0 || h == 0 {
             return RgbaPatch {
                 x: x0 as u32,
@@ -1070,20 +1206,37 @@ impl AssLayoutEngine {
             };
         }
 
-        // Accumulate in premultiplied f32 RGBA for exact associative Porter-Duff SRC_OVER
-        // across shadow -> outline -> character ASS_Image layers.
-        let pixel_count = (w as usize) * (h as usize);
-        let mut accum = vec![0.0f32; pixel_count * 4];
-        let mut touched = false;
-
         let mut change: c_int = 0;
-        unsafe {
-            let mut img = ffi::ass_render_frame(
+        let first_img = unsafe {
+            ffi::ass_render_frame(
                 self.renderer,
                 track,
                 now_ms as libc::c_longlong,
                 &mut change,
-            );
+            )
+        };
+        if first_img.is_null() {
+            return RgbaPatch {
+                x: x0 as u32,
+                y: y0 as u32,
+                width: w,
+                height: h,
+                rgba: vec![0u8; accum_len],
+                has_visible_pixels: false,
+            };
+        }
+
+        // Accumulate in premultiplied f32 RGBA using the engine's reusable scratch buffer
+        // for exact associative Porter-Duff SRC_OVER across shadow -> outline -> character layers.
+        if self.scratch_accum.len() < accum_len {
+            self.scratch_accum.resize(accum_len, 0.0);
+        }
+        let accum = &mut self.scratch_accum[..accum_len];
+        accum.fill(0.0);
+        let mut touched = false;
+
+        unsafe {
+            let mut img = first_img;
             while !img.is_null() {
                 let node = &*img;
                 if node.w > 0 && node.h > 0 && node.stride >= node.w && !node.bitmap.is_null() {
@@ -1091,8 +1244,8 @@ impl AssLayoutEngine {
                     if col_alpha > 0 {
                         let ix0 = node.dst_x.max(x0);
                         let iy0 = node.dst_y.max(y0);
-                        let ix1 = (node.dst_x + node.w).min(x1);
-                        let iy1 = (node.dst_y + node.h).min(y1);
+                        let ix1 = node.dst_x.saturating_add(node.w).min(x1);
+                        let iy1 = node.dst_y.saturating_add(node.h).min(y1);
 
                         if ix0 < ix1 && iy0 < iy1 {
                             let sr = ((node.color >> 24) & 0xFF) as f32 / 255.0;
@@ -1126,7 +1279,7 @@ impl AssLayoutEngine {
             }
         }
 
-        let mut rgba = vec![0u8; pixel_count * 4];
+        let mut rgba = vec![0u8; accum_len];
         let mut has_visible_pixels = false;
         if touched {
             for i in 0..pixel_count {
@@ -1162,7 +1315,7 @@ impl AssLayoutEngine {
 impl Drop for AssLayoutEngine {
     fn drop(&mut self) {
         // Strict libass destruction order: Track -> Renderer -> Library.
-        self.clear_cached_clean_track();
+        self.clear_cached_tracks();
         unsafe {
             if !self.renderer.is_null() {
                 ffi::ass_renderer_done(self.renderer);
@@ -1218,13 +1371,17 @@ impl PixelRect {
         (self.max_y - self.min_y).max(0) as f32
     }
 
+    fn center_x(self) -> f32 {
+        (self.min_x as f32 + self.max_x as f32) * 0.5
+    }
+
     fn center_y(self) -> f32 {
-        (self.min_y + self.max_y) as f32 * 0.5
+        (self.min_y as f32 + self.max_y as f32) * 0.5
     }
 }
 
 fn build_active_event(
-    pe: ParsedEvent,
+    pe: &ParsedEvent,
     raw_bboxes: &[Option<PixelRect>],
     global_byte_offset: usize,
     global_utf16_offset: usize,
@@ -1232,29 +1389,35 @@ fn build_active_event(
     frame_h: u32,
 ) -> AssActiveEvent {
     // 1. Group characters into visual lines (explicit \N splits + auto-wrap detection).
-    let mut line_groups: Vec<Vec<(ParsedChar, Option<PixelRect>)>> = Vec::new();
-    let mut cur_group: Vec<(ParsedChar, Option<PixelRect>)> = Vec::new();
+    let mut line_groups: Vec<Vec<(&ParsedChar, Option<PixelRect>)>> = Vec::new();
+    let mut cur_group: Vec<(&ParsedChar, Option<PixelRect>)> = Vec::new();
 
     let mut cur_explicit_line: Option<u16> = None;
     let mut cur_ink_min_y: i32 = i32::MAX;
     let mut cur_ink_max_y: i32 = i32::MIN;
+    let mut cur_first_ink_min_x: Option<i32> = None;
     let mut cur_last_ink_min_x: Option<i32> = None;
+    let mut cur_last_ink_max_x: Option<i32> = None;
     let mut cur_ink_y_sum: f32 = 0.0;
     let mut cur_ink_count: usize = 0;
 
     let reset_line_stats = |min_y: &mut i32,
                             max_y: &mut i32,
-                            last_x: &mut Option<i32>,
+                            first_x: &mut Option<i32>,
+                            last_min_x: &mut Option<i32>,
+                            last_max_x: &mut Option<i32>,
                             y_sum: &mut f32,
                             count: &mut usize| {
         *min_y = i32::MAX;
         *max_y = i32::MIN;
-        *last_x = None;
+        *first_x = None;
+        *last_min_x = None;
+        *last_max_x = None;
         *y_sum = 0.0;
         *count = 0;
     };
 
-    for pc in pe.chars {
+    for pc in &pe.chars {
         let bbox = if pc.color_id >= 1 && (pc.color_id as usize) <= raw_bboxes.len() {
             raw_bboxes[(pc.color_id - 1) as usize]
         } else {
@@ -1267,9 +1430,24 @@ fn build_active_event(
                 let line_h = (cur_ink_max_y - cur_ink_min_y).max(1) as f32;
                 let line_cy = cur_ink_y_sum / cur_ink_count as f32;
                 let disjoint_vert = b.min_y >= cur_ink_max_y - 1 || b.max_y <= cur_ink_min_y + 1;
-                let wrapped_left = cur_last_ink_min_x.is_some_and(|lx| b.min_x < lx)
-                    && (b.center_y() - line_cy).abs() > line_h * 0.65;
-                disjoint_vert || wrapped_left
+                let wrapped_vert = disjoint_vert || (b.center_y() - line_cy).abs() > line_h * 0.65;
+                // Require horizontal line-wrap reversal alongside vertical separation so
+                // punctuation sitting purely in the ascender/descender band (e.g. apostrophes,
+                // quotes, periods, ellipses, underscores) never falsely splits a horizontal line.
+                let is_rtl_line = matches!(
+                    (cur_first_ink_min_x, cur_last_ink_min_x),
+                    (Some(fx), Some(lx)) if cur_ink_count >= 2 && lx < fx
+                );
+                let moved_to_new_line_x = if is_rtl_line {
+                    cur_last_ink_max_x.is_some_and(|last_rx| b.max_x > last_rx)
+                } else {
+                    let last_cx = match (cur_last_ink_min_x, cur_last_ink_max_x) {
+                        (Some(lx), Some(rx)) => Some((lx as f32 + rx as f32) * 0.5),
+                        _ => None,
+                    };
+                    last_cx.is_some_and(|lcx| b.center_x() <= lcx)
+                };
+                moved_to_new_line_x && wrapped_vert
             } else {
                 false
             }
@@ -1282,7 +1460,9 @@ fn build_active_event(
             reset_line_stats(
                 &mut cur_ink_min_y,
                 &mut cur_ink_max_y,
+                &mut cur_first_ink_min_x,
                 &mut cur_last_ink_min_x,
+                &mut cur_last_ink_max_x,
                 &mut cur_ink_y_sum,
                 &mut cur_ink_count,
             );
@@ -1292,7 +1472,11 @@ fn build_active_event(
         if let Some(b) = bbox {
             cur_ink_min_y = cur_ink_min_y.min(b.min_y);
             cur_ink_max_y = cur_ink_max_y.max(b.max_y);
+            if cur_first_ink_min_x.is_none() {
+                cur_first_ink_min_x = Some(b.min_x);
+            }
             cur_last_ink_min_x = Some(b.min_x);
+            cur_last_ink_max_x = Some(b.max_x);
             cur_ink_y_sum += b.center_y();
             cur_ink_count += 1;
         }
@@ -1409,7 +1593,7 @@ fn build_active_event(
         // then partition inter-character gaps at midpoints so hit-testing is O(log N) and gapless.
         let is_monotonic = line_chars
             .windows(2)
-            .all(|pair| pair[0].x + pair[0].w * 0.5 <= pair[1].x + pair[1].w * 0.5 + 1.0);
+            .all(|pair| pair[0].x + pair[0].w * 0.5 <= pair[1].x + pair[1].w * 0.5);
         if !is_monotonic {
             line_chars.sort_by(|a, b| {
                 let ca = a.x + a.w * 0.5;
@@ -1426,11 +1610,22 @@ fn build_active_event(
             if idx + 1 < n {
                 let right_cur = line_chars[idx].x + line_chars[idx].w;
                 let left_next = line_chars[idx + 1].x;
-                let mid = (right_cur + left_next) * 0.5;
+                let raw_mid = if right_cur <= left_next {
+                    (right_cur + left_next) * 0.5
+                } else {
+                    let center_cur = line_chars[idx].x + line_chars[idx].w * 0.5;
+                    let center_next = line_chars[idx + 1].x + line_chars[idx + 1].w * 0.5;
+                    (center_cur + center_next) * 0.5
+                };
+                // Enforce the non-decreasing `hit_x1` invariant required by `partition_point`.
+                let mid = raw_mid.max(line_chars[idx].hit_x0);
                 line_chars[idx].hit_x1 = mid;
                 line_chars[idx + 1].hit_x0 = mid;
             } else {
-                line_chars[idx].hit_x1 = hitbox.right().max(line_chars[idx].x + line_chars[idx].w);
+                line_chars[idx].hit_x1 = hitbox
+                    .right()
+                    .max(line_chars[idx].x + line_chars[idx].w)
+                    .max(line_chars[idx].hit_x0);
             }
         }
 
@@ -1455,8 +1650,8 @@ fn build_active_event(
 
     AssActiveEvent {
         event_index: pe.event_index,
-        dialogue: pe.dialogue,
-        plain_text: pe.plain_text,
+        dialogue: pe.dialogue.clone(),
+        plain_text: pe.plain_text.clone(),
         global_byte_offset,
         global_utf16_offset,
         chars: all_chars,
@@ -1587,5 +1782,139 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 0 100 100 0 
         let snapped = layout.highlight_rects_for_byte_span(0, 1, 5);
         assert_eq!(snapped.len(), 1);
         assert!(engine.read_track_from_str("").is_err());
+    }
+
+    #[test]
+    fn punctuation_does_not_falsely_split_line_and_hit_x1_stays_monotonic() {
+        let make_char = |ch: char, idx: usize, cid: u32| ParsedChar {
+            ch,
+            byte_offset: idx,
+            utf16_offset: idx,
+            utf16_len: 1,
+            color_id: cid,
+            explicit_line_idx: 0,
+            is_whitespace: false,
+        };
+        let make_dialogue = |text: &str| AssDialogueLine {
+            layer: 0,
+            start_ms: 0,
+            end_ms: 5_000,
+            style: "Default".to_string(),
+            name: String::new(),
+            margin_l: 0,
+            margin_r: 0,
+            margin_v: 0,
+            effect: String::new(),
+            raw_text: text.to_string(),
+        };
+
+        // 1. "won't": lowercase 'w','o','n' sit in x-height [966..990], apostrophe '\'' sits in
+        //    ascender zone [950..960] (vertically disjoint!), 't' spans [952..990].
+        //    Must stay on ONE visual line (no false wrap split!).
+        let text = "won't";
+        let chars: Vec<ParsedChar> = text
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| make_char(ch, i, (i + 1) as u32))
+            .collect();
+        let pe = ParsedEvent {
+            event_index: 0,
+            dialogue: make_dialogue(text),
+            plain_text: text.to_string(),
+            chars,
+            is_drawing_only: false,
+            has_animated_geometry: false,
+            is_rotated_or_sign: false,
+            has_explicit_pos: false,
+        };
+        let bboxes = vec![
+            Some(PixelRect { min_x: 100, min_y: 966, max_x: 120, max_y: 990 }), // w
+            Some(PixelRect { min_x: 122, min_y: 966, max_x: 138, max_y: 990 }), // o
+            Some(PixelRect { min_x: 140, min_y: 966, max_x: 156, max_y: 990 }), // n
+            Some(PixelRect { min_x: 158, min_y: 950, max_x: 164, max_y: 960 }), // '
+            Some(PixelRect { min_x: 166, min_y: 952, max_x: 178, max_y: 990 }), // t
+        ];
+        let ev = build_active_event(&pe, &bboxes, 0, 0, 1920, 1080);
+        assert_eq!(ev.lines.len(), 1, "apostrophe must not falsely split 'won't' into 2 lines");
+
+        // 2. Overlapping / kerned glyphs ("f's"): 'f' [10..30] (c=20), '\'' [26..28] (c=27),
+        //    's' [22..34] (c=28). `hit_x1` must be strictly non-decreasing so `partition_point`
+        //    always hits every character at its center!
+        let text2 = "f's";
+        let chars2: Vec<ParsedChar> = text2
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| make_char(ch, i, (i + 1) as u32))
+            .collect();
+        let pe2 = ParsedEvent {
+            event_index: 0,
+            dialogue: make_dialogue(text2),
+            plain_text: text2.to_string(),
+            chars: chars2,
+            is_drawing_only: false,
+            has_animated_geometry: false,
+            is_rotated_or_sign: false,
+            has_explicit_pos: false,
+        };
+        let bboxes2 = vec![
+            Some(PixelRect { min_x: 10, min_y: 100, max_x: 30, max_y: 140 }), // f
+            Some(PixelRect { min_x: 26, min_y: 100, max_x: 28, max_y: 112 }), // '
+            Some(PixelRect { min_x: 22, min_y: 115, max_x: 34, max_y: 140 }), // s
+        ];
+        let ev2 = build_active_event(&pe2, &bboxes2, 0, 0, 1920, 1080);
+        assert_eq!(ev2.lines.len(), 1);
+        for pair in ev2.chars.windows(2) {
+            assert!(
+                pair[0].hit_x1 <= pair[1].hit_x1,
+                "hit_x1 must be monotonic: {} > {}",
+                pair[0].hit_x1,
+                pair[1].hit_x1
+            );
+            assert!(pair[0].hit_x0 <= pair[0].hit_x1);
+        }
+        let layout = AssFrameLayout {
+            frame_w: 1920,
+            frame_h: 1080,
+            now_ms: 1_000,
+            script_info: AssScriptInfo::default(),
+            events: vec![ev2],
+            combined_plain_text: text2.to_string(),
+            has_animated_geometry: false,
+            hit_order: vec![0],
+        };
+        for c in &layout.events[0].chars {
+            let hit = layout
+                .hit_test(c.x + c.w * 0.5, 120.0)
+                .expect("center hit");
+            assert_eq!(hit.ch, c.ch);
+        }
+    }
+
+    #[test]
+    fn animated_probe_cache_tracks_movement_and_clean_patch_works() {
+        let mut engine = AssLayoutEngine::new().expect("libass init");
+        engine.configure(&MpvAssParams::for_frame(1280, 720));
+
+        let ass_full = "Dialogue: 0,0:00:05.00,0:00:10.00,Default,,0,0,0,,{\\move(100,300,700,300,0,5000)}移動テスト";
+        let l1 = engine
+            .probe_active_events(SAMPLE_HEADER, ass_full, 5_500)
+            .expect("probe t1");
+        let l2 = engine
+            .probe_active_events(SAMPLE_HEADER, ass_full, 9_500)
+            .expect("probe t2 (cached probe_track)");
+        assert!(l1.has_animated_geometry && l2.has_animated_geometry);
+        let b1 = l1.events[0].bounds.expect("b1");
+        let b2 = l2.events[0].bounds.expect("b2");
+        assert!(
+            b2.x > b1.x + 100.0,
+            "expected \\move to advance x across cached probes: b1.x={}, b2.x={}",
+            b1.x,
+            b2.x
+        );
+
+        let patch = engine
+            .render_clean_patch(SAMPLE_HEADER, ass_full, b2, 9_500)
+            .expect("render_clean_patch");
+        assert!(patch.has_visible_pixels);
     }
 }

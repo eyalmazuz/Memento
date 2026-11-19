@@ -23,10 +23,8 @@
 //! `structuredrichtext_p.h` (L1354-1392) and the
 //! `DictionaryStyles::candidateRuleIndexes(tag, childIndex)` lookup chain.
 
-use std::collections::HashMap;
-
 use crate::element::ParsedStylesheet;
-use crate::qstring::{c_double, is_pcre_space, starts_with_ascii_ci};
+use crate::qstring::{c_double, is_pcre_space, strip_prefix_ascii_ci};
 
 /// Set of supported structured content tags (structuredrichtext_p.h
 /// L1357-1361). QSet membership only; sorted for `binary_search` - iteration
@@ -96,46 +94,40 @@ pub(crate) const SUPPORTED_CSS_PROPERTIES: &[&str] = &[
     "word-spacing",
 ];
 
-/// CSS functions that are supported by Qt rich text
-/// (structuredrichtext_p.h L1389-1392), sorted for `binary_search`.
-pub(crate) const SUPPORTED_CSS_FUNCTIONS: &[&str] = &["hsl", "hsla", "rgb", "rgba"];
-
-pub(crate) fn is_supported_css_function(function_name: &str) -> bool {
-    SUPPORTED_CSS_FUNCTIONS.binary_search(&function_name).is_ok()
+#[inline]
+pub(crate) fn is_supported_css_function_ascii_ci(function_name: &str) -> bool {
+    function_name.eq_ignore_ascii_case("rgb")
+        || function_name.eq_ignore_ascii_case("rgba")
+        || function_name.eq_ignore_ascii_case("hsl")
+        || function_name.eq_ignore_ascii_case("hsla")
 }
 
+#[inline]
 pub(crate) fn is_supported_css_property(property: &str) -> bool {
     SUPPORTED_CSS_PROPERTIES.binary_search(&property).is_ok()
 }
 
+#[inline]
 pub(crate) fn is_supported_structured_tag(tag: &str) -> bool {
     SUPPORTED_TAGS.binary_search(&tag).is_ok()
 }
 
-/// PCRE2 `\w` (no Unicode-properties option): `[A-Za-z0-9_]`.
-///
-/// PORT-NOTE: `qstring::is_pcre_word_char` additionally classifies '-' as a
-/// word character, diverging from PCRE2. For `\b([A-Za-z-]+)\s*\(` that
-/// changes which start positions pass the `\b` assertion (e.g. a capture may
-/// begin at a '-' preceded by a word character). The pattern is mirrored
-/// here with the genuine PCRE2 `\w` definition.
+/// ASCII word byte (`[A-Za-z0-9_]`) for CSS function-name word boundaries.
 #[inline]
 fn is_pcre2_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The captures of `\b([A-Za-z-]+)\s*\(` (`m_cssFunctionRegex`,
-/// structuredrichtext_p.h L1384-1387) applied globally.
+/// Check whether `text` contains any CSS function capture matching
+/// `\b([A-Za-z-]+)\s*\(` (`m_cssFunctionRegex`, structuredrichtext_p.h
+/// L1384-1387) whose name is not a supported CSS function.
 ///
-/// PORT-NOTE: hand-rolled PCRE2-equivalent scan. One pattern iteration is a
-/// `\b` boundary at the capture start, a greedy `[A-Za-z-]+` run that may
-/// backtrack to shorter lengths, then `\s*` and a literal '('; successive
-/// global matches never overlap (scanning resumes after the whole match).
-/// Greedy backtracking order is reproduced by trying capture ends from
-/// longest to shortest.
-pub(crate) fn css_function_captures(text: &str) -> Vec<String> {
+/// Fast-paths `!text.contains('(')` and allocates nothing on the hot path.
+pub(crate) fn has_unsupported_css_function(text: &str) -> bool {
+    if !text.contains('(') {
+        return false;
+    }
     let bytes = text.as_bytes();
-    let mut captures = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         /* `\b` at position i: exactly one of the sides is a PCRE2 `\w` char
@@ -164,7 +156,9 @@ pub(crate) fn css_function_captures(text: &str) -> Vec<String> {
                 probe += 1;
             }
             if probe < bytes.len() && bytes[probe] == b'(' {
-                captures.push(text[i..capture_end].to_string());
+                if !is_supported_css_function_ascii_ci(&text[i..capture_end]) {
+                    return true;
+                }
                 i = probe + 1;
                 matched = true;
                 break;
@@ -174,7 +168,7 @@ pub(crate) fn css_function_captures(text: &str) -> Vec<String> {
             i += 1;
         }
     }
-    captures
+    false
 }
 
 /// Manual equivalent of the trailing percentage regexes
@@ -183,17 +177,8 @@ pub(crate) fn css_function_captures(text: &str) -> Vec<String> {
 /// `\s+[0-9]+(?:\.[0-9]+)?%\s*$` (L818-820, `COLOR_STOP`, no capture).
 ///
 /// Returns the whole-match start - the PCRE2 `capturedStart()`, i.e. the
-/// beginning of the required whitespace run (leftmost start wins - and the
-/// captured number slice. `capture` selects which of the two patterns is
-/// mirrored; the match positions are identical.
-///
-/// PORT-NOTE: with PCRE2 defaults (no `PCRE2_DOLLAR_ENDONLY`), `$` also
-/// matches just before a final newline. Both callers pass
-/// `QString::trimmed()` results (`colorValue = arguments[i].trimmed()`,
-/// L715/L816), which cannot end in '\n', so treating `$` as end-of-subject
-/// only is behavior-classified equivalent here. `\s` and `\d` are the ASCII
-/// PCRE2 classes. The `\.[0-9]+` branch requires fraction digits when a dot
-/// participates, and the leading `[0-9]+` requires a digit before it.
+/// beginning of the required whitespace run (leftmost start wins) - and the
+/// captured number slice.
 pub(crate) fn match_trailing_percentage(text: &str, capture: bool) -> Option<(usize, &str)> {
     let bytes = text.as_bytes();
     let _ = capture;
@@ -210,7 +195,7 @@ pub(crate) fn match_trailing_percentage(text: &str, capture: bool) -> Option<(us
      * offset, so the number occupies [start, end) when complete. */
     let end = pos - 1;
     let mut j = end;
-    while j > 0 && (bytes[j - 1] as char).is_ascii_digit() {
+    while j > 0 && bytes[j - 1].is_ascii_digit() {
         j -= 1;
     }
     if end > j && j > 0 && bytes[j - 1] == b'.' {
@@ -218,7 +203,7 @@ pub(crate) fn match_trailing_percentage(text: &str, capture: bool) -> Option<(us
          * digits were read above; the leading [0-9]+ still needs a digit. */
         j -= 1;
         let integer_digits_end = j;
-        while j > 0 && (bytes[j - 1] as char).is_ascii_digit() {
+        while j > 0 && bytes[j - 1].is_ascii_digit() {
             j -= 1;
         }
         if j == integer_digits_end {
@@ -247,18 +232,10 @@ pub(crate) fn match_trailing_percentage(text: &str, capture: bool) -> Option<(us
 /// `^calc\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))([a-z%]+)\s*/\s*([+-]?(?:\d+(?:
 /// \.\d*)?|\.\d+))\s*\)$` with `QRegularExpression::CaseInsensitiveOption`
 /// (so `[a-z%]` also accepts `A-Z`). Returns (number, unit, denominator).
-///
-/// PORT-NOTE: byte-level scanner over the UTF-8 representation; `\s`/`\d`
-/// are the ASCII PCRE2 classes; `^`/`$` are end-of-subject anchors (values
-/// passed here are sliced call substrings that end in ')'). The greedy
-/// `[a-z%]+` unit stops at the first non-member byte; the class is disjoint
-/// from the number grammar, so no backtracking interaction exists.
 pub(crate) fn match_calc_division(value: &str) -> Option<(f64, String, f64)> {
-    if !starts_with_ascii_ci(value, "calc(") {
-        return None;
-    }
-    let bytes = value.as_bytes();
-    let mut pos = 5usize; /* "calc(" */
+    let rest = strip_prefix_ascii_ci(value, "calc(")?;
+    let bytes = rest.as_bytes();
+    let mut pos = 0usize;
     while pos < bytes.len() && is_pcre_space(bytes[pos] as char) {
         pos += 1;
     }
@@ -278,7 +255,7 @@ pub(crate) fn match_calc_division(value: &str) -> Option<(f64, String, f64)> {
     if pos == unit_start {
         return None;
     }
-    let unit = value[unit_start..pos].to_string();
+    let unit = rest[unit_start..pos].to_string();
 
     while pos < bytes.len() && is_pcre_space(bytes[pos] as char) {
         pos += 1;
@@ -341,27 +318,21 @@ fn scan_pcre_number(bytes: &[u8], mut pos: usize) -> Option<(f64, usize)> {
         }
     }
     let end = pos;
-    /* The scanned bytes are ASCII, so the byte slice is valid UTF-8 and the
-     * value conversion matches QString::toDouble on the same capture. */
-    let number = c_double(&String::from_utf8_lossy(&bytes[start..end]))?;
+    /* The scanned bytes are pure ASCII, so `from_utf8` always succeeds without allocation. */
+    let slice = std::str::from_utf8(&bytes[start..end]).ok()?;
+    let number = c_double(slice)?;
     Some((number, end))
 }
 
 /// Candidates for `DictionaryStyles::candidateRuleIndexes(tag, childIndex)`
 /// (dictionarystyles.cpp L81-104).
 ///
-/// SEAM: stylesheet producers must seed the `""` key entries exactly the way
-/// dictionarystyles_parser.cpp does.
+/// The returned slice borrows only `stylesheet`, allowing callers to iterate
+/// without cloning into a `Vec`.
 pub fn candidate_rule_indexes_for<'a>(
     stylesheet: &'a ParsedStylesheet,
-    tag: &'a str,
+    tag: &str,
     child_index: i64,
 ) -> &'a [usize] {
     stylesheet.candidate_rule_indexes_for_child(tag, child_index)
 }
-
-/// Referenced to keep `HashMap` listed for the ParsedStylesheet maps layout:
-/// the stylesheet index maps are hash maps that are only ever keyed by tag or
-/// child index, never iterated by this engine (see element.rs doc comments).
-#[allow(dead_code)]
-type StylesheetIndexMapShape = HashMap<String, Vec<usize>>;

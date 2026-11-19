@@ -1,20 +1,27 @@
 //! Manga OCR runtime for normalized player selections.
 //!
-//! Model loading and inference run on a dedicated worker thread. Its callback
-//! is posted to Slint's event loop, so callers can update UI state directly.
+//! Runtime library loading, model loading, and inference happen lazily on a
+//! dedicated worker thread started on the first OCR trigger. A single-slot
+//! latest-wins queue drops stale frames so 4K RGBA captures never accumulate.
+//! Results are posted back to Slint's event loop so callers can update UI state
+//! directly.
 
 use libloading::Library;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
 use std::fmt;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::mpsc::{self, Sender};
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
-use memento_util::ocrutils::{map_ocr_region, OcrRegionStatus};
+use memento_util::ocrutils::{map_ocr_region, resolve_venv_python_str, OcrRegionStatus};
 
 const MOCR_MODE_RGBA: c_int = 4;
 const OCR_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+static OCR_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct MocrContextOpaque {
@@ -26,6 +33,35 @@ type MocrDestroy = unsafe extern "C" fn(*mut MocrContextOpaque) -> c_int;
 type MocrRead =
     unsafe extern "C" fn(*mut MocrContextOpaque, *const c_void, usize, usize, c_int) -> *mut c_char;
 type MocrFree = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+#[cfg(target_os = "macos")]
+fn python_library_candidates() -> &'static [&'static str] {
+    &[
+        "libpython3.14.dylib",
+        "libpython3.13.dylib",
+        "libpython3.12.dylib",
+        "libpython3.11.dylib",
+        "libpython3.10.dylib",
+        "libpython3.dylib",
+    ]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn python_library_candidates() -> &'static [&'static str] {
+    &[
+        "libpython3.14.so.1.0",
+        "libpython3.14.so",
+        "libpython3.13.so.1.0",
+        "libpython3.13.so",
+        "libpython3.12.so.1.0",
+        "libpython3.12.so",
+        "libpython3.11.so.1.0",
+        "libpython3.11.so",
+        "libpython3.10.so.1.0",
+        "libpython3.10.so",
+        "libpython3.so",
+    ]
+}
 
 struct MocrApi {
     // Keep libmocr loaded until every context and returned text is released,
@@ -44,7 +80,11 @@ impl MocrApi {
         #[cfg(target_os = "linux")]
         let candidates = ["/usr/local/lib/libmocr.so", "libmocr.so"];
         #[cfg(target_os = "macos")]
-        let candidates = ["/usr/local/lib/libmocr.dylib", "libmocr.dylib"];
+        let candidates = [
+            "/usr/local/lib/libmocr.dylib",
+            "/opt/homebrew/lib/libmocr.dylib",
+            "libmocr.dylib",
+        ];
         #[cfg(target_os = "windows")]
         let candidates = ["libmocr.dll", "mocr.dll"];
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -58,13 +98,7 @@ impl MocrApi {
         #[cfg(unix)]
         let python_library = {
             let mut loaded = None;
-            for py_name in [
-                "libpython3.14.so.1.0",
-                "libpython3.14.so",
-                "libpython3.13.so.1.0",
-                "libpython3.13.so",
-                "libpython3.so",
-            ] {
+            for py_name in python_library_candidates() {
                 if let Ok(lib) = unsafe {
                     libloading::os::unix::Library::open(
                         Some(py_name),
@@ -111,7 +145,9 @@ impl MocrApi {
                         free,
                     });
                 }
-                Err(error) => errors.push(format!("{candidate}: missing/incompatible libmocr symbol: {error}")),
+                Err(error) => errors.push(format!(
+                    "{candidate}: missing/incompatible libmocr symbol: {error}"
+                )),
             }
         }
         Err(OcrError::LibraryUnavailable(errors.join("; ")))
@@ -174,12 +210,7 @@ pub struct OcrFrame {
 
 impl OcrFrame {
     /// Creates a frame from RGBA pixels with an explicit row stride.
-    pub fn new(
-        width: u32,
-        height: u32,
-        stride: usize,
-        pixels: Vec<u8>,
-    ) -> Result<Self, OcrError> {
+    pub fn new(width: u32, height: u32, stride: usize, pixels: Vec<u8>) -> Result<Self, OcrError> {
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
             return Err(OcrError::InvalidFrameDimensions);
         }
@@ -198,7 +229,12 @@ impl OcrFrame {
         if pixels.len() < required_bytes {
             return Err(OcrError::InvalidFrameBuffer);
         }
-        Ok(Self { width, height, stride, pixels })
+        Ok(Self {
+            width,
+            height,
+            stride,
+            pixels,
+        })
     }
 
     /// Creates a tightly packed frame from the usual RGBA byte layout.
@@ -248,26 +284,50 @@ impl fmt::Display for OcrError {
             Self::Disabled => formatter.write_str("OCR is disabled."),
             Self::InvalidViewport => formatter.write_str("The video viewport is invalid."),
             Self::InvalidSelection => formatter.write_str("No valid region was selected."),
-            Self::InvalidFrameDimensions => formatter.write_str("The screenshot dimensions are invalid."),
-            Self::InvalidFrameStride => formatter.write_str("The screenshot row stride is invalid."),
-            Self::InvalidFrameBuffer => formatter.write_str("The screenshot pixel buffer is incomplete."),
-            Self::SelectionOutsideVideo => formatter.write_str("The selected region does not include video."),
+            Self::InvalidFrameDimensions => {
+                formatter.write_str("The screenshot dimensions are invalid.")
+            }
+            Self::InvalidFrameStride => {
+                formatter.write_str("The screenshot row stride is invalid.")
+            }
+            Self::InvalidFrameBuffer => {
+                formatter.write_str("The screenshot pixel buffer is incomplete.")
+            }
+            Self::SelectionOutsideVideo => {
+                formatter.write_str("The selected region does not include video.")
+            }
             Self::EmptyRegion => formatter.write_str("The selected region is empty."),
-            Self::InvalidModelName => formatter.write_str("The configured OCR model name is invalid."),
+            Self::InvalidModelName => {
+                formatter.write_str("The configured OCR model name is invalid.")
+            }
             Self::ModelInitializationFailed(model) => {
                 write!(formatter, "Could not initialize OCR model `{model}`.")
             }
             Self::ModelDestructionFailed(status) => {
-                write!(formatter, "Could not release the previous OCR model (libmocr status {status}).")
+                write!(
+                    formatter,
+                    "Could not release the previous OCR model (libmocr status {status})."
+                )
             }
-            Self::InferenceFailed => formatter.write_str("libmocr could not read the selected image."),
-            Self::InvalidNativeText => formatter.write_str("libmocr returned text that was not valid UTF-8."),
+            Self::InferenceFailed => {
+                formatter.write_str("libmocr could not read the selected image.")
+            }
+            Self::InvalidNativeText => {
+                formatter.write_str("libmocr returned text that was not valid UTF-8.")
+            }
             Self::NativeTextFreeFailed(status) => {
-                write!(formatter, "Could not release OCR text (libmocr status {status}).")
+                write!(
+                    formatter,
+                    "Could not release OCR text (libmocr status {status})."
+                )
             }
             Self::NoTextDetected => formatter.write_str("No text was detected."),
-            Self::LibraryUnavailable(error) => write!(formatter, "Could not load libmocr: {error}"),
-            Self::WorkerStartFailed(error) => write!(formatter, "Could not start OCR worker: {error}"),
+            Self::LibraryUnavailable(error) => {
+                write!(formatter, "Could not load libmocr: {error}")
+            }
+            Self::WorkerStartFailed(error) => {
+                write!(formatter, "Could not start OCR worker: {error}")
+            }
             Self::WorkerUnavailable => formatter.write_str("The OCR worker is unavailable."),
         }
     }
@@ -285,37 +345,116 @@ struct OcrRequest {
     callback: OcrCallback,
 }
 
-/// Asynchronous OCR controller backed by one persistent libmocr worker.
+/// Bounded 1-slot latest-wins request queue so queued 4K RGBA frames cannot
+/// accumulate unboundedly while an OCR pass is running.
+struct RequestSlot {
+    pending: Option<OcrRequest>,
+    closed: bool,
+}
+
+impl RequestSlot {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            closed: false,
+        }
+    }
+
+    fn push_latest(&mut self, request: OcrRequest) -> Result<Option<OcrRequest>, OcrError> {
+        if self.closed {
+            return Err(OcrError::WorkerUnavailable);
+        }
+        Ok(self.pending.replace(request))
+    }
+
+    fn close(&mut self) -> Option<OcrRequest> {
+        self.closed = true;
+        self.pending.take()
+    }
+}
+
+struct OcrControllerInner {
+    queue: Arc<(Mutex<RequestSlot>, Condvar)>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for OcrControllerInner {
+    fn drop(&mut self) {
+        let displaced = {
+            let (lock, cvar) = &*self.queue;
+            let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pending = slot.close();
+            cvar.notify_all();
+            pending
+        };
+        drop(displaced);
+
+        let handle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            if handle.thread().id() != thread::current().id() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// Asynchronous OCR controller backed by one lazily initialized libmocr worker.
 ///
-/// The native context is created, used, switched, and destroyed exclusively on
-/// the worker. Results are delivered on Slint's event-loop thread.
+/// Neither `libpython`/`libmocr` loading nor the 8 MiB worker thread happens in
+/// [`OcrController::new`]; both initialize lazily on the first OCR request.
+/// Native contexts are created, used, switched, and destroyed exclusively on
+/// the worker thread, which shuts down and joins cleanly when the last
+/// controller handle drops.
 #[derive(Clone)]
 pub struct OcrController {
-    requests: Sender<OcrRequest>,
+    inner: Arc<OcrControllerInner>,
 }
 
 impl OcrController {
-    /// Starts the native OCR worker after confirming the optional runtime can
-    /// be loaded. Model loading remains lazy on the worker.
+    /// Creates a lazy OCR controller. Native libraries and the worker thread
+    /// are initialized on the first [`Self::read_region_async`] call.
     pub fn new() -> Result<Self, OcrError> {
-        let api = MocrApi::load()?;
-        let (requests, receiver) = mpsc::channel();
-        thread::Builder::new()
+        Ok(Self {
+            inner: Arc::new(OcrControllerInner {
+                queue: Arc::new((Mutex::new(RequestSlot::new()), Condvar::new())),
+                worker: Mutex::new(None),
+            }),
+        })
+    }
+
+    fn ensure_worker_started(&self) -> Result<(), OcrError> {
+        let mut worker = self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if worker.is_some() {
+            return Ok(());
+        }
+        let queue = Arc::clone(&self.inner.queue);
+        OCR_WORKER_STARTED.store(true, Ordering::Release);
+        let handle = thread::Builder::new()
             .name("memento-ocr".to_owned())
             // libmocr's model initialization needs a larger stack on macOS.
             .stack_size(OCR_WORKER_STACK_SIZE)
-            .spawn(move || worker_loop(receiver, api))
+            .spawn(move || worker_loop(queue))
             .map_err(|error| OcrError::WorkerStartFailed(error.to_string()))?;
-        Ok(Self { requests })
+        *worker = Some(handle);
+        Ok(())
     }
 
     /// Queues a screenshot region for OCR without blocking the UI thread.
     ///
-    /// `frame` must contain the source-resolution, uncomposited RGBA video
-    /// screenshot. `viewport` is the Slint viewport size in the same coordinate
-    /// space as the normalized drag, not the screenshot dimensions. The
-    /// callback is invoked on Slint's event loop with detected text or a typed
-    /// error.
+    /// If a previous capture has not yet been picked up by the worker, it is
+    /// superseded and dropped immediately (latest-wins). `frame` must contain
+    /// the source-resolution, uncomposited RGBA video screenshot. `viewport` is
+    /// the Slint viewport size in the same coordinate space as the normalized
+    /// drag, not the screenshot dimensions. The callback is invoked on Slint's
+    /// event loop with detected text or a typed error.
     pub fn read_region_async(
         &self,
         frame: OcrFrame,
@@ -324,32 +463,75 @@ impl OcrController {
         settings: OcrSettings,
         callback: impl FnOnce(Result<String, OcrError>) + Send + 'static,
     ) -> Result<(), OcrError> {
-        self.requests
-            .send(OcrRequest {
-                frame,
-                region,
-                viewport,
-                settings,
-                callback: Box::new(callback),
-            })
-            .map_err(|_| OcrError::WorkerUnavailable)
+        self.ensure_worker_started()?;
+        let request = OcrRequest {
+            frame,
+            region,
+            viewport,
+            settings,
+            callback: Box::new(callback),
+        };
+        let displaced = {
+            let (lock, cvar) = &*self.inner.queue;
+            let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let displaced = slot.push_latest(request)?;
+            cvar.notify_one();
+            displaced
+        };
+        // Release any stale RGBA frame outside the mutex lock.
+        drop(displaced);
+        Ok(())
     }
 }
 
-fn worker_loop(receiver: mpsc::Receiver<OcrRequest>, api: MocrApi) {
-    let mut worker = OcrWorker { api, model: None };
-    while let Ok(request) = receiver.recv() {
-        let result = worker.read(request.frame, request.region, request.viewport, request.settings);
+fn pop_latest_request(queue: &(Mutex<RequestSlot>, Condvar)) -> Option<OcrRequest> {
+    let (lock, cvar) = queue;
+    let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if slot.closed {
+            slot.pending = None;
+            return None;
+        }
+        if let Some(request) = slot.pending.take() {
+            return Some(request);
+        }
+        slot = cvar
+            .wait(slot)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+fn worker_loop(queue: Arc<(Mutex<RequestSlot>, Condvar)>) {
+    let mut worker = OcrWorker {
+        model: None,
+        api: None,
+    };
+    while let Some(request) = pop_latest_request(&queue) {
+        let result = worker.read(
+            request.frame,
+            request.region,
+            request.viewport,
+            request.settings,
+        );
         if let Err(error) = slint::invoke_from_event_loop(move || (request.callback)(result)) {
             eprintln!("Could not deliver OCR result to Slint event loop: {error}");
         }
     }
 }
 
+fn normalize_model_name(raw: &str) -> Result<&str, OcrError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.as_bytes().contains(&0) {
+        return Err(OcrError::InvalidModelName);
+    }
+    Ok(trimmed)
+}
+
 struct OcrWorker {
-    // The native context must be dropped before the library handle.
+    // Field order is deliberate: the native context must be destroyed before
+    // `libmocr` is unloaded, and `libmocr` before `libpython`.
     model: Option<LoadedModel>,
-    api: MocrApi,
+    api: Option<MocrApi>,
 }
 
 struct LoadedModel {
@@ -359,6 +541,15 @@ struct LoadedModel {
 }
 
 impl OcrWorker {
+    fn ensure_api(&mut self) -> Result<&MocrApi, OcrError> {
+        if self.api.is_none() {
+            self.api = Some(MocrApi::load()?);
+        }
+        self.api.as_ref().ok_or_else(|| {
+            OcrError::LibraryUnavailable("libmocr runtime is not initialized".to_owned())
+        })
+    }
+
     fn read(
         &mut self,
         frame: OcrFrame,
@@ -370,10 +561,15 @@ impl OcrWorker {
             return Err(OcrError::Disabled);
         }
         let (pixels, width, height) = crop_frame(&frame, region, viewport)?;
-        let read = self.api.read;
-        let free = self.api.free;
-        let model = self.model_for(&settings)?;
-        let text = model.context.read_rgba(read, free, &pixels, width, height)?;
+        let model_name = normalize_model_name(&settings.model)?.to_owned();
+        let (read, free) = {
+            let api = self.ensure_api()?;
+            (api.read, api.free)
+        };
+        let model = self.model_for(&model_name, settings.use_gpu)?;
+        let text = model
+            .context
+            .read_rgba(read, free, &pixels, width, height)?;
         let text = text.trim();
         if text.is_empty() {
             return Err(OcrError::NoTextDetected);
@@ -381,49 +577,49 @@ impl OcrWorker {
         Ok(text.to_owned())
     }
 
-    fn model_for(&mut self, settings: &OcrSettings) -> Result<&mut LoadedModel, OcrError> {
-        if settings.model.trim().is_empty() || settings.model.as_bytes().contains(&0) {
-            return Err(OcrError::InvalidModelName);
-        }
-        let needs_recreate = self.model.as_ref().map_or(true, |model| {
-            model.name != settings.model || model.use_gpu != settings.use_gpu
-        });
+    fn model_for(&mut self, model_name: &str, use_gpu: bool) -> Result<&mut LoadedModel, OcrError> {
+        let model_name = normalize_model_name(model_name)?;
+        let needs_recreate = self
+            .model
+            .as_ref()
+            .is_none_or(|model| model.name != model_name || model.use_gpu != use_gpu);
         if needs_recreate {
             if let Some(previous) = self.model.take() {
                 previous.context.destroy()?;
             }
-            let context = MocrContext::new(&self.api, &settings.model, settings.use_gpu)?;
+            let api = self.ensure_api()?;
+            let context = MocrContext::new(api, model_name, use_gpu)?;
             self.model = Some(LoadedModel {
-                name: settings.model.clone(),
-                use_gpu: settings.use_gpu,
+                name: model_name.to_owned(),
+                use_gpu,
                 context,
             });
         }
-        Ok(self.model.as_mut().expect("model was initialized above"))
+        self.model
+            .as_mut()
+            .ok_or_else(|| OcrError::ModelInitializationFailed(model_name.to_owned()))
     }
 }
 
 struct MocrContext {
-    pointer: Option<NonNull<MocrContextOpaque>>,
+    pointer: NonNull<MocrContextOpaque>,
     destroy: MocrDestroy,
 }
 
 impl MocrContext {
     fn new(api: &MocrApi, model: &str, use_gpu: bool) -> Result<Self, OcrError> {
-        let model_str = if model.trim().is_empty() {
-            "kha-white/manga-ocr-base"
-        } else {
-            model.trim()
-        };
+        let model_str = normalize_model_name(model)?;
         let model_name = CString::new(model_str).map_err(|_| OcrError::InvalidModelName)?;
         let mut pointer = unsafe { (api.init)(model_name.as_ptr(), if use_gpu { 0 } else { 1 }) };
         if pointer.is_null() && use_gpu {
             pointer = unsafe { (api.init)(model_name.as_ptr(), 1) };
         }
-        let pointer = NonNull::new(pointer).ok_or_else(|| {
-            OcrError::ModelInitializationFailed(model_str.to_owned())
-        })?;
-        Ok(Self { pointer: Some(pointer), destroy: api.destroy })
+        let pointer = NonNull::new(pointer)
+            .ok_or_else(|| OcrError::ModelInitializationFailed(model_str.to_owned()))?;
+        Ok(Self {
+            pointer,
+            destroy: api.destroy,
+        })
     }
 
     fn read_rgba(
@@ -441,22 +637,27 @@ impl MocrContext {
         if width == 0 || height == 0 || pixels.len() != expected_bytes {
             return Err(OcrError::InvalidFrameBuffer);
         }
-        let context = self.pointer.expect("live OCR context");
         // SAFETY: the context is live, `pixels` stays borrowed and alive for the
         // entire synchronous `mocr_read` call and contains `width * height * 4`
         // RGBA bytes (`MOCR_MODE_RGBA`). `mocr_read` takes a read-only image buffer.
         let output = unsafe {
-            (read)(context.as_ptr(), pixels.as_ptr().cast(), width, height, MOCR_MODE_RGBA)
+            (read)(
+                self.pointer.as_ptr(),
+                pixels.as_ptr().cast(),
+                width,
+                height,
+                MOCR_MODE_RGBA,
+            )
         };
         let output = NonNull::new(output).ok_or(OcrError::InferenceFailed)?;
-        MocrText::new(output, free).into_string(free)
+        MocrText::new(output, free).into_string()
     }
 
-    fn destroy(mut self) -> Result<(), OcrError> {
-        let pointer = self.pointer.take().expect("live OCR context");
-        // SAFETY: this wrapper owns the context and clears its pointer before
-        // calling the matching libmocr destructor.
-        let status = unsafe { (self.destroy)(pointer.as_ptr()) };
+    fn destroy(self) -> Result<(), OcrError> {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `ManuallyDrop` suppresses `Drop`, so the owned context
+        // pointer is released exactly once with the matching destructor.
+        let status = unsafe { (this.destroy)(this.pointer.as_ptr()) };
         if status == 0 {
             Ok(())
         } else {
@@ -467,36 +668,37 @@ impl MocrContext {
 
 impl Drop for MocrContext {
     fn drop(&mut self) {
-        if let Some(pointer) = self.pointer.take() {
-            // SAFETY: the pointer is owned by this wrapper and is destroyed at
-            // most once. Drop runs on the OCR worker thread.
-            let status = unsafe { (self.destroy)(pointer.as_ptr()) };
-            if status != 0 {
-                eprintln!("Could not release OCR model (libmocr status {status}).");
-            }
+        // SAFETY: this pointer is owned by `MocrContext` and `destroy`
+        // suppresses `Drop` via `ManuallyDrop`, so it is destroyed at most once.
+        let status = unsafe { (self.destroy)(self.pointer.as_ptr()) };
+        if status != 0 {
+            eprintln!("Could not release OCR model (libmocr status {status}).");
         }
     }
 }
 
 struct MocrText {
-    pointer: Option<NonNull<c_char>>,
+    pointer: NonNull<c_char>,
     free: MocrFree,
 }
 
 impl MocrText {
     fn new(pointer: NonNull<c_char>, free: MocrFree) -> Self {
-        Self { pointer: Some(pointer), free }
+        Self { pointer, free }
     }
 
-    fn into_string(mut self, free: MocrFree) -> Result<String, OcrError> {
-        let pointer = self.pointer.take().expect("live OCR text");
+    fn into_string(self) -> Result<String, OcrError> {
+        // Convert before disarming `Drop` so an unwind still frees the pointer.
         // SAFETY: libmocr returns a NUL-terminated string allocated by
-        // mocr_read; it remains valid until freed below.
-        let text = unsafe { CStr::from_ptr(pointer.as_ptr()) }.to_str()
+        // `mocr_read`; it remains valid until freed below.
+        let text = unsafe { CStr::from_ptr(self.pointer.as_ptr()) }
+            .to_str()
             .map(str::to_owned)
             .map_err(|_| OcrError::InvalidNativeText);
-        // SAFETY: pointer came from mocr_read and is released by mocr_free.
-        let status = unsafe { free(pointer.as_ptr().cast()) };
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `ManuallyDrop` suppresses `Drop`, so the pointer returned by
+        // `mocr_read` is released exactly once with `this.free`.
+        let status = unsafe { (this.free)(this.pointer.as_ptr().cast()) };
         let text = text?;
         if status != 0 {
             return Err(OcrError::NativeTextFreeFailed(status));
@@ -507,13 +709,11 @@ impl MocrText {
 
 impl Drop for MocrText {
     fn drop(&mut self) {
-        if let Some(pointer) = self.pointer.take() {
-            // SAFETY: this is the pointer returned by mocr_read, which must be
-            // released with mocr_free if text conversion exits early.
-            let status = unsafe { (self.free)(pointer.as_ptr().cast()) };
-            if status != 0 {
-                eprintln!("Could not release OCR text (libmocr status {status}).");
-            }
+        // SAFETY: this is the pointer returned by `mocr_read` and `into_string`
+        // suppresses `Drop` via `ManuallyDrop`, so it is freed at most once.
+        let status = unsafe { (self.free)(self.pointer.as_ptr().cast()) };
+        if status != 0 {
+            eprintln!("Could not release OCR text (libmocr status {status}).");
         }
     }
 }
@@ -575,57 +775,91 @@ fn crop_frame(
     let y = usize::try_from(y).map_err(|_| OcrError::EmptyRegion)?;
     let width = usize::try_from(width).map_err(|_| OcrError::EmptyRegion)?;
     let height = usize::try_from(height).map_err(|_| OcrError::EmptyRegion)?;
-    let row_bytes = width.checked_mul(4).ok_or(OcrError::InvalidFrameDimensions)?;
-    let output_bytes = row_bytes.checked_mul(height).ok_or(OcrError::InvalidFrameDimensions)?;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or(OcrError::InvalidFrameDimensions)?;
+    let output_bytes = row_bytes
+        .checked_mul(height)
+        .ok_or(OcrError::InvalidFrameDimensions)?;
     let mut crop = Vec::with_capacity(output_bytes);
     for row in y..y + height {
         let start = row
             .checked_mul(frame.stride)
             .and_then(|offset| offset.checked_add(x.checked_mul(4)?))
             .ok_or(OcrError::InvalidFrameBuffer)?;
-        let end = start.checked_add(row_bytes).ok_or(OcrError::InvalidFrameBuffer)?;
-        crop.extend_from_slice(frame.pixels.get(start..end).ok_or(OcrError::InvalidFrameBuffer)?);
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or(OcrError::InvalidFrameBuffer)?;
+        crop.extend_from_slice(
+            frame
+                .pixels
+                .get(start..end)
+                .ok_or(OcrError::InvalidFrameBuffer)?,
+        );
     }
     Ok((crop, width, height))
 }
 
-/// Probes `VIRTUAL_ENV` and sets `PYTHONEXECUTABLE` once if unset.
+fn resolve_python_executable_from_env(
+    python_executable: Option<&OsStr>,
+    virtual_env: Option<&OsStr>,
+    is_windows: bool,
+    file_exists: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    if python_executable.is_some() {
+        return None;
+    }
+    let virtual_env = virtual_env?.to_str()?;
+    let path = resolve_venv_python_str(false, virtual_env, is_windows)?;
+    file_exists(Path::new(&path)).then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_single_threaded() -> bool {
+    !OCR_WORKER_STARTED.load(Ordering::Acquire)
+        && std::fs::read_dir("/proc/self/task")
+            .map(|entries| entries.take(2).count() <= 1)
+            .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_single_threaded() -> bool {
+    cfg!(windows) || !OCR_WORKER_STARTED.load(Ordering::Acquire)
+}
+
+/// Probes `VIRTUAL_ENV` and sets `PYTHONEXECUTABLE` once during single-threaded
+/// process startup if unset.
 ///
-/// Must be called on the main thread during startup before any worker threads
-/// (libmpv, GUI, ASR, or OCR) are spawned because mutating process environment
-/// variables from a multi-threaded process is undefined behavior on Unix.
+/// Must be called on the main thread before any worker threads (libmpv, GUI,
+/// ASR, or OCR) are spawned. If the process is already multi-threaded, this
+/// skips mutating process environment variables to avoid Unix `setenv` UB.
 pub fn prepare_python_executable() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         const PYTHON_EXECUTABLE: &str = "PYTHONEXECUTABLE";
         const VIRTUAL_ENV: &str = "VIRTUAL_ENV";
 
-        if std::env::var_os(PYTHON_EXECUTABLE).is_some() {
+        if !process_is_single_threaded() {
             return;
         }
-        let Some(virtual_env) = std::env::var_os(VIRTUAL_ENV) else {
-            return;
-        };
-        let virtual_env: Vec<u16> = virtual_env.to_string_lossy().encode_utf16().collect();
-        let Some(path) = memento_util::ocrutils::resolve_venv_python(
-            false,
-            &virtual_env,
+        let python_executable = std::env::var_os(PYTHON_EXECUTABLE);
+        let virtual_env = std::env::var_os(VIRTUAL_ENV);
+        let Some(path) = resolve_python_executable_from_env(
+            python_executable.as_deref(),
+            virtual_env.as_deref(),
             cfg!(windows),
+            |candidate| candidate.is_file(),
         ) else {
             return;
         };
-        let Ok(path) = String::from_utf16(&path) else {
-            return;
-        };
-        if Path::new(&path).is_file() {
-            std::env::set_var(PYTHON_EXECUTABLE, path);
-        }
+        std::env::set_var(PYTHON_EXECUTABLE, path);
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn crop_maps_normalized_region_and_honors_row_stride() {
@@ -635,8 +869,16 @@ mod tests {
         let frame = OcrFrame::new(2, 2, 12, pixels).unwrap();
         let (crop, width, height) = crop_frame(
             &frame,
-            OcrRegion { x: 0.5, y: 0.5, width: 0.5, height: 0.5 },
-            OcrViewport { width: 2.0, height: 2.0 },
+            OcrRegion {
+                x: 0.5,
+                y: 0.5,
+                width: 0.5,
+                height: 0.5,
+            },
+            OcrViewport {
+                width: 2.0,
+                height: 2.0,
+            },
         )
         .unwrap();
         assert_eq!((width, height), (1, 1));
@@ -648,10 +890,174 @@ mod tests {
         let frame = OcrFrame::from_rgba(16, 9, vec![0; 16 * 9 * 4]).unwrap();
         let error = crop_frame(
             &frame,
-            OcrRegion { x: 0.0, y: 0.0, width: 1.0, height: 0.1 },
-            OcrViewport { width: 16.0, height: 16.0 },
+            OcrRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.1,
+            },
+            OcrViewport {
+                width: 16.0,
+                height: 16.0,
+            },
         )
         .unwrap_err();
         assert_eq!(error, OcrError::SelectionOutsideVideo);
+    }
+
+    #[test]
+    fn ocr_controller_new_is_lazy_and_drops_without_spawning_worker() {
+        let controller = OcrController::new().unwrap();
+        assert!(controller.inner.worker.lock().unwrap().is_none());
+        drop(controller);
+    }
+
+    #[test]
+    fn request_slot_keeps_only_latest_frame_and_rejects_after_close() {
+        let mut slot = RequestSlot::new();
+        let make_req = |tag: u8| OcrRequest {
+            frame: OcrFrame::from_rgba(1, 1, vec![tag, 0, 0, 255]).unwrap(),
+            region: OcrRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            viewport: OcrViewport {
+                width: 1.0,
+                height: 1.0,
+            },
+            settings: OcrSettings::default(),
+            callback: Box::new(|_| {}),
+        };
+
+        assert!(slot.push_latest(make_req(1)).unwrap().is_none());
+        let displaced_1 = slot.push_latest(make_req(2)).unwrap().unwrap();
+        assert_eq!(displaced_1.frame.pixels[0], 1);
+        let displaced_2 = slot.push_latest(make_req(3)).unwrap().unwrap();
+        assert_eq!(displaced_2.frame.pixels[0], 2);
+
+        let latest = slot.pending.take().unwrap();
+        assert_eq!(latest.frame.pixels[0], 3);
+
+        assert!(slot.close().is_none());
+        assert_eq!(
+            slot.push_latest(make_req(4)).unwrap_err(),
+            OcrError::WorkerUnavailable
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_trims_and_rejects_blank_or_nul() {
+        assert_eq!(
+            normalize_model_name("  kha-white/manga-ocr-base \t\n").unwrap(),
+            "kha-white/manga-ocr-base"
+        );
+        assert_eq!(
+            normalize_model_name("   ").unwrap_err(),
+            OcrError::InvalidModelName
+        );
+        assert_eq!(
+            normalize_model_name("bad\0model").unwrap_err(),
+            OcrError::InvalidModelName
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_library_probes_cover_3_14_through_3_10() {
+        let candidates = python_library_candidates();
+        for minor in ["3.14", "3.13", "3.12", "3.11", "3.10"] {
+            assert!(
+                candidates.iter().any(|name| name.contains(minor)),
+                "missing libpython {minor} candidate in {candidates:?}"
+            );
+        }
+        assert!(candidates
+            .iter()
+            .any(|name| name.starts_with("libpython3.")));
+    }
+
+    #[test]
+    fn mocr_text_uses_owned_free_fn_and_frees_on_drop() {
+        static FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn mock_free(ptr: *mut c_void) -> c_int {
+            FREE_CALLS.fetch_add(1, Ordering::SeqCst);
+            drop(CString::from_raw(ptr.cast::<c_char>()));
+            0
+        }
+
+        let before = FREE_CALLS.load(Ordering::SeqCst);
+        let raw_ok = NonNull::new(CString::new("日本語").unwrap().into_raw()).unwrap();
+        let text = MocrText::new(raw_ok, mock_free).into_string().unwrap();
+        assert_eq!(text, "日本語");
+        assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 1);
+
+        let raw_drop = NonNull::new(CString::new("dropped").unwrap().into_raw()).unwrap();
+        drop(MocrText::new(raw_drop, mock_free));
+        assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 2);
+    }
+
+    #[test]
+    fn resolve_python_executable_from_env_checks_existing_venv_python() {
+        assert_eq!(
+            resolve_python_executable_from_env(
+                Some(OsStr::new("/already/set")),
+                Some(OsStr::new("/tmp/venv")),
+                false,
+                |_| true
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_python_executable_from_env(None, Some(OsStr::new("/tmp/venv")), false, |_| {
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            resolve_python_executable_from_env(None, Some(OsStr::new("/tmp/venv")), false, |p| {
+                p == Path::new("/tmp/venv/bin/python")
+            }),
+            Some("/tmp/venv/bin/python".to_owned())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_is_single_threaded_is_false_when_background_thread_exists() {
+        let ready = Arc::new((Mutex::new(false), Condvar::new()));
+        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let ready_bg = Arc::clone(&ready);
+        let done_bg = Arc::clone(&done);
+        let bg = thread::spawn(move || {
+            {
+                let (lock, cvar) = &*ready_bg;
+                *lock.lock().unwrap() = true;
+                cvar.notify_one();
+            }
+            let (lock, cvar) = &*done_bg;
+            let mut finished = lock.lock().unwrap();
+            while !*finished {
+                finished = cvar.wait(finished).unwrap();
+            }
+        });
+        {
+            let (lock, cvar) = &*ready;
+            let mut started = lock.lock().unwrap();
+            while !*started {
+                started = cvar.wait(started).unwrap();
+            }
+        }
+        assert!(
+            !process_is_single_threaded(),
+            "must refuse process env mutation while other threads are running"
+        );
+        {
+            let (lock, cvar) = &*done;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
+        bg.join().unwrap();
     }
 }

@@ -1,0 +1,605 @@
+import { ScrollView } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { PlayerTrack } from "types.slint";
+
+component MenuBarButton inherits Rectangle {
+    in property <string> label;
+    in property <int> menu-id;
+    in property <length> item-width;
+    in-out property <int> open-menu: -1;
+    out property <bool> hovered: touch.has-hover;
+    callback activity();
+    callback interacted();
+
+    width: root.item-width;
+    height: 24px;
+    border-radius: 5px;
+    background: root.open-menu == root.menu-id
+        ? MementoPalette.active-bg
+        : (touch.has-hover ? MementoPalette.hover-bg : transparent);
+
+    animate background { duration: 100ms; }
+
+    Text {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.label;
+        font-size: 12px;
+        font-weight: root.open-menu == root.menu-id ? 600 : 500;
+        color: MementoPalette.text;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        changed has-hover => {
+            if self.has-hover && root.open-menu >= 0 && root.open-menu != root.menu-id {
+                root.open-menu = root.menu-id;
+            }
+        }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+        clicked => {
+            root.open-menu = root.open-menu == root.menu-id ? -1 : root.menu-id;
+        }
+    }
+}
+
+// ── Top Native Menu Bar ─────────────────────────────────────────────────
+export component TopMenuBar inherits Rectangle {
+    in-out property <int> open-menu: -1; // -1: none, 0: Media, 1: Audio, 2: Subtitle, 3: Tools, 4: Settings
+    out property <bool> is-hovered:
+        top-touch.has-hover || m0.hovered || m1.hovered
+        || m2.hovered || m3.hovered || m4.hovered;
+    callback activity();
+    callback interacted();
+
+    height: 30px;
+    background: MementoPalette.surface-bg;
+    border-width: 1px;
+    border-color: MementoPalette.border;
+
+    top-touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.activity(); }
+            else if event.kind == PointerEventKind.down { root.interacted(); }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        spacing: 2px;
+        alignment: start;
+
+        VerticalLayout {
+            alignment: center;
+            m0 := MenuBarButton {
+                label: "Media";
+                menu-id: 0;
+                item-width: 56px;
+                open-menu <=> root.open-menu;
+                activity => { root.activity(); }
+                interacted => { root.interacted(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            m1 := MenuBarButton {
+                label: "Audio";
+                menu-id: 1;
+                item-width: 56px;
+                open-menu <=> root.open-menu;
+                activity => { root.activity(); }
+                interacted => { root.interacted(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            m2 := MenuBarButton {
+                label: "Subtitle";
+                menu-id: 2;
+                item-width: 66px;
+                open-menu <=> root.open-menu;
+                activity => { root.activity(); }
+                interacted => { root.interacted(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            m3 := MenuBarButton {
+                label: "Tools";
+                menu-id: 3;
+                item-width: 56px;
+                open-menu <=> root.open-menu;
+                activity => { root.activity(); }
+                interacted => { root.interacted(); }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            m4 := MenuBarButton {
+                label: "Settings";
+                menu-id: 4;
+                item-width: 68px;
+                open-menu <=> root.open-menu;
+                activity => { root.activity(); }
+                interacted => { root.interacted(); }
+            }
+        }
+    }
+}
+
+// ── Dropdown Menu Item ──────────────────────────────────────────────────
+component DropdownItem inherits Rectangle {
+    in property <string> text: "";
+    in property <string> shortcut: "";
+    in property <bool> checkable: false;
+    in property <bool> reserve-check-gutter: false;
+    in property <bool> checked: false;
+    in property <bool> has-submenu: false;
+    in property <bool> submenu-active: false;
+    in property <bool> is-disabled: false;
+    callback clicked();
+
+    height: 30px;
+    border-radius: 5px;
+    background: root.is-disabled
+        ? transparent
+        : (root.submenu-active
+            ? MementoPalette.active-bg
+            : (touch.has-hover ? MementoPalette.hover-bg : transparent));
+
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: space-between;
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            horizontal-stretch: 1;
+
+            if root.checkable || root.reserve-check-gutter : Text {
+                width: 14px;
+                text: (root.checkable && root.checked) ? "✓" : "";
+                font-size: 11px;
+                font-weight: 700;
+                color: MementoPalette.cyan-accent;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: root.text;
+                font-size: 12px;
+                color: root.is-disabled ? MementoPalette.text-muted : MementoPalette.text;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+
+            if root.shortcut != "" : Text {
+                text: root.shortcut;
+                font-size: 11px;
+                color: MementoPalette.text-muted;
+                vertical-alignment: center;
+            }
+
+            if root.has-submenu : Text {
+                text: "›";
+                font-size: 14px;
+                font-weight: 700;
+                color: MementoPalette.text-secondary;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        enabled: !root.is-disabled;
+        mouse-cursor: root.is-disabled ? default : pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── Dropdown Menu Separator ─────────────────────────────────────────────
+component DropdownSeparator inherits Rectangle {
+    height: 9px;
+    Rectangle {
+        x: 6px;
+        y: 4px;
+        width: parent.width - 12px;
+        height: 1px;
+        background: MementoPalette.border;
+    }
+}
+
+// ── Dropdown Menus Overlay ──────────────────────────────────────────────
+export component MenuDropdown inherits Rectangle {
+    in property <int> menu-index: -1;
+    in property <length> max-dropdown-height: 460px;
+    in-out property <int> submenu-index: -1; // 0 Recent, 1 Size/Position, 2 Secondary, 3 Primary, 4 Anki profile
+    property <length> submenu-anchor-y: 0px;
+    in property <[PlayerTrack]> audio-tracks: [];
+    in property <[PlayerTrack]> subtitle-tracks: [];
+    in property <[string]> recent-files: [];
+    in property <[string]> recent-file-labels: [];
+    in property <[string]> anki-profiles: [];
+    in property <int> audio-id: 0;
+    in property <int> primary-sid: 0;
+    in property <int> secondary-sid: 0;
+    in property <string> anki-profile: "";
+    in property <bool> anki-enabled: false;
+    in property <bool> asr-enabled: false;
+    in property <bool> furigana-enabled: false;
+    in property <bool> asr-running: false;
+    in property <bool> asr-track-selected: false;
+    in property <bool> ocr-enabled: false;
+    in property <bool> auto-pause: false;
+    in property <bool> subtitles-visible: true;
+    in property <bool> furigana-visible: false;
+    in property <string> key-open-file: "";
+    in property <string> key-open-url: "";
+    in property <string> key-show-search: "";
+    in property <string> key-show-sub-list: "";
+    in property <string> key-start-ocr: "";
+    in property <string> key-sub-auto-pause: "";
+    in property <string> key-sub-show: "";
+    in property <string> key-sub-furigana: "";
+    in property <string> key-sub-increase-size: "";
+    in property <string> key-sub-decrease-size: "";
+    in property <string> key-sub-move-up: "";
+    in property <string> key-sub-move-down: "";
+
+    callback open-file();
+    callback open-url();
+    callback add-subtitle();
+    callback open-recent(string);
+    callback clear-recent();
+    callback select-audio-track(int);
+    callback select-subtitle-track(int);
+    callback select-secondary-subtitle-track(int);
+    callback select-asr();
+    callback auto-pause-changed(bool);
+    callback adjust-subtitle-scale(float);
+    callback adjust-subtitle-offset(float);
+    callback subtitles-visible-changed(bool);
+    callback furigana-visible-changed(bool);
+    callback toggle-search();
+    callback toggle-sub-drawer();
+    callback start-ocr();
+    callback open-options();
+    callback open-config();
+    callback check-updates();
+    callback show-about();
+    callback select-anki-profile(string);
+    callback close-menu();
+
+    changed menu-index => {
+        root.submenu-index = -1;
+        root.submenu-anchor-y = 0px;
+    }
+
+    function toggle-submenu(id: int, item-y: length) {
+        if root.submenu-index == id {
+            root.submenu-index = -1;
+        } else {
+            root.submenu-anchor-y = item-y + 6px + menu-scroll.viewport-y;
+            root.submenu-index = id;
+        }
+    }
+
+    visible: root.menu-index >= 0;
+    x: root.menu-index == 0 ? 8px :
+       root.menu-index == 1 ? 66px :
+       root.menu-index == 2 ? 124px :
+       root.menu-index == 3 ? 192px : 250px;
+    y: 30px;
+    width: root.menu-index == 1 ? (root.audio-tracks.length > 0 ? 228px : 150px) :
+           root.menu-index == 2 ? 236px :
+           root.menu-index == 3 ? 196px : 210px;
+    height: min(menu-content.preferred-height, max(120px, root.max-dropdown-height));
+    background: MementoPalette.surface-elevated;
+    border-width: 1px;
+    border-color: MementoPalette.border-light;
+    border-radius: 8px;
+    drop-shadow-blur: 18px;
+    drop-shadow-color: MementoPalette.shadow;
+
+    menu-scroll := ScrollView {
+        width: parent.width;
+        height: parent.height;
+
+        menu-content := VerticalLayout {
+            width: parent.width;
+            padding: 6px;
+            spacing: 2px;
+
+            // Media
+            if root.menu-index == 0 : VerticalLayout {
+                spacing: 2px;
+                DropdownItem {
+                    text: "Open File…";
+                    shortcut: root.key-open-file;
+                    clicked => { root.open-file(); root.close-menu(); }
+                }
+                DropdownItem {
+                    text: "Open URL…";
+                    shortcut: root.key-open-url;
+                    clicked => { root.open-url(); root.close-menu(); }
+                }
+                recent-item := DropdownItem {
+                    text: "Recent";
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 0;
+                    is-disabled: root.recent-files.length == 0;
+                    clicked => { root.toggle-submenu(0, self.y); }
+                }
+            }
+
+            // Audio tracks (bounded scroll list when many tracks exist)
+            if root.menu-index == 1 : VerticalLayout {
+                spacing: 2px;
+                DropdownItem {
+                    text: "None";
+                    checkable: true;
+                    checked: root.audio-id == 0;
+                    clicked => { root.select-audio-track(0); root.close-menu(); }
+                }
+                for track[index] in root.audio-tracks : DropdownItem {
+                    text: track.label;
+                    checkable: true;
+                    checked: track.id == root.audio-id;
+                    clicked => { root.select-audio-track(track.id); root.close-menu(); }
+                }
+            }
+
+            // Subtitle controls — uniform leading check gutter + Primary Track ABOVE Second Track
+            if root.menu-index == 2 : VerticalLayout {
+                spacing: 2px;
+                DropdownItem {
+                    text: "Auto Pause";
+                    shortcut: root.key-sub-auto-pause;
+                    checkable: true;
+                    reserve-check-gutter: true;
+                    checked: root.auto-pause;
+                    clicked => { root.auto-pause-changed(!root.auto-pause); root.close-menu(); }
+                }
+                size-pos-item := DropdownItem {
+                    text: "Size and Position";
+                    reserve-check-gutter: true;
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 1;
+                    clicked => { root.toggle-submenu(1, self.y); }
+                }
+                DropdownSeparator {}
+                DropdownItem {
+                    text: "Show Subtitles";
+                    shortcut: root.key-sub-show;
+                    checkable: true;
+                    reserve-check-gutter: true;
+                    checked: root.subtitles-visible;
+                    clicked => { root.subtitles-visible-changed(!root.subtitles-visible); root.close-menu(); }
+                }
+                if root.furigana-enabled : DropdownItem {
+                    text: "Show Furigana";
+                    shortcut: root.key-sub-furigana;
+                    checkable: true;
+                    reserve-check-gutter: true;
+                    checked: root.furigana-visible;
+                    clicked => { root.furigana-visible-changed(!root.furigana-visible); root.close-menu(); }
+                }
+                DropdownSeparator {}
+                DropdownItem {
+                    text: "Add Subtitle…";
+                    reserve-check-gutter: true;
+                    clicked => { root.add-subtitle(); root.close-menu(); }
+                }
+                primary-track-item := DropdownItem {
+                    text: "Primary Track";
+                    reserve-check-gutter: true;
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 3;
+                    clicked => { root.toggle-submenu(3, self.y); }
+                }
+                second-track-item := DropdownItem {
+                    text: "Second Track";
+                    reserve-check-gutter: true;
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 2;
+                    clicked => { root.toggle-submenu(2, self.y); }
+                }
+            }
+
+            // Tools
+            if root.menu-index == 3 : VerticalLayout {
+                spacing: 2px;
+                DropdownItem {
+                    text: "Show Search";
+                    shortcut: root.key-show-search;
+                    clicked => { root.toggle-search(); root.close-menu(); }
+                }
+                DropdownItem {
+                    text: "Show Subtitle List";
+                    shortcut: root.key-show-sub-list;
+                    clicked => { root.toggle-sub-drawer(); root.close-menu(); }
+                }
+                if root.ocr-enabled : DropdownItem {
+                    text: "Start OCR";
+                    shortcut: root.key-start-ocr;
+                    clicked => { root.start-ocr(); root.close-menu(); }
+                }
+            }
+
+            // Settings
+            if root.menu-index == 4 : VerticalLayout {
+                spacing: 2px;
+                if root.anki-enabled : anki-prof-item := DropdownItem {
+                    text: "Anki Profile";
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 4;
+                    clicked => { root.toggle-submenu(4, self.y); }
+                }
+                DropdownItem {
+                    text: "Options…";
+                    shortcut: "Ctrl+,";
+                    clicked => { root.open-options(); root.close-menu(); }
+                }
+                DropdownItem {
+                    text: "Open Config";
+                    clicked => { root.open-config(); root.close-menu(); }
+                }
+                DropdownItem {
+                    text: "Check for Updates";
+                    clicked => { root.check-updates(); root.close-menu(); }
+                }
+                DropdownSeparator {}
+                DropdownItem {
+                    text: "About Memento";
+                    clicked => { root.show-about(); root.close-menu(); }
+                }
+            }
+        }
+    }
+
+    // Dynamic Submenu Flyout positioned cleanly from clicked row's anchor-y and clamped to viewport
+    if root.submenu-index >= 0 : Rectangle {
+        x: parent.width - 4px;
+        y: max(0px, min(root.submenu-anchor-y, max(0px, root.max-dropdown-height - self.height)));
+        width: root.submenu-index == 0 ? 380px : 260px;
+        height: min(sub-content.preferred-height, max(120px, min(360px, root.max-dropdown-height)));
+        background: MementoPalette.surface-elevated;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        border-radius: 8px;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: MementoPalette.shadow;
+
+        ScrollView {
+            width: parent.width;
+            height: parent.height;
+
+            sub-content := VerticalLayout {
+                width: parent.width;
+                padding: 6px;
+                spacing: 2px;
+
+                if root.submenu-index == 0 : VerticalLayout {
+                    spacing: 2px;
+                    if root.recent-files.length == 0 : DropdownItem {
+                        text: "No recent files";
+                        is-disabled: true;
+                    }
+                    for file[index] in root.recent-files : DropdownItem {
+                        text: index < root.recent-file-labels.length && root.recent-file-labels[index] != ""
+                            ? root.recent-file-labels[index]
+                            : file;
+                        clicked => { root.open-recent(file); root.close-menu(); }
+                    }
+                    DropdownSeparator {}
+                    DropdownItem {
+                        text: "Clear Recents";
+                        clicked => { root.clear-recent(); root.close-menu(); }
+                    }
+                }
+
+                if root.submenu-index == 1 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "Increase Size";
+                        shortcut: root.key-sub-increase-size;
+                        clicked => { root.adjust-subtitle-scale(0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Decrease Size";
+                        shortcut: root.key-sub-decrease-size;
+                        clicked => { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Move Up";
+                        shortcut: root.key-sub-move-up;
+                        clicked => { root.adjust-subtitle-offset(0.005); root.close-menu(); }
+                    }
+                    DropdownItem {
+                        text: "Move Down";
+                        shortcut: root.key-sub-move-down;
+                        clicked => { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
+                    }
+                }
+
+                if root.submenu-index == 2 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "None";
+                        checkable: true;
+                        checked: root.secondary-sid == 0;
+                        clicked => { root.select-secondary-subtitle-track(0); root.close-menu(); }
+                    }
+                    for track[index] in root.subtitle-tracks : DropdownItem {
+                        text: track.label;
+                        checkable: true;
+                        checked: track.id == root.secondary-sid;
+                        is-disabled: track.id == root.primary-sid;
+                        clicked => {
+                            if (track.id != root.primary-sid) {
+                                root.select-secondary-subtitle-track(track.id);
+                                root.close-menu();
+                            }
+                        }
+                    }
+                }
+
+                if root.submenu-index == 3 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "None";
+                        checkable: true;
+                        checked: root.primary-sid == 0 && !root.asr-track-selected;
+                        clicked => { root.select-subtitle-track(0); root.close-menu(); }
+                    }
+                    if root.asr-enabled : DropdownItem {
+                        text: root.asr-running ? "ASR subtitles…" : "ASR subtitles";
+                        checkable: true;
+                        checked: root.asr-track-selected;
+                        clicked => { root.select-asr(); root.close-menu(); }
+                    }
+                    for track[index] in root.subtitle-tracks : DropdownItem {
+                        text: track.label;
+                        checkable: true;
+                        checked: track.id == root.primary-sid && !root.asr-track-selected;
+                        is-disabled: track.id == root.secondary-sid;
+                        clicked => {
+                            if (track.id != root.secondary-sid) {
+                                root.select-subtitle-track(track.id);
+                                root.close-menu();
+                            }
+                        }
+                    }
+                }
+
+                if root.submenu-index == 4 : VerticalLayout {
+                    spacing: 2px;
+                    for profile[index] in root.anki-profiles : DropdownItem {
+                        text: profile;
+                        checkable: true;
+                        checked: profile == root.anki-profile;
+                        clicked => { root.select-anki-profile(profile); root.close-menu(); }
+                    }
+                }
+            }
+        }
+    }
+}

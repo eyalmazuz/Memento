@@ -24,9 +24,9 @@
 //!
 //! # Layers
 //!
-//! * [`http`] — HTTP/1.1 over TCP with rustls-backed HTTPS and validated
-//!   Mozilla WebPKI roots: canonical requests, framing, redirects, timeouts,
-//!   and byte-level streaming for downloads.
+//! * [`http`] — HTTP/1.1 over TCP with `ureq` + rustls-backed HTTPS and
+//!   validated Mozilla WebPKI roots, `url`-backed URL parsing, redirect/SSRF
+//!   policy, timeouts, and byte-level streaming for downloads.
 //! * [`anki`] — typed AnkiConnect client. Request bodies and reply-shape
 //!   validation reuse the already-ported core in
 //!   `memento_anki::client` (`ReplyValidation`, `TypedReplyStatus`,

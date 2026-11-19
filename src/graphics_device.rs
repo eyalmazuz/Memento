@@ -27,7 +27,6 @@ const EGL_VENDOR_DIRS: &[&str] = &[
 ];
 
 /// Linux display server detected from environment variables.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinuxDisplayServer {
     Wayland,
@@ -37,7 +36,6 @@ pub enum LinuxDisplayServer {
 }
 
 /// Preferred OpenGL context creation API on Linux.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinuxGlContextApi {
     /// EGL (required on Wayland and for VAAPI zero-copy on Intel/AMD).
@@ -47,7 +45,6 @@ pub enum LinuxGlContextApi {
 }
 
 /// Planned Linux graphics device selection before graphics/libmpv init.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxGraphicsDevicePlan {
     pub display_server: LinuxDisplayServer,
@@ -59,7 +56,6 @@ pub struct LinuxGraphicsDevicePlan {
 
 /// Renderer/decoder-relevant global options extracted from `mpv.conf` before
 /// creating a libmpv handle.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MpvConfRendererHints {
     pub hwdec: Option<String>,
@@ -69,7 +65,6 @@ pub struct MpvConfRendererHints {
 }
 
 /// Detect the active Linux display server from an injectable environment lookup.
-#[allow(dead_code)]
 pub fn detect_linux_display_server_with(
     env: impl Fn(&str) -> Option<String>,
 ) -> LinuxDisplayServer {
@@ -95,13 +90,11 @@ pub fn detect_linux_display_server_with(
 }
 
 /// Detect the active Linux display server from the current process environment.
-#[allow(dead_code)]
 pub fn detect_linux_display_server() -> LinuxDisplayServer {
     detect_linux_display_server_with(|key| std::env::var(key).ok())
 }
 
 /// Classify whether a `GL_RENDERER` string identifies a CPU software rasterizer.
-#[allow(dead_code)]
 pub fn is_software_gl_renderer(renderer: &str) -> bool {
     let lower = renderer.to_ascii_lowercase();
     lower.contains("llvmpipe")
@@ -113,14 +106,12 @@ pub fn is_software_gl_renderer(renderer: &str) -> bool {
 }
 
 /// Classify whether a `GL_RENDERER` string identifies an NVIDIA GPU.
-#[allow(dead_code)]
 pub fn is_nvidia_gl_renderer(renderer: &str) -> bool {
     let lower = renderer.to_ascii_lowercase();
     lower.contains("nvidia") || lower.contains("geforce") || lower.contains("quadro")
 }
 
 /// Classify whether a `GL_RENDERER` string typically uses VAAPI on Linux (Intel/AMD/Mesa).
-#[allow(dead_code)]
 pub fn is_vaapi_capable_renderer(renderer: &str) -> bool {
     if is_software_gl_renderer(renderer) || is_nvidia_gl_renderer(renderer) {
         return false;
@@ -134,7 +125,6 @@ pub fn is_vaapi_capable_renderer(renderer: &str) -> bool {
 
 /// Determine whether a configured `hwdec` string explicitly starts with a
 /// direct NVIDIA CUDA/GL decoder (`nvdec` or `cuda`) requiring PRIME offload.
-#[allow(dead_code)]
 pub fn decoder_requests_direct_nvidia(decoder: &str) -> bool {
     decoder
         .split(',')
@@ -143,7 +133,6 @@ pub fn decoder_requests_direct_nvidia(decoder: &str) -> bool {
 }
 
 /// Pure Linux graphics-device decision planner (testable without probing `/dev`).
-#[allow(dead_code)]
 pub fn plan_linux_graphics_device(
     decoder: &str,
     display_server: LinuxDisplayServer,
@@ -192,7 +181,6 @@ fn find_nvidia_egl_vendor_file() -> Option<PathBuf> {
     find_nvidia_egl_vendor_file_in(EGL_VENDOR_DIRS.iter().map(Path::new))
 }
 
-#[allow(dead_code)]
 pub fn find_nvidia_egl_vendor_file_in<'a>(
     dirs: impl IntoIterator<Item = &'a Path>,
 ) -> Option<PathBuf> {
@@ -226,7 +214,6 @@ pub fn find_nvidia_egl_vendor_file_in<'a>(
     None
 }
 
-#[allow(dead_code)]
 fn strip_unquoted_comment(line: &str) -> &str {
     let mut in_single = false;
     let mut in_double = false;
@@ -247,7 +234,6 @@ fn strip_unquoted_comment(line: &str) -> &str {
     line
 }
 
-#[allow(dead_code)]
 fn unquote_conf_value(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() >= 2
@@ -262,7 +248,6 @@ fn unquote_conf_value(value: &str) -> String {
 
 /// Parse global `hwdec`, `vo`, `gpu-api`, and `gpu-context` hints from `mpv.conf`
 /// without initializing a libmpv instance.
-#[allow(dead_code)]
 pub fn parse_mpv_conf_renderer_hints(contents: &str) -> MpvConfRendererHints {
     let mut in_global_section = true;
     let mut hints = MpvConfRendererHints::default();
@@ -308,7 +293,6 @@ pub fn parse_mpv_conf_renderer_hints(contents: &str) -> MpvConfRendererHints {
 }
 
 /// Read renderer hints from `<config_dir>/mpv.conf` if present.
-#[allow(dead_code)]
 pub fn read_mpv_conf_renderer_hints(config_dir: &Path) -> MpvConfRendererHints {
     std::fs::read_to_string(config_dir.join("mpv.conf"))
         .map(|contents| parse_mpv_conf_renderer_hints(&contents))
@@ -317,21 +301,18 @@ pub fn read_mpv_conf_renderer_hints(config_dir: &Path) -> MpvConfRendererHints {
 
 /// Lightweight pre-init parser for `mpv.conf` extracting global `hwdec=...`
 /// without constructing an `mpv_handle` before `exec()`.
-#[allow(dead_code)]
 pub fn parse_hwdec_from_mpv_conf_str(contents: &str) -> Option<String> {
     parse_mpv_conf_renderer_hints(contents).hwdec
 }
 
 /// Read global `hwdec` directly from `<config_dir>/mpv.conf` before creating
 /// any graphics context or libmpv instance.
-#[allow(dead_code)]
 pub fn configured_hwdec_from_mpv_conf(config_dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(config_dir.join("mpv.conf")).ok()?;
     parse_hwdec_from_mpv_conf_str(&contents)
 }
 
 /// Extract a global `--<key>=<val>` CLI override outside `--{ ... --}` groups.
-#[allow(dead_code)]
 pub fn configured_option_from_args<'a>(
     args: impl IntoIterator<Item = &'a str>,
     key: &str,
@@ -365,7 +346,6 @@ pub fn configured_option_from_args<'a>(
 }
 
 /// Extract global `--hwdec=...` / `--hwdec` / `--no-hwdec` CLI overrides outside `--{ ... --}`.
-#[allow(dead_code)]
 pub fn configured_hwdec_from_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<String> {
     let mut depth = 0usize;
     let mut configured = None;
@@ -406,7 +386,6 @@ fn needs_nvidia_offload(decoder: &str, driver_available: bool, overridden: bool)
 /// Inspect CLI options and `<config_dir>/mpv.conf` before initializing libmpv
 /// or Slint, re-execing with NVIDIA PRIME offload (X11 GLX and Wayland EGL)
 /// when `hwdec` explicitly starts with `nvdec` or `cuda`.
-#[allow(dead_code)]
 pub fn select_for_config_dir(config_dir: &Path) {
     let cli_args: Vec<String> = std::env::args().collect();
     let cli_hwdec = configured_hwdec_from_args(cli_args.iter().map(String::as_str));
@@ -523,7 +502,10 @@ mod tests {
         assert_eq!(parse_hwdec_from_mpv_conf_str(profile_only), None);
 
         let disabled = "hwdec=nvdec\nno-hwdec\n";
-        assert_eq!(parse_hwdec_from_mpv_conf_str(disabled).as_deref(), Some("no"));
+        assert_eq!(
+            parse_hwdec_from_mpv_conf_str(disabled).as_deref(),
+            Some("no")
+        );
     }
 
     #[test]

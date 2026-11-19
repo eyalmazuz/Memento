@@ -27,6 +27,7 @@
 //! [`furiganautils`]) normalization adds the iteration marks
 //! `0x30FD→0x309D`/`0x30FE→0x309E`, which this function must **not** do.
 
+use std::borrow::Cow;
 use unicode_normalization::UnicodeNormalization;
 
 fn katakana_narrow(c: char) -> char {
@@ -93,6 +94,16 @@ pub fn katakana_to_hiragana(text: &[u16]) -> Vec<u16> {
     }
 }
 
+/// Native UTF-8 version of [`katakana_to_hiragana`]: NFKC normalization
+/// followed by the narrow katakana-to-hiragana shift (`0x30A1..=0x30F6` by `-0x60`).
+pub fn katakana_to_hiragana_str(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for c in text.nfkc().map(katakana_narrow) {
+        normalized.push(c);
+    }
+    normalized
+}
+
 /// `FuriganaParser::getFallbackResult` uses the unchanged surface as its
 /// sole QVariantMap element. A Rust caller can borrow the original UTF-16
 /// units until it constructs the corresponding output.
@@ -100,53 +111,112 @@ pub fn fallback_surface(text: &[u16]) -> &[u16] {
     text
 }
 
-/// A borrowed view of a MeCab lattice node for furigana parsing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FuriganaNodeSlice<'a> {
-    pub whitespace: &'a [u8],
-    pub surface: &'a [u8],
-    pub feature: &'a [u8],
-}
-
-/// A parsed token with surface UTF-16 code units and optional reading UTF-16 code units.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedToken {
-    pub surface: Vec<u16>,
-    pub reading: Option<Vec<u16>>,
-}
-
-fn utf8_to_utf16(bytes: &[u8]) -> Vec<u16> {
-    String::from_utf8_lossy(bytes).encode_utf16().collect()
-}
-
 /// Split a MeCab CSV feature row respecting double-quoted fields (`"1,2"`) and
 /// escaped quotes (`""`).
-pub fn split_csv_row(row: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut chars = row.chars().peekable();
-    let mut in_quotes = false;
-    while let Some(c) = chars.next() {
-        if in_quotes {
-            if c == '"' {
-                if chars.peek() == Some(&'"') {
-                    current.push('"');
-                    chars.next();
-                } else {
-                    in_quotes = false;
-                }
-            } else {
-                current.push(c);
-            }
-        } else if c == '"' {
-            in_quotes = true;
-        } else if c == ',' {
-            fields.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
+///
+/// Fast-paths unquoted rows via `row.split(',')` and borrows unescaped quoted
+/// fields directly from `row`, avoiding per-column heap `String` allocations on
+/// both IPADic and UniDic morphemes.
+pub fn split_csv_row(row: &str) -> Vec<Cow<'_, str>> {
+    let bytes = row.as_bytes();
+    if !bytes.contains(&b'"') {
+        return row.split(',').map(Cow::Borrowed).collect();
     }
-    fields.push(current);
+
+    let mut fields = Vec::with_capacity(if bytes.len() > 40 { 30 } else { 10 });
+    let mut i = 0;
+    let len = bytes.len();
+    loop {
+        if i < len && bytes[i] == b'"' {
+            let content_start = i + 1;
+            let mut j = content_start;
+            let mut has_escape_or_trailing = false;
+            while j < len {
+                if bytes[j] == b'"' {
+                    if j + 1 == len || bytes[j + 1] == b',' {
+                        fields.push(Cow::Borrowed(&row[content_start..j]));
+                        i = j + 1;
+                        break;
+                    } else {
+                        has_escape_or_trailing = true;
+                        break;
+                    }
+                }
+                j += 1;
+            }
+            if !has_escape_or_trailing {
+                if j == len {
+                    fields.push(Cow::Borrowed(&row[content_start..len]));
+                    break;
+                }
+                if i < len {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+        } else {
+            let field_start = i;
+            let mut j = i;
+            let mut saw_quote = false;
+            while j < len && bytes[j] != b',' {
+                if bytes[j] == b'"' {
+                    saw_quote = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !saw_quote {
+                fields.push(Cow::Borrowed(&row[field_start..j]));
+                if j < len {
+                    i = j + 1;
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // Slow path for a single field containing escaped `""` or mid-field quotes.
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut seg_start = i;
+        while i < len {
+            let b = bytes[i];
+            if in_quotes {
+                if b == b'"' {
+                    current.push_str(&row[seg_start..i]);
+                    if i + 1 < len && bytes[i + 1] == b'"' {
+                        current.push('"');
+                        i += 2;
+                        seg_start = i;
+                    } else {
+                        in_quotes = false;
+                        i += 1;
+                        seg_start = i;
+                    }
+                } else {
+                    i += 1;
+                }
+            } else if b == b'"' {
+                current.push_str(&row[seg_start..i]);
+                in_quotes = true;
+                i += 1;
+                seg_start = i;
+            } else if b == b',' {
+                current.push_str(&row[seg_start..i]);
+                break;
+            } else {
+                i += 1;
+            }
+        }
+        if i == len {
+            current.push_str(&row[seg_start..len]);
+            fields.push(Cow::Owned(current));
+            break;
+        }
+        fields.push(Cow::Owned(current));
+        i += 1;
+    }
     fields
 }
 
@@ -291,13 +361,20 @@ fn derive_inflected_from_lemma(
     l_form.to_string()
 }
 
+fn field_at<S: AsRef<str>>(fields: &[S], idx: usize) -> Option<&str> {
+    fields.get(idx).map(S::as_ref)
+}
+
 /// Extract the best orthographic surface reading from a parsed MeCab CSV feature row,
 /// supporting IPADic (9 columns) as well as UniDic (10, 17, 26, and 29+ columns).
-pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> String {
+pub fn extract_surface_reading_from_fields<S: AsRef<str>>(
+    surface: &str,
+    fields: &[S],
+) -> String {
     if fields.len() <= 9 {
         // IPADic (pos1..4, cType, cForm, baseForm, reading, pron):
         // Column 7 is the surface reading (Column 6 is the dictionary base form!).
-        if let Some(r) = fields.get(7).map(String::as_str) {
+        if let Some(r) = field_at(fields, 7) {
             if is_kana_field(r) {
                 return reconcile_phonetic_with_orthographic(surface, r, None);
             }
@@ -305,7 +382,7 @@ pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> 
                 return "*".to_string();
             }
         }
-        if let Some(p) = fields.get(8).map(String::as_str).filter(|s| is_kana_field(s)) {
+        if let Some(p) = field_at(fields, 8).filter(|s| is_kana_field(s)) {
             return reconcile_phonetic_with_orthographic(surface, p, None);
         }
         return String::new();
@@ -313,10 +390,10 @@ pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> 
 
     // UniDic (>= 10 columns):
     // 0..3: pos1..4, 4: cType, 5: cForm, 6: lForm, 7: lemma, 8: orth, 9: pron
-    let c_form = fields.get(5).map(String::as_str);
-    let l_form = fields.get(6).map(String::as_str).filter(|s| is_kana_field(s));
-    let lemma = fields.get(7).map(String::as_str);
-    let pron = fields.get(9).map(String::as_str).filter(|s| is_kana_field(s));
+    let c_form = field_at(fields, 5);
+    let l_form = field_at(fields, 6).filter(|s| is_kana_field(s));
+    let lemma = field_at(fields, 7);
+    let pron = field_at(fields, 9).filter(|s| is_kana_field(s));
 
     // In 29-col UniDic, column 20 is `kana` (inflected orthographic kana).
     // In 26-col UniDic, column 17 is `kana` (inflected orthographic kana).
@@ -329,7 +406,7 @@ pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> 
     };
 
     for &idx in orth_kana_indices {
-        if let Some(k) = fields.get(idx).map(String::as_str).filter(|s| is_kana_field(s)) {
+        if let Some(k) = field_at(fields, idx).filter(|s| is_kana_field(s)) {
             // Only accept uninflected fallback columns (18, or 20 in 26-col) if `pron` is absent
             // or has the same char count as `k`.
             let is_primary_kana_col =
@@ -351,70 +428,11 @@ pub fn extract_surface_reading_from_fields(surface: &str, fields: &[String]) -> 
         return derive_inflected_from_lemma(surface, c_form, lf, lemma);
     }
 
-    if let Some(r) = fields.get(7).map(String::as_str).filter(|s| is_kana_field(s)) {
+    if let Some(r) = field_at(fields, 7).filter(|s| is_kana_field(s)) {
         return reconcile_phonetic_with_orthographic(surface, r, None);
     }
 
     String::new()
-}
-
-fn extract_reading_for_node(surface_bytes: &[u8], feature_bytes: &[u8]) -> Vec<u16> {
-    let surface_str = String::from_utf8_lossy(surface_bytes);
-    let feature_str = String::from_utf8_lossy(feature_bytes);
-    let fields = split_csv_row(&feature_str);
-    let reading = extract_surface_reading_from_fields(&surface_str, &fields);
-    reading.encode_utf16().collect()
-}
-
-/// Full `FuriganaParser::parse` token-chain processing over a sequence of MeCab nodes.
-pub fn parse_nodes(nodes: &[FuriganaNodeSlice<'_>]) -> Vec<ParsedToken> {
-    let mut tokens = Vec::new();
-
-    for node in nodes {
-        if !node.whitespace.is_empty() {
-            tokens.push(ParsedToken {
-                surface: utf8_to_utf16(node.whitespace),
-                reading: None,
-            });
-        }
-
-        let surface_u16 = utf8_to_utf16(node.surface);
-        let reading_u16 = extract_reading_for_node(node.surface, node.feature);
-
-        let surface_hiragana = katakana_to_hiragana(&surface_u16);
-        let reading_hiragana = katakana_to_hiragana(&reading_u16);
-
-        let is_asterisk = reading_hiragana.len() == 1 && reading_hiragana[0] == b'*' as u16;
-
-        if is_asterisk || surface_hiragana == reading_hiragana {
-            tokens.push(ParsedToken {
-                surface: surface_u16,
-                reading: None,
-            });
-        } else {
-            let spans = crate::furiganautils::simplify_surface(&surface_u16, &reading_hiragana);
-            for span in spans {
-                let surf_start = span.surface_start as usize;
-                let surf_end = span.surface_end as usize;
-                let span_surface = surface_u16.get(surf_start..surf_end).unwrap_or(&[]).to_vec();
-
-                let span_reading = if span.reading_start < span.reading_end {
-                    let read_start = span.reading_start as usize;
-                    let read_end = span.reading_end as usize;
-                    reading_hiragana.get(read_start..read_end).map(|s| s.to_vec())
-                } else {
-                    None
-                };
-
-                tokens.push(ParsedToken {
-                    surface: span_surface,
-                    reading: span_reading,
-                });
-            }
-        }
-    }
-
-    tokens
 }
 
 #[cfg(test)]
@@ -491,51 +509,54 @@ mod tests {
     }
 
     #[test]
-    fn parse_nodes_token_chain() {
-        let nodes = [
-            FuriganaNodeSlice {
-                whitespace: b"  ",
-                surface: "食べる".as_bytes(),
-                feature: "動詞,自立,*,*,一段,基本形,食べる,タベル,タベル".as_bytes(),
-            },
-            FuriganaNodeSlice {
-                whitespace: b"",
-                surface: "人".as_bytes(),
-                feature: "名詞,一般,*,*,*,*,人,ヒト,ヒト".as_bytes(),
-            },
-            FuriganaNodeSlice {
-                whitespace: b" ",
-                surface: "カタカナ".as_bytes(),
-                feature: "名詞,一般,*,*,*,*,カタカナ,カタカナ,カタカナ".as_bytes(),
-            },
-            FuriganaNodeSlice {
-                whitespace: b"",
-                surface: "記号".as_bytes(),
-                feature: "名詞,一般,*,*,*,*,記号,*,*".as_bytes(),
-            },
-        ];
+    fn katakana_to_hiragana_str_matches_utf16_semantics() {
+        assert_eq!(katakana_to_hiragana_str("カタカナ"), "かたかな");
+        assert_eq!(katakana_to_hiragana_str("ヴ"), "ゔ");
+        assert_eq!(katakana_to_hiragana_str("ｱｲｳｴｵ"), "あいうえお");
+        assert_eq!(katakana_to_hiragana_str("ｶﾞﾊﾟ"), "がぱ");
+        // Iteration marks and 0x30A0 are not shifted here.
+        assert_eq!(katakana_to_hiragana_str("\u{30a0}\u{30fd}\u{30fe}"), "\u{30a0}\u{30fd}\u{30fe}");
+    }
 
-        let tokens = parse_nodes(&nodes);
+    #[test]
+    fn split_csv_row_fast_path_and_quoted_cases() {
+        // Unquoted IPADic row: every field is zero-copy borrowed.
+        let ipadic = "動詞,自立,*,*,一段,基本形,食べる,タベル,タベル";
+        let fields = split_csv_row(ipadic);
+        assert_eq!(fields.len(), 9);
+        assert!(fields.iter().all(|f| matches!(f, Cow::Borrowed(_))));
+        assert_eq!(extract_surface_reading_from_fields("食べる", &fields), "タベル");
 
-        let decode = |tok: &ParsedToken| {
-            (
-                String::from_utf16_lossy(&tok.surface),
-                tok.reading.as_ref().map(|r| String::from_utf16_lossy(r)),
-            )
-        };
+        // 29-column UniDic row with empty/simple quoted columns: all 29 fields borrowed!
+        let unidic = "動詞,非自立可能,,,サ行変格,連用形-一般,スル,為る-動詞,し,シ,する,スル,和,\"\",\"\",\"\",\"\",\"\",\"\",用,シ,スル,シ,スル,\"0\",\"C5\",\"\",1,1";
+        let ufields = split_csv_row(unidic);
+        assert_eq!(ufields.len(), 29);
+        assert!(ufields.iter().all(|f| matches!(f, Cow::Borrowed(_))));
+        assert_eq!(ufields[0], "動詞");
+        assert_eq!(ufields[13], "");
+        assert_eq!(ufields[24], "0");
+        assert_eq!(ufields[25], "C5");
+        assert_eq!(ufields[26], "");
+        assert_eq!(ufields[28], "1");
+        assert_eq!(extract_surface_reading_from_fields("し", &ufields), "シ");
 
-        let decoded: Vec<_> = tokens.iter().map(decode).collect();
-        assert_eq!(
-            decoded,
-            vec![
-                ("  ".to_string(), None),
-                ("食".to_string(), Some("た".to_string())),
-                ("べる".to_string(), None),
-                ("人".to_string(), Some("ひと".to_string())),
-                (" ".to_string(), None),
-                ("カタカナ".to_string(), None),
-                ("記号".to_string(), None),
-            ]
-        );
+        // Quoted comma, escaped quotes, trailing commas, empty string, mid-field quotes.
+        let quoted = split_csv_row("a,\"1,2\",\"x\"\"y\",\"\",");
+        let as_strs: Vec<&str> = quoted.iter().map(|f| &**f).collect();
+        assert_eq!(as_strs, vec!["a", "1,2", "x\"y", "", ""]);
+        assert!(matches!(quoted[1], Cow::Borrowed(_)));
+        assert!(matches!(quoted[2], Cow::Owned(_)));
+
+        let empty = split_csv_row("");
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0], "");
+
+        let four_quotes = split_csv_row("\"\"\"\"");
+        assert_eq!(four_quotes.len(), 1);
+        assert_eq!(four_quotes[0], "\"");
+
+        let mid = split_csv_row("a\"b,c\"d,e");
+        let mid_strs: Vec<&str> = mid.iter().map(|f| &**f).collect();
+        assert_eq!(mid_strs, vec!["ab,cd", "e"]);
     }
 }

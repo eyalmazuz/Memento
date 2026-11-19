@@ -1,46 +1,5 @@
 //! Audio source URL templates and JSON audioSourceList extraction.
 
-use std::borrow::Cow;
-
-fn replace_all<'a>(input: &'a [u16], needle: &[u8], replacement: &[u16]) -> Option<Vec<u16>> {
-    // The template tokens are ASCII; compare directly to UTF-16 units without
-    // allocating an encoded needle or decoding input (which would lose UTF-16).
-    let matches_at = |units: &[u16]| units.iter().zip(needle).all(|(&unit, &ascii)| unit == ascii as u16);
-    let first = input.windows(needle.len()).position(&matches_at)?;
-    let mut result = Vec::with_capacity(input.len());
-    result.extend_from_slice(&input[..first]);
-    let mut offset = first;
-    loop {
-        result.extend_from_slice(replacement);
-        offset += needle.len();
-        let Some(next) = input[offset..].windows(needle.len()).position(&matches_at) else {
-            result.extend_from_slice(&input[offset..]);
-            break;
-        };
-        result.extend_from_slice(&input[offset..offset + next]);
-        offset += next;
-    }
-    Some(result)
-}
-
-/// Apply each Qt QString::replace pass in its original order. Each pass
-/// replaces matches in the current string, but does not rescan its own inserted
-/// text. An empty reading uses the expression for `{reading}`.
-pub fn expand_url(url: &[u16], expression: &[u16], reading: &[u16]) -> Vec<u16> {
-    let mut expanded = Cow::Borrowed(url);
-    let reading = if reading.is_empty() { expression } else { reading };
-    for (token, replacement) in [
-        (b"{expression}".as_slice(), expression),
-        (b"{term}".as_slice(), expression),
-        (b"{reading}".as_slice(), reading),
-    ] {
-        if let Some(next) = replace_all(&expanded, token, replacement) {
-            expanded = Cow::Owned(next);
-        }
-    }
-    expanded.into_owned()
-}
-
 /// RFC 3986 percent-encoding for URL path/query template parameters (`{expression}`,
 /// `{term}`, `{reading}`). Unreserved characters (`A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`)
 /// are kept literal; all other UTF-8 bytes (kanji, kana, spaces, `&`, `=`, `?`, `#`, `+`,
@@ -302,31 +261,8 @@ impl JsonReader<'_> {
     }
 }
 
-/// Parses an `audioSourceList` JSON payload into `(name, url)` UTF-16 pairs.
-pub fn parse_json(bytes: &[u8]) -> Option<Vec<(Vec<u16>, Vec<u16>)>> {
-    let mut reader = JsonReader { bytes, pos: 0 };
-    let root = reader.value(0)?;
-    reader.whitespace();
-    if reader.pos != bytes.len() { return None }
-    let ty = root.field("type")?.text()?;
-    if ty.len() != b"audioSourceList".len()
-        || !ty.iter().zip(b"audioSourceList").all(|(&unit, &ascii)| unit == u16::from(ascii))
-    {
-        return None;
-    }
-    // QJsonValue::toArray() yields an empty array for missing or wrong-typed
-    // fields, even when the root itself is a valid audioSourceList.
-    let Some(JsonValue::Array(sources)) = root.field("audioSources") else { return Some(Vec::new()) };
-    Some(sources.iter().filter_map(|source| {
-        let name = source.field("name")?.text()?;
-        let url = source.field("url")?.text()?;
-        Some((name.to_vec(), url.to_vec()))
-    }).collect())
-}
-
 /// Parses a Yomitan/Memento `audioSourceList` JSON payload into UTF-8 `(name, url)` pairs.
 ///
-/// Compared to the strict Qt-parity [`parse_json`]:
 /// - Strips an optional leading UTF-8 BOM (`0xEF 0xBB 0xBF`).
 /// - Accepts entries where `"name"` is omitted or `null` (yielding an empty name so callers
 ///   can fall back to the parent source's display name).
@@ -377,41 +313,6 @@ pub fn parse_audio_source_list(bytes: &[u8]) -> Option<Vec<(String, String)>> {
 mod tests {
     use super::*;
 
-    fn utf16(text: &str) -> Vec<u16> { text.encode_utf16().collect() }
-
-    #[test]
-    fn unicode_replacement_obeys_pass_order_without_rescanning_insertions() {
-        let url = utf16("https://x/{expression}/{term}/{reading}/{expression}");
-        let expression = utf16("{term}語😀");
-        let reading = utf16("{expression}🌸");
-        assert_eq!(
-            expand_url(&url, &expression, &reading),
-            utf16("https://x/{term}語😀語😀/{term}語😀/{expression}🌸/{term}語😀語😀")
-        );
-    }
-
-    #[test]
-    fn empty_reading_falls_back_and_utf16_is_not_normalized() {
-        let url = utf16("🍣/{reading}/{expression}/{term}");
-        assert_eq!(expand_url(&url, &utf16("辞書"), &[]), utf16("🍣/辞書/辞書/辞書"));
-        let mut ill_formed = vec![0xd800];
-        ill_formed.extend(utf16("{reading}"));
-        ill_formed.push(0xdc00);
-        assert_eq!(expand_url(&ill_formed, &[0xdfff], &[]), vec![0xd800, 0xdfff, 0xdc00]);
-    }
-
-    #[test]
-    fn accepts_in_order_only_entries_with_string_names_and_urls() {
-        let json = r#"{"type":"audioSourceList","audioSources":[{"name":"東京","url":"https://例え/😀"},null,{"name":7,"url":"x"},{"name":"","url":""},{"url":"x"},{"name":"last","url":"z","ignored":false}]}"#;
-        let parsed = parse_json(json.as_bytes()).unwrap();
-        assert_eq!(parsed, vec![
-            (utf16("東京"), utf16("https://例え/😀")),
-            (utf16(""), utf16("")),
-            (utf16("last"), utf16("z")),
-        ]);
-        assert_eq!(parse_json(br#"{"type":"audioSourceList","audioSources":[]}"#), Some(vec![]));
-    }
-
     #[test]
     fn rejects_invalid_json_and_mismatched_payload_types() {
         for json in [
@@ -425,19 +326,19 @@ mod tests {
             br#"{"type":"audioSourceList","audioSources":[{"name":"\uXYZ1","url":"x"}]}"#,
             br#"{"type":"audioSourceList","audioSources":[] }garbage"#,
         ] {
-            assert!(parse_json(json).is_none(), "unexpected valid JSON: {json:?}");
+            assert!(
+                parse_audio_source_list(json).is_none(),
+                "unexpected valid JSON: {json:?}"
+            );
         }
-        assert_eq!(parse_json(br#"{"type":"audioSourceList"}"#), Some(Vec::new()));
-        assert_eq!(parse_json(br#"{"type":"audioSourceList","audioSources":{}}"#), Some(Vec::new()));
-    }
-
-    #[test]
-    fn json_preserves_qt_unpaired_utf16_and_last_duplicate_fields() {
-        let json = br#"{"type":"wrong","type":"audioSourceList","audioSources":[{"name":"\ud800","url":"\udfff"},{"name":"\ud83d\ude3a","url":"A\u0000B"}]}"#;
-        assert_eq!(parse_json(json), Some(vec![
-            (vec![0xd800], vec![0xdfff]),
-            (utf16("😺"), vec![65, 0, 66]),
-        ]));
+        assert_eq!(
+            parse_audio_source_list(br#"{"type":"audioSourceList"}"#),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_audio_source_list(br#"{"type":"audioSourceList","audioSources":{}}"#),
+            Some(Vec::new())
+        );
     }
 
     #[test]

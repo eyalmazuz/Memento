@@ -94,7 +94,7 @@ pub fn plan_add_subtitle(
     end: f64,
 ) -> AddPlan {
     let _ = end; // end is preserved for the inserted entry
-    if block_adds {
+    if block_adds || !start.is_finite() {
         return AddPlan { action: AddAction::Reject, index: -1 };
     }
     if text.len() > MAX_TEXT_LENGTH {
@@ -130,12 +130,17 @@ pub fn find_first_overlapping_span(
     end: f64,
     from_row: usize,
 ) -> Option<SubtitleSpanC> {
-    if end <= start || from_row >= items.len() {
+    if !(start < end) || from_row >= items.len() {
         return None;
     }
+    let end_limit = end - TIME_DELTA;
+    let start_limit = start + TIME_DELTA;
     let mut row = from_row;
     while row < items.len() {
-        let overlaps = items[row].start < end - TIME_DELTA && start + TIME_DELTA < items[row].end;
+        if items[row].start >= end_limit {
+            break;
+        }
+        let overlaps = items[row].start < end_limit && start_limit < items[row].end;
         if !overlaps {
             row += 1;
             continue;
@@ -143,7 +148,7 @@ pub fn find_first_overlapping_span(
         let first = row;
         while row < items.len() {
             let item = &items[row];
-            if !(item.start < end - TIME_DELTA && start + TIME_DELTA < item.end) {
+            if !(item.start < end_limit && start_limit < item.end) {
                 break;
             }
             row += 1;
@@ -163,21 +168,26 @@ pub fn collect_overlapping_spans(
     start: f64,
     end: f64,
 ) -> Vec<SubtitleSpanC> {
-    if end <= start {
+    if !(start < end) {
         return Vec::new();
     }
+    let end_limit = end - TIME_DELTA;
+    let start_limit = start + TIME_DELTA;
     let mut spans = Vec::new();
     let mut current_offset: usize = 0;
     let mut i = 0;
     while i < items.len() {
-        let overlaps = items[i].start < end - TIME_DELTA && start + TIME_DELTA < items[i].end;
+        if items[i].start >= end_limit {
+            break;
+        }
+        let overlaps = items[i].start < end_limit && start_limit < items[i].end;
         if !overlaps {
             i += 1;
             continue;
         }
         let first_orig = i;
         while i < items.len() {
-            if !(items[i].start < end - TIME_DELTA && start + TIME_DELTA < items[i].end) {
+            if !(items[i].start < end_limit && start_limit < items[i].end) {
                 break;
             }
             i += 1;
@@ -197,8 +207,12 @@ pub fn collect_overlapping_spans(
 /// Matches C++ `position += TIME_DELTA; item.start < pos && pos < item.end`.
 pub fn select_position_rows(items: &[SubtitleCueView<'_>], position: f64) -> Vec<usize> {
     let pos = position + TIME_DELTA;
+    if pos.is_nan() {
+        return Vec::new();
+    }
+    let upper = items.partition_point(|item| item.start < pos);
     let mut rows = Vec::new();
-    for (i, item) in items.iter().enumerate() {
+    for (i, item) in items[..upper].iter().enumerate() {
         if item.start < pos && pos < item.end {
             rows.push(i);
         }
@@ -845,6 +859,12 @@ mod tests {
         let too_many_nl: Vec<u16> = "a\n".repeat(16).encode_utf16().collect();
         let plan = plan_add_subtitle(&items, false, &too_many_nl, 3.0, 4.0);
         assert_eq!(plan.action, AddAction::Reject);
+
+        // Non-finite start timestamps must be rejected so sorted order is never corrupted.
+        for bad_start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let plan = plan_add_subtitle(&items, false, &t1, bad_start, 4.0);
+            assert_eq!(plan, AddPlan { action: AddAction::Reject, index: -1 });
+        }
     }
 
     #[test]
@@ -944,6 +964,9 @@ mod tests {
 
         // position 0.5 -> pos = 0.5001 -> none
         assert_eq!(select_position_rows(&items, 0.5), Vec::<usize>::new());
+
+        // NaN position -> none
+        assert_eq!(select_position_rows(&items, f64::NAN), Vec::<usize>::new());
     }
 
     #[test]

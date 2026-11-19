@@ -21,7 +21,9 @@
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Half-open offsets into the original UTF-16 surface and reading buffers.
+/// Half-open offsets into the original surface and reading buffers
+/// (UTF-16 code-unit offsets for [`simplify_surface`], UTF-8 byte offsets for
+/// [`simplify_surface_str`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FuriganaSpan {
@@ -79,14 +81,18 @@ fn normalize_text(text: &str) -> String {
     text.nfkc().map(kata_to_hira).collect()
 }
 
-fn make_reading_data(reading: &str) -> ReadingData<String> {
+fn make_reading_data(reading: &str, utf16_offsets: bool) -> ReadingData<String> {
     let mut original_offsets = vec![0];
     let mut normalized_offsets = vec![0];
     let mut normalized = String::with_capacity(reading.len());
-    let mut original_end = 0;
+    let mut original_end = 0u64;
 
     for unit in reading.graphemes(true) {
-        original_end += unit.encode_utf16().count() as u64;
+        original_end += if utf16_offsets {
+            unit.encode_utf16().count() as u64
+        } else {
+            unit.len() as u64
+        };
         original_offsets.push(original_end);
         normalized.extend(unit.nfkc().map(kata_to_hira));
         normalized_offsets.push(normalized.len());
@@ -99,13 +105,21 @@ fn make_reading_data(reading: &str) -> ReadingData<String> {
     }
 }
 
-fn make_segments(surface: &str, normalized_reading: &str) -> Vec<Segment<String>> {
+fn make_segments(
+    surface: &str,
+    normalized_reading: &str,
+    utf16_offsets: bool,
+) -> Vec<Segment<String>> {
     let mut segments: Vec<Segment<String>> = Vec::new();
-    let mut original_end = 0;
+    let mut original_end = 0u64;
 
     for unit in surface.graphemes(true) {
         let start = original_end;
-        original_end += unit.encode_utf16().count() as u64;
+        original_end += if utf16_offsets {
+            unit.encode_utf16().count() as u64
+        } else {
+            unit.len() as u64
+        };
         let normalized = normalize_text(unit);
         let anchor = !normalized.is_empty() && normalized_reading.contains(normalized.as_str());
 
@@ -277,13 +291,44 @@ fn match_anchor_at<T: AsRef<[E]>, E: PartialEq>(
     (reading.normalized_offsets.get(end_index) == Some(&end)).then_some(end_index)
 }
 
+struct SolutionTable {
+    cols: usize,
+    cells: Vec<SolutionState>,
+}
+
+impl SolutionTable {
+    fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            cols,
+            cells: vec![SolutionState::default(); rows * cols],
+        }
+    }
+
+    #[inline]
+    fn get(&self, row: usize, col: usize) -> SolutionState {
+        self.cells[row * self.cols + col]
+    }
+
+    #[inline]
+    fn set(&mut self, row: usize, col: usize, state: SolutionState) {
+        self.cells[row * self.cols + col] = state;
+    }
+}
+
 fn make_solution_table<T: AsRef<[E]>, E: PartialEq>(
     segments: &[Segment<T>],
     reading: &ReadingData<T>,
-) -> Vec<Vec<SolutionState>> {
+) -> SolutionTable {
     let reading_units = reading.original_offsets.len() - 1;
-    let mut table = vec![vec![SolutionState::default(); reading_units + 1]; segments.len() + 1];
-    table[segments.len()][reading_units].count = 1;
+    let mut table = SolutionTable::new(segments.len() + 1, reading_units + 1);
+    table.set(
+        segments.len(),
+        reading_units,
+        SolutionState {
+            count: 1,
+            next_reading_unit_index: None,
+        },
+    );
 
     // For each following segment, suffix_counts[j] counts all alignments
     // starting at any reading boundary >= j. This permits non-anchor segments
@@ -298,28 +343,37 @@ fn make_solution_table<T: AsRef<[E]>, E: PartialEq>(
         for j in (0..=reading_units).rev() {
             if segments[i].anchor {
                 if let Some(end) = match_anchor_at(reading, j, &segments[i].normalized) {
-                    let count = table[i + 1][end].count;
-                    table[i][j] = SolutionState {
-                        count,
-                        next_reading_unit_index: (count == 1).then_some(end),
-                    };
+                    let count = table.get(i + 1, end).count;
+                    table.set(
+                        i,
+                        j,
+                        SolutionState {
+                            count,
+                            next_reading_unit_index: (count == 1).then_some(end),
+                        },
+                    );
                 }
             } else {
                 let count = suffix_counts[j + 1];
-                table[i][j] = SolutionState {
-                    count,
-                    next_reading_unit_index: if count == 1 {
-                        suffix_first_indices[j + 1]
-                    } else {
-                        None
+                table.set(
+                    i,
+                    j,
+                    SolutionState {
+                        count,
+                        next_reading_unit_index: if count == 1 {
+                            suffix_first_indices[j + 1]
+                        } else {
+                            None
+                        },
                     },
-                };
+                );
             }
         }
 
         for j in (0..=reading_units).rev() {
-            suffix_counts[j] = (table[i][j].count + suffix_counts[j + 1]).min(2);
-            suffix_first_indices[j] = if table[i][j].count != 0 {
+            let cell_count = table.get(i, j).count;
+            suffix_counts[j] = (cell_count + suffix_counts[j + 1]).min(2);
+            suffix_first_indices[j] = if cell_count != 0 {
                 Some(j)
             } else {
                 suffix_first_indices[j + 1]
@@ -337,14 +391,15 @@ fn align_segments<T: AsRef<[E]>, E: PartialEq>(
     reading_len: u64,
 ) -> Vec<FuriganaSpan> {
     let table = make_solution_table(segments, reading);
-    if table[0][0].count != 1 {
+    if table.get(0, 0).count != 1 {
         return fallback_result(surface_len, reading_len);
     }
 
     let mut solution = Vec::with_capacity(segments.len());
     let mut reading_unit_index = 0;
     for (i, segment) in segments.iter().enumerate() {
-        let next = table[i][reading_unit_index]
+        let next = table
+            .get(i, reading_unit_index)
             .next_reading_unit_index
             .expect("a unique alignment has a next reading boundary");
         let (reading_start, reading_end) = if segment.anchor {
@@ -390,13 +445,34 @@ pub fn simplify_surface(surface: &[u16], reading: &[u16]) -> Vec<FuriganaSpan> {
             &reading_text,
             surface.len() as u64,
             reading.len() as u64,
+            true,
         ),
         _ => simplify_surface_malformed(surface, reading),
     }
 }
 
+/// Native UTF-8 version of [`simplify_surface`].
+///
+/// Returns half-open **UTF-8 byte** offsets into `surface` and `reading`,
+/// guaranteed to lie on valid UTF-8 grapheme boundaries. If there is no unique
+/// alignment, returns a single span covering both full inputs. Matched surface
+/// anchors always have the empty reading range `0..0`.
+pub fn simplify_surface_str(surface: &str, reading: &str) -> Vec<FuriganaSpan> {
+    simplify_surface_valid(
+        surface,
+        reading,
+        surface.len() as u64,
+        reading.len() as u64,
+        false,
+    )
+}
+
 fn simplify_surface_valid(
-    surface_text: &str, reading_text: &str, surface_len: u64, reading_len: u64,
+    surface_text: &str,
+    reading_text: &str,
+    surface_len: u64,
+    reading_len: u64,
+    utf16_offsets: bool,
 ) -> Vec<FuriganaSpan> {
     // Match normalized whole strings before normalizing separate graphemes.
     if surface_text
@@ -412,8 +488,8 @@ fn simplify_surface_valid(
         }];
     }
 
-    let reading_data = make_reading_data(&reading_text);
-    let segments = make_segments(&surface_text, &reading_data.normalized);
+    let reading_data = make_reading_data(reading_text, utf16_offsets);
+    let segments = make_segments(surface_text, &reading_data.normalized, utf16_offsets);
     align_segments(&segments, &reading_data, surface_len, reading_len)
 }
 
@@ -434,29 +510,19 @@ pub fn is_kanji_char(c: char) -> bool {
     )
 }
 
-/// Returns `true` if `text` contains any kanji, `々`/`〆`, or kanji-adjacent `ヶ`/`ヵ`.
+/// Returns `true` if `text` contains any kanji or ideographic mark (`々`, `〆`, `〇`).
 pub fn contains_kanji(text: &str) -> bool {
-    if text.chars().any(is_kanji_char) {
-        return true;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    for (idx, &c) in chars.iter().enumerate() {
-        if matches!(c, '\u{30F5}' | '\u{30F6}')
-            && (chars.get(idx + 1).is_some_and(|&next| is_kanji_char(next))
-                || (idx > 0 && chars.get(idx - 1).is_some_and(|&prev| is_kanji_char(prev))))
-        {
-            return true;
-        }
-    }
-    false
+    text.chars().any(is_kanji_char)
 }
 
-/// Distribute a reading across `surface` so furigana attaches strictly over kanji
-/// stems while okurigana and kana affixes receive empty readings `""`.
+/// Native UTF-8 furigana distribution with zero UTF-16 round-trips.
+///
+/// Distributes `reading` across `surface` so furigana attaches strictly over
+/// kanji stems while okurigana and kana affixes receive empty readings `""`.
 ///
 /// Preserves the exact surface concatenation invariant:
-/// `distribute_furigana(surface, reading).iter().map(|(s, _)| s.as_str()).collect::<String>() == surface`.
-pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)> {
+/// `distribute_furigana_str(surface, reading).iter().map(|(s, _)| s.as_str()).collect::<String>() == surface`.
+pub fn distribute_furigana_str(surface: &str, reading: &str) -> Vec<(String, String)> {
     if surface.is_empty() {
         return Vec::new();
     }
@@ -464,25 +530,26 @@ pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)
         return vec![(surface.to_string(), String::new())];
     }
 
-    let surface_u16: Vec<u16> = surface.encode_utf16().collect();
-    let reading_raw_u16: Vec<u16> = reading.encode_utf16().collect();
-    let reading_u16 = crate::furiganaparser::katakana_to_hiragana(&reading_raw_u16);
-    let reading_hira = String::from_utf16_lossy(&reading_u16);
+    let reading_hira = crate::furiganaparser::katakana_to_hiragana_str(reading);
 
-    if normalize_text(surface) == normalize_text(&reading_hira) {
+    if surface
+        .nfkc()
+        .map(kata_to_hira)
+        .eq(reading_hira.nfkc().map(kata_to_hira))
+    {
         return vec![(surface.to_string(), String::new())];
     }
 
-    let spans = simplify_surface(&surface_u16, &reading_u16);
+    let spans = simplify_surface_str(surface, &reading_hira);
 
-    // If `simplify_surface` fell back to a single full span despite leading/trailing
+    // If `simplify_surface_str` fell back to a single full span despite leading/trailing
     // kana affixes (e.g. due to an ambiguous internal anchor), peel off exact matching
     // leading and trailing kana affixes so okurigana never receives furigana.
     if spans.len() == 1
         && spans[0].surface_start == 0
-        && spans[0].surface_end == surface_u16.len() as u64
+        && spans[0].surface_end == surface.len() as u64
         && spans[0].reading_start == 0
-        && spans[0].reading_end == reading_u16.len() as u64
+        && spans[0].reading_end == reading_hira.len() as u64
     {
         if let Some(peeled) = peel_kana_affixes(surface, &reading_hira) {
             return peeled;
@@ -493,32 +560,39 @@ pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)
     for span in spans {
         let s_start = span.surface_start as usize;
         let s_end = span.surface_end as usize;
-        let span_surf = surface_u16
-            .get(s_start..s_end)
-            .map(String::from_utf16_lossy)
-            .unwrap_or_default();
+        let span_surf = surface.get(s_start..s_end).unwrap_or_default();
         if span_surf.is_empty() {
             continue;
         }
-        let span_read = if span.reading_start < span.reading_end && contains_kanji(&span_surf) {
+        let span_read = if span.reading_start < span.reading_end && contains_kanji(span_surf) {
             let r_start = span.reading_start as usize;
             let r_end = span.reading_end as usize;
-            let r = reading_u16
-                .get(r_start..r_end)
-                .map(String::from_utf16_lossy)
-                .unwrap_or_default();
-            if normalize_text(&span_surf) == normalize_text(&r) {
+            let r = reading_hira.get(r_start..r_end).unwrap_or_default();
+            if span_surf
+                .nfkc()
+                .map(kata_to_hira)
+                .eq(r.nfkc().map(kata_to_hira))
+            {
                 String::new()
             } else {
-                r
+                r.to_owned()
             }
         } else {
             String::new()
         };
-        out.push((span_surf, span_read));
+        out.push((span_surf.to_owned(), span_read));
     }
 
     out
+}
+
+/// Distribute a reading across `surface` so furigana attaches strictly over kanji
+/// stems while okurigana and kana affixes receive empty readings `""`.
+///
+/// Preserves the exact surface concatenation invariant:
+/// `distribute_furigana(surface, reading).iter().map(|(s, _)| s.as_str()).collect::<String>() == surface`.
+pub fn distribute_furigana(surface: &str, reading: &str) -> Vec<(String, String)> {
+    distribute_furigana_str(surface, reading)
 }
 
 fn peel_kana_affixes(surface: &str, reading_hira: &str) -> Option<Vec<(String, String)>> {
@@ -586,7 +660,10 @@ fn peel_kana_affixes(surface: &str, reading_hira: &str) -> Option<Vec<(String, S
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_kanji, distribute_furigana, is_kanji_char, simplify_surface, FuriganaSpan};
+    use super::{
+        contains_kanji, distribute_furigana, distribute_furigana_str, is_kanji_char,
+        simplify_surface, simplify_surface_str, FuriganaSpan,
+    };
 
     fn span(surface_start: u64, surface_end: u64, reading_start: u64, reading_end: u64) -> FuriganaSpan {
         FuriganaSpan {
@@ -762,5 +839,45 @@ mod tests {
             distribute_furigana("人々", "ヒトビト"),
             vec![("人々".into(), "ひとびと".into())]
         );
+        assert_eq!(
+            distribute_furigana_str("申し込み", "モウシコミ"),
+            vec![
+                ("申".into(), "もう".into()),
+                ("し".into(), "".into()),
+                ("込".into(), "こ".into()),
+                ("み".into(), "".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn simplify_surface_str_returns_sliceable_utf8_byte_offsets() {
+        let surface = "縞か\u{3099}糸";
+        let reading = "しまがいと";
+        let spans = simplify_surface_str(surface, reading);
+        let slices: Vec<(&str, &str)> = spans
+            .iter()
+            .map(|s| {
+                (
+                    &surface[s.surface_start as usize..s.surface_end as usize],
+                    &reading[s.reading_start as usize..s.reading_end as usize],
+                )
+            })
+            .collect();
+        assert_eq!(slices, vec![("縞", "しま"), ("か\u{3099}", ""), ("糸", "いと")]);
+
+        let non_bmp_surface = "字𠀋語";
+        let non_bmp_reading = "じ𠀋ご";
+        let non_bmp_spans = simplify_surface_str(non_bmp_surface, non_bmp_reading);
+        let non_bmp_slices: Vec<(&str, &str)> = non_bmp_spans
+            .iter()
+            .map(|s| {
+                (
+                    &non_bmp_surface[s.surface_start as usize..s.surface_end as usize],
+                    &non_bmp_reading[s.reading_start as usize..s.reading_end as usize],
+                )
+            })
+            .collect();
+        assert_eq!(non_bmp_slices, vec![("字", "じ"), ("𠀋", ""), ("語", "ご")]);
     }
 }

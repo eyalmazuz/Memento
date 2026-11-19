@@ -1,0 +1,335 @@
+import { MementoPalette } from "../palette.slint";
+
+export component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    in property <bool> ghost: false;
+    in property <bool> compact: false;
+    in property <bool> enabled: true;
+    in property <bool> loading: false;
+    in property <string> tooltip: "";
+    callback clicked();
+
+    private property <bool> interactive: root.enabled && !root.loading;
+
+    height: root.compact ? 28px : 32px;
+    width: max(root.compact ? 32px : 72px, btn-lbl.preferred-width + (root.compact ? 18px : 26px));
+    border-radius: 7px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    border-width: 1px;
+    border-color: root.danger
+        ? (touch.has-hover && root.interactive ? MementoPalette.danger-text : MementoPalette.danger)
+        : (root.primary
+            ? (touch.has-hover && root.interactive ? MementoPalette.teal-border : MementoPalette.teal-hover)
+            : (root.ghost
+                ? (touch.has-hover && root.interactive ? MementoPalette.border-light : transparent)
+                : (touch.has-hover && root.interactive ? MementoPalette.cyan-accent : MementoPalette.border-light)));
+    background: root.danger
+        ? (touch.pressed && root.interactive
+            ? MementoPalette.danger-pressed
+            : (touch.has-hover && root.interactive ? MementoPalette.danger-hover : MementoPalette.danger))
+        : (root.primary
+            ? (touch.pressed && root.interactive
+                ? MementoPalette.teal-pressed
+                : (touch.has-hover && root.interactive ? MementoPalette.teal-hover : MementoPalette.teal-accent))
+            : (root.ghost
+                ? (touch.pressed && root.interactive
+                    ? MementoPalette.active-bg
+                    : (touch.has-hover && root.interactive ? MementoPalette.hover-bg : transparent))
+                : (touch.pressed && root.interactive
+                    ? MementoPalette.button-pressed
+                    : (touch.has-hover && root.interactive ? MementoPalette.button-hover : MementoPalette.button-bg))));
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    btn-lbl := Text {
+        text: root.text;
+        color: (root.primary || root.danger) ? #FFFFFF : MementoPalette.text;
+        font-size: root.compact ? 12px : 12.5px;
+        font-weight: (root.primary || root.danger) ? 700 : 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.interactive;
+        mouse-cursor: root.interactive ? pointer : default;
+        clicked => {
+            if root.interactive {
+                root.clicked();
+            }
+        }
+    }
+
+    if root.tooltip != "" && touch.has-hover : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: -self.height - 6px;
+        width: tip-lbl.preferred-width + 14px;
+        height: 24px;
+        border-radius: 5px;
+        background: MementoPalette.tooltip-bg;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        tip-lbl := Text {
+            text: root.tooltip;
+            color: MementoPalette.text;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint: MementoPalette.icon;
+    in property <bool> enabled: true;
+    in property <bool> active: false;
+    in property <bool> danger: false;
+    in property <length> size: 30px;
+    in property <length> icon-size: 16px;
+    in property <string> tooltip: "";
+    in property <bool> tooltip-below: false;
+    in property <bool> tooltip-align-right: false;
+    callback clicked();
+
+    width: root.size;
+    height: root.size;
+    border-radius: 6px;
+    border-width: 1px;
+    opacity: root.enabled ? 1.0 : 0.4;
+    background: !root.enabled
+        ? transparent
+        : (touch.pressed
+            ? (root.danger ? MementoPalette.danger-bg : MementoPalette.active-bg)
+            : (root.active
+                ? MementoPalette.accent-muted
+                : (touch.has-hover
+                    ? (root.danger ? MementoPalette.danger-bg : MementoPalette.hover-bg)
+                    : transparent)));
+    border-color: !root.enabled
+        ? transparent
+        : (root.active
+            ? MementoPalette.cyan-accent
+            : (touch.has-hover
+                ? (root.danger ? MementoPalette.danger : MementoPalette.border-light)
+                : transparent));
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.icon-size;
+        height: root.icon-size;
+        source: root.icon;
+        colorize: !root.enabled
+            ? MementoPalette.text-muted
+            : (root.danger ? MementoPalette.danger : (root.active ? MementoPalette.cyan-text : root.tint));
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+
+    if root.tooltip != "" && touch.has-hover : Rectangle {
+        x: root.tooltip-align-right
+            ? parent.width - self.width
+            : (parent.width - self.width) / 2;
+        y: root.tooltip-below ? parent.height + 6px : -self.height - 6px;
+        width: tip-lbl.preferred-width + 14px;
+        height: 24px;
+        border-radius: 5px;
+        background: MementoPalette.tooltip-bg;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        tip-lbl := Text {
+            text: root.tooltip;
+            color: MementoPalette.text;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component ToggleChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active: false;
+    in property <bool> bold-text: false;
+    in property <bool> italic-text: false;
+    in property <bool> enabled: true;
+    in property <string> tooltip: "";
+    in property <bool> tooltip-below: false;
+    in property <length> chip-width: 30px;
+    callback clicked();
+
+    width: root.chip-width;
+    height: 28px;
+    border-radius: 6px;
+    border-width: 1px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    border-color: root.active
+        ? MementoPalette.teal-border
+        : (chip-touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+    background: root.active
+        ? (chip-touch.pressed && root.enabled ? MementoPalette.teal-pressed : MementoPalette.teal-accent)
+        : (chip-touch.pressed && root.enabled
+            ? MementoPalette.button-pressed
+            : (chip-touch.has-hover && root.enabled ? MementoPalette.button-hover : MementoPalette.surface-bg));
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        color: root.active ? #FFFFFF : MementoPalette.text;
+        font-size: 12.5px;
+        font-weight: root.bold-text ? 700 : 600;
+        font-italic: root.italic-text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    chip-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+
+    if root.tooltip != "" && chip-touch.has-hover : Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: root.tooltip-below ? parent.height + 6px : -self.height - 6px;
+        width: tip-lbl.preferred-width + 14px;
+        height: 24px;
+        border-radius: 5px;
+        background: MementoPalette.tooltip-bg;
+        border-width: 1px;
+        border-color: MementoPalette.border-light;
+        tip-lbl := Text {
+            text: root.tooltip;
+            color: MementoPalette.text;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component FilterChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 26px;
+    width: chip-lbl.preferred-width + 22px;
+    border-radius: 13px;
+    border-width: 1px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    background: root.active
+        ? (touch.pressed ? MementoPalette.teal-pressed : MementoPalette.teal-accent)
+        : (touch.pressed
+            ? MementoPalette.button-pressed
+            : (touch.has-hover && root.enabled ? MementoPalette.hover-bg : MementoPalette.card-bg));
+    border-color: root.active
+        ? MementoPalette.teal-border
+        : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    chip-lbl := Text {
+        text: root.label;
+        color: root.active ? #FFFFFF : MementoPalette.text-secondary;
+        font-size: 11.5px;
+        font-weight: root.active ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if root.enabled {
+                root.clicked();
+            }
+        }
+    }
+}
+
+export component TabPill inherits Rectangle {
+    in property <string> label;
+    in property <string> badge: "";
+    in property <bool> active: false;
+    in property <bool> compact: false;
+    callback clicked();
+
+    height: root.compact ? 30px : 34px;
+    width: pill-row.preferred-width;
+    border-radius: 7px;
+    border-width: 1px;
+    background: root.active
+        ? MementoPalette.accent-muted
+        : (touch.pressed
+            ? MementoPalette.active-bg
+            : (touch.has-hover ? MementoPalette.hover-bg : transparent));
+    border-color: root.active
+        ? MementoPalette.cyan-accent
+        : (touch.has-hover ? MementoPalette.border-light : MementoPalette.border);
+
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    pill-row := HorizontalLayout {
+        padding-left: root.compact ? 12px : 14px;
+        padding-right: root.compact ? 12px : 14px;
+        spacing: 7px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: root.active ? MementoPalette.text : MementoPalette.text-secondary;
+            font-size: root.compact ? 12px : 13px;
+            font-weight: root.active ? 700 : 600;
+            vertical-alignment: center;
+        }
+
+        if root.badge != "" : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 18px;
+                width: max(22px, badge-lbl.preferred-width + 10px);
+                border-radius: 9px;
+                background: root.active ? MementoPalette.accent-subtle : MementoPalette.track-bg;
+                badge-lbl := Text {
+                    text: root.badge;
+                    color: root.active ? MementoPalette.cyan-text : MementoPalette.text-muted;
+                    font-size: 10px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

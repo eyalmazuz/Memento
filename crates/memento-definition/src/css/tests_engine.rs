@@ -11,7 +11,7 @@ use crate::element::{
     CssPseudoClassSelector, CssPseudoElement, CssRule, CssSelectorPart, ParsedStylesheet,
     SiblingState, StructuredElement,
 };
-use crate::json::Json;
+use serde_json::json;
 use std::sync::Arc;
 
 fn part(
@@ -442,14 +442,14 @@ fn structured_element_records_attributes_and_siblings() {
     // L1134-1202: data keys become data-sc- attributes (strings only),
     // href/lang/title copy in, classes gain gloss-sc-tag, details keeps
     // "open" only while detailsOpen.
-    let json = Json::object([
-        ("tag", Json::string("DETAILS")),
-        ("data", Json::object([("myKey", Json::string("value")), ("number", Json::Number(3.0))])),
-        ("lang", Json::string("ja")),
-        ("href", Json::string("file://a.html")),
-    ]);
+    let json = json!({
+        "tag": "DETAILS",
+        "data": { "myKey": "value", "number": 3.0 },
+        "lang": "ja",
+        "href": "file://a.html",
+    });
 
-    let index = renderer.structured_element(&json, &mut ctx, true);
+    let index = renderer.structured_element_value(&json, &mut ctx, true);
     assert_eq!(index, 0);
 
     let element = &ctx.selector_elements[0];
@@ -465,16 +465,16 @@ fn structured_element_records_attributes_and_siblings() {
     assert_eq!(element.attributes.get("lang").map(String::as_str), Some("ja"));
     assert!(element.classes.contains("gloss-sc-details"));
 
-    // Sibling bookkeeping (L1189-1198): childIndex is pre-incremented
+    // Sibling bookkeeping: childIndex is pre-incremented
     // ++siblings.visitedElementCount, childCount from the container.
     assert_eq!(element.child_index, 1);
     assert_eq!(element.child_count, 4);
     assert_eq!(element.previous_sibling, 5);
     assert_eq!(ctx.siblings[0].visited_element_count, 1);
 
-    // The next element's previousSibling is this element's index (L1199-1204).
-    let empty = Json::object([("tag", Json::string("span"))]);
-    let second = renderer.structured_element(&empty, &mut ctx, false);
+    // The next element's previousSibling is this element's index.
+    let empty = json!({ "tag": "span" });
+    let second = renderer.structured_element_value(&empty, &mut ctx, false);
     assert_eq!(second, 1);
     let second_element = &ctx.selector_elements[1];
     assert_eq!(second_element.previous_sibling, 0);
@@ -486,8 +486,8 @@ fn structured_element_records_attributes_and_siblings() {
 fn img_elements_gain_the_image_classes() {
     let renderer = Renderer::new();
     let mut ctx = Context::default();
-    let json = Json::object([("tag", Json::string("img"))]);
-    renderer.structured_element(&json, &mut ctx, false);
+    let json = json!({ "tag": "img" });
+    renderer.structured_element_value(&json, &mut ctx, false);
     let element = &ctx.selector_elements[0];
     assert!(element.classes.contains("gloss-image"));
     assert!(element.classes.contains("gloss-image-container"));

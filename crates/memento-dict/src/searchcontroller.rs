@@ -1,6 +1,6 @@
 //! Pure search controller sorting, deduplication, cloze slicing, and model move planning.
 
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 /// Source origin of a search query.
@@ -94,11 +94,11 @@ pub struct ClozeSpans {
 
 /// Computes (prefix, body, suffix) spans for cloze generation matching
 /// QString::left(index), QString::mid(index, surface_len), and
-/// QString::right(text.size() - (index + surface_len)) bit-for-bit.
+/// QString::right(text.size() - (index + surface_len)) without signed/width overflow.
 pub fn cloze_spans(text_len: u64, index: i64, surface_len: u64) -> ClozeSpans {
     let prefix = qstring_left(text_len, index);
-    let body = qstring_mid(text_len, index, surface_len as i64);
-    let suffix_n = (text_len as i64).wrapping_sub(index.wrapping_add(surface_len as i64));
+    let body = qstring_mid(text_len, index, i128::from(surface_len));
+    let suffix_n = i128::from(text_len) - i128::from(index) - i128::from(surface_len);
     let suffix = qstring_right(text_len, suffix_n);
 
     ClozeSpans {
@@ -112,28 +112,30 @@ pub fn cloze_spans(text_len: u64, index: i64, surface_len: u64) -> ClozeSpans {
 }
 
 fn qstring_left(text_len: u64, n: i64) -> (u64, u64) {
-    if (n as usize) >= (text_len as usize) {
+    if n < 0 || (n as u64) >= text_len {
         (0, text_len)
     } else {
         (0, n as u64)
     }
 }
 
-fn qstring_right(text_len: u64, n: i64) -> (u64, u64) {
-    if (n as usize) >= (text_len as usize) {
+fn qstring_right(text_len: u64, n: i128) -> (u64, u64) {
+    if n < 0 || n >= i128::from(text_len) {
         (0, text_len)
     } else {
-        (text_len - (n as u64), n as u64)
+        let len = n as u64;
+        (text_len - len, len)
     }
 }
 
-fn qstring_mid(text_len: u64, mut pos: i64, mut len: i64) -> (u64, u64) {
-    let orig = text_len as i64;
+fn qstring_mid(text_len: u64, pos: i64, mut len: i128) -> (u64, u64) {
+    let orig = i128::from(text_len);
+    let mut pos = i128::from(pos);
     if pos > orig {
         return (0, 0);
     }
     if pos < 0 {
-        if len < 0 || len.saturating_add(pos) >= orig {
+        if len < 0 || len + pos >= orig {
             return (0, text_len);
         }
         if len + pos <= 0 {
@@ -141,7 +143,7 @@ fn qstring_mid(text_len: u64, mut pos: i64, mut len: i64) -> (u64, u64) {
         }
         len += pos;
         pos = 0;
-    } else if (len as usize) > (orig - pos) as usize {
+    } else if len < 0 || len > orig - pos {
         len = orig - pos;
     }
 
@@ -207,20 +209,21 @@ pub fn sort_by_dict_priority(
 ) -> Vec<usize> {
     let priority_map: HashMap<i64, i64> = priorities.iter().copied().collect();
 
-    items.sort_by(|a, b| {
-        let prio_a = priority_map.get(&a.dict_id).copied().unwrap_or(missing_default);
-        let prio_b = priority_map.get(&b.dict_id).copied().unwrap_or(missing_default);
-
-        prio_a
-            .cmp(&prio_b)
-            .then_with(|| {
-                if a.use_score_tiebreak {
-                    b.score.cmp(&a.score)
-                } else {
-                    Ordering::Equal
-                }
-            })
-            .then_with(|| a.original_index.cmp(&b.original_index))
+    items.sort_by_key(|item| {
+        let prio = priority_map
+            .get(&item.dict_id)
+            .copied()
+            .unwrap_or(missing_default);
+        (
+            prio,
+            !item.use_score_tiebreak,
+            Reverse(if item.use_score_tiebreak {
+                item.score
+            } else {
+                0
+            }),
+            item.original_index,
+        )
     });
     items.into_iter().map(|item| item.original_index).collect()
 }

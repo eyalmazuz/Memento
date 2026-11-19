@@ -27,6 +27,46 @@ fn temp_test_dir(sub: &str) -> PathBuf {
     dir
 }
 
+/// Read a complete HTTP/1.1 request (headers + `Content-Length` body) from a TCP stream
+/// and parse its JSON body. Handles clients such as `ureq 3` that write headers and body
+/// in separate syscalls.
+fn read_http_json_body(stream: &mut std::net::TcpStream) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    };
+    let headers = String::from_utf8_lossy(&raw[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, val) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                val.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while raw.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+    let body_bytes = &raw[header_end..raw.len().min(header_end + content_length)];
+    serde_json::from_slice(body_bytes).ok()
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ConfigController Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -594,7 +634,7 @@ fn invalid_glossary_dict_id_emits_error_string() {
 #[test]
 fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequencies() {
     use memento_dict::yomidbbuilder::{dictionary_resource_dir, prepare_db};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
 
     let temp_dir = temp_test_dir("sqlite_anki_full");
@@ -813,11 +853,7 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
         let mut actions = Vec::new();
         for idx in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let req_text = String::from_utf8_lossy(&buf[..n]);
-            let body_str = req_text.split("\r\n\r\n").nth(1).unwrap_or("");
-            let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+            let body = read_http_json_body(&mut stream).unwrap();
             actions.push(body["action"].as_str().unwrap().to_owned());
             let reply_json = match idx {
                 0 => serde_json::json!({"error": null, "result": [true]}).to_string(),
@@ -1126,7 +1162,7 @@ fn structured_interface_font_color_keybind_and_osc_limits_work_end_to_end() {
 
 #[test]
 fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_policies() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -1183,11 +1219,7 @@ fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_po
         let mut seen_actions = Vec::new();
         for step in 0..2 {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let body: serde_json::Value =
-                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            let body = read_http_json_body(&mut stream).unwrap();
             seen_actions.push(body["action"].as_str().unwrap().to_owned());
             let reply = match step {
                 0 => {
@@ -1250,11 +1282,7 @@ fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_po
         let mut seen_actions = Vec::new();
         for step in 0..3 {
             let (mut stream, _) = listener2.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let body: serde_json::Value =
-                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            let body = read_http_json_body(&mut stream).unwrap();
             seen_actions.push(body["action"].as_str().unwrap().to_owned());
             let reply = match step {
                 0 => {
@@ -1312,7 +1340,7 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
     };
     use memento_dict::yomidbbuilder::prepare_db;
     use slint::{ComponentHandle, Model};
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1363,17 +1391,7 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
             };
             stream.set_nonblocking(false).unwrap();
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let mut buf = vec![0u8; 65536];
-            let Ok(n) = stream.read(&mut buf) else {
-                continue;
-            };
-            if n == 0 {
-                continue;
-            }
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let Ok(body) =
-                serde_json::from_str::<serde_json::Value>(req.split("\r\n\r\n").nth(1).unwrap_or(""))
-            else {
+            let Some(body) = read_http_json_body(&mut stream) else {
                 continue;
             };
             let action = body["action"].as_str().unwrap_or("");
@@ -1763,7 +1781,7 @@ fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_ad
     use memento_net::anki::MediaFilePayload;
     use memento_player::RawFrame;
     use memento_setting::enums::AudioSourceType;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -1780,11 +1798,7 @@ fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_ad
         let mut recorded = Vec::new();
         for step in 0..4 {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let body: serde_json::Value =
-                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            let body = read_http_json_body(&mut stream).unwrap();
             let action = body["action"].as_str().unwrap().to_owned();
             recorded.push(action.clone());
             let reply = match step {
@@ -1937,7 +1951,7 @@ fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_ad
 
 #[test]
 fn update_existing_note_reports_missing_note_cleanly() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
@@ -1945,8 +1959,7 @@ fn update_existing_note_reports_missing_note_cleanly() {
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf);
+        let _ = read_http_json_body(&mut stream);
         let reply = serde_json::json!({ "error": null, "result": [{}] }).to_string();
         let http = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",

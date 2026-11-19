@@ -1,0 +1,247 @@
+import { MementoPalette } from "../palette.slint";
+import { ActionButton, FilterChip, IconButton } from "../components/buttons.slint";
+import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { SettingsField, SettingsGroup } from "types.slint";
+import { FieldRow } from "controls.slint";
+
+export component SettingsSection inherits VerticalLayout {
+    in property <SettingsGroup> group;
+    in property <[string]> anki-decks;
+    in property <[string]> anki-models;
+    in property <[string]> font-families;
+    in property <int> keybind-conflict-count: 0;
+    in property <bool> testing-anki: false;
+    in property <bool> can-move-up: true;
+    in property <bool> can-move-down: true;
+    in-out property <bool> show-advanced: false;
+    callback edited(string, string);
+    callback color-hex-committed(string, string);
+    callback font-edited(string, string, string, bool, bool);
+    callback font-size-typed(string, string, string, bool, bool);
+    callback open-color-picker(SettingsField);
+    callback keybind-captured(string, string, bool, bool, bool, bool);
+    callback apply-anki-preset(string);
+    callback advanced-changed(bool);
+    callback move-entry(string, int);
+    callback remove-entry(string, string);
+    callback test-anki-connection();
+    callback load-anki-fields(string);
+
+    spacing: 8px;
+    horizontal-stretch: 1;
+
+    SectionHeader {
+        title: root.group.title;
+
+        if root.group.entry_id != "" : IconButton {
+            icon: @image-url("../icons/arrow-up.svg");
+            enabled: root.can-move-up;
+            tooltip: "Move source up";
+            clicked => { root.move-entry(root.group.entry_id, -1); }
+        }
+        if root.group.entry_id != "" : IconButton {
+            icon: @image-url("../icons/arrow-down.svg");
+            enabled: root.can-move-down;
+            tooltip: "Move source down";
+            clicked => { root.move-entry(root.group.entry_id, 1); }
+        }
+        if root.group.entry_id != "" : IconButton {
+            icon: @image-url("../icons/delete.svg");
+            danger: true;
+            tooltip: "Delete audio source";
+            tooltip-align-right: true;
+            clicked => { root.remove-entry(root.group.entry_id, root.group.title); }
+        }
+    }
+
+    if root.group.category == 6 && root.group.title == "Keyboard Shortcuts" && root.keybind-conflict-count > 0 : Rectangle {
+        height: 38px;
+        background: MementoPalette.warning-bg;
+        border-width: 1px;
+        border-color: MementoPalette.warning-border;
+        border-radius: 8px;
+        Text {
+            x: 14px;
+            width: parent.width - 28px;
+            height: parent.height;
+            text: "⚠ Duplicate shortcut conflict detected in this profile. Click any shortcut to reassign.";
+            color: MementoPalette.warning-text;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    settings-card := Rectangle {
+        background: MementoPalette.card-bg;
+        border-width: 1px;
+        border-color: MementoPalette.card-border;
+        border-radius: 10px;
+        height: card-col.preferred-height;
+
+        card-col := VerticalLayout {
+            width: parent.width;
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 0px;
+
+            for field[index] in root.group.fields : VerticalLayout {
+                spacing: 0px;
+                if index > 0 && field.visible : Rectangle { height: 1px; background: MementoPalette.border; }
+                field-row := FieldRow {
+                    field: field;
+                    anki-decks: root.anki-decks;
+                    anki-models: root.anki-models;
+                    font-families: root.font-families;
+                    edited(key, value) => { root.edited(key, value); }
+                    color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
+                    font-edited(key, family, size, bold, italic) => {
+                        root.font-edited(key, family, size, bold, italic);
+                    }
+                    font-size-typed(key, family, size, bold, italic) => {
+                        root.font-size-typed(key, family, size, bold, italic);
+                    }
+                    open-color-picker(f) => { root.open-color-picker(f); }
+                    keybind-captured(key, text, ctrl, alt, shift, meta) => {
+                        root.keybind-captured(key, text, ctrl, alt, shift, meta);
+                    }
+                }
+            }
+
+            // One-click presets (stacked header + wrapping FlexboxLayout chips — never overflows at 820px)
+            if root.group.category == 0 && root.group.title == "Term Notes" : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                VerticalLayout {
+                    padding-top: 11px;
+                    padding-bottom: 11px;
+                    spacing: 8px;
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text {
+                            text: "One-click presets";
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: MementoPalette.text;
+                        }
+                        Text {
+                            text: "Pre-fill field markers for popular Anki note types";
+                            font-size: 11px;
+                            color: MementoPalette.text-muted;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+
+                        FilterChip { label: "Lapis"; clicked => { root.apply-anki-preset("Lapis"); } }
+                        FilterChip { label: "Kiku"; clicked => { root.apply-anki-preset("Kiku"); } }
+                        FilterChip { label: "Senren"; clicked => { root.apply-anki-preset("Senren"); } }
+                        FilterChip { label: "Animecards"; clicked => { root.apply-anki-preset("Animecards"); } }
+                        FilterChip { label: "JPMN"; clicked => { root.apply-anki-preset("JPMN"); } }
+                    }
+                }
+            }
+
+            if root.group.category == 0 && (root.group.title == "Term Notes" || root.group.title == "Kanji Notes") : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                HorizontalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 12px;
+                    alignment: space-between;
+                    Text {
+                        text: root.group.fields.length <= 2
+                            ? "No model fields loaded yet — connect to Anki or load fields to map them."
+                            : "Refresh fields from the selected Anki note model";
+                        color: MementoPalette.text-muted;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        ActionButton {
+                            text: "Load Model Fields";
+                            clicked => { root.load-anki-fields(root.group.title == "Term Notes" ? "term" : "kanji"); }
+                        }
+                    }
+                }
+            }
+
+            if root.group.category == 0 && root.group.title == "General" : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                HorizontalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 12px;
+                    alignment: space-between;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        spacing: 1px;
+                        Text {
+                            text: "Show advanced settings";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: MementoPalette.text;
+                        }
+                        Text {
+                            text: "Reveal duplicate-check, audio normalization, and media quality options";
+                            font-size: 11px;
+                            color: MementoPalette.text-muted;
+                            overflow: elide;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        MementoSwitch {
+                            checked: root.show-advanced;
+                            toggled(value) => {
+                                root.show-advanced = value;
+                                root.advanced-changed(value);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.group.category == 0 && root.group.title == "AnkiConnect" : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                HorizontalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 12px;
+                    alignment: space-between;
+                    Text {
+                        text: "Verify AnkiConnect endpoint and load decks & note models";
+                        font-size: 12px;
+                        color: MementoPalette.text-muted;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        ActionButton {
+                            text: root.testing-anki ? "Testing…" : "Test Connection";
+                            loading: root.testing-anki;
+                            enabled: !root.testing-anki;
+                            clicked => { root.test-anki-connection(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

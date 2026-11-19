@@ -146,6 +146,27 @@ pub struct ProbeScript {
     pub color_id_map: Vec<(usize, usize)>,
 }
 
+/// Pre-parsed ASS header metadata cached across probes when `extradata` is unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedExtradata {
+    pub script_info: AssScriptInfo,
+    pub format: EventsFormat,
+    pub header_prefix: String,
+}
+
+impl ParsedExtradata {
+    pub(crate) fn parse(extradata: &str) -> Self {
+        let script_info = parse_script_info(extradata);
+        let format = parse_events_format(extradata);
+        let header_prefix = extract_header_up_to_events_format(extradata, &format);
+        Self {
+            script_info,
+            format,
+            header_prefix,
+        }
+    }
+}
+
 /// Decode a 24-bit probe color ID from a `libass` `ASS_Image.color` (`0xRRGGBBAA`).
 #[inline]
 pub fn decode_color_id(ass_image_color: u32) -> u32 {
@@ -155,13 +176,21 @@ pub fn decode_color_id(ass_image_color: u32) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
-/// Encode a 24-bit probe color ID into an ASS `\1c&HBBGGRR&` override tag value.
+/// Write a 24-bit probe color ID as an ASS `\1c&HBBGGRR&` override tag directly into `out`.
 #[inline]
-pub fn format_color_id_tag(color_id: u32) -> String {
+fn write_color_id_tag(out: &mut String, color_id: u32) {
     let r = color_id & 0xFF;
     let g = (color_id >> 8) & 0xFF;
     let b = (color_id >> 16) & 0xFF;
-    format!(r"\1c&H{b:02X}{g:02X}{r:02X}&")
+    let _ = write!(out, r"\1c&H{b:02X}{g:02X}{r:02X}&");
+}
+
+/// Encode a 24-bit probe color ID into an ASS `\1c&HBBGGRR&` override tag value.
+#[inline]
+pub fn format_color_id_tag(color_id: u32) -> String {
+    let mut out = String::with_capacity(12);
+    write_color_id_tag(&mut out, color_id);
+    out
 }
 
 /// Parse `[Script Info]` fields from an ASS/SSA header or full document.
@@ -239,7 +268,7 @@ pub fn parse_events_format(ass_text: &str) -> EventsFormat {
                 cols.iter()
                     .position(|c| names.iter().any(|n| c.eq_ignore_ascii_case(n)))
             };
-            let text_idx = find(&["Text"]).unwrap_or(cols.len() - 1);
+            let text_idx = find(&["Text"]).unwrap_or_else(|| cols.len().saturating_sub(1));
             return EventsFormat {
                 layer_idx: find(&["Layer", "Marked"]),
                 start_idx: find(&["Start"]),
@@ -274,30 +303,45 @@ pub fn parse_ass_timecode_ms(s: &str) -> Option<i64> {
         None => (sec_part, "0"),
     };
     let secs: i64 = secs_str.parse().ok()?;
+    if hours < 0 || mins < 0 || secs < 0 {
+        return None;
+    }
+    if !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let frac_ms: i64 = match frac_str.len() {
         0 => 0,
-        1 => frac_str.parse::<i64>().ok()? * 100,
-        2 => frac_str.parse::<i64>().ok()? * 10,
+        1 => frac_str.parse::<i64>().ok()?.checked_mul(100)?,
+        2 => frac_str.parse::<i64>().ok()?.checked_mul(10)?,
         _ => frac_str.get(..3)?.parse::<i64>().ok()?,
     };
 
-    Some(((hours * 60 + mins) * 60 + secs) * 1000 + frac_ms)
+    let total_mins = hours.checked_mul(60)?.checked_add(mins)?;
+    let total_secs = total_mins.checked_mul(60)?.checked_add(secs)?;
+    total_secs.checked_mul(1000)?.checked_add(frac_ms)
 }
 
-/// Format milliseconds into an ASS timecode (`H:MM:SS.cc`, clamped at `0:00:00.00`).
-pub fn format_ass_timecode(ms: i64) -> String {
-    let cs_total = (ms.max(0) / 10) as u64;
+/// Write milliseconds as an ASS timecode (`H:MM:SS.cc`, clamped at `0:00:00.00`) into `out`.
+pub(crate) fn write_ass_timecode(out: &mut String, ms: i64) {
+    let cs_total = (ms.max(0) as u64) / 10;
     let cs = cs_total % 100;
     let total_secs = cs_total / 100;
     let secs = total_secs % 60;
     let mins = (total_secs / 60) % 60;
     let hours = total_secs / 3600;
-    format!("{hours}:{mins:02}:{secs:02}.{cs:02}")
+    let _ = write!(out, "{hours}:{mins:02}:{secs:02}.{cs:02}");
+}
+
+/// Format milliseconds into an ASS timecode (`H:MM:SS.cc`, clamped at `0:00:00.00`).
+pub fn format_ass_timecode(ms: i64) -> String {
+    let mut out = String::with_capacity(12);
+    write_ass_timecode(&mut out, ms);
+    out
 }
 
 /// Format milliseconds rounding UP to the next centisecond so `end > now_ms` holds strictly.
 fn format_ass_timecode_ceil(ms: i64) -> String {
-    let cs_total = ((ms.max(0) + 9) / 10) as u64;
+    let cs_total = (ms.max(0) as u64).saturating_add(9) / 10;
     let cs = cs_total % 100;
     let total_secs = cs_total / 100;
     let secs = total_secs % 60;
@@ -309,12 +353,12 @@ fn format_ass_timecode_ceil(ms: i64) -> String {
 /// Parse a single `Dialogue: ...` line according to `format`.
 pub fn parse_dialogue_line(line: &str, format: &EventsFormat) -> Option<AssDialogueLine> {
     let rest = strip_ascii_prefix_ignore_case(line.trim_start(), "Dialogue:")?.trim_start();
-    let total_cols = format.columns.len().max(format.text_idx + 1);
+    let total_cols = format.columns.len().max(format.text_idx.saturating_add(1));
     let mut fields: Vec<&str> = Vec::with_capacity(total_cols);
 
     let mut rem = rest;
     for col in 0..total_cols {
-        if col == format.text_idx || col + 1 == total_cols {
+        if col == format.text_idx || col.saturating_add(1) == total_cols {
             fields.push(rem);
             break;
         }
@@ -339,7 +383,8 @@ pub fn parse_dialogue_line(line: &str, format: &EventsFormat) -> Option<AssDialo
 
     let raw_text = fields.get(format.text_idx).copied().unwrap_or("").to_string();
     let start_ms = parse_ass_timecode_ms(get(format.start_idx)).unwrap_or(0);
-    let end_ms = parse_ass_timecode_ms(get(format.end_idx)).unwrap_or(start_ms + 5_000);
+    let end_ms = parse_ass_timecode_ms(get(format.end_idx))
+        .unwrap_or_else(|| start_ms.saturating_add(5_000));
 
     Some(AssDialogueLine {
         layer: parse_i32(get(format.layer_idx)),
@@ -448,23 +493,41 @@ pub fn is_japanese_or_alnum_lookup_char(ch: char) -> bool {
 /// `.ass` document), events active at `now_ms` (`start <= now_ms < end`) are extracted from
 /// `extradata` directly.
 pub fn build_probe_script(extradata: &str, ass_full: &str, now_ms: i64) -> ProbeScript {
-    let script_info = parse_script_info(extradata);
-    let format = parse_events_format(extradata);
-    let header_prefix = extract_header_up_to_events_format(extradata, &format);
+    let parsed = ParsedExtradata::parse(extradata);
+    build_probe_script_with_parsed(&parsed, extradata, ass_full, now_ms)
+}
 
+/// Build an instrumented probe ASS script and matching clean ASS script using pre-parsed
+/// `extradata` metadata.
+pub(crate) fn build_probe_script_with_parsed(
+    parsed: &ParsedExtradata,
+    extradata: &str,
+    ass_full: &str,
+    now_ms: i64,
+) -> ProbeScript {
     let dialogue_lines: Vec<AssDialogueLine> = if !ass_full.trim().is_empty() {
         ass_full
             .lines()
-            .filter_map(|line| parse_dialogue_line(line, &format))
+            .filter_map(|line| parse_dialogue_line(line, &parsed.format))
             .collect()
     } else {
-        extract_active_dialogues_from_document(extradata, &format, now_ms)
+        extract_active_dialogues_from_document(extradata, &parsed.format, now_ms)
     };
 
-    let mut probe_ass = String::with_capacity(header_prefix.len() + ass_full.len() * 4 + 256);
-    let mut clean_ass = String::with_capacity(header_prefix.len() + ass_full.len() + 256);
-    probe_ass.push_str(&header_prefix);
-    clean_ass.push_str(&header_prefix);
+    let probe_cap = parsed
+        .header_prefix
+        .len()
+        .saturating_add(ass_full.len().saturating_mul(4))
+        .saturating_add(256);
+    let clean_cap = parsed
+        .header_prefix
+        .len()
+        .saturating_add(ass_full.len())
+        .saturating_add(256);
+    let mut probe_ass = String::with_capacity(probe_cap);
+    let mut clean_ass = String::with_capacity(clean_cap);
+    probe_ass.push_str(&parsed.header_prefix);
+    clean_ass.push_str(&parsed.header_prefix);
 
     let mut events = Vec::with_capacity(dialogue_lines.len());
     let mut color_id_map: Vec<(usize, usize)> = Vec::new();
@@ -479,7 +542,7 @@ pub fn build_probe_script(extradata: &str, ass_full: &str, now_ms: i64) -> Probe
 
         let instrumented = instrument_dialogue_text(
             &dialogue.raw_text,
-            script_info.wrap_style,
+            parsed.script_info.wrap_style,
             event_index,
             &mut next_color_id,
             &mut color_id_map,
@@ -487,7 +550,7 @@ pub fn build_probe_script(extradata: &str, ass_full: &str, now_ms: i64) -> Probe
 
         write_dialogue_row(
             &mut clean_ass,
-            &format,
+            &parsed.format,
             &dialogue,
             &eff_start_str,
             &eff_end_str,
@@ -495,7 +558,7 @@ pub fn build_probe_script(extradata: &str, ass_full: &str, now_ms: i64) -> Probe
         );
         write_dialogue_row(
             &mut probe_ass,
-            &format,
+            &parsed.format,
             &dialogue,
             &eff_start_str,
             &eff_end_str,
@@ -518,12 +581,53 @@ pub fn build_probe_script(extradata: &str, ass_full: &str, now_ms: i64) -> Probe
     ProbeScript {
         probe_ass,
         clean_ass,
-        script_info,
+        script_info: parsed.script_info.clone(),
         events,
         total_probed_chars,
         probe_now_ms: now_ms.max(0),
         color_id_map,
     }
+}
+
+/// Build ONLY the clean (uninstrumented) ASS script using pre-parsed `extradata` metadata,
+/// skipping all color-ID probe instrumentation.
+pub(crate) fn build_clean_script_with_parsed(
+    parsed: &ParsedExtradata,
+    extradata: &str,
+    ass_full: &str,
+    now_ms: i64,
+) -> String {
+    let dialogue_lines: Vec<AssDialogueLine> = if !ass_full.trim().is_empty() {
+        ass_full
+            .lines()
+            .filter_map(|line| parse_dialogue_line(line, &parsed.format))
+            .collect()
+    } else {
+        extract_active_dialogues_from_document(extradata, &parsed.format, now_ms)
+    };
+
+    let clean_cap = parsed
+        .header_prefix
+        .len()
+        .saturating_add(ass_full.len())
+        .saturating_add(256);
+    let mut clean_ass = String::with_capacity(clean_cap);
+    clean_ass.push_str(&parsed.header_prefix);
+
+    for dialogue in &dialogue_lines {
+        let (eff_start_str, eff_end_str) =
+            effective_timecode_bounds(dialogue.start_ms, dialogue.end_ms, now_ms);
+        write_dialogue_row(
+            &mut clean_ass,
+            &parsed.format,
+            dialogue,
+            &eff_start_str,
+            &eff_end_str,
+            &dialogue.raw_text,
+        );
+    }
+
+    clean_ass
 }
 
 /// Extract all `Dialogue:` lines from a complete ASS document that are active at `now_ms`.
@@ -562,18 +666,18 @@ fn effective_timecode_bounds(start_ms: i64, end_ms: i64, now_ms: i64) -> (String
     let mut eff_end = if end_ms > now {
         end_ms
     } else {
-        now + 1_000
+        now.saturating_add(1_000)
     };
     // Ensure end centisecond is strictly greater than now_ms.
-    let end_cs_ms = ((eff_end + 9) / 10) * 10;
-    if end_cs_ms <= now {
-        eff_end = now + 20;
+    let end_cs_ms = ((eff_end.max(0) as u64).saturating_add(9) / 10).saturating_mul(10);
+    if end_cs_ms <= now as u64 {
+        eff_end = now.saturating_add(20);
     }
     (format_ass_timecode(eff_start), format_ass_timecode_ceil(eff_end))
 }
 
 fn extract_header_up_to_events_format(extradata: &str, format: &EventsFormat) -> String {
-    let mut out = String::with_capacity(extradata.len() + 128);
+    let mut out = String::with_capacity(extradata.len().saturating_add(128));
     let mut in_events = false;
     let mut saw_events_section = false;
     let mut saw_events_format = false;
@@ -679,7 +783,8 @@ fn instrument_dialogue_text(
     next_color_id: &mut u32,
     color_id_map: &mut Vec<(usize, usize)>,
 ) -> InstrumentedDialogue {
-    let mut probe_text = String::with_capacity(raw_text.len() * 4 + 64);
+    let mut probe_text =
+        String::with_capacity(raw_text.len().saturating_mul(4).saturating_add(64));
     let mut plain_text = String::with_capacity(raw_text.len());
     let mut chars: Vec<ParsedChar> = Vec::new();
     let mut utf16_cursor: usize = 0;
@@ -733,7 +838,7 @@ fn instrument_dialogue_text(
             match bytes[i + 1] {
                 b'N' => {
                     plain_text.push('\n');
-                    utf16_cursor += 1;
+                    utf16_cursor = utf16_cursor.saturating_add(1);
                     explicit_line_idx = explicit_line_idx.saturating_add(1);
                     probe_text.push_str(r"\N");
                     last_non_ws_color_id = 0;
@@ -743,7 +848,7 @@ fn instrument_dialogue_text(
                 b'n' => {
                     if wrap_style == Some(2) {
                         plain_text.push('\n');
-                        utf16_cursor += 1;
+                        utf16_cursor = utf16_cursor.saturating_add(1);
                         explicit_line_idx = explicit_line_idx.saturating_add(1);
                     } else {
                         let byte_offset = plain_text.len();
@@ -757,7 +862,7 @@ fn instrument_dialogue_text(
                             explicit_line_idx,
                             is_whitespace: true,
                         });
-                        utf16_cursor += 1;
+                        utf16_cursor = utf16_cursor.saturating_add(1);
                     }
                     probe_text.push_str(r"\n");
                     last_non_ws_color_id = 0;
@@ -776,7 +881,7 @@ fn instrument_dialogue_text(
                         explicit_line_idx,
                         is_whitespace: true,
                     });
-                    utf16_cursor += 1;
+                    utf16_cursor = utf16_cursor.saturating_add(1);
                     probe_text.push_str(r"\h");
                     last_non_ws_color_id = 0;
                     i += 2;
@@ -821,7 +926,7 @@ fn instrument_dialogue_text(
             probe_text.push(ch);
         } else if (*next_color_id as usize) <= MAX_PROBED_CHARS {
             let cid = *next_color_id;
-            *next_color_id += 1;
+            *next_color_id = next_color_id.saturating_add(1);
             color_id_map.push((event_index, char_idx_in_event));
             chars.push(ParsedChar {
                 ch,
@@ -833,7 +938,7 @@ fn instrument_dialogue_text(
                 is_whitespace: false,
             });
             probe_text.push('{');
-            probe_text.push_str(&format_color_id_tag(cid));
+            write_color_id_tag(&mut probe_text, cid);
             probe_text.push('}');
             probe_text.push(ch);
             last_non_ws_color_id = cid;
@@ -853,7 +958,7 @@ fn instrument_dialogue_text(
             last_non_ws_color_id = 0;
         }
 
-        utf16_cursor += utf16_len;
+        utf16_cursor = utf16_cursor.saturating_add(utf16_len);
         i += ch.len_utf8();
     }
 
@@ -876,12 +981,12 @@ fn split_override_tokens(block: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let bytes = block.as_bytes();
     let mut start: Option<usize> = None;
-    let mut paren_depth: i32 = 0;
+    let mut paren_depth: u32 = 0;
 
     for (idx, &b) in bytes.iter().enumerate() {
         match b {
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = (paren_depth - 1).max(0),
+            b'(' => paren_depth = paren_depth.saturating_add(1),
+            b')' => paren_depth = paren_depth.saturating_sub(1),
             b'\\' if paren_depth == 0 => {
                 if let Some(s) = start {
                     tokens.push(&block[s..idx]);
@@ -961,7 +1066,7 @@ fn filter_override_block(
             *has_explicit_pos = true;
             *has_animated_geometry = true;
         } else if let Some(val) = parse_rotation_or_shear_value(body) {
-            if val.abs() > 0.01 {
+            if val.is_finite() && val.abs() > 0.01 {
                 *is_rotated_or_sign = true;
             }
         }
@@ -989,7 +1094,7 @@ fn filter_transform_tag(
             continue;
         }
         if let Some(val) = parse_rotation_or_shear_value(body) {
-            if val.abs() > 0.01 {
+            if val.is_finite() && val.abs() > 0.01 {
                 *is_rotated_or_sign = true;
             }
         }
@@ -1217,5 +1322,27 @@ Dialogue: 0,0:00:01.1あ,0:00:05.00,Default,,0,0,0,,{\\t(0,500,\\alpha&H00&) }�
         // Trailing-whitespace alpha-only \t(...) must be stripped cleanly in probe_ass.
         assert!(!probe.probe_ass.contains(r"\t("));
         assert!(!probe.probe_ass.contains(r"\alpha"));
+    }
+
+    #[test]
+    fn untrusted_timecodes_and_extreme_bounds_do_not_overflow() {
+        assert_eq!(parse_ass_timecode_ms("99999999999999999:00:00.00"), None);
+        assert_eq!(parse_ass_timecode_ms("-1:00:00.00"), None);
+        assert_eq!(parse_ass_timecode_ms("0:-5:00.00"), None);
+        assert_eq!(parse_ass_timecode_ms("0:00:-1.00"), None);
+        assert_eq!(parse_ass_timecode_ms("0:00:00.-5"), None);
+        assert_eq!(parse_ass_timecode_ms("0:00:00.+5"), None);
+        assert_eq!(parse_ass_timecode_ms("0:00:00."), Some(0));
+
+        // Extreme now_ms / i64::MAX must saturate cleanly without panicking.
+        let (s, e) = effective_timecode_bounds(i64::MAX, i64::MAX, i64::MAX);
+        assert!(!s.is_empty() && !e.is_empty());
+
+        let header = "[Script Info]\nPlayResX: 1280\nPlayResY: 720\n";
+        let ass_full = "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,テスト";
+        let parsed = ParsedExtradata::parse(header);
+        let probe = build_probe_script_with_parsed(&parsed, header, ass_full, 2_000);
+        let clean = build_clean_script_with_parsed(&parsed, header, ass_full, 2_000);
+        assert_eq!(clean, probe.clean_ass);
     }
 }

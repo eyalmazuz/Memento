@@ -1,0 +1,319 @@
+// Shared types, layout helpers, and global bridges for the Yomitan dictionary popup and search panel.
+
+export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
+export struct PitchGraph { dictionary: string, position: int, mora: [PitchMora] }
+export struct PopupFrequency { dictionary: string, value: string }
+export struct PopupFrequencyLine { entries: [PopupFrequency] }
+export struct PopupGlossaryBlock { text: string, kind: int, href: string }
+export struct PopupAudioSource { name: string, index: int }
+
+export struct DictResult {
+    index: int,
+    expression: string,
+    reading: string,
+    pos_tags: string,
+    dict_name: string,
+    glossary: string,
+    glossary-blocks: [PopupGlossaryBlock],
+    notes: string,
+    example_ja: string,
+    example_en: string,
+    selected: bool,
+    score: int,
+    is_kanji: bool,
+    has_kanji: bool,
+    term_start: bool,
+    term_end: bool,
+    collapsed: bool,
+    pitch_graphs: [PitchGraph],
+    frequencies: [PopupFrequency],
+}
+
+export struct RichHeadwordChar {
+    text: string,
+    is_kanji: bool,
+    char_index: int,
+}
+
+export struct RichHeadwordLine {
+    chars: [RichHeadwordChar],
+}
+
+export struct RichTagPill {
+    name: string,
+    category: string,
+    notes: string,
+    bg_color: brush,
+}
+
+export struct RichDerivationStep {
+    label: string,
+    description: string,
+    has_arrow: bool,
+}
+
+export struct RichPitchMora {
+    text: string,
+    high: bool,
+    rises_after: bool,
+    falls_after: bool,
+    nasal: bool,
+    devoice: bool,
+}
+
+export struct RichPitchGraph {
+    dictionary: string,
+    position: int,
+    mora: [RichPitchMora],
+    tags: string,
+}
+
+export struct RichKanjiStat {
+    label: string,
+    value: string,
+}
+
+export struct RichKanjiDetail {
+    valid: bool,
+    character: string,
+    meanings: [string],
+    readings: [string],
+    stats: [RichKanjiStat],
+    classifications: [RichKanjiStat],
+    codepoints: [RichKanjiStat],
+    indices: [RichKanjiStat],
+}
+
+export struct RichSelectionRect {
+    x_px: float,
+    y_px: float,
+    w_px: float,
+    h_px: float,
+}
+
+export struct RichGlossaryRender {
+    has_rich: bool,
+    width_px: float,
+    height_px: float,
+    rendered: image,
+    selection_rects: [RichSelectionRect],
+    scan_highlight_rects: [RichSelectionRect],
+    collapsible: bool,
+    collapsed_height: length,
+    total_lines: int,
+    expanded: bool,
+}
+
+export struct PopupDictStyle {
+    badge_bg: color,
+    badge_color: color,
+    card_bg: color,
+    card_border: color,
+    card_border_width: length,
+    card_radius: length,
+    card_padding: length,
+    glossary_opacity: float,
+    glossary_hover_opacity: float,
+    glossary_solo_opacity: float,
+}
+
+export struct PopupFreqStyle {
+    bg: color,
+    color: color,
+}
+
+export struct DefinitionGridRow {
+    left: DictResult,
+    right: DictResult,
+    has_right: bool,
+    is_solo: bool,
+}
+
+export global PopupLayout {
+    pure callback frequency-lines([PopupFrequency], float) -> [PopupFrequencyLine];
+}
+
+export global PopupBridge {
+    in-out property <int> bridge-instance-id: 0;
+    in-out property <string> selected-glossary-text: "";
+    in-out property <string> last-copied-glossary-text: "";
+    in-out property <bool> rich-enabled: false;
+    in-out property <int> rich-revision: 0;
+    in-out property <int> selection-revision: 0;
+
+    // Custom Popup Outer CSS properties (~/.config/memento/popup-outer.css)
+    in-out property <color> css-popup-bg: #1C2024;
+    in-out property <color> css-popup-border: #384046;
+    in-out property <length> css-popup-border-width: 1px;
+    in-out property <length> css-popup-radius: 8px;
+    in-out property <length> css-popup-padding: 12px;
+    in-out property <length> css-popup-shadow-blur: 24px;
+    in-out property <color> css-popup-shadow-color: #000000DD;
+    in-out property <length> css-popup-width: 0px;
+    in-out property <length> css-popup-height: 0px;
+
+    // Custom Popup Inner CSS properties (~/.config/memento/popup.css)
+    in-out property <color> css-text-color: #F8FAFC;
+    in-out property <color> css-muted-color: #94A3B8;
+    in-out property <color> css-headword-color: #FFFFFF;
+    in-out property <length> css-headword-size: 23px;
+    in-out property <color> css-reading-color: #94A3B8;
+    in-out property <length> css-reading-size: 12px;
+    in-out property <string> css-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-headword-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-reading-font-family: "Noto Sans CJK JP";
+    in-out property <string> css-conj-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-conj-font-size: 11px;
+    in-out property <string> css-tag-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-tag-font-size: 11px;
+    in-out property <string> css-kanji-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-kanji-font-size: 0px;
+    in-out property <length> css-glossary-font-size: 14.5px;
+    in-out property <color> css-link-color: #93C5FD;
+    in-out property <color> css-divider-color: #30373D;
+    in-out property <color> css-term-divider-color: #52616B;
+    in-out property <color> css-freq-bg: #07513E;
+    in-out property <color> css-freq-color: #9CE5C7;
+    in-out property <length> css-freq-font-size: 10px;
+    in-out property <color> css-pitch-color: #B9A1E8;
+    in-out property <color> css-pitch-dict-bg: #6640BE;
+    in-out property <color> css-dict-badge-bg: #6D28D9;
+    in-out property <color> css-dict-badge-color: #EDE9FE;
+    in-out property <color> css-anki-tag-bg: #162B3D;
+    in-out property <color> css-anki-tag-border: #38BDF888;
+    in-out property <color> css-anki-tag-color: #BAE6FD;
+    in-out property <int> css-definition-columns: 1;
+    in-out property <length> css-definition-columns-min-width: 560px;
+    in-out property <length> css-definition-gap: 8px;
+    in-out property <bool> css-show-term-tags: true;
+    in-out property <bool> css-show-pitch-dict: true;
+    in-out property <bool> css-show-kanji-extra: true;
+    in-out property <bool> css-compact-derivations: false;
+
+    // Navigation history stack (Back / Forward)
+    in-out property <bool> can-go-back: false;
+    in-out property <bool> can-go-forward: false;
+    in-out property <string> nav-breadcrumb: "";
+    in-out property <bool> kana-reading-active: false;
+    in-out property <string> active-kana-reading: "";
+
+    // Floating tooltip overlay state
+    in-out property <bool> tooltip-visible: false;
+    in-out property <string> tooltip-text: "";
+    in-out property <float> tooltip-x: 0.0;
+    in-out property <float> tooltip-y: 0.0;
+
+    // Independent DictionarySearchPanel state
+    in-out property <string> panel-query: "";
+    in-out property <[DictResult]> panel-results: [];
+    in-out property <bool> panel-kana-only: false;
+    in-out property <bool> panel-searching: false;
+
+    // Background Anki duplicate & show-tag state (#340, #346)
+    in-out property <int> popup-revision: 0;
+    in-out property <bool> anki-show-tags: false;
+    in-out property <bool> anki-checking: false;
+    in-out property <[bool]> row-anki-duplicates: [];
+    in-out property <[int]> row-anki-note-ids: [];
+    in-out property <[string]> row-anki-note-id-strings: [];
+    in-out property <[string]> row-anki-browse-queries: [];
+    in-out property <[string]> row-anki-tags: [];
+
+    // Recursive nested child popup state (depth 1..=4)
+    in-out property <int> nested-depth: 0;
+    in-out property <int> nested-max-depth: 4;
+    in-out property <int> nested-revision: 0;
+    in-out property <int> nested-nav-revision: 0;
+    in-out property <bool> nested-locked: false;
+    in-out property <bool> nested-searching: false;
+    in-out property <string> nested-breadcrumb: "";
+    in-out property <string> nested-headword: "";
+    in-out property <string> nested-reading: "";
+    in-out property <float> nested-anchor-x: 0.0;
+    in-out property <float> nested-anchor-y: 0.0;
+    in-out property <[DictResult]> nested-results: [];
+    in-out property <[bool]> nested-row-anki-duplicates: [];
+    in-out property <[int]> nested-row-anki-note-ids: [];
+    in-out property <[string]> nested-row-anki-browse-queries: [];
+    in-out property <[string]> nested-row-anki-tags: [];
+    in-out property <bool> last-added-was-nested: false;
+
+    // Rich query callbacks
+    pure callback headword-chars(string) -> [RichHeadwordChar];
+    pure callback headword-lines(string, float) -> [RichHeadwordLine];
+    pure callback headword-pitch-color(int, int) -> color;
+    pure callback dict-entry-style(string, bool, int) -> PopupDictStyle;
+    pure callback freq-badge-style(string, int) -> PopupFreqStyle;
+    pure callback pitch-dict-bg(string, int) -> color;
+    pure callback definition-grid-rows([DictResult], int) -> [DefinitionGridRow];
+    pure callback split-anki-tags(string) -> [string];
+    pure callback term-tag-pills(int, int) -> [RichTagPill];
+    pure callback def-tag-pills(int, int) -> [RichTagPill];
+    pure callback derivation-steps(int, int) -> [RichDerivationStep];
+    pure callback derivation-summary(int, int) -> string;
+    pure callback rich-pitch-graphs(int, int) -> [RichPitchGraph];
+    pure callback devoice-circle-image() -> image;
+    pure callback kanji-detail(int, int) -> RichKanjiDetail;
+    pure callback render-glossary(int, float, bool, int, int) -> RichGlossaryRender;
+    pure callback glossary-cursor-is-pointer(int, float, float) -> bool;
+
+    // Nested child popup rich query callbacks (depth >= 1)
+    pure callback nested-headword-pitch-color(int, int, int) -> color;
+    pure callback nested-term-tag-pills(int, int, int) -> [RichTagPill];
+    pure callback nested-def-tag-pills(int, int, int) -> [RichTagPill];
+    pure callback nested-derivation-steps(int, int, int) -> [RichDerivationStep];
+    pure callback nested-derivation-summary(int, int, int) -> string;
+    pure callback nested-rich-pitch-graphs(int, int, int) -> [RichPitchGraph];
+    pure callback nested-kanji-detail(int, int, int) -> RichKanjiDetail;
+    pure callback nested-render-glossary(int, int, float, bool, int, int) -> RichGlossaryRender;
+    pure callback nested-glossary-cursor-is-pointer(int, int, float, float) -> bool;
+
+    // Interactive actions
+    callback nav-back();
+    callback nav-forward();
+    callback lookup-kanji-char(string, string);
+    callback toggle-kana-reading-search(string, string);
+    callback activate-glossary-link(string) -> bool;
+    callback toggle-glossary-details(int, string);
+    callback toggle-definition-expanded(int, int);
+    callback show-tooltip(string, float, float);
+    callback hide-tooltip();
+    callback glossary-pointer-down(int, float, float);
+    callback glossary-pointer-drag(int, float, float);
+    callback glossary-pointer-up(int, float, float);
+    callback glossary-pointer-hover(int, float, float, float, float);
+    callback glossary-double-clicked(int, float, float);
+    callback glossary-scan-hover(int, int, float, float, float, float, bool, bool, bool, bool);
+    callback glossary-scan-middle-click(int, int, float, float, float, float);
+    callback glossary-scan-leave(int, int);
+    callback nested-glossary-pointer-down(int, int, float, float);
+    callback nested-glossary-pointer-drag(int, int, float, float);
+    callback nested-glossary-pointer-up(int, int, float, float);
+    callback nested-glossary-double-clicked(int, int, float, float);
+    callback nested-lookup-kanji-char(int, string, string);
+    callback nested-toggle-select-definition(int, int);
+    callback nested-toggle-term-collapse(int, int);
+    callback nested-add-anki-note(int);
+    callback nested-popup-hover-changed(bool);
+    callback nested-body-hover-changed(bool);
+    callback lock-nested-popup();
+    callback pop-nested-popup();
+    callback dismiss-all-nested-popups();
+    callback copy-selected-glossary();
+    callback popup-key-pressed(string, bool, bool, bool, bool) -> bool;
+    callback popup-key-released(bool, bool, bool, bool);
+
+    // Sibling track hooks (default no-op until connected in main.rs)
+    callback update-anki-note-requested(int, int, string, string, string);
+    callback first-term-ready(string, string);
+
+    // Independent search panel actions
+    callback panel-search-requested(string);
+    callback panel-toggle-kana-only();
+    callback panel-lookup-requested(string);
+}
+
+// Japanese text uses one family; Slint accepts a single name, not a CSS list.
+export component DictionaryText inherits Text {
+    font-family: PopupBridge.css-font-family;
+}

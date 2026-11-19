@@ -231,7 +231,7 @@ impl VideoRendererCapabilities {
         let nvidia_driver_available = false;
 
         #[cfg(target_os = "linux")]
-        let vaapi_available = std::path::Path::new("/dev/dri/renderD128").exists();
+        let vaapi_available = has_drm_render_node_in(Path::new("/dev/dri"));
         #[cfg(not(target_os = "linux"))]
         let vaapi_available = false;
 
@@ -295,8 +295,8 @@ impl RendererOverrides {
         let gpu_context = cli_gpu_context.or(hints.gpu_context);
 
         let env_renderer = env("MEMENTO_RENDERER").and_then(|v| PlatformRendererKind::parse(&v));
-        let slint_software = env("SLINT_BACKEND")
-            .is_some_and(|v| v.to_ascii_lowercase().contains("software"));
+        let slint_software =
+            env("SLINT_BACKEND").is_some_and(|v| v.to_ascii_lowercase().contains("software"));
         let vo_software = vo
             .as_deref()
             .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "sw" | "software"));
@@ -304,18 +304,14 @@ impl RendererOverrides {
         let explicit_renderer = env_renderer
             .or_else(|| slint_software.then_some(PlatformRendererKind::Software))
             .or_else(|| vo_software.then_some(PlatformRendererKind::Software))
-            .or_else(|| {
-                gpu_api
-                    .as_deref()
-                    .and_then(PlatformRendererKind::parse)
-            });
+            .or_else(|| gpu_api.as_deref().and_then(PlatformRendererKind::parse));
 
-        let libgl_always_software = env("LIBGL_ALWAYS_SOFTWARE")
-            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-        let force_rgba8 = env("MEMENTO_GL_FORCE_RGBA8")
-            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-        let prefer_hdr = env("MEMENTO_PREFER_HDR")
-            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let libgl_always_software =
+            env("LIBGL_ALWAYS_SOFTWARE").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let force_rgba8 =
+            env("MEMENTO_GL_FORCE_RGBA8").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let prefer_hdr =
+            env("MEMENTO_PREFER_HDR").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let disable_windows_borderless_workaround = env("MEMENTO_DISABLE_WIN_BORDERLESS_FS")
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
 
@@ -381,7 +377,9 @@ impl PlatformRendererConfig {
         match caps.os {
             TargetOs::MacOs => Self::select_macos(caps, overrides, requested_hwdec),
             TargetOs::Windows => Self::select_windows(caps, overrides, requested_hwdec),
-            TargetOs::Linux | TargetOs::Other => Self::select_linux(caps, overrides, requested_hwdec),
+            TargetOs::Linux | TargetOs::Other => {
+                Self::select_linux(caps, overrides, requested_hwdec)
+            }
         }
     }
 
@@ -575,10 +573,43 @@ impl PlatformRendererConfig {
     }
 }
 
+/// Check whether `dir` (typically `/dev/dri`) contains any DRM render node
+/// (`renderD*`, such as `renderD128` or `renderD129`).
+pub fn has_drm_render_node_in(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("renderD"))
+    })
+}
+
 fn opengl_fbo_formats(rgba16f_supported: bool, force_rgba8: bool) -> Vec<VideoColorFormat> {
     if rgba16f_supported && !force_rgba8 {
         vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Rgba8Unorm]
     } else {
         vec![VideoColorFormat::Rgba8Unorm]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drm_render_node_detection_matches_any_renderd_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!has_drm_render_node_in(dir.path()));
+        assert!(!has_drm_render_node_in(&dir.path().join("missing")));
+
+        std::fs::write(dir.path().join("card0"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("by-path")).unwrap();
+        assert!(!has_drm_render_node_in(dir.path()));
+
+        std::fs::write(dir.path().join("renderD129"), b"").unwrap();
+        assert!(has_drm_render_node_in(dir.path()));
     }
 }
