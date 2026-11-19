@@ -788,6 +788,25 @@ pub mod native {
         fn objc_getClass(name: *const c_char) -> Class;
         fn sel_registerName(name: *const c_char) -> Sel;
         fn objc_msgSend();
+        fn objc_release(obj: Id);
+        fn objc_autoreleasePoolPush() -> *mut c_void;
+        fn objc_autoreleasePoolPop(pool: *mut c_void);
+    }
+
+    struct AutoreleasePoolGuard(*mut c_void);
+
+    impl AutoreleasePoolGuard {
+        unsafe fn push() -> Self {
+            Self(objc_autoreleasePoolPush())
+        }
+    }
+
+    impl Drop for AutoreleasePoolGuard {
+        fn drop(&mut self) {
+            unsafe {
+                objc_autoreleasePoolPop(self.0);
+            }
+        }
     }
 
     /// Owned `IOSurfaceRef` released via `CFRelease` on drop.
@@ -919,6 +938,16 @@ pub mod native {
                 (&fmt_val as *const i32).cast(),
             );
 
+            let numbers = [n_width, n_height, n_bpe, n_bpr, n_fmt];
+            if numbers.iter().any(|n| n.is_null()) {
+                for num in numbers {
+                    if !num.is_null() {
+                        CFRelease(num.cast());
+                    }
+                }
+                return Err("CFNumberCreate failed for IOSurface properties".to_owned());
+            }
+
             let keys = [
                 kIOSurfaceWidth.cast(),
                 kIOSurfaceHeight.cast(),
@@ -942,10 +971,8 @@ pub mod native {
                 &kCFTypeDictionaryValueCallBacks,
             );
 
-            for num in [n_width, n_height, n_bpe, n_bpr, n_fmt] {
-                if !num.is_null() {
-                    CFRelease(num.cast());
-                }
+            for num in numbers {
+                CFRelease(num.cast());
             }
             if dict.is_null() {
                 return Err("CFDictionaryCreate failed for IOSurface properties".to_owned());
@@ -1010,6 +1037,10 @@ pub mod native {
         if mtl_device.is_null() {
             return Err("MTLDevice pointer is null".to_owned());
         }
+        // Drain the autoreleased MTLTextureDescriptor even on non-AppKit threads.
+        // `newTextureWithDescriptor:iosurface:plane:` returns a +1 retained object
+        // owned by the caller, so popping the pool preserves `texture`.
+        let _pool = AutoreleasePoolGuard::push();
         let desc_cls = objc_getClass(c"MTLTextureDescriptor".as_ptr());
         if desc_cls.is_null() {
             return Err("MTLTextureDescriptor Objective-C class unavailable".to_owned());
@@ -1103,13 +1134,13 @@ pub mod native {
         Ok(())
     }
 
-    /// Release a retained Objective-C / Metal object pointer via `CFRelease`.
+    /// Release a retained Objective-C / Metal object pointer via `objc_release`.
     ///
     /// # Safety
-    /// `obj` must be null or a valid retained Objective-C / CoreFoundation object.
+    /// `obj` must be null or a valid retained Objective-C object.
     pub unsafe fn release_metal_object(obj: Id) {
         if !obj.is_null() {
-            CFRelease(obj.cast());
+            objc_release(obj);
         }
     }
 
@@ -1119,7 +1150,7 @@ pub mod native {
             if device.is_null() {
                 false
             } else {
-                CFRelease(device.cast());
+                objc_release(device);
                 true
             }
         }

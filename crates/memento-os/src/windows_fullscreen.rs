@@ -31,10 +31,13 @@
 /// fullscreen to avoid DWM OpenGL fullscreen glitches and hitching.
 pub const WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX: u32 = 1;
 
+/// Win32 `WS_MAXIMIZE` window style bit (`0x0100_0000`).
+pub const WIN32_WS_MAXIMIZE: u32 = 0x0100_0000;
+
 /// Win32 standard window-frame style bits stripped in borderless mode:
-/// `WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU`.
+/// `WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_MAXIMIZE`.
 pub const WIN32_BORDERLESS_STRIP_STYLE_MASK: u32 =
-    0x00C0_0000 | 0x0004_0000 | 0x0002_0000 | 0x0001_0000 | 0x0008_0000;
+    0x00C0_0000 | 0x0004_0000 | 0x0002_0000 | 0x0001_0000 | 0x0008_0000 | WIN32_WS_MAXIMIZE;
 
 /// Win32 extended window-frame style bits stripped in borderless mode:
 /// `WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE`.
@@ -119,12 +122,19 @@ pub struct Win32WindowStyleSnapshot {
     pub normal_rect: WindowRect,
 }
 
-/// Strip titlebar, sizing border, and modal/edge styles for frameless mode.
+/// Strip titlebar, sizing border, maximize bit, and modal/edge styles for frameless mode.
 pub const fn strip_win32_window_frame_styles(style: u32, ex_style: u32) -> (u32, u32) {
     (
         style & !WIN32_BORDERLESS_STRIP_STYLE_MASK,
         ex_style & !WIN32_BORDERLESS_STRIP_EX_STYLE_MASK,
     )
+}
+
+/// Mask `WS_MAXIMIZE` out of a saved Win32 style before applying `SetWindowPos`
+/// and `ShowWindow(SW_SHOWMAXIMIZED)` during borderless fullscreen exit so Win32
+/// does not observe a conflicting maximized style bit prior to restoring bounds.
+pub const fn restore_win32_normal_window_style(saved_style: u32) -> u32 {
+    saved_style & !WIN32_WS_MAXIMIZE
 }
 
 /// Compute the `(monitor_x, monitor_y, monitor_w, monitor_h + 1)` target rect
@@ -163,6 +173,8 @@ mod win32_ffi {
     pub const HWND_TOP: Hwnd = 0;
     pub const HWND_NOTOPMOST: Hwnd = -2;
 
+    pub const SWP_NOSIZE: u32 = 0x0001;
+    pub const SWP_NOMOVE: u32 = 0x0002;
     pub const SWP_NOZORDER: u32 = 0x0004;
     pub const SWP_FRAMECHANGED: u32 = 0x0020;
     pub const SWP_SHOWWINDOW: u32 = 0x0040;
@@ -308,7 +320,25 @@ pub fn capture_win32_window_snapshot(hwnd: isize) -> Result<Win32WindowStyleSnap
         let was_maximized = win32_ffi::IsZoomed(hwnd) != 0
             || (has_placement && placement.show_cmd == win32_ffi::SW_SHOWMAXIMIZED as u32);
 
-        let mut normal_rect = if has_placement {
+        // When not maximized, prefer GetWindowRect (screen coordinates matching
+        // SetWindowPos) rather than rcNormalPosition (workspace coordinates
+        // shifted by top/left Windows taskbars). When maximized, capture
+        // rcNormalPosition as the initial fallback (refreshed after ShowWindow).
+        let mut normal_rect = if !was_maximized {
+            let mut raw_rect = win32_ffi::Rect::default();
+            let screen_rect = if win32_ffi::GetWindowRect(hwnd, &mut raw_rect) != 0 {
+                win32_ffi::rect_to_window_rect(raw_rect)
+            } else {
+                WindowRect::default()
+            };
+            if !screen_rect.is_empty() {
+                screen_rect
+            } else if has_placement {
+                win32_ffi::rect_to_window_rect(placement.rc_normal_position)
+            } else {
+                WindowRect::default()
+            }
+        } else if has_placement {
             win32_ffi::rect_to_window_rect(placement.rc_normal_position)
         } else {
             WindowRect::default()
@@ -342,7 +372,7 @@ pub fn enter_windows_borderless_fullscreen(
     monitor: Option<MonitorRect>,
 ) -> Result<(Win32WindowStyleSnapshot, WindowRect), String> {
     let hwnd = win32_ffi::validate_hwnd(hwnd)?;
-    let snapshot = capture_win32_window_snapshot(hwnd)?;
+    let mut snapshot = capture_win32_window_snapshot(hwnd)?;
     let target_monitor = match monitor {
         Some(m) => m,
         None => query_window_monitor(hwnd)?,
@@ -354,6 +384,15 @@ pub fn enter_windows_borderless_fullscreen(
     unsafe {
         if snapshot.was_maximized {
             let _ = win32_ffi::ShowWindow(hwnd, win32_ffi::SW_SHOWNORMAL);
+            // Refresh normal_rect in screen coordinates after unmaximizing
+            // (matching Main.qml: showNormal() before reading savedGeometry).
+            let mut raw_rect = win32_ffi::Rect::default();
+            if win32_ffi::GetWindowRect(hwnd, &mut raw_rect) != 0 {
+                let screen_rect = win32_ffi::rect_to_window_rect(raw_rect);
+                if !screen_rect.is_empty() {
+                    snapshot.normal_rect = screen_rect;
+                }
+            }
         }
         let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, frameless_style as i32);
         let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE, frameless_ex_style as i32);
@@ -390,12 +429,13 @@ pub fn exit_windows_borderless_fullscreen(
     snapshot: &Win32WindowStyleSnapshot,
 ) -> Result<(), String> {
     let hwnd = win32_ffi::validate_hwnd(hwnd)?;
+    let restored_style = restore_win32_normal_window_style(snapshot.style);
     unsafe {
-        let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, snapshot.style as i32);
+        let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_STYLE, restored_style as i32);
         let _ = win32_ffi::SetWindowLongW(hwnd, win32_ffi::GWL_EXSTYLE, snapshot.ex_style as i32);
         let rect = snapshot.normal_rect;
-        if !rect.is_empty() {
-            let ok = win32_ffi::SetWindowPos(
+        let ok = if !rect.is_empty() {
+            win32_ffi::SetWindowPos(
                 hwnd,
                 win32_ffi::HWND_NOTOPMOST,
                 rect.x,
@@ -406,13 +446,28 @@ pub fn exit_windows_borderless_fullscreen(
                     | win32_ffi::SWP_NOZORDER
                     | win32_ffi::SWP_NOOWNERZORDER
                     | win32_ffi::SWP_SHOWWINDOW,
+            )
+        } else {
+            win32_ffi::SetWindowPos(
+                hwnd,
+                win32_ffi::HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                win32_ffi::SWP_NOMOVE
+                    | win32_ffi::SWP_NOSIZE
+                    | win32_ffi::SWP_FRAMECHANGED
+                    | win32_ffi::SWP_NOZORDER
+                    | win32_ffi::SWP_NOOWNERZORDER
+                    | win32_ffi::SWP_SHOWWINDOW,
+            )
+        };
+        if ok == 0 {
+            return Err(
+                "SetWindowPos failed restoring windowed geometry from borderless fullscreen"
+                    .to_owned(),
             );
-            if ok == 0 {
-                return Err(
-                    "SetWindowPos failed restoring windowed geometry from borderless fullscreen"
-                        .to_owned(),
-                );
-            }
         }
         if snapshot.was_maximized {
             let _ = win32_ffi::ShowWindow(hwnd, win32_ffi::SW_SHOWMAXIMIZED);

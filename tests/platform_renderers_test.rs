@@ -48,8 +48,9 @@ use memento_app::video_metal::{
     MTL_PIXEL_FORMAT_RGBA16_FLOAT,
 };
 use memento_os::{
-    compute_windows_borderless_fullscreen_rect, strip_win32_window_frame_styles, MonitorRect,
-    WindowRect, WIN32_BORDERLESS_STRIP_EX_STYLE_MASK, WIN32_BORDERLESS_STRIP_STYLE_MASK,
+    compute_windows_borderless_fullscreen_rect, restore_win32_normal_window_style,
+    strip_win32_window_frame_styles, MonitorRect, WindowRect, WIN32_BORDERLESS_STRIP_EX_STYLE_MASK,
+    WIN32_BORDERLESS_STRIP_STYLE_MASK, WIN32_WS_MAXIMIZE,
     WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX,
 };
 use memento_player::mpv::{
@@ -609,10 +610,17 @@ fn windows_borderless_fullscreen_preserves_maximized_state_and_win32_style_helpe
         }
     );
 
-    // Verify Win32 style stripping clears frame chrome while preserving visibility flags.
-    let (style, ex_style) = strip_win32_window_frame_styles(0x10CF_0000, 0x0004_0301);
+    // Verify Win32 style stripping clears frame chrome AND WS_MAXIMIZE while preserving WS_VISIBLE,
+    // and restore_win32_normal_window_style clears WS_MAXIMIZE before SetWindowPos + ShowWindow.
+    let maximized_style = 0x10CF_0000 | WIN32_WS_MAXIMIZE;
+    let (style, ex_style) = strip_win32_window_frame_styles(maximized_style, 0x0004_0301);
     assert_eq!(style & WIN32_BORDERLESS_STRIP_STYLE_MASK, 0);
+    assert_eq!(style & WIN32_WS_MAXIMIZE, 0);
+    assert_ne!(style & 0x1000_0000, 0);
     assert_eq!(ex_style & WIN32_BORDERLESS_STRIP_EX_STYLE_MASK, 0);
+    let restored_style = restore_win32_normal_window_style(maximized_style);
+    assert_eq!(restored_style & WIN32_WS_MAXIMIZE, 0);
+    assert_eq!(restored_style, 0x10CF_0000);
 }
 
 #[test]
@@ -781,6 +789,14 @@ fn mpv_hwdec_compatibility_and_render_context_lifecycle_guard_against_cuda_hazar
     assert_eq!(
         compatible_opengl_hwdec_for_session("cuda", "NVIDIA GeForce RTX 4090", true),
         "cuda-copy"
+    );
+    assert_eq!(
+        compatible_opengl_hwdec_for_session("auto", "NVIDIA GeForce RTX 4090", true),
+        "nvdec-copy,auto-copy"
+    );
+    assert_eq!(
+        compatible_opengl_hwdec_for_session("yes", "NVIDIA GeForce RTX 4090", true),
+        "nvdec-copy,auto-copy"
     );
 
     // Software GL & CPU software renderer convert all direct GPU decoders to copyback.
@@ -955,14 +971,19 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
         // 2. Test with_saved_state resets GL to libmpv defaults and restores every UI binding.
         let tex0 = gl.create_texture().unwrap();
         let tex1 = gl.create_texture().unwrap();
+        let samp0 = gl.create_sampler().unwrap();
+        let samp1 = gl.create_sampler().unwrap();
         let pbo = gl.create_buffer().unwrap();
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(resized.framebuffer));
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex0));
+        gl.bind_sampler(0, Some(samp0));
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex1));
+        gl.bind_sampler(1, Some(samp1));
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
         gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 64);
         gl.viewport(10, 20, 320, 240);
         gl.scissor(5, 6, 100, 80);
@@ -984,7 +1005,12 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
             gl.get_parameter_i32_slice(glow::COLOR_WRITEMASK, &mut mask);
             assert_eq!(mask, [1, 1, 1, 1]);
             assert_eq!(gl.get_parameter_i32(glow::PIXEL_UNPACK_BUFFER_BINDING), 0);
+            assert_eq!(gl.get_parameter_i32(glow::UNPACK_ALIGNMENT), 4);
+            assert_eq!(gl.get_parameter_i32(glow::PACK_ALIGNMENT), 4);
             assert_eq!(gl.get_parameter_i32(glow::UNPACK_ROW_LENGTH), 0);
+            assert_eq!(gl.get_parameter_i32(glow::SAMPLER_BINDING), 0);
+            gl.active_texture(glow::TEXTURE0);
+            assert_eq!(gl.get_parameter_i32(glow::SAMPLER_BINDING), 0);
 
             // Simulate libmpv mutating bindings and state aggressively.
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -993,6 +1019,7 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
             gl.viewport(0, 0, 1280, 720);
             gl.scissor(0, 0, 1280, 720);
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 8);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 8);
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 128);
             gl.enable(glow::BLEND);
             gl.disable(glow::DITHER);
@@ -1009,10 +1036,18 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
             gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) as u32,
             tex1.0.get()
         );
+        assert_eq!(
+            gl.get_parameter_i32(glow::SAMPLER_BINDING) as u32,
+            samp1.0.get()
+        );
         gl.active_texture(glow::TEXTURE0);
         assert_eq!(
             gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) as u32,
             tex0.0.get()
+        );
+        assert_eq!(
+            gl.get_parameter_i32(glow::SAMPLER_BINDING) as u32,
+            samp0.0.get()
         );
         gl.active_texture(glow::TEXTURE1);
         assert_eq!(
@@ -1020,6 +1055,7 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
             pbo.0.get()
         );
         assert_eq!(gl.get_parameter_i32(glow::UNPACK_ALIGNMENT), 1);
+        assert_eq!(gl.get_parameter_i32(glow::PACK_ALIGNMENT), 1);
         assert_eq!(gl.get_parameter_i32(glow::UNPACK_ROW_LENGTH), 64);
         let mut vp = [0i32; 4];
         gl.get_parameter_i32_slice(glow::VIEWPORT, &mut vp);
@@ -1075,6 +1111,10 @@ fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
 
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+        gl.bind_sampler(0, None);
+        gl.bind_sampler(1, None);
+        gl.delete_sampler(samp0);
+        gl.delete_sampler(samp1);
         gl.delete_buffer(pbo);
         gl.delete_texture(tex0);
         gl.delete_texture(tex1);

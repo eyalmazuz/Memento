@@ -3201,6 +3201,7 @@ pub fn compatible_opengl_hwdec_for_session(
                 .split(',')
                 .map(|decoder| match decoder.trim() {
                     "auto-safe" => "nvdec-copy,auto-copy-safe",
+                    "auto" | "yes" => "nvdec-copy,auto-copy",
                     "nvdec" => "nvdec-copy",
                     "cuda" => "cuda-copy",
                     "vdpau" => "vdpau-copy",
@@ -4594,6 +4595,14 @@ mod tests {
         assert_eq!(
             compatible_opengl_hwdec_for_session("nvdec", "NVIDIA GeForce RTX 4080", true),
             "nvdec-copy"
+        );
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("auto", "NVIDIA GeForce RTX 4080", true),
+            "nvdec-copy,auto-copy"
+        );
+        assert_eq!(
+            compatible_opengl_hwdec_for_session("yes", "NVIDIA GeForce RTX 4080", true),
+            "nvdec-copy,auto-copy"
         );
         assert_eq!(
             compatible_opengl_hwdec_for_session("cuda,auto-safe", "NVIDIA GeForce RTX 4080", true),

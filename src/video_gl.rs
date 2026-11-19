@@ -391,13 +391,18 @@ pub fn with_saved_state<T>(gl: &glow::Context, action: impl FnOnce() -> T) -> T 
         } else {
             0
         };
-        let old_texture0 = if old_active_texture != glow::TEXTURE0 {
+        let (old_texture0, old_sampler0) = if old_active_texture != glow::TEXTURE0 {
             gl.active_texture(glow::TEXTURE0);
             let tex0 = gl.get_parameter_i32(glow::TEXTURE_BINDING_2D);
+            let samp0 = if has_samplers {
+                gl.get_parameter_i32(glow::SAMPLER_BINDING)
+            } else {
+                0
+            };
             gl.active_texture(old_active_texture);
-            Some(tex0)
+            (Some(tex0), Some(samp0))
         } else {
-            None
+            (None, None)
         };
 
         let old_program = gl.get_parameter_i32(glow::CURRENT_PROGRAM);
@@ -501,9 +506,20 @@ pub fn with_saved_state<T>(gl: &glow::Context, action: impl FnOnce() -> T) -> T 
                 gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
             }
         }
-        if has_samplers && old_sampler_active != 0 {
-            let unit = old_active_texture - glow::TEXTURE0;
-            gl.bind_sampler(unit, None);
+        if old_unpack_alignment != 4 {
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        }
+        if old_pack_alignment != 4 {
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+        }
+        if has_samplers {
+            if old_sampler_active != 0 {
+                let unit = old_active_texture - glow::TEXTURE0;
+                gl.bind_sampler(unit, None);
+            }
+            if old_sampler0.is_some_and(|s| s != 0) {
+                gl.bind_sampler(0, None);
+            }
         }
 
         let result = without_blending(gl, action);
@@ -530,6 +546,14 @@ pub fn with_saved_state<T>(gl: &glow::Context, action: impl FnOnce() -> T) -> T 
                 glow::TEXTURE_2D,
                 std::num::NonZeroU32::new(tex0 as u32).map(glow::NativeTexture),
             );
+            if has_samplers {
+                if let Some(samp0) = old_sampler0 {
+                    gl.bind_sampler(
+                        0,
+                        std::num::NonZeroU32::new(samp0 as u32).map(glow::NativeSampler),
+                    );
+                }
+            }
         }
         gl.active_texture(old_active_texture);
         gl.bind_texture(
