@@ -557,6 +557,47 @@ impl ConfigController {
             .map_err(|error| format!("{error:?}"))
     }
 
+    /// Update and persist a single non-Anki setting key (such as a live toggle from
+    /// the main window or an internal flag) without committing unrelated unsaved
+    /// draft edits from the Options window.
+    pub fn persist_single_setting(
+        &self,
+        key: &str,
+        value: &str,
+        config_dir: &Path,
+        settings_file: &str,
+    ) -> Result<(), String> {
+        let (group, raw_key) = key
+            .rsplit_once('/')
+            .ok_or_else(|| format!("invalid setting key: {key}"))?;
+        let parsed = {
+            let mut store = self.store.borrow_mut();
+            let current = effective_value(&store, group, raw_key);
+            let parsed = parse_config_value(group, raw_key, value, current)?;
+            store
+                .put_at(group, raw_key, &parsed)
+                .map_err(|error| format!("{error:?}"))?;
+            parsed
+        };
+        let mut persisted = load_config_store(config_dir, settings_file)?;
+        ensure_default_audio_source(&mut persisted);
+        ensure_default_keybind_profile(&mut persisted);
+        normalize_loaded_asr_values(&mut persisted);
+        persisted
+            .put_at(group, raw_key, &parsed)
+            .map_err(|error| format!("{error:?}"))?;
+        persisted
+            .save(config_dir, settings_file)
+            .map_err(|error| format!("{error:?}"))?;
+        let target_group = group.to_owned();
+        let target_key = raw_key.to_owned();
+        self.store.borrow_mut().mark_persisted_against(
+            &persisted,
+            |path| path.group == target_group && path.key == target_key,
+        );
+        Ok(())
+    }
+
     pub fn apply_settings(
         &self,
         category: i32,
@@ -897,6 +938,7 @@ fn field(
     SettingsField {
         key: key.into(),
         label: label.into(),
+        description: SharedString::default(),
         kind: kind.into(),
         value: value.into(),
         choices: strings_model(
@@ -1253,6 +1295,11 @@ fn conditional_switch_field(
         enabled,
         visible,
     )
+}
+
+fn with_description(mut field: SettingsField, description: &str) -> SettingsField {
+    field.description = description.into();
+    field
 }
 
 fn choice_field(
@@ -1794,11 +1841,14 @@ fn application_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             1,
             "Language",
             "",
-            vec![choice_field(
-                "application/language",
-                "Interface language (restart required)",
-                language_label.to_owned(),
-                &["System", "English", "한국어 (MTL)", "简体中文 (MTL)", "繁體中文 (MTL)"],
+            vec![with_description(
+                choice_field(
+                    "application/language",
+                    "Interface language (restart required)",
+                    language_label.to_owned(),
+                    &["System", "English", "한국어 (MTL)", "简体中文 (MTL)", "繁體中文 (MTL)"],
+                ),
+                "Saved for config compatibility. Only English UI translations are currently bundled in this Slint build.",
             )],
         ),
         group(
@@ -2000,10 +2050,13 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             5,
             "Theme",
             "",
-            vec![switch_field(
-                "interface/system-icons",
-                "Use system icons",
-                effective_bool(config, group_name, raw::interface::SYSTEM_ICONS),
+            vec![with_description(
+                switch_field(
+                    "interface/system-icons",
+                    "Use system icons",
+                    effective_bool(config, group_name, raw::interface::SYSTEM_ICONS),
+                ),
+                "Saved for config compatibility. The Slint UI currently renders Memento's bundled SVG icon set.",
             )],
         ),
         group(
@@ -2190,14 +2243,17 @@ fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         raw::subtitle_list::IGNORE_WHITESPACE,
                     ),
                 ),
-                switch_field(
-                    "subtitle-list/auto-seek",
-                    "Auto-seek subtitle list to playback position",
-                    effective_bool(
-                        config,
-                        raw::subtitle_list::GROUP,
-                        raw::subtitle_list::AUTO_SEEK,
+                with_description(
+                    switch_field(
+                        "subtitle-list/auto-seek",
+                        "Auto-seek to matched subtitle",
+                        effective_bool(
+                            config,
+                            raw::subtitle_list::GROUP,
+                            raw::subtitle_list::AUTO_SEEK,
+                        ),
                     ),
+                    "Automatically seek playback to the matched cue when searching in the subtitle list.",
                 ),
                 color_field(
                     "interface/sub-list-background-color",

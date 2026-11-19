@@ -284,6 +284,125 @@ pub fn compute_mpv_subtitle_visibility(
     (primary_visible, secondary_visible)
 }
 
+/// Apply Memento's configured `search/remove-regex`, `search/replace-lines`, and
+/// `search/replace-with` text filters to subtitle text.
+pub fn filter_subtitle_text(
+    text: &str,
+    remove_regex: &str,
+    replace_lines: bool,
+    replace_with: &str,
+) -> String {
+    crate::controller::dict::preprocess_search_text(text, remove_regex, replace_lines, replace_with)
+}
+
+/// Compute the auto-fitted logical window size `(width, height)` for a newly loaded
+/// video (`behavior/autofit` and `behavior/autofit-percent`).
+///
+/// Returns `None` when autofit is disabled, the window is fullscreen or maximized,
+/// or video dimensions are not yet known (`0`). When a side drawer is visible, its
+/// width is preserved alongside the scaled video width, and the combined size is
+/// uniformly clamped within `max_bounds`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_autofit_window_size(
+    video_width: u32,
+    video_height: u32,
+    autofit_enabled: bool,
+    autofit_percent: i32,
+    is_fullscreen: bool,
+    is_maximized: bool,
+    drawer_visible: bool,
+    drawer_width: f32,
+    max_bounds: (f32, f32),
+) -> Option<(f32, f32)> {
+    if !autofit_enabled || is_fullscreen || is_maximized || video_width == 0 || video_height == 0 {
+        return None;
+    }
+    let scale_factor = (autofit_percent.clamp(1, 1000) as f32) / 100.0;
+    let extra_width = if drawer_visible && drawer_width.is_finite() && drawer_width > 0.0 {
+        drawer_width
+    } else {
+        0.0
+    };
+    let req_w = (video_width as f32) * scale_factor + extra_width;
+    let req_h = (video_height as f32) * scale_factor;
+    if !req_w.is_finite() || !req_h.is_finite() || req_w <= 0.0 || req_h <= 0.0 {
+        return None;
+    }
+    let (max_w, max_h) = max_bounds;
+    let fit_scale = if max_w.is_finite() && max_w > 0.0 && max_h.is_finite() && max_h > 0.0 {
+        (max_w / req_w).min(max_h / req_h).min(1.0)
+    } else {
+        1.0
+    };
+    let final_w = (req_w * fit_scale).round().max(1.0);
+    let final_h = (req_h * fit_scale).round().max(1.0);
+    Some((final_w, final_h))
+}
+
+/// Classify a pointer Y position inside the video area into `(in_top_zone, in_bottom_zone)`
+/// for `behavior/subtitle-cursor-show-secondary` (top 20%) and
+/// `behavior/subtitle-cursor-show` (bottom 20%).
+pub fn subtitle_cursor_zones(pointer_y: f32, video_height: f32) -> (bool, bool) {
+    if !pointer_y.is_finite()
+        || !video_height.is_finite()
+        || video_height <= 0.0
+        || pointer_y < 0.0
+        || pointer_y > video_height
+    {
+        return (false, false);
+    }
+    let ratio = pointer_y / video_height;
+    (ratio <= 0.20, ratio >= 0.80)
+}
+
+/// Compute effective subtitle overlay visibility accounting for `subtitle-cursor-show`.
+pub fn compute_subtitle_overlay_visibility(
+    has_text: bool,
+    subtitles_visible: bool,
+    hide_while_playing: bool,
+    is_playing: bool,
+    cursor_show_enabled: bool,
+    cursor_in_zone: bool,
+) -> bool {
+    if !has_text {
+        return false;
+    }
+    if cursor_show_enabled {
+        cursor_in_zone
+    } else {
+        subtitles_visible && !(hide_while_playing && is_playing)
+    }
+}
+
+/// Compute whether `mpv`'s `cursor-autohide` policy wants the video cursor hidden when
+/// `behavior/osc-mpv-cursor` is enabled.
+pub fn mpv_cursor_should_hide(
+    autohide: memento_player::mpv::CursorAutohide,
+    fs_only: bool,
+    is_fullscreen: bool,
+    idle_elapsed_ms: u64,
+    overlay_interactive: bool,
+) -> bool {
+    use memento_player::mpv::CursorAutohide;
+    if overlay_interactive {
+        return false;
+    }
+    if fs_only && !is_fullscreen {
+        return false;
+    }
+    match autohide {
+        CursorAutohide::Never => false,
+        CursorAutohide::Always => true,
+        CursorAutohide::Number(ms) => {
+            if ms < 0 {
+                false
+            } else {
+                idle_elapsed_ms >= ms as u64
+            }
+        }
+    }
+}
+
 /// Choose the display title from `mpv`'s `media-title`, falling back to the
 /// filename component of `path`.
 pub fn effective_media_title(media_title: &str, path: &str) -> String {
@@ -549,24 +668,67 @@ pub fn refresh_subtitle_list(
     subtitles: &SubtitleController,
 ) {
     let query = app.get_subtitle_search_query();
+    let ignore_whitespace = app.get_subtitle_search_ignore_whitespace();
+    let remove_regex = app.get_search_remove_regex();
+    let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
     let matching = if query.trim().is_empty() {
         Vec::new()
+    } else if compiled_regex.is_some() {
+        let q_norm: String = if ignore_whitespace {
+            query
+                .trim()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect()
+        } else {
+            query.trim().chars().flat_map(char::to_lowercase).collect()
+        };
+        if q_norm.is_empty() {
+            Vec::new()
+        } else {
+            subtitles
+                .primary_entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, cue)| {
+                    let raw = String::from_utf16_lossy(&cue.text);
+                    let filtered =
+                        memento_dict::normalize::apply_compiled_remove_regex(&raw, compiled_regex.as_ref());
+                    let haystack: String = if ignore_whitespace {
+                        filtered
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .flat_map(char::to_lowercase)
+                            .collect()
+                    } else {
+                        filtered.chars().flat_map(char::to_lowercase).collect()
+                    };
+                    haystack.contains(&q_norm).then_some(idx)
+                })
+                .collect()
+        }
     } else {
-        subtitles.search(&query, true)
+        subtitles.search(&query, ignore_whitespace)
     };
     let active = subtitles.active_indices(subtitles.primary_sid());
     let rows: Vec<SubEntry> = subtitles
         .primary_entries()
         .iter()
         .enumerate()
-        .map(|(index, cue)| SubEntry {
-            id: (index + 1) as i32,
-            start: cue.start as f32,
-            end: cue.end as f32,
-            text: String::from_utf16_lossy(&cue.text).into(),
-            selected: subtitles.is_selected(index),
-            is_active: active.contains(&index),
-            search_match: matching.contains(&index),
+        .map(|(index, cue)| {
+            let raw = String::from_utf16_lossy(&cue.text);
+            let display =
+                memento_dict::normalize::apply_compiled_remove_regex(&raw, compiled_regex.as_ref());
+            SubEntry {
+                id: (index + 1) as i32,
+                start: cue.start as f32,
+                end: cue.end as f32,
+                text: display.into_owned().into(),
+                selected: subtitles.is_selected(index),
+                is_active: active.contains(&index),
+                search_match: matching.contains(&index),
+            }
         })
         .collect();
     model.set_vec(rows);
@@ -768,6 +930,7 @@ impl LivePlayerCoordinator {
                 volume: 100.0,
                 volume_max: 100,
                 sub_speed: 1.0,
+                cursor_autohide: memento_player::mpv::CursorAutohide::Number(1000),
                 ..Default::default()
             },
             asr_track,
@@ -1727,6 +1890,16 @@ impl LivePlayerCoordinator {
                             self.state.secondary_sub_visibility = *v;
                         }
                     }
+                    "cursor-autohide" => {
+                        if let MpvPropertyValue::CursorAutohide(v) = value {
+                            self.state.cursor_autohide = *v;
+                        }
+                    }
+                    "cursor-autohide-fs-only" => {
+                        if let MpvPropertyValue::Flag(v) = value {
+                            self.state.cursor_autohide_fs_only = *v;
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -1995,11 +2168,20 @@ impl LivePlayerCoordinator {
 
         // Primary subtitle events come natively from libmpv for BOTH standard
         // tracks and the live ASR subtitle track (sid > 0) — zero event skipping!
+        let remove_regex = app.get_search_remove_regex();
+        let replace_lines = app.get_search_replace_lines();
+        let replace_with = app.get_search_replace_with();
         let primary_text = self.state.sub_text.clone();
+        let display_primary = filter_subtitle_text(
+            &primary_text,
+            remove_regex.as_str(),
+            replace_lines,
+            replace_with.as_str(),
+        );
         let primary_times = (self.state.sub_start, self.state.sub_end);
         if primary_text != self.previous_primary_text
             || primary_times != self.previous_primary_cue_times
-            || primary_text != app.get_active_sub_text().as_str()
+            || display_primary != app.get_active_sub_text().as_str()
         {
             app.invoke_dismiss_definition();
             let previous_count = subtitles.primary_entries().len();
@@ -2011,13 +2193,21 @@ impl LivePlayerCoordinator {
                     refresh_subtitle_list(app, sub_model, subtitles);
                 }
             }
-            on_publish_primary_subtitle(app, &primary_text);
+            on_publish_primary_subtitle(app, &display_primary);
             self.previous_primary_text = primary_text;
             self.previous_primary_cue_times = primary_times;
         }
 
         let secondary_text = self.state.secondary_sub_text.clone();
-        if secondary_text != self.previous_secondary_text {
+        let display_secondary = filter_subtitle_text(
+            &secondary_text,
+            remove_regex.as_str(),
+            replace_lines,
+            replace_with.as_str(),
+        );
+        if secondary_text != self.previous_secondary_text
+            || display_secondary != app.get_secondary_sub_text().as_str()
+        {
             let cue = (!secondary_text.is_empty()
                 && self.state.secondary_sub_end > self.state.secondary_sub_start)
                 .then(|| {
@@ -2032,7 +2222,7 @@ impl LivePlayerCoordinator {
             {
                 subtitles.update_active_cue(secondary_sid, cue.as_ref(), raw_secondary);
             }
-            app.set_secondary_sub_text(secondary_text.clone().into());
+            app.set_secondary_sub_text(display_secondary.into());
             self.previous_secondary_text = secondary_text;
         }
 

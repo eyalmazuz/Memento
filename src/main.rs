@@ -34,9 +34,10 @@ use controller::anki::AnkiController;
 use controller::config::ConfigController;
 use controller::dict::DictController;
 use controller::player::{
-    clear_primary_subtitle, compute_video_render_size, effective_media_title,
+    clear_primary_subtitle, compute_autofit_window_size, compute_video_render_size,
+    effective_media_title, filter_subtitle_text, mpv_cursor_should_hide,
     refresh_subtitle_list as base_refresh_subtitle_list, refresh_subtitle_marks,
-    LivePlayerCoordinator, MouseInputForwarder,
+    subtitle_cursor_zones, LivePlayerCoordinator, MouseInputForwarder,
 };
 #[cfg(test)]
 use controller::player::{
@@ -46,7 +47,7 @@ use controller::subtitles::{SubtitleController, ExternalSubtitleLoad};
 #[cfg(test)]
 use controller::subtitles::{MemorySubtitleCue, ASR_TRACK_ID};
 use controller::dictmanager::DictionaryManager;
-use memento_config::Value;
+use memento_config::{ArgbColor, QtFontSpec, Value};
 use memento_player::{MpvInstance, PlaylistLoad};
 use memento_setting::keys as raw;
 
@@ -109,6 +110,8 @@ fn format_time(sec: f64) -> String {
     }
 }
 
+const MEMENTO_RELEASES_URL: &str = "https://github.com/ripose-jp/Memento/releases/latest";
+
 /// Query the same release endpoint as the original Memento update dialog.
 fn latest_release() -> Result<String, String> {
     use memento_net::http::{HttpClient, Request, Url};
@@ -131,6 +134,118 @@ fn latest_release() -> Result<String, String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "GitHub did not return a release tag".to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupUpdateAction {
+    ShowOptInPrompt,
+    RunSilentCheck,
+    Nothing,
+}
+
+pub(crate) fn determine_startup_update_action(config: &ConfigController) -> StartupUpdateAction {
+    let opt_in_shown = setting_enabled(
+        config,
+        raw::internal::GROUP,
+        raw::internal::AUTO_UPDATE_OPT_IN_SHOWN,
+        false,
+    );
+    if !opt_in_shown {
+        return StartupUpdateAction::ShowOptInPrompt;
+    }
+    let auto_check = setting_enabled(
+        config,
+        raw::application::GROUP,
+        raw::application::AUTO_UPDATE_CHECK,
+        raw::application::AUTO_UPDATE_CHECK_DEFAULT,
+    );
+    if auto_check {
+        StartupUpdateAction::RunSilentCheck
+    } else {
+        StartupUpdateAction::Nothing
+    }
+}
+
+pub(crate) fn open_update_opt_in_dialog(app: &MementoApp) {
+    app.set_update_dialog_opt_in(true);
+    app.set_update_dialog_title("Auto Update".into());
+    app.set_update_dialog_message(
+        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts."
+            .into(),
+    );
+    app.set_update_dialog_release_tag("".into());
+    app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+    app.set_update_dialog_open(true);
+}
+
+pub(crate) fn apply_update_check_outcome(
+    app: &MementoApp,
+    current_version: &str,
+    outcome: Result<String, String>,
+    silent: bool,
+) {
+    let current_tag = format!("v{}", current_version.trim_start_matches('v'));
+    match outcome {
+        Ok(tag) => {
+            let trimmed = tag.trim();
+            if trimmed == current_tag || trimmed == current_version {
+                if !silent {
+                    app.set_update_dialog_opt_in(false);
+                    app.set_update_dialog_title("Up to Date".into());
+                    app.set_update_dialog_message(
+                        format!("You're on the latest version ({current_tag}).").into(),
+                    );
+                    app.set_update_dialog_release_tag("".into());
+                    app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                    app.set_update_dialog_open(true);
+                    app.set_status_message("You are on the latest version.".into());
+                }
+            } else {
+                app.set_update_dialog_opt_in(false);
+                app.set_update_dialog_title("New Version Available".into());
+                app.set_update_dialog_message(
+                    format!(
+                        "Memento {trimmed} is available on GitHub Releases (currently installed: {current_tag})."
+                    )
+                    .into(),
+                );
+                app.set_update_dialog_release_tag(trimmed.into());
+                app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                app.set_update_dialog_open(true);
+                app.set_status_message(format!("New Memento release available: {trimmed}").into());
+            }
+        }
+        Err(error) => {
+            if !silent {
+                app.set_update_dialog_opt_in(false);
+                app.set_update_dialog_title("Update Check Failed".into());
+                app.set_update_dialog_message(
+                    format!(
+                        "Could not check GitHub for updates: {error}\n\nYou can check for updates manually on GitHub Releases."
+                    )
+                    .into(),
+                );
+                app.set_update_dialog_release_tag("".into());
+                app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                app.set_update_dialog_open(true);
+                app.set_status_message(format!("Could not check for updates: {error}").into());
+            }
+        }
+    }
+}
+
+fn spawn_update_check(response_app: slint::Weak<MementoApp>, silent: bool) {
+    if !silent {
+        if let Some(app) = response_app.upgrade() {
+            app.set_status_message("Checking for updates…".into());
+        }
+    }
+    std::thread::spawn(move || {
+        let outcome = latest_release();
+        let _ = response_app.upgrade_in_event_loop(move |app| {
+            apply_update_check_outcome(&app, env!("CARGO_PKG_VERSION"), outcome, silent);
+        });
+    });
 }
 
 /// Decode subtitle file bytes supporting UTF-8 (with or without BOM),
@@ -515,6 +630,24 @@ pub(crate) fn spawn_and_reap(mut cmd: Command) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+fn exact_matcher_enabled(config: &ConfigController) -> bool {
+    setting_enabled(
+        config,
+        raw::search::GROUP,
+        raw::search::matcher::EXACT,
+        raw::search::matcher::EXACT_DEFAULT,
+    )
+}
+
+fn deconj_matcher_enabled(config: &ConfigController) -> bool {
+    setting_enabled(
+        config,
+        raw::search::GROUP,
+        raw::search::matcher::DECONJ,
+        raw::search::matcher::DECONJ_DEFAULT,
+    )
+}
+
 fn mecab_matcher_enabled(config: &ConfigController) -> bool {
     match config.effective_setting(raw::search::GROUP, raw::search::matcher::MECAB_IPADIC) {
         Some(Value::Bool(b)) => b,
@@ -522,13 +655,182 @@ fn mecab_matcher_enabled(config: &ConfigController) -> bool {
     }
 }
 
+fn search_text_filters(config: &ConfigController) -> (String, bool, String) {
+    let remove_regex = setting_text(
+        config,
+        raw::search::GROUP,
+        raw::search::REMOVE_REGEX,
+        raw::search::REMOVE_REGEX_DEFAULT,
+    );
+    let replace_lines = setting_enabled(
+        config,
+        raw::search::GROUP,
+        raw::search::REPLACE_NEWLINES,
+        raw::search::REPLACE_NEWLINES_DEFAULT,
+    );
+    let replace_with = setting_text(
+        config,
+        raw::search::GROUP,
+        raw::search::REPLACE_NEWLINES_WITH,
+        raw::search::REPLACE_NEWLINES_WITH_DEFAULT,
+    );
+    (remove_regex, replace_lines, replace_with)
+}
+
 fn apply_dictionary_order(config: &ConfigController, dictionary: &mut DictController) {
+    dictionary.set_exact_enabled(exact_matcher_enabled(config));
+    dictionary.set_deconj_enabled(deconj_matcher_enabled(config));
     dictionary.set_mecab_enabled(mecab_matcher_enabled(config));
+    let (remove_regex, replace_lines, replace_with) = search_text_filters(config);
+    dictionary.set_search_text_filters(&remove_regex, replace_lines, &replace_with);
     if let Some(Value::Ints(order)) =
         config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER)
     {
         dictionary.set_order(&order);
     }
+}
+
+fn maybe_auto_play_first_term_audio(app: &MementoApp, expression: &str, reading: &str) {
+    if app.get_auto_play_audio_enabled() && !expression.is_empty() {
+        app.invoke_play_audio_for_word(expression.into(), reading.into());
+    }
+}
+
+struct WordLookupRequest {
+    generation: u64,
+    query: String,
+    order: Vec<i64>,
+    source_subtitle: String,
+    excluded: Vec<String>,
+    exact_enabled: bool,
+    deconj_enabled: bool,
+    mecab_enabled: bool,
+    remove_regex: String,
+    replace_lines: bool,
+    replace_with: String,
+}
+
+fn parse_xdg_user_dir(contents: &str, key: &str, home: &Path) -> Option<PathBuf> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, rhs)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if lhs.trim() != key {
+            continue;
+        }
+        let val = rhs.trim().trim_matches('"').trim_matches('\'');
+        if val.is_empty() {
+            continue;
+        }
+        if let Some(rest) = val.strip_prefix("$HOME/") {
+            return Some(home.join(rest));
+        }
+        if val == "$HOME" {
+            return Some(home.to_path_buf());
+        }
+        return Some(PathBuf::from(val));
+    }
+    None
+}
+
+pub(crate) fn decode_custom_open_dir(custom: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
+    let trimmed = custom.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("file://") {
+        return memento_os::decode_file_uri(trimmed);
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return home_dir.map(|home| home.join(rest));
+    }
+    if trimmed == "~" {
+        return home_dir.map(Path::to_path_buf);
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Resolve the starting directory for `FileDialogOptions` from `behavior/file-open-dir`
+/// (`0=Current`, `1=Home`, `2=Movies`, `3=Documents`, `4=Custom`) and `behavior/file-open-custom`
+/// with existence checks and graceful fallbacks.
+pub(crate) fn resolve_file_open_dir(
+    dir_kind: i64,
+    custom: &str,
+    home_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+    videos_dir: Option<&Path>,
+    documents_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let existing_dir = |candidate: Option<PathBuf>| candidate.filter(|p| p.is_dir());
+    let home_fallback = || {
+        existing_dir(home_dir.map(Path::to_path_buf))
+            .or_else(|| existing_dir(current_dir.map(Path::to_path_buf)))
+    };
+
+    match dir_kind {
+        0 => existing_dir(current_dir.map(Path::to_path_buf)).or_else(home_fallback),
+        1 => home_fallback(),
+        2 => existing_dir(videos_dir.map(Path::to_path_buf))
+            .or_else(|| existing_dir(home_dir.map(|h| h.join("Videos"))))
+            .or_else(|| existing_dir(home_dir.map(|h| h.join("Movies"))))
+            .or_else(home_fallback),
+        3 => existing_dir(documents_dir.map(Path::to_path_buf))
+            .or_else(|| existing_dir(home_dir.map(|h| h.join("Documents"))))
+            .or_else(home_fallback),
+        4 => existing_dir(decode_custom_open_dir(custom, home_dir)).or_else(home_fallback),
+        _ => existing_dir(videos_dir.map(Path::to_path_buf))
+            .or_else(|| existing_dir(home_dir.map(|h| h.join("Videos"))))
+            .or_else(|| existing_dir(home_dir.map(|h| h.join("Movies"))))
+            .or_else(home_fallback),
+    }
+}
+
+fn resolve_config_file_open_dir(config: &ConfigController) -> Option<PathBuf> {
+    let dir_kind = match config.effective_setting(raw::behavior::GROUP, raw::behavior::FILE_OPEN_DIR)
+    {
+        Some(Value::Int(v)) => v,
+        _ => raw::behavior::FILE_OPEN_DIR_DEFAULT as i64,
+    };
+    let custom = setting_text(config, raw::behavior::GROUP, raw::behavior::FILE_OPEN_CUSTOM, "");
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let current = std::env::current_dir().ok();
+    let user_dirs_content = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")))
+        .and_then(|cfg_dir| std::fs::read_to_string(cfg_dir.join("user-dirs.dirs")).ok());
+    let videos = std::env::var_os("XDG_VIDEOS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home_ref = home.as_deref()?;
+            user_dirs_content
+                .as_deref()
+                .and_then(|c| parse_xdg_user_dir(c, "XDG_VIDEOS_DIR", home_ref))
+        });
+    let documents = std::env::var_os("XDG_DOCUMENTS_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home_ref = home.as_deref()?;
+            user_dirs_content
+                .as_deref()
+                .and_then(|c| parse_xdg_user_dir(c, "XDG_DOCUMENTS_DIR", home_ref))
+        });
+    resolve_file_open_dir(
+        dir_kind,
+        &custom,
+        home.as_deref(),
+        current.as_deref(),
+        videos.as_deref(),
+        documents.as_deref(),
+    )
 }
 
 fn set_popup_term_metadata(
@@ -918,30 +1220,32 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
         }
     }
     app.set_selected_token_count(match_count);
+    if let Some(first_term) = result.hits.iter().find(|hit| !hit.is_kanji) {
+        maybe_auto_play_first_term_audio(app, &first_term.expression, &first_term.reading);
+    }
 }
 
 
-fn estimate_drawer_row_height(text: &str, available_text_width: f32) -> f32 {
+fn estimate_drawer_row_height(text: &str, available_text_width: f32, font_size: f32) -> f32 {
     let usable_w = available_text_width.max(120.0);
+    let scale = (font_size.clamp(9.0, 48.0)) / 13.0;
     let mut visual_lines = 0usize;
     for raw_line in text.split('\n') {
         let line_px: f32 = raw_line
             .chars()
-            .map(|ch| if ch.is_ascii() { 7.5 } else { 13.5 })
+            .map(|ch| if ch.is_ascii() { 7.5 * scale } else { 13.5 * scale })
             .sum();
         let wrapped = ((line_px / usable_w).ceil() as usize).max(1);
         visual_lines += wrapped;
     }
     let visual_lines = visual_lines.max(1);
-    if visual_lines <= 1 {
-        36.0
-    } else {
-        (visual_lines as f32 * 18.0 + 14.0).max(36.0)
-    }
+    let line_height = (18.0 * scale).max(16.0);
+    (visual_lines as f32 * line_height + 14.0).max(36.0)
 }
 
 pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
-    let entries = if app.get_subtitle_drawer_tab() == 1 {
+    let is_secondary = app.get_subtitle_drawer_tab() == 1;
+    let entries = if is_secondary {
         app.get_secondary_subtitle_entries()
     } else {
         app.get_subtitle_entries()
@@ -950,14 +1254,20 @@ pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
     if count == 0 || row_idx >= count {
         return;
     }
-    let text_width = (app.get_sidebar_width() - 104.0).max(120.0);
+    let chrome_w = if app.get_sub_list_show_timestamps() { 104.0 } else { 40.0 };
+    let text_width = (app.get_sidebar_width() - chrome_w).max(120.0);
+    let font_size = if is_secondary {
+        app.get_sub_list_secondary_font_size()
+    } else {
+        app.get_sub_list_primary_font_size()
+    };
     let mut row_y = 0.0f32;
     let mut target_h = 36.0f32;
     let mut total_h = 0.0f32;
     for idx in 0..count {
         let h = entries
             .row_data(idx)
-            .map(|entry| estimate_drawer_row_height(entry.text.as_str(), text_width))
+            .map(|entry| estimate_drawer_row_height(entry.text.as_str(), text_width, font_size))
             .unwrap_or(36.0);
         if idx < row_idx {
             row_y += h;
@@ -1008,8 +1318,16 @@ pub fn refresh_secondary_subtitle_list(
 ) {
     let query = app.get_subtitle_search_query();
     let active_tab = app.get_subtitle_drawer_tab();
+    let ignore_whitespace = app.get_subtitle_search_ignore_whitespace();
+    let remove_regex = app.get_search_remove_regex();
+    let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
     let matching = if active_tab == 1 && !query.trim().is_empty() {
-        search_entries(subtitles.secondary_entries(), &query, true)
+        search_entries(
+            subtitles.secondary_entries(),
+            &query,
+            ignore_whitespace,
+            compiled_regex.as_ref(),
+        )
     } else {
         Vec::new()
     };
@@ -1018,14 +1336,21 @@ pub fn refresh_secondary_subtitle_list(
         .secondary_entries()
         .iter()
         .enumerate()
-        .map(|(index, cue)| SubEntry {
-            id: (index + 1) as i32,
-            start: cue.start as f32,
-            end: cue.end as f32,
-            text: String::from_utf16_lossy(&cue.text).into(),
-            selected: false,
-            is_active: active.contains(&index),
-            search_match: matching.contains(&index),
+        .map(|(index, cue)| {
+            let raw = String::from_utf16_lossy(&cue.text);
+            let display = memento_dict::normalize::apply_compiled_remove_regex(
+                &raw,
+                compiled_regex.as_ref(),
+            );
+            SubEntry {
+                id: (index + 1) as i32,
+                start: cue.start as f32,
+                end: cue.end as f32,
+                text: display.into_owned().into(),
+                selected: false,
+                is_active: active.contains(&index),
+                search_match: matching.contains(&index),
+            }
         })
         .collect();
     model.set_vec(rows);
@@ -1036,6 +1361,7 @@ fn search_entries(
     entries: &[memento_subtitle::SubtitleEntry],
     query: &str,
     ignore_whitespace: bool,
+    remove_regex: Option<&memento_dict::normalize::Regex>,
 ) -> Vec<usize> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -1057,7 +1383,8 @@ fn search_entries(
         .iter()
         .enumerate()
         .filter_map(|(idx, cue)| {
-            let text = String::from_utf16_lossy(&cue.text);
+            let raw = String::from_utf16_lossy(&cue.text);
+            let text = memento_dict::normalize::apply_compiled_remove_regex(&raw, remove_regex);
             let haystack: String = if ignore_whitespace {
                 text.chars()
                     .filter(|c| !c.is_whitespace())
@@ -1069,6 +1396,20 @@ fn search_entries(
             haystack.contains(&normalized_query).then_some(idx)
         })
         .collect()
+}
+
+fn auto_seek_to_matched_row(app: &MementoApp, row: usize) {
+    if !app.get_subtitle_search_auto_seek() {
+        return;
+    }
+    let model = if app.get_subtitle_drawer_tab() == 1 {
+        app.get_secondary_subtitle_entries()
+    } else {
+        app.get_subtitle_entries()
+    };
+    if let Some(entry) = model.row_data(row) {
+        app.invoke_seek_to(entry.start.max(0.0));
+    }
 }
 
 static CLIPBOARD_HOLDER: std::sync::OnceLock<Mutex<Option<copypasta::ClipboardContext>>> =
@@ -1151,27 +1492,59 @@ fn install_subtitle_selection(
         let Some(app) = weak.upgrade() else { return; };
         app.set_subtitle_search_query(query.clone());
         let active_tab = app.get_subtitle_drawer_tab();
+        let ignore_whitespace = app.get_subtitle_search_ignore_whitespace();
+        let remove_regex = app.get_search_remove_regex();
+        let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
         let matching = if query.trim().is_empty() {
             Vec::new()
         } else if active_tab == 1 {
             let subs = search_subs.borrow();
-            let sec_matches = search_entries(subs.secondary_entries(), &query, true);
-            if !sec_matches.is_empty() {
+            let sec_matches = search_entries(
+                subs.secondary_entries(),
+                &query,
+                ignore_whitespace,
+                compiled_regex.as_ref(),
+            );
+            if !sec_matches.is_empty() || !subs.secondary_entries().is_empty() {
                 sec_matches
             } else {
                 let sec_model = app.get_secondary_subtitle_entries();
-                let q_norm: String = query.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+                let q_norm: String = if ignore_whitespace {
+                    query
+                        .trim()
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .flat_map(char::to_lowercase)
+                        .collect()
+                } else {
+                    query.trim().chars().flat_map(char::to_lowercase).collect()
+                };
                 (0..sec_model.row_count())
                     .filter(|&i| {
                         sec_model.row_data(i).is_some_and(|r| {
-                            let h: String = r.text.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+                            let h: String = if ignore_whitespace {
+                                r.text
+                                    .chars()
+                                    .filter(|c| !c.is_whitespace())
+                                    .flat_map(char::to_lowercase)
+                                    .collect()
+                            } else {
+                                r.text.chars().flat_map(char::to_lowercase).collect()
+                            };
                             h.contains(&q_norm)
                         })
                     })
                     .collect()
             }
+        } else if compiled_regex.is_some() {
+            search_entries(
+                search_subs.borrow().primary_entries(),
+                &query,
+                ignore_whitespace,
+                compiled_regex.as_ref(),
+            )
         } else {
-            search_subs.borrow().search(&query, true)
+            search_subs.borrow().search(&query, ignore_whitespace)
         };
 
         if active_tab == 1 {
@@ -1211,6 +1584,7 @@ fn install_subtitle_selection(
             app.set_subtitle_search_current_match(1);
             app.set_subtitle_search_focused_row(first_row as i32);
             scroll_drawer_to_row_accurate(&app, first_row);
+            auto_seek_to_matched_row(&app, first_row);
         } else {
             app.set_subtitle_search_current_match(0);
             app.set_subtitle_search_focused_row(-1);
@@ -1233,6 +1607,7 @@ fn install_subtitle_selection(
         app.set_subtitle_search_current_match((next_idx + 1) as i32);
         app.set_subtitle_search_focused_row(row as i32);
         scroll_drawer_to_row_accurate(&app, row);
+        auto_seek_to_matched_row(&app, row);
     });
 
     let prev_matches = search_matches.clone();
@@ -1250,6 +1625,7 @@ fn install_subtitle_selection(
         app.set_subtitle_search_current_match((prev_idx + 1) as i32);
         app.set_subtitle_search_focused_row(row as i32);
         scroll_drawer_to_row_accurate(&app, row);
+        auto_seek_to_matched_row(&app, row);
     });
 
     let tab_weak = app.as_weak();
@@ -1286,11 +1662,15 @@ fn install_subtitle_selection(
     app.on_copy_selected_subtitles(move || {
         let Some(app) = copy_weak.upgrade() else { return; };
         let subs = copy_subs.borrow();
+        let remove_regex = app.get_search_remove_regex();
         let selected_cues = subs.selected_cues();
         let text = if !selected_cues.is_empty() {
             selected_cues
                 .iter()
-                .map(|c| String::from_utf16_lossy(&c.text))
+                .map(|c| {
+                    let raw = String::from_utf16_lossy(&c.text);
+                    controller::dict::apply_remove_regex(&raw, remove_regex.as_str())
+                })
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -1299,7 +1679,9 @@ fn install_subtitle_selection(
             if !active.is_empty() {
                 active
             } else {
-                subs.active_cue_text().unwrap_or_default()
+                subs.active_cue_text()
+                    .map(|raw| controller::dict::apply_remove_regex(&raw, remove_regex.as_str()))
+                    .unwrap_or_default()
             }
         };
         if !text.is_empty() {
@@ -1734,6 +2116,45 @@ fn setting_enabled(config: &ConfigController, group: &str, key: &str, default: b
     }
 }
 
+fn setting_text(config: &ConfigController, group: &str, key: &str, default: &str) -> String {
+    match config.effective_setting(group, key) {
+        Some(Value::Text(value)) => value,
+        _ => default.to_owned(),
+    }
+}
+
+fn setting_color(
+    config: &ConfigController,
+    group: &str,
+    key: &str,
+    default_hex: &str,
+) -> slint::Color {
+    let raw_hex = setting_text(config, group, key, default_hex);
+    let parsed = ArgbColor::parse(&raw_hex)
+        .or_else(|_| ArgbColor::parse(default_hex))
+        .unwrap_or_else(|_| ArgbColor::new(255, 0, 0, 0));
+    slint::Color::from_argb_u8(parsed.a, parsed.r, parsed.g, parsed.b)
+}
+
+fn setting_font_spec(
+    config: &ConfigController,
+    group: &str,
+    key: &str,
+    default_family: &str,
+    default_size: f32,
+) -> (String, f32, bool, bool) {
+    let raw_font = setting_text(config, group, key, "");
+    match QtFontSpec::parse(&raw_font) {
+        Ok(spec) => (
+            spec.family,
+            (spec.point_size as f32).clamp(8.0, 72.0),
+            spec.bold,
+            spec.italic,
+        ),
+        Err(_) => (default_family.to_owned(), default_size, false, false),
+    }
+}
+
 fn refresh_recent_files(app: &MementoApp, config: &ConfigController) {
     let raw_files = config.recent_files();
     let titles = recent_titles_map()
@@ -1762,25 +2183,135 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
         config, raw::search::GROUP, raw::search::PAUSE_ON_HOVER,
         raw::search::PAUSE_ON_HOVER_DEFAULT,
     ));
+    app.set_auto_play_audio_enabled(setting_enabled(
+        config, raw::search::GROUP, raw::search::AUTO_PLAY_AUDIO,
+        raw::search::AUTO_PLAY_AUDIO_DEFAULT,
+    ));
+    let (remove_regex, replace_lines, replace_with) = search_text_filters(config);
+    app.set_search_remove_regex(remove_regex.into());
+    app.set_search_replace_lines(replace_lines);
+    app.set_search_replace_with(replace_with.into());
     app.set_furigana_visible(setting_enabled(
         config, raw::search::GROUP, raw::search::SUBTITLE_FURIGANA,
         raw::search::SUBTITLE_FURIGANA_DEFAULT,
     ));
     app.set_furigana_enabled(true);
+    app.set_autofit_enabled(setting_enabled(
+        config, raw::behavior::GROUP, raw::behavior::AUTO_FIT,
+        raw::behavior::AUTO_FIT_DEFAULT,
+    ));
+    app.set_autofit_percent(
+        setting_number(
+            config,
+            raw::behavior::GROUP,
+            raw::behavior::AUTO_FIT_PERCENT,
+            raw::behavior::AUTO_FIT_PERCENT_DEFAULT as f64,
+        )
+        .round()
+        .clamp(1.0, 1000.0) as i32,
+    );
     app.set_osc_duration_ms(setting_number(
         config, raw::behavior::GROUP, raw::behavior::OSC_DURATION,
         raw::behavior::OSC_DURATION_DEFAULT as f64,
     ).round().clamp(50.0, 9999.0) as i32);
+    app.set_osc_fade_ms(setting_number(
+        config, raw::behavior::GROUP, raw::behavior::OSC_FADE,
+        raw::behavior::OSC_FADE_DEFAULT as f64,
+    ).round().clamp(0.0, 9999.0) as i32);
     app.set_osc_min_move(setting_number(
         config, raw::behavior::GROUP, raw::behavior::OSC_MIN_MOVE,
         raw::behavior::OSC_MIN_MOVE_DEFAULT as f64,
     ).round().max(0.0) as i32);
+    app.set_osc_mpv_cursor(setting_enabled(
+        config, raw::behavior::GROUP, raw::behavior::OSC_MPV_CURSOR,
+        raw::behavior::OSC_MPV_CURSOR_DEFAULT,
+    ));
+    app.set_subtitle_cursor_show_enabled(setting_enabled(
+        config, raw::behavior::GROUP, raw::behavior::SUBTITLE_CURSOR_SHOW,
+        raw::behavior::SUBTITLE_CURSOR_SHOW_DEFAULT,
+    ));
+    app.set_secondary_subtitle_cursor_show_enabled(setting_enabled(
+        config,
+        raw::behavior::GROUP,
+        raw::behavior::SECONDARY_SUBTITLE_CURSOR_SHOW,
+        raw::behavior::SECONDARY_SUBTITLE_CURSOR_SHOW_DEFAULT,
+    ));
     app.set_preview_thumbnails_enabled(setting_enabled(
         config,
         raw::behavior::GROUP,
         raw::behavior::OSC_PREVIEW_THUMBNAILS,
         raw::behavior::OSC_PREVIEW_THUMBNAILS_DEFAULT,
     ));
+    app.set_sub_list_show_timestamps(setting_enabled(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::TIMESTAMPS,
+        raw::interface::subtitle_list::TIMESTAMPS_DEFAULT,
+    ));
+    app.set_subtitle_search_ignore_whitespace(setting_enabled(
+        config,
+        raw::subtitle_list::GROUP,
+        raw::subtitle_list::IGNORE_WHITESPACE,
+        raw::subtitle_list::IGNORE_WHITESPACE_DEFAULT,
+    ));
+    app.set_subtitle_search_auto_seek(setting_enabled(
+        config,
+        raw::subtitle_list::GROUP,
+        raw::subtitle_list::AUTO_SEEK,
+        raw::subtitle_list::AUTO_SEEK_DEFAULT,
+    ));
+    app.set_sub_list_bg_color(setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::BACKGROUND_COLOR,
+        raw::interface::subtitle_list::BACKGROUND_COLOR_DEFAULT,
+    ));
+    app.set_sub_list_text_color(setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::TEXT_COLOR,
+        raw::interface::subtitle_list::TEXT_COLOR_DEFAULT,
+    ));
+    app.set_sub_list_hover_color(setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::HOVER_COLOR,
+        raw::interface::subtitle_list::HOVER_COLOR_DEFAULT,
+    ));
+    app.set_sub_list_selected_color(setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::SELECTED_COLOR,
+        raw::interface::subtitle_list::SELECTED_COLOR_DEFAULT,
+    ));
+    app.set_sub_list_selected_hover_color(setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::SELECTED_HOVER_COLOR,
+        raw::interface::subtitle_list::SELECTED_HOVER_COLOR_DEFAULT,
+    ));
+    let (p_fam, p_size, p_bold, p_italic) = setting_font_spec(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::PRIMARY_FONT,
+        "Noto Sans CJK JP",
+        16.0,
+    );
+    app.set_sub_list_primary_font_family(p_fam.into());
+    app.set_sub_list_primary_font_size(p_size);
+    app.set_sub_list_primary_font_bold(p_bold);
+    app.set_sub_list_primary_font_italic(p_italic);
+    let (s_fam, s_size, s_bold, s_italic) = setting_font_spec(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle_list::SECONDARY_FONT,
+        "Sans Serif",
+        16.0,
+    );
+    app.set_sub_list_secondary_font_family(s_fam.into());
+    app.set_sub_list_secondary_font_size(s_size);
+    app.set_sub_list_secondary_font_bold(s_bold);
+    app.set_sub_list_secondary_font_italic(s_italic);
     app.set_popup_configured_width((setting_number(
         config,
         raw::interface::GROUP,
@@ -2214,7 +2745,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else if text == " " && !(control || shift || alt || meta) {
             app.invoke_toggle_play();
         } else if text == "\u{001b}" || text == "Escape" {
-            if app.get_url_dialog_open() {
+            if app.get_update_dialog_open() {
+                if app.get_update_dialog_opt_in() {
+                    app.invoke_update_opt_in_responded(false);
+                } else {
+                    app.set_update_dialog_open(false);
+                    app.invoke_update_dialog_dismissed();
+                }
+            } else if app.get_url_dialog_open() {
                 app.set_url_dialog_open(false);
             } else if app.get_about_open() {
                 app.set_about_open(false);
@@ -2304,8 +2842,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The video surface is a Slint window, so mpv's fullscreen key cannot
     // fullscreen it. Keep the OSC timer and fullscreen cursor auto-hide in the UI layer.
+    let last_pointer_activity = Rc::new(Cell::new(std::time::Instant::now()));
     let osc_timer = Rc::new(slint::Timer::default());
     let osc_timer_app = app.as_weak();
+    let osc_timer_coord = coordinator.clone();
+    let osc_timer_activity = last_pointer_activity.clone();
     osc_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(app.get_osc_duration_ms() as u64),
@@ -2327,14 +2868,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 app.set_osc_visible(false);
             }
-            if fullscreen
-                && !app.get_menu_open()
-                && !app.get_dict_open()
-                && !app.get_osc_hovered()
-                && !app.get_ocr_mode()
-                && !app.get_about_open()
-                && !app.get_url_dialog_open()
-            {
+            let overlay_interactive = app.get_menu_open()
+                || app.get_dict_open()
+                || app.get_osc_hovered()
+                || app.get_ocr_mode()
+                || app.get_about_open()
+                || app.get_url_dialog_open()
+                || app.get_update_dialog_open();
+            if app.get_osc_mpv_cursor() {
+                // Delegate cursor hiding to mpv's `cursor-autohide` policy instead of
+                // Memento's OSC timer.
+                let hide = osc_timer_coord
+                    .try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard.as_ref().map(|coord| {
+                            let st = coord.playback_state();
+                            let elapsed_ms =
+                                osc_timer_activity.get().elapsed().as_millis() as u64;
+                            mpv_cursor_should_hide(
+                                st.cursor_autohide,
+                                st.cursor_autohide_fs_only,
+                                fullscreen,
+                                elapsed_ms,
+                                overlay_interactive,
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+                if app.get_cursor_hidden() != hide {
+                    app.set_cursor_hidden(hide);
+                }
+            } else if fullscreen && !overlay_interactive {
                 app.set_cursor_hidden(true);
             }
         },
@@ -2344,14 +2909,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pointer_mpv = mpv.clone();
     let pointer_coord = coordinator.clone();
     let pointer_render_size = current_render_size.clone();
+    let pointer_activity = last_pointer_activity.clone();
     let last_pointer = Rc::new(Cell::new(None::<(f32, f32)>));
     app.on_pointer_moved(move |x, y| {
         let Some(app) = pointer_app.upgrade() else { return };
+        let (in_top, in_bottom) = subtitle_cursor_zones(y, app.get_video_height() as f32);
+        if app.get_cursor_in_top_sub_zone() != in_top {
+            app.set_cursor_in_top_sub_zone(in_top);
+        }
+        if app.get_cursor_in_bottom_sub_zone() != in_bottom {
+            app.set_cursor_in_bottom_sub_zone(in_bottom);
+        }
         if !app.get_dict_open()
             && !app.get_menu_open()
             && !app.get_ocr_mode()
             && !app.get_about_open()
             && !app.get_url_dialog_open()
+            && !app.get_update_dialog_open()
         {
             if let (Ok(player_ref), Ok(mut coord_ref)) =
                 (pointer_mpv.try_borrow(), pointer_coord.try_borrow_mut())
@@ -2377,6 +2951,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         last_pointer.set(Some((x, y)));
+        pointer_activity.set(std::time::Instant::now());
         if app.get_cursor_hidden() {
             app.set_cursor_hidden(false);
         }
@@ -2443,8 +3018,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let activity_app = app.as_weak();
     let activity_osc_timer = osc_timer.clone();
+    let activity_pointer_ts = last_pointer_activity.clone();
     app.on_osc_activity(move || {
         let Some(app) = activity_app.upgrade() else { return };
+        activity_pointer_ts.set(std::time::Instant::now());
         if app.get_cursor_hidden() {
             app.set_cursor_hidden(false);
         }
@@ -2661,9 +3238,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *slot.borrow_mut() = Some(handle_open_or_drop_paths.clone());
     });
 
+    let open_file_config = config_ctrl.clone();
     app.on_open_file(move || {
+        let start_dir = resolve_config_file_open_dir(&open_file_config);
         memento_os::open_files_async(
-            memento_os::FileDialogOptions::media_and_subtitles(None),
+            memento_os::FileDialogOptions::media_and_subtitles(start_dir),
             move |paths| {
                 if paths.is_empty() {
                     return;
@@ -3303,9 +3882,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let add_sub_config = config_ctrl.clone();
     app.on_add_subtitle(move || {
+        let start_dir = resolve_config_file_open_dir(&add_sub_config);
         memento_os::open_files_async(
-            memento_os::FileDialogOptions::subtitles_only(None),
+            memento_os::FileDialogOptions::subtitles_only(start_dir),
             move |paths| {
                 if paths.is_empty() {
                     return;
@@ -3437,21 +4018,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let update_app = app.as_weak();
     app.on_check_updates(move || {
-        if let Some(app) = update_app.upgrade() {
-            app.set_status_message("Checking for updates…".into());
+        spawn_update_check(update_app.clone(), false);
+    });
+
+    let opt_in_app = app.as_weak();
+    let opt_in_config = config_ctrl.clone();
+    let opt_in_cache = config_dir.clone();
+    let opt_in_settings = settings_session.clone();
+    app.on_update_opt_in_responded(move |accepted| {
+        let Some(app) = opt_in_app.upgrade() else { return };
+        app.set_update_dialog_open(false);
+        app.set_update_dialog_opt_in(false);
+        let opt_in_key = format!("{}/{}", raw::internal::GROUP, raw::internal::AUTO_UPDATE_OPT_IN_SHOWN);
+        let auto_check_key = format!("{}/{}", raw::application::GROUP, raw::application::AUTO_UPDATE_CHECK);
+        let auto_val = if accepted { "true" } else { "false" };
+        if let Err(error) = opt_in_config
+            .persist_single_setting(&opt_in_key, "true", &opt_in_cache, "memento.conf")
+            .and_then(|()| {
+                opt_in_config.persist_single_setting(
+                    &auto_check_key,
+                    auto_val,
+                    &opt_in_cache,
+                    "memento.conf",
+                )
+            })
+        {
+            app.set_status_message(format!("Could not save update preference: {error}").into());
         }
-        let response_app = update_app.clone();
-        std::thread::spawn(move || {
-            let message = match latest_release() {
-                Ok(tag) if tag == format!("v{}", env!("CARGO_PKG_VERSION")) =>
-                    "You are on the latest version.".to_string(),
-                Ok(tag) => format!("New Memento release available: {tag}"),
-                Err(error) => format!("Could not check for updates: {error}"),
-            };
-            let _ = response_app.upgrade_in_event_loop(move |app| {
-                app.set_status_message(message.into());
-            });
-        });
+        if let Some(session) = opt_in_settings.borrow().as_ref() {
+            if session.window.get_active_category() == 1 {
+                refresh_category_settings(&session.window, &opt_in_config, 1);
+            }
+        }
+        if accepted {
+            spawn_update_check(opt_in_app.clone(), true);
+        }
+    });
+
+    let dismiss_update_app = app.as_weak();
+    app.on_update_dialog_dismissed(move || {
+        if let Some(app) = dismiss_update_app.upgrade() {
+            app.set_update_dialog_open(false);
+            app.set_update_dialog_opt_in(false);
+        }
     });
 
     let config_dir_app = app.as_weak();
@@ -3581,9 +4190,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     install_subtitle_selection(&app, sub_ctrl.clone(), sub_model.clone());
 
+    let ts_app = app.as_weak();
+    let ts_config = config_ctrl.clone();
+    let ts_cache = config_dir.clone();
+    let ts_settings = settings_session.clone();
+    app.on_sub_list_show_timestamps_toggled(move |show| {
+        let Some(app) = ts_app.upgrade() else { return };
+        app.set_sub_list_show_timestamps(show);
+        let key = format!(
+            "{}/{}",
+            raw::interface::GROUP,
+            raw::interface::subtitle_list::TIMESTAMPS
+        );
+        let val = if show { "true" } else { "false" };
+        if let Err(error) = ts_config.persist_single_setting(&key, val, &ts_cache, "memento.conf") {
+            app.set_status_message(format!("Could not save timestamps preference: {error}").into());
+        }
+        if let Some(session) = ts_settings.borrow().as_ref() {
+            if session.window.get_active_category() == 5 {
+                refresh_category_settings(&session.window, &ts_config, 5);
+            }
+        }
+    });
+
+    let ws_app = app.as_weak();
+    let ws_config = config_ctrl.clone();
+    let ws_cache = config_dir.clone();
+    let ws_settings = settings_session.clone();
+    app.on_subtitle_search_ignore_whitespace_changed(move |enabled| {
+        let Some(app) = ws_app.upgrade() else { return };
+        app.set_subtitle_search_ignore_whitespace(enabled);
+        let key = format!(
+            "{}/{}",
+            raw::subtitle_list::GROUP,
+            raw::subtitle_list::IGNORE_WHITESPACE
+        );
+        let val = if enabled { "true" } else { "false" };
+        if let Err(error) = ws_config.persist_single_setting(&key, val, &ws_cache, "memento.conf") {
+            app.set_status_message(
+                format!("Could not save ignore-whitespace preference: {error}").into(),
+            );
+        }
+        if let Some(session) = ws_settings.borrow().as_ref() {
+            if session.window.get_active_category() == 5 {
+                refresh_category_settings(&session.window, &ws_config, 5);
+            }
+        }
+        let query = app.get_subtitle_search_query();
+        if !query.trim().is_empty() {
+            app.invoke_search_subtitles(query);
+        }
+    });
+
+    let seek_app = app.as_weak();
+    let seek_config = config_ctrl.clone();
+    let seek_cache = config_dir.clone();
+    let seek_settings = settings_session.clone();
+    app.on_subtitle_search_auto_seek_changed(move |enabled| {
+        let Some(app) = seek_app.upgrade() else { return };
+        app.set_subtitle_search_auto_seek(enabled);
+        let key = format!(
+            "{}/{}",
+            raw::subtitle_list::GROUP,
+            raw::subtitle_list::AUTO_SEEK
+        );
+        let val = if enabled { "true" } else { "false" };
+        if let Err(error) =
+            seek_config.persist_single_setting(&key, val, &seek_cache, "memento.conf")
+        {
+            app.set_status_message(format!("Could not save auto-seek preference: {error}").into());
+        }
+        if let Some(session) = seek_settings.borrow().as_ref() {
+            if session.window.get_active_category() == 5 {
+                refresh_category_settings(&session.window, &seek_config, 5);
+            }
+        }
+        if enabled {
+            let focused = app.get_subtitle_search_focused_row();
+            if focused >= 0 {
+                auto_seek_to_matched_row(&app, focused as usize);
+            }
+        }
+    });
+
     // ── Dictionary Lookup ──────────────────────────────────────────────────
     let popup_audio_cache: Arc<Mutex<PopupAudioState>> = Arc::new(Mutex::new(PopupAudioState::default()));
-    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<(u64, String, Vec<i64>, String, Vec<String>, bool)>();
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<WordLookupRequest>();
     let worker_epoch = lookup_epoch.clone();
     let lookup_path = dictionary_database_path.clone();
     let worker_app = app.as_weak();
@@ -3597,7 +4289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Hover can produce several searches while a slow dictionary is
             // busy. Only the most recent query is useful to the popup.
             while let Ok(newer) = lookup_rx.try_recv() { request = newer; }
-            if request.0 != worker_epoch.load(Ordering::Acquire) { continue; }
+            if request.generation != worker_epoch.load(Ordering::Acquire) { continue; }
             let signature = controller::dict::db_file_fingerprint(&lookup_path);
             if signature != database_signature {
                 dictionary = DictController::open(&lookup_path).unwrap_or_else(|error| {
@@ -3606,9 +4298,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 database_signature = signature;
             }
-            dictionary.set_order(&request.2);
-            dictionary.set_mecab_enabled(request.5);
-            let hits = dictionary.search(&request.1).to_vec();
+            dictionary.set_order(&request.order);
+            dictionary.set_exact_enabled(request.exact_enabled);
+            dictionary.set_deconj_enabled(request.deconj_enabled);
+            dictionary.set_mecab_enabled(request.mecab_enabled);
+            dictionary.set_search_text_filters(
+                &request.remove_regex,
+                request.replace_lines,
+                &request.replace_with,
+            );
+            let hits = dictionary.search(&request.query).to_vec();
             let error = dictionary.take_search_error();
             let database_open = dictionary.database_path_is_open();
             let matched_units = dictionary.last_match_units();
@@ -3627,11 +4326,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hits, error, database_open, matched_units, headword, reading,
                 pitch: String::new(), freq: String::new(), jpdb: String::new(),
             };
-            if request.0 != worker_epoch.load(Ordering::Acquire) { continue; }
-            let generation = request.0;
-            let query = request.1;
-            let source_subtitle = request.3;
-            let excluded = request.4;
+            if request.generation != worker_epoch.load(Ordering::Acquire) { continue; }
+            let generation = request.generation;
+            let query = request.query;
+            let source_subtitle = request.source_subtitle;
+            let excluded = request.excluded;
             let meta_subtitle = source_subtitle.clone();
             let event_epoch = worker_epoch.clone();
             let _ = worker_app.upgrade_in_event_loop(move |app| {
@@ -3679,16 +4378,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Value::Ints(order)) => order,
             _ => Vec::new(),
         };
+        let exact_enabled = exact_matcher_enabled(&lookup_config);
+        let deconj_enabled = deconj_matcher_enabled(&lookup_config);
         let mecab_enabled = mecab_matcher_enabled(&lookup_config);
+        let (remove_regex, replace_lines, replace_with) = search_text_filters(&lookup_config);
         let generation = lookup_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = lookup_sender.send((
+        let _ = lookup_sender.send(WordLookupRequest {
             generation,
-            word.to_string(),
+            query: word.to_string(),
             order,
-            app.get_active_sub_text().to_string(),
-            lookup_config.anki_excluded_glossaries(),
+            source_subtitle: app.get_active_sub_text().to_string(),
+            excluded: lookup_config.anki_excluded_glossaries(),
+            exact_enabled,
+            deconj_enabled,
             mecab_enabled,
-        ));
+            remove_regex,
+            replace_lines,
+            replace_with,
+        });
     });
     let glossary_link_app = app.as_weak();
     app.on_open_glossary_link(move |href| {
@@ -3814,6 +4521,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.invoke_dismiss_definition();
         set_dictionary_rows(&app, dictionary_result_rows(&hits, &search_dict_config.anki_excluded_glossaries()));
         app.invoke_reset_definition_scroll();
+        if let Some(first_term) = hits.iter().find(|hit| !hit.is_kanji) {
+            maybe_auto_play_first_term_audio(&app, &first_term.expression, &first_term.reading);
+        }
     });
     let kanji_app = app.as_weak();
     let kanji_dict = dict_ctrl.clone();
@@ -3944,6 +4654,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui::install_popup_navigation(&app);
     ui::install_rich_ui_bridges(&app, &dictionary_database_path, &config_dir, &config_ctrl);
     ui::bind_rich_bridge_lookup_epoch(&app, lookup_epoch.clone());
+    // INTEGRATION NOTE (popup-features -> PopupBridge.first-term-ready):
+    // Connect `app.global::<PopupBridge>().on_first_term_ready(...)` here to
+    // `maybe_auto_play_first_term_audio(&app, expression.as_str(), reading.as_str())`.
 
     let note_app = app.as_weak();
     let note_config = config_ctrl.clone();
@@ -4002,13 +4715,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             (String::new(), None)
         };
+        let (remove_regex, replace_lines, replace_with) = (
+            app.get_search_remove_regex().to_string(),
+            app.get_search_replace_lines(),
+            app.get_search_replace_with().to_string(),
+        );
         let (active_start, active_end, context_start, context_end, selected_cues, active_pos_in_selected) = {
             let subtitles = note_subtitles.borrow();
             let selected_indices = subtitles.selected_indices();
             let active_indices = subtitles.active_indices(subtitles.primary_sid());
             let active_pos = selected_indices.iter().position(|idx| active_indices.contains(idx));
             let cues = subtitles.selected_cues()
-                .iter().map(|cue| String::from_utf16_lossy(&cue.text)).collect::<Vec<_>>();
+                .iter()
+                .map(|cue| {
+                    let raw = String::from_utf16_lossy(&cue.text);
+                    filter_subtitle_text(&raw, &remove_regex, replace_lines, &replace_with)
+                })
+                .collect::<Vec<_>>();
             let active = subtitles.active_cue();
             let start = active.map(|cue| cue.start).unwrap_or(0.0);
             let end = active.map(|cue| cue.end).unwrap_or(0.0);
@@ -4370,6 +5093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_video_report = Cell::new(std::time::Instant::now());
         let previous_drops = Cell::new((0i64, 0i64));
         let last_sync = Cell::new(std::time::Instant::now());
+        let last_autofit_generation: Cell<Option<u64>> = Cell::new(None);
 
         Rc::new(move || {
             if sync_closing.get() {
@@ -4440,6 +5164,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let state = coord.playback_state();
+            if state.file_loaded && last_autofit_generation.get() != Some(gen_after) {
+                let (vw, vh) = if state.dimensions.0 > 0 && state.dimensions.1 > 0 {
+                    state.dimensions
+                } else if state.video_width > 0 && state.video_height > 0 {
+                    (state.video_width as u32, state.video_height as u32)
+                } else {
+                    (0, 0)
+                };
+                if vw > 0 && vh > 0 {
+                    last_autofit_generation.set(Some(gen_after));
+                    let sf = app.window().scale_factor().max(0.5);
+                    let cur_phys = app.window().size();
+                    let max_w = ((cur_phys.width as f32) / sf).max(1920.0);
+                    let max_h = ((cur_phys.height as f32) / sf).max(1080.0);
+                    if let Some((fit_w, fit_h)) = compute_autofit_window_size(
+                        vw,
+                        vh,
+                        app.get_autofit_enabled(),
+                        app.get_autofit_percent(),
+                        app.window().is_fullscreen() || app.get_is_fullscreen(),
+                        app.window().is_maximized(),
+                        app.get_dict_search_open() || app.get_sub_drawer_open(),
+                        app.get_sidebar_width(),
+                        (max_w, max_h),
+                    ) {
+                        app.window().set_size(slint::LogicalSize::new(fit_w, fit_h));
+                    }
+                }
+            }
             if app.get_is_muted() != state.mute {
                 app.set_is_muted(state.mute);
             }
@@ -4579,6 +5332,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.get_video_width(),
         app.get_video_height(),
         app.get_subtitle_scale().to_bits(),
+        app.get_search_remove_regex(),
+        app.get_search_replace_lines(),
+        app.get_search_replace_with(),
     );
     timer.start(
         slint::TimerMode::Repeated,
@@ -4617,6 +5373,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.get_video_width(),
                 app.get_video_height(),
                 app.get_subtitle_scale().to_bits(),
+                app.get_search_remove_regex(),
+                app.get_search_replace_lines(),
+                app.get_search_replace_with(),
             );
             let ui_flags_changed = ui_flags != last_ui_flags;
             last_ui_flags = ui_flags;
@@ -4938,6 +5697,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     app.invoke_update_video();
+
+    match determine_startup_update_action(&config_ctrl) {
+        StartupUpdateAction::ShowOptInPrompt => open_update_opt_in_dialog(&app),
+        StartupUpdateAction::RunSilentCheck => spawn_update_check(app.as_weak(), true),
+        StartupUpdateAction::Nothing => {}
+    }
 
     let run_result = app.run();
     timer.stop();
@@ -5525,5 +6290,396 @@ mod window_ux_tests {
         assert!(mecab_matcher_enabled(&cfg));
         apply_dictionary_order(&cfg, &mut dict);
         assert!(dict.mecab_enabled());
+    }
+
+    #[test]
+    fn apply_dictionary_order_wires_exact_deconj_and_text_filters() {
+        let cfg = ConfigController::new();
+        let mut dict = DictController::new();
+        let mut noun = controller::dict::SearchHit::new("猫", "ねこ", "cat", "n", 10, false);
+        noun.rules = "n".to_owned();
+        let mut verb = controller::dict::SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        verb.rules = "v1".to_owned();
+        dict.add_entries([noun, verb]);
+
+        cfg.edit_setting("search/ipadic-matcher", "false").unwrap();
+        cfg.edit_setting("search/exact-matcher", "false").unwrap();
+        cfg.edit_setting("search/deconj-matcher", "true").unwrap();
+        cfg.edit_setting("search/remove-regex", "（[^）]*）").unwrap();
+        cfg.edit_setting("search/replace-lines", "true").unwrap();
+        cfg.edit_setting("search/replace-with", "").unwrap();
+        apply_dictionary_order(&cfg, &mut dict);
+
+        assert!(!dict.exact_enabled());
+        assert!(dict.deconj_enabled());
+        assert!(!dict.mecab_enabled());
+        assert_eq!(dict.remove_regex_pattern(), "（[^）]*）");
+        assert!(dict.replace_lines());
+        assert_eq!(dict.replace_lines_with(), "");
+        assert!(dict.search("猫").is_empty());
+        assert_eq!(
+            dict.search("（笑）食べ\nた").first().map(|h| h.expression.as_str()),
+            Some("食べる")
+        );
+
+        cfg.edit_setting("search/exact-matcher", "true").unwrap();
+        cfg.edit_setting("search/deconj-matcher", "false").unwrap();
+        apply_dictionary_order(&cfg, &mut dict);
+        assert!(dict.exact_enabled());
+        assert!(!dict.deconj_enabled());
+        assert_eq!(dict.search("（笑）猫").first().map(|h| h.expression.as_str()), Some("猫"));
+        assert!(dict.search("食べた").is_empty());
+    }
+
+    #[test]
+    fn subtitle_list_timestamps_toggle_ignore_whitespace_auto_seek_and_styling_binding() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = Rc::new(ConfigController::new());
+        cfg.edit_setting("interface/sub-list-timestamps", "true").unwrap();
+        cfg.edit_setting("subtitle-list/ignore-whitespace", "false").unwrap();
+        cfg.edit_setting("subtitle-list/auto-seek", "true").unwrap();
+        cfg.edit_setting("interface/sub-list-background-color", "#FF112233").unwrap();
+        cfg.edit_setting("interface/sub-list-text-color", "#FFCCDDEE").unwrap();
+        cfg.edit_setting("interface/sub-list-hover-color", "#FF223344").unwrap();
+        cfg.edit_setting("interface/sub-list-selected-color", "#FF334455").unwrap();
+        cfg.edit_setting("interface/sub-list-selected-hover-color", "#FF445566").unwrap();
+        cfg.edit_setting("interface/sub-list-primary-font", "Noto Sans CJK JP,18,-1,5,75,1,0,0,0,0")
+            .unwrap();
+        cfg.edit_setting("interface/sub-list-secondary-font", "Monospace,14,-1,5,50,0,0,0,0,0")
+            .unwrap();
+
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_sub_drawer_open(true);
+        refresh_player_preferences(&app, &cfg);
+
+        assert!(app.get_sub_list_show_timestamps());
+        assert!(!app.get_subtitle_search_ignore_whitespace());
+        assert!(app.get_subtitle_search_auto_seek());
+        assert_eq!(app.get_sub_list_bg_color(), slint::Color::from_argb_u8(255, 0x11, 0x22, 0x33));
+        assert_eq!(app.get_sub_list_text_color(), slint::Color::from_argb_u8(255, 0xCC, 0xDD, 0xEE));
+        assert_eq!(app.get_sub_list_hover_color(), slint::Color::from_argb_u8(255, 0x22, 0x33, 0x44));
+        assert_eq!(app.get_sub_list_selected_color(), slint::Color::from_argb_u8(255, 0x33, 0x44, 0x55));
+        assert_eq!(
+            app.get_sub_list_selected_hover_color(),
+            slint::Color::from_argb_u8(255, 0x44, 0x55, 0x66)
+        );
+        assert_eq!(app.get_sub_list_primary_font_family().as_str(), "Noto Sans CJK JP");
+        assert_eq!(app.get_sub_list_primary_font_size(), 18.0);
+        assert!(app.get_sub_list_primary_font_bold());
+        assert!(app.get_sub_list_primary_font_italic());
+        assert_eq!(app.get_sub_list_secondary_font_family().as_str(), "Monospace");
+        assert_eq!(app.get_sub_list_secondary_font_size(), 14.0);
+        assert!(!app.get_sub_list_secondary_font_bold());
+        assert!(!app.get_sub_list_secondary_font_italic());
+
+        // Wire timestamps toggle callback -> persistence into memento.conf.
+        let ts_cfg = cfg.clone();
+        let ts_dir = dir.path().to_path_buf();
+        app.on_sub_list_show_timestamps_toggled(move |show| {
+            let key = format!(
+                "{}/{}",
+                raw::interface::GROUP,
+                raw::interface::subtitle_list::TIMESTAMPS
+            );
+            ts_cfg
+                .persist_single_setting(&key, if show { "true" } else { "false" }, &ts_dir, "memento.conf")
+                .unwrap();
+        });
+        app.show().unwrap();
+        // Click the inline "Time" toggle pill at the top-right of the 360px drawer header (x ~ 1240, y ~ 54).
+        let pos = slint::LogicalPosition::new(1240.0, 54.0);
+        app.window().dispatch_event(WindowEvent::PointerPressed {
+            position: pos,
+            button: PointerEventButton::Left,
+        });
+        app.window().dispatch_event(WindowEvent::PointerReleased {
+            position: pos,
+            button: PointerEventButton::Left,
+        });
+        assert!(!app.get_sub_list_show_timestamps(), "clicking Time pill must toggle timestamps off");
+        let reloaded = ConfigController::load(dir.path(), "memento.conf").unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::interface::GROUP, raw::interface::subtitle_list::TIMESTAMPS),
+            Some(Value::Bool(false))
+        );
+
+        // Subtitle search respects live `ignore-whitespace` and `auto-seek`.
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        subtitles.borrow_mut().load_cues(vec![
+            controller::subtitles::create_cue("Alpha one", 12.0, 14.0),
+            controller::subtitles::create_cue("Beta two", 25.0, 27.0),
+            controller::subtitles::create_cue("Alpha   three", 41.0, 43.0),
+        ]);
+        let rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(rows.clone().into());
+        refresh_subtitle_list(&app, &rows, &subtitles.borrow());
+        install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+
+        let sought = Rc::new(RefCell::new(Vec::<f32>::new()));
+        let sought_sink = sought.clone();
+        app.on_seek_to(move |sec| sought_sink.borrow_mut().push(sec));
+
+        // With `ignore-whitespace = false`, "Alphaone" does NOT match "Alpha one".
+        app.invoke_search_subtitles("Alphaone".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 0);
+        assert!(sought.borrow().is_empty());
+
+        // With `ignore-whitespace = true` and `auto-seek = true`, search & next/prev auto-seek!
+        app.set_subtitle_search_ignore_whitespace(true);
+        app.invoke_search_subtitles("Alpha".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 2);
+        assert_eq!(sought.borrow().as_slice(), &[12.0]);
+        app.invoke_next_subtitle_search_match();
+        assert_eq!(sought.borrow().as_slice(), &[12.0, 41.0]);
+        app.invoke_prev_subtitle_search_match();
+        assert_eq!(sought.borrow().as_slice(), &[12.0, 41.0, 12.0]);
+
+        // Turning `auto-seek` off stops seeking on match navigation.
+        app.set_subtitle_search_auto_seek(false);
+        app.invoke_next_subtitle_search_match();
+        assert_eq!(sought.borrow().as_slice(), &[12.0, 41.0, 12.0]);
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn auto_play_audio_triggers_on_first_term_result_when_enabled() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        cfg.edit_setting("search/auto-play-audio", "true").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(app.get_auto_play_audio_enabled());
+
+        let played = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+        let played_sink = played.clone();
+        app.on_play_audio_for_word(move |expr, reading| {
+            played_sink.borrow_mut().push((expr.to_string(), reading.to_string()));
+        });
+
+        let term = controller::dict::SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        let kanji = controller::dict::SearchHit::new("食", "しょく", "eat", "kanji", 1, true);
+        display_word_lookup(
+            &app,
+            WordLookupResult {
+                hits: vec![kanji.clone(), term.clone()],
+                error: None,
+                database_open: true,
+                matched_units: 3,
+                headword: "食べる".into(),
+                reading: "たべる".into(),
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+            },
+            "食べる",
+            &[],
+        );
+        assert_eq!(
+            played.borrow().as_slice(),
+            &[("食べる".to_owned(), "たべる".to_owned())]
+        );
+
+        // Disabled setting must not auto-play.
+        played.borrow_mut().clear();
+        cfg.edit_setting("search/auto-play-audio", "false").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(!app.get_auto_play_audio_enabled());
+        display_word_lookup(
+            &app,
+            WordLookupResult {
+                hits: vec![term],
+                error: None,
+                database_open: true,
+                matched_units: 3,
+                headword: "食べる".into(),
+                reading: "たべる".into(),
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+            },
+            "食べる",
+            &[],
+        );
+        assert!(played.borrow().is_empty());
+    }
+
+    #[test]
+    fn cursor_reveal_zones_osc_fade_and_osc_mpv_cursor_bindings_work_in_headless_ui() {
+        i_slint_backend_testing::init_no_event_loop();
+        let cfg = ConfigController::new();
+        cfg.edit_setting("behavior/osc-fade", "0").unwrap();
+        cfg.edit_setting("behavior/osc-mpv-cursor", "true").unwrap();
+        cfg.edit_setting("behavior/subtitle-cursor-show", "true").unwrap();
+        cfg.edit_setting("behavior/subtitle-cursor-show-secondary", "true").unwrap();
+
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        refresh_player_preferences(&app, &cfg);
+        assert_eq!(app.get_osc_fade_ms(), 0);
+        assert!(app.get_osc_mpv_cursor());
+        assert!(app.get_subtitle_cursor_show_enabled());
+        assert!(app.get_secondary_subtitle_cursor_show_enabled());
+
+        // With `osc-fade-ms = 0`, toggling `osc-visible` switches opacity immediately without animation lag.
+        app.set_osc_visible(false);
+        assert_eq!(app.get_osc_opacity(), 0.0);
+        assert_eq!(app.get_menu_bar_opacity(), 0.0);
+        app.set_osc_visible(true);
+        assert_eq!(app.get_osc_opacity(), 1.0);
+        assert_eq!(app.get_menu_bar_opacity(), 1.0);
+
+        // Even when subtitles are hidden (`!subtitles-visible` and `hide-memento-while-playing && is-playing`),
+        // moving the pointer into the bottom 20% reveals primary subtitles, and top 20% reveals secondary subtitles.
+        app.set_active_sub_text("Primary line".into());
+        app.set_secondary_sub_text("Secondary line".into());
+        app.set_subtitles_visible(false);
+        app.set_hide_memento_while_playing(true);
+        app.set_is_playing(true);
+        app.show().unwrap();
+
+        // Pointer in middle of video (y = 360px, video area starts at y = 30px): both hidden.
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 360.),
+        });
+        assert!(!app.get_cursor_in_top_sub_zone());
+        assert!(!app.get_cursor_in_bottom_sub_zone());
+        assert!(!app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        // Pointer in bottom 20% of video above OSC (y = 610px -> 580/690 = 84%): primary revealed, secondary hidden.
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 610.),
+        });
+        assert!(app.get_cursor_in_bottom_sub_zone());
+        assert!(!app.get_cursor_in_top_sub_zone());
+        assert!(app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        // Pointer hovering the bottom OSC bar itself (y = 660px with OSC visible) keeps primary revealed.
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 660.),
+        });
+        assert!(app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        // With OSC hidden during playback, pointer at y = 660px (91%) lands on video-motion bottom zone.
+        app.set_osc_visible(false);
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 660.),
+        });
+        assert!(app.get_cursor_in_bottom_sub_zone());
+        assert!(app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        // Pointer in top 20% of video (y = 80px): secondary revealed, primary hidden.
+        app.set_osc_visible(true);
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 80.),
+        });
+        assert!(app.get_cursor_in_top_sub_zone());
+        assert!(!app.get_cursor_in_bottom_sub_zone());
+        assert!(!app.get_primary_subtitle_effective_visible());
+        assert!(app.get_secondary_subtitle_effective_visible());
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn file_open_dir_resolution_and_update_dialog_flow() {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let current = root.path().join("cwd");
+        let videos = home.join("Videos");
+        let documents = home.join("Documents");
+        let custom = root.path().join("My Anime");
+        for d in [&home, &current, &videos, &documents, &custom] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        // 0=Current, 1=Home, 2=Movies, 3=Documents, 4=Custom (plain path, file:// URI, ~/path, missing fallback)
+        assert_eq!(
+            resolve_file_open_dir(0, "", Some(&home), Some(&current), Some(&videos), Some(&documents)),
+            Some(current.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(1, "", Some(&home), Some(&current), Some(&videos), Some(&documents)),
+            Some(home.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(2, "", Some(&home), Some(&current), Some(&videos), Some(&documents)),
+            Some(videos.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(3, "", Some(&home), Some(&current), Some(&videos), Some(&documents)),
+            Some(documents.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(
+                4,
+                custom.to_str().unwrap(),
+                Some(&home),
+                Some(&current),
+                Some(&videos),
+                Some(&documents),
+            ),
+            Some(custom.clone())
+        );
+        let file_uri = format!("file://{}", custom.to_str().unwrap().replace(' ', "%20"));
+        assert_eq!(
+            resolve_file_open_dir(4, &file_uri, Some(&home), Some(&current), Some(&videos), Some(&documents)),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(4, "~/Videos", Some(&home), Some(&current), None, None),
+            Some(videos.clone())
+        );
+        assert_eq!(
+            resolve_file_open_dir(
+                4,
+                "/nonexistent/memento/dir/xyz",
+                Some(&home),
+                Some(&current),
+                Some(&videos),
+                Some(&documents),
+            ),
+            Some(home.clone()),
+            "missing custom directory must fall back cleanly to home"
+        );
+
+        // Startup update check decision & UpdateDialog modal outcomes.
+        let cfg = ConfigController::new();
+        assert_eq!(determine_startup_update_action(&cfg), StartupUpdateAction::ShowOptInPrompt);
+        cfg.edit_setting("internal/auto-update-opt-in-shown", "true").unwrap();
+        assert_eq!(determine_startup_update_action(&cfg), StartupUpdateAction::Nothing);
+        cfg.edit_setting("application/auto-update-check", "true").unwrap();
+        assert_eq!(determine_startup_update_action(&cfg), StartupUpdateAction::RunSilentCheck);
+
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        open_update_opt_in_dialog(&app);
+        assert!(app.get_update_dialog_open());
+        assert!(app.get_update_dialog_opt_in());
+        app.set_update_dialog_open(false);
+
+        // Silent up-to-date and silent failure must not pop up the dialog.
+        apply_update_check_outcome(&app, "2.0.2", Ok("v2.0.2".to_owned()), true);
+        assert!(!app.get_update_dialog_open());
+        apply_update_check_outcome(&app, "2.0.2", Err("offline".to_owned()), true);
+        assert!(!app.get_update_dialog_open());
+
+        // Silent newer release DOES open the modal with the release tag.
+        apply_update_check_outcome(&app, "2.0.2", Ok("v2.1.0".to_owned()), true);
+        assert!(app.get_update_dialog_open());
+        assert!(!app.get_update_dialog_opt_in());
+        assert_eq!(app.get_update_dialog_release_tag().as_str(), "v2.1.0");
+        assert_eq!(app.get_update_dialog_title().as_str(), "New Version Available");
+
+        // Manual up-to-date check opens modal with "Up to Date".
+        app.set_update_dialog_open(false);
+        apply_update_check_outcome(&app, "2.0.2", Ok("v2.0.2".to_owned()), false);
+        assert!(app.get_update_dialog_open());
+        assert_eq!(app.get_update_dialog_title().as_str(), "Up to Date");
+        assert!(app.get_update_dialog_release_tag().is_empty());
     }
 }
