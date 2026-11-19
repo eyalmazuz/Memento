@@ -1471,6 +1471,9 @@ export component YomitanPopup inherits Rectangle {
                             update-anki-touch := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => {
+                                    if PopupBridge.nested-depth > 0 {
+                                        PopupBridge.dismiss-all-nested-popups();
+                                    }
                                     PopupBridge.update-anki-note-requested(
                                         term-segment.row-zero-idx,
                                         term-segment.row-anki-note-id,

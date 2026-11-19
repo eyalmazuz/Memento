@@ -4734,12 +4734,18 @@ pub fn compute_collapsible_metrics(
     line_limit: usize,
 ) -> (bool, f32, i32) {
     let total_lines = doc.line_bottoms.len() as i32;
+    if !doc.height_px.is_finite() || doc.height_px <= 0.0 {
+        return (false, 0.0, total_lines);
+    }
     if line_limit == 0 || doc.line_bottoms.len() <= line_limit {
         return (false, doc.height_px, total_lines);
     }
-    let clamped_h = (doc.line_bottoms[line_limit - 1] + 4.0)
-        .ceil()
-        .clamp(18.0, doc.height_px);
+    let raw_bottom = doc.line_bottoms[line_limit - 1];
+    if !raw_bottom.is_finite() {
+        return (false, doc.height_px, total_lines);
+    }
+    let min_h = 18.0f32.min(doc.height_px);
+    let clamped_h = (raw_bottom + 4.0).ceil().clamp(min_h, doc.height_px);
     if clamped_h + 4.0 >= doc.height_px {
         (false, doc.height_px, total_lines)
     } else {
@@ -9994,13 +10000,29 @@ impl RichUiBridge {
         self.dispatch_anki_check_for_rows(app, &rows, Some(target_depth));
     }
 
-    fn toggle_nested_select_definition(&self, app: &MementoApp, depth: i32, one_based_idx: i32) {
+    fn is_nested_target_already_shown(&self, target: &HoveredGlossaryTarget) -> bool {
+        if target.depth < 0 {
+            return false;
+        }
+        let st = self.state.borrow();
+        st.nested_stack
+            .get(target.depth as usize)
+            .is_some_and(|child| {
+                child.source_row_index == target.row_index
+                    && child.source_start_char == target.start_char
+            })
+    }
+
+    fn toggle_nested_select_definition(&self, app: &MementoApp, depth: i32, zero_based_idx: i32) {
+        if zero_based_idx < 0 {
+            return;
+        }
         let mut changed = false;
         {
             let mut st = self.state.borrow_mut();
             if let Some(lvl) = st.nested_level_mut(depth) {
                 lvl.locked = true;
-                if let Some(row) = lvl.rows.iter_mut().find(|r| r.index == one_based_idx) {
+                if let Some(row) = lvl.rows.get_mut(zero_based_idx as usize) {
                     row.selected = !row.selected;
                     changed = true;
                 }
@@ -10011,25 +10033,24 @@ impl RichUiBridge {
         }
     }
 
-    fn toggle_nested_term_collapse(&self, app: &MementoApp, depth: i32, term_start_idx: i32) {
+    fn toggle_nested_term_collapse(&self, app: &MementoApp, depth: i32, term_start_zero_idx: i32) {
+        if term_start_zero_idx < 0 {
+            return;
+        }
         let mut changed = false;
         {
             let mut st = self.state.borrow_mut();
             if let Some(lvl) = st.nested_level_mut(depth) {
                 lvl.locked = true;
-                let mut in_group = false;
-                let mut target_collapsed = false;
-                for row in &mut lvl.rows {
-                    if !in_group {
-                        if row.index == term_start_idx {
-                            in_group = true;
-                            target_collapsed = !row.collapsed;
-                            row.collapsed = target_collapsed;
-                            changed = true;
+                let start = term_start_zero_idx as usize;
+                if start < lvl.rows.len() {
+                    let target_collapsed = !lvl.rows[start].collapsed;
+                    lvl.rows[start].collapsed = target_collapsed;
+                    changed = true;
+                    for row in lvl.rows.iter_mut().skip(start + 1) {
+                        if row.term_start {
+                            break;
                         }
-                    } else if row.term_start {
-                        break;
-                    } else {
                         row.collapsed = target_collapsed;
                     }
                 }
@@ -11410,7 +11431,9 @@ pub fn install_rich_ui_bridges(
                     };
                     if let Some(target) = target_opt {
                         if modifier_matches_setting(mod_setting, c, s, a, m) {
-                            b_pkey.dispatch_nested_scan(&app, target, false);
+                            if !b_pkey.is_nested_target_already_shown(&target) {
+                                b_pkey.dispatch_nested_scan(&app, target, false);
+                            }
                             return true;
                         }
                     }
@@ -11852,7 +11875,9 @@ pub fn install_rich_ui_bridges(
                 b_stat_mod.trigger_subtitle_scan_now(&app, cluster);
             } else if app.get_dict_open() {
                 if let Some(target) = gloss_target_opt {
-                    b_stat_mod.dispatch_nested_scan(&app, target, false);
+                    if !b_stat_mod.is_nested_target_already_shown(&target) {
+                        b_stat_mod.dispatch_nested_scan(&app, target, false);
+                    }
                 }
             }
         }
@@ -11949,10 +11974,13 @@ pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU
     });
 }
 
-/// Returns the lossless 64-bit Anki note ID for a popup row (or nested row if `nested_depth > 0`),
-/// avoiding `i32` truncation for 13-digit AnkiConnect epoch-millisecond note IDs.
+/// Returns the lossless 64-bit Anki note ID for a popup row (or active nested row if
+/// `nested_depth > 0`), avoiding `i32` truncation for 13-digit AnkiConnect epoch-ms note IDs.
 pub fn popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i64> {
     let pb = app.global::<PopupBridge>();
+    if pb.get_nested_depth() > 0 {
+        return nested_popup_row_anki_note_id_i64(app, row_idx);
+    }
     if let Some(s) = pb.get_row_anki_note_id_strings().row_data(row_idx) {
         if let Ok(parsed) = s.as_str().trim().parse::<i64>() {
             if parsed > 0 {

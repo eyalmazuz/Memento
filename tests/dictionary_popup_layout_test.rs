@@ -1627,6 +1627,16 @@ mod rich_popup_phase4_tests {
                 ["line one English\nline two 言葉\nline three details\nline four extra\nline five tail"],
                 10,
                 ""
+            ],
+            [
+                "言葉",
+                "ことば",
+                "n",
+                "",
+                65,
+                ["word; language; speech"],
+                11,
+                ""
             ]
         ])
         .to_string();
@@ -1892,6 +1902,39 @@ mod rich_popup_phase4_tests {
             "parent glossary must display continuous blue highlight on matched nested word"
         );
 
+        // 2b. Verify 0-based nested definition selection & term collapse toggle on row 0
+        //     without off-by-one mismatch (row 1 remains untouched on row-0 selection toggle).
+        assert_eq!(
+            pb.get_nested_results().row_count(),
+            2,
+            "言葉 should have 2 dictionaries in nested popup"
+        );
+        assert!(pb.get_nested_results().row_data(0).unwrap().selected);
+        assert!(pb.get_nested_results().row_data(1).unwrap().selected);
+        pb.invoke_nested_toggle_select_definition(1, 0);
+        assert!(
+            !pb.get_nested_results().row_data(0).unwrap().selected,
+            "toggling 0-based nested row 0 selection must flip row 0"
+        );
+        assert!(
+            pb.get_nested_results().row_data(1).unwrap().selected,
+            "toggling nested row 0 selection must not affect row 1"
+        );
+        pb.invoke_nested_toggle_select_definition(1, 0);
+        assert!(pb.get_nested_results().row_data(0).unwrap().selected);
+
+        pb.invoke_nested_toggle_term_collapse(1, 0);
+        assert!(
+            pb.get_nested_results().row_data(0).unwrap().collapsed
+                && pb.get_nested_results().row_data(1).unwrap().collapsed,
+            "toggling 0-based nested term collapse on row 0 must collapse the term group"
+        );
+        pb.invoke_nested_toggle_term_collapse(1, 0);
+        assert!(
+            !pb.get_nested_results().row_data(0).unwrap().collapsed
+                && !pb.get_nested_results().row_data(1).unwrap().collapsed
+        );
+
         // 3. Recursive depth-2 lookup inside depth-1 nested glossary (文字).
         let nrender = pb.invoke_nested_render_glossary(
             1,
@@ -2016,9 +2059,17 @@ mod rich_popup_phase4_tests {
             "Modifier mode must not scan when modifier key is not held"
         );
         let shift_text = slint::SharedString::from(slint::platform::Key::Shift);
-        assert!(pb.invoke_popup_key_pressed(shift_text, false, true, false, false));
+        assert!(pb.invoke_popup_key_pressed(shift_text.clone(), false, true, false, false));
         wait_for_nested_depth(&app, 1);
         assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+        // OS key-repeat while holding Shift over the same target must NOT re-dispatch async lookup.
+        let rev_before_repeat = pb.get_nested_revision();
+        assert!(pb.invoke_popup_key_pressed(shift_text, false, true, false, false));
+        assert!(
+            !pb.get_nested_searching(),
+            "modifier key-repeat over already-open target must not re-dispatch async lookup"
+        );
+        assert_eq!(pb.get_nested_revision(), rev_before_repeat);
         pb.invoke_dismiss_all_nested_popups();
 
         // 7. Middle-mouse scan respects search/middle-mouse-scan toggle and opens locked child.
@@ -2311,6 +2362,24 @@ mod rich_popup_phase4_tests {
             !card1_reset.expanded,
             "per-card expand state must reset on a new lookup"
         );
+
+        // Edge cases in compute_collapsible_metrics: small height (< 18px), 0, negative, NaN/Inf must never panic.
+        for bad_h in [12.0f32, 0.0, -5.0, f32::NAN, f32::INFINITY] {
+            let synthetic = memento_app::RenderedGlossaryDoc {
+                image: slint::Image::default(),
+                width_px: 200.0,
+                height_px: bad_h,
+                hit_zones: Vec::new(),
+                selectable_chars: Vec::new(),
+                line_bottoms: vec![4.0, 8.0, 11.0],
+                plain_text: String::new(),
+            };
+            let (collapsible, collapsed_h, lines) =
+                memento_app::compute_collapsible_metrics(&synthetic, 1);
+            assert!(!collapsible, "bad/tiny height {bad_h} must never panic or report collapsible");
+            assert!(collapsed_h.is_finite() && collapsed_h >= 0.0);
+            assert_eq!(lines, 3);
+        }
     }
 
     #[test]
@@ -2436,6 +2505,12 @@ mod rich_popup_phase4_tests {
             assert_eq!(calls[0].3, "だいじせんご");
         }
 
+        // Configure immediate hover scan before marking large 13-digit Anki note IDs so
+        // refresh_rich_ui_bridges does not clear the manually marked duplicate state.
+        cfg.edit_setting("search/method", "0").unwrap();
+        cfg.edit_setting("search/delay", "0").unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+
         // Large 13-digit AnkiConnect epoch-ms note ID must clamp positive (i32::MAX) in Slint
         // while staying lossless via popup_row_anki_note_id_i64!
         let large_nid: i64 = 1_732_000_000_123;
@@ -2445,6 +2520,89 @@ mod rich_popup_phase4_tests {
             memento_app::popup_row_anki_note_id_i64(&app, 0),
             Some(large_nid)
         );
+
+        // When a nested popup is active, popup_row_anki_note_id_i64 must delegate to the nested
+        // row's lossless 64-bit note ID, and clicking root Update must dismiss nested first so
+        // root's lossless 64-bit note ID resolves unambiguously!
+        let _ = pb.invoke_render_glossary(
+            1,
+            360.0,
+            true,
+            pb.get_rich_revision(),
+            pb.get_selection_revision(),
+        );
+        let ref_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            &hits[0].raw_glossary,
+            &hits[0].glossary,
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            hits[0].dictionary_id,
+            &hits[0].dict_name,
+            360.0,
+            true,
+        )
+        .unwrap();
+        let k_cell = ref_doc
+            .selectable_chars
+            .iter()
+            .find(|c| c.ch == '言')
+            .unwrap();
+        pb.invoke_glossary_scan_hover(
+            0,
+            1,
+            k_cell.x + k_cell.w * 0.5,
+            k_cell.y + k_cell.h * 0.5,
+            120.0,
+            140.0,
+            false,
+            false,
+            false,
+            false,
+        );
+        wait_for_nested_depth(&app, 1);
+        let nested_large_nid: i64 = 1_732_999_000_777;
+        pb.invoke_nested_add_anki_note(0);
+        memento_app::mark_popup_term_anki_added(&app, 0, nested_large_nid, &profile, false);
+        assert_eq!(pb.get_nested_depth(), 1);
+        assert_eq!(
+            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            Some(nested_large_nid),
+            "popup_row_anki_note_id_i64 must return nested row's lossless 64-bit ID when nested_depth > 0"
+        );
+        // Simulate root update-anki-touch click while nested popup is open: dismisses nested first
+        // so callback sees nested_depth == 0 and resolves root's lossless 64-bit note ID!
+        let resolved_in_cb = Rc::new(Cell::new(0i64));
+        let resolved_cl = resolved_in_cb.clone();
+        let app_weak_cb = app.as_weak();
+        pb.on_update_anki_note_requested(move |row_idx, _note_id, _expr, _reading, _gloss| {
+            if let Some(a) = app_weak_cb.upgrade() {
+                assert_eq!(
+                    a.global::<PopupBridge>().get_nested_depth(),
+                    0,
+                    "clicking root Update must dismiss nested popup first"
+                );
+                resolved_cl.set(
+                    memento_app::popup_row_anki_note_id_i64(&a, row_idx.max(0) as usize)
+                        .unwrap_or(0),
+                );
+            }
+        });
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+            let root_update_btn = ElementQuery::from_root(&app)
+                .match_id("YomitanPopup::update-anki-touch")
+                .find_first()
+                .expect("root update-anki-touch must exist");
+            root_update_btn.mock_single_click(slint::platform::PointerEventButton::Left);
+            assert_eq!(resolved_in_cb.get(), large_nid);
+        } else {
+            pb.invoke_dismiss_all_nested_popups();
+            assert_eq!(
+                memento_app::popup_row_anki_note_id_i64(&app, 0),
+                Some(large_nid)
+            );
+        }
 
         // 3. Interface search-*-font fallbacks apply when popup.css doesn't override, and yield when popup.css does.
         cfg.edit_setting(
