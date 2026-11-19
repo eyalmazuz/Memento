@@ -38,6 +38,7 @@
 //! `modelFieldNames`, `canAddNotes`, `addNote`, `guiBrowse`,
 //! `storeMediaFile` (via `multi`).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -70,6 +71,8 @@ pub enum AnkiAction
     FieldNames,
     CanAddNotes,
     AddNote,
+    FindNotes,
+    NotesInfo,
     GuiBrowse,
     StoreMediaFile,
     Multi,
@@ -87,6 +90,8 @@ impl AnkiAction
             Self::FieldNames => "modelFieldNames",
             Self::CanAddNotes => "canAddNotes",
             Self::AddNote => "addNote",
+            Self::FindNotes => "findNotes",
+            Self::NotesInfo => "notesInfo",
             Self::GuiBrowse => "guiBrowse",
             Self::StoreMediaFile => "storeMediaFile",
             Self::Multi => "multi",
@@ -502,6 +507,36 @@ impl AnkiClient
             .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
     }
 
+    /// `findNotes` with `{ "query": query }`, returning positive 64-bit note IDs.
+    pub fn find_notes(&self, query: &str) -> AnkiResult<Vec<i64>>
+    {
+        let params = json!({ "query": query });
+        let result = self.request_typed(
+            TypedReplyKind::OpenBrowse,
+            AnkiAction::FindNotes,
+            Some(params),
+        )?;
+        let values = result
+            .as_array()
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ResultNotArray))?;
+        let mut ids = Vec::with_capacity(values.len());
+        for value in values
+        {
+            let id = as_note_id(value)
+                .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// `notesInfo` with `{ "notes": [...] }`, decoding structured note metadata.
+    pub fn notes_info(&self, notes: &[i64]) -> AnkiResult<Vec<AnkiNoteInfo>>
+    {
+        let params = json!({ "notes": notes });
+        let result = self.request(AnkiAction::NotesInfo, Some(params))?;
+        parse_notes_info_result(&result)
+    }
+
     /// `guiBrowse` with `{ "query": query }`, returning note ids
     /// (`openBrowseAsync` shape).
     pub fn open_browse(&self, query: &str) -> AnkiResult<Vec<i64>>
@@ -540,6 +575,87 @@ impl AnkiClient
             other => Err(AnkiError::Typed(other)),
         }
     }
+}
+
+/// Structured note metadata returned by AnkiConnect `notesInfo`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnkiNoteInfo
+{
+    pub note_id: i64,
+    pub model_name: String,
+    pub tags: Vec<String>,
+    pub fields: HashMap<String, String>,
+}
+
+fn parse_notes_info_result(result: &Value) -> AnkiResult<Vec<AnkiNoteInfo>>
+{
+    let entries = result
+        .as_array()
+        .ok_or(AnkiError::Typed(TypedReplyStatus::ResultNotArray))?;
+    let mut infos = Vec::with_capacity(entries.len());
+    for entry in entries
+    {
+        let obj = entry
+            .as_object()
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+        if obj.is_empty()
+        {
+            // AnkiConnect returns `{}` for missing/deleted note IDs.
+            continue;
+        }
+        let note_id = obj
+            .get("noteId")
+            .and_then(as_note_id)
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+        let model_name = obj
+            .get("modelName")
+            .and_then(Value::as_str)
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?
+            .to_owned();
+        let tags_array = obj
+            .get("tags")
+            .and_then(Value::as_array)
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+        let mut tags = Vec::with_capacity(tags_array.len());
+        for tag in tags_array
+        {
+            let tag_str = tag
+                .as_str()
+                .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+            tags.push(tag_str.to_owned());
+        }
+        let fields_obj = obj
+            .get("fields")
+            .and_then(Value::as_object)
+            .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))?;
+        let mut fields = HashMap::with_capacity(fields_obj.len());
+        for (name, field_val) in fields_obj
+        {
+            let value_str = if let Some(s) = field_val.as_str()
+            {
+                s
+            }
+            else if let Some(s) = field_val
+                .as_object()
+                .and_then(|f| f.get("value"))
+                .and_then(Value::as_str)
+            {
+                s
+            }
+            else
+            {
+                return Err(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch));
+            };
+            fields.insert(name.clone(), value_str.to_owned());
+        }
+        infos.push(AnkiNoteInfo {
+            note_id,
+            model_name,
+            tags,
+            fields,
+        });
+    }
+    Ok(infos)
 }
 
 /// Pre-encoded media file for the `multi`/`storeMediaFile` flow. The

@@ -2225,7 +2225,13 @@ export component MementoApp inherits Window {
                             visible: root.dict-search-open;
                             results: root.dict-results;
                             query <=> root.dict-query;
-                            search-changed(query) => { root.search-dictionary(query); }
+                            search-changed(query) => {
+                                if PopupBridge.rich-enabled {
+                                    PopupBridge.panel-search-requested(query);
+                                } else {
+                                    root.search-dictionary(query);
+                                }
+                            }
                             lookup(word) => { root.lookup-word(word); }
                             close => { root.dict-search-open = false; f-scope.focus(); }
                         }

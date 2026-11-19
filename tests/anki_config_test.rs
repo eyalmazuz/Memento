@@ -5,11 +5,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use memento_app::controller::anki::{
-    apply_subtitle_cloze, build_note_payload_from_profile, create_cloze_sentence,
-    default_note_fields, format_cloze, format_cloze_with_hint, format_expression_furigana,
-    format_glossary, map_note_fields, populate_note_context_from_sqlite, scope_dictionary_css,
-    secondary_context_for_range, split_cloze, unavailable_profile_markers, validate_json_payload,
-    validate_note_payload, AnkiController, GlossaryDefinition, NoteFieldsContext, NotePayload,
+    apply_subtitle_cloze, build_entry_find_query, build_note_payload_from_profile,
+    create_cloze_sentence, default_note_fields, escape_anki_search_term, format_cloze,
+    format_cloze_with_hint, format_expression_furigana, format_glossary, format_nid_browse_query,
+    map_note_fields, normalize_anki_browse_target, populate_note_context_from_sqlite,
+    scope_dictionary_css, secondary_context_for_range, split_cloze, unavailable_profile_markers,
+    validate_json_payload, validate_note_payload, AnkiController, GlossaryDefinition,
+    NoteFieldsContext, NotePayload,
 };
 use memento_app::controller::config::{
     anki_note_preset_fields, AnkiNoteConfig, AnkiNotePreset, ConfigController,
@@ -1116,6 +1118,481 @@ fn structured_interface_font_color_keybind_and_osc_limits_work_end_to_end() {
     assert_eq!(
         reloaded.effective_setting("subtitle-list", "auto-seek"),
         Some(Value::Bool(true))
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_policies() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    assert_eq!(escape_anki_search_term("a\"b\\c"), "a\\\"b\\\\c");
+    assert_eq!(
+        format_nid_browse_query(&[1669909161234, 1669909161239, 1669909161234]),
+        "nid:1669909161234 or nid:1669909161239"
+    );
+    assert_eq!(
+        normalize_anki_browse_target("1669909161234").as_deref(),
+        Some("nid:1669909161234")
+    );
+    assert_eq!(
+        normalize_anki_browse_target("nid:123 or nid:456").as_deref(),
+        Some("nid:123 or nid:456")
+    );
+    assert_eq!(normalize_anki_browse_target("   "), None);
+
+    let mut base_profile = AnkiNoteConfig {
+        enabled: true,
+        endpoint: AnkiEndpoint::default(),
+        deck: "Japanese \"Mining\"".into(),
+        model: "Lapis".into(),
+        field_templates: HashMap::from([
+            ("Expression".into(), "{expression}".into()),
+            ("ExpressionReading".into(), "{reading}".into()),
+            ("Glossary".into(), "{glossary}".into()),
+        ]),
+        tags: vec!["memento".into()],
+        duplicate_policy: 1, // DifferentDeck
+        screenshot_type: 0,
+        audio_pad_start: 0.0,
+        audio_pad_end: 0.0,
+        audio_normalize: false,
+        audio_db: -20.0,
+        newline_replacer: "<br>".into(),
+    };
+
+    assert_eq!(
+        build_entry_find_query(&base_profile, "食\"べる", "たべる").unwrap(),
+        "deck:\"Japanese \\\"Mining\\\"\" Expression:\"食\\\"べる\""
+    );
+    let mut none_profile = base_profile.clone();
+    none_profile.duplicate_policy = 0; // None -> all decks
+    assert_eq!(
+        build_entry_find_query(&none_profile, "食べる", "たべる").unwrap(),
+        "Expression:\"食べる\""
+    );
+
+    // 1. DifferentDeck (policy = 1), show_tags = false -> `canAddNotes` + `findNotes` only for duplicate
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let mut seen_actions = Vec::new();
+        for step in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let body: serde_json::Value =
+                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            seen_actions.push(body["action"].as_str().unwrap().to_owned());
+            let reply = match step {
+                0 => {
+                    assert_eq!(body["params"]["notes"][0]["options"]["duplicateScope"], "deck");
+                    serde_json::json!({ "error": null, "result": [false, true] }).to_string()
+                }
+                _ => {
+                    assert_eq!(
+                        body["params"]["query"],
+                        "deck:\"Japanese \\\"Mining\\\"\" Expression:\"食べる\""
+                    );
+                    serde_json::json!({
+                        "error": null,
+                        "result": [1669909161234_i64, 1669909161239_i64]
+                    })
+                    .to_string()
+                }
+            };
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(http.as_bytes()).unwrap();
+        }
+        seen_actions
+    });
+
+    base_profile.endpoint = AnkiEndpoint {
+        hostname: "http://127.0.0.1".into(),
+        port,
+        api_key: None,
+        timeout: Some(Duration::from_secs(2)),
+        use_api_key: false,
+    };
+    let ctrl = AnkiController::new(base_profile.endpoint());
+    let entries = vec![
+        ("食べる".to_owned(), "たべる".to_owned()),
+        ("未知語".to_owned(), "みちご".to_owned()),
+    ];
+    let statuses = ctrl
+        .check_entries_anki_status(&base_profile, &entries, false)
+        .unwrap();
+    assert_eq!(handle.join().unwrap(), vec!["canAddNotes", "findNotes"]);
+    assert_eq!(statuses.len(), 2);
+    assert!(!statuses[0].can_add && statuses[0].is_duplicate);
+    assert_eq!(
+        statuses[0].browse_query,
+        "nid:1669909161234 or nid:1669909161239"
+    );
+    assert!(statuses[0].tags.is_empty());
+    assert!(statuses[1].can_add && !statuses[1].is_duplicate);
+    assert_eq!(statuses[1].browse_query, "");
+
+    // 2. SameDeck (policy = 2, allowDuplicate = true) with show_tags = true ->
+    //    `can_add` stays true (`is_duplicate` = false, so `+` stays enabled!) while
+    //    `findNotes` + `notesInfo` still fetch existing card tags!
+    let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port2 = listener2.local_addr().unwrap().port();
+    let handle2 = std::thread::spawn(move || {
+        let mut seen_actions = Vec::new();
+        for step in 0..3 {
+            let (mut stream, _) = listener2.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let body: serde_json::Value =
+                serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+            seen_actions.push(body["action"].as_str().unwrap().to_owned());
+            let reply = match step {
+                0 => {
+                    assert_eq!(body["params"]["notes"][0]["options"]["allowDuplicate"], true);
+                    serde_json::json!({ "error": null, "result": [true] }).to_string()
+                }
+                1 => serde_json::json!({ "error": null, "result": [1669909165555_i64] }).to_string(),
+                _ => serde_json::json!({
+                    "error": null,
+                    "result": [{
+                        "noteId": 1669909165555_i64,
+                        "modelName": "Lapis",
+                        "tags": ["leech", "anime", "leech"],
+                        "fields": { "Expression": { "value": "食べる", "order": 0 } }
+                    }]
+                })
+                .to_string(),
+            };
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.write_all(http.as_bytes()).unwrap();
+        }
+        seen_actions
+    });
+
+    let mut same_deck_profile = base_profile.clone();
+    same_deck_profile.duplicate_policy = 2;
+    same_deck_profile.endpoint.port = port2;
+    let ctrl2 = AnkiController::new(same_deck_profile.endpoint());
+    let same_statuses = ctrl2
+        .check_entries_anki_status(
+            &same_deck_profile,
+            &[("食べる".to_owned(), "たべる".to_owned())],
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        handle2.join().unwrap(),
+        vec!["canAddNotes", "findNotes", "notesInfo"]
+    );
+    assert!(same_statuses[0].can_add && !same_statuses[0].is_duplicate);
+    assert_eq!(same_statuses[0].note_ids, vec![1669909165555]);
+    assert_eq!(same_statuses[0].tags, vec!["leech", "anime"]);
+}
+
+#[test]
+fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
+    use memento_app::controller::dict::DictController;
+    use memento_app::{
+        bind_rich_bridge_lookup_epoch, dictionary_result_rows, install_popup_navigation,
+        install_rich_ui_bridges, mark_popup_term_anki_added, refresh_rich_ui_bridges,
+        set_dictionary_rows, MementoApp, PopupBridge,
+    };
+    use memento_dict::yomidbbuilder::prepare_db;
+    use slint::{ComponentHandle, Model};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+
+    i_slint_backend_testing::init_no_event_loop();
+    let dir = temp_test_dir("popup_anki_ux");
+    let config_dir = dir.join("config");
+    fs::create_dir_all(config_dir.join("dict_resources")).unwrap();
+    let db_path = dir.join("dictionaries.sqlite");
+    prepare_db(&db_path).unwrap();
+
+    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (1, 'Jitendex', 3, '1', 1);",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) VALUES \
+         (1, '食べる', 'たべる', 'v1', 'v1', 100, '[\"to eat\"]', 1, ''), \
+         (1, '世界', 'せかい', 'n', '', 90, '[\"world\"]', 2, ''), \
+         (1, '橋', 'はし', 'n', '', 80, '[\"bridge\"]', 3, '');",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO kanji_bank (dic_id, char, onyomi, kunyomi, tags, meanings, stats) VALUES \
+         (1, '食', 'ショク', 'た.べる', '', '[\"eat\"]', '{}');",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Ephemeral AnkiConnect mock server answering dynamic `canAddNotes`, `findNotes`, `notesInfo`
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_server = stop.clone();
+    let server_thread = std::thread::spawn(move || {
+        while !stop_server.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut buf = vec![0u8; 65536];
+            let Ok(n) = stream.read(&mut buf) else {
+                continue;
+            };
+            if n == 0 {
+                continue;
+            }
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let Ok(body) =
+                serde_json::from_str::<serde_json::Value>(req.split("\r\n\r\n").nth(1).unwrap_or(""))
+            else {
+                continue;
+            };
+            let action = body["action"].as_str().unwrap_or("");
+            let reply = match action {
+                "canAddNotes" => {
+                    let notes = body["params"]["notes"].as_array().unwrap();
+                    let flags: Vec<bool> = notes
+                        .iter()
+                        .map(|note| {
+                            let expr = note["fields"]["Expression"]
+                                .as_str()
+                                .or_else(|| note["fields"]["Character"].as_str())
+                                .unwrap_or("");
+                            !matches!(expr, "食べる" | "橋" | "食")
+                        })
+                        .collect();
+                    serde_json::json!({ "error": null, "result": flags }).to_string()
+                }
+                "findNotes" => {
+                    let q = body["params"]["query"].as_str().unwrap_or("");
+                    let ids: Vec<i64> = if q.contains("Expression:\"食べる\"") {
+                        vec![1669909161234]
+                    } else if q.contains("Expression:\"橋\"") {
+                        vec![1669909161001, 1669909161002]
+                    } else if q.contains("Character:\"食\"") {
+                        vec![1669909169000]
+                    } else {
+                        vec![]
+                    };
+                    serde_json::json!({ "error": null, "result": ids }).to_string()
+                }
+                "notesInfo" => {
+                    let ids = body["params"]["notes"].as_array().unwrap();
+                    let infos: Vec<serde_json::Value> = ids
+                        .iter()
+                        .filter_map(|v| v.as_i64())
+                        .map(|nid| match nid {
+                            1669909161234 => serde_json::json!({
+                                "noteId": nid,
+                                "modelName": "Lapis",
+                                "tags": ["mining", "leech"],
+                                "fields": { "Expression": { "value": "食べる", "order": 0 } }
+                            }),
+                            1669909161001 | 1669909161002 => serde_json::json!({
+                                "noteId": nid,
+                                "modelName": "Lapis",
+                                "tags": ["vocab_n4"],
+                                "fields": { "Expression": { "value": "橋", "order": 0 } }
+                            }),
+                            1669909169000 => serde_json::json!({
+                                "noteId": nid,
+                                "modelName": "KanjiCard",
+                                "tags": ["kanji_known"],
+                                "fields": { "Character": { "value": "食", "order": 0 } }
+                            }),
+                            _ => serde_json::json!({}),
+                        })
+                        .collect();
+                    serde_json::json!({ "error": null, "result": infos }).to_string()
+                }
+                _ => serde_json::json!({ "error": null, "result": null }).to_string(),
+            };
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(http.as_bytes());
+        }
+    });
+
+    let config = ConfigController::new();
+    config.edit_setting("anki/enabled", "true").unwrap();
+    config
+        .edit_setting("anki/profile/host", "http://127.0.0.1")
+        .unwrap();
+    config
+        .edit_setting("anki/profile/port", &port.to_string())
+        .unwrap();
+    config.edit_setting("anki/profile/show-tag", "true").unwrap();
+    config
+        .edit_setting("anki/profile/term/deck", "Japanese")
+        .unwrap();
+    config
+        .edit_setting("anki/profile/term/model", "Lapis")
+        .unwrap();
+    config.apply_anki_note_preset("Lapis").unwrap();
+    config
+        .edit_setting("anki/profile/kanji/deck", "Kanji")
+        .unwrap();
+    config
+        .edit_setting("anki/profile/kanji/model", "KanjiCard")
+        .unwrap();
+    config
+        .set_anki_model_fields("kanji", &["Character".into(), "Meaning".into()])
+        .unwrap();
+    config
+        .apply_settings(0, &config_dir, "memento.conf", &config_dir.join("anki_connect.json"))
+        .unwrap();
+
+    let app = MementoApp::new().unwrap();
+    app.window().set_size(slint::LogicalSize::new(1280., 720.));
+    app.set_anki_enabled(true);
+    let lookup_epoch = Arc::new(AtomicU64::new(1));
+    install_popup_navigation(&app);
+    install_rich_ui_bridges(&app, &db_path, &config_dir, &config);
+    bind_rich_bridge_lookup_epoch(&app, lookup_epoch.clone());
+    app.show().unwrap();
+
+    let pb = app.global::<PopupBridge>();
+    let wait_anki = |pb: &PopupBridge| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pb.get_anki_checking() && Instant::now() < deadline {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+    };
+
+    // 1. Initial popup with 2 entries: `食べる` (duplicate) and `世界` (addable)
+    let mut dict_ctrl = DictController::open(&db_path).unwrap();
+    let mut combined_hits = dict_ctrl.search("食べる").to_vec();
+    combined_hits.extend_from_slice(dict_ctrl.search("世界"));
+    set_dictionary_rows(&app, dictionary_result_rows(&combined_hits, &[]));
+    app.set_dict_open(true);
+    wait_anki(&pb);
+
+    let dups: Vec<bool> = pb.get_row_anki_duplicates().iter().collect();
+    let queries: Vec<String> = pb
+        .get_row_anki_browse_queries()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let tags: Vec<String> = pb
+        .get_row_anki_tags()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(dups, vec![true, false]);
+    assert_eq!(queries, vec!["nid:1669909161234".to_owned(), String::new()]);
+    assert_eq!(tags, vec!["mining leech".to_owned(), String::new()]);
+    let split_pills: Vec<String> = pb
+        .invoke_split_anki_tags(tags[0].clone().into())
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(split_pills, vec!["mining", "leech"]);
+
+    // 2. Clicking `?query=橋` inside YomitanPopup refreshes duplicate & tag badges for `橋`!
+    assert!(pb.invoke_activate_glossary_link("?query=橋".into()));
+    wait_anki(&pb);
+    assert_eq!(app.get_dict_query().as_str(), "橋");
+    assert_eq!(
+        pb.get_row_anki_duplicates().iter().collect::<Vec<_>>(),
+        vec![true]
+    );
+    assert_eq!(
+        pb.get_row_anki_browse_queries()
+            .row_data(0)
+            .unwrap()
+            .as_str(),
+        "nid:1669909161001 or nid:1669909161002"
+    );
+    assert_eq!(
+        pb.get_row_anki_tags().row_data(0).unwrap().as_str(),
+        "vocab_n4"
+    );
+
+    // 3. Clicking Kanji character `'食'` refreshes Anki status via Kanji profile!
+    pb.invoke_lookup_kanji_char("食べる".into(), "食".into());
+    wait_anki(&pb);
+    assert_eq!(app.get_dict_query().as_str(), "食");
+    assert_eq!(
+        pb.get_row_anki_duplicates().iter().collect::<Vec<_>>(),
+        vec![true]
+    );
+    assert_eq!(
+        pb.get_row_anki_tags().row_data(0).unwrap().as_str(),
+        "kanji_known"
+    );
+
+    // 4. Navigating Back via `PopupBridge.nav_back()` restores `橋` and refreshes its Anki badges!
+    pb.invoke_nav_back();
+    wait_anki(&pb);
+    assert_eq!(app.get_dict_query().as_str(), "橋");
+    assert_eq!(
+        pb.get_row_anki_browse_queries()
+            .row_data(0)
+            .unwrap()
+            .as_str(),
+        "nid:1669909161001 or nid:1669909161002"
+    );
+
+    // 5. Navigate back to `食べる` + `世界` and verify `mark_popup_term_anki_added` marks `世界` (idx 1) immediately!
+    pb.invoke_nav_back();
+    wait_anki(&pb);
+    let term_profile = config.anki_profile_note_config().unwrap();
+    mark_popup_term_anki_added(&app, 1, 1669909167777, &term_profile, true);
+    assert_eq!(
+        pb.get_row_anki_duplicates().iter().collect::<Vec<_>>(),
+        vec![true, true]
+    );
+    assert_eq!(
+        pb.get_row_anki_browse_queries()
+            .row_data(1)
+            .unwrap()
+            .as_str(),
+        "nid:1669909167777"
+    );
+
+    // 6. Bumping `lookup_epoch` (hover cancellation) + unreachable AnkiConnect port fails silently with 0 errors!
+    stop.store(true, Ordering::Release);
+    let _ = server_thread.join();
+    lookup_epoch.fetch_add(1, Ordering::AcqRel);
+    config.edit_setting("anki/profile/port", "9").unwrap();
+    refresh_rich_ui_bridges(&app, &config);
+    wait_anki(&pb);
+    assert_eq!(
+        app.get_status_message().as_str(),
+        "",
+        "unreachable AnkiConnect during hover check must fail silently"
     );
 
     let _ = fs::remove_dir_all(&dir);

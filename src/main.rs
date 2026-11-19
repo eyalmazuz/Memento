@@ -495,6 +495,26 @@ fn record_recent_media(
     Ok(())
 }
 
+fn open_directory_command(path: &Path) -> Command {
+    #[cfg(target_os = "macos")]
+    let mut cmd = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = Command::new("explorer");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = Command::new("xdg-open");
+    cmd.arg(path);
+    cmd
+}
+
+fn spawn_and_reap(mut cmd: Command) -> std::io::Result<u32> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
 fn apply_dictionary_order(config: &ConfigController, dictionary: &mut DictController) {
     if let Some(Value::Ints(order)) =
         config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER)
@@ -3379,9 +3399,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let text = text.trim();
                             if !text.is_empty() {
                                 app.invoke_dismiss_definition();
-                                app.set_dict_query(text.into());
                                 app.set_dict_search_open(true);
-                                app.invoke_search_dictionary(text.into());
+                                if app.global::<PopupBridge>().get_rich_enabled() {
+                                    app.global::<PopupBridge>()
+                                        .invoke_panel_search_requested(text.into());
+                                } else {
+                                    app.set_dict_query(text.into());
+                                    app.invoke_search_dictionary(text.into());
+                                }
                                 app.set_status_message(format!("OCR: {text}").into());
                             } else {
                                 app.set_status_message("No text recognized in selected region".into());
@@ -3424,7 +3449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_open_config(move || {
         if let Some(path) = memento_xdg_dir("XDG_CONFIG_HOME", ".config") {
             if let Err(error) = std::fs::create_dir_all(&path)
-                .and_then(|_| Command::new("xdg-open").arg(path).spawn().map(|_| ()))
+                .and_then(|()| spawn_and_reap(open_directory_command(&path)).map(|_| ()))
             {
                 if let Some(app) = config_dir_app.upgrade() {
                     app.set_status_message(format!("Could not open configuration directory: {error}").into());
@@ -3746,6 +3771,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let search_audio_cache = popup_audio_cache.clone();
     app.on_search_dictionary(move |query| {
         let Some(app) = search_dict_app.upgrade() else { return };
+        if app.global::<PopupBridge>().get_rich_enabled() {
+            app.global::<PopupBridge>().invoke_panel_search_requested(query);
+            return;
+        }
         set_popup_audio_sources(&app, &search_audio_cache, "", "", search_dict_config.audio_source_entries());
         let hits = if query.trim().is_empty() {
             Vec::new()
@@ -3894,6 +3923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     ui::install_popup_navigation(&app);
     ui::install_rich_ui_bridges(&app, &dictionary_database_path, &config_dir, &config_ctrl);
+    ui::bind_rich_bridge_lookup_epoch(&app, lookup_epoch.clone());
 
     let note_app = app.as_weak();
     let note_config = config_ctrl.clone();
@@ -4076,6 +4106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &context.secondary_subtitle,
         );
         let unavailable = controller::anki::unavailable_profile_markers(&profile);
+        let show_tag = note_config.anki_show_tag();
         app.set_status_message("Adding note to Anki…".into());
         let response_app = note_app.clone();
         let response_epoch = note_lookup_epoch.clone();
@@ -4100,10 +4131,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             let result = controller::anki_media::prepare_note_media(&profile, &mut context, media_input)
                 .and_then(|()| controller.add_note_from_profile(&profile, &context));
+            let added_profile = profile.clone();
             let expire_app = response_app.clone();
             let _ = response_app.upgrade_in_event_loop(move |app| {
                 if app.get_dict_open() && response_epoch.load(Ordering::Acquire) == request_epoch {
                     if let Ok(note_id) = &result {
+                        ui::mark_popup_term_anki_added(
+                            &app,
+                            index as usize,
+                            *note_id,
+                            &added_profile,
+                            show_tag,
+                        );
                         let note_id = note_id.to_string();
                         app.set_anki_added_note_id(note_id.clone().into());
                         app.set_anki_added_result_index(index);
@@ -4134,11 +4173,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browse_app = app.as_weak();
     let browse_config = config_ctrl.clone();
     app.on_browse_anki_note(move |id| {
-        let Ok(note_id) = id.parse::<i64>() else { return };
+        let Some(query) = controller::anki::normalize_anki_browse_target(id.as_str()) else {
+            return;
+        };
         let endpoint = browse_config.anki_endpoint();
         let weak = browse_app.clone();
         std::thread::spawn(move || {
-            let result = AnkiController::new(endpoint).client().open_browse(&format!("nid:{note_id}"));
+            let result = AnkiController::new(endpoint).client().open_browse(&query);
             if let Err(error) = result {
                 let _ = weak.upgrade_in_event_loop(move |app| {
                     app.set_status_message(format!("Could not open Anki browser: {error}").into());
@@ -5407,5 +5448,37 @@ mod window_ux_tests {
             !hover_state.get(),
             "Moving pointer from YomitanPopup onto menu bar / OSC / sidebar must release hover-pause"
         );
+    }
+
+    #[test]
+    fn spawn_and_reap_leaves_zero_defunct_zombies_and_browse_targets_normalize() {
+        let pid = spawn_and_reap(Command::new("true")).expect("should spawn /usr/bin/true");
+        #[cfg(target_os = "linux")]
+        {
+            let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while stat_path.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+                let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next());
+                assert_ne!(state, Some("Z"), "spawned child pid {pid} became a <defunct> zombie: {stat}");
+            }
+        }
+
+        let cmd = open_directory_command(Path::new("/tmp/memento-cfg"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(cmd.get_program(), "xdg-open");
+
+        assert_eq!(
+            controller::anki::normalize_anki_browse_target("1669909161234").as_deref(),
+            Some("nid:1669909161234")
+        );
+        assert_eq!(
+            controller::anki::normalize_anki_browse_target("nid:123 or nid:456").as_deref(),
+            Some("nid:123 or nid:456")
+        );
+        assert_eq!(controller::anki::normalize_anki_browse_target(""), None);
+        assert_eq!(controller::anki::normalize_anki_browse_target("0"), None);
     }
 }

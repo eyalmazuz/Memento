@@ -2682,6 +2682,194 @@ pub fn build_note_payload_from_profile(
     build_note_payload_from_profile_inner(profile, ctx, true)
 }
 
+// ── Anki Duplicate & Card Tag Inspection Helpers (#340, #346) ───────────────
+
+/// Per-entry Anki duplicate and existing card tag status (#340, #346).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryAnkiStatus {
+    pub can_add: bool,
+    pub is_duplicate: bool,
+    pub note_ids: Vec<i64>,
+    pub tags: Vec<String>,
+    pub browse_query: String,
+}
+
+/// Escapes `\` and `"` for safe embedding inside Anki double-quoted search terms.
+pub fn escape_anki_search_term(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Formats one or more positive 64-bit Anki note IDs as `"nid:123"` or `"nid:123 or nid:456"`.
+pub fn format_nid_browse_query(note_ids: &[i64]) -> String {
+    let mut seen = HashSet::new();
+    let mut parts = Vec::new();
+    for &id in note_ids {
+        if id > 0 && seen.insert(id) {
+            parts.push(format!("nid:{id}"));
+        }
+    }
+    parts.join(" or ")
+}
+
+/// Normalizes an Anki browse callback argument:
+/// - All ASCII digits -> parses positive 64-bit ID into `"nid:{id}"`.
+/// - Non-empty query string (e.g. `"nid:123 or nid:456"`) -> passed through trimmed.
+pub fn normalize_anki_browse_target(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let note_id = trimmed.parse::<i64>().ok().filter(|&id| id > 0)?;
+        Some(format!("nid:{note_id}"))
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn template_references_any_marker(template: &str, marker_names: &[&str]) -> bool {
+    for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
+        for marker in &token.markers {
+            if marker_names.iter().any(|name| marker_is(marker, name)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn canonical_key_field_rank(field_name: &str) -> u8 {
+    match field_name.trim().to_ascii_lowercase().as_str() {
+        "expression" | "word" | "character" | "kanji" => 0,
+        "front" | "term" => 1,
+        _ => 2,
+    }
+}
+
+fn select_primary_key_field(field_templates: &HashMap<String, String>) -> Option<String> {
+    if field_templates.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<(&String, &String)> = field_templates.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    if let Some((name, _)) = sorted
+        .iter()
+        .filter(|(_, tmpl)| matches!(tmpl.trim(), "{expression}" | "{character}"))
+        .min_by_key(|(name, _)| (canonical_key_field_rank(name), *name))
+    {
+        return Some((*name).clone());
+    }
+    for group in [
+        &["expression", "character"][..],
+        &["furigana-plain", "furigana"][..],
+        &["reading"][..],
+    ] {
+        if let Some((name, _)) = sorted
+            .iter()
+            .filter(|(_, tmpl)| template_references_any_marker(tmpl, group))
+            .min_by_key(|(name, _)| (canonical_key_field_rank(name), *name))
+        {
+            return Some((*name).clone());
+        }
+    }
+    sorted.first().map(|(name, _)| (*name).clone())
+}
+
+/// Builds the Anki search query used by `findNotes` for `(expression, reading)` under `profile`.
+pub fn build_entry_find_query(
+    profile: &AnkiNoteConfig,
+    expression: &str,
+    reading: &str,
+) -> Result<String, String> {
+    let (_, query) = build_entry_probe_and_query(profile, expression, reading)?;
+    Ok(query)
+}
+
+fn build_entry_probe_and_query(
+    profile: &AnkiNoteConfig,
+    expression: &str,
+    reading: &str,
+) -> Result<(serde_json::Value, String), String> {
+    if profile.deck.trim().is_empty() {
+        return Err("deckName cannot be empty".to_owned());
+    }
+    if profile.model.trim().is_empty() {
+        return Err("modelName cannot be empty".to_owned());
+    }
+    if profile.field_templates.is_empty() {
+        return Err(NoteBuildError::NoFieldTemplates.to_string());
+    }
+    let policy = AnkiDuplicatePolicy::try_from(profile.duplicate_policy)
+        .map_err(|error| error.to_string())?;
+
+    let mut ctx = NoteFieldsContext::new(expression, reading, "");
+    ctx.clipboard = Some(String::new());
+    if templates_reference_marker(profile.field_templates.values(), "character") {
+        ctx.is_kanji = true;
+        ctx.character = expression.to_owned();
+    }
+
+    let mut fields = map_note_fields(&profile.field_templates, &ctx);
+    let key_field = select_primary_key_field(&profile.field_templates);
+    if fields.values().all(|v| v.trim().is_empty()) {
+        if let Some(ref k) = key_field {
+            if !expression.trim().is_empty() {
+                fields.insert(k.clone(), expression.to_owned());
+            }
+        }
+    }
+
+    let field_clause = if let Some((field_name, field_val)) = key_field.as_ref().and_then(|k| {
+        fields
+            .get(k)
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| (k, v))
+    }) {
+        let escaped_val = escape_anki_search_term(field_val);
+        if field_name
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == ':')
+        {
+            format!("\"{}\":\"{escaped_val}\"", escape_anki_search_term(field_name))
+        } else {
+            format!("{field_name}:\"{escaped_val}\"")
+        }
+    } else {
+        format!("\"{}\"", escape_anki_search_term(expression))
+    };
+
+    let find_query = match policy {
+        AnkiDuplicatePolicy::None => field_clause,
+        AnkiDuplicatePolicy::DifferentDeck | AnkiDuplicatePolicy::SameDeck => {
+            format!(
+                "deck:\"{}\" {field_clause}",
+                escape_anki_search_term(&profile.deck)
+            )
+        }
+    };
+
+    let payload = NotePayload {
+        deck_name: profile.deck.clone(),
+        model_name: profile.model.clone(),
+        fields,
+        tags: profile.tags.clone(),
+        options: policy.into(),
+        audio: Vec::new(),
+        picture: Vec::new(),
+        video: Vec::new(),
+    };
+    Ok((payload.to_value(), find_query))
+}
+
 // ── AnkiController ──────────────────────────────────────────────────────────
 
 pub struct AnkiController {
@@ -2760,6 +2948,149 @@ impl AnkiController {
             .can_add_notes(&[note])
             .map_err(|error| error.to_string())?;
         Ok(results.first().copied().unwrap_or(false))
+    }
+
+    /// Queries AnkiConnect `findNotes` and returns matching 64-bit note IDs.
+    pub fn find_note_ids(&self, query: &str) -> Result<Vec<i64>, String> {
+        self.client
+            .find_notes(query)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Fetches unique non-empty card tags across `note_ids` via AnkiConnect `notesInfo` (#346).
+    pub fn fetch_note_tags(&self, note_ids: &[i64]) -> Result<Vec<String>, String> {
+        if note_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let infos = self
+            .client
+            .notes_info(note_ids)
+            .map_err(|error| error.to_string())?;
+        let mut seen = HashSet::new();
+        let mut tags = Vec::new();
+        for info in infos {
+            for raw_tag in info.tags {
+                for tag in raw_tag.split_whitespace() {
+                    if !tag.is_empty() && seen.insert(tag.to_owned()) {
+                        tags.push(tag.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Batches `canAddNotes` across `entries` (`(expression, reading)`), resolves matching
+    /// `note_ids` via `findNotes` (respecting `duplicate_policy`: `deck:"..."` vs all decks,
+    /// and `SameDeck` `allow_duplicate = true`), and optionally fetches unique card tags via
+    /// a single batched `notesInfo` request when `show_tags` is true (#340, #346).
+    pub fn check_entries_anki_status(
+        &self,
+        profile: &AnkiNoteConfig,
+        entries: &[(String, String)],
+        show_tags: bool,
+    ) -> Result<Vec<EntryAnkiStatus>, String> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let policy = AnkiDuplicatePolicy::try_from(profile.duplicate_policy)
+            .map_err(|error| error.to_string())?;
+        let mut probes = Vec::with_capacity(entries.len());
+        let mut find_queries = Vec::with_capacity(entries.len());
+        for (expression, reading) in entries {
+            let (probe, query) = build_entry_probe_and_query(profile, expression, reading)?;
+            probes.push(probe);
+            find_queries.push(query);
+        }
+
+        let raw_can_add = self
+            .client
+            .can_add_notes(&probes)
+            .map_err(|error| error.to_string())?;
+
+        let mut can_add_vec = Vec::with_capacity(entries.len());
+        let mut note_ids_vec: Vec<Vec<i64>> = vec![Vec::new(); entries.len()];
+        let mut query_cache: HashMap<String, Vec<i64>> = HashMap::new();
+
+        for idx in 0..entries.len() {
+            let can_add = if policy == AnkiDuplicatePolicy::SameDeck {
+                true
+            } else {
+                raw_can_add.get(idx).copied().unwrap_or(false)
+            };
+            can_add_vec.push(can_add);
+
+            if !can_add || (show_tags && policy == AnkiDuplicatePolicy::SameDeck) {
+                let query = &find_queries[idx];
+                let ids = if let Some(cached) = query_cache.get(query) {
+                    cached.clone()
+                } else {
+                    let found = self.find_note_ids(query)?;
+                    query_cache.insert(query.clone(), found.clone());
+                    found
+                };
+                note_ids_vec[idx] = ids;
+            }
+        }
+
+        let mut tags_by_nid: HashMap<i64, Vec<String>> = HashMap::new();
+        if show_tags {
+            let mut all_unique_ids = Vec::new();
+            let mut seen_ids = HashSet::new();
+            for ids in &note_ids_vec {
+                for &id in ids {
+                    if id > 0 && seen_ids.insert(id) {
+                        all_unique_ids.push(id);
+                    }
+                }
+            }
+            if !all_unique_ids.is_empty() {
+                let infos = self
+                    .client
+                    .notes_info(&all_unique_ids)
+                    .map_err(|error| error.to_string())?;
+                for info in infos {
+                    tags_by_nid.insert(info.note_id, info.tags);
+                }
+            }
+        }
+
+        let mut statuses = Vec::with_capacity(entries.len());
+        for idx in 0..entries.len() {
+            let can_add = can_add_vec[idx];
+            let is_duplicate = !can_add;
+            let note_ids = std::mem::take(&mut note_ids_vec[idx]);
+            let mut tags = Vec::new();
+            if show_tags && !note_ids.is_empty() {
+                let mut seen_tags = HashSet::new();
+                for &nid in &note_ids {
+                    if let Some(raw_tags) = tags_by_nid.get(&nid) {
+                        for raw_tag in raw_tags {
+                            for tag in raw_tag.split_whitespace() {
+                                if !tag.is_empty() && seen_tags.insert(tag.to_owned()) {
+                                    tags.push(tag.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let browse_query = if !note_ids.is_empty() {
+                format_nid_browse_query(&note_ids)
+            } else if is_duplicate {
+                find_queries[idx].clone()
+            } else {
+                String::new()
+            };
+            statuses.push(EntryAnkiStatus {
+                can_add,
+                is_duplicate,
+                note_ids,
+                tags,
+                browse_query,
+            });
+        }
+        Ok(statuses)
     }
 
     /// Builds and sends a profile-backed note, uploading any referenced
