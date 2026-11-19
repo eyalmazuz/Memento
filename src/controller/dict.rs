@@ -8,9 +8,15 @@ use std::sync::Mutex;
 use memento_dict::databasemanager;
 use memento_dict::deconjugationquerygenerator;
 use memento_dict::exactquerygenerator;
+use memento_dict::mecabquerygenerator;
 use memento_dict::normalize::{self, Regex};
-use memento_dict::searchcontroller::{self, TagSortItem};
+use memento_dict::searchcontroller::{
+    self, CandidateSearchQuery, QuerySource, TagSortItem,
+};
 use memento_dict::sqlite_db;
+use memento_util::mecab::MecabLookupToken;
+
+type MecabTokenizerFn = fn(&str) -> Result<Vec<MecabLookupToken>, String>;
 
 pub use memento_dict::databasemanager::{
     build_dict_id_style_path, build_style_path, resolve_dictionary_style_path,
@@ -611,6 +617,8 @@ pub struct DictController {
     remove_regex: Option<Regex>,
     replace_lines: bool,
     replace_lines_with: String,
+    mecab_enabled: bool,
+    mecab_tokenizer: MecabTokenizerFn,
 }
 
 impl Default for DictController {
@@ -632,6 +640,8 @@ impl DictController {
             remove_regex: None,
             replace_lines: false,
             replace_lines_with: String::new(),
+            mecab_enabled: false,
+            mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
         }
     }
 
@@ -680,7 +690,25 @@ impl DictController {
             remove_regex: None,
             replace_lines: false,
             replace_lines_with: String::new(),
+            mecab_enabled: false,
+            mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
         })
+    }
+
+    /// Enables or disables MeCab morphological compound/lemma query generation during [`Self::search`].
+    pub fn set_mecab_enabled(&mut self, enabled: bool) {
+        self.mecab_enabled = enabled;
+    }
+
+    /// Returns whether MeCab morphological query generation is enabled.
+    pub fn mecab_enabled(&self) -> bool {
+        self.mecab_enabled
+    }
+
+    /// Overrides the MeCab lookup tokenizer function (defaults to
+    /// [`memento_util::mecab::mecab_tokenize_for_lookup`]).
+    pub fn set_mecab_tokenizer(&mut self, tokenizer: MecabTokenizerFn) {
+        self.mecab_tokenizer = tokenizer;
     }
 
     pub fn take_search_error(&mut self) -> Option<String> {
@@ -840,7 +868,8 @@ impl DictController {
 
         let norm_query = normalize_reading(trimmed);
         let full_u16_len = trimmed.encode_utf16().count();
-        let lookups = build_lookup_queries(trimmed);
+        let lookups =
+            build_lookup_queries(trimmed, self.mecab_enabled, self.mecab_tokenizer);
 
         struct Candidate {
             hit: SearchHit,
@@ -945,12 +974,14 @@ impl DictController {
 
                         if matches {
                             seen_memory_entries.insert(entry_key);
-                            let is_exact = lookup.rule_mask == 0
-                                && (lookup.surface_len == full_u16_len
-                                    || entry.expression == trimmed
-                                    || norm_entry_expr == norm_query
-                                    || (!norm_entry_reading.is_empty()
-                                        && norm_entry_reading == norm_query));
+                            let is_exact = (lookup.source == QuerySource::Exact
+                                && lookup.rule_mask == 0
+                                && lookup.surface_len == full_u16_len)
+                                || (lookup.rule_mask == 0
+                                    && (entry.expression == trimmed
+                                        || norm_entry_expr == norm_query
+                                        || (!norm_entry_reading.is_empty()
+                                            && norm_entry_reading == norm_query)));
                             let mut hit = entry.clone();
                             if hit.dict_name.is_empty() {
                                 hit.dict_name = dict.name.clone();
@@ -1582,8 +1613,10 @@ fn compute_anki_frequency_summary(
 /// required Yomitan `rule_mask` (`0` for exact uninflected queries), and derivation chain.
 struct LookupQuery {
     key: String,
+    deconj_u16: Vec<u16>,
     surface_len: usize,
     rule_mask: u8,
+    source: QuerySource,
     derivation: String,
     derivation_descriptions: Vec<(String, String)>,
     rule_derivations: Vec<(u8, String, Vec<(String, String)>)>,
@@ -1612,12 +1645,37 @@ struct DatabaseCandidate {
 }
 
 const MAX_DECONJ_PREFIX_CHARS: usize = 36;
+const MAX_MECAB_LOOKUP_CHARS: usize = 32;
 
 fn is_ascii_regex_ws(ch: char) -> bool {
     matches!(ch, '\t'..='\r' | ' ')
 }
 
-fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
+fn slice_mecab_lookup_prefix(trimmed: &str) -> &str {
+    let mut end_byte = trimmed.len();
+    for (char_idx, (byte_idx, ch)) in trimmed.char_indices().enumerate() {
+        if char_idx >= MAX_MECAB_LOOKUP_CHARS {
+            end_byte = byte_idx;
+            break;
+        }
+        if char_idx > 0
+            && matches!(
+                ch,
+                '\r' | '\n' | '。' | '、' | '！' | '？' | '「' | '」' | '（' | '）'
+            )
+        {
+            end_byte = byte_idx;
+            break;
+        }
+    }
+    &trimmed[..end_byte]
+}
+
+fn build_lookup_queries(
+    trimmed: &str,
+    mecab_enabled: bool,
+    mecab_tokenizer: MecabTokenizerFn,
+) -> Vec<LookupQuery> {
     let mut raw_lookups: Vec<LookupQuery> = Vec::new();
     let mut seq = 0usize;
 
@@ -1639,10 +1697,17 @@ fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
 
         // 1. Exact prefix variants (`rule_mask = 0`)
         for variant in normalize::expand_query_variants(prefix) {
+            let deconj_u16 = if mecab_enabled {
+                variant.encode_utf16().collect()
+            } else {
+                Vec::new()
+            };
             raw_lookups.push(LookupQuery {
                 key: variant,
+                deconj_u16,
                 surface_len: orig_u16_len,
                 rule_mask: 0,
+                source: QuerySource::Exact,
                 derivation: String::new(),
                 derivation_descriptions: Vec::new(),
                 rule_derivations: Vec::new(),
@@ -1654,10 +1719,17 @@ fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
         if prefix.chars().any(is_ascii_regex_ws) {
             let no_ws: String = prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
             for variant in normalize::expand_query_variants(&no_ws) {
+                let deconj_u16 = if mecab_enabled {
+                    variant.encode_utf16().collect()
+                } else {
+                    Vec::new()
+                };
                 raw_lookups.push(LookupQuery {
                     key: variant,
+                    deconj_u16,
                     surface_len: orig_u16_len,
                     rule_mask: 0,
+                    source: QuerySource::Exact,
                     derivation: String::new(),
                     derivation_descriptions: Vec::new(),
                     rule_derivations: Vec::new(),
@@ -1693,10 +1765,17 @@ fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
                 for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
                     let base = String::from_utf16_lossy(&dq.deconj);
                     for base_variant in normalize::expand_query_variants(&base) {
+                        let deconj_u16 = if mecab_enabled {
+                            base_variant.encode_utf16().collect()
+                        } else {
+                            Vec::new()
+                        };
                         raw_lookups.push(LookupQuery {
                             key: base_variant,
+                            deconj_u16,
                             surface_len: orig_u16_len,
                             rule_mask: dq.rule_mask,
+                            source: QuerySource::Deconj,
                             derivation: dq.derivation.clone(),
                             derivation_descriptions: dq.derivation_descriptions.clone(),
                             rule_derivations: dq.rule_derivations.clone(),
@@ -1709,10 +1788,103 @@ fn build_lookup_queries(trimmed: &str) -> Vec<LookupQuery> {
         }
     }
 
-    // Longest surface first; at equal surface length, Exact (`rule_mask == 0`) precedes Deconj.
+    // 3. Optional MeCab morphological compound & lemma candidates (`QuerySource::Mecab`).
+    // Gracefully falls back to `Exact` + `Deconj` if MeCab is unavailable or returns an error.
+    if mecab_enabled {
+        let mecab_prefix = slice_mecab_lookup_prefix(trimmed);
+        if let Ok(tokens) = (mecab_tokenizer)(mecab_prefix) {
+            if !tokens.is_empty() {
+                let spans: Vec<mecabquerygenerator::TokenSpan<'_>> = tokens
+                    .iter()
+                    .map(|t| mecabquerygenerator::TokenSpan {
+                        surface: t.surface.as_str(),
+                        surface_clean: t.surface_clean.as_str(),
+                        lemma: t.lemma.as_str(),
+                        alt_lemma: t.alt_lemma.as_deref(),
+                        pos: t.pos.as_str(),
+                        conj_type: t.conj_type.as_str(),
+                    })
+                    .collect();
+
+                let mut distinct_mecab_fallbacks: Vec<LookupQuery> = Vec::new();
+                for cand in mecabquerygenerator::generate_candidates_from_tokens(&spans) {
+                    for variant in normalize::expand_query_variants(&cand.deconj) {
+                        let deconj_u16: Vec<u16> = variant.encode_utf16().collect();
+                        let covered_by_deconj = raw_lookups.iter().any(|d| {
+                            d.source == QuerySource::Deconj
+                                && d.key == variant
+                                && d.surface_len >= cand.surface_u16_len
+                                && cand.rule_mask != 0
+                                && (d.rule_mask & cand.rule_mask) == cand.rule_mask
+                        });
+                        let lq = LookupQuery {
+                            key: variant.clone(),
+                            deconj_u16: deconj_u16.clone(),
+                            surface_len: cand.surface_u16_len,
+                            rule_mask: cand.rule_mask,
+                            source: QuerySource::Mecab,
+                            derivation: String::new(),
+                            derivation_descriptions: Vec::new(),
+                            rule_derivations: Vec::new(),
+                            seq,
+                        };
+                        if !covered_by_deconj
+                            && ((cand.span_tokens >= 2 && cand.rule_mask == 0)
+                                || cand.rule_mask != 0)
+                        {
+                            distinct_mecab_fallbacks.push(LookupQuery {
+                                key: variant,
+                                deconj_u16,
+                                surface_len: cand.surface_u16_len,
+                                rule_mask: cand.rule_mask,
+                                source: QuerySource::Mecab,
+                                derivation: String::new(),
+                                derivation_descriptions: Vec::new(),
+                                rule_derivations: Vec::new(),
+                                seq,
+                            });
+                        }
+                        raw_lookups.push(lq);
+                        seq += 1;
+                    }
+                }
+
+                let descriptors: Vec<CandidateSearchQuery<'_>> = raw_lookups
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, lq)| CandidateSearchQuery {
+                        original_index: idx,
+                        deconj: lq.deconj_u16.as_slice(),
+                        surface_len: lq.surface_len as u64,
+                        rule_mask: lq.rule_mask,
+                        source: lq.source,
+                    })
+                    .collect();
+                let surviving = searchcontroller::sort_and_filter_queries(descriptors, true);
+                let mut filtered: Vec<LookupQuery> = Vec::with_capacity(
+                    surviving.len() + distinct_mecab_fallbacks.len(),
+                );
+                let mut opts: Vec<Option<LookupQuery>> =
+                    raw_lookups.into_iter().map(Some).collect();
+                for idx in surviving {
+                    if let Some(lq) = opts.get_mut(idx).and_then(Option::take) {
+                        filtered.push(lq);
+                    }
+                }
+                // Retain MeCab lookups whose `rule_mask` or `surface_len` was not covered by
+                // `Deconj` (e.g. honorific `ください` -> `くださる` `v5` where prefix `くださ` only
+                // emitted `v1`, and multi-morpheme `exp` compounds with `rule_mask = 0`).
+                filtered.extend(distinct_mecab_fallbacks);
+                raw_lookups = filtered;
+            }
+        }
+    }
+
+    // Longest surface first; at equal surface length, `Exact` precedes `Deconj` which precedes `Mecab`.
     raw_lookups.sort_by(|a, b| {
         b.surface_len
             .cmp(&a.surface_len)
+            .then_with(|| a.source.to_u8().cmp(&b.source.to_u8()))
             .then_with(|| (a.rule_mask != 0).cmp(&(b.rule_mask != 0)))
             .then_with(|| a.seq.cmp(&b.seq))
     });
@@ -1889,11 +2061,13 @@ fn database_search_candidates(
                 let norm_reading = normalize_reading(&row.reading);
                 let formatted_tags =
                     format_dictionary_tags(&cache.tags, row.dic_id, &row.def_tags, &row.term_tags);
-                let is_exact = lookup.rule_mask == 0
-                    && (lookup.surface_len == full_u16_len
-                        || row.expression == query
-                        || norm_expression == normalized_query
-                        || (!norm_reading.is_empty() && norm_reading == normalized_query));
+                let is_exact = (lookup.source == QuerySource::Exact
+                    && lookup.rule_mask == 0
+                    && lookup.surface_len == full_u16_len)
+                    || (lookup.rule_mask == 0
+                        && (row.expression == query
+                            || norm_expression == normalized_query
+                            || (!norm_reading.is_empty() && norm_reading == normalized_query)));
 
                 let (derivation, derivation_descriptions) = if lookup.rule_mask != 0 {
                     lookup.derivation_for_entry(entry_mask)

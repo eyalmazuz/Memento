@@ -29,8 +29,32 @@ use std::sync::{Mutex, OnceLock};
 type MecabNew2Fn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type MecabSparseToStr2Fn =
     unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> *const c_char;
+type MecabNbestSparseToStr2Fn =
+    unsafe extern "C" fn(*mut c_void, usize, *const c_char, usize) -> *const c_char;
 type MecabStrerrorFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type MecabDestroyFn = unsafe extern "C" fn(*mut c_void);
+
+/// Morphological token extracted from MeCab (supporting both 9-column IPADic and
+/// 10/17/26/29+ column UniDic) for dictionary lookup and compound query generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MecabLookupToken {
+    /// Raw surface slice from the input text, including any leading whitespace before this token.
+    pub surface: String,
+    /// Clean morpheme surface without leading whitespace.
+    pub surface_clean: String,
+    /// Primary dictionary base form (`orthBase` col 10 in UniDic matching input script,
+    /// or `base_form` col 6 in IPADic, with UniDic `-variant` suffixes stripped).
+    pub lemma: String,
+    /// Secondary canonical lemma when UniDic `lemma` (col 7, trimmed before `'-'`)
+    /// differs from `lemma` (e.g. `"仕舞う"` alongside `"しまう"`, `"為る"` alongside `"する"`).
+    pub alt_lemma: Option<String>,
+    /// Orthographic surface reading in hiragana (or empty when unavailable/`*`).
+    pub reading: String,
+    /// Primary part-of-speech tag (`pos1`, col 0, e.g. `"動詞"`, `"形容詞"`, `"名詞"`, `"助詞"`).
+    pub pos: String,
+    /// Conjugation type (`cType`, col 4, e.g. `"五段-カ行"`, `"下一段-バ行"`, `"一段"`, `"サ行変格"`).
+    pub conj_type: String,
+}
 
 /// Dynamically loaded in-process `libmecab` tagger.
 ///
@@ -40,6 +64,7 @@ type MecabDestroyFn = unsafe extern "C" fn(*mut c_void);
 pub struct LibMecabTagger {
     tagger: *mut c_void,
     mecab_sparse_tostr2: MecabSparseToStr2Fn,
+    mecab_nbest_sparse_tostr2: Option<MecabNbestSparseToStr2Fn>,
     mecab_strerror: MecabStrerrorFn,
     mecab_destroy: MecabDestroyFn,
     _lib: libloading::Library,
@@ -107,20 +132,36 @@ impl LibMecabTagger {
 
         let lib = loaded_lib.ok_or_else(|| format!("Failed to load libmecab: {last_err}"))?;
 
-        let (mecab_new2, mecab_sparse_tostr2, mecab_strerror, mecab_destroy) = unsafe {
+        let (
+            mecab_new2,
+            mecab_sparse_tostr2,
+            mecab_nbest_sparse_tostr2,
+            mecab_strerror,
+            mecab_destroy,
+        ) = unsafe {
             let new2: libloading::Symbol<MecabNew2Fn> = lib
                 .get(b"mecab_new2\0")
                 .map_err(|e| format!("missing mecab_new2: {e}"))?;
             let sparse_tostr2: libloading::Symbol<MecabSparseToStr2Fn> = lib
                 .get(b"mecab_sparse_tostr2\0")
                 .map_err(|e| format!("missing mecab_sparse_tostr2: {e}"))?;
+            let nbest_sparse_tostr2 = lib
+                .get::<MecabNbestSparseToStr2Fn>(b"mecab_nbest_sparse_tostr2\0")
+                .ok()
+                .map(|sym| *sym);
             let strerror: libloading::Symbol<MecabStrerrorFn> = lib
                 .get(b"mecab_strerror\0")
                 .map_err(|e| format!("missing mecab_strerror: {e}"))?;
             let destroy: libloading::Symbol<MecabDestroyFn> = lib
                 .get(b"mecab_destroy\0")
                 .map_err(|e| format!("missing mecab_destroy: {e}"))?;
-            (*new2, *sparse_tostr2, *strerror, *destroy)
+            (
+                *new2,
+                *sparse_tostr2,
+                nbest_sparse_tostr2,
+                *strerror,
+                *destroy,
+            )
         };
 
         let mut c_arg: Vec<u8> = tagger_arg.iter().copied().filter(|&b| b != 0).collect();
@@ -142,6 +183,7 @@ impl LibMecabTagger {
         Ok(Self {
             tagger,
             mecab_sparse_tostr2,
+            mecab_nbest_sparse_tostr2,
             mecab_strerror,
             mecab_destroy,
             _lib: lib,
@@ -200,6 +242,55 @@ impl LibMecabTagger {
         }
 
         Ok(combined)
+    }
+
+    /// Parse a single-line `text` into up to `n` N-best `EOS`-delimited MeCab lattice paths.
+    /// Falls back to a single 1-best parse when `n <= 1` or `mecab_nbest_sparse_tostr2` is unavailable.
+    pub fn parse_nbest(&mut self, text: &str, n: usize) -> Result<Vec<String>, String> {
+        if text.is_empty() || n == 0 {
+            return Ok(Vec::new());
+        }
+        let clean: String = text
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+            .collect();
+        if clean.is_empty() {
+            return Ok(Vec::new());
+        }
+        if n == 1 || self.mecab_nbest_sparse_tostr2.is_none() {
+            let single = self.parse(&clean)?;
+            return Ok(if single.is_empty() {
+                Vec::new()
+            } else {
+                vec![single]
+            });
+        }
+        if self.tagger.is_null() {
+            return Err("MeCab tagger pointer is null".into());
+        }
+
+        let nbest_fn = self.mecab_nbest_sparse_tostr2.unwrap();
+        let len = clean.len();
+        let mut buf = Vec::with_capacity(len + 1);
+        buf.extend_from_slice(clean.as_bytes());
+        buf.push(0);
+
+        let out_ptr =
+            unsafe { (nbest_fn)(self.tagger, n, buf.as_ptr() as *const c_char, len) };
+        if out_ptr.is_null() {
+            let err_msg = unsafe {
+                let err_ptr = (self.mecab_strerror)(self.tagger);
+                if err_ptr.is_null() {
+                    "unknown mecab_nbest_sparse_tostr2 error".to_string()
+                } else {
+                    CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+                }
+            };
+            return Err(format!("mecab_nbest_sparse_tostr2 failed: {err_msg}"));
+        }
+
+        let raw = unsafe { CStr::from_ptr(out_ptr).to_string_lossy() };
+        Ok(split_eos_blocks(&raw))
     }
 }
 
@@ -358,9 +449,43 @@ impl MecabBackend {
             Self::Piped(daemon) => daemon.parse(text),
         }
     }
+
+    fn parse_nbest(&mut self, text: &str, n: usize) -> Result<Vec<String>, String> {
+        match self {
+            Self::InProcess(tagger) => tagger.parse_nbest(text, n),
+            Self::Piped(daemon) => {
+                if text.is_empty() || n == 0 {
+                    return Ok(Vec::new());
+                }
+                let out = daemon.parse(text)?;
+                Ok(split_eos_blocks(&out))
+            }
+        }
+    }
 }
 
 static GLOBAL_MECAB: OnceLock<Mutex<Option<MecabBackend>>> = OnceLock::new();
+
+fn split_eos_blocks(raw: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed == "EOS" {
+            if !current.is_empty() {
+                current.push_str("EOS\n");
+                blocks.push(std::mem::take(&mut current));
+            }
+        } else if !trimmed.is_empty() {
+            current.push_str(trimmed);
+            current.push('\n');
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
 
 /// Parse `text` using the process-wide warm MeCab backend (preferring in-process
 /// `libmecab` via `libloading`, falling back to a persistent piped `mecab` daemon).
@@ -376,6 +501,251 @@ pub fn parse_mecab(text: &str) -> Result<String, String> {
         *guard = Some(MecabBackend::init()?);
     }
     guard.as_mut().unwrap().parse(text)
+}
+
+/// Parse `text` into up to `n` N-best `EOS`-terminated lattice path blocks using
+/// the process-wide warm MeCab backend.
+pub fn mecab_nbest_lines(text: &str, n: usize) -> Result<Vec<String>, String> {
+    if text.is_empty() || n == 0 {
+        return Ok(Vec::new());
+    }
+    let mutex = GLOBAL_MECAB.get_or_init(|| Mutex::new(MecabBackend::init().ok()));
+    let mut guard = mutex
+        .lock()
+        .map_err(|_| "MeCab mutex poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(MecabBackend::init()?);
+    }
+    guard.as_mut().unwrap().parse_nbest(text, n)
+}
+
+fn clean_feature_atom(field: &str) -> Option<&str> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn strip_unidic_variant_suffix(raw: &str) -> &str {
+    if let Some((head, _tail)) = raw.split_once('-') {
+        if !head.is_empty() {
+            return head;
+        }
+    }
+    raw
+}
+
+fn strip_ipadic_variant_suffix(raw: &str) -> &str {
+    if let Some((head, tail)) = raw.split_once('-') {
+        if !head.is_empty()
+            && matches!(
+                tail,
+                "動詞" | "他動詞" | "自動詞" | "名詞" | "形容詞" | "副詞" | "代名詞"
+            )
+        {
+            return head;
+        }
+    }
+    raw
+}
+
+fn is_single_non_kanji_kana(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    !crate::furiganautils::is_kanji_char(ch)
+        && matches!(
+            ch,
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{FF65}'..='\u{FF9F}'
+        )
+}
+
+fn find_mecab_surface_in_remaining(remaining: &str, raw_surface: &str) -> Option<(usize, usize)> {
+    if !raw_surface.contains('叱') || !remaining.contains('𠮟') {
+        return remaining
+            .find(raw_surface)
+            .map(|gap| (gap, raw_surface.len()));
+    }
+    let raw_chars: Vec<char> = raw_surface.chars().collect();
+    for (byte_start, _) in remaining.char_indices() {
+        let mut tail_chars = remaining[byte_start..].chars();
+        let mut matched_bytes = 0;
+        let mut ok = true;
+        for &rc in &raw_chars {
+            match tail_chars.next() {
+                Some(tc) if tc == rc || (rc == '叱' && tc == '𠮟') => {
+                    matched_bytes += tc.len_utf8();
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some((byte_start, matched_bytes));
+        }
+    }
+    None
+}
+
+/// Parse a MeCab output block (supporting both 9-column IPADic and 10/17/26/29+ column UniDic)
+/// aligned against `text` into morphological lookup tokens.
+pub fn parse_mecab_lookup_tokens(text: &str, output: &str) -> Vec<MecabLookupToken> {
+    if text.is_empty() || output.is_empty() {
+        return Vec::new();
+    }
+
+    let mut tokens = Vec::new();
+    let mut offset = 0usize;
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line == "EOS" {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let Some((raw_surface, features)) = line.split_once('\t') else {
+            continue;
+        };
+        if raw_surface.is_empty() || offset >= text.len() {
+            continue;
+        }
+
+        let remaining = &text[offset..];
+        let Some((gap, matched_len)) = find_mecab_surface_in_remaining(remaining, raw_surface)
+        else {
+            break;
+        };
+
+        let surface = text[offset..offset + gap + matched_len].to_owned();
+        let surface_clean = text[offset + gap..offset + gap + matched_len].to_owned();
+        offset += gap + matched_len;
+
+        let fields = crate::furiganaparser::split_csv_row(features);
+        let pos = fields
+            .first()
+            .and_then(|s| clean_feature_atom(s))
+            .unwrap_or_default()
+            .to_owned();
+        let conj_type = fields
+            .get(4)
+            .and_then(|s| clean_feature_atom(s))
+            .unwrap_or_default()
+            .to_owned();
+
+        let raw_reading =
+            crate::furiganaparser::extract_surface_reading_from_fields(&surface_clean, &fields);
+        let reading = if !raw_reading.is_empty() && raw_reading != "*" {
+            let units: Vec<u16> = raw_reading.encode_utf16().collect();
+            String::from_utf16_lossy(&crate::furiganaparser::katakana_to_hiragana(&units))
+        } else {
+            String::new()
+        };
+
+        let is_non_inflecting_pos =
+            matches!(pos.as_str(), "助詞" | "記号" | "補助記号" | "空白");
+        let single_kana = is_single_non_kanji_kana(&surface_clean);
+
+        let (lemma, alt_lemma) = if fields.len() <= 9 {
+            // IPADic (up to 9 columns): base_form at col 6, reading at col 7, pos at col 0.
+            let base = fields
+                .get(6)
+                .and_then(|s| clean_feature_atom(s))
+                .map(strip_ipadic_variant_suffix);
+            if is_non_inflecting_pos || (single_kana && !matches!(pos.as_str(), "動詞" | "形容詞")) {
+                (surface_clean.clone(), None)
+            } else {
+                (
+                    base.unwrap_or(surface_clean.as_str()).to_owned(),
+                    None,
+                )
+            }
+        } else {
+            // UniDic (10 / 17 / 26 / 29+ columns):
+            // col 6 = lForm, col 7 = lemma, col 8 = orth, col 9 = pron, col 10 = orthBase.
+            let orth_base = fields
+                .get(10)
+                .and_then(|s| clean_feature_atom(s))
+                .map(strip_unidic_variant_suffix);
+            let dict_lemma = fields
+                .get(7)
+                .and_then(|s| clean_feature_atom(s))
+                .map(strip_unidic_variant_suffix);
+
+            if is_non_inflecting_pos {
+                let primary = orth_base
+                    .filter(|&ob| ob == surface_clean)
+                    .unwrap_or(surface_clean.as_str())
+                    .to_owned();
+                (primary, None)
+            } else if single_kana && !matches!(pos.as_str(), "動詞" | "形容詞") {
+                (surface_clean.clone(), None)
+            } else {
+                let primary = orth_base
+                    .or(dict_lemma)
+                    .unwrap_or(surface_clean.as_str())
+                    .to_owned();
+                let alt = dict_lemma
+                    .filter(|&dl| dl != primary)
+                    .map(str::to_owned);
+                (primary, alt)
+            }
+        };
+
+        tokens.push(MecabLookupToken {
+            surface,
+            surface_clean,
+            lemma,
+            alt_lemma,
+            reading,
+            pos,
+            conj_type,
+        });
+    }
+
+    tokens
+}
+
+/// Tokenize `text` for dictionary lookup using the warm in-process `libmecab` tagger
+/// (or piped `mecab` daemon fallback), supporting both IPADic and UniDic feature layouts.
+pub fn mecab_tokenize_for_lookup(text: &str) -> Result<Vec<MecabLookupToken>, String> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Substitute non-BMP Joyo `𠮟` (U+20B9F) with BMP `叱` (U+53F1) for MeCab lookup
+    // while `parse_mecab_lookup_tokens` slices exact original spans from `text`.
+    let sanitized: String;
+    let query_ref = if text.contains('𠮟') || text.contains('\n') || text.contains('\r') {
+        sanitized = text
+            .chars()
+            .map(|c| match c {
+                '𠮟' => '叱',
+                '\r' | '\n' => ' ',
+                other => other,
+            })
+            .collect();
+        sanitized.as_str()
+    } else {
+        text
+    };
+
+    let output = parse_mecab(query_ref)?;
+    Ok(parse_mecab_lookup_tokens(text, &output))
+}
+
+/// Alias for [`mecab_tokenize_for_lookup`].
+pub fn tokenize_for_lookup(text: &str) -> Result<Vec<MecabLookupToken>, String> {
+    mecab_tokenize_for_lookup(text)
 }
 
 #[cfg(test)]
@@ -422,5 +792,106 @@ mod tests {
         let _ = daemon.child.wait();
         let recovered = daemon.parse("食べる").expect("daemon should auto-restart");
         assert!(recovered.contains("食べる\t"));
+    }
+
+    #[test]
+    fn parses_ipadic_9col_and_unidic_orthbase_lemma_variants_cleanly() {
+        // IPADic 9-column fixture (with leading space before second token + unknown `*`):
+        let ipadic_out = "食べ\t動詞,自立,*,*,一段,連用形,食べる,タベ,タベ\n\
+て\t助詞,接続助詞,*,*,*,*,て,テ,テ\n\
+しまっ\t動詞,非自立,*,*,五段・ワ行促音便,連用タ接続,しまう,シマッ,シマッ\n\
+た\t助動詞,*,*,*,特殊・タ,基本形,た,タ,タ\nEOS\n";
+        let ipadic_tokens = parse_mecab_lookup_tokens("食べて しまった", ipadic_out);
+        assert_eq!(ipadic_tokens.len(), 4);
+        assert_eq!(ipadic_tokens[0].surface, "食べ");
+        assert_eq!(ipadic_tokens[0].surface_clean, "食べ");
+        assert_eq!(ipadic_tokens[0].lemma, "食べる");
+        assert_eq!(ipadic_tokens[0].reading, "たべ");
+        assert_eq!(ipadic_tokens[0].pos, "動詞");
+        assert_eq!(ipadic_tokens[0].conj_type, "一段");
+        assert_eq!(ipadic_tokens[2].surface, " しまっ");
+        assert_eq!(ipadic_tokens[2].surface_clean, "しまっ");
+        assert_eq!(ipadic_tokens[2].lemma, "しまう");
+        assert_eq!(ipadic_tokens[2].alt_lemma, None);
+
+        // UniDic 29-column fixture with `orthBase` col 10 vs `lemma` col 7 and `-` variant suffixes:
+        let unidic_out = "し\t動詞,非自立可能,,,サ行変格,連用形-一般,スル,為る-動詞,し,シ,する,スル,和,\"\",\"\",\"\",\"\",\"\",\"\",用,シ,スル,シ,スル,\"0\",\"C5\",\"\",1,1\n\
+て\t助詞,接続助詞,,,,,テ,て,て,テ,て,テ,和,\"\",\"\",\"\",\"\",\"\",\"\",接助,テ,テ,テ,テ,\"\",\"\",\"\",1,1\n\
+い\t動詞,非自立可能,,,上一段-ア行,連用形-一般,イル,居る,い,イ,いる,イル,和,\"\",\"\",\"\",\"\",\"\",\"\",用,イ,イル,イ,イル,\"0\",\"C4\",\"\",1,1\n\
+行っ\t動詞,非自立可能,,,五段-カ行,連用形-促音便,イク,行く-他動詞,行っ,イッ,行く,イク,和,\"\",\"\",\"\",\"\",\"\",\"\",用,イッ,イク,イッ,イク,\"0\",\"C2\",\"\",1,1\n\
+コーヒー\t名詞,普通名詞,一般,,,,コーヒー,コーヒー-coffee,コーヒー,コーヒー,コーヒー,コーヒー,外,\"\",\"\",\"\",\"\",\"\",\"\",体,コーヒー,コーヒー,コーヒー,コーヒー,\"3\",\"C2\",\"\",1,1\nEOS\n";
+        let unidic_tokens = parse_mecab_lookup_tokens("してい行ったコーヒー", unidic_out);
+        assert_eq!(unidic_tokens.len(), 5);
+        assert_eq!(unidic_tokens[0].lemma, "する");
+        assert_eq!(unidic_tokens[0].alt_lemma.as_deref(), Some("為る"));
+        assert_eq!(unidic_tokens[1].lemma, "て");
+        assert_eq!(unidic_tokens[1].alt_lemma, None);
+        assert_eq!(unidic_tokens[2].lemma, "いる");
+        assert_eq!(unidic_tokens[2].alt_lemma.as_deref(), Some("居る"));
+        assert_eq!(unidic_tokens[3].lemma, "行く");
+        assert_eq!(unidic_tokens[3].alt_lemma, None);
+        assert_eq!(unidic_tokens[4].lemma, "コーヒー");
+        assert_eq!(unidic_tokens[4].alt_lemma, None);
+    }
+
+    #[test]
+    fn live_unidic_tokenize_for_lookup_nbest_and_sub_millisecond_latency() {
+        let shite = mecab_tokenize_for_lookup("していました").expect("live mecab should succeed");
+        assert!(shite.len() >= 4);
+        assert_eq!(shite[0].surface_clean, "し");
+        assert_eq!(shite[0].lemma, "する");
+        assert_eq!(shite[0].alt_lemma.as_deref(), Some("為る"));
+        assert_eq!(shite[1].lemma, "て");
+        assert_eq!(shite[2].lemma, "いる");
+        assert_eq!(shite[2].alt_lemma.as_deref(), Some("居る"));
+
+        let tabete = mecab_tokenize_for_lookup("食べてしまいました").expect("live mecab");
+        assert_eq!(tabete[0].lemma, "食べる");
+        assert_eq!(tabete[1].lemma, "て");
+        assert_eq!(tabete[2].lemma, "しまう");
+        assert_eq!(tabete[2].alt_lemma.as_deref(), Some("仕舞う"));
+
+        // Single-kana particles never emit verb/noun lemmas:
+        for particle in ["は", "の", "と"] {
+            let p_toks = mecab_tokenize_for_lookup(particle).expect("particle parse");
+            assert_eq!(p_toks.len(), 1);
+            assert_eq!(p_toks[0].lemma, particle);
+            assert_eq!(p_toks[0].alt_lemma, None);
+            assert_eq!(p_toks[0].pos, "助詞");
+        }
+
+        // N-best paths:
+        let nbest = mecab_nbest_lines("いっていた", 3).expect("nbest should succeed");
+        assert!(!nbest.is_empty());
+
+        // Invalid config returns Err cleanly:
+        assert!(LibMecabTagger::new_with_config(
+            None,
+            b"-d /definitely/missing/mecab/dic -r /definitely/missing/mecabrc"
+        )
+        .is_err());
+
+        // Warm lookup latency < 1ms (< 1000us):
+        let inputs = [
+            "食べてしまいました",
+            "食べさせられてしまった",
+            "見ておいた",
+            "日本語能力試験",
+            "していました",
+        ];
+        let iterations = 10;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for input in &inputs {
+                let toks = mecab_tokenize_for_lookup(input).expect("warm lookup");
+                assert!(!toks.is_empty());
+            }
+        }
+        let avg_micros =
+            start.elapsed().as_micros() as f64 / (inputs.len() * iterations) as f64;
+        assert!(
+            avg_micros < 1000.0,
+            "mecab_tokenize_for_lookup must run under 1ms (1000us), took {avg_micros:.2}us"
+        );
     }
 }
