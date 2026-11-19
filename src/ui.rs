@@ -175,10 +175,15 @@ pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
         Rc::new(VecModel::from(popup_rows_through(&full, first_batch_end))).into(),
     );
 
-    app.global::<PopupBridge>().set_selected_glossary_text("".into());
-    app.global::<PopupBridge>().set_tooltip_visible(false);
+    let pb = app.global::<PopupBridge>();
+    pb.set_selected_glossary_text("".into());
+    pb.set_tooltip_visible(false);
+    pb.set_row_anki_duplicates(Rc::new(VecModel::from(Vec::<bool>::new())).into());
+    pb.set_row_anki_browse_queries(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
+    pb.set_row_anki_tags(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
+    pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
 
-    let app_bridge_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    let app_bridge_id = pb.get_bridge_instance_id();
     if app_bridge_id > 0 {
         ACTIVE_RICH_BRIDGES.with(|slot| {
             let mut bridges = slot.borrow_mut();
@@ -277,8 +282,23 @@ pub fn rich_pitch_graphs_from_details(details: &[TermPitchDetail]) -> Vec<RichPi
         .collect()
 }
 
+/// Splits a whitespace- or comma-separated Anki card tag list into deduplicated pills (#346).
+pub fn split_anki_tags_str(raw: &str) -> Vec<SharedString> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for part in raw.split(|ch: char| ch.is_whitespace() || ch == ',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_owned()) {
+            out.push(SharedString::from(trimmed));
+        }
+    }
+    out
+}
+
 /// Shared popup actions used by the desktop window and the GL interaction test.
 pub fn install_popup_navigation(app: &MementoApp) {
+    app.global::<PopupBridge>()
+        .on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
     app.global::<PopupLayout>()
         .on_frequency_lines(|frequencies, available_width| {
             let available_width = available_width.max(1.0);
@@ -4104,6 +4124,10 @@ struct CachedConfigSettings {
     glossary_style: LegacyGlossaryStyle,
     dict_order: Vec<i64>,
     excluded_glossaries: Vec<String>,
+    anki_enabled: bool,
+    anki_show_tag: bool,
+    anki_term_profile: Option<crate::controller::config::AnkiNoteConfig>,
+    anki_kanji_profile: Option<crate::controller::config::AnkiNoteConfig>,
     conf_mtime: Option<SystemTime>,
     anki_mtime: Option<SystemTime>,
 }
@@ -4119,6 +4143,10 @@ impl CachedConfigSettings {
             glossary_style: LegacyGlossaryStyle::Bullet,
             dict_order: Vec::new(),
             excluded_glossaries: Vec::new(),
+            anki_enabled: false,
+            anki_show_tag: false,
+            anki_term_profile: None,
+            anki_kanji_profile: None,
             conf_mtime: std::fs::metadata(config_dir.join("memento.conf"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
@@ -4225,6 +4253,10 @@ impl CachedConfigSettings {
             self.dict_order = order;
         }
         self.excluded_glossaries = config.anki_excluded_glossaries();
+        self.anki_enabled = config.anki_enabled();
+        self.anki_show_tag = config.anki_show_tag();
+        self.anki_term_profile = config.anki_profile_note_config();
+        self.anki_kanji_profile = config.anki_kanji_note_config();
     }
 
     fn reload_if_changed_on_disk(&mut self, config_dir: &Path) -> bool {
@@ -4316,6 +4348,32 @@ fn collect_default_detail_states(raw_glossary: &str) -> HashMap<String, bool> {
     out
 }
 
+struct AnkiPopupCheckRequest {
+    nav_epoch: u64,
+    lookup_epoch: Option<u64>,
+    show_tags: bool,
+    term_profile: Option<crate::controller::config::AnkiNoteConfig>,
+    kanji_profile: Option<crate::controller::config::AnkiNoteConfig>,
+    term_entries: Vec<(String, String)>,
+    kanji_entries: Vec<(String, String)>,
+}
+
+struct AnkiPopupCheckResponse {
+    nav_epoch: u64,
+    lookup_epoch: Option<u64>,
+    show_tags: bool,
+    term_statuses: HashMap<(String, String), crate::controller::anki::EntryAnkiStatus>,
+    kanji_statuses: HashMap<String, crate::controller::anki::EntryAnkiStatus>,
+}
+
+fn current_external_lookup_epoch(
+    ext: &std::sync::Mutex<Option<Arc<AtomicU64>>>,
+) -> Option<u64> {
+    ext.lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|e| e.load(Ordering::Acquire)))
+}
+
 struct RichUiBridge {
     instance_id: i32,
     app_weak: slint::Weak<MementoApp>,
@@ -4325,6 +4383,11 @@ struct RichUiBridge {
     panel_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<(u64, Vec<SearchHit>, Vec<String>)>>>,
     panel_poll_timer: slint::Timer,
     panel_epoch: Arc<AtomicU64>,
+    anki_tx: mpsc::Sender<AnkiPopupCheckRequest>,
+    anki_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<AnkiPopupCheckResponse>>>,
+    anki_poll_timer: slint::Timer,
+    anki_nav_epoch: Arc<AtomicU64>,
+    external_lookup_epoch: Arc<std::sync::Mutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl RichUiBridge {
@@ -4375,7 +4438,7 @@ impl RichUiBridge {
         bridge.set_highlight_revision(bridge.get_highlight_revision().wrapping_add(1));
     }
 
-    fn on_dictionary_rows_updated(&self, app: &MementoApp, rows: &[DictResult]) {
+    fn on_dictionary_rows_updated(self: &Rc<Self>, app: &MementoApp, rows: &[DictResult]) {
         self.ensure_fresh_db_and_config(app);
         let candidate_hits = LAST_GROUPED_HITS.with(|slot| slot.borrow().clone());
         let matches_hits = candidate_hits.len() == rows.len()
@@ -4586,6 +4649,108 @@ impl RichUiBridge {
 
         let sb = app.global::<SubtitleOverlayBridge>();
         sb.set_highlight_revision(sb.get_highlight_revision().wrapping_add(1));
+
+        self.dispatch_anki_check_for_rows(app, rows);
+    }
+
+    fn dispatch_anki_check_for_rows(self: &Rc<Self>, app: &MementoApp, rows: &[DictResult]) {
+        let next_nav = self.anki_nav_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let pb = app.global::<PopupBridge>();
+        let (anki_enabled, show_tags, term_profile, kanji_profile) = {
+            let st = self.state.borrow();
+            (
+                st.settings.anki_enabled,
+                st.settings.anki_show_tag,
+                st.settings.anki_term_profile.clone(),
+                st.settings.anki_kanji_profile.clone(),
+            )
+        };
+        pb.set_anki_show_tags(show_tags);
+        pb.set_row_anki_duplicates(Rc::new(VecModel::from(Vec::<bool>::new())).into());
+        pb.set_row_anki_browse_queries(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
+        pb.set_row_anki_tags(Rc::new(VecModel::from(Vec::<SharedString>::new())).into());
+        pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+
+        if rows.is_empty() || !anki_enabled {
+            self.anki_poll_timer.stop();
+            pb.set_anki_checking(false);
+            return;
+        }
+
+        let mut term_entries: Vec<(String, String)> = Vec::new();
+        let mut kanji_entries: Vec<(String, String)> = Vec::new();
+        for row in rows {
+            if !row.term_start {
+                continue;
+            }
+            if row.is_kanji {
+                let expr = row.expression.to_string();
+                if !expr.is_empty() && !kanji_entries.iter().any(|(e, _)| e == &expr) {
+                    kanji_entries.push((expr, String::new()));
+                }
+            } else {
+                let pair = (row.expression.to_string(), row.reading.to_string());
+                if !pair.0.is_empty() && !term_entries.contains(&pair) {
+                    term_entries.push(pair);
+                }
+            }
+        }
+
+        let has_valid_term = !term_entries.is_empty()
+            && term_profile.as_ref().is_some_and(|p| {
+                p.enabled
+                    && !p.deck.trim().is_empty()
+                    && !p.model.trim().is_empty()
+                    && !p.field_templates.is_empty()
+            });
+        let has_valid_kanji = !kanji_entries.is_empty()
+            && kanji_profile.as_ref().is_some_and(|p| {
+                p.enabled
+                    && !p.deck.trim().is_empty()
+                    && !p.model.trim().is_empty()
+                    && !p.field_templates.is_empty()
+            });
+        if !has_valid_term && !has_valid_kanji {
+            self.anki_poll_timer.stop();
+            pb.set_anki_checking(false);
+            return;
+        }
+
+        let lookup_epoch = current_external_lookup_epoch(&self.external_lookup_epoch);
+        pb.set_anki_checking(true);
+        let _ = self.anki_tx.send(AnkiPopupCheckRequest {
+            nav_epoch: next_nav,
+            lookup_epoch,
+            show_tags,
+            term_profile: has_valid_term.then_some(term_profile).flatten(),
+            kanji_profile: has_valid_kanji.then_some(kanji_profile).flatten(),
+            term_entries,
+            kanji_entries,
+        });
+
+        let weak_br = Rc::downgrade(self);
+        self.anki_poll_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(8),
+            move || {
+                let Some(br) = weak_br.upgrade() else {
+                    return;
+                };
+                let Some(app) = br.app_weak.upgrade() else {
+                    br.anki_poll_timer.stop();
+                    return;
+                };
+                let _ = drain_anki_results(
+                    &app,
+                    &br.anki_res_rx,
+                    &br.anki_nav_epoch,
+                    &br.external_lookup_epoch,
+                );
+                if !app.global::<PopupBridge>().get_anki_checking() {
+                    br.anki_poll_timer.stop();
+                }
+            },
+        );
     }
 
     fn snapshot_current_popup(&self, app: &MementoApp) -> Option<PopupHistoryEntry> {
@@ -5111,6 +5276,70 @@ fn drain_panel_results(
     true
 }
 
+fn drain_anki_results(
+    app: &MementoApp,
+    rx: &std::sync::Mutex<mpsc::Receiver<AnkiPopupCheckResponse>>,
+    nav_epoch: &AtomicU64,
+    external_lookup_epoch: &std::sync::Mutex<Option<Arc<AtomicU64>>>,
+) -> bool {
+    let mut latest: Option<AnkiPopupCheckResponse> = None;
+    if let Ok(guard) = rx.lock() {
+        while let Ok(item) = guard.try_recv() {
+            latest = Some(item);
+        }
+    }
+    let Some(resp) = latest else {
+        return false;
+    };
+    if resp.nav_epoch != nav_epoch.load(Ordering::Acquire) {
+        return false;
+    }
+    if resp.lookup_epoch != current_external_lookup_epoch(external_lookup_epoch) {
+        app.global::<PopupBridge>().set_anki_checking(false);
+        return false;
+    }
+    let pb = app.global::<PopupBridge>();
+    pb.set_anki_checking(false);
+    if !app.get_dict_open() {
+        return false;
+    }
+    let full = app.get_dict_results();
+    let count = full.row_count();
+    let mut dups = Vec::with_capacity(count);
+    let mut queries = Vec::with_capacity(count);
+    let mut tags = Vec::with_capacity(count);
+    for idx in 0..count {
+        if let Some(row) = full.row_data(idx) {
+            let status_opt = if row.is_kanji {
+                resp.kanji_statuses.get(row.expression.as_str())
+            } else {
+                resp.term_statuses
+                    .get(&(row.expression.to_string(), row.reading.to_string()))
+            };
+            if let Some(st) = status_opt {
+                dups.push(st.is_duplicate);
+                queries.push(SharedString::from(st.browse_query.as_str()));
+                tags.push(SharedString::from(st.tags.join(" ")));
+            } else {
+                dups.push(false);
+                queries.push(SharedString::default());
+                tags.push(SharedString::default());
+            }
+        } else {
+            dups.push(false);
+            queries.push(SharedString::default());
+            tags.push(SharedString::default());
+        }
+    }
+    pb.set_anki_show_tags(resp.show_tags);
+    pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+    pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+    pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+    pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+    pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+    true
+}
+
 /// Extension hook for rich definition/subtitle UI bridges.
 pub fn install_rich_ui_bridges(
     app: &MementoApp,
@@ -5120,6 +5349,7 @@ pub fn install_rich_ui_bridges(
 ) {
     let settings = CachedConfigSettings::from_controller(config, config_dir);
     let middle_mouse_default = settings.middle_mouse_scan;
+    let initial_anki_show_tag = settings.anki_show_tag;
     let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
     let db_sig = crate::controller::dict::db_file_fingerprint(dictionary_db_path);
     let mut dict_ctrl = DictController::open(dictionary_db_path).unwrap_or_default();
@@ -5190,6 +5420,87 @@ pub fn install_rich_ui_bridges(
         }
     });
 
+    // Background Anki duplicate & `show-tag` checker thread (#340, #346) so AnkiConnect
+    // round-trips never block subtitle hover latency and fail silently when Anki is closed.
+    let (anki_tx, anki_rx) = mpsc::channel::<AnkiPopupCheckRequest>();
+    let (anki_res_tx, raw_anki_res_rx) = mpsc::channel::<AnkiPopupCheckResponse>();
+    let anki_res_rx = Arc::new(std::sync::Mutex::new(raw_anki_res_rx));
+    let anki_nav_epoch = Arc::new(AtomicU64::new(0));
+    let external_lookup_epoch: Arc<std::sync::Mutex<Option<Arc<AtomicU64>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let worker_anki_epoch = anki_nav_epoch.clone();
+    let worker_anki_ext = external_lookup_epoch.clone();
+    let worker_anki_res_rx = anki_res_rx.clone();
+    let worker_anki_app = app.as_weak();
+    std::thread::spawn(move || {
+        while let Ok(mut req) = anki_rx.recv() {
+            while let Ok(newer) = anki_rx.try_recv() {
+                req = newer;
+            }
+            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
+                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
+            {
+                continue;
+            }
+
+            let mut term_statuses = HashMap::new();
+            if let Some(mut profile) = req.term_profile.clone() {
+                if profile.endpoint.timeout.is_none() {
+                    profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
+                }
+                let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
+                if let Ok(statuses) =
+                    ctrl.check_entries_anki_status(&profile, &req.term_entries, req.show_tags)
+                {
+                    for (pair, st) in req.term_entries.iter().cloned().zip(statuses) {
+                        term_statuses.insert(pair, st);
+                    }
+                }
+            }
+
+            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
+                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
+            {
+                continue;
+            }
+
+            let mut kanji_statuses = HashMap::new();
+            if let Some(mut profile) = req.kanji_profile.clone() {
+                if profile.endpoint.timeout.is_none() {
+                    profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
+                }
+                let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
+                if let Ok(statuses) =
+                    ctrl.check_entries_anki_status(&profile, &req.kanji_entries, req.show_tags)
+                {
+                    for ((expr, _), st) in req.kanji_entries.iter().cloned().zip(statuses) {
+                        kanji_statuses.insert(expr, st);
+                    }
+                }
+            }
+
+            if req.nav_epoch != worker_anki_epoch.load(Ordering::Acquire)
+                || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
+            {
+                continue;
+            }
+
+            let _ = anki_res_tx.send(AnkiPopupCheckResponse {
+                nav_epoch: req.nav_epoch,
+                lookup_epoch: req.lookup_epoch,
+                show_tags: req.show_tags,
+                term_statuses,
+                kanji_statuses,
+            });
+            let rx_cl = worker_anki_res_rx.clone();
+            let ep_cl = worker_anki_epoch.clone();
+            let ext_cl = worker_anki_ext.clone();
+            let _ = worker_anki_app.upgrade_in_event_loop(move |app| {
+                let _ = drain_anki_results(&app, &rx_cl, &ep_cl, &ext_cl);
+            });
+        }
+    });
+
     let instance_id = NEXT_BRIDGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
     let prev_instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
     app.global::<PopupBridge>().set_bridge_instance_id(instance_id);
@@ -5225,6 +5536,11 @@ pub fn install_rich_ui_bridges(
         panel_res_rx,
         panel_poll_timer: slint::Timer::default(),
         panel_epoch,
+        anki_tx,
+        anki_res_rx,
+        anki_poll_timer: slint::Timer::default(),
+        anki_nav_epoch,
+        external_lookup_epoch,
     });
 
     ACTIVE_RICH_BRIDGES.with(|slot| {
@@ -5236,6 +5552,8 @@ pub fn install_rich_ui_bridges(
     // ── Wire PopupBridge ────────────────────────────────────────────────────
     let pb = app.global::<PopupBridge>();
     pb.set_rich_enabled(true);
+    pb.set_anki_show_tags(initial_anki_show_tag);
+    pb.on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
 
     pb.on_headword_chars(|expr| {
         let chars: Vec<RichHeadwordChar> = expr
@@ -6112,7 +6430,14 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         st.settings.middle_mouse_scan
     };
     let pb = app.global::<PopupBridge>();
+    pb.set_anki_show_tags(config.anki_show_tag());
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+    if app.get_dict_open() {
+        let full = app.get_dict_results();
+        let current_rows: Vec<DictResult> =
+            (0..full.row_count()).filter_map(|i| full.row_data(i)).collect();
+        bridge.dispatch_anki_check_for_rows(app, &current_rows);
+    }
     let sb = app.global::<SubtitleOverlayBridge>();
     sb.set_middle_mouse_scan_enabled(middle_mouse);
     sb.set_style_revision(sb.get_style_revision().wrapping_add(1));
@@ -6121,4 +6446,85 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         let lines = subtitle_lines_for_app(app, words);
         app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
     }
+}
+
+/// Binds `main.rs`'s `lookup_epoch` onto the active `RichUiBridge` so background Anki
+/// duplicate/tag checks are cancelled immediately when a subtitle lookup is superseded or dismissed.
+pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU64>) {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    ACTIVE_RICH_BRIDGES.with(|slot| {
+        if let Some(bridge) = slot.borrow().iter().find(|b| b.instance_id == instance_id) {
+            if let Ok(mut guard) = bridge.external_lookup_epoch.lock() {
+                *guard = Some(lookup_epoch);
+            }
+        }
+    });
+}
+
+/// Immediately updates `PopupBridge` Anki duplicate/browse/tag state for a term right after
+/// `add_note_from_profile` succeeds so the `Browse in Anki` badge stays accurate without waiting.
+pub fn mark_popup_term_anki_added(
+    app: &MementoApp,
+    added_index: usize,
+    note_id: i64,
+    profile: &crate::controller::config::AnkiNoteConfig,
+    show_tags: bool,
+) {
+    let full = app.get_dict_results();
+    let count = full.row_count();
+    let Some(target) = full.row_data(added_index) else {
+        return;
+    };
+    let pb = app.global::<PopupBridge>();
+    let existing_dups = pb.get_row_anki_duplicates();
+    let existing_queries = pb.get_row_anki_browse_queries();
+    let existing_tags = pb.get_row_anki_tags();
+
+    let is_same_deck = matches!(
+        crate::controller::anki::AnkiDuplicatePolicy::try_from(profile.duplicate_policy),
+        Ok(crate::controller::anki::AnkiDuplicatePolicy::SameDeck)
+    );
+    let nid_query = format!("nid:{note_id}");
+    let joined_profile_tags = profile.tags.join(" ");
+
+    let mut dups = Vec::with_capacity(count);
+    let mut queries = Vec::with_capacity(count);
+    let mut tags = Vec::with_capacity(count);
+    for idx in 0..count {
+        let mut d = existing_dups.row_data(idx).unwrap_or(false);
+        let mut q = existing_queries.row_data(idx).unwrap_or_default();
+        let mut t = existing_tags.row_data(idx).unwrap_or_default();
+        if let Some(row) = full.row_data(idx) {
+            if row.expression == target.expression
+                && row.reading == target.reading
+                && row.is_kanji == target.is_kanji
+            {
+                if !is_same_deck {
+                    d = true;
+                    q = SharedString::from(nid_query.as_str());
+                }
+                if show_tags && !joined_profile_tags.is_empty() {
+                    let combined = if t.is_empty() {
+                        joined_profile_tags.clone()
+                    } else {
+                        format!("{t} {joined_profile_tags}")
+                    };
+                    let dedup: Vec<String> = split_anki_tags_str(&combined)
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    t = SharedString::from(dedup.join(" "));
+                }
+            }
+        }
+        dups.push(d);
+        queries.push(q);
+        tags.push(t);
+    }
+    pb.set_anki_show_tags(show_tags);
+    pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+    pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+    pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+    pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+    pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
 }

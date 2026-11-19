@@ -27,13 +27,14 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{Action, CapturedRequest, TestServer};
 use serde_json::{json, Value};
 
 use memento_anki::client::{ReplyValidation, TypedReplyStatus};
-use memento_net::anki::{AnkiClient, AnkiEndpoint, AnkiError, MediaFilePayload};
+use memento_net::anki::{AnkiClient, AnkiEndpoint, AnkiError, AnkiNoteInfo, MediaFilePayload};
 
 // ---- request shapes -----------------------------------------------------
 
@@ -449,6 +450,130 @@ fn http_error_status_is_not_accepted_as_a_valid_anki_frame()
 
 
 #[test]
+fn find_notes_and_notes_info_bodies_and_64bit_replies()
+{
+    let server = TestServer::start();
+    server.spawn(move |index, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        match index
+        {
+            0 => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "findNotes",
+                        "version": 6,
+                        "params": { "query": "deck:\"Japanese\" Expression:\"食べる\"" }
+                    })
+                );
+                Action::Respond(reply_of(json!([1669909161234_i64, 1669909161239_i64])))
+            }
+            _ => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "notesInfo",
+                        "version": 6,
+                        "params": { "notes": [1669909161234_i64, 1669909161239_i64, 1669909169999_i64] }
+                    })
+                );
+                Action::Respond(reply_of(json!([
+                    {
+                        "noteId": 1669909161234_i64,
+                        "profile": "User 1",
+                        "modelName": "Lapis",
+                        "tags": ["memento", "leech"],
+                        "fields": {
+                            "Expression": { "value": "食べる", "order": 0 },
+                            "ExpressionReading": { "value": "たべる", "order": 1 }
+                        },
+                        "mod": 1700000000,
+                        "cards": [1669909161235_i64]
+                    },
+                    {},
+                    {
+                        "noteId": 1669909161239_i64,
+                        "modelName": "Lapis",
+                        "tags": ["anime"],
+                        "fields": {
+                            "Expression": "食べる"
+                        }
+                    }
+                ])))
+            }
+        }
+    });
+
+    let client = AnkiClient::new(endpoint_for(&server));
+    let ids = client
+        .find_notes("deck:\"Japanese\" Expression:\"食べる\"")
+        .unwrap();
+    assert_eq!(ids, vec![1669909161234, 1669909161239]);
+
+    let infos = client
+        .notes_info(&[1669909161234, 1669909161239, 1669909169999])
+        .unwrap();
+    assert_eq!(
+        infos,
+        vec![
+            AnkiNoteInfo {
+                note_id: 1669909161234,
+                model_name: "Lapis".to_owned(),
+                tags: vec!["memento".to_owned(), "leech".to_owned()],
+                fields: HashMap::from([
+                    ("Expression".to_owned(), "食べる".to_owned()),
+                    ("ExpressionReading".to_owned(), "たべる".to_owned()),
+                ]),
+            },
+            AnkiNoteInfo {
+                note_id: 1669909161239,
+                model_name: "Lapis".to_owned(),
+                tags: vec!["anime".to_owned()],
+                fields: HashMap::from([("Expression".to_owned(), "食べる".to_owned())]),
+            },
+        ]
+    );
+}
+
+#[test]
+fn find_notes_and_notes_info_reject_malformed_result_shapes()
+{
+    // findNotes rejects non-positive or fractional IDs.
+    let server = TestServer::start();
+    server.spawn(move |_, _| Action::Respond(reply_of(json!([1669909161234_i64, 0]))));
+    let client = AnkiClient::new(endpoint_for(&server));
+    assert!(matches!(
+        client.find_notes("Expression:\"食べる\""),
+        Err(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
+    ));
+
+    // notesInfo rejects non-array result.
+    let server = TestServer::start();
+    server.spawn(move |_, _| Action::Respond(reply_of(json!({"bad": true}))));
+    let client = AnkiClient::new(endpoint_for(&server));
+    assert!(matches!(
+        client.notes_info(&[1]),
+        Err(AnkiError::Typed(TypedReplyStatus::ResultNotArray))
+    ));
+
+    // notesInfo rejects malformed note object.
+    let server = TestServer::start();
+    server.spawn(move |_, _| {
+        Action::Respond(reply_of(json!([{
+            "noteId": 1669909161234_i64,
+            "modelName": "Lapis",
+            "tags": [123],
+            "fields": {}
+        }])))
+    });
+    let client = AnkiClient::new(endpoint_for(&server));
+    assert!(matches!(
+        client.notes_info(&[1669909161234]),
+        Err(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
+    ));
+}
+
+#[test]
 fn forbidden_action_body_stays_outside_the_verb_set()
 {
     // The wire strings are exactly the constants in `ankiconnect.h`; the
@@ -460,6 +585,8 @@ fn forbidden_action_body_stays_outside_the_verb_set()
     assert_eq!(FieldNames.as_wire(), "modelFieldNames");
     assert_eq!(CanAddNotes.as_wire(), "canAddNotes");
     assert_eq!(AddNote.as_wire(), "addNote");
+    assert_eq!(FindNotes.as_wire(), "findNotes");
+    assert_eq!(NotesInfo.as_wire(), "notesInfo");
     assert_eq!(GuiBrowse.as_wire(), "guiBrowse");
     assert_eq!(StoreMediaFile.as_wire(), "storeMediaFile");
     assert_eq!(Multi.as_wire(), "multi");

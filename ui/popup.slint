@@ -137,9 +137,18 @@ export global PopupBridge {
     in-out property <bool> panel-kana-only: false;
     in-out property <bool> panel-searching: false;
 
+    // Background Anki duplicate & show-tag state (#340, #346)
+    in-out property <int> popup-revision: 0;
+    in-out property <bool> anki-show-tags: false;
+    in-out property <bool> anki-checking: false;
+    in-out property <[bool]> row-anki-duplicates: [];
+    in-out property <[string]> row-anki-browse-queries: [];
+    in-out property <[string]> row-anki-tags: [];
+
     // Rich query callbacks
     pure callback headword-chars(string) -> [RichHeadwordChar];
     pure callback headword-lines(string, float) -> [RichHeadwordLine];
+    pure callback split-anki-tags(string) -> [string];
     pure callback term-tag-pills(int, int) -> [RichTagPill];
     pure callback def-tag-pills(int, int) -> [RichTagPill];
     pure callback derivation-steps(int, int) -> [RichDerivationStep];
@@ -384,6 +393,27 @@ export component YomitanPopup inherits Rectangle {
                 visible: !res.collapsed || res.term-start;
                 background: transparent;
                 term-segment := Rectangle {
+                    property <int> row-zero-idx: res.index - 1;
+                    property <bool> added-this-row: root.added-note-id != "" && root.added-result-index == self.row-zero-idx;
+                    property <bool> row-is-duplicate:
+                        (PopupBridge.popup-revision >= 0)
+                        && self.row-zero-idx >= 0
+                        && self.row-zero-idx < PopupBridge.row-anki-duplicates.length
+                        && PopupBridge.row-anki-duplicates[self.row-zero-idx];
+                    property <string> row-browse-query:
+                        self.added-this-row
+                            ? root.added-note-id
+                            : ((self.row-zero-idx >= 0 && self.row-zero-idx < PopupBridge.row-anki-browse-queries.length)
+                                ? PopupBridge.row-anki-browse-queries[self.row-zero-idx]
+                                : "");
+                    property <string> row-raw-anki-tags:
+                        (PopupBridge.popup-revision >= 0)
+                        && self.row-zero-idx >= 0
+                        && self.row-zero-idx < PopupBridge.row-anki-tags.length
+                            ? PopupBridge.row-anki-tags[self.row-zero-idx]
+                            : "";
+                    property <bool> show-browse-btn: self.added-this-row || (root.anki-enabled && self.row-is-duplicate);
+
                     width: parent.width;
                     height: card-content.preferred-height + 16px;
                     background: transparent;
@@ -401,11 +431,10 @@ export component YomitanPopup inherits Rectangle {
                         spacing: 6px;
                         min-height: 34px;
                         property <length> buttons-reserved-w:
-                            (root.added-note-id != "" && root.added-result-index == res.index - 1 ? 68px : 0px)
-                            + (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
+                            (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
                             + (!res.is-kanji && res.has-kanji ? 34px : 0px)
                             + (!res.is-kanji ? 34px : 0px)
-                            + (root.anki-enabled ? 34px : 0px)
+                            + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
                             + 34px
                             + (res.index == 1 && !(PopupBridge.rich-enabled && (PopupBridge.can-go-back || PopupBridge.can-go-forward)) ? 34px : 0px);
                         property <length> avail-title-w: max(96px, card-content.width - self.buttons-reserved-w);
@@ -507,24 +536,6 @@ export component YomitanPopup inherits Rectangle {
                             }
                         }
 
-                        if root.added-note-id != "" && root.added-result-index == res.index - 1 : Rectangle {
-                            width: 62px;
-                            height: 28px;
-                            border-radius: 3px;
-                            background: browse-touch.has-hover ? #385D75 : #24465C;
-                            DictionaryText {
-                                text: "Browse";
-                                color: #BAE6FD;
-                                font-size: 10px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            browse-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.browse-anki-note(root.added-note-id); }
-                            }
-                        }
-
                         // `かな` reading-search toggle button
                         if PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression : Rectangle {
                             width: 34px;
@@ -596,7 +607,41 @@ export component YomitanPopup inherits Rectangle {
                             }
                         }
 
-                        if root.anki-enabled : Rectangle {
+                        if term-segment.show-browse-btn : browse-btn-box := Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 3px;
+                            background: browse-touch.has-hover ? #385D75 : #24465C;
+                            Image {
+                                x: 6px;
+                                y: 6px;
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("icons/note-stack.svg");
+                                colorize: #BAE6FD;
+                            }
+                            browse-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (term-segment.row-browse-query != "") {
+                                        root.browse-anki-note(term-segment.row-browse-query);
+                                    }
+                                }
+                                changed has-hover => {
+                                    if self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.show-tooltip(
+                                            "Browse in Anki",
+                                            (root.width - 140px) / 1px,
+                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
+                                        );
+                                    } else if !self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.hide-tooltip();
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.anki-enabled && !term-segment.show-browse-btn : Rectangle {
                             width: 28px;
                             height: 28px;
                             border-radius: 3px;
@@ -638,6 +683,46 @@ export component YomitanPopup inherits Rectangle {
                             pill: pill;
                             anchor-x: 20px;
                             anchor-y: 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 44px;
+                        }
+                    }
+
+                    // Existing Anki card tag pills when `show-tag` is enabled (#346)
+                    if !res.collapsed && res.term-start && PopupBridge.anki-show-tags && term-segment.row-raw-anki-tags != "" : anki-tag-row := HorizontalLayout {
+                        property <[string]> split-tags: PopupBridge.split-anki-tags(term-segment.row-raw-anki-tags);
+                        property <[string]> effective-tags: self.split-tags.length > 0 ? self.split-tags : [term-segment.row-raw-anki-tags];
+                        spacing: 4px;
+                        alignment: start;
+                        for anki-tag in self.effective-tags : anki-tag-pill := Rectangle {
+                            height: 18px;
+                            width: anki-tag-lbl.preferred-width + 12px;
+                            background: #162B3D;
+                            border-width: 1px;
+                            border-color: #38BDF888;
+                            border-radius: 3px;
+                            anki-tag-lbl := DictionaryText {
+                                x: 6px;
+                                width: parent.width - 12px;
+                                height: parent.height;
+                                text: anki-tag;
+                                font-size: 10px;
+                                font-weight: 700;
+                                color: #BAE6FD;
+                                vertical-alignment: center;
+                            }
+                            TouchArea {
+                                mouse-cursor: PopupBridge.rich-enabled ? help : default;
+                                changed has-hover => {
+                                    if self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.show-tooltip(
+                                            "Anki tag: " + anki-tag,
+                                            20.0,
+                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 44px) / 1px
+                                        );
+                                    } else if !self.has-hover && PopupBridge.rich-enabled {
+                                        PopupBridge.hide-tooltip();
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1334,6 +1419,25 @@ export component DictionarySearchPanel inherits Rectangle {
             placeholder-text: "Search Japanese…";
             text <=> root.query;
             edited(value) => { root.search-changed(value); }
+        }
+
+        if PopupBridge.rich-enabled && PopupBridge.panel-searching : HorizontalLayout {
+            height: 18px;
+            spacing: 6px;
+            alignment: start;
+            Rectangle {
+                y: 5px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: #38BDF8;
+            }
+            DictionaryText {
+                text: "Searching…";
+                font-size: 11px;
+                color: #94A3B8;
+                vertical-alignment: center;
+            }
         }
 
         ListView {
