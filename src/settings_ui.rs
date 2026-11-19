@@ -1035,8 +1035,10 @@ pub(crate) fn create_settings_session(
         if result.is_ok() {
             if let Some(app) = apply_app.upgrade() {
                 refresh_player_preferences(&app, &apply_config);
-                if category == 4 {
+                if category == 4 || category == 9 {
                     apply_dictionary_order(&apply_config, &mut apply_dict.borrow_mut());
+                }
+                if category == 4 {
                     if let Some(window) = apply_window.upgrade() {
                         refresh_dictionary_settings(
                             &window,
@@ -1044,6 +1046,9 @@ pub(crate) fn create_settings_session(
                             &apply_config,
                         );
                     }
+                }
+                if category == 5 || category == 9 {
+                    refresh_subtitle_list(&app, &apply_subtitle_model, &apply_subtitles.borrow());
                 }
                 app.set_ocr_enabled(
                     ocr_available
@@ -1139,9 +1144,14 @@ pub(crate) fn create_settings_session(
                         Some(&reset_coord),
                     );
                 }
+                if category == 5 || category == 9 {
+                    refresh_subtitle_list(&app, &reset_subtitle_model, &reset_subtitles.borrow());
+                }
+            }
+            if category == 4 || category == 9 {
+                apply_dictionary_order(&reset_config, &mut reset_dict.borrow_mut());
             }
             if category == 4 {
-                apply_dictionary_order(&reset_config, &mut reset_dict.borrow_mut());
                 if let Some(window) = reset_window.upgrade() {
                     refresh_dictionary_settings(
                         &window,

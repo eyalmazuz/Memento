@@ -1835,3 +1835,236 @@ fn refresh_active_rows_clears_previous_highlights_even_when_previous_slice_is_st
     assert!(!model.row_data(1).unwrap().is_active);
     assert!(!model.row_data(2).unwrap().is_active);
 }
+
+#[test]
+fn autofit_window_size_scales_accounts_for_drawer_clamps_and_skips_fullscreen_or_maximized() {
+    use memento_app::controller::player::compute_autofit_window_size;
+
+    // 100% 720p video fits cleanly without drawer.
+    assert_eq!(
+        compute_autofit_window_size(1280, 720, true, 100, false, false, false, 360.0, (1920.0, 1080.0)),
+        Some((1280.0, 720.0))
+    );
+
+    // 50% 1080p video scales to 960x540.
+    assert_eq!(
+        compute_autofit_window_size(1920, 1080, true, 50, false, false, false, 360.0, (1920.0, 1080.0)),
+        Some((960.0, 540.0))
+    );
+
+    // Open side drawer width is added to the scaled video width.
+    assert_eq!(
+        compute_autofit_window_size(1280, 720, true, 100, false, false, true, 360.0, (1920.0, 1080.0)),
+        Some((1640.0, 720.0))
+    );
+
+    // Oversized 4K video clamps uniformly to the screen bound preserving 16:9 aspect.
+    assert_eq!(
+        compute_autofit_window_size(3840, 2160, true, 100, false, false, false, 0.0, (1920.0, 1080.0)),
+        Some((1920.0, 1080.0))
+    );
+
+    // 1080p + 360px drawer exceeds 1920px wide and scales down uniformly within bounds.
+    let clamped_with_drawer = compute_autofit_window_size(
+        1920, 1080, true, 100, false, false, true, 360.0, (1920.0, 1080.0),
+    )
+    .expect("should produce clamped size");
+    assert!(clamped_with_drawer.0 <= 1920.0 && clamped_with_drawer.1 <= 1080.0);
+    assert_eq!(clamped_with_drawer.0, 1920.0);
+
+    // Disabled, fullscreen, maximized, or zero dimensions must never resize.
+    assert_eq!(
+        compute_autofit_window_size(1280, 720, false, 100, false, false, false, 0.0, (1920.0, 1080.0)),
+        None
+    );
+    assert_eq!(
+        compute_autofit_window_size(1280, 720, true, 100, true, false, false, 0.0, (1920.0, 1080.0)),
+        None
+    );
+    assert_eq!(
+        compute_autofit_window_size(1280, 720, true, 100, false, true, false, 0.0, (1920.0, 1080.0)),
+        None
+    );
+    assert_eq!(
+        compute_autofit_window_size(0, 720, true, 100, false, false, false, 0.0, (1920.0, 1080.0)),
+        None
+    );
+}
+
+#[test]
+fn subtitle_cursor_zones_and_overlay_visibility_reveal_primary_bottom_and_secondary_top() {
+    use memento_app::controller::player::{
+        compute_subtitle_overlay_visibility, subtitle_cursor_zones,
+    };
+
+    // 1000px tall video: top <= 200px, bottom >= 800px, middle = neither.
+    assert_eq!(subtitle_cursor_zones(0.0, 1000.0), (true, false));
+    assert_eq!(subtitle_cursor_zones(150.0, 1000.0), (true, false));
+    assert_eq!(subtitle_cursor_zones(500.0, 1000.0), (false, false));
+    assert_eq!(subtitle_cursor_zones(850.0, 1000.0), (false, true));
+    assert_eq!(subtitle_cursor_zones(1000.0, 1000.0), (false, true));
+    assert_eq!(subtitle_cursor_zones(-5.0, 1000.0), (false, false));
+    assert_eq!(subtitle_cursor_zones(500.0, 0.0), (false, false));
+
+    // When cursor-show is enabled and pointer is in the zone, subtitles reveal even if
+    // `!subtitles_visible` or `(hide_while_playing && is_playing)`.
+    assert!(compute_subtitle_overlay_visibility(true, false, false, false, true, true));
+    assert!(compute_subtitle_overlay_visibility(true, true, true, true, true, true));
+    // Outside the zone with cursor-show enabled -> hidden.
+    assert!(!compute_subtitle_overlay_visibility(true, true, false, false, true, false));
+    // No subtitle text -> never visible even in zone.
+    assert!(!compute_subtitle_overlay_visibility(false, true, false, false, true, true));
+    // Normal mode (cursor-show disabled) respects `subtitles_visible` and `hide_while_playing`.
+    assert!(compute_subtitle_overlay_visibility(true, true, false, true, false, false));
+    assert!(!compute_subtitle_overlay_visibility(true, false, false, false, false, true));
+    assert!(!compute_subtitle_overlay_visibility(true, true, true, true, false, true));
+    assert!(compute_subtitle_overlay_visibility(true, true, true, false, false, false));
+}
+
+#[test]
+fn mpv_cursor_autohide_policy_respects_never_always_timeout_fs_only_and_interactive_overlay() {
+    use memento_app::controller::player::mpv_cursor_should_hide;
+    use memento_player::mpv::CursorAutohide;
+
+    assert!(!mpv_cursor_should_hide(CursorAutohide::Never, false, true, 10_000, false));
+    assert!(mpv_cursor_should_hide(CursorAutohide::Always, false, false, 0, false));
+    assert!(!mpv_cursor_should_hide(CursorAutohide::Always, true, false, 0, false));
+    assert!(mpv_cursor_should_hide(CursorAutohide::Always, true, true, 0, false));
+    assert!(!mpv_cursor_should_hide(CursorAutohide::Always, false, true, 0, true));
+
+    assert!(!mpv_cursor_should_hide(CursorAutohide::Number(1000), false, false, 500, false));
+    assert!(mpv_cursor_should_hide(CursorAutohide::Number(1000), false, false, 1000, false));
+    assert!(!mpv_cursor_should_hide(CursorAutohide::Number(1000), true, false, 2000, false));
+    assert!(mpv_cursor_should_hide(CursorAutohide::Number(1000), true, true, 1200, false));
+}
+
+#[test]
+fn filter_subtitle_text_and_refresh_subtitle_list_respect_regex_newlines_and_ignore_whitespace() {
+    use memento_app::controller::player::{filter_subtitle_text, refresh_subtitle_list};
+    use memento_app::{MementoApp, SubEntry};
+    use slint::{Model, VecModel};
+
+    assert_eq!(
+        filter_subtitle_text("（笑）おはよう\n世界", "（[^）]*）", true, " "),
+        "おはよう 世界"
+    );
+    assert_eq!(
+        filter_subtitle_text("行1\n行2", "[invalid", true, ""),
+        "行1行2"
+    );
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = MementoApp::new().unwrap();
+    let mut subs = SubtitleController::new();
+    subs.load_cues(vec![
+        create_cue("（SE）Alpha one", 1.0, 2.0),
+        create_cue("Beta two", 3.0, 4.0),
+    ]);
+    let model = VecModel::<SubEntry>::default();
+
+    // `remove-regex` strips matched text in displayed rows, and `ignore-whitespace = false`
+    // does NOT match "Alphaone" against "Alpha one".
+    app.set_search_remove_regex("（[^）]*）".into());
+    app.set_subtitle_search_query("Alphaone".into());
+    app.set_subtitle_search_ignore_whitespace(false);
+    refresh_subtitle_list(&app, &model, &subs);
+    assert_eq!(model.row_data(0).unwrap().text.as_str(), "Alpha one");
+    assert!(!model.row_data(0).unwrap().search_match);
+
+    // Enabling `ignore-whitespace = true` matches "Alphaone" against "Alpha one".
+    app.set_subtitle_search_ignore_whitespace(true);
+    refresh_subtitle_list(&app, &model, &subs);
+    assert!(model.row_data(0).unwrap().search_match);
+    assert!(!model.row_data(1).unwrap().search_match);
+}
+
+#[test]
+fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descriptions() {
+    use memento_app::controller::config::ConfigController;
+    use memento_config::Value;
+    use memento_setting::keys as raw;
+    use slint::Model;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = ConfigController::new();
+
+    // Make an unapplied draft edit in Behavior category.
+    cfg.edit_setting("behavior/osc-fade", "900").unwrap();
+
+    // Persist individual live toggles via `persist_single_setting`.
+    cfg.persist_single_setting("interface/sub-list-timestamps", "true", dir.path(), "memento.conf")
+        .unwrap();
+    cfg.persist_single_setting("subtitle-list/ignore-whitespace", "true", dir.path(), "memento.conf")
+        .unwrap();
+    cfg.persist_single_setting("subtitle-list/auto-seek", "true", dir.path(), "memento.conf")
+        .unwrap();
+    cfg.persist_single_setting("internal/auto-update-opt-in-shown", "true", dir.path(), "memento.conf")
+        .unwrap();
+    cfg.persist_single_setting("application/auto-update-check", "true", dir.path(), "memento.conf")
+        .unwrap();
+
+    // Reloading from disk must have persisted all single settings WITHOUT committing the draft osc-fade.
+    let reloaded = ConfigController::load(dir.path(), "memento.conf").unwrap();
+    assert_eq!(
+        reloaded.effective_setting(raw::interface::GROUP, raw::interface::subtitle_list::TIMESTAMPS),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting(raw::subtitle_list::GROUP, raw::subtitle_list::IGNORE_WHITESPACE),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting(raw::subtitle_list::GROUP, raw::subtitle_list::AUTO_SEEK),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting(raw::internal::GROUP, raw::internal::AUTO_UPDATE_OPT_IN_SHOWN),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting(raw::application::GROUP, raw::application::AUTO_UPDATE_CHECK),
+        Some(Value::Bool(true))
+    );
+    assert_eq!(
+        reloaded.effective_setting(raw::behavior::GROUP, raw::behavior::OSC_FADE),
+        Some(Value::Int(raw::behavior::OSC_FADE_DEFAULT as i64))
+    );
+
+    // Verify `application/language` and `interface/system-icons` keep full config round-trip
+    // AND expose accurate non-empty compatibility descriptions in Settings.
+    reloaded.edit_setting("application/language", "한국어 (MTL)").unwrap();
+    reloaded.edit_setting("interface/system-icons", "false").unwrap();
+    let anki_path = dir.path().join("anki_connect.json");
+    reloaded.apply_settings(1, dir.path(), "memento.conf", &anki_path).unwrap();
+    reloaded.apply_settings(5, dir.path(), "memento.conf", &anki_path).unwrap();
+    let reloaded2 = ConfigController::load(dir.path(), "memento.conf").unwrap();
+    assert_eq!(
+        reloaded2.effective_setting(raw::application::GROUP, raw::application::LANGUAGE),
+        Some(Value::Int(2))
+    );
+    assert_eq!(
+        reloaded2.effective_setting(raw::interface::GROUP, raw::interface::SYSTEM_ICONS),
+        Some(Value::Bool(false))
+    );
+
+    let groups = reloaded2.settings_groups();
+    let find_field = |key: &str| {
+        groups.iter().find_map(|g| {
+            (0..g.fields.row_count())
+                .filter_map(|i| g.fields.row_data(i))
+                .find(|f| f.key.as_str() == key)
+        })
+    };
+    let lang_field = find_field("application/language").expect("application/language field");
+    assert!(
+        lang_field.description.as_str().contains("English"),
+        "language setting must honestly explain available UI language: {:?}",
+        lang_field.description
+    );
+    let icons_field = find_field("interface/system-icons").expect("interface/system-icons field");
+    assert!(
+        icons_field.description.as_str().contains("bundled SVG"),
+        "system-icons setting must honestly describe bundled SVG icons: {:?}",
+        icons_field.description
+    );
+}

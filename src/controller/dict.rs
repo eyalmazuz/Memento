@@ -617,6 +617,8 @@ pub struct DictController {
     remove_regex: Option<Regex>,
     replace_lines: bool,
     replace_lines_with: String,
+    exact_enabled: bool,
+    deconj_enabled: bool,
     mecab_enabled: bool,
     mecab_tokenizer: MecabTokenizerFn,
 }
@@ -640,6 +642,8 @@ impl DictController {
             remove_regex: None,
             replace_lines: false,
             replace_lines_with: String::new(),
+            exact_enabled: true,
+            deconj_enabled: true,
             mecab_enabled: false,
             mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
         }
@@ -690,9 +694,31 @@ impl DictController {
             remove_regex: None,
             replace_lines: false,
             replace_lines_with: String::new(),
+            exact_enabled: true,
+            deconj_enabled: true,
             mecab_enabled: false,
             mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
         })
+    }
+
+    /// Enables or disables exact-prefix query generation (`search/exact-matcher`).
+    pub fn set_exact_enabled(&mut self, enabled: bool) {
+        self.exact_enabled = enabled;
+    }
+
+    /// Returns whether exact-prefix query generation is enabled.
+    pub fn exact_enabled(&self) -> bool {
+        self.exact_enabled
+    }
+
+    /// Enables or disables deconjugation query generation (`search/deconj-matcher`).
+    pub fn set_deconj_enabled(&mut self, enabled: bool) {
+        self.deconj_enabled = enabled;
+    }
+
+    /// Returns whether deconjugation query generation is enabled.
+    pub fn deconj_enabled(&self) -> bool {
+        self.deconj_enabled
     }
 
     /// Enables or disables MeCab morphological compound/lemma query generation during [`Self::search`].
@@ -755,6 +781,21 @@ impl DictController {
     ) {
         self.set_remove_regex(remove_regex);
         self.set_replace_lines(replace_lines, replace_with);
+    }
+
+    /// Returns the configured `search/remove-regex` pattern.
+    pub fn remove_regex_pattern(&self) -> &str {
+        &self.remove_regex_pattern
+    }
+
+    /// Returns whether `search/replace-lines` is enabled.
+    pub fn replace_lines(&self) -> bool {
+        self.replace_lines
+    }
+
+    /// Returns the configured `search/replace-with` replacement string.
+    pub fn replace_lines_with(&self) -> &str {
+        &self.replace_lines_with
     }
 
     #[inline]
@@ -868,8 +909,13 @@ impl DictController {
 
         let norm_query = normalize_reading(trimmed);
         let full_u16_len = trimmed.encode_utf16().count();
-        let lookups =
-            build_lookup_queries(trimmed, self.mecab_enabled, self.mecab_tokenizer);
+        let lookups = build_lookup_queries(
+            trimmed,
+            self.exact_enabled,
+            self.deconj_enabled,
+            self.mecab_enabled,
+            self.mecab_tokenizer,
+        );
 
         struct Candidate {
             hit: SearchHit,
@@ -883,9 +929,13 @@ impl DictController {
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen_database_rows = HashSet::new();
 
-        let database_candidates = self.database.as_ref().map(|database| {
-            database_search_candidates(database, trimmed, &norm_query, full_u16_len, &lookups)
-        });
+        let database_candidates = if !lookups.is_empty() {
+            self.database.as_ref().map(|database| {
+                database_search_candidates(database, trimmed, &norm_query, full_u16_len, &lookups)
+            })
+        } else {
+            None
+        };
         if let Some(Err(error)) = database_candidates.as_ref() {
             self.last_search_error = Some(error.to_string());
         }
@@ -908,7 +958,7 @@ impl DictController {
             }
         }
 
-        let database_kanji_candidates = if trimmed.chars().count() == 1 {
+        let database_kanji_candidates = if self.exact_enabled && trimmed.chars().count() == 1 {
             self.database.as_ref().map(|database| {
                 database_kanji_candidates(database, trimmed, full_u16_len, &self.dictionary_order)
             })
@@ -1673,115 +1723,123 @@ fn slice_mecab_lookup_prefix(trimmed: &str) -> &str {
 
 fn build_lookup_queries(
     trimmed: &str,
+    exact_enabled: bool,
+    deconj_enabled: bool,
     mecab_enabled: bool,
     mecab_tokenizer: MecabTokenizerFn,
 ) -> Vec<LookupQuery> {
     let mut raw_lookups: Vec<LookupQuery> = Vec::new();
     let mut seq = 0usize;
 
-    // Collect all non-empty prefix byte boundaries + UTF-16 lengths from longest to shortest.
-    let mut prefixes: Vec<(usize, usize, usize)> = Vec::new();
-    let mut char_count = 0usize;
-    let mut u16_count = 0usize;
-    for (byte_idx, ch) in trimmed.char_indices() {
-        char_count += 1;
-        u16_count += ch.len_utf16();
-        prefixes.push((byte_idx + ch.len_utf8(), char_count, u16_count));
-    }
-
-    for &(byte_end, chars_len, orig_u16_len) in prefixes.iter().rev() {
-        let prefix = &trimmed[..byte_end];
-        if prefix.trim().is_empty() {
-            continue;
+    if exact_enabled || deconj_enabled {
+        // Collect all non-empty prefix byte boundaries + UTF-16 lengths from longest to shortest.
+        let mut prefixes: Vec<(usize, usize, usize)> = Vec::new();
+        let mut char_count = 0usize;
+        let mut u16_count = 0usize;
+        for (byte_idx, ch) in trimmed.char_indices() {
+            char_count += 1;
+            u16_count += ch.len_utf16();
+            prefixes.push((byte_idx + ch.len_utf8(), char_count, u16_count));
         }
 
-        // 1. Exact prefix variants (`rule_mask = 0`)
-        for variant in normalize::expand_query_variants(prefix) {
-            let deconj_u16 = if mecab_enabled {
-                variant.encode_utf16().collect()
-            } else {
-                Vec::new()
-            };
-            raw_lookups.push(LookupQuery {
-                key: variant,
-                deconj_u16,
-                surface_len: orig_u16_len,
-                rule_mask: 0,
-                source: QuerySource::Exact,
-                derivation: String::new(),
-                derivation_descriptions: Vec::new(),
-                rule_derivations: Vec::new(),
-                seq,
-            });
-            seq += 1;
-        }
-
-        if prefix.chars().any(is_ascii_regex_ws) {
-            let no_ws: String = prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
-            for variant in normalize::expand_query_variants(&no_ws) {
-                let deconj_u16 = if mecab_enabled {
-                    variant.encode_utf16().collect()
-                } else {
-                    Vec::new()
-                };
-                raw_lookups.push(LookupQuery {
-                    key: variant,
-                    deconj_u16,
-                    surface_len: orig_u16_len,
-                    rule_mask: 0,
-                    source: QuerySource::Exact,
-                    derivation: String::new(),
-                    derivation_descriptions: Vec::new(),
-                    rule_derivations: Vec::new(),
-                    seq,
-                });
-                seq += 1;
-            }
-        }
-
-        // 2. Deconjugation candidates (`rule_mask != 0`) preserving `orig_u16_len`
-        if chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == trimmed.len() {
-            let mut deconj_inputs: Vec<String> = Vec::new();
-            let mut push_deconj_in = |s: String| {
-                if !s.is_empty() && !deconj_inputs.contains(&s) {
-                    deconj_inputs.push(s);
-                }
-            };
-            let nfkc = normalize::normalize_nfkc(prefix);
-            push_deconj_in(prefix.to_owned());
-            push_deconj_in(nfkc.clone());
-            push_deconj_in(normalize::kata_to_hira_str(&nfkc));
-            for iter_var in normalize::expand_iteration_marks(&nfkc) {
-                push_deconj_in(iter_var.clone());
-                if iter_var.contains('ー') {
-                    for pv in normalize::expand_prolonged_vowels(&iter_var) {
-                        push_deconj_in(pv);
-                    }
-                }
+        for &(byte_end, chars_len, orig_u16_len) in prefixes.iter().rev() {
+            let prefix = &trimmed[..byte_end];
+            if prefix.trim().is_empty() {
+                continue;
             }
 
-            for deconj_input in deconj_inputs {
-                let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
-                for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
-                    let base = String::from_utf16_lossy(&dq.deconj);
-                    for base_variant in normalize::expand_query_variants(&base) {
+            // 1. Exact prefix variants (`rule_mask = 0`)
+            if exact_enabled {
+                for variant in normalize::expand_query_variants(prefix) {
+                    let deconj_u16 = if mecab_enabled {
+                        variant.encode_utf16().collect()
+                    } else {
+                        Vec::new()
+                    };
+                    raw_lookups.push(LookupQuery {
+                        key: variant,
+                        deconj_u16,
+                        surface_len: orig_u16_len,
+                        rule_mask: 0,
+                        source: QuerySource::Exact,
+                        derivation: String::new(),
+                        derivation_descriptions: Vec::new(),
+                        rule_derivations: Vec::new(),
+                        seq,
+                    });
+                    seq += 1;
+                }
+
+                if prefix.chars().any(is_ascii_regex_ws) {
+                    let no_ws: String =
+                        prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
+                    for variant in normalize::expand_query_variants(&no_ws) {
                         let deconj_u16 = if mecab_enabled {
-                            base_variant.encode_utf16().collect()
+                            variant.encode_utf16().collect()
                         } else {
                             Vec::new()
                         };
                         raw_lookups.push(LookupQuery {
-                            key: base_variant,
+                            key: variant,
                             deconj_u16,
                             surface_len: orig_u16_len,
-                            rule_mask: dq.rule_mask,
-                            source: QuerySource::Deconj,
-                            derivation: dq.derivation.clone(),
-                            derivation_descriptions: dq.derivation_descriptions.clone(),
-                            rule_derivations: dq.rule_derivations.clone(),
+                            rule_mask: 0,
+                            source: QuerySource::Exact,
+                            derivation: String::new(),
+                            derivation_descriptions: Vec::new(),
+                            rule_derivations: Vec::new(),
                             seq,
                         });
                         seq += 1;
+                    }
+                }
+            }
+
+            // 2. Deconjugation candidates (`rule_mask != 0`) preserving `orig_u16_len`
+            if deconj_enabled && (chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == trimmed.len())
+            {
+                let mut deconj_inputs: Vec<String> = Vec::new();
+                let mut push_deconj_in = |s: String| {
+                    if !s.is_empty() && !deconj_inputs.contains(&s) {
+                        deconj_inputs.push(s);
+                    }
+                };
+                let nfkc = normalize::normalize_nfkc(prefix);
+                push_deconj_in(prefix.to_owned());
+                push_deconj_in(nfkc.clone());
+                push_deconj_in(normalize::kata_to_hira_str(&nfkc));
+                for iter_var in normalize::expand_iteration_marks(&nfkc) {
+                    push_deconj_in(iter_var.clone());
+                    if iter_var.contains('ー') {
+                        for pv in normalize::expand_prolonged_vowels(&iter_var) {
+                            push_deconj_in(pv);
+                        }
+                    }
+                }
+
+                for deconj_input in deconj_inputs {
+                    let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
+                    for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
+                        let base = String::from_utf16_lossy(&dq.deconj);
+                        for base_variant in normalize::expand_query_variants(&base) {
+                            let deconj_u16 = if mecab_enabled {
+                                base_variant.encode_utf16().collect()
+                            } else {
+                                Vec::new()
+                            };
+                            raw_lookups.push(LookupQuery {
+                                key: base_variant,
+                                deconj_u16,
+                                surface_len: orig_u16_len,
+                                rule_mask: dq.rule_mask,
+                                source: QuerySource::Deconj,
+                                derivation: dq.derivation.clone(),
+                                derivation_descriptions: dq.derivation_descriptions.clone(),
+                                rule_derivations: dq.rule_derivations.clone(),
+                                seq,
+                            });
+                            seq += 1;
+                        }
                     }
                 }
             }
@@ -2619,4 +2677,94 @@ fn strip_glossary_markup(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod matcher_and_filter_tests {
+    use super::*;
+
+    fn test_dict_with_noun_and_verb() -> DictController {
+        let mut dict = DictController::new();
+        let mut noun = SearchHit::new("猫", "ねこ", "cat", "n", 10, false);
+        noun.rules = "n".to_owned();
+        let mut verb = SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        verb.rules = "v1".to_owned();
+        let mut compound = SearchHit::new("猫食", "ねこしょく", "cat food", "n", 5, false);
+        compound.rules = "n".to_owned();
+        dict.add_entries([noun, verb, compound]);
+        dict
+    }
+
+    #[test]
+    fn exact_and_deconj_matcher_toggles_gate_queries_while_defaulting_true() {
+        let mut dict = test_dict_with_noun_and_verb();
+        assert!(dict.exact_enabled());
+        assert!(dict.deconj_enabled());
+        assert!(!dict.mecab_enabled());
+
+        // Default (both enabled): finds both exact noun and conjugated verb.
+        assert_eq!(dict.search("猫").first().map(|h| h.expression.as_str()), Some("猫"));
+        assert_eq!(dict.search("食べた").first().map(|h| h.expression.as_str()), Some("食べる"));
+
+        // Disable deconjugation: exact noun still works, conjugated verb does not.
+        dict.set_deconj_enabled(false);
+        assert!(!dict.deconj_enabled());
+        assert_eq!(dict.search("猫").first().map(|h| h.expression.as_str()), Some("猫"));
+        assert!(dict.search("食べた").is_empty());
+
+        // Re-enable deconjugation, disable exact: conjugated verb works, bare noun does not.
+        dict.set_deconj_enabled(true);
+        dict.set_exact_enabled(false);
+        assert!(!dict.exact_enabled());
+        assert!(dict.search("猫").is_empty());
+        assert_eq!(dict.search("食べた").first().map(|h| h.expression.as_str()), Some("食べる"));
+
+        // Disable both (with MeCab off): neither matches.
+        dict.set_deconj_enabled(false);
+        assert!(dict.search("猫").is_empty());
+        assert!(dict.search("食べた").is_empty());
+    }
+
+    #[test]
+    fn remove_regex_and_replace_lines_preprocess_queries_before_lookup() {
+        let mut dict = test_dict_with_noun_and_verb();
+
+        // Without filters, leading bracketed stage direction blocks prefix match.
+        assert!(dict.search("（笑）猫").is_empty());
+
+        // `remove-regex` strips stage directions before lookup.
+        dict.set_search_text_filters("（[^）]*）", false, "");
+        assert_eq!(dict.remove_regex_pattern(), "（[^）]*）");
+        assert!(!dict.replace_lines());
+        assert_eq!(
+            dict.search("（笑）猫").first().map(|h| h.expression.as_str()),
+            Some("猫")
+        );
+
+        // Invalid regex is ignored gracefully without panicking.
+        dict.set_search_text_filters("[unclosed", false, "");
+        assert_eq!(dict.search("猫").first().map(|h| h.expression.as_str()), Some("猫"));
+
+        // `replace-lines` joins multi-line text with `replace-with` before matching.
+        dict.set_search_text_filters("", true, "");
+        assert!(dict.replace_lines());
+        assert_eq!(dict.replace_lines_with(), "");
+        assert_eq!(
+            dict.search("猫\n食").first().map(|h| h.expression.as_str()),
+            Some("猫食")
+        );
+
+        // Non-empty `replace-with` separates lines rather than gluing them.
+        dict.set_search_text_filters("", true, " ");
+        assert_eq!(dict.replace_lines_with(), " ");
+        assert_eq!(
+            dict.search("猫\n食").first().map(|h| h.expression.as_str()),
+            Some("猫食") // whitespace-stripped exact variant still matches "猫食"
+        );
+        dict.set_search_text_filters("", true, "・");
+        assert_eq!(
+            dict.search("猫\n食").first().map(|h| h.expression.as_str()),
+            Some("猫")
+        );
+    }
 }

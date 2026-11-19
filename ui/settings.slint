@@ -5,6 +5,7 @@ import { MementoPalette } from "palette.slint";
 export struct SettingsField {
     key: string,
     label: string,
+    description: string,
     kind: string, // "switch", "choice", "text", "font", "color", or "keybind"
     value: string,
     choices: [string],
@@ -585,14 +586,24 @@ component FieldRow inherits VerticalLayout {
     HorizontalLayout {
         spacing: 16px;
         alignment: space-between;
-        Text {
-            text: root.field.label;
-            font-size: 13px;
-            font-weight: 500;
-            color: root.field.enabled ? MementoPalette.text : MementoPalette.text-muted;
-            vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
             horizontal-stretch: 1;
-            overflow: elide;
+            spacing: 2px;
+            Text {
+                text: root.field.label;
+                font-size: 13px;
+                font-weight: 500;
+                color: root.field.enabled ? MementoPalette.text : MementoPalette.text-muted;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.field.description != "" : Text {
+                text: root.field.description;
+                font-size: 11px;
+                color: MementoPalette.text-muted;
+                wrap: word-wrap;
+            }
         }
         if root.field.kind == "switch" : VerticalLayout {
             alignment: center;

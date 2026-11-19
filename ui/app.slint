@@ -471,6 +471,22 @@ component SubtitleDrawerPanel inherits Rectangle {
     in property <int> current-match: 0;
     in property <int> total-matches: 0;
     in property <int> focused-match-row: -1;
+    in-out property <bool> show-timestamps: false;
+    in-out property <bool> ignore-whitespace: false;
+    in-out property <bool> auto-seek: false;
+    in property <color> bg-color: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
+    in property <color> text-color: MementoPalette.text;
+    in property <color> hover-color: MementoPalette.list-hover;
+    in property <color> selected-color: #1E2D3D;
+    in property <color> selected-hover-color: #2A3B4C;
+    in property <string> primary-font-family: "";
+    in property <length> primary-font-size: 13px;
+    in property <bool> primary-font-bold: false;
+    in property <bool> primary-font-italic: false;
+    in property <string> secondary-font-family: "";
+    in property <length> secondary-font-size: 13px;
+    in property <bool> secondary-font-bold: false;
+    in property <bool> secondary-font-italic: false;
     in-out property <bool> user-scrolling: false;
     property <bool> programmatic-scroll: false;
     out property <length> viewport-y: sub-list-view.viewport-y;
@@ -478,8 +494,11 @@ component SubtitleDrawerPanel inherits Rectangle {
         drawer-bg-touch.has-hover
         || prim-tab-touch.has-hover
         || sec-tab-touch.has-hover
+        || time-toggle-touch.has-hover
         || prev-m-touch.has-hover
-        || next-m-touch.has-hover;
+        || next-m-touch.has-hover
+        || ignore-ws-touch.has-hover
+        || auto-seek-touch.has-hover;
 
     pure callback format-timestamp(float) -> string;
     callback row-clicked(int, bool);
@@ -489,6 +508,9 @@ component SubtitleDrawerPanel inherits Rectangle {
     callback next-match();
     callback prev-match();
     callback tab-changed(int);
+    callback toggle-timestamps(bool);
+    callback ignore-whitespace-changed(bool);
+    callback auto-seek-changed(bool);
     callback scroll-to-row(int);
     callback scroll-to-offset(length, length, length);
     callback focus-search();
@@ -497,7 +519,7 @@ component SubtitleDrawerPanel inherits Rectangle {
     scroll-to-offset(row-y, row-h, total-h) => {
         let view-h = sub-list-view.visible-height > 0px
             ? sub-list-view.visible-height
-            : max(200px, root.height - 84px);
+            : max(200px, root.height - 112px);
         let content-h = max(total-h, sub-list-view.viewport-height);
         root.programmatic-scroll = true;
         if content-h > view-h {
@@ -525,7 +547,7 @@ component SubtitleDrawerPanel inherits Rectangle {
         search-input.select-all();
     }
 
-    background: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
+    background: root.bg-color;
     border-width: 1px;
     border-color: MementoPalette.border;
 
@@ -537,7 +559,7 @@ component SubtitleDrawerPanel inherits Rectangle {
             padding: 10px;
             spacing: 8px;
 
-            // Top 28px header: Primary / Secondary Tabs
+            // Top 28px header: Primary / Secondary Tabs + Inline Timestamps Toggle Pill
             HorizontalLayout {
                 height: 28px;
                 spacing: 6px;
@@ -547,15 +569,15 @@ component SubtitleDrawerPanel inherits Rectangle {
                     height: 28px;
                     border-radius: 4px;
                     background: root.active-tab == 0
-                        ? MementoPalette.list-selected
-                        : (prim-tab-touch.has-hover ? MementoPalette.list-hover : transparent);
+                        ? root.selected-color
+                        : (prim-tab-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
                     border-color: root.active-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border;
                     Text {
                         text: "Primary";
                         font-size: 12px;
                         font-weight: root.active-tab == 0 ? 700 : 500;
-                        color: MementoPalette.text;
+                        color: root.text-color;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -576,8 +598,8 @@ component SubtitleDrawerPanel inherits Rectangle {
                     height: 28px;
                     border-radius: 4px;
                     background: root.active-tab == 1
-                        ? MementoPalette.list-selected
-                        : (sec-tab-touch.has-hover ? MementoPalette.list-hover : transparent);
+                        ? root.selected-color
+                        : (sec-tab-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
                     border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
                     opacity: root.has-secondary || root.secondary-entries.length > 0 ? 1.0 : 0.65;
@@ -585,7 +607,7 @@ component SubtitleDrawerPanel inherits Rectangle {
                         text: "Secondary";
                         font-size: 12px;
                         font-weight: root.active-tab == 1 ? 700 : 500;
-                        color: MementoPalette.text;
+                        color: root.text-color;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -597,6 +619,52 @@ component SubtitleDrawerPanel inherits Rectangle {
                                 root.active-tab = 1;
                                 root.tab-changed(1);
                             }
+                        }
+                    }
+                }
+
+                // Inline toggle pill for showing/hiding cue timestamps
+                Rectangle {
+                    width: 60px;
+                    height: 28px;
+                    border-radius: 4px;
+                    background: root.show-timestamps
+                        ? root.selected-color
+                        : (time-toggle-touch.has-hover ? root.hover-color : transparent);
+                    border-width: 1px;
+                    border-color: root.show-timestamps ? MementoPalette.cyan-accent : MementoPalette.border;
+                    accessible-role: checkbox;
+                    accessible-label: "Show timestamps";
+                    accessible-checked: root.show-timestamps;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: root.show-timestamps
+                                    ? MementoPalette.cyan-accent
+                                    : MementoPalette.text-muted;
+                            }
+                        }
+                        Text {
+                            text: "Time";
+                            font-size: 11px;
+                            font-weight: root.show-timestamps ? 700 : 500;
+                            color: root.text-color;
+                            vertical-alignment: center;
+                        }
+                    }
+                    time-toggle-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.show-timestamps = !root.show-timestamps;
+                            root.toggle-timestamps(root.show-timestamps);
                         }
                     }
                 }
@@ -619,10 +687,10 @@ component SubtitleDrawerPanel inherits Rectangle {
                     border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
                     border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : #C29D4B;
                     background: entry.selected
-                        ? (d-touch.has-hover ? #2A3B4C : #1E2D3D)
+                        ? (d-touch.has-hover ? root.selected-hover-color : root.selected-color)
                         : (entry.is_active
                             ? #134E4A
-                            : (d-touch.has-hover ? MementoPalette.list-hover : transparent));
+                            : (d-touch.has-hover ? root.hover-color : transparent));
 
                     // Emerald indicator for active playing cue
                     if entry.is_active : Rectangle {
@@ -642,14 +710,15 @@ component SubtitleDrawerPanel inherits Rectangle {
                         spacing: 12px;
                         alignment: start;
 
-                        // Timecode
-                        Text {
+                        // Timecode (omitted completely when `show-timestamps` is false so cue text gets full width)
+                        if root.show-timestamps : Text {
                             width: 52px;
                             horizontal-alignment: left;
                             vertical-alignment: center;
-                            font-size: 11px;
+                            font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
                             font-weight: 600;
-                            color: entry.selected ? #6EE7B7 : MementoPalette.text-secondary;
+                            color: entry.selected ? #6EE7B7 : root.text-color;
+                            opacity: entry.selected ? 1.0 : 0.72;
                             text: root.format-timestamp(entry.start);
                         }
 
@@ -657,9 +726,13 @@ component SubtitleDrawerPanel inherits Rectangle {
                         cue-text := Text {
                             horizontal-stretch: 1;
                             vertical-alignment: center;
-                            font-size: 13px;
-                            font-weight: entry.is_active ? 700 : 400;
-                            color: entry.selected ? MementoPalette.list-sel-text : MementoPalette.text;
+                            font-family: root.active-tab == 1 ? root.secondary-font-family : root.primary-font-family;
+                            font-size: root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size;
+                            font-weight: entry.is_active
+                                ? 700
+                                : ((root.active-tab == 1 ? root.secondary-font-bold : root.primary-font-bold) ? 700 : 400);
+                            font-italic: root.active-tab == 1 ? root.secondary-font-italic : root.primary-font-italic;
+                            color: root.text-color;
                             wrap: word-wrap;
                             text: entry.text;
                         }
@@ -712,66 +785,176 @@ component SubtitleDrawerPanel inherits Rectangle {
                 }
             }
 
-            // Bottom Search Bar + X of Y Counter + Up/Down Navigation
-            HorizontalLayout {
-                height: 30px;
+            // Bottom Search Bar + X of Y Counter + Up/Down Navigation + Search Options
+            VerticalLayout {
                 spacing: 6px;
-                alignment: center;
 
-                search-input := LineEdit {
-                    horizontal-stretch: 1;
-                    placeholder-text: "Search subtitles (Ctrl+F)…";
-                    text <=> root.search-text;
-                    edited(val) => { root.search-changed(val); }
-                    accepted => { root.next-match(); }
+                HorizontalLayout {
+                    height: 30px;
+                    spacing: 6px;
+                    alignment: center;
+
+                    search-input := LineEdit {
+                        horizontal-stretch: 1;
+                        placeholder-text: "Search subtitles (Ctrl+F)…";
+                        text <=> root.search-text;
+                        edited(val) => { root.search-changed(val); }
+                        accepted => { root.next-match(); }
+                    }
+
+                    if root.search-text != "" : Text {
+                        text: root.total-matches > 0
+                            ? (root.current-match + " of " + root.total-matches)
+                            : "0 of 0";
+                        font-size: 11px;
+                        color: root.text-color;
+                        opacity: 0.78;
+                        vertical-alignment: center;
+                        min-width: 44px;
+                        horizontal-alignment: center;
+                    }
+
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 4px;
+                        background: prev-m-touch.has-hover ? root.hover-color : transparent;
+                        Image {
+                            x: 4px;
+                            y: 4px;
+                            width: 16px;
+                            height: 16px;
+                            source: @image-url("icons/arrow-up.svg");
+                            colorize: root.text-color;
+                        }
+                        prev-m-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.prev-match(); }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 4px;
+                        background: next-m-touch.has-hover ? root.hover-color : transparent;
+                        Image {
+                            x: 4px;
+                            y: 4px;
+                            width: 16px;
+                            height: 16px;
+                            source: @image-url("icons/arrow-down.svg");
+                            colorize: root.text-color;
+                        }
+                        next-m-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.next-match(); }
+                        }
+                    }
                 }
 
-                if root.search-text != "" : Text {
-                    text: root.total-matches > 0
-                        ? (root.current-match + " of " + root.total-matches)
-                        : "0 of 0";
-                    font-size: 11px;
-                    color: MementoPalette.text-secondary;
-                    vertical-alignment: center;
-                    min-width: 44px;
-                    horizontal-alignment: center;
-                }
+                // Ignore Whitespace & Auto Seek search checkboxes
+                HorizontalLayout {
+                    height: 22px;
+                    spacing: 12px;
+                    alignment: start;
 
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 4px;
-                    background: prev-m-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                    Image {
-                        x: 4px;
-                        y: 4px;
-                        width: 16px;
-                        height: 16px;
-                        source: @image-url("icons/arrow-up.svg");
-                        colorize: MementoPalette.icon;
+                    Rectangle {
+                        height: 22px;
+                        width: ignore-ws-row.preferred-width + 8px;
+                        border-radius: 4px;
+                        background: ignore-ws-touch.has-hover ? root.hover-color : transparent;
+                        accessible-role: checkbox;
+                        accessible-label: "Ignore Whitespace";
+                        accessible-checked: root.ignore-whitespace;
+                        ignore-ws-row := HorizontalLayout {
+                            x: 4px;
+                            height: 100%;
+                            spacing: 6px;
+                            alignment: start;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.ignore-whitespace ? MementoPalette.cyan-accent : MementoPalette.border-light;
+                                    background: root.ignore-whitespace ? MementoPalette.cyan-accent : transparent;
+                                    if root.ignore-whitespace : Text {
+                                        text: "✓";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #000000;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "Ignore Whitespace";
+                                font-size: 11px;
+                                color: root.text-color;
+                                opacity: 0.9;
+                                vertical-alignment: center;
+                            }
+                        }
+                        ignore-ws-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.ignore-whitespace = !root.ignore-whitespace;
+                                root.ignore-whitespace-changed(root.ignore-whitespace);
+                            }
+                        }
                     }
-                    prev-m-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.prev-match(); }
-                    }
-                }
 
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: 4px;
-                    background: next-m-touch.has-hover ? MementoPalette.hover-bg : transparent;
-                    Image {
-                        x: 4px;
-                        y: 4px;
-                        width: 16px;
-                        height: 16px;
-                        source: @image-url("icons/arrow-down.svg");
-                        colorize: MementoPalette.icon;
-                    }
-                    next-m-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.next-match(); }
+                    Rectangle {
+                        height: 22px;
+                        width: auto-seek-row.preferred-width + 8px;
+                        border-radius: 4px;
+                        background: auto-seek-touch.has-hover ? root.hover-color : transparent;
+                        accessible-role: checkbox;
+                        accessible-label: "Auto Seek";
+                        accessible-checked: root.auto-seek;
+                        auto-seek-row := HorizontalLayout {
+                            x: 4px;
+                            height: 100%;
+                            spacing: 6px;
+                            alignment: start;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 3px;
+                                    border-width: 1px;
+                                    border-color: root.auto-seek ? MementoPalette.cyan-accent : MementoPalette.border-light;
+                                    background: root.auto-seek ? MementoPalette.cyan-accent : transparent;
+                                    if root.auto-seek : Text {
+                                        text: "✓";
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        color: #000000;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "Auto Seek";
+                                font-size: 11px;
+                                color: root.text-color;
+                                opacity: 0.9;
+                                vertical-alignment: center;
+                            }
+                        }
+                        auto-seek-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.auto-seek = !root.auto-seek;
+                                root.auto-seek-changed(root.auto-seek);
+                            }
+                        }
                     }
                 }
             }
@@ -1388,13 +1571,29 @@ export component MementoApp inherits Window {
     in-out property <bool> osc-visible: true;
     in-out property <int> osc-visibility-mode: 0; // 0: Auto, 1: Hidden, 2: Visible
     in-out property <int> osc-duration-ms: 700;
+    in-out property <int> osc-fade-ms: 250;
     in-out property <int> osc-min-move: 0;
+    in-out property <bool> osc-mpv-cursor: false;
     in-out property <bool> cursor-hidden: false;
+    in-out property <bool> autofit-enabled: true;
+    in-out property <int> autofit-percent: 100;
+    in-out property <bool> subtitle-cursor-show-enabled: false;
+    in-out property <bool> secondary-subtitle-cursor-show-enabled: false;
+    in-out property <bool> cursor-in-bottom-sub-zone: false;
+    in-out property <bool> cursor-in-top-sub-zone: false;
+    in-out property <bool> auto-play-audio-enabled: false;
+    in-out property <string> search-remove-regex: "";
+    in-out property <bool> search-replace-lines: false;
+    in-out property <string> search-replace-with: "";
     out property <bool> menu-open: menu-bar.open-menu >= 0;
     out property <bool> osc-hovered:
         osc.is-hovered || menu-bar.is-hovered || root.menu-open
         || subtitle-hover-area.has-hover || secondary-hover-area.has-hover
         || root.token-hovered;
+    out property <bool> primary-subtitle-effective-visible: subtitle-box.visible;
+    out property <bool> secondary-subtitle-effective-visible: secondary-subtitle-box.visible;
+    out property <float> osc-opacity: osc.opacity;
+    out property <float> menu-bar-opacity: menu-bar.opacity;
     in-out property <bool> token-hovered: false;
     in-out property <bool> ocr-mode: false;
     in-out property <bool> ocr-enabled: false;
@@ -1476,6 +1675,12 @@ export component MementoApp inherits Window {
     in-out property <bool> about-open: false;
     in-out property <bool> url-dialog-open: false;
     in-out property <string> url-dialog-text: "";
+    in-out property <bool> update-dialog-open: false;
+    in-out property <bool> update-dialog-opt-in: false;
+    in-out property <string> update-dialog-title: "";
+    in-out property <string> update-dialog-message: "";
+    in-out property <string> update-dialog-release-tag: "";
+    in-out property <string> update-dialog-release-url: "https://github.com/ripose-jp/Memento/releases/latest";
     in-out property <string> copied-subtitle-text: "";
 
     // Subtitle Entries & Interactive Words
@@ -1486,6 +1691,22 @@ export component MementoApp inherits Window {
     in-out property <int> subtitle-search-current-match: 0;
     in-out property <int> subtitle-search-total-matches: 0;
     in-out property <int> subtitle-search-focused-row: -1;
+    in-out property <bool> sub-list-show-timestamps: false;
+    in-out property <bool> subtitle-search-ignore-whitespace: false;
+    in-out property <bool> subtitle-search-auto-seek: false;
+    in-out property <color> sub-list-bg-color: MementoPalette.dark ? #181A1D : MementoPalette.surface-bg;
+    in-out property <color> sub-list-text-color: MementoPalette.text;
+    in-out property <color> sub-list-hover-color: MementoPalette.list-hover;
+    in-out property <color> sub-list-selected-color: #1E2D3D;
+    in-out property <color> sub-list-selected-hover-color: #2A3B4C;
+    in-out property <string> sub-list-primary-font-family: "";
+    in-out property <length> sub-list-primary-font-size: 13px;
+    in-out property <bool> sub-list-primary-font-bold: false;
+    in-out property <bool> sub-list-primary-font-italic: false;
+    in-out property <string> sub-list-secondary-font-family: "";
+    in-out property <length> sub-list-secondary-font-size: 13px;
+    in-out property <bool> sub-list-secondary-font-bold: false;
+    in-out property <bool> sub-list-secondary-font-italic: false;
     in-out property <[SubtitleWord]> active-sub-words: [];
     in-out property <[SubtitleLine]> active-sub-lines: [];
     in-out property <length> popup-offset-x: 0px;
@@ -1529,6 +1750,8 @@ export component MementoApp inherits Window {
     callback ocr-region(float, float, float, float);
     callback open-config();
     callback check-updates();
+    callback update-opt-in-responded(bool);
+    callback update-dialog-dismissed();
     callback open-external-link(string);
     callback toggle-fullscreen();
     callback timeline-hover-moved(float);
@@ -1542,6 +1765,9 @@ export component MementoApp inherits Window {
     callback search-subtitles(string);
     callback next-subtitle-search-match();
     callback prev-subtitle-search-match();
+    callback sub-list-show-timestamps-toggled(bool);
+    callback subtitle-search-ignore-whitespace-changed(bool);
+    callback subtitle-search-auto-seek-changed(bool);
     callback copy-selected-subtitles();
     callback scroll-subtitle-drawer-to-row(int);
     callback scroll-subtitle-drawer-to-offset(float, float, float);
@@ -1622,7 +1848,21 @@ export component MementoApp inherits Window {
         || root.menu-open
         || root.about-open
         || root.url-dialog-open
+        || root.update-dialog-open
         || root.ocr-mode;
+    property <bool> primary-cursor-reveal:
+        root.subtitle-cursor-show-enabled
+        && (root.cursor-in-bottom-sub-zone
+            || subtitle-hover-area.has-hover
+            || root.token-hovered
+            || hover-bridge.has-hover
+            || osc.is-hovered
+            || (root.dict-open && root.subtitle-hover-latched));
+    property <bool> secondary-cursor-reveal:
+        root.secondary-subtitle-cursor-show-enabled
+        && (root.cursor-in-top-sub-zone
+            || secondary-hover-area.has-hover
+            || menu-bar.is-hovered);
     property <bool> direct-subtitle-hovered:
         subtitle-hover-area.has-hover
         || secondary-hover-area.has-hover
@@ -1661,6 +1901,11 @@ export component MementoApp inherits Window {
             f-scope.focus();
         }
     }
+    changed update-dialog-open => {
+        if !root.update-dialog-open {
+            f-scope.focus();
+        }
+    }
     changed sub-drawer-open => {
         if !root.sub-drawer-open {
             f-scope.focus();
@@ -1678,23 +1923,23 @@ export component MementoApp inherits Window {
     changed dict-open => {
         if !root.dict-open {
             root.subtitle-hover-latched = false;
-            if !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+            if !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
                 f-scope.focus();
             }
         }
     }
     changed active-sub-lines => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
     changed active-sub-text => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
     changed token-hovered => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
@@ -1792,6 +2037,15 @@ export component MementoApp inherits Window {
             }
             if (event.text == Key.Escape) {
                 if (root.ocr-mode) { root.ocr-mode = false; return accept; }
+                if (root.update-dialog-open) {
+                    if (root.update-dialog-opt-in) {
+                        root.update-opt-in-responded(false);
+                    } else {
+                        root.update-dialog-open = false;
+                        root.update-dialog-dismissed();
+                    }
+                    return accept;
+                }
                 if (root.url-dialog-open) { root.url-dialog-open = false; return accept; }
                 if (root.about-open) { root.about-open = false; return accept; }
                 if (had-dict) { return accept; }
@@ -1819,7 +2073,10 @@ export component MementoApp inherits Window {
 
             // Top Native Menu Bar
             menu-bar := TopMenuBar {
-                visible: root.osc-visible || self.open-menu >= 0;
+                property <bool> target-visible: root.osc-visible || self.open-menu >= 0;
+                opacity: self.target-visible ? 1.0 : 0.0;
+                animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
+                visible: self.target-visible || self.opacity > 0.01;
                 activity => { root.osc-activity(); }
                 interacted => { root.dismiss-definition(); }
             }
@@ -1849,10 +2106,15 @@ export component MementoApp inherits Window {
                     video-motion := TouchArea {
                         width: 100%;
                         height: 100%;
-                        mouse-cursor: (root.is-fullscreen && (root.cursor-hidden || (!root.osc-visible && !root.osc-hovered && !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open)))
+                        mouse-cursor: (root.cursor-hidden
+                            || (!root.osc-mpv-cursor && root.is-fullscreen && !root.osc-visible && !root.osc-hovered && !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open))
                             ? none
                             : default;
                         changed has-hover => {
+                            if !self.has-hover {
+                                root.cursor-in-top-sub-zone = false;
+                                root.cursor-in-bottom-sub-zone = false;
+                            }
                             if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
                                 root.subtitle-hover-changed(false);
                             }
@@ -1860,6 +2122,14 @@ export component MementoApp inherits Window {
                         pointer-event(event) => {
                             if event.kind == PointerEventKind.move {
                                 root.cursor-hidden = false;
+                                if video-area.height > 0px {
+                                    let y-ratio = self.mouse-y / video-area.height;
+                                    root.cursor-in-top-sub-zone = y-ratio >= 0.0 && y-ratio <= 0.20;
+                                    root.cursor-in-bottom-sub-zone = y-ratio >= 0.80 && y-ratio <= 1.0;
+                                } else {
+                                    root.cursor-in-top-sub-zone = false;
+                                    root.cursor-in-bottom-sub-zone = false;
+                                }
                                 if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
                                     root.subtitle-hover-changed(false);
                                 }
@@ -1876,7 +2146,7 @@ export component MementoApp inherits Window {
                                 if event.kind == PointerEventKind.down {
                                     root.dismiss-definition();
                                 }
-                                if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && btn > 0 {
+                                if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open && btn > 0 {
                                     root.video-pointer-button(
                                         self.mouse-x / 1px,
                                         self.mouse-y / 1px,
@@ -1893,7 +2163,7 @@ export component MementoApp inherits Window {
                             }
                         }
                         scroll-event(event) => {
-                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open {
+                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open {
                                 root.video-wheel(
                                     self.mouse-x / 1px,
                                     self.mouse-y / 1px,
@@ -1971,7 +2241,10 @@ export component MementoApp inherits Window {
 
                     // Secondary Subtitles cleanly positioned at the top edge of the video viewport
                     secondary-subtitle-box := Rectangle {
-                        visible: root.secondary-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
+                        visible: root.secondary-sub-text != ""
+                            && (root.secondary-subtitle-cursor-show-enabled
+                                ? root.secondary-cursor-reveal
+                                : (root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing)));
                         x: (parent.width - self.width) / 2;
                         y: 12px;
                         width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
@@ -1997,7 +2270,10 @@ export component MementoApp inherits Window {
 
                     // Clickable primary subtitle tokens supply the search suffix at each token.
                     subtitle-box := Rectangle {
-                        visible: root.active-sub-text != "" && root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing);
+                        visible: root.active-sub-text != ""
+                            && (root.subtitle-cursor-show-enabled
+                                ? root.primary-cursor-reveal
+                                : (root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing)));
                         x: (parent.width - self.width) / 2;
                         y: max(10px, parent.height - self.height - max(62px, parent.height * root.subtitle-offset));
                         width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
@@ -2104,7 +2380,10 @@ export component MementoApp inherits Window {
 
                     // Bottom OSC Bar (Floating, 50px)
                     osc := PlayerOscBar {
-                        visible: root.osc-visible && !root.ocr-mode;
+                        property <bool> target-visible: root.osc-visible && !root.ocr-mode;
+                        opacity: self.target-visible ? 1.0 : 0.0;
+                        animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
+                        visible: self.target-visible || self.opacity > 0.01;
                         x: 16px;
                         y: parent.height - self.height - 12px;
                         width: parent.width - 32px;
@@ -2138,7 +2417,7 @@ export component MementoApp inherits Window {
                     }
 
                     // Timeline Hover Preview Card (Thumbnail + Chapter Label + Timestamp)
-                    if osc.visible && osc.timeline-hovered && root.duration > 0.0 : Rectangle {
+                    if root.osc-visible && !root.ocr-mode && osc.timeline-hovered && root.duration > 0.0 : Rectangle {
                         property <bool> has-thumb: root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0;
                         width: self.has-thumb ? 212px : max(84px, preview-col.preferred-width + 20px);
                         height: preview-col.preferred-height + 16px;
@@ -2303,6 +2582,22 @@ export component MementoApp inherits Window {
                             current-match: root.subtitle-search-current-match;
                             total-matches: root.subtitle-search-total-matches;
                             focused-match-row: root.subtitle-search-focused-row;
+                            show-timestamps <=> root.sub-list-show-timestamps;
+                            ignore-whitespace <=> root.subtitle-search-ignore-whitespace;
+                            auto-seek <=> root.subtitle-search-auto-seek;
+                            bg-color: root.sub-list-bg-color;
+                            text-color: root.sub-list-text-color;
+                            hover-color: root.sub-list-hover-color;
+                            selected-color: root.sub-list-selected-color;
+                            selected-hover-color: root.sub-list-selected-hover-color;
+                            primary-font-family: root.sub-list-primary-font-family;
+                            primary-font-size: root.sub-list-primary-font-size;
+                            primary-font-bold: root.sub-list-primary-font-bold;
+                            primary-font-italic: root.sub-list-primary-font-italic;
+                            secondary-font-family: root.sub-list-secondary-font-family;
+                            secondary-font-size: root.sub-list-secondary-font-size;
+                            secondary-font-bold: root.sub-list-secondary-font-bold;
+                            secondary-font-italic: root.sub-list-secondary-font-italic;
                             format-timestamp(sec) => { root.format-timestamp(sec) }
                             row-clicked(idx, extend-range) => { root.dismiss-definition(); root.select-row(idx, extend-range); f-scope.focus(); }
                             range-dragged(first, last, begin) => { root.dismiss-definition(); root.select-subtitle-range(first, last, begin); }
@@ -2311,6 +2606,9 @@ export component MementoApp inherits Window {
                             next-match => { root.next-subtitle-search-match(); }
                             prev-match => { root.prev-subtitle-search-match(); }
                             tab-changed(tab) => { root.subtitle-drawer-tab-changed(tab); }
+                            toggle-timestamps(show) => { root.sub-list-show-timestamps-toggled(show); }
+                            ignore-whitespace-changed(enabled) => { root.subtitle-search-ignore-whitespace-changed(enabled); }
+                            auto-seek-changed(enabled) => { root.subtitle-search-auto-seek-changed(enabled); }
                             user-scrolled => { root.subtitle-drawer-user-scrolled(); }
                         }
                     }
@@ -2618,6 +2916,119 @@ export component MementoApp inherits Window {
                             text: "Close";
                             clicked => {
                                 root.about-open = false;
+                                f-scope.focus();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update Check & First-Launch Auto-Update Opt-In Modal
+        if root.update-dialog-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #00000099;
+            TouchArea {
+                clicked => {
+                    if root.update-dialog-opt-in {
+                        root.update-opt-in-responded(false);
+                    } else {
+                        root.update-dialog-open = false;
+                        root.update-dialog-dismissed();
+                    }
+                    f-scope.focus();
+                }
+            }
+            update-card := Rectangle {
+                width: 460px;
+                height: max(195px, update-col.preferred-height + 40px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: MementoPalette.surface-bg;
+                border-color: MementoPalette.border-light;
+                border-width: 1px;
+                border-radius: 8px;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: #000000AA;
+                // Click-shield prevents clicks inside the dialog from dismissing it
+                TouchArea {}
+                update-col := VerticalLayout {
+                    x: 20px;
+                    y: 20px;
+                    width: parent.width - 40px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: space-between;
+                        Text {
+                            text: root.update-dialog-title != "" ? root.update-dialog-title : "Updates";
+                            color: MementoPalette.text;
+                            font-size: 18px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        if !root.update-dialog-opt-in && root.update-dialog-release-tag != "" : Rectangle {
+                            height: 24px;
+                            width: tag-lbl.preferred-width + 16px;
+                            border-radius: 12px;
+                            background: MementoPalette.list-selected;
+                            border-width: 1px;
+                            border-color: MementoPalette.cyan-accent;
+                            tag-lbl := Text {
+                                text: root.update-dialog-release-tag;
+                                color: MementoPalette.cyan-accent;
+                                font-size: 12px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: root.update-dialog-message;
+                        color: MementoPalette.text-secondary;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    if root.update-dialog-opt-in : HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        Button {
+                            text: "No";
+                            clicked => {
+                                root.update-opt-in-responded(false);
+                                f-scope.focus();
+                            }
+                        }
+                        Button {
+                            text: "Yes";
+                            primary: true;
+                            clicked => {
+                                root.update-opt-in-responded(true);
+                                f-scope.focus();
+                            }
+                        }
+                    }
+
+                    if !root.update-dialog-opt-in : HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        if root.update-dialog-release-url != "" && (root.update-dialog-release-tag != "" || root.update-dialog-title == "Update Check Failed") : Button {
+                            text: "Open GitHub Releases";
+                            primary: root.update-dialog-release-tag != "";
+                            clicked => {
+                                root.open-external-link(root.update-dialog-release-url);
+                            }
+                        }
+                        Button {
+                            text: "Dismiss";
+                            clicked => {
+                                root.update-dialog-open = false;
+                                root.update-dialog-dismissed();
                                 f-scope.focus();
                             }
                         }
