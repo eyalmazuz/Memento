@@ -4121,6 +4121,7 @@ struct CachedConfigSettings {
     search_modifier: i32,
     search_delay_ms: u64,
     middle_mouse_scan: bool,
+    mecab_enabled: bool,
     glossary_style: LegacyGlossaryStyle,
     dict_order: Vec<i64>,
     excluded_glossaries: Vec<String>,
@@ -4140,6 +4141,7 @@ impl CachedConfigSettings {
             search_modifier: raw::search::MODIFIER_DEFAULT as i32,
             search_delay_ms: raw::search::DELAY_DEFAULT as u64,
             middle_mouse_scan: raw::search::MIDDLE_MOUSE_SCAN_DEFAULT,
+            mecab_enabled: raw::search::matcher::MECAB_IPADIC_DEFAULT,
             glossary_style: LegacyGlossaryStyle::Bullet,
             dict_order: Vec::new(),
             excluded_glossaries: Vec::new(),
@@ -4237,6 +4239,13 @@ impl CachedConfigSettings {
         {
             self.middle_mouse_scan = b;
         }
+        self.mecab_enabled = match config.effective_setting(
+            raw::search::GROUP,
+            raw::search::matcher::MECAB_IPADIC,
+        ) {
+            Some(Value::Bool(b)) => b,
+            _ => raw::search::matcher::MECAB_IPADIC_DEFAULT,
+        };
         if let Some(Value::Int(gs)) =
             config.effective_setting(raw::search::GROUP, raw::search::GLOSSARY_STYLE)
         {
@@ -4379,7 +4388,7 @@ struct RichUiBridge {
     app_weak: slint::Weak<MementoApp>,
     db_path: PathBuf,
     state: RefCell<RichUiMutable>,
-    panel_tx: mpsc::Sender<(u64, String, bool, Vec<i64>, Vec<String>)>,
+    panel_tx: mpsc::Sender<(u64, String, bool, Vec<i64>, Vec<String>, bool)>,
     panel_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<(u64, Vec<SearchHit>, Vec<String>)>>>,
     panel_poll_timer: slint::Timer,
     panel_epoch: Arc<AtomicU64>,
@@ -4410,7 +4419,9 @@ impl RichUiBridge {
                 st.dict_ctrl = DictController::open(&self.db_path).unwrap_or_default();
             }
             let order = st.settings.dict_order.clone();
+            let mecab_enabled = st.settings.mecab_enabled;
             st.dict_ctrl.set_order(&order);
+            st.dict_ctrl.set_mecab_enabled(mecab_enabled);
             st.db_helper.refresh_if_needed();
         }
         if reloaded_config {
@@ -5354,11 +5365,12 @@ pub fn install_rich_ui_bridges(
     let db_sig = crate::controller::dict::db_file_fingerprint(dictionary_db_path);
     let mut dict_ctrl = DictController::open(dictionary_db_path).unwrap_or_default();
     dict_ctrl.set_order(&settings.dict_order);
+    dict_ctrl.set_mecab_enabled(settings.mecab_enabled);
 
     // Independent async worker thread for DictionarySearchPanel so panel searches NEVER
     // block the UI thread and NEVER overwrite or get overwritten by subtitle hover popups!
     let (panel_tx, panel_rx) =
-        mpsc::channel::<(u64, String, bool, Vec<i64>, Vec<String>)>();
+        mpsc::channel::<(u64, String, bool, Vec<i64>, Vec<String>, bool)>();
     let (panel_res_tx, raw_panel_res_rx) =
         mpsc::channel::<(u64, Vec<SearchHit>, Vec<String>)>();
     let panel_res_rx = Arc::new(std::sync::Mutex::new(raw_panel_res_rx));
@@ -5374,7 +5386,7 @@ pub fn install_rich_ui_bridges(
             while let Ok(newer) = panel_rx.try_recv() {
                 req = newer;
             }
-            let (gen_id, query, kana_only, order, excluded) = req;
+            let (gen_id, query, kana_only, order, excluded, mecab_enabled) = req;
             if gen_id != worker_epoch.load(Ordering::Acquire) {
                 continue;
             }
@@ -5394,6 +5406,7 @@ pub fn install_rich_ui_bridges(
                 dict = DictController::open(&worker_db_path).unwrap_or_default();
             }
             dict.set_order(&order);
+            dict.set_mecab_enabled(mecab_enabled);
             let search_key = if kana_only {
                 crate::controller::dict::normalize_reading(&trimmed)
             } else {
@@ -6033,11 +6046,12 @@ pub fn install_rich_ui_bridges(
         let pb = app.global::<PopupBridge>();
         pb.set_panel_query(query.clone());
         let kana_only = pb.get_panel_kana_only();
-        let (order, excluded) = {
+        let (order, excluded, mecab_enabled) = {
             let st = b_panel_search.state.borrow();
             (
                 st.settings.dict_order.clone(),
                 st.settings.excluded_glossaries.clone(),
+                st.settings.mecab_enabled,
             )
         };
         let gen_id = b_panel_search.panel_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -6054,6 +6068,7 @@ pub fn install_rich_ui_bridges(
             kana_only,
             order,
             excluded,
+            mecab_enabled,
         ));
         let weak_br = Rc::downgrade(&b_panel_search);
         b_panel_search.panel_poll_timer.start(
@@ -6422,7 +6437,9 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
             st.dict_ctrl = DictController::open(&bridge.db_path).unwrap_or_default();
         }
         let order = st.settings.dict_order.clone();
+        let mecab_enabled = st.settings.mecab_enabled;
         st.dict_ctrl.set_order(&order);
+        st.dict_ctrl.set_mecab_enabled(mecab_enabled);
         st.db_helper.refresh_if_needed();
         st.rich_epoch = st.rich_epoch.wrapping_add(1);
         st.glossary_cache.clear();
@@ -6527,4 +6544,26 @@ pub fn mark_popup_term_anki_added(
     pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
     pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+}
+
+#[cfg(test)]
+mod mecab_settings_tests {
+    use super::*;
+
+    #[test]
+    fn cached_config_settings_tracks_mecab_ipadic_matcher_setting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ConfigController::new();
+        let cached = CachedConfigSettings::from_controller(&cfg, dir.path());
+        assert_eq!(cached.mecab_enabled, raw::search::matcher::MECAB_IPADIC_DEFAULT);
+
+        let key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::MECAB_IPADIC);
+        cfg.edit_setting(&key, "false").unwrap();
+        let mut updated = CachedConfigSettings::from_controller(&cfg, dir.path());
+        assert!(!updated.mecab_enabled);
+
+        cfg.edit_setting(&key, "true").unwrap();
+        updated.apply_controller(&cfg);
+        assert!(updated.mecab_enabled);
+    }
 }

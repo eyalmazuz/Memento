@@ -515,7 +515,15 @@ fn spawn_and_reap(mut cmd: Command) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+fn mecab_matcher_enabled(config: &ConfigController) -> bool {
+    match config.effective_setting(raw::search::GROUP, raw::search::matcher::MECAB_IPADIC) {
+        Some(Value::Bool(b)) => b,
+        _ => raw::search::matcher::MECAB_IPADIC_DEFAULT,
+    }
+}
+
 fn apply_dictionary_order(config: &ConfigController, dictionary: &mut DictController) {
+    dictionary.set_mecab_enabled(mecab_matcher_enabled(config));
     if let Some(Value::Ints(order)) =
         config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER)
     {
@@ -3574,7 +3582,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Dictionary Lookup ──────────────────────────────────────────────────
     let popup_audio_cache: Arc<Mutex<PopupAudioState>> = Arc::new(Mutex::new(PopupAudioState::default()));
-    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<(u64, String, Vec<i64>, String, Vec<String>)>();
+    let (lookup_tx, lookup_rx) = std::sync::mpsc::channel::<(u64, String, Vec<i64>, String, Vec<String>, bool)>();
     let worker_epoch = lookup_epoch.clone();
     let lookup_path = dictionary_database_path.clone();
     let worker_app = app.as_weak();
@@ -3598,6 +3606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 database_signature = signature;
             }
             dictionary.set_order(&request.2);
+            dictionary.set_mecab_enabled(request.5);
             let hits = dictionary.search(&request.1).to_vec();
             let error = dictionary.take_search_error();
             let database_open = dictionary.database_path_is_open();
@@ -3669,8 +3678,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Value::Ints(order)) => order,
             _ => Vec::new(),
         };
+        let mecab_enabled = mecab_matcher_enabled(&lookup_config);
         let generation = lookup_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let _ = lookup_sender.send((generation, word.to_string(), order, app.get_active_sub_text().to_string(), lookup_config.anki_excluded_glossaries()));
+        let _ = lookup_sender.send((
+            generation,
+            word.to_string(),
+            order,
+            app.get_active_sub_text().to_string(),
+            lookup_config.anki_excluded_glossaries(),
+            mecab_enabled,
+        ));
     });
     let glossary_link_app = app.as_weak();
     app.on_open_glossary_link(move |href| {
@@ -3780,6 +3797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         } else {
             let Ok(mut dictionary) = search_dict_ctrl.try_borrow_mut() else { return };
+            apply_dictionary_order(&search_dict_config, &mut dictionary);
             let hits = dictionary.search(&query).to_vec();
             let error = dictionary.take_search_error();
             let database_open = dictionary.database_path_is_open();
@@ -5480,5 +5498,30 @@ mod window_ux_tests {
         );
         assert_eq!(controller::anki::normalize_anki_browse_target(""), None);
         assert_eq!(controller::anki::normalize_anki_browse_target("0"), None);
+    }
+
+    #[test]
+    fn apply_dictionary_order_wires_search_ipadic_matcher_setting() {
+        let cfg = ConfigController::new();
+        let mut dict = DictController::new();
+        assert!(!dict.mecab_enabled());
+
+        assert_eq!(
+            mecab_matcher_enabled(&cfg),
+            raw::search::matcher::MECAB_IPADIC_DEFAULT
+        );
+        apply_dictionary_order(&cfg, &mut dict);
+        assert_eq!(dict.mecab_enabled(), raw::search::matcher::MECAB_IPADIC_DEFAULT);
+
+        let key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::MECAB_IPADIC);
+        cfg.edit_setting(&key, "false").unwrap();
+        assert!(!mecab_matcher_enabled(&cfg));
+        apply_dictionary_order(&cfg, &mut dict);
+        assert!(!dict.mecab_enabled());
+
+        cfg.edit_setting(&key, "true").unwrap();
+        assert!(mecab_matcher_enabled(&cfg));
+        apply_dictionary_order(&cfg, &mut dict);
+        assert!(dict.mecab_enabled());
     }
 }
