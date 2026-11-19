@@ -116,17 +116,18 @@ fn main() {
             }
             (dirs, None, metal, accelerate)
         } else {
-            let source = if let Some(dir) = std::env::var_os("WHISPER_SOURCE_DIR") {
+            let source = if let Some(dir) =
+                std::env::var_os("WHISPER_SOURCE_DIR").filter(|v| !v.is_empty())
+            {
                 let source = PathBuf::from(dir);
                 assert!(
-                    source.join("include/whisper.h").is_file()
-                        && source.join("CMakeLists.txt").is_file(),
+                    is_valid_whisper_source(&source),
                     "WHISPER_SOURCE_DIR ({}) does not contain whisper.cpp sources",
                     source.display()
                 );
                 source
             } else {
-                download_source(&out)
+                probe_cached_source(&out).unwrap_or_else(|| download_source(&out))
             };
             let openmp = env_flag("MEMENTO_WHISPER_OPENMP").unwrap_or(true);
             let portable = env_flag("MEMENTO_WHISPER_PORTABLE").unwrap_or(false);
@@ -282,10 +283,169 @@ fn main() {
     }
 }
 
+fn is_valid_whisper_source(dir: &Path) -> bool {
+    dir.join("include/whisper.h").is_file() && dir.join("CMakeLists.txt").is_file()
+}
+
+fn probe_build_dir(build_dir: &Path, dir_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(build_dir).ok()?;
+    let mut crate_dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let path = entry.path();
+            if name.starts_with("memento-asr-whisper-") && path.is_dir() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    crate_dirs.sort();
+    for crate_dir in crate_dirs {
+        let candidate = crate_dir.join("out").join(dir_name);
+        if is_valid_whisper_source(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn probe_target_dir(target_dir: &Path, dir_name: &str) -> Option<PathBuf> {
+    if let Some(found) = probe_build_dir(&target_dir.join("build"), dir_name) {
+        return Some(found);
+    }
+    for profile in ["debug", "release"] {
+        if let Some(found) = probe_build_dir(&target_dir.join(profile).join("build"), dir_name) {
+            return Some(found);
+        }
+    }
+    let entries = fs::read_dir(target_dir).ok()?;
+    let mut subdirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort();
+    for subdir in subdirs {
+        if let Some(found) = probe_build_dir(&subdir.join("build"), dir_name) {
+            return Some(found);
+        }
+        if let Ok(nested_entries) = fs::read_dir(&subdir) {
+            let mut nested_dirs: Vec<PathBuf> = nested_entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            nested_dirs.sort();
+            for nested in nested_dirs {
+                if let Some(found) = probe_build_dir(&nested.join("build"), dir_name) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_worktree_main_repo_root(workspace_root: &Path) -> Option<PathBuf> {
+    let dot_git = workspace_root.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let content = fs::read_to_string(&dot_git).ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.trim().strip_prefix("gitdir:") {
+            let raw_path = PathBuf::from(rest.trim());
+            let gitdir = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                workspace_root.join(raw_path)
+            };
+            for ancestor in gitdir.ancestors() {
+                if ancestor.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                    return ancestor.parent().map(Path::to_path_buf);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cache_source_link(out: &Path, dir_name: &str, found: PathBuf) -> PathBuf {
+    let direct = out.join(dir_name);
+    if !direct.exists() {
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&found, &direct);
+    }
+    found
+}
+
+fn probe_cached_source(out: &Path) -> Option<PathBuf> {
+    let dir_name = format!("whisper.cpp-{VERSION}");
+    let direct = out.join(&dir_name);
+    if is_valid_whisper_source(&direct) {
+        return Some(direct);
+    }
+
+    if let Some(build_dir) = out.ancestors().nth(2) {
+        if let Some(found) = probe_build_dir(build_dir, &dir_name) {
+            return Some(cache_source_link(out, &dir_name, found));
+        }
+    }
+
+    for ancestor_depth in [3, 4] {
+        if let Some(target_root) = out.ancestors().nth(ancestor_depth) {
+            if let Some(found) = probe_target_dir(target_root, &dir_name) {
+                return Some(cache_source_link(out, &dir_name, found));
+            }
+            if let Some(parent) = target_root.parent() {
+                if let Ok(entries) = fs::read_dir(parent) {
+                    let mut sibling_targets: Vec<PathBuf> = entries
+                        .flatten()
+                        .filter_map(|entry| {
+                            let name = entry.file_name();
+                            let name = name.to_str()?;
+                            let path = entry.path();
+                            if name.starts_with("target") && path.is_dir() {
+                                Some(path)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    sibling_targets.sort();
+                    for sibling_target in sibling_targets {
+                        if let Some(found) = probe_target_dir(&sibling_target, &dir_name) {
+                            return Some(cache_source_link(out, &dir_name, found));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(manifest_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) {
+        if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
+            if let Some(found) = probe_target_dir(&workspace_root.join("target"), &dir_name) {
+                return Some(cache_source_link(out, &dir_name, found));
+            }
+            if let Some(main_repo_root) = resolve_worktree_main_repo_root(workspace_root) {
+                if let Some(found) = probe_target_dir(&main_repo_root.join("target"), &dir_name) {
+                    return Some(cache_source_link(out, &dir_name, found));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn download_source(out: &Path) -> PathBuf {
     let source = out.join(format!("whisper.cpp-{VERSION}"));
     let complete = out.join("whisper-source-complete");
-    if complete.is_file() && source.join("include/whisper.h").is_file() {
+    if complete.is_file() && is_valid_whisper_source(&source) {
         return source;
     }
     let url =
