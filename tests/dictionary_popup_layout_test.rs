@@ -2783,13 +2783,13 @@ mod rich_popup_phase4_tests {
         );
 
         let nested_list = ElementQuery::from_root(&app)
-            .match_id("YomitanPopup::nested-definition-list")
+            .match_id("NestedYomitanPopup::nested-definition-list")
             .find_first()
-            .expect("YomitanPopup::nested-definition-list");
+            .expect("NestedYomitanPopup::nested-definition-list");
         let nested_row = ElementQuery::from_root(&app)
-            .match_id("YomitanPopup::nested-row-wrapper")
+            .match_id("NestedYomitanPopup::nested-row-wrapper")
             .find_first()
-            .expect("YomitanPopup::nested-row-wrapper");
+            .expect("NestedYomitanPopup::nested-row-wrapper");
         let nested_top_gap = nested_row.absolute_position().y - nested_list.absolute_position().y;
         assert!(
             nested_row.size().height < nested_list.size().height - 80.0,
@@ -2803,5 +2803,684 @@ mod rich_popup_phase4_tests {
             nested_row.absolute_position().y,
             nested_list.absolute_position().y
         );
+    }
+
+    #[test]
+    fn v3_deliverable1_hidpi_supersampled_glossary_text_svg_and_cache_speed() {
+        init_no_event_loop();
+        let fixture = build_recursive_scan_fixture();
+        // Write a monochrome gaiji SVG into the fixture's dictionary resources dir.
+        let res_dir = fixture.config_dir.join("dict_resources").join("SMK8");
+        fs::create_dir_all(&res_dir).unwrap();
+        let svg_bytes = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 14" width="24" height="14">
+            <rect x="0" y="0" width="24" height="14" rx="2" fill="#ffffff"/>
+        </svg>"##;
+        fs::write(res_dir.join("badge.svg"), svg_bytes).unwrap();
+
+        let raw_with_svg = r#"[{"type":"structured-content","content":[{"tag":"span","content":[{"tag":"img","path":"badge.svg","width":24,"height":14,"appearance":"monochrome"}," そこそこ・明鏡国語辞典の鮮明な高解像度テキスト表示。"]}]}]"#;
+        let doc = memento_app::render_structured_glossary_entry_in_dirs(
+            raw_with_svg,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[fixture.config_dir.join("dict_resources")],
+            1,
+            "SMK8",
+            360.0,
+            true,
+        )
+        .expect("supersampled doc with SVG should render");
+
+        // Default render_scale is 2.0x physical pixels while logical width_px/height_px stay 1:1 logical!
+        let img_size = doc.image.size();
+        assert_eq!(
+            img_size.width,
+            (doc.width_px * 2.0).round() as u32,
+            "default glossary pixmap must supersample width at 2.0x (img_w={}, logical_w={})",
+            img_size.width,
+            doc.width_px
+        );
+        assert_eq!(
+            img_size.height,
+            (doc.height_px * 2.0).round() as u32,
+            "default glossary pixmap must supersample height at 2.0x (img_h={}, logical_h={})",
+            img_size.height,
+            doc.height_px
+        );
+        assert!(
+            (doc.width_px - 360.0).abs() <= 1.0,
+            "logical width_px must remain logical avail_w (got {})",
+            doc.width_px
+        );
+        // Selectable char coordinates must stay strictly in logical pixel space (never multiplied by 2x).
+        for cell in &doc.selectable_chars {
+            if cell.ch != '\n' {
+                assert!(
+                    cell.x >= 0.0 && cell.x + cell.w <= doc.width_px + 4.0,
+                    "selectable char '{}' logical x={}..{} must stay inside logical width {}",
+                    cell.ch,
+                    cell.x,
+                    cell.x + cell.w,
+                    doc.width_px
+                );
+                assert!(
+                    cell.y >= 0.0 && cell.y + cell.h <= doc.height_px + 4.0,
+                    "selectable char '{}' logical y={}..{} must stay inside logical height {}",
+                    cell.ch,
+                    cell.y,
+                    cell.y + cell.h,
+                    doc.height_px
+                );
+            }
+        }
+
+        // Verify live window ScaleFactorChanged updates GlossaryDocCacheKey (scale_quarter) cleanly:
+        // 1.0 -> 2.0x, 2.0 -> 2.0x, 2.5 -> 2.5x, 3.5 -> clamped 3.0x, while logical metrics stay constant.
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        set_dictionary_rows(&app, memento_app::dictionary_result_rows(&hits, &[]));
+        app.set_dict_open(true);
+        let pb = app.global::<PopupBridge>();
+
+        let mut logical_baseline: Option<(f32, f32)> = None;
+        for (win_scale, expected_render_scale) in [(1.0f32, 2.0f32), (2.0, 2.0), (2.5, 2.5), (3.5, 3.0)] {
+            app.window().dispatch_event(
+                slint::platform::WindowEvent::ScaleFactorChanged {
+                    scale_factor: win_scale,
+                },
+            );
+            let r = pb.invoke_render_glossary(
+                1,
+                320.0,
+                true,
+                pb.get_rich_revision(),
+                pb.get_selection_revision(),
+            );
+            assert!(r.has_rich);
+            let sz = r.rendered.size();
+            let expected_w = (r.width_px * expected_render_scale).round() as u32;
+            let expected_h = (r.height_px * expected_render_scale).round() as u32;
+            assert!(
+                (sz.width as i32 - expected_w as i32).abs() <= 1,
+                "scale_factor={win_scale} must rasterize at {expected_render_scale}x width (got {}, expected ~{expected_w}, logical={})",
+                sz.width,
+                r.width_px
+            );
+            assert!(
+                (sz.height as i32 - expected_h as i32).abs() <= 1,
+                "scale_factor={win_scale} must rasterize at {expected_render_scale}x height (got {}, expected ~{expected_h}, logical={})",
+                sz.height,
+                r.height_px
+            );
+            if let Some((bw, bh)) = logical_baseline {
+                assert!(
+                    (r.width_px - bw).abs() <= 1.0 && (r.height_px - bh).abs() <= 1.0,
+                    "logical dimensions must not drift across scale factors ({}x{} vs {}x{})",
+                    r.width_px,
+                    r.height_px,
+                    bw,
+                    bh
+                );
+            } else {
+                logical_baseline = Some((r.width_px, r.height_px));
+            }
+        }
+
+        // Warm glyph-cache performance check across 10 fresh uncached widths/cards.
+        let sample_json = r#"[{"type":"structured-content","content":"ある程度の状態であること。まずまず。ほどほど。日本語辞書の解説文を高速に描画する。"}]"#;
+        let _ = memento_app::render_structured_glossary_entry_in_dirs(
+            sample_json,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "大辞泉",
+            320.0,
+            true,
+        );
+        let t0 = Instant::now();
+        for i in 0..10 {
+            let _ = memento_app::render_structured_glossary_entry_in_dirs(
+                sample_json,
+                "",
+                None,
+                &HashMap::new(),
+                LegacyGlossaryStyle::Bullet,
+                &[],
+                1,
+                "大辞泉",
+                280.0 + (i as f32) * 8.0,
+                true,
+            )
+            .unwrap();
+        }
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let per_card_ms = elapsed_ms / 10.0;
+        eprintln!("[v3_deliverable1] warm 2x supersampled glossary render: {per_card_ms:.2} ms/card");
+        assert!(
+            per_card_ms < 80.0,
+            "warm supersampled glossary card render should remain fast (got {per_card_ms:.2} ms/card in debug mode)"
+        );
+    }
+
+    #[test]
+    fn v3_deliverable2_real_window_events_shift_hover_2col_plain_and_structured_and_max_depth() {
+        init_no_event_loop();
+        let fixture = build_recursive_scan_fixture();
+
+        // Write user's real 2-column CSS & 560x360 popup-outer.css.
+        fs::write(
+            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            ":root { --definition-columns: 2; --definition-columns-min-width: 560px; }",
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .config_dir
+                .join(memento_app::CUSTOM_POPUP_OUTER_CSS_FILENAME),
+            "iframe.yomitan-popup { width: 560px; height: 360px; }",
+        )
+        .unwrap();
+
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        // Exact user memento.conf search settings: Modifier (1), Shift (2), Delay 0, Middle-mouse true.
+        cfg.edit_setting("search/method", "1").unwrap();
+        cfg.edit_setting("search/modifier", "2").unwrap();
+        cfg.edit_setting("search/delay", "0").unwrap();
+        cfg.edit_setting("search/middle-mouse-scan", "true")
+            .unwrap();
+
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+
+        let mut dict = DictController::open(&fixture.db_path).unwrap();
+        let hits = dict.search("大辞泉語").to_vec();
+        assert!(
+            hits.len() >= 2,
+            "fixture must have both structured-content and plain-string dictionaries for 大辞泉語"
+        );
+        // Seed a stale subtitle hover target before opening the popup to prove glossary hover clears it
+        // and Shift prioritizes the glossary word over stale subtitle hover!
+        let sub_word = memento_app::SubtitleWord {
+            index: 0,
+            text: "意味".into(),
+            reading: "いみ".into(),
+            query: "意味".into(),
+        };
+        app.set_active_sub_words(Rc::new(VecModel::from(vec![sub_word.clone()])).into());
+        app.set_active_sub_lines(
+            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+                &app,
+                vec![sub_word.clone()],
+            )))
+            .into(),
+        );
+        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
+        sb.invoke_pointer_hovered(sub_word, 36.0, false, 10.0, 18.0, false, false, false, false);
+
+        set_dictionary_rows(&app, memento_app::dictionary_result_rows(&hits, &[]));
+        app.set_dict_query("大辞泉語".into());
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+        assert_eq!(pb.get_css_definition_columns(), 2);
+        assert_eq!(pb.get_nested_max_depth(), 4);
+
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() == Ok("1") {
+            let rich_touches = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::rich-touch")
+                .find_all();
+            assert!(
+                rich_touches.len() >= 2,
+                "2-column popup must render at least 2 DefinitionEntryBody::rich-touch surfaces (got {})",
+                rich_touches.len()
+            );
+
+            // Compute exact char coordinates for '言' in col 1 (row 1, structured-content)
+            // and col 2 (row 2, plain-string JSON array dictionary) using their real rendered widths.
+            let touch1 = &rich_touches[0];
+            let touch2 = &rich_touches[1];
+            let pos1 = touch1.absolute_position();
+            let sz1 = touch1.size();
+            let pos2 = touch2.absolute_position();
+            let sz2 = touch2.size();
+
+            let doc1 = memento_app::render_structured_glossary_entry_in_dirs(
+                &hits[0].raw_glossary,
+                &hits[0].glossary,
+                None,
+                &HashMap::new(),
+                LegacyGlossaryStyle::Bullet,
+                &[],
+                hits[0].dictionary_id,
+                &hits[0].dict_name,
+                ((sz1.width.max(120.0) / 4.0).round() * 4.0).max(120.0),
+                true,
+            )
+            .unwrap();
+            let cell1 = doc1
+                .selectable_chars
+                .iter()
+                .find(|c| c.ch == '言')
+                .expect("col 1 must contain 言");
+            let win_pt1 = slint::LogicalPosition::new(
+                pos1.x + cell1.x + cell1.w * 0.5,
+                pos1.y + cell1.y + cell1.h * 0.5,
+            );
+
+            let doc2 = memento_app::render_structured_glossary_entry_in_dirs(
+                &hits[1].raw_glossary,
+                &hits[1].glossary,
+                None,
+                &HashMap::new(),
+                LegacyGlossaryStyle::Bullet,
+                &[],
+                hits[1].dictionary_id,
+                &hits[1].dict_name,
+                ((sz2.width.max(120.0) / 4.0).round() * 4.0).max(120.0),
+                true,
+            )
+            .unwrap();
+            let cell2 = doc2
+                .selectable_chars
+                .iter()
+                .find(|c| c.ch == '言')
+                .expect("col 2 plain-string dict must contain 言");
+            let win_pt2 = slint::LogicalPosition::new(
+                pos2.x + cell2.x + cell2.w * 0.5,
+                pos2.y + cell2.y + cell2.h * 0.5,
+            );
+
+            // A. Hover stationary FIRST over col 1 via REAL WindowEvent::PointerMoved, THEN press Shift!
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(60));
+            assert_eq!(
+                pb.get_nested_depth(),
+                0,
+                "Modifier mode must not trigger before Shift is pressed"
+            );
+
+            let shift_key = slint::SharedString::from(slint::platform::Key::Shift);
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: shift_key.clone(),
+                });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: shift_key.clone(),
+                });
+            wait_for_nested_depth(&app, 1);
+            assert_eq!(
+                pb.get_nested_headword().as_str(),
+                "言葉",
+                "Real WindowEvent PointerMoved + KeyPressed(Shift) must open child popup for 言葉"
+            );
+            assert_eq!(
+                app.get_dict_query().as_str(),
+                "大辞泉語",
+                "Stale subtitle hover must NOT hijack Shift press over glossary"
+            );
+
+            // Dismiss nested via Escape -> parent remains open!
+            let esc = slint::SharedString::from(slint::platform::Key::Escape);
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc.clone() });
+            assert_eq!(pb.get_nested_depth(), 0);
+            assert!(app.get_dict_open());
+
+            // B. Hold Shift FIRST, THEN move pointer onto col 2 (plain-string JSON array dictionary)!
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: shift_key.clone(),
+                });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt2 });
+            wait_for_nested_depth(&app, 1);
+            assert_eq!(
+                pb.get_nested_headword().as_str(),
+                "言葉",
+                "Holding Shift BEFORE moving onto plain-string dict column 2 must open child popup"
+            );
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: shift_key.clone(),
+                });
+
+            // C. Recursive depth 2 (`child -> grandchild`) via REAL WindowEvent inside NestedYomitanPopup!
+            let nested_card = ElementQuery::from_root(&app)
+                .match_id("NestedYomitanPopup::nested-definition-list")
+                .find_first()
+                .expect("nested-definition-list must be mounted");
+            let nc_pos = nested_card.absolute_position();
+            let nc_sz = nested_card.size();
+            let all_touches_after = ElementQuery::from_root(&app)
+                .match_id("DefinitionEntryBody::rich-touch")
+                .find_all();
+            let nested_touch = all_touches_after
+                .iter()
+                .find(|el| {
+                    let p = el.absolute_position();
+                    p.x >= nc_pos.x - 2.0
+                        && p.y >= nc_pos.y - 2.0
+                        && p.x < nc_pos.x + nc_sz.width
+                        && p.y < nc_pos.y + nc_sz.height
+                })
+                .expect("must find rich-touch inside NestedYomitanPopup");
+            let nt_pos = nested_touch.absolute_position();
+            let nt_sz = nested_touch.size();
+            let kotoba_hits = dict.search("言葉").to_vec();
+            let nested_doc = memento_app::render_structured_glossary_entry_in_dirs(
+                &kotoba_hits[0].raw_glossary,
+                &kotoba_hits[0].glossary,
+                None,
+                &HashMap::new(),
+                LegacyGlossaryStyle::Bullet,
+                &[],
+                kotoba_hits[0].dictionary_id,
+                &kotoba_hits[0].dict_name,
+                ((nt_sz.width.max(120.0) / 4.0).round() * 4.0).max(120.0),
+                true,
+            )
+            .unwrap();
+            let m_cell = nested_doc
+                .selectable_chars
+                .iter()
+                .find(|c| c.ch == '文')
+                .expect("nested doc must contain 文");
+            let nested_win_pt = slint::LogicalPosition::new(
+                nt_pos.x + m_cell.x + m_cell.w * 0.5,
+                nt_pos.y + m_cell.y + m_cell.h * 0.5,
+            );
+            app.window().dispatch_event(
+                slint::platform::WindowEvent::PointerMoved {
+                    position: nested_win_pt,
+                },
+            );
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: shift_key.clone(),
+                });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: shift_key.clone(),
+                });
+            wait_for_nested_depth(&app, 2);
+            assert_eq!(pb.get_nested_headword().as_str(), "文字");
+            assert_eq!(pb.get_nested_breadcrumb().as_str(), "言葉 › 文字");
+
+            // Escape pops 2 -> 1 -> 0 without closing parent.
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc.clone() });
+            assert_eq!(pb.get_nested_depth(), 1);
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: esc.clone() });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: esc.clone() });
+            assert_eq!(pb.get_nested_depth(), 0);
+            assert!(app.get_dict_open());
+
+            // D. Real middle-click WindowEvent inside glossary opens locked child popup.
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
+            app.window().dispatch_event(
+                slint::platform::WindowEvent::PointerPressed {
+                    position: win_pt1,
+                    button: slint::platform::PointerEventButton::Middle,
+                },
+            );
+            app.window().dispatch_event(
+                slint::platform::WindowEvent::PointerReleased {
+                    position: win_pt1,
+                    button: slint::platform::PointerEventButton::Middle,
+                },
+            );
+            wait_for_nested_depth(&app, 1);
+            assert!(pb.get_nested_locked());
+            pb.invoke_dismiss_all_nested_popups();
+
+            // E. Empty-text winit bare modifier event (text == "", shift == true) must still scan!
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
+            assert!(
+                pb.invoke_popup_key_pressed("".into(), false, true, false, false),
+                "empty-text key event with shift=true must be treated as bare modifier press"
+            );
+            wait_for_nested_depth(&app, 1);
+            assert_eq!(pb.get_nested_headword().as_str(), "言葉");
+
+            // F. Configurable `search/max-recursion-depth`:
+            // Setting 0 truncates open child popup AND disables recursive scanning completely!
+            cfg.edit_setting("search/max-recursion-depth", "0").unwrap();
+            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            assert_eq!(pb.get_nested_max_depth(), 0);
+            assert_eq!(
+                pb.get_nested_depth(),
+                0,
+                "lowering max-recursion-depth to 0 must immediately close open nested popups"
+            );
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: shift_key.clone(),
+                });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: shift_key.clone(),
+                });
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(80));
+            assert_eq!(
+                pb.get_nested_depth(),
+                0,
+                "max-recursion-depth=0 must disable Shift+hover recursive scanning"
+            );
+
+            // Setting 1 allows depth 1, blocks depth 2!
+            cfg.edit_setting("search/max-recursion-depth", "1").unwrap();
+            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            assert_eq!(pb.get_nested_max_depth(), 1);
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                    text: shift_key.clone(),
+                });
+            app.window()
+                .dispatch_event(slint::platform::WindowEvent::KeyReleased {
+                    text: shift_key.clone(),
+                });
+            wait_for_nested_depth(&app, 1);
+            assert_eq!(pb.get_nested_depth(), 1);
+            // Attempt depth 2 from depth 1 -> blocked by max_recursion_depth == 1!
+            pb.invoke_glossary_scan_middle_click(1, 1, 10.0, 10.0, 120.0, 120.0);
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(80));
+            assert_eq!(
+                pb.get_nested_depth(),
+                1,
+                "max-recursion-depth=1 must prevent opening depth 2"
+            );
+
+            // Setting 6 updates nested-max-depth to 6 (clamped 0..=10).
+            cfg.edit_setting("search/max-recursion-depth", "6").unwrap();
+            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            assert_eq!(pb.get_nested_max_depth(), 6);
+            cfg.edit_setting("search/max-recursion-depth", "99")
+                .unwrap();
+            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            assert_eq!(pb.get_nested_max_depth(), 10);
+        }
+    }
+
+    #[test]
+    fn v3_deliverable3_kana_reading_match_highlights_all_four_chars_in_regular_and_ass_subtitles() {
+        init_no_event_loop();
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("memento-v3-iiwake-{seq}-{nanos}"));
+        let config_dir = root.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let db_path = root.join("dictionaries.sqlite");
+        let zip_path = root.join("iiwake.zip");
+        write_yomi_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"TestDict","format":3,"revision":"1"}"#,
+                ),
+                (
+                    "term_bank_1.json",
+                    r#"[["言い訳","いいわけ","n","",100,["excuse; pretext"],1,""]]"#.as_bytes(),
+                ),
+            ],
+        );
+        let dict_resources = config_dir.join("dict_resources");
+        fs::create_dir_all(&dict_resources).unwrap();
+        yomidbbuilder::process_dictionary(&zip_path, &db_path, &dict_resources).unwrap();
+
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.show().unwrap();
+
+        let mut dict = DictController::open(&db_path).unwrap();
+        let subtitle_line = "いいわけあるか〜っ!!";
+        let hits = dict.search(subtitle_line).to_vec();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].expression, "言い訳");
+        assert_eq!(hits[0].reading, "いいわけ");
+        assert!(
+            hits[0].derivation.is_empty(),
+            "exact kana-reading match has empty derivation — this is the exact regression trigger"
+        );
+        assert_eq!(dict.last_match_units(), 4);
+
+        // 1. Regular subtitle scan: clicking char 0 of "いいわけあるか〜っ!!" must highlight UTF-16 range 0..4 ("いいわけ"), NOT 0..3 ("いいわ")!
+        let sub_word = memento_app::SubtitleWord {
+            index: 0,
+            text: subtitle_line.into(),
+            reading: "".into(),
+            query: subtitle_line.into(),
+        };
+        app.set_active_sub_words(Rc::new(VecModel::from(vec![sub_word.clone()])).into());
+        app.set_active_sub_lines(
+            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+                &app,
+                vec![sub_word.clone()],
+            )))
+            .into(),
+        );
+        let hits_for_cb = hits.clone();
+        let app_weak = app.as_weak();
+        app.on_lookup_word(move |_q| {
+            if let Some(a) = app_weak.upgrade() {
+                set_dictionary_rows(&a, memento_app::dictionary_result_rows(&hits_for_cb, &[]));
+                a.set_dict_open(true);
+            }
+        });
+        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
+        sb.invoke_token_left_clicked(sub_word, 36.0, false, 6.0, 18.0);
+        assert_eq!(
+            memento_app::active_subtitle_scan_utf16_range(&app),
+            Some((0, 4)),
+            "kana subtitle 'いいわけあるか〜っ!!' matching 言い訳(いいわけ) must highlight 0..4 (いいわけ), not 0..3 (いいわ)"
+        );
+
+        // 2. Native ASS subtitle scan via AssOverlayController: scanned_surface must be "いいわけ" (4 UTF-16 units)!
+        let ass_header = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,30,1
+";
+        let ass_full = format!(
+            "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{subtitle_line}\n"
+        );
+        let ass_ctrl = Rc::new(std::cell::RefCell::new(
+            memento_app::controller::ass::AssOverlayController::new(),
+        ));
+        let ass_params = memento_ass::MpvAssParams::for_frame(1280, 720);
+        memento_app::bind_rich_bridge_ass_controller(&app, ass_ctrl.clone());
+        ass_ctrl.borrow_mut().sync_from_playback(
+            &app,
+            true,
+            ass_header,
+            &ass_full,
+            &ass_params,
+            2_000,
+            true,
+            0.4,
+        );
+        let hitboxes = sb.get_ass_line_hitboxes();
+        assert!(
+            hitboxes.row_count() >= 1,
+            "ASS subtitle line must produce at least one interactive hitbox"
+        );
+        let hb = hitboxes.row_data(0).unwrap();
+        sb.invoke_ass_left_clicked(hb.x + 8.0, hb.y + hb.height * 0.5);
+        let active_ass = memento_app::active_ass_lookup_for_app(&app)
+            .expect("ASS left-click scan must establish active ASS lookup highlight");
+        assert_eq!(
+            active_ass.utf16_offset_in_event, 0,
+            "ASS match must start at UTF-16 offset 0"
+        );
+        assert_eq!(
+            active_ass.matched_utf16_len, 4,
+            "ASS highlight length must cover all 4 UTF-16 units of 'いいわけ', not 3 ('いいわ')"
+        );
+        assert_eq!(
+            active_ass.scanned_surface, "いいわけ",
+            "ASS scanned_surface must be 'いいわけ', not 'いいわ'"
+        );
+
+        // 3. Katakana variant "イイワケあるか〜っ!!" must also match 4 UTF-16 units ("イイワケ")!
+        let kata_line = "イイワケあるか〜っ!!";
+        let kata_word = memento_app::SubtitleWord {
+            index: 0,
+            text: kata_line.into(),
+            reading: "".into(),
+            query: kata_line.into(),
+        };
+        app.set_active_sub_words(Rc::new(VecModel::from(vec![kata_word.clone()])).into());
+        app.set_active_sub_lines(
+            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+                &app,
+                vec![kata_word.clone()],
+            )))
+            .into(),
+        );
+        sb.invoke_token_left_clicked(kata_word, 36.0, false, 6.0, 18.0);
+        assert_eq!(
+            memento_app::active_subtitle_scan_utf16_range(&app),
+            Some((0, 4)),
+            "katakana subtitle 'イイワケあるか〜っ!!' matching 言い訳(いいわけ) must highlight 0..4"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

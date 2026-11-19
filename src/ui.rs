@@ -1062,6 +1062,7 @@ impl TextEngine {
         strikethrough: bool,
         collector: &mut PaintCollector,
     ) {
+        let scale = collector.render_scale;
         for line in layout.lines() {
             let baseline = origin_y + line.metrics().baseline;
             for item in line.items() {
@@ -1069,6 +1070,7 @@ impl TextEngine {
                     let run = glyph_run.run();
                     let run_font = run.font().clone();
                     let font_size = run.font_size();
+                    let scaled_font_size = font_size * scale;
                     let brush = glyph_run.style().brush;
                     let is_color_font = self.font_supports_color(run_font.borrow_font());
                     let synth_italic = run.synthesis().skew().is_some();
@@ -1077,27 +1079,37 @@ impl TextEngine {
                     for g in glyph_run.positioned_glyphs() {
                         let px = origin_x + g.x;
                         let py = origin_y + g.y;
+                        let phys_x = px * scale;
+                        let phys_y = py * scale;
                         let rendered_color = is_color_font
                             && self
                                 .try_render_color_glyph(
                                     run_font.borrow_font(),
                                     g.id as u16,
-                                    font_size,
+                                    scaled_font_size,
                                 )
                                 .is_some_and(|cg| {
-                                    collector.images.push((px + cg.left, py - cg.top, cg.pixmap));
+                                    let cw = cg.pixmap.width() as f32;
+                                    let ch = cg.pixmap.height() as f32;
+                                    collector.images.push(PositionedGlossaryImage {
+                                        phys_x: phys_x + cg.left,
+                                        phys_y: phys_y - cg.top,
+                                        phys_w: cw,
+                                        phys_h: ch,
+                                        pixmap: cg.pixmap,
+                                    });
                                     true
                                 });
                         if !rendered_color {
                             if let Some(ag) = self.try_render_alpha_glyph(
                                 run_font.borrow_font(),
                                 g.id as u16,
-                                font_size,
+                                scaled_font_size,
                                 synth_italic,
                             ) {
                                 collector.mask_glyphs.push(PositionedMaskGlyph {
-                                    x: px.round() as i32 + ag.left,
-                                    y: py.round() as i32 - ag.top,
+                                    x: phys_x.round() as i32 + ag.left,
+                                    y: phys_y.round() as i32 - ag.top,
                                     glyph: ag,
                                     rgba: brush,
                                 });
@@ -4383,6 +4395,28 @@ pub fn load_dictionary_image_pixmap(
     monochrome_tint: Option<[u8; 4]>,
     current_color_hex: &str,
 ) -> Option<Arc<tiny_skia::Pixmap>> {
+    load_dictionary_image_pixmap_scaled(
+        asset_path,
+        requested_w,
+        requested_h,
+        monochrome_tint,
+        current_color_hex,
+        1.0,
+    )
+    .map(|(pm, _, _)| pm)
+}
+
+/// Rasterizes a local dictionary image or SVG at `render_scale` physical density,
+/// returning `(high_res_pixmap, logical_width_px, logical_height_px)`.
+fn load_dictionary_image_pixmap_scaled(
+    asset_path: &Path,
+    requested_w: Option<f32>,
+    requested_h: Option<f32>,
+    monochrome_tint: Option<[u8; 4]>,
+    current_color_hex: &str,
+    render_scale: f32,
+) -> Option<(Arc<tiny_skia::Pixmap>, f32, f32)> {
+    let scale = render_scale.clamp(1.0, 3.0);
     let bytes = std::fs::read(asset_path).ok()?;
     let ext = asset_path
         .extension()
@@ -4433,8 +4467,10 @@ pub fn load_dictionary_image_pixmap(
             }
             (None, None) => (intrinsic_w.clamp(8.0, 360.0), intrinsic_h.clamp(8.0, 360.0)),
         };
-        let pw = (target_w.round() as u32).clamp(1, 1024);
-        let ph = (target_h.round() as u32).clamp(1, 1024);
+        let logical_w = target_w.round().clamp(1.0, 1024.0);
+        let logical_h = target_h.round().clamp(1.0, 1024.0);
+        let pw = (logical_w * scale).round().clamp(1.0, 2048.0) as u32;
+        let ph = (logical_h * scale).round().clamp(1.0, 2048.0) as u32;
         let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
         let transform = tiny_skia::Transform::from_scale(
             pw as f32 / intrinsic_w,
@@ -4455,7 +4491,7 @@ pub fn load_dictionary_image_pixmap(
                 }
             }
         }
-        return Some(Arc::new(pixmap));
+        return Some((Arc::new(pixmap), logical_w, logical_h));
     }
 
     let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
@@ -4484,14 +4520,16 @@ pub fn load_dictionary_image_pixmap(
             ((h * iw as f32 / ih as f32).max(1.0), h)
         }
         (None, None) => {
-            let scale = (340.0 / iw as f32).min(1.0);
-            (iw as f32 * scale, ih as f32 * scale)
+            let fit = (340.0 / iw as f32).min(1.0);
+            (iw as f32 * fit, ih as f32 * fit)
         }
     };
-    let pw = (target_w.round() as u32).clamp(1, 1024);
-    let ph = (target_h.round() as u32).clamp(1, 1024);
-    if pw == iw && ph == ih {
-        return Some(Arc::new(src_pixmap));
+    let logical_w = target_w.round().clamp(1.0, 1024.0);
+    let logical_h = target_h.round().clamp(1.0, 1024.0);
+    let pw = (logical_w * scale).round().clamp(1.0, 2048.0) as u32;
+    let ph = (logical_h * scale).round().clamp(1.0, 2048.0) as u32;
+    if (pw == iw && ph == ih) || (scale > 1.0 && iw <= pw && ih <= ph) {
+        return Some((Arc::new(src_pixmap), logical_w, logical_h));
     }
     let mut dst_pixmap = tiny_skia::Pixmap::new(pw, ph)?;
     let paint = tiny_skia::PixmapPaint {
@@ -4507,7 +4545,7 @@ pub fn load_dictionary_image_pixmap(
         tiny_skia::Transform::from_scale(pw as f32 / iw as f32, ph as f32 / ih as f32),
         None,
     );
-    Some(Arc::new(dst_pixmap))
+    Some((Arc::new(dst_pixmap), logical_w, logical_h))
 }
 
 // ── Rich Structured Content Layout & Painter (`memento-definition` + `parley` + `resvg`) ─
@@ -4939,6 +4977,7 @@ struct GlossaryBuilder<'a> {
     dic_id: i64,
     dict_name: &'a str,
     default_link_color: [u8; 4],
+    render_scale: f32,
     had_hidden_elements: bool,
 }
 
@@ -5137,13 +5176,17 @@ impl<'a> GlossaryBuilder<'a> {
             self.dict_name,
             rel_path,
         )?;
-        let mut pixmap =
-            load_dictionary_image_pixmap(&asset_path, req_w, req_h, tint, &color_str)?;
+        let (mut pixmap, w, h) = load_dictionary_image_pixmap_scaled(
+            &asset_path,
+            req_w,
+            req_h,
+            tint,
+            &color_str,
+            self.render_scale,
+        )?;
         if invert_ratio > 0.001 && !is_monochrome {
             pixmap = invert_pixmap(&pixmap, invert_ratio);
         }
-        let w = pixmap.width() as f32;
-        let h = pixmap.height() as f32;
         Some(InlineAtom::Image {
             pixmap,
             w,
@@ -5787,10 +5830,18 @@ fn frame_is_trivial(f: &BoxFrameIR) -> bool {
         && f.borders.iter().all(Option::is_none)
 }
 
-#[derive(Default)]
+struct PositionedGlossaryImage {
+    phys_x: f32,
+    phys_y: f32,
+    phys_w: f32,
+    phys_h: f32,
+    pixmap: Arc<tiny_skia::Pixmap>,
+}
+
 struct PaintCollector {
+    render_scale: f32,
     rects: Vec<(f32, f32, f32, f32, [u8; 4])>,
-    images: Vec<(f32, f32, Arc<tiny_skia::Pixmap>)>,
+    images: Vec<PositionedGlossaryImage>,
     mask_glyphs: Vec<PositionedMaskGlyph>,
     hit_zones: Vec<GlossaryHitZone>,
     selectable_chars: Vec<GlossaryCharCell>,
@@ -5798,7 +5849,26 @@ struct PaintCollector {
     next_line_id: usize,
 }
 
+impl Default for PaintCollector {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
 impl PaintCollector {
+    fn new(render_scale: f32) -> Self {
+        Self {
+            render_scale: render_scale.clamp(1.0, 3.0),
+            rects: Vec::new(),
+            images: Vec::new(),
+            mask_glyphs: Vec::new(),
+            hit_zones: Vec::new(),
+            selectable_chars: Vec::new(),
+            line_bounds: Vec::new(),
+            next_line_id: 0,
+        }
+    }
+
     fn push_frame(&mut self, x: f32, y: f32, w: f32, h: f32, frame: &BoxFrameIR) {
         if w <= 0.0 || h <= 0.0 {
             return;
@@ -5977,7 +6047,7 @@ fn layout_and_collect_block(
             let box_h = border_t + frame.padding[TOP] + inner_h + frame.padding[BOTTOM] + border_b;
 
             if !measure_only && !frame_is_trivial(frame) {
-                let mut frame_collector = PaintCollector::default();
+                let mut frame_collector = PaintCollector::new(collector.render_scale);
                 frame_collector.push_frame(outer_x, outer_y, box_w, box_h, frame);
                 collector
                     .rects
@@ -6363,33 +6433,41 @@ fn layout_inline_atoms(
                         }
 
                         if c_glyph_count > 0 {
+                            let scale = collector.render_scale;
+                            let scaled_font_size = font_size * scale;
                             let mut gx = x_cursor;
                             for g in cluster.glyphs() {
+                                let phys_x = (gx + g.x) * scale;
+                                let phys_y = (baseline + g.y) * scale;
                                 let rendered_color = is_color_font
                                     && engine
                                         .try_render_color_glyph(
                                             run_font.borrow_font(),
                                             g.id as u16,
-                                            font_size,
+                                            scaled_font_size,
                                         )
                                         .is_some_and(|cg| {
-                                            collector.images.push((
-                                                gx + g.x + cg.left,
-                                                baseline + g.y - cg.top,
-                                                cg.pixmap,
-                                            ));
+                                            let cw = cg.pixmap.width() as f32;
+                                            let ch = cg.pixmap.height() as f32;
+                                            collector.images.push(PositionedGlossaryImage {
+                                                phys_x: phys_x + cg.left,
+                                                phys_y: phys_y - cg.top,
+                                                phys_w: cw,
+                                                phys_h: ch,
+                                                pixmap: cg.pixmap,
+                                            });
                                             true
                                         });
                                 if !rendered_color {
                                     if let Some(ag) = engine.try_render_alpha_glyph(
                                         run_font.borrow_font(),
                                         g.id as u16,
-                                        font_size,
+                                        scaled_font_size,
                                         synth_italic,
                                     ) {
                                         collector.mask_glyphs.push(PositionedMaskGlyph {
-                                            x: (gx + g.x).round() as i32 + ag.left,
-                                            y: (baseline + g.y).round() as i32 - ag.top,
+                                            x: phys_x.round() as i32 + ag.left,
+                                            y: phys_y.round() as i32 - ag.top,
                                             glyph: ag,
                                             rgba: brush,
                                         });
@@ -6508,7 +6586,14 @@ fn layout_inline_atoms(
                                 .or_else(|| Some(format!("{}: {}", rbox.base, rbox.reading))),
                         });
                     } else if let Some(img) = image_boxes.iter().find(|im| im.box_id == ibox.id) {
-                        collector.images.push((bx + 1.0, by + 1.0, img.pixmap.clone()));
+                        let scale = collector.render_scale;
+                        collector.images.push(PositionedGlossaryImage {
+                            phys_x: (bx + 1.0) * scale,
+                            phys_y: (by + 1.0) * scale,
+                            phys_w: img.w * scale,
+                            phys_h: img.h * scale,
+                            pixmap: img.pixmap.clone(),
+                        });
                         if img.link_href.is_some() || img.tooltip.is_some() {
                             collector.hit_zones.push(GlossaryHitZone {
                                 x: bx,
@@ -6601,7 +6686,7 @@ fn layout_table_block(
     let max_table_w = (avail_w - frame.margin_left - frame.margin_right).max(40.0);
 
     let mut col_pref = vec![36.0f32; num_cols];
-    let mut dummy_collector = PaintCollector::default();
+    let mut dummy_collector = PaintCollector::new(collector.render_scale);
     for p in &placed {
         let pad_h = p.cell.frame.padding[LEFT] + p.cell.frame.padding[RIGHT] + 4.0;
         let mut natural_w = 24.0f32;
@@ -6756,6 +6841,19 @@ pub fn render_structured_glossary_entry_in_dirs(
     )
 }
 
+/// Quantize a window's logical-to-physical DPI scale factor to `0.25` steps in `[2.0, 3.0]`
+/// for supersampled HiDPI glossary rasterization and stable cache keys.
+fn quantize_glossary_render_scale(window_scale: f32) -> (f32, u16) {
+    let raw = if window_scale.is_finite() && window_scale > 0.0 {
+        window_scale
+    } else {
+        1.0
+    };
+    let clamped = raw.clamp(2.0, 3.0);
+    let quarters = (clamped * 4.0).round().clamp(8.0, 12.0) as u16;
+    (f32::from(quarters) * 0.25, quarters)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_structured_glossary_entry_with_theme(
     raw_glossary: &str,
@@ -6770,6 +6868,38 @@ fn render_structured_glossary_entry_with_theme(
     selected: bool,
     theme: &PopupCssTheme,
 ) -> Option<RenderedGlossaryDoc> {
+    render_structured_glossary_entry_with_theme_scaled(
+        raw_glossary,
+        fallback_glossary,
+        stylesheet,
+        detail_states,
+        legacy_style,
+        dict_resource_dirs,
+        dic_id,
+        dict_name,
+        avail_width_px,
+        selected,
+        theme,
+        2.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_structured_glossary_entry_with_theme_scaled(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+    theme: &PopupCssTheme,
+    render_scale: f32,
+) -> Option<RenderedGlossaryDoc> {
+    let scale = render_scale.clamp(1.0, 3.0);
     let avail_w = avail_width_px.clamp(120.0, 960.0);
     let mut base_text_color = if selected {
         theme.text_color
@@ -6897,6 +7027,7 @@ fn render_structured_glossary_entry_with_theme(
         dic_id,
         dict_name,
         default_link_color: theme.link_color,
+        render_scale: scale,
         had_hidden_elements: root_hidden,
     };
 
@@ -6998,7 +7129,7 @@ fn render_structured_glossary_entry_with_theme(
 
     SHARED_TEXT_ENGINE.with(|engine_cell| {
         let mut engine = engine_cell.borrow_mut();
-        let mut collector = PaintCollector::default();
+        let mut collector = PaintCollector::new(scale);
         let mut cur_y = 2.0f32;
         for (idx, blk) in top_blocks.iter().enumerate() {
             if idx > 0 {
@@ -7008,13 +7139,20 @@ fn render_structured_glossary_entry_with_theme(
                 layout_and_collect_block(&mut engine, blk, 0.0, cur_y, avail_w, &mut collector, false);
             cur_y += bh;
         }
-        let total_h = (cur_y + 2.0).ceil().max(18.0);
-        let pw = (avail_w.ceil() as u32).clamp(1, 1400);
-        let ph = (total_h.ceil() as u32).clamp(1, 8192);
+        let logical_w = avail_w.ceil().clamp(1.0, 1400.0);
+        let max_logical_h = (16384.0 / scale).floor().min(8192.0);
+        let logical_h = (cur_y + 2.0).ceil().clamp(18.0, max_logical_h);
+        let pw = (logical_w * scale).ceil().clamp(1.0, 4200.0) as u32;
+        let ph = (logical_h * scale).ceil().clamp(1.0, 16384.0) as u32;
         let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
 
         for &(rx, ry, rw, rh, col) in &collector.rects {
-            if let Some(rect) = tiny_skia::Rect::from_xywh(rx, ry, rw.max(0.5), rh.max(0.5)) {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(
+                rx * scale,
+                ry * scale,
+                (rw * scale).max(1.0),
+                (rh * scale).max(1.0),
+            ) {
                 let mut paint = tiny_skia::Paint::default();
                 paint.set_color_rgba8(col[0], col[1], col[2], col[3]);
                 pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
@@ -7026,15 +7164,25 @@ fn render_structured_glossary_entry_with_theme(
             blend_mode: tiny_skia::BlendMode::SourceOver,
             quality: tiny_skia::FilterQuality::Bilinear,
         };
-        for (ix, iy, img_pm) in &collector.images {
-            pixmap.draw_pixmap(
-                ix.round() as i32,
-                iy.round() as i32,
-                (**img_pm).as_ref(),
-                &img_paint,
-                tiny_skia::Transform::default(),
-                None,
-            );
+        for img in &collector.images {
+            let src_w = img.pixmap.width().max(1) as f32;
+            let src_h = img.pixmap.height().max(1) as f32;
+            if (src_w - img.phys_w).abs() <= 0.75 && (src_h - img.phys_h).abs() <= 0.75 {
+                pixmap.draw_pixmap(
+                    img.phys_x.round() as i32,
+                    img.phys_y.round() as i32,
+                    (*img.pixmap).as_ref(),
+                    &img_paint,
+                    tiny_skia::Transform::default(),
+                    None,
+                );
+            } else {
+                let sx = img.phys_w / src_w;
+                let sy = img.phys_h / src_h;
+                let xform = tiny_skia::Transform::from_scale(sx, sy)
+                    .post_translate(img.phys_x, img.phys_y);
+                pixmap.draw_pixmap(0, 0, (*img.pixmap).as_ref(), &img_paint, xform, None);
+            }
         }
 
         for mg in &collector.mask_glyphs {
@@ -7052,8 +7200,8 @@ fn render_structured_glossary_entry_with_theme(
         let line_bottoms = compute_visual_line_bottoms(&collector.line_bounds);
 
         Some(RenderedGlossaryDoc {
-            width_px: pw as f32,
-            height_px: ph as f32,
+            width_px: pw as f32 / scale,
+            height_px: ph as f32 / scale,
             image: pixmap_to_slint_image(&pixmap),
             hit_zones: collector.hit_zones,
             selectable_chars: collector.selectable_chars,
@@ -7487,6 +7635,7 @@ struct CachedConfigSettings {
     search_modifier: i32,
     search_delay_ms: u64,
     middle_mouse_scan: bool,
+    max_recursion_depth: usize,
     exact_enabled: bool,
     deconj_enabled: bool,
     mecab_enabled: bool,
@@ -7513,6 +7662,7 @@ impl CachedConfigSettings {
             search_modifier: raw::search::MODIFIER_DEFAULT as i32,
             search_delay_ms: raw::search::DELAY_DEFAULT as u64,
             middle_mouse_scan: raw::search::MIDDLE_MOUSE_SCAN_DEFAULT,
+            max_recursion_depth: MAX_NESTED_POPUP_DEPTH,
             exact_enabled: raw::search::matcher::EXACT_DEFAULT,
             deconj_enabled: raw::search::matcher::DECONJ_DEFAULT,
             mecab_enabled: raw::search::matcher::MECAB_IPADIC_DEFAULT,
@@ -7686,6 +7836,17 @@ impl CachedConfigSettings {
         {
             self.middle_mouse_scan = b;
         }
+        self.max_recursion_depth =
+            match config.effective_setting(raw::search::GROUP, "max-recursion-depth") {
+                Some(Value::Int(d)) => d.clamp(0, 10) as usize,
+                Some(Value::Real(f)) => (f.round() as i64).clamp(0, 10) as usize,
+                Some(Value::Text(s)) => s
+                    .trim()
+                    .parse::<i64>()
+                    .map(|d| d.clamp(0, 10) as usize)
+                    .unwrap_or(MAX_NESTED_POPUP_DEPTH),
+                _ => MAX_NESTED_POPUP_DEPTH,
+            };
         self.exact_enabled = match config
             .effective_setting(raw::search::GROUP, raw::search::matcher::EXACT)
         {
@@ -7773,6 +7934,7 @@ struct GlossaryDocCacheKey {
     selected: bool,
     details_sig: String,
     rich_epoch: u64,
+    scale_quarter: u16,
 }
 
 struct RichUiMutable {
@@ -7801,7 +7963,7 @@ struct RichUiMutable {
     nested_stack: Vec<NestedPopupLevel>,
     hovered_glossary_target: Option<HoveredGlossaryTarget>,
     nested_card_hovered: bool,
-    nested_body_hovered: bool,
+    nested_body_hover_count: usize,
     nested_scan_timer: slint::Timer,
     nested_dismiss_timer: slint::Timer,
     pending_nested_anki_add: Option<(usize, String, String, bool)>,
@@ -8112,12 +8274,27 @@ impl RichUiBridge {
     fn ensure_fresh_db_and_config(&self, app: &MementoApp) {
         let mut reloaded_config = false;
         let mut reloaded_css_theme: Option<PopupCssTheme> = None;
+        let mut reloaded_max_depth: Option<usize> = None;
+        let mut truncated_nested = false;
         {
             let mut st = self.state.borrow_mut();
             let config_dir = st.config_dir.clone();
             if st.settings.reload_if_changed_on_disk(&config_dir) {
                 reloaded_config = true;
                 st.clear_all_glossary_caches();
+                let max_d = st.settings.max_recursion_depth;
+                reloaded_max_depth = Some(max_d);
+                if st.nested_stack.len() > max_d {
+                    st.nested_stack.truncate(max_d);
+                    if let Some(top) = st.nested_stack.last_mut() {
+                        top.scan_highlight = None;
+                    } else {
+                        st.root_scan_highlight = None;
+                        st.nested_card_hovered = false;
+                        st.nested_body_hover_count = 0;
+                    }
+                    truncated_nested = true;
+                }
                 let bg = st.settings.subtitle_style.bg_rgba;
                 let sb = app.global::<SubtitleOverlayBridge>();
                 sb.set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
@@ -8138,6 +8315,13 @@ impl RichUiBridge {
             let search_cfg = st.settings.dict_search_config();
             search_cfg.apply_to(&mut st.dict_ctrl);
             st.db_helper.refresh_if_needed();
+        }
+        if let Some(max_d) = reloaded_max_depth {
+            app.global::<PopupBridge>()
+                .set_nested_max_depth(max_d as i32);
+        }
+        if truncated_nested {
+            self.sync_nested_popup_to_bridge(app, true);
         }
         if let Some(theme) = reloaded_css_theme {
             apply_popup_css_theme_to_bridge(app, &theme);
@@ -8207,7 +8391,7 @@ impl RichUiBridge {
         st.nested_stack.clear();
         st.hovered_glossary_target = None;
         st.nested_card_hovered = false;
-        st.nested_body_hovered = false;
+        st.nested_body_hover_count = 0;
         st.nested_scan_timer.stop();
         st.nested_dismiss_timer.stop();
         st.pending_nested_anki_add = None;
@@ -8360,26 +8544,11 @@ impl RichUiBridge {
 
             let pending_sub = st.pending_scan_sub_query.take();
             let compute_matched_u16 = |dict_ctrl: &mut DictController| -> usize {
-                if let (Some(first), Some(sub_q)) = (candidate_hits.first(), pending_sub.as_deref())
-                {
-                    if !first.derivation.is_empty() {
-                        let _ = dict_ctrl.search(sub_q);
-                        let units = dict_ctrl.last_match_units();
-                        if units > 0 {
-                            units
-                        } else {
-                            first.expression.encode_utf16().count()
-                        }
-                    } else {
-                        first.expression.encode_utf16().count()
-                    }
-                } else {
-                    candidate_hits
-                        .first()
-                        .map(|h| h.expression.encode_utf16().count())
-                        .unwrap_or(1)
-                }
-                .max(1)
+                compute_subtitle_lookup_match_u16(
+                    dict_ctrl,
+                    candidate_hits.first(),
+                    pending_sub.as_deref(),
+                )
             };
             if let Some(utf16_start) = st.pending_scan_utf16_start.take() {
                 let matched_u16 = compute_matched_u16(&mut st.dict_ctrl);
@@ -8811,6 +8980,12 @@ impl RichUiBridge {
         selected: bool,
     ) -> Option<RenderedGlossaryDoc> {
         let bucket_w = ((width_px.max(120.0) / 4.0).round() as i32 * 4).max(120);
+        let window_scale = self
+            .app_weak
+            .upgrade()
+            .map(|app| app.window().scale_factor())
+            .unwrap_or(1.0);
+        let (render_scale, scale_quarter) = quantize_glossary_render_scale(window_scale);
         let mut st = self.state.borrow_mut();
         let (hit, detail_states, epoch) = if depth == 0 {
             let extras = st.row_extras.get(&row_index)?;
@@ -8837,6 +9012,7 @@ impl RichUiBridge {
             selected,
             details_sig,
             rich_epoch: epoch,
+            scale_quarter,
         };
         if depth == 0 {
             if let Some(doc) = st.glossary_cache.get(&cache_key).cloned() {
@@ -8863,7 +9039,7 @@ impl RichUiBridge {
         let sheet = st
             .stylesheets
             .get_for_dictionary(&res_dirs, hit.dictionary_id, &hit.dict_name);
-        let doc = render_structured_glossary_entry_with_theme(
+        let doc = render_structured_glossary_entry_with_theme_scaled(
             &hit.raw_glossary,
             &hit.glossary,
             sheet,
@@ -8875,6 +9051,7 @@ impl RichUiBridge {
             bucket_w as f32,
             selected,
             &theme,
+            render_scale,
         )?;
         if depth == 0 {
             st.last_rendered_key.insert(row_index, cache_key.clone());
@@ -9150,6 +9327,7 @@ impl RichUiBridge {
     fn sync_nested_popup_to_bridge(&self, app: &MementoApp, nav_changed: bool) {
         let (
             depth,
+            max_depth,
             locked,
             breadcrumb,
             headword,
@@ -9164,6 +9342,7 @@ impl RichUiBridge {
         ) = {
             let st = self.state.borrow();
             let depth = st.nested_stack.len();
+            let max_depth = st.settings.max_recursion_depth;
             if let Some(top) = st.nested_stack.last() {
                 let crumb = st
                     .nested_stack
@@ -9180,6 +9359,7 @@ impl RichUiBridge {
                     .collect();
                 (
                     depth,
+                    max_depth,
                     top.locked,
                     crumb,
                     top.headword.clone(),
@@ -9195,6 +9375,7 @@ impl RichUiBridge {
             } else {
                 (
                     0,
+                    max_depth,
                     false,
                     String::new(),
                     String::new(),
@@ -9211,7 +9392,7 @@ impl RichUiBridge {
         };
         let pb = app.global::<PopupBridge>();
         pb.set_nested_depth(depth as i32);
-        pb.set_nested_max_depth(MAX_NESTED_POPUP_DEPTH as i32);
+        pb.set_nested_max_depth(max_depth as i32);
         pb.set_nested_locked(locked);
         pb.set_nested_breadcrumb(breadcrumb.into());
         pb.set_nested_headword(headword.into());
@@ -9240,12 +9421,12 @@ impl RichUiBridge {
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
             let popped = st.nested_stack.pop().is_some();
+            st.nested_body_hover_count = 0;
             if let Some(top) = st.nested_stack.last_mut() {
                 top.scan_highlight = None;
             } else {
                 st.root_scan_highlight = None;
                 st.nested_card_hovered = false;
-                st.nested_body_hovered = false;
                 st.pending_nested_anki_add = None;
             }
             popped
@@ -9270,7 +9451,7 @@ impl RichUiBridge {
             st.nested_stack.clear();
             st.root_scan_highlight = None;
             st.nested_card_hovered = false;
-            st.nested_body_hovered = false;
+            st.nested_body_hover_count = 0;
             st.pending_nested_anki_add = None;
             had_any
         };
@@ -9289,7 +9470,7 @@ impl RichUiBridge {
             let Some(top) = st.nested_stack.last() else {
                 return;
             };
-            if top.locked || st.nested_card_hovered || st.nested_body_hovered {
+            if top.locked || st.nested_card_hovered || st.nested_body_hover_count > 0 {
                 false
             } else {
                 let parent_depth = (st.nested_stack.len() - 1) as i32;
@@ -9320,7 +9501,7 @@ impl RichUiBridge {
                     let Some(top) = st.nested_stack.last() else {
                         return;
                     };
-                    if top.locked || st.nested_card_hovered || st.nested_body_hovered {
+                    if top.locked || st.nested_card_hovered || st.nested_body_hover_count > 0 {
                         false
                     } else {
                         let parent_depth = (st.nested_stack.len() - 1) as i32;
@@ -9345,18 +9526,23 @@ impl RichUiBridge {
         target: HoveredGlossaryTarget,
         locked: bool,
     ) {
-        if target.depth < 0 || (target.depth as usize) >= MAX_NESTED_POPUP_DEPTH {
-            return;
-        }
-        let (excluded, search_config) = {
+        let (max_depth, excluded, search_config) = {
             let st = self.state.borrow();
+            let max_depth = st.settings.max_recursion_depth;
+            if target.depth < 0 || (target.depth as usize) >= max_depth {
+                return;
+            }
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
             (
+                max_depth,
                 st.settings.excluded_glossaries.clone(),
                 st.settings.dict_search_config(),
             )
         };
+        if max_depth == 0 {
+            return;
+        }
         let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         app.global::<PopupBridge>().set_nested_searching(true);
         let _ = self.nested_tx.send(NestedScanRequest {
@@ -9440,10 +9626,12 @@ impl RichUiBridge {
         let new_depth_opt = {
             let mut st = self.state.borrow_mut();
             let parent_depth = resp.parent_depth.max(0) as usize;
-            if parent_depth > st.nested_stack.len() || parent_depth >= MAX_NESTED_POPUP_DEPTH {
+            let max_depth = st.settings.max_recursion_depth;
+            if parent_depth > st.nested_stack.len() || parent_depth >= max_depth {
                 None
             } else {
                 st.nested_stack.truncate(parent_depth);
+                st.nested_body_hover_count = 0;
                 let hl_count = resp
                     .matched_char_count
                     .clamp(1, resp.cell_indices.len().max(1));
@@ -9540,18 +9728,18 @@ impl RichUiBridge {
         let over_action_zone = doc.hit_zones.iter().any(|z| {
             z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
         });
-        let is_dragging = {
+        let (is_dragging, max_depth) = {
             let st = self.state.borrow();
-            if depth == 0 {
+            let dragging = if depth == 0 {
                 st.selection.as_ref().is_some_and(|s| s.dragging)
             } else {
                 st.nested_level(depth)
                     .and_then(|lvl| lvl.selection.as_ref())
                     .is_some_and(|s| s.dragging)
-            }
+            };
+            (dragging, st.settings.max_recursion_depth)
         };
-        if over_action_zone || is_dragging || depth < 0 || (depth as usize) >= MAX_NESTED_POPUP_DEPTH
-        {
+        if over_action_zone || is_dragging || depth < 0 || (depth as usize) >= max_depth {
             let mut st = self.state.borrow_mut();
             st.hovered_glossary_target = None;
             st.nested_scan_timer.stop();
@@ -9585,6 +9773,11 @@ impl RichUiBridge {
 
         let (method, mod_setting, delay_ms, already_showing_this) = {
             let mut st = self.state.borrow_mut();
+            // Clear stale subtitle / ASS hover targets so pressing the scan modifier while
+            // hovering a glossary word NEVER re-scans the underlying subtitle instead.
+            st.hovered_ass_target = None;
+            st.hovered_cluster = None;
+            st.scan_timer.stop();
             st.hovered_glossary_target = Some(target.clone());
             let already = st.nested_stack.get(depth as usize).is_some_and(|child| {
                 child.source_row_index == row_idx && child.source_start_char == char_idx
@@ -9668,8 +9861,11 @@ impl RichUiBridge {
         popup_y: f32,
     ) {
         self.ensure_fresh_db_and_config(app);
-        let enabled = self.state.borrow().settings.middle_mouse_scan;
-        if !enabled || depth < 0 || (depth as usize) >= MAX_NESTED_POPUP_DEPTH {
+        let (enabled, max_depth) = {
+            let st = self.state.borrow();
+            (st.settings.middle_mouse_scan, st.settings.max_recursion_depth)
+        };
+        if !enabled || depth < 0 || (depth as usize) >= max_depth {
             return;
         }
         let Some(doc) = self.latest_cached_doc_at_depth(depth, row_idx) else {
@@ -9692,7 +9888,13 @@ impl RichUiBridge {
             anchor_x: popup_x,
             anchor_y: popup_y,
         };
-        self.state.borrow_mut().hovered_glossary_target = Some(target.clone());
+        {
+            let mut st = self.state.borrow_mut();
+            st.hovered_ass_target = None;
+            st.hovered_cluster = None;
+            st.scan_timer.stop();
+            st.hovered_glossary_target = Some(target.clone());
+        }
         self.dispatch_nested_scan(app, target, true);
     }
 
@@ -10011,10 +10213,15 @@ impl RichUiBridge {
                 row_anki_tags: vec![SharedString::default(); row_count],
             };
             let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
+            let max_depth = st.settings.max_recursion_depth;
+            if max_depth == 0 {
+                return;
+            }
             st.nested_stack.truncate(base);
-            if st.nested_stack.len() >= MAX_NESTED_POPUP_DEPTH {
+            if st.nested_stack.len() >= max_depth {
                 st.nested_stack.pop();
             }
+            st.nested_body_hover_count = 0;
             st.nested_stack.push(level);
             st.nested_stack.len()
         };
@@ -10088,10 +10295,15 @@ impl RichUiBridge {
                 row_anki_tags: vec![SharedString::default(); row_count],
             };
             let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
+            let max_depth = st.settings.max_recursion_depth;
+            if max_depth == 0 {
+                return;
+            }
             st.nested_stack.truncate(base);
-            if st.nested_stack.len() >= MAX_NESTED_POPUP_DEPTH {
+            if st.nested_stack.len() >= max_depth {
                 st.nested_stack.pop();
             }
+            st.nested_body_hover_count = 0;
             st.nested_stack.push(level);
             st.nested_stack.len()
         };
@@ -10276,6 +10488,70 @@ impl RichUiBridge {
     }
 }
 
+fn matched_prefix_u16_by_norm(sub_q: &str, target: &str) -> Option<usize> {
+    if target.is_empty() || sub_q.is_empty() {
+        return None;
+    }
+    if sub_q.starts_with(target) {
+        return Some(target.encode_utf16().count());
+    }
+    let target_norm = crate::controller::dict::normalize_reading(target);
+    if target_norm.is_empty() {
+        return None;
+    }
+    let mut acc = String::new();
+    let mut u16_len = 0usize;
+    for ch in sub_q.chars() {
+        acc.push(ch);
+        u16_len += ch.len_utf16();
+        let norm = crate::controller::dict::normalize_reading(&acc);
+        if norm == target_norm {
+            return Some(u16_len);
+        }
+        if !target_norm.starts_with(&norm) && norm.len() >= target_norm.len() {
+            break;
+        }
+    }
+    None
+}
+
+/// Compute the exact UTF-16 highlight span length for a subtitle lookup against `pending_sub`,
+/// always querying `dict_ctrl.search(sub_q)` -> `last_match_units()` regardless of whether
+/// `first_hit.derivation` is empty (so kana-reading matches like `いいわけ` -> `言い訳` highlight
+/// all 4 matched kana characters instead of only the 3-char kanji expression length).
+fn compute_subtitle_lookup_match_u16(
+    dict_ctrl: &mut DictController,
+    first_hit: Option<&SearchHit>,
+    pending_sub: Option<&str>,
+) -> usize {
+    if let Some(sub_q) = pending_sub {
+        let trimmed = sub_q.trim();
+        if !trimmed.is_empty() {
+            let _ = dict_ctrl.search(trimmed);
+            let units = dict_ctrl.last_match_units();
+            if units > 0 {
+                return units;
+            }
+            if let Some(first) = first_hit {
+                let expr_m = matched_prefix_u16_by_norm(trimmed, &first.expression);
+                let read_m = matched_prefix_u16_by_norm(trimmed, &first.reading);
+                if let Some(best) = match (expr_m, read_m) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                } {
+                    return best.max(1);
+                }
+            }
+        }
+    }
+    first_hit
+        .map(|h| h.expression.encode_utf16().count())
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn is_modifier_only_key_text(text: &str) -> Option<(bool, bool, bool, bool)> {
     use slint::platform::Key;
     let mut chars = text.chars();
@@ -10293,6 +10569,31 @@ fn is_modifier_only_key_text(text: &str) -> Option<(bool, bool, bool, bool)> {
         Some((false, false, false, true))
     } else {
         None
+    }
+}
+
+/// Resolve a bare modifier key press into `(control, shift, alt, meta)` flags,
+/// supporting both Slint's private-use `Key::*` encodings, named modifier strings,
+/// and `winit` events where `text` is empty while a modifier flag is active.
+fn resolve_bare_modifier_event(
+    text: &str,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    meta: bool,
+) -> Option<(bool, bool, bool, bool)> {
+    if let Some((mc, ms, ma, mm)) = is_modifier_only_key_text(text) {
+        return Some((control || mc, shift || ms, alt || ma, meta || mm));
+    }
+    if text.is_empty() && (control || shift || alt || meta) {
+        return Some((control, shift, alt, meta));
+    }
+    match text {
+        "Shift" => Some((control, true, alt, meta)),
+        "Control" | "Ctrl" => Some((true, shift, alt, meta)),
+        "Alt" => Some((control, shift, true, meta)),
+        "Meta" | "Super" => Some((control, shift, alt, true)),
+        _ => None,
     }
 }
 
@@ -10515,6 +10816,7 @@ pub fn install_rich_ui_bridges(
 ) {
     let settings = CachedConfigSettings::from_controller(config, config_dir);
     let middle_mouse_default = settings.middle_mouse_scan;
+    let initial_max_recursion_depth = settings.max_recursion_depth;
     let initial_sub_bg = settings.subtitle_style.bg_rgba;
     let initial_anki_show_tag = settings.anki_show_tag;
     let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
@@ -10827,7 +11129,7 @@ pub fn install_rich_ui_bridges(
             nested_stack: Vec::new(),
             hovered_glossary_target: None,
             nested_card_hovered: false,
-            nested_body_hovered: false,
+            nested_body_hover_count: 0,
             nested_scan_timer: slint::Timer::default(),
             nested_dismiss_timer: slint::Timer::default(),
             pending_nested_anki_add: None,
@@ -10866,6 +11168,7 @@ pub fn install_rich_ui_bridges(
     let pb = app.global::<PopupBridge>();
     pb.set_rich_enabled(true);
     pb.set_anki_show_tags(initial_anki_show_tag);
+    pb.set_nested_max_depth(initial_max_recursion_depth as i32);
     apply_popup_css_theme_to_bridge(app, &initial_popup_theme);
     pb.on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
 
@@ -11473,9 +11776,11 @@ pub fn install_rich_ui_bridges(
     pb.on_nested_body_hover_changed(move |hovered| {
         {
             let mut st = b_nbhover.state.borrow_mut();
-            st.nested_body_hovered = hovered;
             if hovered {
+                st.nested_body_hover_count = st.nested_body_hover_count.saturating_add(1);
                 st.nested_dismiss_timer.stop();
+            } else {
+                st.nested_body_hover_count = st.nested_body_hover_count.saturating_sub(1);
             }
         }
         if !hovered {
@@ -11535,12 +11840,11 @@ pub fn install_rich_ui_bridges(
 
     let b_pkey = bridge.clone();
     pb.on_popup_key_pressed(move |text, control, shift, alt, meta| {
-        if let Some((mc, ms, ma, mm)) = is_modifier_only_key_text(text.as_str()) {
-            let c = control || mc;
-            let s = shift || ms;
-            let a = alt || ma;
-            let m = meta || mm;
+        if let Some((c, s, a, m)) =
+            resolve_bare_modifier_event(text.as_str(), control, shift, alt, meta)
+        {
             if let Some(app) = b_pkey.app_weak.upgrade() {
+                b_pkey.ensure_fresh_db_and_config(&app);
                 if app.get_dict_open() {
                     let (mod_setting, target_opt) = {
                         let st = b_pkey.state.borrow();
@@ -11990,16 +12294,18 @@ pub fn install_rich_ui_bridges(
             )
         };
         if modifier_matches_setting(mod_setting, control, shift, alt, meta) {
-            if let Some(ass_target) = ass_target_opt {
-                b_stat_mod.trigger_ass_scan_now(&app, ass_target);
-            } else if let Some(cluster) = cluster_opt {
-                b_stat_mod.trigger_subtitle_scan_now(&app, cluster);
-            } else if app.get_dict_open() {
+            if app.get_dict_open() {
                 if let Some(target) = gloss_target_opt {
                     if !b_stat_mod.is_nested_target_already_shown(&target) {
                         b_stat_mod.dispatch_nested_scan(&app, target, false);
                     }
+                    return;
                 }
+            }
+            if let Some(ass_target) = ass_target_opt {
+                b_stat_mod.trigger_ass_scan_now(&app, ass_target);
+            } else if let Some(cluster) = cluster_opt {
+                b_stat_mod.trigger_subtitle_scan_now(&app, cluster);
             }
         }
     });
@@ -12173,14 +12479,11 @@ pub fn install_rich_ui_bridges(
         let Some(app) = b_hkey.app_weak.upgrade() else {
             return false;
         };
-        if let Some((mc, ms, ma, mm)) = is_modifier_only_key_text(text.as_str()) {
+        if let Some((c, s, a, m)) =
+            resolve_bare_modifier_event(text.as_str(), control, shift, alt, meta)
+        {
             app.global::<SubtitleOverlayBridge>()
-                .invoke_stationary_modifier_changed(
-                    control || mc,
-                    shift || ms,
-                    alt || ma,
-                    meta || mm,
-                );
+                .invoke_stationary_modifier_changed(c, s, a, m);
             return true;
         }
         false
@@ -12199,9 +12502,22 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     let Some(bridge) = bridge else {
         return;
     };
-    let (middle_mouse, sub_bg, popup_theme) = {
+    let (middle_mouse, max_recursion_depth, truncated_nested, sub_bg, popup_theme) = {
         let mut st = bridge.state.borrow_mut();
         st.settings.apply_controller(config);
+        let max_depth = st.settings.max_recursion_depth;
+        let mut truncated = false;
+        if st.nested_stack.len() > max_depth {
+            st.nested_stack.truncate(max_depth);
+            st.nested_body_hover_count = 0;
+            if let Some(top) = st.nested_stack.last_mut() {
+                top.scan_highlight = None;
+            } else {
+                st.root_scan_highlight = None;
+                st.nested_card_hovered = false;
+            }
+            truncated = true;
+        }
         st.stylesheets.force_reload_user_css();
         let sig = crate::controller::dict::db_file_fingerprint(&bridge.db_path);
         if sig != st.db_sig {
@@ -12214,6 +12530,8 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         st.clear_all_glossary_caches();
         (
             st.settings.middle_mouse_scan,
+            max_depth,
+            truncated,
             st.settings.subtitle_style.bg_rgba,
             st.effective_popup_theme(),
         )
@@ -12221,6 +12539,10 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     apply_popup_css_theme_to_bridge(app, &popup_theme);
     let pb = app.global::<PopupBridge>();
     pb.set_anki_show_tags(config.anki_show_tag());
+    pb.set_nested_max_depth(max_recursion_depth as i32);
+    if truncated_nested {
+        bridge.sync_nested_popup_to_bridge(app, true);
+    }
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
     if pb.get_nested_depth() > 0 {
         pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
@@ -12291,6 +12613,17 @@ pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
             ctrl.clear_lookup_highlight(app);
         }
     }
+}
+
+/// Returns the active regular-subtitle highlight UTF-16 range `(start, end)` for the open popup, if any.
+pub fn active_subtitle_scan_utf16_range(app: &MementoApp) -> Option<(usize, usize)> {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .and_then(|bridge| bridge.state.borrow().active_scan_utf16_range)
+    })
 }
 
 /// Returns the active ASS per-speaker lookup context (if the open popup came from
