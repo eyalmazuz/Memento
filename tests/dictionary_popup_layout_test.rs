@@ -2705,4 +2705,103 @@ mod rich_popup_phase4_tests {
             m14.glyph_y_px
         );
     }
+
+    #[test]
+    fn short_popup_and_nested_popup_entries_align_to_top_of_scroll_viewport() {
+        init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
+        let single_row = DictResult {
+            index: 1,
+            expression: "鳥白島".into(),
+            reading: "とりしろじま".into(),
+            dict_name: "JMdict".into(),
+            selected: true,
+            term_start: true,
+            term_end: true,
+            glossary_blocks: Rc::new(VecModel::from(vec![PopupGlossaryBlock {
+                text: "Torishirojima".into(),
+                kind: 2,
+                href: "".into(),
+            }]))
+            .into(),
+            ..Default::default()
+        };
+        memento_app::set_dictionary_rows(&app, vec![single_row.clone()]);
+        app.set_dict_query("鳥白島".into());
+        app.set_dict_reading("とりしろじま".into());
+        app.set_dict_open(true);
+
+        let pb = app.global::<PopupBridge>();
+        pb.set_rich_enabled(true);
+        pb.set_nested_depth(1);
+        pb.set_nested_headword("座席".into());
+        pb.set_nested_breadcrumb("座席".into());
+        pb.set_nested_results(Rc::new(VecModel::from(vec![DictResult {
+            index: 1,
+            expression: "座席".into(),
+            reading: "ざせき".into(),
+            dict_name: "JMdict".into(),
+            selected: true,
+            term_start: true,
+            term_end: true,
+            glossary_blocks: Rc::new(VecModel::from(vec![PopupGlossaryBlock {
+                text: "seat".into(),
+                kind: 2,
+                href: "".into(),
+            }]))
+            .into(),
+            ..Default::default()
+        }]))
+        .into());
+        app.show().unwrap();
+
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+            return;
+        }
+
+        let def_list = ElementQuery::from_root(&app)
+            .match_id("YomitanPopup::definition-list")
+            .find_first()
+            .expect("YomitanPopup::definition-list");
+        let row_wrapper = ElementQuery::from_root(&app)
+            .match_id("YomitanPopup::row-wrapper")
+            .find_first()
+            .expect("YomitanPopup::row-wrapper");
+        let top_gap = row_wrapper.absolute_position().y - def_list.absolute_position().y;
+        assert!(
+            row_wrapper.size().height < def_list.size().height - 100.0,
+            "fixture must be shorter than scroll viewport to catch vertical centering (row_h={}, list_h={})",
+            row_wrapper.size().height,
+            def_list.size().height
+        );
+        assert!(
+            (-1.0..=16.0).contains(&top_gap),
+            "short YomitanPopup entry must align to top of ScrollView, not center vertically (top_gap={top_gap}, row_y={}, list_y={})",
+            row_wrapper.absolute_position().y,
+            def_list.absolute_position().y
+        );
+
+        let nested_list = ElementQuery::from_root(&app)
+            .match_id("YomitanPopup::nested-definition-list")
+            .find_first()
+            .expect("YomitanPopup::nested-definition-list");
+        let nested_row = ElementQuery::from_root(&app)
+            .match_id("YomitanPopup::nested-row-wrapper")
+            .find_first()
+            .expect("YomitanPopup::nested-row-wrapper");
+        let nested_top_gap = nested_row.absolute_position().y - nested_list.absolute_position().y;
+        assert!(
+            nested_row.size().height < nested_list.size().height - 80.0,
+            "nested fixture must be shorter than scroll viewport (row_h={}, list_h={})",
+            nested_row.size().height,
+            nested_list.size().height
+        );
+        assert!(
+            (-1.0..=16.0).contains(&nested_top_gap),
+            "short nested popup entry must align to top of ScrollView, not center vertically (nested_top_gap={nested_top_gap}, row_y={}, list_y={})",
+            nested_row.absolute_position().y,
+            nested_list.absolute_position().y
+        );
+    }
 }

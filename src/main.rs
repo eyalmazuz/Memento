@@ -5610,23 +5610,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             continue;
                         }
-                        let remove_regex = app.get_search_remove_regex();
-                        let replace_lines = app.get_search_replace_lines();
-                        let replace_with = app.get_search_replace_with();
                         let entries: Vec<memento_subtitle::SubtitleEntry> = cues
                             .into_iter()
                             .filter_map(|cue| {
-                                let filtered = filter_subtitle_text(
-                                    &cue.plain_text,
-                                    remove_regex.as_str(),
-                                    replace_lines,
-                                    replace_with.as_str(),
-                                );
-                                if filtered.trim().is_empty() || cue.end_ms <= cue.start_ms {
+                                if cue.plain_text.trim().is_empty() || cue.end_ms <= cue.start_ms {
                                     return None;
                                 }
                                 Some(controller::subtitles::create_cue(
-                                    &filtered,
+                                    &cue.plain_text,
                                     cue.start_ms as f64 / 1000.0,
                                     cue.end_ms as f64 / 1000.0,
                                 ))

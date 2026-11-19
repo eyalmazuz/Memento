@@ -737,7 +737,7 @@ end)
             &app,
             vec![
                 DictResult {
-                    index: 0,
+                    index: 1,
                     expression: "鳥白島".into(),
                     reading: "とりしろじま".into(),
                     dict_name: "JMdict".into(),
@@ -928,7 +928,7 @@ end)
         set_dictionary_rows(
             &app,
             vec![DictResult {
-                index: 0,
+                index: 1,
                 expression: "座席".into(),
                 reading: "ざせき".into(),
                 dict_name: "JMdict".into(),
@@ -962,7 +962,7 @@ end)
         set_dictionary_rows(
             &app,
             vec![DictResult {
-                index: 0,
+                index: 1,
                 expression: "羽依里".into(),
                 reading: "はいり".into(),
                 dict_name: "JMnedict".into(),

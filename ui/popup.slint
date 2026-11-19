@@ -1149,8 +1149,11 @@ export component YomitanPopup inherits Rectangle {
             changed viewport-height => { self.fill-viewport(); }
             changed height => { self.fill-viewport(); }
             definition-content := VerticalLayout {
+                x: 0px;
+                y: 0px;
                 width: parent.width;
                 height: self.preferred-height;
+                alignment: start;
                 spacing: 0px;
                 for res[idx] in root.results : row-wrapper := Rectangle {
                 property <bool> hidden-by-grid: root.use-two-columns && !res.term-start;
@@ -1919,8 +1922,11 @@ export component YomitanPopup inherits Rectangle {
                     }
                 }
                 nested-definition-content := VerticalLayout {
+                    x: 0px;
+                    y: 0px;
                     width: parent.width;
                     height: self.preferred-height;
+                    alignment: start;
                     spacing: 0px;
 
                     for nres[nidx] in PopupBridge.nested-results : nested-row-wrapper := Rectangle {
