@@ -169,10 +169,10 @@ pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
     let full = Rc::new(VecModel::from(rows.clone()));
     app.set_dict_results(full.into());
     let full = app.get_dict_results();
-    let first_batch_end = next_popup_batch_end(&full, 0);
-    app.set_popup_loaded_count(first_batch_end as i32);
+    let total = full.row_count();
+    app.set_popup_loaded_count(total as i32);
     app.set_popup_results(
-        Rc::new(VecModel::from(popup_rows_through(&full, first_batch_end))).into(),
+        Rc::new(VecModel::from(popup_rows_through(&full, total))).into(),
     );
 
     let pb = app.global::<PopupBridge>();
@@ -408,7 +408,11 @@ pub fn install_popup_navigation(app: &MementoApp) {
             if start >= full.row_count() {
                 return;
             }
-            let end = next_popup_batch_end(&full, start);
+            let end = if force {
+                full.row_count()
+            } else {
+                next_popup_batch_end(&full, start)
+            };
             let popup = app.get_popup_results();
             if let Some(model) = popup.as_any().downcast_ref::<VecModel<DictResult>>() {
                 for index in start..end {
@@ -716,9 +720,17 @@ struct PositionedSvgCluster {
 }
 
 #[derive(Clone)]
+struct RenderedColorGlyph {
+    pixmap: Arc<tiny_skia::Pixmap>,
+    left: f32,
+    top: f32,
+}
+
+#[derive(Clone)]
 pub struct ShapedSubtitleToken {
     pub width_px: f32,
     pub height_px: f32,
+    pub bleed_x_px: f32,
     pub glyph_x_px: f32,
     pub glyph_y_px: f32,
     pub glyph_width_px: f32,
@@ -744,11 +756,87 @@ struct SubtitleCacheKey {
     italic: bool,
 }
 
+#[derive(Clone)]
+struct CachedAlphaGlyph {
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    mask: Arc<[u8]>,
+}
+
+struct PositionedMaskGlyph {
+    x: i32,
+    y: i32,
+    glyph: CachedAlphaGlyph,
+    rgba: [u8; 4],
+}
+
+fn blit_alpha_glyph(
+    pixmap: &mut tiny_skia::Pixmap,
+    x0: i32,
+    y0: i32,
+    glyph: &CachedAlphaGlyph,
+    rgba: [u8; 4],
+) {
+    let pw = pixmap.width() as i32;
+    let ph = pixmap.height() as i32;
+    let gw = glyph.width as i32;
+    let gh = glyph.height as i32;
+    let [sr, sg, sb, sa] = rgba;
+    let sa_u = u32::from(sa);
+    if sa_u == 0 || gw <= 0 || gh <= 0 {
+        return;
+    }
+    let sy_start = (-y0).max(0);
+    let sy_end = (ph - y0).min(gh);
+    let sx_start = (-x0).max(0);
+    let sx_end = (pw - x0).min(gw);
+    if sy_start >= sy_end || sx_start >= sx_end {
+        return;
+    }
+    let pixels = pixmap.pixels_mut();
+    let pw_u = pw as usize;
+    let gw_u = gw as usize;
+    for sy in sy_start..sy_end {
+        let row_off = (y0 + sy) as usize * pw_u;
+        let mask_row = (sy as usize) * gw_u;
+        for sx in sx_start..sx_end {
+            let cov = u32::from(glyph.mask[mask_row + sx as usize]);
+            if cov == 0 {
+                continue;
+            }
+            let alpha = (cov * sa_u + 127) / 255;
+            if alpha == 0 {
+                continue;
+            }
+            let inv_a = 255 - alpha;
+            let idx = row_off + (x0 + sx) as usize;
+            let dst = pixels[idx];
+            let out_a = (alpha + (u32::from(dst.alpha()) * inv_a + 127) / 255).min(255) as u8;
+            let out_r = ((u32::from(sr) * alpha + u32::from(dst.red()) * inv_a + 127) / 255)
+                .min(u32::from(out_a)) as u8;
+            let out_g = ((u32::from(sg) * alpha + u32::from(dst.green()) * inv_a + 127) / 255)
+                .min(u32::from(out_a)) as u8;
+            let out_b = ((u32::from(sb) * alpha + u32::from(dst.blue()) * inv_a + 127) / 255)
+                .min(u32::from(out_a)) as u8;
+            if let Some(pm) = tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a) {
+                pixels[idx] = pm;
+            }
+        }
+    }
+}
+
 struct TextEngine {
     font_cx: FontContext,
     layout_cx: LayoutContext<[u8; 4]>,
+    scale_cx: swash::scale::ScaleContext,
     fontdb: Arc<usvg::fontdb::Database>,
     registered_fonts: HashMap<(u64, u32), RegisteredFontInfo>,
+    font_is_color: HashMap<(u64, u32), bool>,
+    emoji_cache: HashMap<(u64, u32, u16, i32), Option<RenderedColorGlyph>>,
+    alpha_glyph_cache: HashMap<(u64, u32, u16, i32, i8), Option<CachedAlphaGlyph>>,
+    default_svg_fonts_primed: bool,
     subtitle_cache: HashMap<SubtitleCacheKey, ShapedSubtitleToken>,
     devoice_circle: Option<slint::Image>,
 }
@@ -757,15 +845,245 @@ thread_local! {
     static SHARED_TEXT_ENGINE: RefCell<TextEngine> = RefCell::new(TextEngine::new());
 }
 
+const RICH_EMOJI_FALLBACK_STACK: &str =
+    "Noto Sans CJK JP, Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, sans-serif";
+
 impl TextEngine {
     fn new() -> Self {
         Self {
             font_cx: FontContext::new(),
             layout_cx: LayoutContext::new(),
+            scale_cx: swash::scale::ScaleContext::new(),
             fontdb: Arc::new(usvg::fontdb::Database::new()),
             registered_fonts: HashMap::new(),
+            font_is_color: HashMap::new(),
+            emoji_cache: HashMap::new(),
+            alpha_glyph_cache: HashMap::new(),
+            default_svg_fonts_primed: false,
             subtitle_cache: HashMap::new(),
             devoice_circle: None,
+        }
+    }
+
+    /// Ensure `self.fontdb` has a real CJK-capable sans-serif font registered and mapped
+    /// to SVG generic families (`sans-serif`, `serif`, `monospace`). Dictionary SVGs such
+    /// as `smk8/運用-fill.svg` use `<text font-family="sans-serif">` inside `<mask>`; if
+    /// `sans-serif` is unresolved, the cutout text disappears and renders as a solid box.
+    fn ensure_default_svg_fonts(&mut self) {
+        if self.default_svg_fonts_primed {
+            return;
+        }
+        self.default_svg_fonts_primed = true;
+        let sample = self.shape_single_line("運用あA", "", 16.0, 400, false, [255, 255, 255, 255]);
+        let mut primary_family: Option<String> = None;
+        for line in sample.lines() {
+            for run in line.runs() {
+                let info = self.ensure_font_registered(run.font().clone().borrow_font());
+                if primary_family.is_none() {
+                    primary_family = Some(info.family);
+                }
+            }
+        }
+        if let Some(family) = primary_family {
+            let db = Arc::make_mut(&mut self.fontdb);
+            db.set_sans_serif_family(&family);
+            db.set_serif_family(&family);
+            db.set_monospace_family(&family);
+        }
+    }
+
+    fn font_supports_color(&mut self, font: &parley::FontData) -> bool {
+        let key = (font.data.id(), font.index);
+        if let Some(&is_color) = self.font_is_color.get(&key) {
+            return is_color;
+        }
+        let is_color = swash::FontRef::from_index(font.data.data(), font.index as usize)
+            .is_some_and(|font_ref| {
+                let scaler = self.scale_cx.builder(font_ref).size(16.0).build();
+                scaler.has_color_bitmaps() || scaler.has_color_outlines()
+            });
+        self.font_is_color.insert(key, is_color);
+        is_color
+    }
+
+    fn try_render_color_glyph(
+        &mut self,
+        font: &parley::FontData,
+        glyph_id: u16,
+        font_size: f32,
+    ) -> Option<RenderedColorGlyph> {
+        if !self.font_supports_color(font) {
+            return None;
+        }
+        let size_tenth = (font_size * 10.0).round() as i32;
+        let key = (font.data.id(), font.index, glyph_id, size_tenth);
+        if let Some(cached) = self.emoji_cache.get(&key) {
+            return cached.clone();
+        }
+        if self.emoji_cache.len() > 2048 {
+            self.emoji_cache.clear();
+        }
+        let rendered = (|| -> Option<RenderedColorGlyph> {
+            let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)?;
+            let mut scaler = self
+                .scale_cx
+                .builder(font_ref)
+                .size(font_size.max(6.0))
+                .hint(false)
+                .build();
+            let image = swash::scale::Render::new(&[
+                swash::scale::Source::ColorOutline(0),
+                swash::scale::Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+            ])
+            .render(&mut scaler, glyph_id)?;
+            if image.content != swash::scale::image::Content::Color
+                || image.placement.width == 0
+                || image.placement.height == 0
+            {
+                return None;
+            }
+            let w = image.placement.width;
+            let h = image.placement.height;
+            let mut pixmap = tiny_skia::Pixmap::new(w, h)?;
+            for (dst, src) in pixmap.pixels_mut().iter_mut().zip(image.data.chunks_exact(4)) {
+                let [r, g, b, a] = [src[0], src[1], src[2], src[3]];
+                let pr = (u32::from(r) * u32::from(a) + 127) / 255;
+                let pg = (u32::from(g) * u32::from(a) + 127) / 255;
+                let pb = (u32::from(b) * u32::from(a) + 127) / 255;
+                if let Some(pm) =
+                    tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, a)
+                {
+                    *dst = pm;
+                }
+            }
+            Some(RenderedColorGlyph {
+                pixmap: Arc::new(pixmap),
+                left: image.placement.left as f32,
+                top: image.placement.top as f32,
+            })
+        })();
+        self.emoji_cache.insert(key, rendered.clone());
+        rendered
+    }
+
+    fn try_render_alpha_glyph(
+        &mut self,
+        font: &parley::FontData,
+        glyph_id: u16,
+        font_size: f32,
+        synthetic_italic: bool,
+    ) -> Option<CachedAlphaGlyph> {
+        let size_tenth = (font_size * 10.0).round() as i32;
+        let skew_key: i8 = if synthetic_italic { 1 } else { 0 };
+        let key = (font.data.id(), font.index, glyph_id, size_tenth, skew_key);
+        if let Some(cached) = self.alpha_glyph_cache.get(&key) {
+            return cached.clone();
+        }
+        if self.alpha_glyph_cache.len() > 16384 {
+            self.alpha_glyph_cache.clear();
+        }
+        let rendered = (|| -> Option<CachedAlphaGlyph> {
+            let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)?;
+            let mut scaler = self
+                .scale_cx
+                .builder(font_ref)
+                .size(font_size.max(6.0))
+                .hint(true)
+                .build();
+            let mut render = swash::scale::Render::new(&[
+                swash::scale::Source::Outline,
+                swash::scale::Source::Bitmap(swash::scale::StrikeWith::BestFit),
+            ]);
+            if synthetic_italic {
+                render.transform(Some(swash::zeno::Transform::skew(
+                    swash::zeno::Angle::from_degrees(-14.0),
+                    swash::zeno::Angle::ZERO,
+                )));
+            }
+            let image = render.render(&mut scaler, glyph_id)?;
+            if image.content != swash::scale::image::Content::Mask
+                || image.placement.width == 0
+                || image.placement.height == 0
+            {
+                return None;
+            }
+            Some(CachedAlphaGlyph {
+                width: image.placement.width,
+                height: image.placement.height,
+                left: image.placement.left,
+                top: image.placement.top,
+                mask: Arc::from(image.data),
+            })
+        })();
+        self.alpha_glyph_cache.insert(key, rendered.clone());
+        rendered
+    }
+
+    fn collect_glossary_glyphs_from_layout(
+        &mut self,
+        layout: &Layout<[u8; 4]>,
+        origin_x: f32,
+        origin_y: f32,
+        underline: bool,
+        strikethrough: bool,
+        collector: &mut PaintCollector,
+    ) {
+        for line in layout.lines() {
+            let baseline = origin_y + line.metrics().baseline;
+            for item in line.items() {
+                if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+                    let run = glyph_run.run();
+                    let run_font = run.font().clone();
+                    let font_size = run.font_size();
+                    let brush = glyph_run.style().brush;
+                    let is_color_font = self.font_supports_color(run_font.borrow_font());
+                    let synth_italic = run.synthesis().skew().is_some();
+                    let run_x = origin_x + glyph_run.offset();
+                    let mut gx = run_x;
+                    for g in glyph_run.positioned_glyphs() {
+                        let px = origin_x + g.x;
+                        let py = origin_y + g.y;
+                        let rendered_color = is_color_font
+                            && self
+                                .try_render_color_glyph(
+                                    run_font.borrow_font(),
+                                    g.id as u16,
+                                    font_size,
+                                )
+                                .is_some_and(|cg| {
+                                    collector.images.push((px + cg.left, py - cg.top, cg.pixmap));
+                                    true
+                                });
+                        if !rendered_color {
+                            if let Some(ag) = self.try_render_alpha_glyph(
+                                run_font.borrow_font(),
+                                g.id as u16,
+                                font_size,
+                                synth_italic,
+                            ) {
+                                collector.mask_glyphs.push(PositionedMaskGlyph {
+                                    x: px.round() as i32 + ag.left,
+                                    y: py.round() as i32 - ag.top,
+                                    glyph: ag,
+                                    rgba: brush,
+                                });
+                            }
+                        }
+                        gx = gx.max(px + g.advance);
+                    }
+                    let adv = (gx - run_x).max(0.0);
+                    if underline && adv > 0.0 {
+                        collector
+                            .rects
+                            .push((run_x, baseline + 2.0, adv, 1.0, brush));
+                    }
+                    if strikethrough && adv > 0.0 {
+                        collector
+                            .rects
+                            .push((run_x, baseline - font_size * 0.32, adv, 1.0, brush));
+                    }
+                }
+            }
         }
     }
 
@@ -816,9 +1134,9 @@ impl TextEngine {
         color: [u8; 4],
     ) -> Layout<[u8; 4]> {
         let family_stack = if font_family.trim().is_empty() {
-            Cow::Borrowed("Noto Sans CJK JP, sans-serif")
+            Cow::Borrowed(RICH_EMOJI_FALLBACK_STACK)
         } else {
-            Cow::Owned(format!("{font_family}, Noto Sans CJK JP, sans-serif"))
+            Cow::Owned(format!("{font_family}, {RICH_EMOJI_FALLBACK_STACK}"))
         };
         let mut builder = self.layout_cx.ranged_builder(&mut self.font_cx, text, 1.0, true);
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family_stack)));
@@ -859,50 +1177,130 @@ impl TextEngine {
         origin_y: f32,
         override_underline: Option<&[bool]>,
         override_strike: Option<&[bool]>,
-    ) -> Vec<PositionedSvgCluster> {
+    ) -> (Vec<PositionedSvgCluster>, Vec<(f32, f32, Arc<tiny_skia::Pixmap>)>) {
         let mut out = Vec::new();
+        let mut color_images = Vec::new();
         for line in layout.lines() {
             let baseline = origin_y + line.metrics().baseline;
+            let mut prev_run_key: Option<(usize, usize, u64, u32)> = None;
+            let mut run_glyph_cursor: usize = 0;
             for item in line.items() {
-                if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
-                    let run = glyph_run.run();
-                    let font_info = self.ensure_font_registered(run.font().clone().borrow_font());
-                    let font_size = run.font_size();
-                    let brush = glyph_run.style().brush;
-                    let run_underline = glyph_run.style().underline.is_some();
-                    let run_strike = glyph_run.style().strikethrough.is_some();
-                    let mut x_cursor = origin_x + glyph_run.offset();
-                    for cluster in run.visual_clusters() {
-                        let range = cluster.text_range();
-                        let advance = cluster.advance();
-                        if let Some(slice) = source_text.get(range.clone()) {
-                            if !slice.is_empty() && !slice.chars().all(|c| c == '\n' || c == '\r') {
-                                let ul = override_underline
-                                    .and_then(|map| map.get(range.start).copied())
-                                    .unwrap_or(run_underline);
-                                let st = override_strike
-                                    .and_then(|map| map.get(range.start).copied())
-                                    .unwrap_or(run_strike);
-                                out.push(PositionedSvgCluster {
-                                    x: x_cursor,
-                                    baseline_y: baseline,
-                                    text: slice.to_owned(),
-                                    family: font_info.family.clone(),
-                                    font_size,
-                                    weight: font_info.weight,
-                                    italic: font_info.italic,
-                                    fill_rgba: brush,
-                                    underline: ul,
-                                    strikethrough: st,
-                                });
-                            }
+                match item {
+                    PositionedLayoutItem::InlineBox(_) => {
+                        prev_run_key = None;
+                        run_glyph_cursor = 0;
+                    }
+                    PositionedLayoutItem::GlyphRun(glyph_run) => {
+                        let run = glyph_run.run();
+                        let run_font = run.font().clone();
+                        let run_key = (
+                            run.text_range().start,
+                            run.text_range().end,
+                            run_font.data.id(),
+                            run_font.index,
+                        );
+                        if prev_run_key != Some(run_key) {
+                            prev_run_key = Some(run_key);
+                            run_glyph_cursor = 0;
                         }
-                        x_cursor += advance;
+                        let glyph_start = run_glyph_cursor;
+                        let glyph_count = glyph_run.glyphs().count();
+                        run_glyph_cursor += glyph_count;
+                        let glyph_end = glyph_start + glyph_count;
+
+                        let font_info = self.ensure_font_registered(run_font.borrow_font());
+                        let font_size = run.font_size();
+                        let brush = glyph_run.style().brush;
+                        let run_underline = glyph_run.style().underline.is_some();
+                        let run_strike = glyph_run.style().strikethrough.is_some();
+                        let mut x_cursor = origin_x + glyph_run.offset();
+                        let mut cluster_glyph_idx = 0usize;
+                        let mut prev_cluster_in_slice = false;
+                        let mut prev_cluster_rendered_as_color = false;
+
+                        for cluster in run.visual_clusters() {
+                            let c_glyph_count = cluster.glyphs().count();
+                            let in_slice = if c_glyph_count == 0 {
+                                prev_cluster_in_slice || (cluster_glyph_idx == 0 && glyph_start == 0)
+                            } else {
+                                let matched = cluster_glyph_idx < glyph_end
+                                    && (cluster_glyph_idx + c_glyph_count) > glyph_start;
+                                prev_cluster_in_slice = matched;
+                                matched
+                            };
+                            cluster_glyph_idx += c_glyph_count;
+                            if !in_slice {
+                                if c_glyph_count > 0 {
+                                    prev_cluster_rendered_as_color = false;
+                                }
+                                continue;
+                            }
+
+                            let range = cluster.text_range();
+                            let advance = cluster.advance();
+                            let rendered_as_color = if c_glyph_count == 0 {
+                                // Zero-glyph ligature continuation (e.g. `\u{fe0f}`, `\u{20e3}` in
+                                // `1️⃣`/`2️⃣`, regional indicator second half in `🇯🇵`, ZWJ emoji parts):
+                                // inherit color-emoji suppression so `usvg` never paints a stray box
+                                // on top of the rendered color bitmap.
+                                prev_cluster_rendered_as_color
+                            } else if self.font_supports_color(run_font.borrow_font()) {
+                                let mut gx = x_cursor;
+                                let mut any_color = false;
+                                for g in cluster.glyphs() {
+                                    if let Some(cg) = self.try_render_color_glyph(
+                                        run_font.borrow_font(),
+                                        g.id as u16,
+                                        font_size,
+                                    ) {
+                                        color_images.push((
+                                            gx + g.x + cg.left,
+                                            baseline + g.y - cg.top,
+                                            cg.pixmap,
+                                        ));
+                                        any_color = true;
+                                    }
+                                    gx += g.advance;
+                                }
+                                prev_cluster_rendered_as_color = any_color;
+                                any_color
+                            } else {
+                                prev_cluster_rendered_as_color = false;
+                                false
+                            };
+                            if !rendered_as_color {
+                                if let Some(slice) = source_text.get(range.clone()) {
+                                    if !slice.is_empty()
+                                        && !slice.chars().all(|c| c == '\n' || c == '\r')
+                                    {
+                                        let ul = override_underline
+                                            .and_then(|map| map.get(range.start).copied())
+                                            .unwrap_or(run_underline);
+                                        let st = override_strike
+                                            .and_then(|map| map.get(range.start).copied())
+                                            .unwrap_or(run_strike);
+                                        out.push(PositionedSvgCluster {
+                                            x: x_cursor,
+                                            baseline_y: baseline,
+                                            text: slice.to_owned(),
+                                            family: font_info.family.clone(),
+                                            font_size,
+                                            weight: font_info.weight,
+                                            italic: font_info.italic,
+                                            fill_rgba: brush,
+                                            underline: ul,
+                                            strikethrough: st,
+                                        });
+                                    }
+                                }
+                            }
+                            x_cursor += advance;
+                        }
                     }
                 }
             }
         }
-        out
+        (out, color_images)
     }
 
     fn shape_and_render_subtitle_token(
@@ -925,7 +1323,7 @@ impl TextEngine {
             font_family: style.font_family.clone(),
             text_rgba: style.text_rgba,
             stroke_rgba: style.stroke_rgba,
-            bg_rgba: style.bg_rgba,
+            bg_rgba: [0, 0, 0, 0],
             stroke_tenth: (style.stroke_size * 10.0).round() as i32,
             furigana_pct: (style.furigana_ratio * 100.0).round() as i32,
             bold: style.bold,
@@ -966,8 +1364,15 @@ impl TextEngine {
         } else {
             (style.stroke_size * (font_px / 48.0)).clamp(1.2, font_px * 0.28)
         };
-        let pad_x = (stroke_px * 0.65).ceil().max(1.0);
-        let pad_y = (stroke_px * 0.5).ceil().max(1.0);
+        // Keep token layout advance equal to the true typographic width so adjacent tokens
+        // never develop artificial gaps, while letting strokes/shadows bleed visually into
+        // `bleed_x` on each side of the rendered image.
+        let bleed_x = if stroke_px > 0.0 {
+            (stroke_px * 0.75 + 1.5).ceil()
+        } else {
+            1.0
+        };
+        let pad_y = (stroke_px * 0.55).ceil().max(1.0);
 
         let furigana_ratio = style.furigana_ratio.clamp(0.25, 0.75);
         let ruby_font_px = (font_px * furigana_ratio).max(8.0);
@@ -1001,9 +1406,10 @@ impl TextEngine {
             (None, 0.0, 0.0)
         };
 
-        let total_width = (base_width.max(ruby_width) + pad_x * 2.0).ceil().max(2.0);
+        let layout_width = base_width.max(ruby_width).ceil().max(1.0);
         let total_height = (ruby_space + base_height + pad_y * 2.0).ceil().max(2.0);
-        let base_origin_x = (total_width - base_width) * 0.5;
+        let base_origin_x_token = (layout_width - base_width) * 0.5;
+        let base_origin_x_pix = bleed_x + base_origin_x_token;
         let base_origin_y = ruby_space + pad_y;
 
         let mut clusters = Vec::new();
@@ -1019,46 +1425,33 @@ impl TextEngine {
             }
         }
 
-        let base_svg_clusters = self.collect_svg_clusters_from_layout(
+        let (base_svg_clusters, base_color_images) = self.collect_svg_clusters_from_layout(
             &base_layout,
             word.text.as_str(),
-            base_origin_x,
+            base_origin_x_pix,
             base_origin_y,
             None,
             None,
         );
-        let ruby_svg_clusters = if let Some(ref r_layout) = ruby_layout {
-            let r_origin_x = (total_width - ruby_width) * 0.5;
+        let (ruby_svg_clusters, ruby_color_images) = if let Some(ref r_layout) = ruby_layout {
+            let r_origin_x_pix = bleed_x + (layout_width - ruby_width) * 0.5;
             let r_origin_y = (ruby_space - ruby_height).max(0.0) + pad_y * 0.5;
             self.collect_svg_clusters_from_layout(
                 r_layout,
                 word.reading.as_str(),
-                r_origin_x,
+                r_origin_x_pix,
                 r_origin_y,
                 None,
                 None,
             )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
-        let pix_w = (total_width.ceil() as u32).max(1);
+        let pix_w = ((layout_width + bleed_x * 2.0).ceil() as u32).max(1);
         let pix_h = (total_height.ceil() as u32).max(1);
         let mut pixmap =
             tiny_skia::Pixmap::new(pix_w, pix_h).unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
-
-        if style.bg_rgba[3] > 0 {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color_rgba8(
-                style.bg_rgba[0],
-                style.bg_rgba[1],
-                style.bg_rgba[2],
-                style.bg_rgba[3],
-            );
-            if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, pix_w as f32, pix_h as f32) {
-                pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
-            }
-        }
 
         let mut svg = String::with_capacity(512);
         svg.push_str(&format!(
@@ -1097,11 +1490,30 @@ impl TextEngine {
             resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
         }
 
+        if !ruby_color_images.is_empty() || !base_color_images.is_empty() {
+            let img_paint = tiny_skia::PixmapPaint {
+                opacity: 1.0,
+                blend_mode: tiny_skia::BlendMode::SourceOver,
+                quality: tiny_skia::FilterQuality::Bilinear,
+            };
+            for (ix, iy, img_pm) in ruby_color_images.into_iter().chain(base_color_images) {
+                pixmap.draw_pixmap(
+                    ix.round() as i32,
+                    iy.round() as i32,
+                    (*img_pm).as_ref(),
+                    &img_paint,
+                    tiny_skia::Transform::default(),
+                    None,
+                );
+            }
+        }
+
         let image = pixmap_to_slint_image(&pixmap);
         let shaped = ShapedSubtitleToken {
-            width_px: total_width,
+            width_px: layout_width,
             height_px: total_height,
-            glyph_x_px: base_origin_x,
+            bleed_x_px: bleed_x,
+            glyph_x_px: base_origin_x_token,
             glyph_y_px: base_origin_y,
             glyph_width_px: base_width,
             glyph_height_px: base_height,
@@ -1592,12 +2004,1886 @@ pub fn collect_dictionary_resource_dirs(
     dirs
 }
 
+pub const CUSTOM_POPUP_CSS_FILENAME: &str = "popup.css";
+pub const CUSTOM_POPUP_OUTER_CSS_FILENAME: &str = "popup-outer.css";
+
+pub fn default_custom_popup_css_template() -> &'static str {
+    r#"/* Memento Popup CSS (~/.config/memento/popup.css)
+ *
+ * Customize inner typography, pitch headword colors, 2-column card layout,
+ * per-dictionary badge/tint colors, hover-to-reveal dictionaries, frequency
+ * pill colors, and structured-content glossary rules.
+ */
+
+:root {
+    --text-color: #F8FAFC;
+    --muted-color: #94A3B8;
+    --headword-color: #FFFFFF;
+    --headword-size: 23px;
+    --reading-color: #94A3B8;
+    --reading-size: 12px;
+
+    --font-family: "Noto Sans CJK JP";
+    --glossary-font-size: 14.5px;
+    --link-color: #93C5FD;
+    --divider-color: #30373D;
+    --term-divider-color: #52616B;
+
+    --freq-bg: #07513E;
+    --freq-color: #9CE5C7;
+    --freq-font-size: 10px;
+    --pitch-color: #B9A1E8;
+    --pitch-dict-bg: #6640BE;
+    --dict-badge-bg: #6D28D9;
+    --dict-badge-color: #EDE9FE;
+    --anki-tag-bg: #162B3D;
+    --anki-tag-border: #38BDF888;
+    --anki-tag-color: #BAE6FD;
+
+    /* Set to 2 (with --popup-width >= 600px in popup-outer.css) for a 2-column card grid */
+    --definition-columns: 1;
+    --definition-columns-min-width: 560px;
+    --definition-gap: 8px;
+}
+
+/* Example: Color headwords by pitch accent category
+:root {
+    --pitch-heiban-color: #59b2ff;
+    --pitch-atamadaka-color: #ff6666;
+    --pitch-nakadaka-color: #ff9b54;
+    --pitch-odaka-color: #67e47d;
+    --pitch-kifuku-color: #af85f4;
+}
+*/
+
+/* Example: Per-dictionary badge color, subtle card tint & hover-to-reveal JMdict
+[data-dictionary="デジタル大辞泉"] {
+    --dict-color: rgb(170, 0, 0);
+    --dict-bg-opacity: 0.08;
+}
+[data-dictionary*="JMdict"] {
+    --dict-color: rgb(0, 132, 255);
+    --dict-bg-opacity: 0.04;
+    --glossary-opacity: 0;
+    --glossary-hover-opacity: 1;
+    --glossary-solo-opacity: 1;
+}
+*/
+
+/* Example: Per-frequency-dictionary pill colors
+[data-frequency^="JPDB"] { background-color: #ff3e3d; color: #ffffff; }
+[data-frequency="CC100"]   { background-color: #6238fa; color: #ffffff; }
+*/
+
+/* Example: Hide UI sections or remove link underlines
+.term-tags { display: none; }
+.pitch-dict { display: none; }
+.kanji-extra { display: none; }
+.derivations { display: compact; }
+a { text-decoration: none; }
+*/
+"#
+}
+
+pub fn default_custom_popup_outer_css_template() -> &'static str {
+    r#"/* Memento Popup Outer CSS (~/.config/memento/popup-outer.css)
+ *
+ * Controls the floating popup card container: translucent RGBA background,
+ * border, corner radius, drop shadow, padding, and optional width/height.
+ */
+
+.popup {
+    background: #1C2024;
+    border: 1px solid #384046;
+    border-radius: 8px;
+    box-shadow: 0 4px 24px #000000DD;
+    padding: 12px;
+    /* Uncomment to widen the popup (e.g. for 2-column layout):
+    width: 780px;
+    height: 520px;
+    */
+}
+"#
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CssAttrMatchOp {
+    Exists,
+    Equals,
+    StartsWith,
+    Contains,
+    EndsWith,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CssAttrMatcher {
+    pub op: CssAttrMatchOp,
+    pub value: String,
+}
+
+impl CssAttrMatcher {
+    pub fn matches(&self, target: &str) -> bool {
+        match self.op {
+            CssAttrMatchOp::Exists => !target.is_empty(),
+            CssAttrMatchOp::Equals => target == self.value,
+            CssAttrMatchOp::StartsWith => target.starts_with(&self.value),
+            CssAttrMatchOp::Contains => target.contains(&self.value),
+            CssAttrMatchOp::EndsWith => target.ends_with(&self.value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DictStyleRule {
+    pub matcher: CssAttrMatcher,
+    pub badge_bg: Option<[u8; 4]>,
+    pub badge_color: Option<[u8; 4]>,
+    pub bg_opacity: Option<f32>,
+    pub card_bg: Option<[u8; 4]>,
+    pub card_border: Option<[u8; 4]>,
+    pub glossary_opacity: Option<f32>,
+    pub glossary_hover_opacity: Option<f32>,
+    pub glossary_solo_opacity: Option<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FreqStyleRule {
+    pub matcher: CssAttrMatcher,
+    pub bg: Option<[u8; 4]>,
+    pub color: Option<[u8; 4]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PitchDictStyleRule {
+    pub matcher: CssAttrMatcher,
+    pub bg: [u8; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedDictStyle {
+    pub badge_bg: [u8; 4],
+    pub badge_color: [u8; 4],
+    pub card_bg: [u8; 4],
+    pub card_border: [u8; 4],
+    pub card_border_width: f32,
+    pub card_radius: f32,
+    pub card_padding: f32,
+    pub glossary_opacity: f32,
+    pub glossary_hover_opacity: f32,
+    pub glossary_solo_opacity: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PopupCssTheme {
+    // Outer popup frame
+    pub popup_bg: [u8; 4],
+    pub popup_border: [u8; 4],
+    pub popup_border_width: f32,
+    pub popup_radius: f32,
+    pub popup_padding: f32,
+    pub popup_shadow_blur: f32,
+    pub popup_shadow_color: [u8; 4],
+    pub popup_width: f32,
+    pub popup_height: f32,
+
+    // Typography & core colors
+    pub text_color: [u8; 4],
+    pub muted_color: [u8; 4],
+    pub headword_color: [u8; 4],
+    pub headword_size: f32,
+    pub reading_color: [u8; 4],
+    pub reading_size: f32,
+    pub font_family: String,
+    pub glossary_font_size: f32,
+    pub link_color: [u8; 4],
+    pub divider_color: [u8; 4],
+    pub term_divider_color: [u8; 4],
+
+    // Badges & tags
+    pub freq_bg: [u8; 4],
+    pub freq_color: [u8; 4],
+    pub freq_font_size: f32,
+    pub pitch_color: [u8; 4],
+    pub pitch_dict_bg: [u8; 4],
+    pub dict_badge_bg: [u8; 4],
+    pub dict_badge_color: [u8; 4],
+    pub anki_tag_bg: [u8; 4],
+    pub anki_tag_border: [u8; 4],
+    pub anki_tag_color: [u8; 4],
+
+    // Definition layout & cards
+    pub definition_columns: i32,
+    pub definition_columns_min_width: f32,
+    pub definition_gap: f32,
+    pub card_bg: [u8; 4],
+    pub card_border: [u8; 4],
+    pub card_border_width: f32,
+    pub card_radius: f32,
+    pub card_padding: f32,
+
+    // Visibility & UI toggles
+    pub show_term_tags: bool,
+    pub show_pitch_dict: bool,
+    pub show_kanji_extra: bool,
+    pub compact_derivations: bool,
+
+    // Headword pitch category colors
+    pub pitch_heiban_color: Option<[u8; 4]>,
+    pub pitch_atamadaka_color: Option<[u8; 4]>,
+    pub pitch_nakadaka_color: Option<[u8; 4]>,
+    pub pitch_odaka_color: Option<[u8; 4]>,
+    pub pitch_kifuku_color: Option<[u8; 4]>,
+
+    // Per-dictionary / per-frequency / per-pitch-dict dynamic rules
+    pub dict_color_opacity: f32,
+    pub dict_rules: Vec<DictStyleRule>,
+    pub freq_rules: Vec<FreqStyleRule>,
+    pub pitch_dict_rules: Vec<PitchDictStyleRule>,
+}
+
+impl Default for PopupCssTheme {
+    fn default() -> Self {
+        Self {
+            popup_bg: [0x1C, 0x20, 0x24, 0xFF],
+            popup_border: [0x38, 0x40, 0x46, 0xFF],
+            popup_border_width: 1.0,
+            popup_radius: 8.0,
+            popup_padding: 12.0,
+            popup_shadow_blur: 24.0,
+            popup_shadow_color: [0x00, 0x00, 0x00, 0xDD],
+            popup_width: 0.0,
+            popup_height: 0.0,
+            text_color: [0xF8, 0xFA, 0xFC, 0xFF],
+            muted_color: [0x94, 0xA3, 0xB8, 0xFF],
+            headword_color: [0xFF, 0xFF, 0xFF, 0xFF],
+            headword_size: 23.0,
+            reading_color: [0x94, 0xA3, 0xB8, 0xFF],
+            reading_size: 12.0,
+            font_family: "Noto Sans CJK JP".to_owned(),
+            glossary_font_size: 14.5,
+            link_color: [0x93, 0xC5, 0xFD, 0xFF],
+            divider_color: [0x30, 0x37, 0x3D, 0xFF],
+            term_divider_color: [0x52, 0x61, 0x6B, 0xFF],
+            freq_bg: [0x07, 0x51, 0x3E, 0xFF],
+            freq_color: [0x9C, 0xE5, 0xC7, 0xFF],
+            freq_font_size: 10.0,
+            pitch_color: [0xB9, 0xA1, 0xE8, 0xFF],
+            pitch_dict_bg: [0x66, 0x40, 0xBE, 0xFF],
+            dict_badge_bg: [0x6D, 0x28, 0xD9, 0xFF],
+            dict_badge_color: [0xED, 0xE9, 0xFE, 0xFF],
+            anki_tag_bg: [0x16, 0x2B, 0x3D, 0xFF],
+            anki_tag_border: [0x38, 0xBD, 0xF8, 0x88],
+            anki_tag_color: [0xBA, 0xE6, 0xFD, 0xFF],
+            definition_columns: 1,
+            definition_columns_min_width: 560.0,
+            definition_gap: 8.0,
+            card_bg: [0, 0, 0, 0],
+            card_border: [0, 0, 0, 0],
+            card_border_width: 0.0,
+            card_radius: 0.0,
+            card_padding: 0.0,
+            show_term_tags: true,
+            show_pitch_dict: true,
+            show_kanji_extra: true,
+            compact_derivations: false,
+            pitch_heiban_color: None,
+            pitch_atamadaka_color: None,
+            pitch_nakadaka_color: None,
+            pitch_odaka_color: None,
+            pitch_kifuku_color: None,
+            dict_color_opacity: 1.0,
+            dict_rules: Vec::new(),
+            freq_rules: Vec::new(),
+            pitch_dict_rules: Vec::new(),
+        }
+    }
+}
+
+impl PopupCssTheme {
+    pub fn resolve_headword_pitch_color(&self, category: Option<&str>) -> [u8; 4] {
+        match category {
+            Some("heiban") => self.pitch_heiban_color.unwrap_or(self.headword_color),
+            Some("atamadaka") => self.pitch_atamadaka_color.unwrap_or(self.headword_color),
+            Some("nakadaka") => self.pitch_nakadaka_color.unwrap_or(self.headword_color),
+            Some("odaka") => self.pitch_odaka_color.unwrap_or(self.headword_color),
+            Some("kifuku") => self.pitch_kifuku_color.unwrap_or(self.headword_color),
+            _ => self.headword_color,
+        }
+    }
+
+    pub fn resolve_dict_style(&self, dict_name: &str) -> ResolvedDictStyle {
+        let mut badge_bg = self.dict_badge_bg;
+        let mut badge_color = self.dict_badge_color;
+        let mut card_bg = self.card_bg;
+        let mut card_border = self.card_border;
+        let mut bg_opacity = 0.0f32;
+        let mut explicit_card_bg = false;
+        let mut glossary_opacity = 1.0f32;
+        let mut glossary_hover_opacity = 1.0f32;
+        let mut glossary_solo_opacity = 1.0f32;
+
+        for rule in &self.dict_rules {
+            if !rule.matcher.matches(dict_name) {
+                continue;
+            }
+            if let Some(c) = rule.badge_bg {
+                badge_bg = c;
+            }
+            if let Some(c) = rule.badge_color {
+                badge_color = c;
+            }
+            if let Some(op) = rule.bg_opacity {
+                bg_opacity = op;
+            }
+            if let Some(c) = rule.card_bg {
+                card_bg = c;
+                explicit_card_bg = true;
+            }
+            if let Some(c) = rule.card_border {
+                card_border = c;
+            }
+            if let Some(o) = rule.glossary_opacity {
+                glossary_opacity = o;
+            }
+            if let Some(o) = rule.glossary_hover_opacity {
+                glossary_hover_opacity = o;
+            }
+            if let Some(o) = rule.glossary_solo_opacity {
+                glossary_solo_opacity = o;
+            }
+        }
+
+        // Blend subtle per-dictionary tint when `--dict-bg-opacity` > 0 and card_bg wasn't overridden.
+        let tint_alpha = (bg_opacity * self.dict_color_opacity).clamp(0.0, 1.0);
+        if !explicit_card_bg && tint_alpha > 0.001 {
+            if card_bg[3] == 0 {
+                // Translucent overlay tint so glassy outer popup backgrounds remain translucent!
+                card_bg = [
+                    badge_bg[0],
+                    badge_bg[1],
+                    badge_bg[2],
+                    (tint_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+                ];
+            } else {
+                let mix = |a: u8, b: u8| -> u8 {
+                    (f32::from(a) * (1.0 - tint_alpha) + f32::from(b) * tint_alpha)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+                card_bg = [
+                    mix(card_bg[0], badge_bg[0]),
+                    mix(card_bg[1], badge_bg[1]),
+                    mix(card_bg[2], badge_bg[2]),
+                    card_bg[3],
+                ];
+            }
+        }
+
+        ResolvedDictStyle {
+            badge_bg,
+            badge_color,
+            card_bg,
+            card_border,
+            card_border_width: self.card_border_width,
+            card_radius: self.card_radius,
+            card_padding: self.card_padding,
+            glossary_opacity,
+            glossary_hover_opacity,
+            glossary_solo_opacity,
+        }
+    }
+
+    pub fn resolve_freq_style(&self, freq_dict: &str) -> ([u8; 4], [u8; 4]) {
+        let mut bg = self.freq_bg;
+        let mut color = self.freq_color;
+        for rule in &self.freq_rules {
+            if !rule.matcher.matches(freq_dict) {
+                continue;
+            }
+            if let Some(c) = rule.bg {
+                bg = c;
+            }
+            if let Some(c) = rule.color {
+                color = c;
+            }
+        }
+        (bg, color)
+    }
+
+    pub fn resolve_pitch_dict_bg(&self, pitch_dict: &str) -> [u8; 4] {
+        let mut bg = self.pitch_dict_bg;
+        for rule in &self.pitch_dict_rules {
+            if rule.matcher.matches(pitch_dict) {
+                bg = rule.bg;
+            }
+        }
+        bg
+    }
+}
+
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let bytes = css.as_bytes();
+    let mut i = 0usize;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(b as char);
+                let next_ch = css[i + 1..].chars().next().unwrap();
+                out.push(next_ch);
+                i += 1 + next_ch.len_utf8();
+                continue;
+            }
+            if b == q {
+                in_quote = None;
+            }
+            let ch = css[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                break;
+            }
+            continue;
+        }
+        // Strip JS-style `// ...` comments while preserving URLs like `https://` / `memento://`.
+        if b == b'/'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'/'
+            && (i == 0 || bytes[i - 1] != b':')
+        {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let ch = css[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn clean_css_font_family(raw: &str) -> String {
+    let first = raw.split(',').next().unwrap_or("").trim();
+    let unquoted = first
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| first.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(first)
+        .trim();
+    unquoted.to_owned()
+}
+
+fn parse_css_theme_color(value: &str) -> Option<[u8; 4]> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v.eq_ignore_ascii_case("transparent") {
+        return Some([0, 0, 0, 0]);
+    }
+    // Standard CSS #RGBA and #RRGGBBAA (DefColor::from_string uses Qt #AARRGGBB for 8-digit hex).
+    if let Some(hex) = v.strip_prefix('#') {
+        if hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let nibble = |idx: usize| u8::from_str_radix(&hex[idx..idx + 1], 16).ok().map(|n| n * 17);
+            return Some([nibble(0)?, nibble(1)?, nibble(2)?, nibble(3)?]);
+        }
+        if hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let byte = |idx: usize| u8::from_str_radix(&hex[idx..idx + 2], 16).ok();
+            return Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]);
+        }
+    }
+    DefColor::from_string(v).map(|c| {
+        [
+            ((u32::from(c.red) + 128) / 257) as u8,
+            ((u32::from(c.green) + 128) / 257) as u8,
+            ((u32::from(c.blue) + 128) / 257) as u8,
+            ((u32::from(c.alpha) + 128) / 257) as u8,
+        ]
+    })
+}
+
+fn parse_css_length_px(value: &str, base_px: f32) -> Option<f32> {
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let parsed = if lower == "0" {
+        Some(0.0)
+    } else if let Some(num) = lower.strip_suffix("px") {
+        num.trim().parse::<f32>().ok()
+    } else if let Some(num) = lower.strip_suffix("rem") {
+        num.trim().parse::<f32>().ok().map(|n| n * base_px)
+    } else if let Some(num) = lower.strip_suffix("em") {
+        num.trim().parse::<f32>().ok().map(|n| n * base_px)
+    } else if let Some(num) = lower.strip_suffix("pt") {
+        num.trim().parse::<f32>().ok().map(|n| n * (96.0 / 72.0))
+    } else if let Some(num) = lower.strip_suffix('%') {
+        num.trim().parse::<f32>().ok().map(|n| base_px * (n / 100.0))
+    } else {
+        None
+    }?;
+    (parsed.is_finite() && parsed >= 0.0).then_some(parsed)
+}
+
+fn parse_css_unit_float(value: &str) -> Option<f32> {
+    let t = value.trim();
+    if let Some(pct) = t.strip_suffix('%') {
+        pct.trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| (v / 100.0).clamp(0.0, 1.0))
+    } else {
+        t.parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+    }
+}
+
+fn parse_css_border_shorthand(value: &str, base_px: f32) -> (Option<f32>, Option<[u8; 4]>) {
+    let mut width = None;
+    let mut color = None;
+    for tok in mdef::split_css_tokens(value) {
+        let lower = tok.to_ascii_lowercase();
+        if lower == "none" {
+            width = Some(0.0);
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
+        ) {
+            continue;
+        }
+        if width.is_none() {
+            if let Some(w) = parse_css_length_px(&tok, base_px) {
+                width = Some(w);
+                continue;
+            }
+        }
+        if color.is_none() {
+            if let Some(c) = parse_css_theme_color(&tok) {
+                color = Some(c);
+            }
+        }
+    }
+    (width, color)
+}
+
+fn parse_css_box_shadow(value: &str, base_px: f32) -> (Option<f32>, Option<[u8; 4]>) {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return (Some(0.0), Some([0, 0, 0, 0]));
+    }
+    // Use first shadow if comma-separated (ignoring commas inside rgba(...))
+    let mut first_end = trimmed.len();
+    let mut depth = 0i32;
+    for (idx, ch) in trimmed.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                first_end = idx;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let first = &trimmed[..first_end];
+    let mut lengths = Vec::new();
+    let mut color = None;
+    for tok in mdef::split_css_tokens(first) {
+        if tok.eq_ignore_ascii_case("inset") {
+            continue;
+        }
+        if let Some(px) = parse_css_length_px(&tok, base_px) {
+            lengths.push(px);
+        } else if color.is_none() {
+            if let Some(c) = parse_css_theme_color(&tok) {
+                color = Some(c);
+            }
+        }
+    }
+    let blur = lengths.get(2).copied().or_else(|| lengths.first().copied());
+    (blur, color)
+}
+
+fn parse_attr_matcher(selector: &str, attr_name: &str) -> Option<CssAttrMatcher> {
+    let mut rest = selector;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let close = after.find(']')?;
+        let inner = after[..close].trim();
+        rest = &after[close + 1..];
+
+        // Check if attribute name matches (case-insensitive)
+        let (name_part, op_and_val) = if let Some(idx) = inner.find('=') {
+            let prefix_len = if idx > 0 && matches!(inner.as_bytes()[idx - 1], b'^' | b'*' | b'$') {
+                idx - 1
+            } else {
+                idx
+            };
+            (inner[..prefix_len].trim(), Some(&inner[prefix_len..]))
+        } else {
+            (inner.trim(), None)
+        };
+
+        if !name_part.eq_ignore_ascii_case(attr_name) {
+            continue;
+        }
+        let Some(rhs) = op_and_val else {
+            return Some(CssAttrMatcher {
+                op: CssAttrMatchOp::Exists,
+                value: String::new(),
+            });
+        };
+        let (op, raw_val) = if let Some(v) = rhs.strip_prefix("^=") {
+            (CssAttrMatchOp::StartsWith, v.trim())
+        } else if let Some(v) = rhs.strip_prefix("*=") {
+            (CssAttrMatchOp::Contains, v.trim())
+        } else if let Some(v) = rhs.strip_prefix("$=") {
+            (CssAttrMatchOp::EndsWith, v.trim())
+        } else if let Some(v) = rhs.strip_prefix('=') {
+            (CssAttrMatchOp::Equals, v.trim())
+        } else {
+            continue;
+        };
+        let unquoted = raw_val
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| raw_val.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(raw_val)
+            .replace("\\.", ".");
+        return Some(CssAttrMatcher { op, value: unquoted });
+    }
+    None
+}
+
+fn resolve_css_var_refs(value: &str, vars: &HashMap<String, String>, depth: u8) -> String {
+    if depth >= 8 || (!value.contains("var(") && !value.contains("VAR(")) {
+        return value.to_owned();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(pos) = rest.to_ascii_lowercase().find("var(") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 4..];
+        let mut paren_depth = 1i32;
+        let mut close_idx = None;
+        for (idx, ch) in after.char_indices() {
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = close_idx else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let inner = &after[..end];
+        let (var_name, fallback) = match inner.find(',') {
+            Some(comma) => (inner[..comma].trim(), Some(inner[comma + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+        if let Some(replacement) = vars.get(&var_name.to_ascii_lowercase()) {
+            out.push_str(&resolve_css_var_refs(replacement, vars, depth + 1));
+        } else if let Some(fb) = fallback {
+            let lower_name = var_name.to_ascii_lowercase();
+            if matches!(
+                lower_name.as_str(),
+                "--font-size-no-units" | "--text-color" | "--background-color" | "--line-height"
+            ) {
+                out.push_str(&rest[pos..pos + 4 + end + 1]);
+            } else {
+                out.push_str(&resolve_css_var_refs(fb, vars, depth + 1));
+            }
+        } else {
+            out.push_str(&rest[pos..pos + 4 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_flat_declarations(body: &str) -> Vec<(String, String)> {
+    let mut decls = Vec::new();
+    for raw_decl in body.split(';') {
+        let decl = raw_decl.trim();
+        if let Some(colon) = decl.find(':') {
+            let prop = decl[..colon].trim().to_ascii_lowercase();
+            let mut val = decl[colon + 1..].trim();
+            if val.len() >= 10
+                && val.as_bytes()[val.len() - 10..].eq_ignore_ascii_case(b"!important")
+            {
+                val = val[..val.len() - 10].trim();
+            }
+            if !prop.is_empty() && !val.is_empty() {
+                decls.push((prop, val.to_owned()));
+            }
+        }
+    }
+    decls
+}
+
+fn combine_nested_selectors(parent: &str, child: &str) -> String {
+    let p_trimmed = parent.trim();
+    if p_trimmed.is_empty()
+        || p_trimmed.eq_ignore_ascii_case(":root")
+        || p_trimmed.eq_ignore_ascii_case(":root[data-theme=\"dark\"]")
+        || p_trimmed.eq_ignore_ascii_case(":root[data-theme='dark']")
+    {
+        return child.trim().to_owned();
+    }
+    let mut combined = Vec::new();
+    for p in p_trimmed.split(',') {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        for c in child.split(',') {
+            let c = c.trim();
+            if c.is_empty() {
+                continue;
+            }
+            if c.contains('&') {
+                combined.push(c.replace('&', p));
+            } else {
+                combined.push(format!("{p} {c}"));
+            }
+        }
+    }
+    combined.join(", ")
+}
+
+/// Parse CSS rules recursively, flattening nested CSS blocks (e.g. `:root[data-theme="dark"] { .a { ... } }`
+/// or `[data-dictionary="..."] { .gloss-sc-span { ... } }`) into flat `(selector_list, decls)` pairs.
+fn parse_css_rules_flattened(
+    input: &str,
+    parent_selector: &str,
+    out: &mut Vec<(String, Vec<(String, String)>)>,
+    depth: u8,
+) {
+    if depth >= 6 {
+        return;
+    }
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let mut seg_start = 0usize;
+    let mut direct_decls_buf = String::new();
+    let mut in_quote: Option<u8> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => {
+                in_quote = Some(b);
+                i += 1;
+            }
+            b';' => {
+                if !parent_selector.is_empty() {
+                    direct_decls_buf.push_str(&input[seg_start..=i]);
+                }
+                seg_start = i + 1;
+                i += 1;
+            }
+            b'{' => {
+                let header = input[seg_start..i].trim();
+                let body_start = i + 1;
+                let mut brace_depth = 1i32;
+                let mut inner_quote: Option<u8> = None;
+                i += 1;
+                while i < bytes.len() && brace_depth > 0 {
+                    let ib = bytes[i];
+                    if let Some(q) = inner_quote {
+                        if ib == b'\\' && i + 1 < bytes.len() {
+                            i += 2;
+                            continue;
+                        }
+                        if ib == q {
+                            inner_quote = None;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    match ib {
+                        b'"' | b'\'' => inner_quote = Some(ib),
+                        b'{' => brace_depth += 1,
+                        b'}' => brace_depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let body_end = if brace_depth == 0 { i - 1 } else { i };
+                let body = &input[body_start..body_end];
+                if !header.is_empty() && !header.starts_with('@') {
+                    let full_sel = combine_nested_selectors(parent_selector, header);
+                    parse_css_rules_flattened(body, &full_sel, out, depth + 1);
+                }
+                seg_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+
+    if !parent_selector.is_empty() {
+        if seg_start < bytes.len() {
+            direct_decls_buf.push_str(&input[seg_start..]);
+        }
+        let decls = parse_flat_declarations(&direct_decls_buf);
+        if !decls.is_empty() {
+            out.push((parent_selector.to_owned(), decls));
+        }
+    }
+}
+
+fn apply_theme_rules(
+    rules: &[(String, Vec<(String, String)>)],
+    vars: &HashMap<String, String>,
+    theme: &mut PopupCssTheme,
+    is_outer: bool,
+) {
+    for (selector_list, decls) in rules {
+        for raw_sel in selector_list.split(',') {
+            let sel = raw_sel.trim();
+            let lower = sel.to_ascii_lowercase();
+
+            // 1. `:root` / `:root[data-theme="dark"]` / `html` custom properties
+            if matches!(
+                lower.as_str(),
+                ":root" | "html" | ":root[data-theme=\"dark\"]" | ":root[data-theme='dark']"
+            ) {
+                for (prop, raw_val) in decls {
+                    let val = resolve_css_var_refs(raw_val, vars, 0);
+                    match prop.as_str() {
+                        "--popup-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.popup_bg = c;
+                            }
+                        }
+                        "--popup-border" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.popup_border = c;
+                            }
+                        }
+                        "--popup-border-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_border_width = px.clamp(0.0, 12.0);
+                            }
+                        }
+                        "--popup-radius" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_radius = px.clamp(0.0, 32.0);
+                            }
+                        }
+                        "--popup-padding" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_padding = px.clamp(0.0, 40.0);
+                            }
+                        }
+                        "--popup-shadow-blur" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_shadow_blur = px.clamp(0.0, 64.0);
+                            }
+                        }
+                        "--popup-shadow-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.popup_shadow_color = c;
+                            }
+                        }
+                        "--popup-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_width = if px == 0.0 { 0.0 } else { px.clamp(280.0, 1600.0) };
+                            }
+                        }
+                        "--popup-height" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_height = if px == 0.0 { 0.0 } else { px.clamp(200.0, 1200.0) };
+                            }
+                        }
+                        "--text-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.text_color = c;
+                            }
+                        }
+                        "--muted-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.muted_color = c;
+                            }
+                        }
+                        "--headword-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.headword_color = c;
+                            }
+                        }
+                        "--headword-size" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.headword_size = px.clamp(12.0, 48.0);
+                            }
+                        }
+                        "--reading-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.reading_color = c;
+                            }
+                        }
+                        "--reading-size" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.reading_size = px.clamp(8.0, 28.0);
+                            }
+                        }
+                        "--font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.font_family = ff;
+                            }
+                        }
+                        "--glossary-font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, 14.5) {
+                                theme.glossary_font_size = px.clamp(9.0, 32.0);
+                            }
+                        }
+                        "--link-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.link_color = c;
+                            }
+                        }
+                        "--divider-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.divider_color = c;
+                                theme.term_divider_color = c;
+                            }
+                        }
+                        "--term-divider-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.term_divider_color = c;
+                            }
+                        }
+                        "--freq-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.freq_bg = c;
+                            }
+                        }
+                        "--freq-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.freq_color = c;
+                            }
+                        }
+                        "--freq-font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, 10.0) {
+                                theme.freq_font_size = px.clamp(7.0, 18.0);
+                            }
+                        }
+                        "--pitch-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.pitch_color = c;
+                            }
+                        }
+                        "--pitch-dict-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.pitch_dict_bg = c;
+                            }
+                        }
+                        "--dict-badge-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.dict_badge_bg = c;
+                            }
+                        }
+                        "--dict-badge-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.dict_badge_color = c;
+                            }
+                        }
+                        "--anki-tag-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.anki_tag_bg = c;
+                            }
+                        }
+                        "--anki-tag-border" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.anki_tag_border = c;
+                            }
+                        }
+                        "--anki-tag-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.anki_tag_color = c;
+                            }
+                        }
+                        "--definition-columns" => {
+                            if let Ok(cols) = val.trim().parse::<i32>() {
+                                theme.definition_columns = cols.clamp(1, 2);
+                            }
+                        }
+                        "--definition-columns-min-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.definition_columns_min_width = px.clamp(320.0, 1400.0);
+                            }
+                        }
+                        "--definition-gap" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.definition_gap = px.clamp(0.0, 32.0);
+                            }
+                        }
+                        "--card-bg" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.card_bg = c;
+                            }
+                        }
+                        "--card-border" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.card_border = c;
+                            }
+                        }
+                        "--card-border-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.card_border_width = px.clamp(0.0, 8.0);
+                            }
+                        }
+                        "--card-radius" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.card_radius = px.clamp(0.0, 24.0);
+                            }
+                        }
+                        "--card-padding" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.card_padding = px.clamp(0.0, 32.0);
+                            }
+                        }
+                        "--dict-color-opacity" => {
+                            if let Some(op) = parse_css_unit_float(&val) {
+                                theme.dict_color_opacity = op;
+                            }
+                        }
+                        "--derivations-compact" => {
+                            theme.compact_derivations =
+                                matches!(val.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes");
+                        }
+                        "--pitch-heiban-color" => {
+                            theme.pitch_heiban_color = parse_css_theme_color(&val);
+                        }
+                        "--pitch-atamadaka-color" => {
+                            theme.pitch_atamadaka_color = parse_css_theme_color(&val);
+                        }
+                        "--pitch-nakadaka-color" => {
+                            theme.pitch_nakadaka_color = parse_css_theme_color(&val);
+                        }
+                        "--pitch-odaka-color" => {
+                            theme.pitch_odaka_color = parse_css_theme_color(&val);
+                        }
+                        "--pitch-kifuku-color" => {
+                            theme.pitch_kifuku_color = parse_css_theme_color(&val);
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // 2. Outer container selectors (`.popup`, `.yomitan-popup`, `iframe.yomitan-popup`, `body`)
+            if matches!(
+                lower.as_str(),
+                ".popup" | ".yomitan-popup" | "iframe.yomitan-popup" | "body"
+            ) {
+                for (prop, raw_val) in decls {
+                    let val = resolve_css_var_refs(raw_val, vars, 0);
+                    match prop.as_str() {
+                        "background" | "background-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                // Ignore inner `body { background: transparent; }` when outer CSS is separate
+                                if is_outer || lower != "body" || c[3] > 0 {
+                                    theme.popup_bg = c;
+                                }
+                            }
+                        }
+                        "border" => {
+                            let (w, c) = parse_css_border_shorthand(&val, theme.glossary_font_size);
+                            if let Some(px) = w {
+                                theme.popup_border_width = px.clamp(0.0, 12.0);
+                            }
+                            if let Some(col) = c {
+                                theme.popup_border = col;
+                            }
+                        }
+                        "border-color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.popup_border = c;
+                            }
+                        }
+                        "border-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_border_width = px.clamp(0.0, 12.0);
+                            }
+                        }
+                        "border-radius" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_radius = px.clamp(0.0, 32.0);
+                            }
+                        }
+                        "box-shadow" => {
+                            let (blur, col) = parse_css_box_shadow(&val, theme.glossary_font_size);
+                            if let Some(b) = blur {
+                                theme.popup_shadow_blur = b.clamp(0.0, 64.0);
+                            }
+                            if let Some(c) = col {
+                                theme.popup_shadow_color = c;
+                            }
+                        }
+                        "padding" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_padding = px.clamp(0.0, 40.0);
+                            }
+                        }
+                        "width" | "max-width" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_width = if px == 0.0 { 0.0 } else { px.clamp(280.0, 1600.0) };
+                            }
+                        }
+                        "height" | "max-height" => {
+                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                theme.popup_height = if px == 0.0 { 0.0 } else { px.clamp(200.0, 1200.0) };
+                            }
+                        }
+                        "color" => {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.text_color = c;
+                            }
+                        }
+                        "font-family" => {
+                            let ff = clean_css_font_family(&val);
+                            if !ff.is_empty() {
+                                theme.font_family = ff;
+                            }
+                        }
+                        "font-size" => {
+                            if let Some(px) = parse_css_length_px(&val, 14.5) {
+                                theme.glossary_font_size = px.clamp(9.0, 32.0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // 3. Per-pitch-category headword colors (`.headword[data-pitch="heiban"]` etc.)
+            if lower.starts_with(".headword[") {
+                if let Some(m) = parse_attr_matcher(sel, "data-pitch")
+                    .or_else(|| parse_attr_matcher(sel, "data-pronunciation-categories"))
+                {
+                    for (prop, raw_val) in decls {
+                        if matches!(prop.as_str(), "color" | "--headword-text-color") {
+                            let val = resolve_css_var_refs(raw_val, vars, 0);
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                match m.value.to_ascii_lowercase().as_str() {
+                                    "heiban" => theme.pitch_heiban_color = Some(c),
+                                    "atamadaka" => theme.pitch_atamadaka_color = Some(c),
+                                    "nakadaka" => theme.pitch_nakadaka_color = Some(c),
+                                    "odaka" => theme.pitch_odaka_color = Some(c),
+                                    "kifuku" => theme.pitch_kifuku_color = Some(c),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 4. Per-dictionary card/badge/opacity rules (`[data-dictionary="..."]`, `.definition-item[data-dictionary^="..."]`)
+            if lower.contains("[data-dictionary") && !lower.contains(' ') {
+                if let Some(matcher) = parse_attr_matcher(sel, "data-dictionary") {
+                    let mut rule = DictStyleRule {
+                        matcher,
+                        badge_bg: None,
+                        badge_color: None,
+                        bg_opacity: None,
+                        card_bg: None,
+                        card_border: None,
+                        glossary_opacity: None,
+                        glossary_hover_opacity: None,
+                        glossary_solo_opacity: None,
+                    };
+                    let mut has_any = false;
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "--dict-color" | "--dict-badge-bg" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.badge_bg = Some(c);
+                                    has_any = true;
+                                }
+                            }
+                            "--dict-text-color" | "--tag-text-color" | "--dict-badge-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.badge_color = Some(c);
+                                    has_any = true;
+                                }
+                            }
+                            "--dict-bg-opacity" => {
+                                if let Some(op) = parse_css_unit_float(&val) {
+                                    rule.bg_opacity = Some(op);
+                                    has_any = true;
+                                }
+                            }
+                            "--card-bg" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.card_bg = Some(c);
+                                    has_any = true;
+                                }
+                            }
+                            "--card-border" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.card_border = Some(c);
+                                    has_any = true;
+                                }
+                            }
+                            "--glossary-opacity" => {
+                                if let Some(op) = parse_css_unit_float(&val) {
+                                    rule.glossary_opacity = Some(op);
+                                    has_any = true;
+                                }
+                            }
+                            "--glossary-hover-opacity" => {
+                                if let Some(op) = parse_css_unit_float(&val) {
+                                    rule.glossary_hover_opacity = Some(op);
+                                    has_any = true;
+                                }
+                            }
+                            "--glossary-solo-opacity" => {
+                                if let Some(op) = parse_css_unit_float(&val) {
+                                    rule.glossary_solo_opacity = Some(op);
+                                    has_any = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if has_any {
+                        theme.dict_rules.push(rule);
+                    }
+                }
+                continue;
+            }
+
+            // 5. Per-frequency-dictionary pill rules (`[data-frequency^="JPDB"]`, `.frequency-group-item[data-details^="JPDB"]`)
+            if (lower.contains("[data-frequency")
+                || (lower.starts_with(".frequency") && lower.contains("[data-details")))
+                && !lower.contains(' ')
+            {
+                if let Some(matcher) = parse_attr_matcher(sel, "data-frequency")
+                    .or_else(|| parse_attr_matcher(sel, "data-details"))
+                {
+                    let mut rule = FreqStyleRule {
+                        matcher,
+                        bg: None,
+                        color: None,
+                    };
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "background"
+                            | "background-color"
+                            | "--tag-frequency-background-color"
+                            | "--freq-bg" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.bg = Some(c);
+                                }
+                            }
+                            "color" | "--freq-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    rule.color = Some(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if rule.bg.is_some() || rule.color.is_some() {
+                        theme.freq_rules.push(rule);
+                    }
+                }
+                continue;
+            }
+
+            // 6. Per-pitch-dictionary badge rules (`[data-pitch-dict^="NHK"]`)
+            if lower.contains("[data-pitch-dict") && !lower.contains(' ') {
+                if let Some(matcher) = parse_attr_matcher(sel, "data-pitch-dict") {
+                    for (prop, raw_val) in decls {
+                        if matches!(prop.as_str(), "background" | "background-color" | "--tag-color") {
+                            let val = resolve_css_var_refs(raw_val, vars, 0);
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.pitch_dict_rules.push(PitchDictStyleRule {
+                                    matcher: matcher.clone(),
+                                    bg: c,
+                                });
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // 7. Standard named element & layout class selectors
+            match lower.as_str() {
+                ".definition-list" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "columns" | "column-count" => {
+                                if let Ok(cols) = val.trim().parse::<i32>() {
+                                    theme.definition_columns = cols.clamp(1, 2);
+                                }
+                            }
+                            "gap" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.definition_gap = px.clamp(0.0, 32.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".definition-card" | ".definition-item" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "background" | "background-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.card_bg = c;
+                                }
+                            }
+                            "border" => {
+                                let (w, c) = parse_css_border_shorthand(&val, theme.glossary_font_size);
+                                if let Some(px) = w {
+                                    theme.card_border_width = px.clamp(0.0, 8.0);
+                                }
+                                if let Some(col) = c {
+                                    theme.card_border = col;
+                                }
+                            }
+                            "border-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.card_border = c;
+                                }
+                            }
+                            "border-width" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.card_border_width = px.clamp(0.0, 8.0);
+                                }
+                            }
+                            "border-radius" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.card_radius = px.clamp(0.0, 24.0);
+                                }
+                            }
+                            "padding" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.card_padding = px.clamp(0.0, 32.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".term-tags" | ".headword-list-tag-list" => {
+                    for (prop, raw_val) in decls {
+                        if prop == "display" {
+                            theme.show_term_tags = !raw_val.trim().eq_ignore_ascii_case("none");
+                        }
+                    }
+                }
+                ".kanji-extra" => {
+                    for (prop, raw_val) in decls {
+                        if prop == "display" {
+                            theme.show_kanji_extra = !raw_val.trim().eq_ignore_ascii_case("none");
+                        }
+                    }
+                }
+                ".derivations" | ".inflection-rule-chains" => {
+                    for (prop, raw_val) in decls {
+                        if prop == "display" {
+                            let v = raw_val.trim().to_ascii_lowercase();
+                            if v == "compact" || v == "tooltip" {
+                                theme.compact_derivations = true;
+                            } else if v == "flex" || v == "block" {
+                                theme.compact_derivations = false;
+                            }
+                        }
+                    }
+                }
+                ".headword" | ".headword-term" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.headword_color = c;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.headword_size = px.clamp(12.0, 48.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".reading" | ".headword-reading" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.reading_color = c;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                                    theme.reading_size = px.clamp(8.0, 28.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".glossary" | ".gloss-content" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.text_color = c;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, 14.5) {
+                                    theme.glossary_font_size = px.clamp(9.0, 32.0);
+                                }
+                            }
+                            "font-family" => {
+                                let ff = clean_css_font_family(&val);
+                                if !ff.is_empty() {
+                                    theme.font_family = ff;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "a" => {
+                    for (prop, raw_val) in decls {
+                        if prop == "color" {
+                            let val = resolve_css_var_refs(raw_val, vars, 0);
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.link_color = c;
+                            }
+                        }
+                    }
+                }
+                ".divider" | "hr" => {
+                    for (prop, raw_val) in decls {
+                        if matches!(
+                            prop.as_str(),
+                            "background" | "background-color" | "color" | "border-color"
+                        ) {
+                            let val = resolve_css_var_refs(raw_val, vars, 0);
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.divider_color = c;
+                                theme.term_divider_color = c;
+                            }
+                        }
+                    }
+                }
+                ".frequency" | ".frequency-badge" | ".frequency-group-item" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "background" | "background-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.freq_bg = c;
+                                }
+                            }
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.freq_color = c;
+                                }
+                            }
+                            "font-size" => {
+                                if let Some(px) = parse_css_length_px(&val, 10.0) {
+                                    theme.freq_font_size = px.clamp(7.0, 18.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".pitch" | ".pronunciation" => {
+                    for (prop, raw_val) in decls {
+                        if matches!(
+                            prop.as_str(),
+                            "color" | "border-color" | "background" | "background-color"
+                        ) {
+                            let val = resolve_css_var_refs(raw_val, vars, 0);
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.pitch_color = c;
+                            }
+                        }
+                    }
+                }
+                ".pitch-dict" | ".pronunciation-group-tag-list" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        if prop == "display" {
+                            theme.show_pitch_dict = !val.trim().eq_ignore_ascii_case("none");
+                        } else if matches!(prop.as_str(), "background" | "background-color") {
+                            if let Some(c) = parse_css_theme_color(&val) {
+                                theme.pitch_dict_bg = c;
+                            }
+                        }
+                    }
+                }
+                ".dictionary-badge" | ".tag-dictionary" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "background" | "background-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.dict_badge_bg = c;
+                                }
+                            }
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.dict_badge_color = c;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ".anki-tag" => {
+                    for (prop, raw_val) in decls {
+                        let val = resolve_css_var_refs(raw_val, vars, 0);
+                        match prop.as_str() {
+                            "background" | "background-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.anki_tag_bg = c;
+                                }
+                            }
+                            "border" => {
+                                let (_, c) = parse_css_border_shorthand(&val, theme.glossary_font_size);
+                                if let Some(col) = c {
+                                    theme.anki_tag_border = col;
+                                }
+                            }
+                            "border-color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.anki_tag_border = c;
+                                }
+                            }
+                            "color" => {
+                                if let Some(c) = parse_css_theme_color(&val) {
+                                    theme.anki_tag_color = c;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn collect_root_vars(rules: &[(String, Vec<(String, String)>)], vars: &mut HashMap<String, String>) {
+    for (selector_list, decls) in rules {
+        let applies_to_root = selector_list.split(',').any(|sel| {
+            matches!(
+                sel.trim().to_ascii_lowercase().as_str(),
+                ":root"
+                    | "html"
+                    | "body"
+                    | ".popup"
+                    | ".yomitan-popup"
+                    | "iframe.yomitan-popup"
+                    | ":root[data-theme=\"dark\"]"
+                    | ":root[data-theme='dark']"
+            )
+        });
+        if applies_to_root {
+            for (prop, val) in decls {
+                if prop.starts_with("--") {
+                    vars.insert(prop.clone(), val.clone());
+                }
+            }
+        }
+    }
+}
+
+fn parse_popup_css_theme_full(
+    inner_css: &str,
+    outer_css: &str,
+) -> (PopupCssTheme, HashMap<String, String>, Vec<(String, Vec<(String, String)>)>) {
+    let mut theme = PopupCssTheme::default();
+    let mut vars: HashMap<String, String> = HashMap::new();
+
+    let inner_stripped = strip_css_comments(inner_css);
+    let mut inner_rules = Vec::new();
+    parse_css_rules_flattened(&inner_stripped, "", &mut inner_rules, 0);
+
+    let outer_stripped = strip_css_comments(outer_css);
+    let mut outer_rules = Vec::new();
+    parse_css_rules_flattened(&outer_stripped, "", &mut outer_rules, 0);
+
+    collect_root_vars(&inner_rules, &mut vars);
+    collect_root_vars(&outer_rules, &mut vars);
+
+    apply_theme_rules(&inner_rules, &vars, &mut theme, false);
+    apply_theme_rules(&outer_rules, &vars, &mut theme, true);
+
+    (theme, vars, inner_rules)
+}
+
+pub fn parse_popup_css_theme(css: &str) -> PopupCssTheme {
+    parse_popup_css_theme_full(css, "").0
+}
+
+pub fn parse_split_popup_css_theme(inner_css: &str, outer_css: &str) -> PopupCssTheme {
+    parse_popup_css_theme_full(inner_css, outer_css).0
+}
+
+fn preprocess_user_glossary_css(
+    inner_rules: &[(String, Vec<(String, String)>)],
+    vars: &HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
+    for (selector_list, decls) in inner_rules {
+        // Normalize Yomitan dictionary container selectors onto our virtual `<memento-dict>` wrapper
+        let norm_sel = selector_list
+            .replace("li.definition-item[data-dictionary", "[data-dictionary")
+            .replace(".definition-item[data-dictionary", "[data-dictionary")
+            .replace("li[data-dictionary", "[data-dictionary")
+            .replace("LI[data-dictionary", "[data-dictionary")
+            .replace("div[data-dictionary", "[data-dictionary")
+            .replace("DIV[data-dictionary", "[data-dictionary");
+        if norm_sel.trim().is_empty() {
+            continue;
+        }
+        let mut decl_str = String::new();
+        for (prop, raw_val) in decls {
+            if prop.starts_with("--") {
+                continue;
+            }
+            let val = resolve_css_var_refs(raw_val, vars, 0);
+            decl_str.push_str(prop);
+            decl_str.push_str(": ");
+            decl_str.push_str(&val);
+            decl_str.push_str("; ");
+        }
+        if !decl_str.is_empty() {
+            out.push_str(&norm_sel);
+            out.push_str(" { ");
+            out.push_str(&decl_str);
+            out.push_str("}\n");
+        }
+    }
+    out
+}
+
+fn rgba_to_css_color(rgba: [u8; 4]) -> String {
+    if rgba[3] == 255 {
+        format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2])
+    } else {
+        let a = f32::from(rgba[3]) / 255.0;
+        format!("rgba({}, {}, {}, {:.3})", rgba[0], rgba[1], rgba[2], a)
+    }
+}
+
+fn rgba_to_slint_color(rgba: [u8; 4]) -> slint::Color {
+    slint::Color::from_argb_u8(rgba[3], rgba[0], rgba[1], rgba[2])
+}
+
+fn apply_popup_css_theme_to_bridge(app: &MementoApp, theme: &PopupCssTheme) {
+    let pb = app.global::<PopupBridge>();
+    pb.set_css_popup_bg(rgba_to_slint_color(theme.popup_bg));
+    pb.set_css_popup_border(rgba_to_slint_color(theme.popup_border));
+    pb.set_css_popup_border_width(theme.popup_border_width);
+    pb.set_css_popup_radius(theme.popup_radius);
+    pb.set_css_popup_padding(theme.popup_padding);
+    pb.set_css_popup_shadow_blur(theme.popup_shadow_blur);
+    pb.set_css_popup_shadow_color(rgba_to_slint_color(theme.popup_shadow_color));
+    pb.set_css_popup_width(theme.popup_width);
+    pb.set_css_popup_height(theme.popup_height);
+    pb.set_css_text_color(rgba_to_slint_color(theme.text_color));
+    pb.set_css_muted_color(rgba_to_slint_color(theme.muted_color));
+    pb.set_css_headword_color(rgba_to_slint_color(theme.headword_color));
+    pb.set_css_headword_size(theme.headword_size);
+    pb.set_css_reading_color(rgba_to_slint_color(theme.reading_color));
+    pb.set_css_reading_size(theme.reading_size);
+    pb.set_css_font_family(theme.font_family.clone().into());
+    pb.set_css_glossary_font_size(theme.glossary_font_size);
+    pb.set_css_link_color(rgba_to_slint_color(theme.link_color));
+    pb.set_css_divider_color(rgba_to_slint_color(theme.divider_color));
+    pb.set_css_term_divider_color(rgba_to_slint_color(theme.term_divider_color));
+    pb.set_css_freq_bg(rgba_to_slint_color(theme.freq_bg));
+    pb.set_css_freq_color(rgba_to_slint_color(theme.freq_color));
+    pb.set_css_freq_font_size(theme.freq_font_size);
+    pb.set_css_pitch_color(rgba_to_slint_color(theme.pitch_color));
+    pb.set_css_pitch_dict_bg(rgba_to_slint_color(theme.pitch_dict_bg));
+    pb.set_css_dict_badge_bg(rgba_to_slint_color(theme.dict_badge_bg));
+    pb.set_css_dict_badge_color(rgba_to_slint_color(theme.dict_badge_color));
+    pb.set_css_anki_tag_bg(rgba_to_slint_color(theme.anki_tag_bg));
+    pb.set_css_anki_tag_border(rgba_to_slint_color(theme.anki_tag_border));
+    pb.set_css_anki_tag_color(rgba_to_slint_color(theme.anki_tag_color));
+    pb.set_css_definition_columns(theme.definition_columns);
+    pb.set_css_definition_columns_min_width(theme.definition_columns_min_width);
+    pb.set_css_definition_gap(theme.definition_gap);
+    pb.set_css_show_term_tags(theme.show_term_tags);
+    pb.set_css_show_pitch_dict(theme.show_pitch_dict);
+    pb.set_css_show_kanji_extra(theme.show_kanji_extra);
+    pb.set_css_compact_derivations(theme.compact_derivations);
+}
+
 #[derive(Default)]
 struct StylesheetCache {
-    entries: HashMap<PathBuf, (Option<SystemTime>, Arc<ParsedStylesheet>)>,
+    user_css_path: PathBuf,
+    user_outer_css_path: PathBuf,
+    user_css_sig: Option<(Option<SystemTime>, u64)>,
+    user_outer_css_sig: Option<(Option<SystemTime>, u64)>,
+    user_css_raw: String,
+    user_outer_css_raw: String,
+    user_css_glossary_preprocessed: String,
+    user_css_theme: PopupCssTheme,
+    user_css_revision: u64,
+    user_only_sheet: Option<Arc<ParsedStylesheet>>,
+    entries: HashMap<PathBuf, (Option<SystemTime>, u64, Arc<ParsedStylesheet>)>,
 }
 
 impl StylesheetCache {
+    fn new(config_dir: &Path) -> Self {
+        let mut cache = Self {
+            user_css_path: config_dir.join(CUSTOM_POPUP_CSS_FILENAME),
+            user_outer_css_path: config_dir.join(CUSTOM_POPUP_OUTER_CSS_FILENAME),
+            ..Self::default()
+        };
+        cache.force_reload_user_css();
+        cache
+    }
+
+    fn theme(&self) -> &PopupCssTheme {
+        &self.user_css_theme
+    }
+
+    fn read_file_sig(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok(), meta.len()))
+    }
+
+    fn reload_user_css_if_changed(&mut self) -> bool {
+        if self.user_css_path.as_os_str().is_empty() && self.user_outer_css_path.as_os_str().is_empty() {
+            return false;
+        }
+        let inner_sig = Self::read_file_sig(&self.user_css_path);
+        let outer_sig = Self::read_file_sig(&self.user_outer_css_path);
+        if inner_sig == self.user_css_sig && outer_sig == self.user_outer_css_sig {
+            return false;
+        }
+        self.apply_reloaded_user_css(inner_sig, outer_sig)
+    }
+
+    fn force_reload_user_css(&mut self) -> bool {
+        if self.user_css_path.as_os_str().is_empty() && self.user_outer_css_path.as_os_str().is_empty() {
+            return false;
+        }
+        let inner_sig = Self::read_file_sig(&self.user_css_path);
+        let outer_sig = Self::read_file_sig(&self.user_outer_css_path);
+        self.apply_reloaded_user_css(inner_sig, outer_sig)
+    }
+
+    fn apply_reloaded_user_css(
+        &mut self,
+        inner_sig: Option<(Option<SystemTime>, u64)>,
+        outer_sig: Option<(Option<SystemTime>, u64)>,
+    ) -> bool {
+        let inner_raw = if inner_sig.is_some() {
+            std::fs::read_to_string(&self.user_css_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let outer_raw = if outer_sig.is_some() {
+            std::fs::read_to_string(&self.user_outer_css_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let changed = inner_sig != self.user_css_sig
+            || outer_sig != self.user_outer_css_sig
+            || inner_raw != self.user_css_raw
+            || outer_raw != self.user_outer_css_raw;
+        self.user_css_sig = inner_sig;
+        self.user_outer_css_sig = outer_sig;
+        if !changed && self.user_css_revision > 0 {
+            return false;
+        }
+        self.user_css_raw = inner_raw;
+        self.user_outer_css_raw = outer_raw;
+        if self.user_css_raw.trim().is_empty() && self.user_outer_css_raw.trim().is_empty() {
+            self.user_css_theme = PopupCssTheme::default();
+            self.user_css_glossary_preprocessed.clear();
+            self.user_only_sheet = None;
+        } else {
+            let (theme, vars, inner_rules) =
+                parse_popup_css_theme_full(&self.user_css_raw, &self.user_outer_css_raw);
+            let preprocessed = preprocess_user_glossary_css(&inner_rules, &vars);
+            self.user_css_theme = theme;
+            self.user_only_sheet = (!preprocessed.trim().is_empty())
+                .then(|| parse_dictionary_css_str(&preprocessed));
+            self.user_css_glossary_preprocessed = preprocessed;
+        }
+        self.user_css_revision = self.user_css_revision.wrapping_add(1).max(1);
+        self.entries.clear();
+        true
+    }
+
     fn get_for_dictionary(
         &mut self,
         dict_resource_dirs: &[PathBuf],
@@ -1606,18 +3892,30 @@ impl StylesheetCache {
     ) -> Option<Arc<ParsedStylesheet>> {
         let style_path = dict_resource_dirs.iter().find_map(|dir| {
             memento_dict::databasemanager::resolve_dictionary_style_path(dir, dic_id, dict_name)
-        })?;
+        });
+        let Some(style_path) = style_path else {
+            return self.user_only_sheet.clone();
+        };
         let mtime = std::fs::metadata(&style_path)
             .ok()
             .and_then(|m| m.modified().ok());
-        if let Some((cached_mtime, sheet)) = self.entries.get(&style_path) {
-            if *cached_mtime == mtime {
+        if let Some((cached_mtime, cached_user_rev, sheet)) = self.entries.get(&style_path) {
+            if *cached_mtime == mtime && *cached_user_rev == self.user_css_revision {
                 return Some(sheet.clone());
             }
         }
-        let css = std::fs::read_to_string(&style_path).ok()?;
-        let parsed = parse_dictionary_css_str(&css);
-        self.entries.insert(style_path, (mtime, parsed.clone()));
+        let dict_css = match std::fs::read_to_string(&style_path) {
+            Ok(s) => s,
+            Err(_) => return self.user_only_sheet.clone(),
+        };
+        let combined = if self.user_css_glossary_preprocessed.trim().is_empty() {
+            dict_css
+        } else {
+            format!("{dict_css}\n{}", self.user_css_glossary_preprocessed)
+        };
+        let parsed = parse_dictionary_css_str(&combined);
+        self.entries
+            .insert(style_path, (mtime, self.user_css_revision, parsed.clone()));
         Some(parsed)
     }
 }
@@ -1717,8 +4015,11 @@ pub fn load_dictionary_image_pixmap(
     if looks_svg {
         let mut opts = usvg::Options::default();
         opts.resources_dir = asset_path.parent().map(Path::to_path_buf);
+        opts.font_family = "sans-serif".to_owned();
         SHARED_TEXT_ENGINE.with(|engine| {
-            opts.fontdb = engine.borrow().fontdb.clone();
+            let mut engine = engine.borrow_mut();
+            engine.ensure_default_svg_fonts();
+            opts.fontdb = engine.fontdb.clone();
         });
         if !current_color_hex.is_empty() {
             opts.style_sheet = Some(format!("svg {{ color: {current_color_hex}; }}"));
@@ -2036,6 +4337,8 @@ struct GlossaryBuilder<'a> {
     dict_resource_dirs: &'a [PathBuf],
     dic_id: i64,
     dict_name: &'a str,
+    default_link_color: [u8; 4],
+    had_hidden_elements: bool,
 }
 
 impl<'a> GlossaryBuilder<'a> {
@@ -2088,6 +4391,12 @@ impl<'a> GlossaryBuilder<'a> {
         let mut next = inherited.clone();
         if state.font_pixel_size > 0.0 {
             next.font_px = (state.font_pixel_size as f32).clamp(9.0, 32.0);
+        }
+        if let Some(ff) = state.declarations.get("font-family") {
+            let cleaned = clean_css_font_family(ff);
+            if !cleaned.is_empty() {
+                next.font_family = cleaned;
+            }
         }
         if !state.text_color.is_empty() {
             next.color = parse_def_rgba(&state.text_color, inherited.color);
@@ -2151,6 +4460,14 @@ impl<'a> GlossaryBuilder<'a> {
         let mut declarations = mdef::CssDeclarations::new();
         self.renderer
             .add_matching_css_rules(&mut self.ctx, &mut declarations, None, None);
+        if declarations
+            .get("display")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+        {
+            self.had_hidden_elements = true;
+            self.ctx.elements.pop();
+            return None;
+        }
 
         let rel_path = obj.get("path").as_str();
         let units = match obj.get("sizeUnits") {
@@ -2192,6 +4509,25 @@ impl<'a> GlossaryBuilder<'a> {
             .then(|| self.ctx.link_href.clone())
             .or_else(|| inherited.link_href.clone());
 
+        // Check `filter: invert(...)` across matching stylesheet rules (e.g. dark-mode gaiji images)
+        let mut invert_ratio = 0.0f32;
+        if let Some(sheet) = self.ctx.dictionary_styles.clone() {
+            for rule in &sheet.rules {
+                if !self.renderer.css_rule_matches(rule, &self.ctx) {
+                    continue;
+                }
+                for decl in &rule.declarations {
+                    if decl.property.eq_ignore_ascii_case("filter")
+                        || decl.property.eq_ignore_ascii_case("-webkit-filter")
+                    {
+                        if let Some(r) = parse_css_invert_ratio(&decl.value) {
+                            invert_ratio = r;
+                        }
+                    }
+                }
+            }
+        }
+
         self.ctx.elements.pop();
 
         let asset_path = resolve_dictionary_asset_path_in_dirs(
@@ -2200,7 +4536,11 @@ impl<'a> GlossaryBuilder<'a> {
             self.dict_name,
             rel_path,
         )?;
-        let pixmap = load_dictionary_image_pixmap(&asset_path, req_w, req_h, tint, &color_str)?;
+        let mut pixmap =
+            load_dictionary_image_pixmap(&asset_path, req_w, req_h, tint, &color_str)?;
+        if invert_ratio > 0.001 && !is_monochrome {
+            pixmap = invert_pixmap(&pixmap, invert_ratio);
+        }
         let w = pixmap.width() as f32;
         let h = pixmap.height() as f32;
         Some(InlineAtom::Image {
@@ -2230,7 +4570,11 @@ impl<'a> GlossaryBuilder<'a> {
                     "thead" | "tbody" | "tfoot" => {
                         let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                         self.ctx.elements.push(idx);
-                        let mut state = self.build_element_state(node, &tag);
+                        let (mut state, hidden) = self.build_element_state_checked(node, &tag);
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
                         let next_style = self.inline_style_from_state(&state, inherited);
                         std::mem::swap(&mut self.ctx.parent_font_pixel_size, &mut state.font_pixel_size);
                         std::mem::swap(&mut self.ctx.text_color, &mut state.text_color);
@@ -2244,7 +4588,11 @@ impl<'a> GlossaryBuilder<'a> {
                     "tr" => {
                         let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                         self.ctx.elements.push(idx);
-                        let mut state = self.build_element_state(node, "tr");
+                        let (mut state, hidden) = self.build_element_state_checked(node, "tr");
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
                         let row_style = self.inline_style_from_state(&state, inherited);
                         std::mem::swap(&mut self.ctx.parent_font_pixel_size, &mut state.font_pixel_size);
                         std::mem::swap(&mut self.ctx.text_color, &mut state.text_color);
@@ -2285,7 +4633,11 @@ impl<'a> GlossaryBuilder<'a> {
                 }
                 let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                 self.ctx.elements.push(idx);
-                let mut state = self.build_element_state(node, &tag);
+                let (mut state, hidden) = self.build_element_state_checked(node, &tag);
+                if hidden {
+                    self.ctx.elements.pop();
+                    return;
+                }
                 // Ensure table cells retain their default 5px padding & 1px border when resolve_box_style skipped Inline
                 self.renderer.resolve_box_style(&self.ctx, &mut state);
                 let mut cell_style = self.inline_style_from_state(&state, inherited);
@@ -2334,7 +4686,11 @@ impl<'a> GlossaryBuilder<'a> {
         }
     }
 
-    fn build_element_state(&mut self, obj: &DefJson, tag: &str) -> mdef::ElementRenderState {
+    fn build_element_state_checked(
+        &mut self,
+        obj: &DefJson,
+        tag: &str,
+    ) -> (mdef::ElementRenderState, bool) {
         let mut state = mdef::ElementRenderState {
             tag: tag.to_owned(),
             output_tag: tag.to_owned(),
@@ -2356,9 +4712,17 @@ impl<'a> GlossaryBuilder<'a> {
         self.renderer.add_element_attributes(obj, &mut state);
         self.renderer
             .resolve_element_styles(obj, &mut self.ctx, &mut state);
+        if state
+            .declarations
+            .get("display")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+        {
+            self.had_hidden_elements = true;
+            return (state, true);
+        }
         self.renderer.resolve_element_layout(&mut self.ctx, &mut state);
         self.renderer.apply_element_compatibility(&self.ctx, &mut state);
-        state
+        (state, false)
     }
 
     fn build_children_blocks(
@@ -2453,13 +4817,40 @@ impl<'a> GlossaryBuilder<'a> {
                     "ruby" => {
                         let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                         self.ctx.elements.push(idx);
-                        let mut state = self.build_element_state(node, "ruby");
+                        let (mut state, hidden) = self.build_element_state_checked(node, "ruby");
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
+                        // Check if CSS hides `<rt>` inside this `<ruby>` (e.g. `.gloss-sc-rt { display: none; }`).
+                        let rt_hidden = if self.ctx.dictionary_styles.is_some() {
+                            let mut rt_el = mdef::StructuredElement::new();
+                            rt_el.tag = "rt".to_owned();
+                            rt_el.classes.insert("gloss-sc-rt".to_owned());
+                            rt_el.attributes.insert("data-sc-rt".to_owned(), String::new());
+                            let rt_idx = self.ctx.selector_elements.len() as i64;
+                            self.ctx.selector_elements.push(rt_el);
+                            self.ctx.elements.push(rt_idx);
+                            let mut rt_decls = mdef::CssDeclarations::new();
+                            self.renderer.add_matching_css_rules(
+                                &mut self.ctx,
+                                &mut rt_decls,
+                                None,
+                                None,
+                            );
+                            self.ctx.elements.pop();
+                            rt_decls
+                                .get("display")
+                                .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+                        } else {
+                            false
+                        };
                         let ruby_style = self.inline_style_from_state(&state, inherited);
                         for (base, reading) in extract_ruby_pairs(node.get("content")) {
                             if base.is_empty() {
                                 continue;
                             }
-                            if reading.is_empty() {
+                            if reading.is_empty() || rt_hidden {
                                 inline_out.push(InlineAtom::Text {
                                     text: base,
                                     style: ruby_style.clone(),
@@ -2483,7 +4874,11 @@ impl<'a> GlossaryBuilder<'a> {
                     "a" => {
                         let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                         self.ctx.elements.push(idx);
-                        let state = self.build_element_state(node, "a");
+                        let (state, hidden) = self.build_element_state_checked(node, "a");
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
                         let old_href = if let DefJson::String(href) = node.get("href") {
                             Some(std::mem::replace(&mut self.ctx.link_href, href.clone()))
                         } else {
@@ -2498,7 +4893,7 @@ impl<'a> GlossaryBuilder<'a> {
                         if !self.ctx.link_href.is_empty() {
                             link_style.link_href = Some(self.ctx.link_href.clone());
                             if state.declarations.get("color").is_none() {
-                                link_style.color = [147, 197, 253, 255];
+                                link_style.color = self.default_link_color;
                             }
                             if !self.ctx.suppress_link_decoration
                                 && state.declarations.get("text-decoration").is_none()
@@ -2532,10 +4927,14 @@ impl<'a> GlossaryBuilder<'a> {
                         self.ctx.elements.pop();
                     }
                     "table" => {
-                        flush_inline(inline_out, blocks_out);
                         let idx = self.renderer.structured_element(node, &mut self.ctx, false);
                         self.ctx.elements.push(idx);
-                        let mut state = self.build_element_state(node, "table");
+                        let (mut state, hidden) = self.build_element_state_checked(node, "table");
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
+                        flush_inline(inline_out, blocks_out);
                         self.renderer.resolve_box_style(&self.ctx, &mut state);
                         let table_style = self.inline_style_from_state(&state, inherited);
                         let frame = self.box_frame_from_state(&state);
@@ -2561,7 +4960,11 @@ impl<'a> GlossaryBuilder<'a> {
                             details.as_ref().is_some_and(|d| d.open),
                         );
                         self.ctx.elements.push(idx);
-                        let mut state = self.build_element_state(node, &tag);
+                        let (mut state, hidden) = self.build_element_state_checked(node, &tag);
+                        if hidden {
+                            self.ctx.elements.pop();
+                            return;
+                        }
                         if let Some(d) = details {
                             state.details = d;
                         }
@@ -2787,7 +5190,7 @@ fn frame_is_trivial(f: &BoxFrameIR) -> bool {
 struct PaintCollector {
     rects: Vec<(f32, f32, f32, f32, [u8; 4])>,
     images: Vec<(f32, f32, Arc<tiny_skia::Pixmap>)>,
-    svg_texts: Vec<PositionedSvgCluster>,
+    mask_glyphs: Vec<PositionedMaskGlyph>,
     hit_zones: Vec<GlossaryHitZone>,
     selectable_chars: Vec<GlossaryCharCell>,
     next_line_id: usize,
@@ -2856,10 +5259,14 @@ fn layout_and_collect_block(
                     + 6.0;
                 marker_w = mw;
                 if !measure_only {
-                    let clusters = engine.collect_svg_clusters_from_layout(
-                        &m_layout, m_txt, content_x, content_y, None, None,
+                    engine.collect_glossary_glyphs_from_layout(
+                        &m_layout,
+                        content_x,
+                        content_y,
+                        false,
+                        false,
+                        collector,
                     );
-                    collector.svg_texts.extend(clusters);
                 }
                 content_x += mw;
                 content_w = (content_w - mw).max(16.0);
@@ -2933,10 +5340,14 @@ fn layout_and_collect_block(
                     + 6.0;
                 marker_w = mw;
                 if !measure_only {
-                    let clusters = engine.collect_svg_clusters_from_layout(
-                        &m_layout, m_txt, content_x, content_y, None, None,
+                    engine.collect_glossary_glyphs_from_layout(
+                        &m_layout,
+                        content_x,
+                        content_y,
+                        false,
+                        false,
+                        collector,
                     );
-                    collector.svg_texts.extend(clusters);
                 }
                 content_x += mw;
                 content_w = (content_w - mw).max(16.0);
@@ -3179,13 +5590,22 @@ fn layout_inline_atoms(
         .layout_cx
         .ranged_builder(&mut engine.font_cx, &full_text, 1.0, true);
     builder.push_default(StyleProperty::FontFamily(FontFamily::Source(Cow::Borrowed(
-        "Noto Sans CJK JP, sans-serif",
+        RICH_EMOJI_FALLBACK_STACK,
     ))));
     builder.push_default(StyleProperty::FontSize(14.5));
     builder.push_default(StyleProperty::LineHeight(LineHeight::MetricsRelative(1.18)));
     builder.push_default(StyleProperty::Brush([241, 245, 249, 255]));
 
     for span in &spans {
+        let ff = span.style.font_family.trim();
+        if !ff.is_empty() && !ff.eq_ignore_ascii_case("Noto Sans CJK JP") {
+            builder.push(
+                StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(format!(
+                    "{ff}, {RICH_EMOJI_FALLBACK_STACK}"
+                )))),
+                span.byte_range.clone(),
+            );
+        }
         builder.push(
             StyleProperty::FontSize(span.style.font_px),
             span.byte_range.clone(),
@@ -3238,19 +5658,54 @@ fn layout_inline_atoms(
         let line_top = origin_y + line.metrics().min_coord;
         let line_h = line.metrics().line_height.max(14.0);
         let baseline = origin_y + line.metrics().baseline;
+        let mut prev_run_key: Option<(usize, usize, u64, u32)> = None;
+        let mut run_glyph_cursor: usize = 0;
 
         for item in line.items() {
             match item {
                 PositionedLayoutItem::GlyphRun(glyph_run) => {
                     let run = glyph_run.run();
-                    let font_info = engine.ensure_font_registered(run.font().clone().borrow_font());
+                    let run_font = run.font().clone();
+                    let run_key = (
+                        run.text_range().start,
+                        run.text_range().end,
+                        run_font.data.id(),
+                        run_font.index,
+                    );
+                    if prev_run_key != Some(run_key) {
+                        prev_run_key = Some(run_key);
+                        run_glyph_cursor = 0;
+                    }
+                    let glyph_start = run_glyph_cursor;
+                    let glyph_count = glyph_run.glyphs().count();
+                    run_glyph_cursor += glyph_count;
+                    let glyph_end = glyph_start + glyph_count;
+
                     let font_size = run.font_size();
                     let brush = glyph_run.style().brush;
                     let run_ul = glyph_run.style().underline.is_some();
                     let run_st = glyph_run.style().strikethrough.is_some();
+                    let synth_italic = run.synthesis().skew().is_some();
+                    let is_color_font = engine.font_supports_color(run_font.borrow_font());
                     let mut x_cursor = origin_x + glyph_run.offset();
+                    let mut cluster_glyph_idx = 0usize;
+                    let mut prev_cluster_in_slice = false;
 
                     for cluster in run.visual_clusters() {
+                        let c_glyph_count = cluster.glyphs().count();
+                        let in_slice = if c_glyph_count == 0 {
+                            prev_cluster_in_slice || (cluster_glyph_idx == 0 && glyph_start == 0)
+                        } else {
+                            let matched = cluster_glyph_idx < glyph_end
+                                && (cluster_glyph_idx + c_glyph_count) > glyph_start;
+                            prev_cluster_in_slice = matched;
+                            matched
+                        };
+                        cluster_glyph_idx += c_glyph_count;
+                        if !in_slice {
+                            continue;
+                        }
+
                         let range = cluster.text_range();
                         let adv = cluster.advance();
                         let span_meta = byte_to_span
@@ -3304,20 +5759,55 @@ fn layout_inline_atoms(
                             }
                         }
 
+                        if c_glyph_count > 0 {
+                            let mut gx = x_cursor;
+                            for g in cluster.glyphs() {
+                                let rendered_color = is_color_font
+                                    && engine
+                                        .try_render_color_glyph(
+                                            run_font.borrow_font(),
+                                            g.id as u16,
+                                            font_size,
+                                        )
+                                        .is_some_and(|cg| {
+                                            collector.images.push((
+                                                gx + g.x + cg.left,
+                                                baseline + g.y - cg.top,
+                                                cg.pixmap,
+                                            ));
+                                            true
+                                        });
+                                if !rendered_color {
+                                    if let Some(ag) = engine.try_render_alpha_glyph(
+                                        run_font.borrow_font(),
+                                        g.id as u16,
+                                        font_size,
+                                        synth_italic,
+                                    ) {
+                                        collector.mask_glyphs.push(PositionedMaskGlyph {
+                                            x: (gx + g.x).round() as i32 + ag.left,
+                                            y: (baseline + g.y).round() as i32 - ag.top,
+                                            glyph: ag,
+                                            rgba: brush,
+                                        });
+                                    }
+                                }
+                                gx += g.advance;
+                            }
+                        }
+                        if run_ul && adv > 0.0 {
+                            collector
+                                .rects
+                                .push((x_cursor, baseline + 2.0, adv, 1.0, brush));
+                        }
+                        if run_st && adv > 0.0 {
+                            collector
+                                .rects
+                                .push((x_cursor, baseline - font_size * 0.32, adv, 1.0, brush));
+                        }
+
                         if let Some(slice) = full_text.get(range.clone()) {
                             if !slice.is_empty() && !slice.chars().all(|c| c == '\n' || c == '\r') {
-                                collector.svg_texts.push(PositionedSvgCluster {
-                                    x: x_cursor,
-                                    baseline_y: baseline,
-                                    text: slice.to_owned(),
-                                    family: font_info.family.clone(),
-                                    font_size,
-                                    weight: font_info.weight,
-                                    italic: font_info.italic,
-                                    fill_rgba: brush,
-                                    underline: run_ul,
-                                    strikethrough: run_st,
-                                });
                                 let selectable = span_meta.is_none_or(|m| m.selectable);
                                 if selectable {
                                     let chars: Vec<char> = slice.chars().collect();
@@ -3340,6 +5830,8 @@ fn layout_inline_atoms(
                     }
                 }
                 PositionedLayoutItem::InlineBox(ibox) => {
+                    prev_run_key = None;
+                    run_glyph_cursor = 0;
                     let bx = origin_x + ibox.x;
                     let by = origin_y + ibox.y;
                     if let Some(rbox) = ruby_boxes.iter().find(|r| r.box_id == ibox.id) {
@@ -3365,24 +5857,22 @@ fn layout_inline_atoms(
                             [196, 181, 253, 255],
                         );
                         let rw = ruby_l.lines().next().map_or(0.0, |l| l.metrics().advance);
-                        let base_clusters = engine.collect_svg_clusters_from_layout(
-                            &base_l,
-                            &rbox.base,
-                            bx + (rbox.w - bw) * 0.5,
-                            by + rbox.base_y,
-                            Some(&vec![rbox.style.underline; rbox.base.len() + 1]),
-                            None,
-                        );
-                        let ruby_clusters = engine.collect_svg_clusters_from_layout(
+                        engine.collect_glossary_glyphs_from_layout(
                             &ruby_l,
-                            &rbox.reading,
                             bx + (rbox.w - rw) * 0.5,
                             by,
-                            None,
-                            None,
+                            false,
+                            false,
+                            collector,
                         );
-                        collector.svg_texts.extend(ruby_clusters);
-                        collector.svg_texts.extend(base_clusters);
+                        engine.collect_glossary_glyphs_from_layout(
+                            &base_l,
+                            bx + (rbox.w - bw) * 0.5,
+                            by + rbox.base_y,
+                            rbox.style.underline,
+                            rbox.style.strikethrough,
+                            collector,
+                        );
 
                         let base_chars: Vec<char> = rbox.base.chars().collect();
                         let per_w = rbox.w / (base_chars.len().max(1) as f32);
@@ -3648,13 +6138,45 @@ pub fn render_structured_glossary_entry_in_dirs(
     avail_width_px: f32,
     selected: bool,
 ) -> Option<RenderedGlossaryDoc> {
+    render_structured_glossary_entry_with_theme(
+        raw_glossary,
+        fallback_glossary,
+        stylesheet,
+        detail_states,
+        legacy_style,
+        dict_resource_dirs,
+        dic_id,
+        dict_name,
+        avail_width_px,
+        selected,
+        &PopupCssTheme::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_structured_glossary_entry_with_theme(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+    theme: &PopupCssTheme,
+) -> Option<RenderedGlossaryDoc> {
     let avail_w = avail_width_px.clamp(120.0, 960.0);
-    let base_text_color = if selected {
-        [248, 250, 252, 255]
+    let mut base_text_color = if selected {
+        theme.text_color
     } else {
-        [148, 163, 184, 255]
+        theme.muted_color
     };
-    let text_color_hex = if selected { "#F8FAFC" } else { "#94A3B8" };
+    let text_color_css = rgba_to_css_color(base_text_color);
+    let gloss_text_css = rgba_to_css_color(theme.text_color);
+    let bg_color_css = rgba_to_css_color(theme.popup_bg);
+    let root_font_px = f64::from(theme.glossary_font_size.clamp(9.0, 32.0));
 
     let parsed = if !raw_glossary.trim().is_empty() {
         DefJson::parse(raw_glossary).ok()
@@ -3676,19 +6198,19 @@ pub fn render_structured_glossary_entry_in_dirs(
 
     let renderer = DefRenderer::new();
     let contains_structured = renderer.contains_structured_content(&entries);
-    let ctx = DefContext {
+    let mut ctx = DefContext {
         screen: Some(ScreenMetrics {
             available_width: avail_w as i32,
             available_height: 440,
             logical_dpi: 96.0,
         }),
-        root_font_pixel_size: 14.5,
-        parent_font_pixel_size: 14.5,
-        text_color: text_color_hex.to_owned(),
-        glossary_text_color: "#F8FAFC".to_owned(),
-        glossary_background_color: "#1C2024".to_owned(),
-        background_color: "#1C2024".to_owned(),
-        painted_background_color: "#1C2024".to_owned(),
+        root_font_pixel_size: root_font_px,
+        parent_font_pixel_size: root_font_px,
+        text_color: text_color_css,
+        glossary_text_color: gloss_text_css,
+        glossary_background_color: bg_color_css.clone(),
+        background_color: bg_color_css.clone(),
+        painted_background_color: bg_color_css,
         needs_element_child_count: stylesheet
             .as_ref()
             .is_some_and(|s| s.uses_element_child_count),
@@ -3698,10 +6220,72 @@ pub fn render_structured_glossary_entry_in_dirs(
         ..DefContext::default()
     };
 
-    let root_inline = InlineStyleIR {
+    // Virtual dictionary container so Yomitan `[data-dictionary="..."]` / `[data-dictionary^="..."]`
+    // and `.gloss-item` rules match without interfering with bare tag selectors (`div`, `li`) in
+    // dictionary `styles.css`.
+    let mut dict_root = mdef::StructuredElement::new();
+    dict_root.tag = "memento-dict".to_owned();
+    dict_root.classes.insert("gloss-item".to_owned());
+    dict_root.classes.insert("yomitan-glossary".to_owned());
+    dict_root
+        .attributes
+        .insert("data-dictionary".to_owned(), dict_name.to_owned());
+    ctx.selector_elements.push(dict_root);
+    ctx.elements.push(0);
+
+    let mut root_inline = InlineStyleIR {
+        font_family: theme.font_family.clone(),
+        font_px: theme.glossary_font_size.clamp(9.0, 32.0),
         color: base_text_color,
         ..InlineStyleIR::default()
     };
+
+    // Apply any dictionary-root rules (e.g. `[data-dictionary^="JMdict"] { font-size: 16px; }`).
+    let mut root_hidden = false;
+    if ctx.dictionary_styles.is_some() {
+        let mut root_decls = mdef::CssDeclarations::new();
+        renderer.add_matching_css_rules(&mut ctx, &mut root_decls, None, None);
+        if root_decls
+            .get("display")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+        {
+            root_hidden = true;
+        }
+        if let Some(fs) = root_decls.get("font-size") {
+            let px = mdef::helpers::css_font_size_to_pixels(
+                fs,
+                ctx.screen.as_ref(),
+                ctx.parent_font_pixel_size,
+                ctx.root_font_pixel_size,
+            );
+            if px > 0.0 {
+                ctx.parent_font_pixel_size = px;
+                root_inline.font_px = (px as f32).clamp(9.0, 32.0);
+            }
+        }
+        if let Some(ff) = root_decls.get("font-family") {
+            let cleaned = clean_css_font_family(ff);
+            if !cleaned.is_empty() {
+                root_inline.font_family = cleaned;
+            }
+        }
+        if let Some(col) = root_decls.get("color") {
+            if let Some(rgba) = parse_css_theme_color(col) {
+                base_text_color = rgba;
+                root_inline.color = rgba;
+                ctx.text_color = rgba_to_css_color(rgba);
+            }
+        }
+        root_inline.weight = parse_weight_css(root_decls.get("font-weight"), root_inline.weight);
+        if let Some(st) = root_decls.get("font-style") {
+            let l = st.trim().to_ascii_lowercase();
+            if l == "italic" || l == "oblique" {
+                root_inline.italic = true;
+            } else if l == "normal" {
+                root_inline.italic = false;
+            }
+        }
+    }
 
     let mut builder = GlossaryBuilder {
         renderer,
@@ -3709,11 +6293,14 @@ pub fn render_structured_glossary_entry_in_dirs(
         dict_resource_dirs,
         dic_id,
         dict_name,
+        default_link_color: theme.link_color,
+        had_hidden_elements: root_hidden,
     };
 
     let mut top_blocks: Vec<BlockIR> = Vec::new();
     let use_bullets = legacy_style == LegacyGlossaryStyle::Bullet && !contains_structured;
 
+    if !root_hidden {
     for (idx, entry) in entries.iter().enumerate() {
         match entry {
             DefJson::String(text) => {
@@ -3738,7 +6325,7 @@ pub fn render_structured_glossary_entry_in_dirs(
                 top_blocks.push(BlockIR::Paragraph {
                     atoms,
                     frame: BoxFrameIR::default(),
-                    marker: use_bullets.then(|| ("•".to_owned(), base_text_color, 14.5)),
+                    marker: use_bullets.then(|| ("•".to_owned(), base_text_color, root_inline.font_px)),
                     summary_detail_id: None,
                 });
             }
@@ -3778,7 +6365,7 @@ pub fn render_structured_glossary_entry_in_dirs(
                                 selectable: true,
                             }],
                             frame: BoxFrameIR::default(),
-                            marker: use_bullets.then(|| ("•".to_owned(), base_text_color, 14.5)),
+                            marker: use_bullets.then(|| ("•".to_owned(), base_text_color, root_inline.font_px)),
                             summary_detail_id: None,
                         });
                     }
@@ -3788,8 +6375,20 @@ pub fn render_structured_glossary_entry_in_dirs(
             _ => {}
         }
     }
+    }
 
     if top_blocks.is_empty() {
+        if builder.had_hidden_elements {
+            let empty_pm = tiny_skia::Pixmap::new(1, 1)?;
+            return Some(RenderedGlossaryDoc {
+                width_px: 1.0,
+                height_px: 1.0,
+                image: pixmap_to_slint_image(&empty_pm),
+                hit_zones: Vec::new(),
+                selectable_chars: Vec::new(),
+                plain_text: String::new(),
+            });
+        }
         return None;
     }
 
@@ -3834,19 +6433,8 @@ pub fn render_structured_glossary_entry_in_dirs(
             );
         }
 
-        if !collector.svg_texts.is_empty() {
-            let mut svg = String::with_capacity(collector.svg_texts.len() * 96 + 96);
-            svg.push_str(&format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{pw}\" height=\"{ph}\">"
-            ));
-            append_svg_text_items(&mut svg, &collector.svg_texts, None, 0.0, 0.0, false);
-            svg.push_str("</svg>");
-
-            let mut opts = usvg::Options::default();
-            opts.fontdb = engine.fontdb.clone();
-            if let Ok(tree) = usvg::Tree::from_str(&svg, &opts) {
-                resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
-            }
+        for mg in &collector.mask_glyphs {
+            blit_alpha_glyph(&mut pixmap, mg.x, mg.y, &mg.glyph, mg.rgba);
         }
 
         while collector
@@ -4086,6 +6674,76 @@ struct PopupHistoryEntry {
     active_kana_reading: String,
 }
 
+fn parse_css_invert_ratio(filter_value: &str) -> Option<f32> {
+    let lower = filter_value.to_ascii_lowercase();
+    let pos = lower.find("invert(")?;
+    let rest = &lower[pos + 7..];
+    let end = rest.find(')')?;
+    let arg = rest[..end].trim();
+    if arg.is_empty() {
+        return Some(1.0);
+    }
+    parse_css_unit_float(arg)
+}
+
+fn invert_pixmap(src: &tiny_skia::Pixmap, ratio: f32) -> Arc<tiny_skia::Pixmap> {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let mut out = src.clone();
+    for px in out.pixels_mut() {
+        let a = px.alpha();
+        if a == 0 {
+            continue;
+        }
+        let af = f32::from(a) / 255.0;
+        let inv_chan = |c: u8| -> u8 {
+            let unp = (f32::from(c) / af).clamp(0.0, 255.0);
+            let blended = unp * (1.0 - ratio) + (255.0 - unp) * ratio;
+            (blended * af).round().clamp(0.0, f32::from(a)) as u8
+        };
+        if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(
+            inv_chan(px.red()),
+            inv_chan(px.green()),
+            inv_chan(px.blue()),
+            a,
+        ) {
+            *px = p;
+        }
+    }
+    Arc::new(out)
+}
+
+fn classify_pitch_category(pitches: &[RichPitchGraph], group_tags: &str) -> Option<&'static str> {
+    let first = pitches.first()?;
+    let pos = first.position;
+    if pos == 0 {
+        return Some("heiban");
+    }
+    let is_kifuku_pos = group_tags.split_whitespace().any(|t| {
+        t == "adj-i"
+            || t == "v1"
+            || t == "vk"
+            || t == "vs-i"
+            || t == "vs-s"
+            || t.starts_with("v5")
+            || t.starts_with("v1-")
+            || t.starts_with("v2")
+            || t.starts_with("v4")
+    });
+    if is_kifuku_pos {
+        return Some("kifuku");
+    }
+    if pos == 1 {
+        Some("atamadaka")
+    } else {
+        let mora_count = first.mora.row_count() as i32;
+        if mora_count > 1 && pos >= mora_count {
+            Some("odaka")
+        } else {
+            Some("nakadaka")
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct RichRowExtras {
     hit: Option<SearchHit>,
@@ -4093,6 +6751,7 @@ struct RichRowExtras {
     def_pills: Vec<RichTagPill>,
     derivation_steps: Vec<RichDerivationStep>,
     pitch_graphs: Vec<RichPitchGraph>,
+    pitch_category: Option<&'static str>,
     kanji_detail: Option<RichKanjiDetail>,
     detail_states: HashMap<String, bool>,
 }
@@ -4402,16 +7061,24 @@ struct RichUiBridge {
 impl RichUiBridge {
     fn ensure_fresh_db_and_config(&self, app: &MementoApp) {
         let mut reloaded_config = false;
+        let mut reloaded_css_theme: Option<PopupCssTheme> = None;
         {
             let mut st = self.state.borrow_mut();
             let config_dir = st.config_dir.clone();
             if st.settings.reload_if_changed_on_disk(&config_dir) {
                 reloaded_config = true;
-                app.global::<SubtitleOverlayBridge>()
-                    .set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
-                let rev = app.global::<SubtitleOverlayBridge>().get_style_revision();
-                app.global::<SubtitleOverlayBridge>()
-                    .set_style_revision(rev.wrapping_add(1));
+                let bg = st.settings.subtitle_style.bg_rgba;
+                let sb = app.global::<SubtitleOverlayBridge>();
+                sb.set_middle_mouse_scan_enabled(st.settings.middle_mouse_scan);
+                sb.set_subtitle_bg_color(slint::Color::from_argb_u8(bg[3], bg[0], bg[1], bg[2]));
+                let rev = sb.get_style_revision();
+                sb.set_style_revision(rev.wrapping_add(1));
+            }
+            if st.stylesheets.reload_user_css_if_changed() {
+                st.rich_epoch = st.rich_epoch.wrapping_add(1);
+                st.glossary_cache.clear();
+                st.last_rendered_key.clear();
+                reloaded_css_theme = Some(st.stylesheets.theme().clone());
             }
             let sig = crate::controller::dict::db_file_fingerprint(&self.db_path);
             if sig != st.db_sig {
@@ -4423,6 +7090,11 @@ impl RichUiBridge {
             st.dict_ctrl.set_order(&order);
             st.dict_ctrl.set_mecab_enabled(mecab_enabled);
             st.db_helper.refresh_if_needed();
+        }
+        if let Some(theme) = reloaded_css_theme {
+            apply_popup_css_theme_to_bridge(app, &theme);
+            let pb = app.global::<PopupBridge>();
+            pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         }
         if reloaded_config {
             let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
@@ -4491,6 +7163,18 @@ impl RichUiBridge {
                     Vec::new()
                 };
                 let rich_pitches = rich_pitch_graphs_from_details(&pitch_details);
+                let mut group_pos_tags = String::new();
+                for hit in &candidate_hits[group_start..group_end] {
+                    if !hit.def_tags.is_empty() {
+                        group_pos_tags.push(' ');
+                        group_pos_tags.push_str(&hit.def_tags);
+                    }
+                    if !hit.term_tags.is_empty() {
+                        group_pos_tags.push(' ');
+                        group_pos_tags.push_str(&hit.term_tags);
+                    }
+                }
+                let group_pitch_category = classify_pitch_category(&rich_pitches, &group_pos_tags);
                 let kanji_freqs: Vec<TermFrequency> = if first_hit.is_kanji {
                     st.dict_ctrl.get_kanji_frequencies(&first_hit.expression)
                 } else {
@@ -4560,6 +7244,11 @@ impl RichUiBridge {
                                 rich_pitches.clone()
                             } else {
                                 Vec::new()
+                            },
+                            pitch_category: if idx == group_start {
+                                group_pitch_category
+                            } else {
+                                None
                             },
                             kanji_detail,
                             detail_states: collect_default_detail_states(&hit.raw_glossary),
@@ -5023,7 +7712,7 @@ impl RichUiBridge {
             st.last_rendered_key.insert(row_index, cache_key);
             return Some(doc);
         }
-        if st.glossary_cache.len() > 128 {
+        if st.glossary_cache.len() > 256 {
             st.glossary_cache.clear();
             st.last_rendered_key.clear();
         }
@@ -5031,8 +7720,9 @@ impl RichUiBridge {
         let sheet = st
             .stylesheets
             .get_for_dictionary(&res_dirs, hit.dictionary_id, &hit.dict_name);
+        let theme = st.stylesheets.theme().clone();
         let legacy_style = st.settings.glossary_style;
-        let doc = render_structured_glossary_entry_in_dirs(
+        let doc = render_structured_glossary_entry_with_theme(
             &hit.raw_glossary,
             &hit.glossary,
             sheet,
@@ -5043,6 +7733,7 @@ impl RichUiBridge {
             &hit.dict_name,
             bucket_w as f32,
             selected,
+            &theme,
         )?;
         st.last_rendered_key.insert(row_index, cache_key.clone());
         st.glossary_cache.insert(cache_key, doc.clone());
@@ -5219,6 +7910,7 @@ impl RichUiBridge {
             st.pending_scan_utf16_start = Some(cluster.global_utf16_offset);
             st.pending_scan_sub_query = Some(cluster.sub_query.clone());
         }
+        app.set_popup_offset_x(app.get_pending_popup_offset_x());
         app.set_selected_token_index(cluster.word.index);
         app.invoke_lookup_word(cluster.sub_query.into());
     }
@@ -5360,6 +8052,7 @@ pub fn install_rich_ui_bridges(
 ) {
     let settings = CachedConfigSettings::from_controller(config, config_dir);
     let middle_mouse_default = settings.middle_mouse_scan;
+    let initial_sub_bg = settings.subtitle_style.bg_rgba;
     let initial_anki_show_tag = settings.anki_show_tag;
     let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
     let db_sig = crate::controller::dict::db_file_fingerprint(dictionary_db_path);
@@ -5518,6 +8211,9 @@ pub fn install_rich_ui_bridges(
     let prev_instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
     app.global::<PopupBridge>().set_bridge_instance_id(instance_id);
 
+    let stylesheets = StylesheetCache::new(config_dir);
+    let initial_popup_theme = stylesheets.theme().clone();
+
     let bridge = Rc::new(RichUiBridge {
         instance_id,
         app_weak: app.as_weak(),
@@ -5529,7 +8225,7 @@ pub fn install_rich_ui_bridges(
             dict_ctrl,
             db_sig,
             db_helper: RichDbHelper::new(dictionary_db_path.to_path_buf()),
-            stylesheets: StylesheetCache::default(),
+            stylesheets,
             rich_epoch: 1,
             row_extras: HashMap::new(),
             current_hits: Vec::new(),
@@ -5566,6 +8262,7 @@ pub fn install_rich_ui_bridges(
     let pb = app.global::<PopupBridge>();
     pb.set_rich_enabled(true);
     pb.set_anki_show_tags(initial_anki_show_tag);
+    apply_popup_css_theme_to_bridge(app, &initial_popup_theme);
     pb.on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
 
     pb.on_headword_chars(|expr| {
@@ -5581,13 +8278,16 @@ pub fn install_rich_ui_bridges(
         Rc::new(VecModel::from(chars)).into()
     });
 
-    pb.on_headword_lines(|expr, avail_w| {
+    let b_hw_lines = bridge.clone();
+    pb.on_headword_lines(move |expr, avail_w| {
+        let hw_scale = (b_hw_lines.state.borrow().stylesheets.theme().headword_size / 23.0)
+            .clamp(0.5, 2.5);
         let max_w = avail_w.max(96.0);
         let mut lines: Vec<RichHeadwordLine> = Vec::new();
         let mut cur_line: Vec<RichHeadwordChar> = Vec::new();
         let mut cur_w = 0.0f32;
         for (i, ch) in expr.chars().enumerate() {
-            let cw = if ch.is_ascii() { 14.0 } else { 24.0 };
+            let cw = if ch.is_ascii() { 14.0 } else { 24.0 } * hw_scale;
             if !cur_line.is_empty() && cur_w + cw > max_w {
                 lines.push(RichHeadwordLine {
                     chars: Rc::new(VecModel::from(std::mem::take(&mut cur_line))).into(),
@@ -5607,6 +8307,112 @@ pub fn install_rich_ui_bridges(
             });
         }
         Rc::new(VecModel::from(lines)).into()
+    });
+
+    let b_hw_pitch = bridge.clone();
+    pb.on_headword_pitch_color(move |row_idx, _rev| {
+        let st = b_hw_pitch.state.borrow();
+        let cat = st.row_extras.get(&row_idx).and_then(|e| e.pitch_category);
+        rgba_to_slint_color(st.stylesheets.theme().resolve_headword_pitch_color(cat))
+    });
+
+    let b_dict_style = bridge.clone();
+    pb.on_dict_entry_style(move |dict_name, _is_solo, _rev| {
+        let st = b_dict_style.state.borrow();
+        let resolved = st.stylesheets.theme().resolve_dict_style(dict_name.as_str());
+        PopupDictStyle {
+            badge_bg: rgba_to_slint_color(resolved.badge_bg),
+            badge_color: rgba_to_slint_color(resolved.badge_color),
+            card_bg: rgba_to_slint_color(resolved.card_bg),
+            card_border: rgba_to_slint_color(resolved.card_border),
+            card_border_width: resolved.card_border_width,
+            card_radius: resolved.card_radius,
+            card_padding: resolved.card_padding,
+            glossary_opacity: resolved.glossary_opacity,
+            glossary_hover_opacity: resolved.glossary_hover_opacity,
+            glossary_solo_opacity: resolved.glossary_solo_opacity,
+        }
+    });
+
+    let b_freq_style = bridge.clone();
+    pb.on_freq_badge_style(move |freq_dict, _rev| {
+        let st = b_freq_style.state.borrow();
+        let (bg, color) = st.stylesheets.theme().resolve_freq_style(freq_dict.as_str());
+        PopupFreqStyle {
+            bg: rgba_to_slint_color(bg),
+            color: rgba_to_slint_color(color),
+        }
+    });
+
+    let b_pitch_dict_bg = bridge.clone();
+    pb.on_pitch_dict_bg(move |pitch_dict, _rev| {
+        let st = b_pitch_dict_bg.state.borrow();
+        rgba_to_slint_color(st.stylesheets.theme().resolve_pitch_dict_bg(pitch_dict.as_str()))
+    });
+
+    pb.on_definition_grid_rows(|all_rows, term_start_index| {
+        let total = all_rows.row_count();
+        let mut group = Vec::new();
+        let mut started = false;
+        for i in 0..total {
+            let Some(row) = all_rows.row_data(i) else {
+                continue;
+            };
+            if !started {
+                if row.index == term_start_index {
+                    started = true;
+                    group.push(row);
+                }
+            } else if row.term_start {
+                break;
+            } else {
+                group.push(row);
+            }
+        }
+        let is_solo = group.len() == 1;
+        let mut pairs = Vec::with_capacity(group.len().div_ceil(2));
+        let mut iter = group.into_iter();
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                pairs.push(DefinitionGridRow {
+                    left,
+                    right,
+                    has_right: true,
+                    is_solo: false,
+                });
+            } else {
+                pairs.push(DefinitionGridRow {
+                    left,
+                    right: DictResult::default(),
+                    has_right: false,
+                    is_solo,
+                });
+            }
+        }
+        Rc::new(VecModel::from(pairs)).into()
+    });
+
+    let b_deriv_summary = bridge.clone();
+    pb.on_derivation_summary(move |row_idx, _rev| {
+        let st = b_deriv_summary.state.borrow();
+        let Some(extras) = st.row_extras.get(&row_idx) else {
+            return SharedString::default();
+        };
+        if extras.derivation_steps.is_empty() {
+            return SharedString::default();
+        }
+        let joined: Vec<String> = extras
+            .derivation_steps
+            .iter()
+            .map(|s| {
+                if s.description.is_empty() {
+                    s.label.to_string()
+                } else {
+                    format!("{} ({})", s.label, s.description)
+                }
+            })
+            .collect();
+        format!("« {}", joined.join(" ← ")).into()
     });
 
     let b_term_pills = bridge.clone();
@@ -6115,6 +8921,12 @@ pub fn install_rich_ui_bridges(
     // ── Wire SubtitleOverlayBridge ──────────────────────────────────────────
     let sb = app.global::<SubtitleOverlayBridge>();
     sb.set_rich_enabled(true);
+    sb.set_subtitle_bg_color(slint::Color::from_argb_u8(
+        initial_sub_bg[3],
+        initial_sub_bg[0],
+        initial_sub_bg[1],
+        initial_sub_bg[2],
+    ));
     sb.set_middle_mouse_scan_enabled(middle_mouse_default);
 
     let b_sub_render = bridge.clone();
@@ -6139,8 +8951,31 @@ pub fn install_rich_ui_bridges(
             let mut has_sel = false;
             let mut sel_x = shaped.glyph_x_px;
             let mut sel_w = shaped.glyph_width_px;
+            let mut sel_join_left = false;
+            let mut sel_join_right = false;
 
-            if let (Some((hl_start, hl_end)), Some(ref app)) = (scan_range, app_opt) {
+            // Check whether this token has an adjacent token on the same visual subtitle line
+            // so wrapped line boundaries keep neat rounded corners instead of overhanging.
+            let (has_line_prev, has_line_next) = if let Some(ref app) = app_opt {
+                let lines = app.get_active_sub_lines();
+                let mut found = (false, false);
+                for li in 0..lines.row_count() {
+                    if let Some(line) = lines.row_data(li) {
+                        let count = line.words.row_count();
+                        for wi in 0..count {
+                            if line.words.row_data(wi).is_some_and(|w| w.index == word.index) {
+                                found = (wi > 0, wi + 1 < count);
+                                break;
+                            }
+                        }
+                    }
+                }
+                found
+            } else {
+                (false, false)
+            };
+
+            if let (Some((hl_start, hl_end)), Some(app)) = (scan_range, app_opt.as_ref()) {
                 if app.get_dict_open() && app.get_selected_token_index() >= 0 {
                     let words = app.get_active_sub_words();
                     let mut token_u16_start = 0usize;
@@ -6156,6 +8991,8 @@ pub fn install_rich_ui_bridges(
                     let ov_end = hl_end.min(token_u16_end);
                     if ov_start < ov_end {
                         has_sel = true;
+                        sel_join_left = has_line_prev && hl_start < token_u16_start;
+                        sel_join_right = has_line_next && hl_end > token_u16_end;
                         let local_u16_lo = ov_start - token_u16_start;
                         let local_u16_hi = ov_end - token_u16_start;
                         let mut x_min = f32::INFINITY;
@@ -6195,18 +9032,44 @@ pub fn install_rich_ui_bridges(
                     }
                 } else if token_selected {
                     has_sel = true;
+                    let s_idx = app.get_selected_token_index();
+                    let s_cnt = app.get_selected_token_count();
+                    sel_join_left = has_line_prev && word.index > s_idx;
+                    sel_join_right = has_line_next && word.index + 1 < s_idx + s_cnt;
                 }
             } else if token_selected {
                 has_sel = true;
+                if let Some(ref app) = app_opt {
+                    let s_idx = app.get_selected_token_index();
+                    let s_cnt = app.get_selected_token_count();
+                    sel_join_left = has_line_prev && word.index > s_idx;
+                    sel_join_right = has_line_next && word.index + 1 < s_idx + s_cnt;
+                }
+            }
+
+            if has_sel {
+                // Bridge inter-token padding and subpixel rounding so adjacent highlighted
+                // characters form one continuous solid blue bar with zero vertical seams.
+                let mut right = sel_x + sel_w;
+                if sel_join_left {
+                    sel_x = 0.0;
+                }
+                if sel_join_right {
+                    right = shaped.width_px + 0.5;
+                }
+                sel_w = (right - sel_x).max(1.0);
             }
 
             SubtitleTokenMetrics {
                 width_px: shaped.width_px,
                 height_px: shaped.height_px,
+                bleed_x_px: shaped.bleed_x_px,
                 glyph_y_px: shaped.glyph_y_px,
                 glyph_height_px: shaped.glyph_height_px,
                 sel_x_px: sel_x,
                 sel_width_px: sel_w,
+                sel_join_left,
+                sel_join_right,
                 has_selection: has_sel,
                 rendered: shaped.image,
             }
@@ -6351,6 +9214,7 @@ pub fn install_rich_ui_bridges(
         ) {
             b_left_click.trigger_subtitle_scan_now(&app, cluster);
         } else if !word.query.is_empty() {
+            app.set_popup_offset_x(app.get_pending_popup_offset_x());
             app.set_selected_token_index(word.index);
             app.invoke_lookup_word(word.query);
         }
@@ -6428,9 +9292,10 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     let Some(bridge) = bridge else {
         return;
     };
-    let middle_mouse = {
+    let (middle_mouse, sub_bg, popup_theme) = {
         let mut st = bridge.state.borrow_mut();
         st.settings.apply_controller(config);
+        st.stylesheets.force_reload_user_css();
         let sig = crate::controller::dict::db_file_fingerprint(&bridge.db_path);
         if sig != st.db_sig {
             st.db_sig = sig;
@@ -6444,8 +9309,13 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         st.rich_epoch = st.rich_epoch.wrapping_add(1);
         st.glossary_cache.clear();
         st.last_rendered_key.clear();
-        st.settings.middle_mouse_scan
+        (
+            st.settings.middle_mouse_scan,
+            st.settings.subtitle_style.bg_rgba,
+            st.stylesheets.theme().clone(),
+        )
     };
+    apply_popup_css_theme_to_bridge(app, &popup_theme);
     let pb = app.global::<PopupBridge>();
     pb.set_anki_show_tags(config.anki_show_tag());
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
@@ -6457,6 +9327,9 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     }
     let sb = app.global::<SubtitleOverlayBridge>();
     sb.set_middle_mouse_scan_enabled(middle_mouse);
+    sb.set_subtitle_bg_color(slint::Color::from_argb_u8(
+        sub_bg[3], sub_bg[0], sub_bg[1], sub_bg[2],
+    ));
     sb.set_style_revision(sb.get_style_revision().wrapping_add(1));
     let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
     if !words.is_empty() {
@@ -6565,5 +9438,321 @@ mod mecab_settings_tests {
         cfg.edit_setting(&key, "true").unwrap();
         updated.apply_controller(&cfg);
         assert!(updated.mecab_enabled);
+    }
+
+    #[test]
+    fn keycap_emoji_continuations_do_not_emit_stray_svg_overlays() {
+        let mut engine = TextEngine::new();
+        let txt = "1\u{FE0F}\u{20E3}［連体］《2\u{FE0F}\u{20E3}の一語化》";
+        let layout = engine.shape_single_line(txt, "", 14.5, 400, false, [248, 250, 252, 255]);
+        let (svg_clusters, color_images) =
+            engine.collect_svg_clusters_from_layout(&layout, txt, 0.0, 0.0, None, None);
+        assert_eq!(
+            color_images.len(),
+            2,
+            "1️⃣ and 2️⃣ must each render as exactly one color emoji bitmap"
+        );
+        for item in &svg_clusters {
+            assert!(
+                !item.text.contains('\u{20E3}') && !item.text.contains('\u{FE0F}'),
+                "keycap continuation {:?} must never be emitted to usvg on top of the color emoji",
+                item.text
+            );
+        }
+        let svg_text: String = svg_clusters.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(svg_text, "［連体］《の一語化》");
+    }
+
+    #[test]
+    fn custom_popup_css_parser_handles_variables_selectors_and_template() {
+        // Starter templates must reproduce exact defaults cleanly.
+        let from_template = parse_split_popup_css_theme(
+            default_custom_popup_css_template(),
+            default_custom_popup_outer_css_template(),
+        );
+        assert_eq!(from_template, PopupCssTheme::default());
+
+        // Custom :root variables (including var() indirection, CSS #RRGGBBAA, comments, !important)
+        // and class selectors must override defaults accurately.
+        let css = r#"
+            /* Theme comment */
+            :root {
+                --brand: #FF3366;
+                --popup-bg: #101418EE !important;
+                --popup-border: var(--brand);
+                --popup-border-width: 2px;
+                --popup-radius: 14px;
+                --popup-padding: 18px;
+                --font-family: "Noto Serif CJK JP", serif;
+                --glossary-font-size: 16px;
+                --anki-tag-border: #38BDF8AA;
+            }
+            .headword {
+                color: var(--brand);
+                font-size: 28px;
+            }
+            .reading {
+                color: rgb(200, 210, 220);
+                font-size: 14px;
+            }
+            .frequency {
+                background-color: #112233;
+                color: #AAFFEE;
+            }
+            .dictionary-badge {
+                background: #441188;
+                color: #FFFFFF;
+            }
+            .divider {
+                background-color: #556677;
+            }
+        "#;
+        let theme = parse_popup_css_theme(css);
+        assert_eq!(theme.popup_bg, [0x10, 0x14, 0x18, 0xEE]);
+        assert_eq!(theme.popup_border, [0xFF, 0x33, 0x66, 0xFF]);
+        assert_eq!(theme.popup_border_width, 2.0);
+        assert_eq!(theme.popup_radius, 14.0);
+        assert_eq!(theme.popup_padding, 18.0);
+        assert_eq!(theme.font_family, "Noto Serif CJK JP");
+        assert_eq!(theme.glossary_font_size, 16.0);
+        assert_eq!(theme.anki_tag_border, [0x38, 0xBD, 0xF8, 0xAA]);
+        assert_eq!(theme.headword_color, [0xFF, 0x33, 0x66, 0xFF]);
+        assert_eq!(theme.headword_size, 28.0);
+        assert_eq!(theme.reading_color, [200, 210, 220, 255]);
+        assert_eq!(theme.reading_size, 14.0);
+        assert_eq!(theme.freq_bg, [0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(theme.freq_color, [0xAA, 0xFF, 0xEE, 0xFF]);
+        assert_eq!(theme.dict_badge_bg, [0x44, 0x11, 0x88, 0xFF]);
+        assert_eq!(theme.dict_badge_color, [0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(theme.divider_color, [0x55, 0x66, 0x77, 0xFF]);
+        assert_eq!(theme.term_divider_color, [0x55, 0x66, 0x77, 0xFF]);
+    }
+
+    #[test]
+    fn custom_popup_css_glossary_cascade_supports_data_dictionary_and_display_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let css_path = dir.path().join(CUSTOM_POPUP_CSS_FILENAME);
+        std::fs::write(
+            &css_path,
+            r#"
+            [data-dictionary^="JMdict"] [data-sc-content="examples"] {
+                display: none;
+            }
+            li[data-dictionary="SpecialDict"] [data-sc-content="note"] {
+                display: none;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut cache = StylesheetCache::new(dir.path());
+        let res_dirs: Vec<PathBuf> = Vec::new();
+        let raw = r#"[{
+            "type": "structured-content",
+            "content": [
+                {"tag": "div", "data": {"content": "glossary"}, "content": "main meaning"},
+                {"tag": "div", "data": {"content": "examples"}, "content": "secret example"},
+                {"tag": "div", "data": {"content": "note"}, "content": "extra note"}
+            ]
+        }]"#;
+
+        let jmdict_sheet = cache.get_for_dictionary(&res_dirs, 1, "JMdict [2025-11-01]");
+        let jmdict_doc = render_structured_glossary_entry_with_theme(
+            raw,
+            "",
+            jmdict_sheet,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &res_dirs,
+            1,
+            "JMdict [2025-11-01]",
+            420.0,
+            true,
+            cache.theme(),
+        )
+        .expect("JMdict doc should render");
+        assert!(jmdict_doc.plain_text.contains("main meaning"));
+        assert!(
+            !jmdict_doc.plain_text.contains("secret example"),
+            "display: none under [data-dictionary^=\"JMdict\"] must hide examples, got: {:?}",
+            jmdict_doc.plain_text
+        );
+        assert!(jmdict_doc.plain_text.contains("extra note"));
+
+        let other_sheet = cache.get_for_dictionary(&res_dirs, 2, "SpecialDict");
+        let other_doc = render_structured_glossary_entry_with_theme(
+            raw,
+            "",
+            other_sheet,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &res_dirs,
+            2,
+            "SpecialDict",
+            420.0,
+            true,
+            cache.theme(),
+        )
+        .expect("SpecialDict doc should render");
+        assert!(other_doc.plain_text.contains("main meaning"));
+        assert!(
+            other_doc.plain_text.contains("secret example"),
+            "examples must stay visible for non-matching dictionary, got: {:?}",
+            other_doc.plain_text
+        );
+        assert!(
+            !other_doc.plain_text.contains("extra note"),
+            "li[data-dictionary=\"SpecialDict\"] normalization must hide note, got: {:?}",
+            other_doc.plain_text
+        );
+    }
+
+    #[test]
+    fn split_popup_and_outer_css_supports_2col_pitch_dict_colors_freq_and_nested_rules() {
+        let outer = r#"
+            iframe.yomitan-popup {
+                background: rgba(45, 45, 55, 0.85) !important;
+                border-radius: 12px !important;
+                border: 1px solid rgba(255, 255, 255, 0.1) !important;
+                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+                width: 760px;
+            }
+        "#;
+        let inner = r#"
+            body {
+                background: transparent !important;
+                color: #dfdfdf;
+            }
+            :root {
+                --font-family: "UD デジタル 教科書体 NK-R";
+                // --font-family: "英椎楷書";
+                --definition-columns: 2;
+                --definition-gap: 10px;
+                --card-border: #333333;
+                --card-border-width: 2px;
+                --card-radius: 10px;
+                --card-padding: 10px;
+                --pitch-heiban-color: #59b2ff;
+                --pitch-atamadaka-color: #ff6666;
+                --pitch-kifuku-color: #af85f4;
+            }
+            .term-tags { display: none; }
+            .pitch-dict { display: none; }
+            .kanji-extra { display: none; }
+            .derivations { display: compact; }
+
+            [data-dictionary="デジタル大辞泉"] {
+                --dict-color: rgb(170, 0, 0);
+                --dict-bg-opacity: 0.10;
+            }
+            [data-dictionary*="JMdict"] {
+                --dict-color: rgb(0, 132, 255);
+                --dict-bg-opacity: 0.05;
+                --glossary-opacity: 0;
+                --glossary-hover-opacity: 1;
+                --glossary-solo-opacity: 1;
+            }
+            [data-frequency^="JPDB"] { background-color: #ff3e3d; color: #ffffff; }
+            [data-frequency="CC100"] { background-color: #6238fa; color: #ffffff; }
+        "#;
+
+        let theme = parse_split_popup_css_theme(inner, outer);
+        // Outer translucent background must NOT be clobbered by inner `body { background: transparent }`
+        assert_eq!(theme.popup_bg[0..3], [45, 45, 55]);
+        assert!((theme.popup_bg[3] as i32 - 217).abs() <= 2);
+        assert_eq!(theme.popup_radius, 12.0);
+        assert_eq!(theme.popup_border_width, 1.0);
+        assert_eq!(theme.popup_shadow_blur, 15.0);
+        assert_eq!(theme.popup_width, 760.0);
+
+        // Inner typography, 2-col layout, and visibility flags
+        assert_eq!(theme.font_family, "UD デジタル 教科書体 NK-R");
+        assert_eq!(theme.text_color, [0xDF, 0xDF, 0xDF, 0xFF]);
+        assert_eq!(theme.definition_columns, 2);
+        assert_eq!(theme.definition_gap, 10.0);
+        assert_eq!(theme.card_border_width, 2.0);
+        assert_eq!(theme.card_radius, 10.0);
+        assert_eq!(theme.card_padding, 10.0);
+        assert!(!theme.show_term_tags);
+        assert!(!theme.show_pitch_dict);
+        assert!(!theme.show_kanji_extra);
+        assert!(theme.compact_derivations);
+
+        // Pitch colors
+        assert_eq!(theme.resolve_headword_pitch_color(Some("heiban")), [0x59, 0xB2, 0xFF, 0xFF]);
+        assert_eq!(theme.resolve_headword_pitch_color(Some("atamadaka")), [0xFF, 0x66, 0x66, 0xFF]);
+        assert_eq!(theme.resolve_headword_pitch_color(Some("kifuku")), [0xAF, 0x85, 0xF4, 0xFF]);
+
+        // Per-dictionary badge + tint + hover-to-reveal
+        let daijisen = theme.resolve_dict_style("デジタル大辞泉");
+        assert_eq!(daijisen.badge_bg, [170, 0, 0, 255]);
+        assert_eq!(daijisen.card_bg[0..3], [170, 0, 0]);
+        assert!((daijisen.card_bg[3] as i32 - 26).abs() <= 2);
+        assert_eq!(daijisen.glossary_opacity, 1.0);
+
+        let jmdict = theme.resolve_dict_style("JMdict [2025-11-01]");
+        assert_eq!(jmdict.badge_bg, [0, 132, 255, 255]);
+        assert_eq!(jmdict.glossary_opacity, 0.0);
+        assert_eq!(jmdict.glossary_hover_opacity, 1.0);
+        assert_eq!(jmdict.glossary_solo_opacity, 1.0);
+
+        // Per-frequency colors
+        assert_eq!(
+            theme.resolve_freq_style("JPDB").0,
+            [0xFF, 0x3E, 0x3D, 0xFF]
+        );
+        assert_eq!(
+            theme.resolve_freq_style("CC100").0,
+            [0x62, 0x38, 0xFA, 0xFF]
+        );
+    }
+
+    #[test]
+    fn nested_dictionary_css_can_hide_ruby_rt_furigana() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(CUSTOM_POPUP_CSS_FILENAME),
+            r#"
+            [data-dictionary="明鏡国語辞典 第三版"] {
+                .gloss-sc-ruby[data-sc-class="full"] .gloss-sc-rt {
+                    display: none;
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut cache = StylesheetCache::new(dir.path());
+        let res_dirs: Vec<PathBuf> = Vec::new();
+        let raw = r#"[{
+            "type": "structured-content",
+            "content": {
+                "tag": "ruby",
+                "data": { "class": "full" },
+                "content": ["漢字", { "tag": "rt", "content": "かんじ" }]
+            }
+        }]"#;
+        let sheet = cache.get_for_dictionary(&res_dirs, 1, "明鏡国語辞典 第三版");
+        let doc = render_structured_glossary_entry_with_theme(
+            raw,
+            "",
+            sheet,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &res_dirs,
+            1,
+            "明鏡国語辞典 第三版",
+            400.0,
+            true,
+            cache.theme(),
+        )
+        .expect("ruby doc should render");
+        assert_eq!(doc.plain_text, "漢字");
+        // When <rt> is hidden via display: none, it renders as plain text rather than a Ruby InlineBox with tooltip
+        assert!(
+            doc.hit_zones.is_empty(),
+            "hidden <rt> should suppress ruby box tooltip hit zone, got {:?}",
+            doc.hit_zones.len()
+        );
     }
 }

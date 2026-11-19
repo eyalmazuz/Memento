@@ -100,10 +100,35 @@ export struct RichGlossaryRender {
     selection_rects: [RichSelectionRect],
 }
 
+export struct PopupDictStyle {
+    badge_bg: color,
+    badge_color: color,
+    card_bg: color,
+    card_border: color,
+    card_border_width: length,
+    card_radius: length,
+    card_padding: length,
+    glossary_opacity: float,
+    glossary_hover_opacity: float,
+    glossary_solo_opacity: float,
+}
+
+export struct PopupFreqStyle {
+    bg: color,
+    color: color,
+}
+
+export struct DefinitionGridRow {
+    left: DictResult,
+    right: DictResult,
+    has_right: bool,
+    is_solo: bool,
+}
+
 // ── Floating Yomitan Dictionary Card ────────────────────────────────────
 // Japanese text uses one family; Slint accepts a single name, not a CSS list.
 export component DictionaryText inherits Text {
-    font-family: "Noto Sans CJK JP";
+    font-family: PopupBridge.css-font-family;
 }
 
 export global PopupLayout {
@@ -117,6 +142,47 @@ export global PopupBridge {
     in-out property <bool> rich-enabled: false;
     in-out property <int> rich-revision: 0;
     in-out property <int> selection-revision: 0;
+
+    // Custom Popup Outer CSS properties (~/.config/memento/popup-outer.css)
+    in-out property <color> css-popup-bg: #1C2024;
+    in-out property <color> css-popup-border: #384046;
+    in-out property <length> css-popup-border-width: 1px;
+    in-out property <length> css-popup-radius: 8px;
+    in-out property <length> css-popup-padding: 12px;
+    in-out property <length> css-popup-shadow-blur: 24px;
+    in-out property <color> css-popup-shadow-color: #000000DD;
+    in-out property <length> css-popup-width: 0px;
+    in-out property <length> css-popup-height: 0px;
+
+    // Custom Popup Inner CSS properties (~/.config/memento/popup.css)
+    in-out property <color> css-text-color: #F8FAFC;
+    in-out property <color> css-muted-color: #94A3B8;
+    in-out property <color> css-headword-color: #FFFFFF;
+    in-out property <length> css-headword-size: 23px;
+    in-out property <color> css-reading-color: #94A3B8;
+    in-out property <length> css-reading-size: 12px;
+    in-out property <string> css-font-family: "Noto Sans CJK JP";
+    in-out property <length> css-glossary-font-size: 14.5px;
+    in-out property <color> css-link-color: #93C5FD;
+    in-out property <color> css-divider-color: #30373D;
+    in-out property <color> css-term-divider-color: #52616B;
+    in-out property <color> css-freq-bg: #07513E;
+    in-out property <color> css-freq-color: #9CE5C7;
+    in-out property <length> css-freq-font-size: 10px;
+    in-out property <color> css-pitch-color: #B9A1E8;
+    in-out property <color> css-pitch-dict-bg: #6640BE;
+    in-out property <color> css-dict-badge-bg: #6D28D9;
+    in-out property <color> css-dict-badge-color: #EDE9FE;
+    in-out property <color> css-anki-tag-bg: #162B3D;
+    in-out property <color> css-anki-tag-border: #38BDF888;
+    in-out property <color> css-anki-tag-color: #BAE6FD;
+    in-out property <int> css-definition-columns: 1;
+    in-out property <length> css-definition-columns-min-width: 560px;
+    in-out property <length> css-definition-gap: 8px;
+    in-out property <bool> css-show-term-tags: true;
+    in-out property <bool> css-show-pitch-dict: true;
+    in-out property <bool> css-show-kanji-extra: true;
+    in-out property <bool> css-compact-derivations: false;
 
     // Navigation history stack (Back / Forward)
     in-out property <bool> can-go-back: false;
@@ -148,10 +214,16 @@ export global PopupBridge {
     // Rich query callbacks
     pure callback headword-chars(string) -> [RichHeadwordChar];
     pure callback headword-lines(string, float) -> [RichHeadwordLine];
+    pure callback headword-pitch-color(int, int) -> color;
+    pure callback dict-entry-style(string, bool, int) -> PopupDictStyle;
+    pure callback freq-badge-style(string, int) -> PopupFreqStyle;
+    pure callback pitch-dict-bg(string, int) -> color;
+    pure callback definition-grid-rows([DictResult], int) -> [DefinitionGridRow];
     pure callback split-anki-tags(string) -> [string];
     pure callback term-tag-pills(int, int) -> [RichTagPill];
     pure callback def-tag-pills(int, int) -> [RichTagPill];
     pure callback derivation-steps(int, int) -> [RichDerivationStep];
+    pure callback derivation-summary(int, int) -> string;
     pure callback rich-pitch-graphs(int, int) -> [RichPitchGraph];
     pure callback devoice-circle-image() -> image;
     pure callback kanji-detail(int, int) -> RichKanjiDetail;
@@ -212,6 +284,441 @@ component RichTagPillBadge inherits Rectangle {
     }
 }
 
+component DefinitionEntryBody inherits Rectangle {
+    in property <DictResult> res;
+    in property <bool> is-solo: false;
+    in property <bool> show-anki-checkbox: true;
+    in property <length> tooltip-base-x: 12px;
+    in property <length> tooltip-base-y: 0px;
+    callback toggle-select-definition(int);
+    callback open-rich-link(string);
+    callback focus-glossary();
+
+    property <PopupDictStyle> dstyle: PopupBridge.rich-enabled
+        ? PopupBridge.dict-entry-style(root.res.dict-name, root.is-solo, PopupBridge.rich-revision)
+        : {
+            badge-bg: PopupBridge.css-dict-badge-bg,
+            badge-color: PopupBridge.css-dict-badge-color,
+            card-bg: #00000000,
+            card-border: #00000000,
+            card-border-width: 0px,
+            card-radius: 0px,
+            card-padding: 0px,
+            glossary-opacity: 1.0,
+            glossary-hover-opacity: 1.0,
+            glossary-solo-opacity: 1.0,
+        };
+    property <bool> rich-hovered: false;
+    property <bool> select-hovered: false;
+    property <bool> card-hovered: card-hover.has-hover || root.rich-hovered || root.select-hovered;
+    property <float> active-glossary-opacity: root.is-solo
+        ? root.dstyle.glossary-solo-opacity
+        : (root.card-hovered ? root.dstyle.glossary-hover-opacity : root.dstyle.glossary-opacity);
+    property <length> pad: root.dstyle.card-padding;
+
+    background: root.dstyle.card-bg;
+    border-color: root.dstyle.card-border;
+    border-width: root.dstyle.card-border-width;
+    border-radius: root.dstyle.card-radius;
+    preferred-height: entry-inner.preferred-height + root.pad * 2;
+    min-height: entry-inner.preferred-height + root.pad * 2;
+
+    // Background hover sensor so hovering card padding/header also triggers hover-to-reveal.
+    card-hover := TouchArea {
+        width: 100%;
+        height: 100%;
+    }
+
+    entry-inner := VerticalLayout {
+        x: root.pad;
+        y: root.pad;
+        width: parent.width - root.pad * 2;
+        height: self.preferred-height;
+        spacing: 4px;
+
+        // Header row: Checkbox, Category-colored POS tags (#220), Dictionary tag
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+
+            if root.show-anki-checkbox : Rectangle {
+                width: 17px;
+                height: 17px;
+                border-width: 1px;
+                border-color: root.res.selected ? #34D399 : #94A3B8;
+                border-radius: 3px;
+                background: root.res.selected ? #047857 : transparent;
+                DictionaryText {
+                    text: root.res.selected ? "✓" : "";
+                    color: white;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: 13px;
+                }
+                select-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    changed has-hover => { root.select-hovered = self.has-hover; }
+                    clicked => { root.toggle-select-definition(root.res.index - 1); }
+                }
+            }
+
+            if PopupBridge.rich-enabled : HorizontalLayout {
+                spacing: 4px;
+                for pill in PopupBridge.def-tag-pills(root.res.index, PopupBridge.rich-revision) : RichTagPillBadge {
+                    pill: pill;
+                    anchor-x: root.tooltip-base-x + 12px;
+                    anchor-y: root.tooltip-base-y + 24px;
+                }
+            }
+
+            // Fallback Part of Speech badge(s) when rich bridge is not active
+            if !PopupBridge.rich-enabled && root.res.pos-tags != "" : Rectangle {
+                height: 18px;
+                background: #2b3238;
+                border-radius: 3px;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    DictionaryText {
+                        text: root.res.pos-tags;
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: #cbd5e1;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Dictionary Source Badge
+            if root.res.dict-name != "" : Rectangle {
+                height: 18px;
+                background: root.dstyle.badge-bg;
+                border-radius: 3px;
+                HorizontalLayout {
+                    padding-left: 7px;
+                    padding-right: 7px;
+                    DictionaryText {
+                        text: root.res.dict-name;
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: root.dstyle.badge-color;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Glossary body (respects per-dictionary opacity / hover-to-reveal)
+        gloss-wrap := VerticalLayout {
+            property <RichKanjiDetail> cached-kanji-detail: root.res.is-kanji && PopupBridge.rich-enabled
+                ? PopupBridge.kanji-detail(root.res.index, PopupBridge.rich-revision)
+                : { valid: false };
+            property <bool> has-rich-kanji: root.res.is-kanji && PopupBridge.rich-enabled && self.cached-kanji-detail.valid;
+            property <RichGlossaryRender> cached-rich-doc: !root.res.is-kanji && PopupBridge.rich-enabled
+                ? PopupBridge.render-glossary(
+                    root.res.index,
+                    self.width / 1px,
+                    root.res.selected,
+                    PopupBridge.rich-revision,
+                    PopupBridge.selection-revision
+                )
+                : { has-rich: false };
+            property <bool> has-rich-glossary: !root.res.is-kanji && PopupBridge.rich-enabled && self.cached-rich-doc.has-rich;
+
+            width: parent.width;
+            spacing: 4px;
+            opacity: root.active-glossary-opacity;
+            animate opacity { duration: 120ms; }
+
+            // 3-Column Kanji Detail View
+            if gloss-wrap.has-rich-kanji : VerticalLayout {
+                width: parent.width;
+                spacing: 6px;
+                property <RichKanjiDetail> kdetail: gloss-wrap.cached-kanji-detail;
+
+                Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+
+                HorizontalLayout {
+                    width: parent.width;
+                    spacing: 8px;
+                    DictionaryText { horizontal-stretch: 1; width: 0px; text: "Glossary"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+                    DictionaryText { horizontal-stretch: 1; width: 0px; text: "Reading"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+                    DictionaryText { horizontal-stretch: 1; width: 0px; text: "Statistics"; font-size: 12px; font-weight: 700; color: PopupBridge.css-text-color; }
+                }
+
+                Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+
+                HorizontalLayout {
+                    width: parent.width;
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        width: 0px;
+                        spacing: 2px;
+                        alignment: start;
+                        for meaning[m-idx] in kdetail.meanings : DictionaryText {
+                            width: parent.width;
+                            text: (m-idx + 1) + ". " + meaning;
+                            font-size: 13px;
+                            color: root.res.selected ? PopupBridge.css-text-color : PopupBridge.css-muted-color;
+                            wrap: word-wrap;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        width: 0px;
+                        spacing: 2px;
+                        alignment: start;
+                        for r-line in kdetail.readings : DictionaryText {
+                            width: parent.width;
+                            text: r-line;
+                            font-size: 13px;
+                            color: PopupBridge.css-text-color;
+                            wrap: word-wrap;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        width: 0px;
+                        spacing: 3px;
+                        alignment: start;
+                        for stat in kdetail.stats : HorizontalLayout {
+                            width: parent.width;
+                            spacing: 4px;
+                            DictionaryText {
+                                horizontal-stretch: 1;
+                                text: stat.label;
+                                font-size: 11px;
+                                font-weight: 700;
+                                color: PopupBridge.css-muted-color;
+                                wrap: word-wrap;
+                            }
+                            DictionaryText {
+                                text: stat.value;
+                                font-size: 11px;
+                                color: PopupBridge.css-freq-color;
+                            }
+                        }
+                    }
+                }
+
+                if PopupBridge.css-show-kanji-extra && kdetail.classifications.length > 0 : VerticalLayout {
+                    spacing: 3px;
+                    Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+                    DictionaryText { text: "Classifications"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+                    for item in kdetail.classifications : HorizontalLayout {
+                        spacing: 6px;
+                        DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+                        DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+                    }
+                }
+
+                if PopupBridge.css-show-kanji-extra && kdetail.codepoints.length > 0 : VerticalLayout {
+                    spacing: 3px;
+                    Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+                    DictionaryText { text: "Codepoints"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+                    for item in kdetail.codepoints : HorizontalLayout {
+                        spacing: 6px;
+                        DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+                        DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+                    }
+                }
+
+                if PopupBridge.css-show-kanji-extra && kdetail.indices.length > 0 : VerticalLayout {
+                    spacing: 3px;
+                    Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
+                    DictionaryText { text: "Dictionary Indices"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
+                    for item in kdetail.indices : HorizontalLayout {
+                        spacing: 6px;
+                        DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
+                        DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+                    }
+                }
+            }
+
+            // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs, mouse selection)
+            if gloss-wrap.has-rich-glossary : rich-surface := Rectangle {
+                property <RichGlossaryRender> rich-doc: gloss-wrap.cached-rich-doc;
+                visible: self.rich-doc.has-rich;
+                width: parent.width;
+                height: self.rich-doc.has-rich ? self.rich-doc.height-px * 1px : 0px;
+                background: transparent;
+
+                for sel-rect in self.rich-doc.selection-rects : Rectangle {
+                    x: sel-rect.x-px * 1px;
+                    y: sel-rect.y-px * 1px;
+                    width: sel-rect.w-px * 1px;
+                    height: sel-rect.h-px * 1px;
+                    background: #38a6d666;
+                    border-radius: 2px;
+                }
+
+                if self.rich-doc.has-rich : Image {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.rich-doc.width-px * 1px;
+                    height: parent.rich-doc.height-px * 1px;
+                    source: parent.rich-doc.rendered;
+                    image-fit: fill;
+                }
+
+                if self.rich-doc.has-rich : rich-touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    mouse-cursor: PopupBridge.glossary-cursor-is-pointer(
+                        root.res.index,
+                        self.mouse-x / 1px,
+                        self.mouse-y / 1px
+                    ) ? pointer : text;
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                            root.focus-glossary();
+                            PopupBridge.glossary-pointer-down(
+                                root.res.index,
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px
+                            );
+                        } else if (event.kind == PointerEventKind.move) {
+                            if (self.pressed) {
+                                PopupBridge.glossary-pointer-drag(
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px
+                                );
+                            } else {
+                                PopupBridge.glossary-pointer-hover(
+                                    root.res.index,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    (root.tooltip-base-x + root.pad + self.mouse-x) / 1px,
+                                    (root.tooltip-base-y + root.pad + gloss-wrap.y + rich-surface.y + self.mouse-y) / 1px
+                                );
+                            }
+                        } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                            PopupBridge.glossary-pointer-up(
+                                root.res.index,
+                                self.mouse-x / 1px,
+                                self.mouse-y / 1px
+                            );
+                        } else if (event.kind == PointerEventKind.cancel) {
+                            PopupBridge.hide-tooltip();
+                        }
+                    }
+                    double-clicked => {
+                        root.focus-glossary();
+                        PopupBridge.glossary-double-clicked(
+                            root.res.index,
+                            self.mouse-x / 1px,
+                            self.mouse-y / 1px
+                        );
+                    }
+                    changed has-hover => {
+                        root.rich-hovered = self.has-hover;
+                        if !self.has-hover {
+                            PopupBridge.hide-tooltip();
+                        }
+                    }
+                }
+            }
+
+            // Fallback Definition Meaning Text (when rich surface is not rendered for this row)
+            if !gloss-wrap.has-rich-kanji
+                && !gloss-wrap.has-rich-glossary
+                && root.res.glossary-blocks.length > 0 : VerticalLayout
+            {
+                width: parent.width;
+                spacing: 4px;
+                for block in root.res.glossary-blocks : Rectangle {
+                    width: parent.width;
+                    height: rich-text.preferred-height + 2px;
+                    rich-text := DictionaryText {
+                        width: parent.width;
+                        height: self.preferred-height;
+                        text: block.kind == 2 ? "◦  " + block.text : block.text;
+                        wrap: word-wrap;
+                        font-size: block.kind == 1 ? max(11px, PopupBridge.css-glossary-font-size - 1.5px) : PopupBridge.css-glossary-font-size;
+                        font-weight: block.kind == 1 ? 700 : 400;
+                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? #D8C9FC : PopupBridge.css-text-color;
+                    }
+                    if block.href != "" : TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            if !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
+                                root.open-rich-link(block.href);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !gloss-wrap.has-rich-kanji
+                && !gloss-wrap.has-rich-glossary
+                && root.res.glossary-blocks.length == 0 : DictionaryText
+            {
+                width: parent.width;
+                text: root.res.glossary;
+                font-size: PopupBridge.css-glossary-font-size;
+                font-weight: 400;
+                color: root.res.selected ? PopupBridge.css-text-color : PopupBridge.css-muted-color;
+                wrap: word-wrap;
+                height: self.preferred-height;
+            }
+
+            // Japanese Example Sentence (fallback)
+            if !gloss-wrap.has-rich-glossary
+                && root.res.example-ja != "" : HorizontalLayout
+            {
+                width: parent.width;
+                spacing: 5px;
+                Rectangle {
+                    width: 16px;
+                    Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-jp.svg"); }
+                }
+                DictionaryText {
+                    text: root.res.example-ja;
+                    font-size: 13px;
+                    color: PopupBridge.css-text-color;
+                    wrap: word-wrap;
+                    height: self.preferred-height;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // English Example Translation (fallback)
+            if !gloss-wrap.has-rich-glossary
+                && root.res.example-en != "" : HorizontalLayout
+            {
+                width: parent.width;
+                spacing: 5px;
+                Rectangle {
+                    width: 16px;
+                    Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-gb.svg"); }
+                }
+                DictionaryText {
+                    text: root.res.example-en;
+                    font-size: 12px;
+                    color: PopupBridge.css-muted-color;
+                    wrap: word-wrap;
+                    height: self.preferred-height;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            // Notes / Explanations (fallback)
+            if !gloss-wrap.has-rich-kanji
+                && root.res.notes != "" : DictionaryText
+            {
+                width: parent.width;
+                text: "Note: " + root.res.notes;
+                font-size: 12px;
+                color: PopupBridge.css-muted-color;
+                wrap: word-wrap;
+                height: self.preferred-height;
+            }
+        }
+    }
+}
+
 export component YomitanPopup inherits Rectangle {
     in property <string> headword: "";
     in property <string> reading: "";
@@ -248,16 +755,19 @@ export component YomitanPopup inherits Rectangle {
     out property <bool> needs-more: root.is-open && root.has-more-results
         && definition-list.height > 0px
         && definition-list.viewport-height + definition-list.viewport-y <= definition-list.height + 180px;
+    property <bool> use-two-columns: PopupBridge.rich-enabled
+        && PopupBridge.css-definition-columns >= 2
+        && root.width >= PopupBridge.css-definition-columns-min-width;
 
     visible: root.is-open && root.results.length > 0;
     width: 480px;
     height: 500px;
-    background: #1C2024;
-    border-width: 1px;
-    border-color: #384046;
-    border-radius: 8px;
-    drop-shadow-blur: 24px;
-    drop-shadow-color: #000000DD;
+    background: PopupBridge.css-popup-bg;
+    border-width: PopupBridge.css-popup-border-width;
+    border-color: PopupBridge.css-popup-border;
+    border-radius: PopupBridge.css-popup-radius;
+    drop-shadow-blur: PopupBridge.css-popup-shadow-blur;
+    drop-shadow-color: PopupBridge.css-popup-shadow-color;
 
     changed is-open => {
         root.audio-menu-open = false;
@@ -313,7 +823,7 @@ export component YomitanPopup inherits Rectangle {
 
     popup-content := VerticalLayout {
         cache-rendering-hint: true;
-        padding: 12px;
+        padding: PopupBridge.css-popup-padding;
         spacing: 4px;
 
         // Back / Forward Navigation History Bar (shown when internal navigation occurred)
@@ -388,9 +898,11 @@ export component YomitanPopup inherits Rectangle {
                 height: self.preferred-height;
                 spacing: 0px;
                 for res[idx] in root.results : row-wrapper := Rectangle {
+                property <bool> hidden-by-grid: root.use-two-columns && !res.term-start;
+                property <bool> row-hidden: self.hidden-by-grid || (res.collapsed && !res.term-start);
                 width: parent.width - 6px;
-                height: res.collapsed && !res.term-start ? 0px : term-segment.height + ((res.term-end || (res.collapsed && res.term-start)) ? 10px : 0px);
-                visible: !res.collapsed || res.term-start;
+                height: self.row-hidden ? 0px : term-segment.height + ((res.term-end || root.use-two-columns || (res.collapsed && res.term-start)) ? 10px : 0px);
+                visible: !self.row-hidden;
                 background: transparent;
                 term-segment := Rectangle {
                     property <int> row-zero-idx: res.index - 1;
@@ -413,18 +925,21 @@ export component YomitanPopup inherits Rectangle {
                             ? PopupBridge.row-anki-tags[self.row-zero-idx]
                             : "";
                     property <bool> show-browse-btn: self.added-this-row || (root.anki-enabled && self.row-is-duplicate);
+                    property <color> term-headword-color: PopupBridge.rich-enabled
+                        ? PopupBridge.headword-pitch-color(res.index, PopupBridge.rich-revision)
+                        : PopupBridge.css-headword-color;
 
                     width: parent.width;
-                    height: card-content.preferred-height + 16px;
+                    height: row-wrapper.row-hidden ? 0px : card-content.preferred-height + 10px;
                     background: transparent;
-                    if res.term-start && res.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: #52616B; }
-                    if !res.term-end && !res.collapsed : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #30373D; }
+                    if !row-wrapper.row-hidden && res.term-start && res.index > 1 : Rectangle { y: 0px; height: 2px; width: parent.width; background: PopupBridge.css-term-divider-color; }
+                    if !row-wrapper.row-hidden && !res.term-end && !res.collapsed && !root.use-two-columns : Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
                     card-content := VerticalLayout {
                     x: 0px;
-                    y: 6px;
+                    y: 4px;
                     width: parent.width;
                     height: self.preferred-height;
-                    spacing: 6px;
+                    spacing: 4px;
 
                     if res.term-start : HorizontalLayout {
                         width: parent.width;
@@ -447,8 +962,8 @@ export component YomitanPopup inherits Rectangle {
                                 text: res.reading;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
-                                font-size: 12px;
-                                color: #94A3B8;
+                                font-size: PopupBridge.css-reading-size;
+                                color: PopupBridge.css-reading-color;
                             }
                             if PopupBridge.rich-enabled && !res.is-kanji : VerticalLayout {
                                 spacing: 1px;
@@ -462,9 +977,9 @@ export component YomitanPopup inherits Rectangle {
                                         border-radius: 3px;
                                         ch-text := DictionaryText {
                                             text: ch.text;
-                                            font-size: 23px;
+                                            font-size: PopupBridge.css-headword-size;
                                             font-weight: 700;
-                                            color: ch.is-kanji && ch-touch.has-hover ? #93C5FD : #FFFFFF;
+                                            color: ch.is-kanji && ch-touch.has-hover ? PopupBridge.css-link-color : term-segment.term-headword-color;
                                         }
                                         ch-touch := TouchArea {
                                             enabled: ch.is-kanji;
@@ -480,14 +995,13 @@ export component YomitanPopup inherits Rectangle {
                                 text: res.expression;
                                 height: self.preferred-height;
                                 wrap: word-wrap;
-                                font-size: res.is-kanji ? 36px : 23px;
+                                font-size: res.is-kanji ? PopupBridge.css-headword-size * 1.56 : PopupBridge.css-headword-size;
                                 font-weight: 700;
-                                font-family: "Noto Sans CJK JP";
-                                color: #FFFFFF;
+                                color: term-segment.term-headword-color;
                             }
 
-                            // Conjugation derivation steps (#279)
-                            if PopupBridge.rich-enabled && !res.is-kanji : HorizontalLayout {
+                            // Conjugation derivation steps (#279) — full pills or compact `ⓘ` tooltip pill
+                            if PopupBridge.rich-enabled && !res.is-kanji && !PopupBridge.css-compact-derivations : HorizontalLayout {
                                 alignment: start;
                                 spacing: 2px;
                                 for step[step-idx] in PopupBridge.derivation-steps(res.index, PopupBridge.rich-revision) : HorizontalLayout {
@@ -531,6 +1045,36 @@ export component YomitanPopup inherits Rectangle {
                                         font-size: 11px;
                                         color: #64748B;
                                         vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            if PopupBridge.rich-enabled && !res.is-kanji && PopupBridge.css-compact-derivations && PopupBridge.derivation-summary(res.index, PopupBridge.rich-revision) != "" : HorizontalLayout {
+                                alignment: start;
+                                Rectangle {
+                                    width: 22px;
+                                    height: 18px;
+                                    border-radius: 4px;
+                                    background: compact-deriv-touch.has-hover ? #334155 : transparent;
+                                    DictionaryText {
+                                        text: "ⓘ";
+                                        font-size: 12px;
+                                        color: PopupBridge.css-muted-color;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    compact-deriv-touch := TouchArea {
+                                        mouse-cursor: help;
+                                        changed has-hover => {
+                                            if self.has-hover {
+                                                PopupBridge.show-tooltip(
+                                                    PopupBridge.derivation-summary(res.index, PopupBridge.rich-revision),
+                                                    24.0,
+                                                    (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 48px) / 1px
+                                                );
+                                            } else {
+                                                PopupBridge.hide-tooltip();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -676,7 +1220,7 @@ export component YomitanPopup inherits Rectangle {
                     }
 
                     // Term-level deduplicated category-colored tag pills (#220)
-                    if !res.collapsed && res.term-start && PopupBridge.rich-enabled : HorizontalLayout {
+                    if !res.collapsed && res.term-start && PopupBridge.rich-enabled && PopupBridge.css-show-term-tags : HorizontalLayout {
                         spacing: 4px;
                         alignment: start;
                         for pill in PopupBridge.term-tag-pills(res.index, PopupBridge.rich-revision) : RichTagPillBadge {
@@ -695,9 +1239,9 @@ export component YomitanPopup inherits Rectangle {
                         for anki-tag in self.effective-tags : anki-tag-pill := Rectangle {
                             height: 18px;
                             width: anki-tag-lbl.preferred-width + 12px;
-                            background: #162B3D;
+                            background: PopupBridge.css-anki-tag-bg;
                             border-width: 1px;
-                            border-color: #38BDF888;
+                            border-color: PopupBridge.css-anki-tag-border;
                             border-radius: 3px;
                             anki-tag-lbl := DictionaryText {
                                 x: 6px;
@@ -706,7 +1250,7 @@ export component YomitanPopup inherits Rectangle {
                                 text: anki-tag;
                                 font-size: 10px;
                                 font-weight: 700;
-                                color: #BAE6FD;
+                                color: PopupBridge.css-anki-tag-color;
                                 vertical-alignment: center;
                             }
                             TouchArea {
@@ -743,17 +1287,20 @@ export component YomitanPopup inherits Rectangle {
                             alignment: start;
                             spacing: 4px;
                             for frequency in line.entries : Rectangle {
+                                property <PopupFreqStyle> fstyle: PopupBridge.rich-enabled
+                                    ? PopupBridge.freq-badge-style(frequency.dictionary, PopupBridge.rich-revision)
+                                    : { bg: PopupBridge.css-freq-bg, color: PopupBridge.css-freq-color };
                                 width: min(frequency-label.preferred-width + 10px, parent.width);
                                 height: max(18px, frequency-label.preferred-height + 2px);
-                                background: #07513E;
+                                background: self.fstyle.bg;
                                 border-radius: 3px;
                                 frequency-label := DictionaryText {
                                     x: 5px;
                                     width: parent.width - 10px;
                                     height: parent.height;
                                     text: frequency.dictionary + " " + frequency.value;
-                                    font-size: 10px;
-                                    color: #9CE5C7;
+                                    font-size: PopupBridge.css-freq-font-size;
+                                    color: parent.fstyle.color;
                                     vertical-alignment: center;
                                     wrap: word-wrap;
                                 }
@@ -773,11 +1320,11 @@ export component YomitanPopup inherits Rectangle {
                                 height: 30px;
                                 spacing: 8px;
                                 alignment: start;
-                                Rectangle {
+                                if PopupBridge.css-show-pitch-dict : Rectangle {
                                     height: 20px;
                                     y: 5px;
                                     width: min(pitch-dict-lbl.preferred-width + 10px, parent.width * 0.42);
-                                    background: #6640be;
+                                    background: PopupBridge.pitch-dict-bg(pitch.dictionary, PopupBridge.rich-revision);
                                     border-radius: 3px;
                                     pitch-dict-lbl := DictionaryText {
                                         x: 5px;
@@ -799,8 +1346,8 @@ export component YomitanPopup inherits Rectangle {
                                     for mora in pitch.mora : Rectangle {
                                         width: max(20px, rich-mora-lbl.preferred-width + 6px);
                                         height: 30px;
-                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1.5px; background: #B9A1E8; }
-                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1.5px; y: 3px; width: 1.5px; height: 9.5px; background: #B9A1E8; }
+                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1.5px; background: PopupBridge.css-pitch-color; }
+                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1.5px; y: 3px; width: 1.5px; height: 9.5px; background: PopupBridge.css-pitch-color; }
                                         if mora.devoice : Image {
                                             x: (parent.width - 18px) / 2;
                                             y: 11px;
@@ -814,7 +1361,7 @@ export component YomitanPopup inherits Rectangle {
                                             horizontal-alignment: center;
                                             width: parent.width;
                                             font-size: 11px;
-                                            color: mora.devoice ? #FCA5A5 : #E2E8F0;
+                                            color: mora.devoice ? #FCA5A5 : PopupBridge.css-text-color;
                                         }
                                         if mora.nasal : Rectangle {
                                             x: parent.width - 6px;
@@ -824,7 +1371,7 @@ export component YomitanPopup inherits Rectangle {
                                             border-radius: 2.5px;
                                             border-width: 1.2px;
                                             border-color: #FBBF24;
-                                            background: #1C2024;
+                                            background: PopupBridge.css-popup-bg;
                                         }
                                         if mora.nasal || mora.devoice : TouchArea {
                                             mouse-cursor: help;
@@ -876,403 +1423,65 @@ export component YomitanPopup inherits Rectangle {
                                     for mora in pitch.mora : Rectangle {
                                         width: max(18px, mora-label.preferred-width + 3px);
                                         height: 28px;
-                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1px; background: #B9A1E8; }
-                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: #B9A1E8; }
-                                        mora-label := DictionaryText { text: mora.text; y: 13px; horizontal-alignment: center; width: parent.width; font-size: 10px; color: #D9CFF0; }
+                                        Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1px; background: PopupBridge.css-pitch-color; }
+                                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: PopupBridge.css-pitch-color; }
+                                        mora-label := DictionaryText { text: mora.text; y: 13px; horizontal-alignment: center; width: parent.width; font-size: 10px; color: PopupBridge.css-text-color; }
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Header row: Checkbox, Category-colored POS tags (#220), Dictionary tag
-                    if !res.collapsed : HorizontalLayout {
-                        spacing: 6px;
-                        alignment: start;
-
-                        if root.show-anki-checkbox : Rectangle {
-                            width: 17px;
-                            height: 17px;
-                            border-width: 1px;
-                            border-color: res.selected ? #34D399 : #94A3B8;
-                            border-radius: 3px;
-                            background: res.selected ? #047857 : transparent;
-                            DictionaryText {
-                                text: res.selected ? "✓" : "";
-                                color: white;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                font-size: 13px;
-                            }
-                            select-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => { root.toggle-select-definition(res.index - 1); }
-                            }
-                        }
-
-                        if PopupBridge.rich-enabled : HorizontalLayout {
-                            spacing: 4px;
-                            for pill in PopupBridge.def-tag-pills(res.index, PopupBridge.rich-revision) : RichTagPillBadge {
-                                pill: pill;
-                                anchor-x: 24px;
-                                anchor-y: 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
-                            }
-                        }
-
-                        // Fallback Part of Speech badge(s) when rich bridge is not active
-                        if !PopupBridge.rich-enabled && res.pos-tags != "" : Rectangle {
-                            height: 18px;
-                            background: #2b3238;
-                            border-radius: 3px;
-                            HorizontalLayout {
-                                padding-left: 6px;
-                                padding-right: 6px;
-                                DictionaryText {
-                                    text: res.pos-tags;
-                                    font-size: 11px;
-                                    font-weight: 600;
-                                    color: #cbd5e1;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-
-                        // Dictionary Source Badge
-                        if res.dict-name != "" : Rectangle {
-                            height: 18px;
-                            background: #6D28D9;
-                            border-radius: 3px;
-                            HorizontalLayout {
-                                padding-left: 7px;
-                                padding-right: 7px;
-                                DictionaryText {
-                                    text: res.dict-name;
-                                    font-size: 11px;
-                                    font-weight: 700;
-                                    color: #EDE9FE;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
+                    // Single-column definition body (default)
+                    if !res.collapsed && !root.use-two-columns : DefinitionEntryBody {
+                        width: parent.width;
+                        res: res;
+                        is-solo: res.term-start && res.term-end;
+                        show-anki-checkbox: root.show-anki-checkbox;
+                        tooltip-base-x: PopupBridge.css-popup-padding;
+                        tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + self.y;
+                        toggle-select-definition(i) => { root.toggle-select-definition(i); }
+                        open-rich-link(href) => { root.open-rich-link(href); }
+                        focus-glossary => { glossary-focus.focus(); }
                     }
 
-                    // 3-Column Kanji Detail View (Glossary | Reading | Statistics + Classifications/Codepoints/Indices)
-                    if !res.collapsed && res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid : VerticalLayout {
+                    // Responsive 2-column card grid (enabled by `--definition-columns: 2` when width >= min-width)
+                    if !res.collapsed && res.term-start && root.use-two-columns : VerticalLayout {
                         width: parent.width;
-                        spacing: 6px;
-                        property <RichKanjiDetail> kdetail: PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision);
-
-                        Rectangle { height: 1px; width: parent.width; background: #384046; }
-
-                        HorizontalLayout {
+                        spacing: PopupBridge.css-definition-gap;
+                        for grid-row in PopupBridge.definition-grid-rows(root.results, res.index) : HorizontalLayout {
                             width: parent.width;
-                            spacing: 8px;
-                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Glossary"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
-                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Reading"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
-                            DictionaryText { horizontal-stretch: 1; width: 0px; text: "Statistics"; font-size: 12px; font-weight: 700; color: #CBD5E1; }
-                        }
+                            spacing: PopupBridge.css-definition-gap;
+                            alignment: start;
 
-                        Rectangle { height: 1px; width: parent.width; background: #384046; }
+                            DefinitionEntryBody {
+                                width: grid-row.is-solo ? parent.width : max(120px, (parent.width - PopupBridge.css-definition-gap) / 2);
+                                res: grid-row.left;
+                                is-solo: grid-row.is-solo;
+                                show-anki-checkbox: root.show-anki-checkbox;
+                                tooltip-base-x: PopupBridge.css-popup-padding;
+                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
+                                toggle-select-definition(i) => { root.toggle-select-definition(i); }
+                                open-rich-link(href) => { root.open-rich-link(href); }
+                                focus-glossary => { glossary-focus.focus(); }
+                            }
 
-                        HorizontalLayout {
-                            width: parent.width;
-                            spacing: 8px;
-                            // Column 1: Meanings
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                width: 0px;
-                                spacing: 2px;
-                                alignment: start;
-                                for meaning[m-idx] in kdetail.meanings : DictionaryText {
-                                    width: parent.width;
-                                    text: (m-idx + 1) + ". " + meaning;
-                                    font-size: 13px;
-                                    color: res.selected ? #F8FAFC : #94A3B8;
-                                    wrap: word-wrap;
-                                }
-                            }
-                            // Column 2: Onyomi & Kunyomi Readings
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                width: 0px;
-                                spacing: 2px;
-                                alignment: start;
-                                for r-line in kdetail.readings : DictionaryText {
-                                    width: parent.width;
-                                    text: r-line;
-                                    font-size: 13px;
-                                    color: #E2E8F0;
-                                    wrap: word-wrap;
-                                }
-                            }
-                            // Column 3: Statistics (strokes, grade, JLPT, freq)
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                width: 0px;
-                                spacing: 3px;
-                                alignment: start;
-                                for stat in kdetail.stats : HorizontalLayout {
-                                    width: parent.width;
-                                    spacing: 4px;
-                                    DictionaryText {
-                                        horizontal-stretch: 1;
-                                        text: stat.label;
-                                        font-size: 11px;
-                                        font-weight: 700;
-                                        color: #CBD5E1;
-                                        wrap: word-wrap;
-                                    }
-                                    DictionaryText {
-                                        text: stat.value;
-                                        font-size: 11px;
-                                        color: #9CE5C7;
-                                    }
-                                }
+                            if grid-row.has-right : DefinitionEntryBody {
+                                width: max(120px, (parent.width - PopupBridge.css-definition-gap) / 2);
+                                res: grid-row.right;
+                                is-solo: false;
+                                show-anki-checkbox: root.show-anki-checkbox;
+                                tooltip-base-x: PopupBridge.css-popup-padding + (parent.width + PopupBridge.css-definition-gap) / 2;
+                                tooltip-base-y: PopupBridge.css-popup-padding + definition-list.y + definition-list.viewport-y + row-wrapper.y + 84px;
+                                toggle-select-definition(i) => { root.toggle-select-definition(i); }
+                                open-rich-link(href) => { root.open-rich-link(href); }
+                                focus-glossary => { glossary-focus.focus(); }
                             }
                         }
-
-                        if kdetail.classifications.length > 0 : VerticalLayout {
-                            spacing: 3px;
-                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
-                            DictionaryText { text: "Classifications"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
-                            for item in kdetail.classifications : HorizontalLayout {
-                                spacing: 6px;
-                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
-                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
-                            }
-                        }
-
-                        if kdetail.codepoints.length > 0 : VerticalLayout {
-                            spacing: 3px;
-                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
-                            DictionaryText { text: "Codepoints"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
-                            for item in kdetail.codepoints : HorizontalLayout {
-                                spacing: 6px;
-                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
-                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
-                            }
-                        }
-
-                        if kdetail.indices.length > 0 : VerticalLayout {
-                            spacing: 3px;
-                            Rectangle { height: 1px; width: parent.width; background: #30373D; }
-                            DictionaryText { text: "Dictionary Indices"; font-size: 11px; font-weight: 700; color: #CBD5E1; }
-                            for item in kdetail.indices : HorizontalLayout {
-                                spacing: 6px;
-                                DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: #94A3B8; wrap: word-wrap; }
-                                DictionaryText { text: item.value; font-size: 11px; color: #E2E8F0; }
-                            }
-                        }
-                    }
-
-                    // Rich Structured Content Surface (tables, ruby, details, ?query= links, images/SVGs, mouse selection)
-                    if !res.collapsed && !res.is-kanji && PopupBridge.rich-enabled : rich-surface := Rectangle {
-                        property <RichGlossaryRender> rich-doc: PopupBridge.render-glossary(
-                            res.index,
-                            parent.width / 1px,
-                            res.selected,
-                            PopupBridge.rich-revision,
-                            PopupBridge.selection-revision
-                        );
-                        visible: self.rich-doc.has-rich;
-                        width: parent.width;
-                        height: self.rich-doc.has-rich ? self.rich-doc.height-px * 1px : 0px;
-                        background: transparent;
-
-                        for sel-rect in self.rich-doc.selection-rects : Rectangle {
-                            x: sel-rect.x-px * 1px;
-                            y: sel-rect.y-px * 1px;
-                            width: sel-rect.w-px * 1px;
-                            height: sel-rect.h-px * 1px;
-                            background: #38a6d666;
-                            border-radius: 2px;
-                        }
-
-                        if self.rich-doc.has-rich : Image {
-                            x: 0px;
-                            y: 0px;
-                            width: parent.rich-doc.width-px * 1px;
-                            height: parent.rich-doc.height-px * 1px;
-                            source: parent.rich-doc.rendered;
-                            image-fit: fill;
-                        }
-
-                        if self.rich-doc.has-rich : rich-touch := TouchArea {
-                            width: parent.width;
-                            height: parent.height;
-                            mouse-cursor: PopupBridge.glossary-cursor-is-pointer(
-                                res.index,
-                                self.mouse-x / 1px,
-                                self.mouse-y / 1px
-                            ) ? pointer : text;
-                            pointer-event(event) => {
-                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                                    glossary-focus.focus();
-                                    PopupBridge.glossary-pointer-down(
-                                        res.index,
-                                        self.mouse-x / 1px,
-                                        self.mouse-y / 1px
-                                    );
-                                } else if (event.kind == PointerEventKind.move) {
-                                    if (self.pressed) {
-                                        PopupBridge.glossary-pointer-drag(
-                                            res.index,
-                                            self.mouse-x / 1px,
-                                            self.mouse-y / 1px
-                                        );
-                                    } else {
-                                        PopupBridge.glossary-pointer-hover(
-                                            res.index,
-                                            self.mouse-x / 1px,
-                                            self.mouse-y / 1px,
-                                            (12px + self.mouse-x) / 1px,
-                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + rich-surface.y + self.mouse-y) / 1px
-                                        );
-                                    }
-                                } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
-                                    PopupBridge.glossary-pointer-up(
-                                        res.index,
-                                        self.mouse-x / 1px,
-                                        self.mouse-y / 1px
-                                    );
-                                } else if (event.kind == PointerEventKind.cancel) {
-                                    PopupBridge.hide-tooltip();
-                                }
-                            }
-                            double-clicked => {
-                                glossary-focus.focus();
-                                PopupBridge.glossary-double-clicked(
-                                    res.index,
-                                    self.mouse-x / 1px,
-                                    self.mouse-y / 1px
-                                );
-                            }
-                            changed has-hover => {
-                                if !self.has-hover {
-                                    PopupBridge.hide-tooltip();
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback Definition Meaning Text (when rich surface is not rendered for this row)
-                    if !res.collapsed
-                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
-                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
-                        && res.glossary-blocks.length > 0 : VerticalLayout
-                    {
-                        width: parent.width;
-                        spacing: 4px;
-                        for block in res.glossary-blocks : Rectangle {
-                            width: parent.width;
-                            height: rich-text.preferred-height + 2px;
-                            rich-text := DictionaryText {
-                                width: parent.width;
-                                height: self.preferred-height;
-                                text: block.kind == 2 ? "◦  " + block.text : block.text;
-                                wrap: word-wrap;
-                                font-size: block.kind == 1 ? 13px : 15px;
-                                font-weight: block.kind == 1 ? 700 : 400;
-                                color: !res.selected ? #87929C : block.kind == 3 ? #93C5FD : block.kind == 1 ? #D8C9FC : #FFFFFF;
-                            }
-                            if block.href != "" : TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    if !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
-                                        root.open-rich-link(block.href);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if !res.collapsed
-                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
-                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
-                        && res.glossary-blocks.length == 0 : DictionaryText
-                    {
-                        width: parent.width;
-                        text: res.glossary;
-                        font-size: 15px;
-                        font-weight: 400;
-                        color: res.selected ? #FFFFFF : #87929C;
-                        wrap: word-wrap;
-                        height: self.preferred-height;
-                    }
-
-                    // Japanese Example Sentence (shown only when rich structured-content did not already render it)
-                    if !res.collapsed
-                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
-                        && res.example-ja != "" : HorizontalLayout
-                    {
-                        width: parent.width;
-                        spacing: 5px;
-                        Rectangle {
-                            width: 16px;
-                            Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-jp.svg"); }
-                        }
-                        DictionaryText {
-                            text: res.example-ja;
-                            font-size: 13px;
-                            color: #E2E8F0;
-                            wrap: word-wrap;
-                            height: self.preferred-height;
-                            horizontal-stretch: 1;
-                        }
-                    }
-
-                    // English Example Translation
-                    if !res.collapsed
-                        && !(!res.is-kanji && PopupBridge.rich-enabled && PopupBridge.render-glossary(res.index, parent.width / 1px, res.selected, PopupBridge.rich-revision, PopupBridge.selection-revision).has-rich)
-                        && res.example-en != "" : HorizontalLayout
-                    {
-                        width: parent.width;
-                        spacing: 5px;
-                        Rectangle {
-                            width: 16px;
-                            Image { y: 4px; width: 16px; height: 11px; source: @image-url("icons/flag-gb.svg"); }
-                        }
-                        DictionaryText {
-                            text: res.example-en;
-                            font-size: 12px;
-                            color: #94A3B8;
-                            wrap: word-wrap;
-                            height: self.preferred-height;
-                            horizontal-stretch: 1;
-                        }
-                    }
-
-                    // Notes / Explanations
-                    if !res.collapsed
-                        && !(res.is-kanji && PopupBridge.rich-enabled && PopupBridge.kanji-detail(res.index, PopupBridge.rich-revision).valid)
-                        && res.notes != "" : DictionaryText
-                    {
-                        width: parent.width;
-                        text: "Note: " + res.notes;
-                        font-size: 12px;
-                        color: #94A3B8;
-                        wrap: word-wrap;
-                        height: self.preferred-height;
                     }
 
                     }
                 }
-                }
-                if root.has-more-results : Rectangle {
-                    width: parent.width - 6px;
-                    height: 28px;
-                    background: more-touch.has-hover ? #2A3238 : transparent;
-                    DictionaryText {
-                        text: "Show more results ↓";
-                        font-size: 11px;
-                        color: #84939E;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    more-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.load-more-results(true); }
-                    }
                 }
             }
         }
@@ -1309,8 +1518,8 @@ export component YomitanPopup inherits Rectangle {
         width: 28px;
         height: 28px;
         border-radius: 3px;
-        background: close-touch.has-hover ? #384046 : #1C2024;
-        DictionaryText { text: "×"; font-size: 18px; color: #CBD5E1; horizontal-alignment: center; vertical-alignment: center; }
+        background: close-touch.has-hover ? PopupBridge.css-popup-border : PopupBridge.css-popup-bg;
+        DictionaryText { text: "×"; font-size: 18px; color: PopupBridge.css-muted-color; horizontal-alignment: center; vertical-alignment: center; }
         close-touch := TouchArea { mouse-cursor: pointer; clicked => { root.close-requested(); } }
     }
 

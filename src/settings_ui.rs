@@ -28,10 +28,15 @@ use crate::controller::player::{
     clear_primary_subtitle, refresh_subtitle_list, LivePlayerCoordinator,
 };
 use crate::controller::subtitles::SubtitleController;
-use crate::ui::AsrModelStatusRow;
+use crate::ui::{
+    default_custom_popup_css_template, default_custom_popup_outer_css_template,
+    refresh_rich_ui_bridges, AsrModelStatusRow, CUSTOM_POPUP_CSS_FILENAME,
+    CUSTOM_POPUP_OUTER_CSS_FILENAME,
+};
 use crate::{
-    apply_dictionary_order, memento_xdg_dir, refresh_player_preferences, setting_enabled,
-    AnkiHelpWindow, InstalledDictionaryRow, MementoApp, SettingsWindow, SubEntry,
+    apply_dictionary_order, memento_xdg_dir, open_directory_command, refresh_player_preferences,
+    setting_enabled, spawn_and_reap, AnkiHelpWindow, InstalledDictionaryRow, MementoApp,
+    SettingsWindow, SubEntry,
 };
 
 pub(crate) struct SettingsSession {
@@ -476,6 +481,31 @@ pub(crate) fn refresh_category_settings(
     }
 }
 
+pub(crate) fn refresh_custom_popup_css(window: &SettingsWindow, config_dir: &Path) {
+    let inner_path = config_dir.join(CUSTOM_POPUP_CSS_FILENAME);
+    window.set_custom_popup_css_path(inner_path.display().to_string().into());
+    let inner_content = std::fs::read_to_string(&inner_path).unwrap_or_default();
+    window.set_custom_popup_css(inner_content.into());
+
+    let outer_path = config_dir.join(CUSTOM_POPUP_OUTER_CSS_FILENAME);
+    window.set_custom_popup_outer_css_path(outer_path.display().to_string().into());
+    let outer_content = std::fs::read_to_string(&outer_path).unwrap_or_default();
+    window.set_custom_popup_outer_css(outer_content.into());
+}
+
+fn save_custom_css_file(config_dir: &Path, filename: &str, css: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| format!("Could not create config directory: {e}"))?;
+    let target_path = config_dir.join(filename);
+    let mut temp = tempfile::NamedTempFile::new_in(config_dir)
+        .map_err(|e| format!("Could not create temp CSS file: {e}"))?;
+    io::Write::write_all(&mut temp, css.as_bytes())
+        .map_err(|e| format!("Could not write {filename}: {e}"))?;
+    temp.persist(&target_path)
+        .map_err(|e| format!("Could not save {filename}: {}", e.error))?;
+    Ok(target_path)
+}
+
 pub(crate) fn refresh_settings(window: &SettingsWindow, config: &ConfigController) {
     refresh_category_settings(window, config, window.get_active_category());
 }
@@ -610,6 +640,7 @@ pub(crate) fn create_settings_session(
     settings.set_asr_available(controller::asr::AVAILABLE);
     settings.set_font_families(Rc::new(VecModel::from(available_font_families(&config_ctrl))).into());
     refresh_settings(&settings, &config_ctrl);
+    refresh_custom_popup_css(&settings, &cache_dir);
     refresh_dictionary_settings(&settings, dictionary_manager.as_deref(), &config_ctrl);
     refresh_asr_model_status(&settings, &config_ctrl, &cache_dir);
 
@@ -646,6 +677,8 @@ pub(crate) fn create_settings_session(
             refresh_category_settings(&window, &category_config, category);
             if category == 4 {
                 refresh_dictionary_settings(&window, category_manager.as_deref(), &category_config);
+            } else if category == 5 {
+                refresh_custom_popup_css(&window, &category_cache);
             } else if category == 8 {
                 refresh_asr_model_status(&window, &category_config, &category_cache);
             }
@@ -856,6 +889,107 @@ pub(crate) fn create_settings_session(
         }
     });
 
+    let tpl_window = settings.as_weak();
+    settings.on_insert_custom_popup_css_template(move |tab| {
+        if let Some(window) = tpl_window.upgrade() {
+            if tab == 1 {
+                window.set_custom_popup_outer_css(default_custom_popup_outer_css_template().into());
+                window.set_settings_status(
+                    "Starter Popup Outer CSS template inserted — click Save & Reload CSS".into(),
+                );
+            } else {
+                window.set_custom_popup_css(default_custom_popup_css_template().into());
+                window.set_settings_status(
+                    "Starter Popup CSS template inserted — click Save & Reload CSS".into(),
+                );
+            }
+        }
+    });
+
+    let save_css_window = settings.as_weak();
+    let save_css_app = app.as_weak();
+    let save_css_config = config_ctrl.clone();
+    let save_css_dir = cache_dir.clone();
+    settings.on_save_custom_popup_css(move |inner_css, outer_css| {
+        let Some(window) = save_css_window.upgrade() else {
+            return;
+        };
+        if let Err(error) =
+            save_custom_css_file(&save_css_dir, CUSTOM_POPUP_CSS_FILENAME, inner_css.as_str())
+        {
+            window.set_settings_status(error.into());
+            return;
+        }
+        let outer_path = save_css_dir.join(CUSTOM_POPUP_OUTER_CSS_FILENAME);
+        if !outer_css.trim().is_empty() || outer_path.exists() {
+            if let Err(error) = save_custom_css_file(
+                &save_css_dir,
+                CUSTOM_POPUP_OUTER_CSS_FILENAME,
+                outer_css.as_str(),
+            ) {
+                window.set_settings_status(error.into());
+                return;
+            }
+        }
+        if let Some(app) = save_css_app.upgrade() {
+            refresh_rich_ui_bridges(&app, &save_css_config);
+        }
+        window.set_settings_status("Custom popup CSS saved & reloaded".into());
+    });
+
+    let open_css_window = settings.as_weak();
+    let open_css_dir = cache_dir.clone();
+    settings.on_open_custom_popup_css(move |tab| {
+        let Some(window) = open_css_window.upgrade() else {
+            return;
+        };
+        let (filename, default_tpl) = if tab == 1 {
+            (
+                CUSTOM_POPUP_OUTER_CSS_FILENAME,
+                default_custom_popup_outer_css_template(),
+            )
+        } else {
+            (
+                CUSTOM_POPUP_CSS_FILENAME,
+                default_custom_popup_css_template(),
+            )
+        };
+        let css_path = open_css_dir.join(filename);
+        if !css_path.exists() {
+            let current = if tab == 1 {
+                window.get_custom_popup_outer_css().to_string()
+            } else {
+                window.get_custom_popup_css().to_string()
+            };
+            let initial = if current.trim().is_empty() {
+                default_tpl.to_owned()
+            } else {
+                current
+            };
+            match save_custom_css_file(&open_css_dir, filename, &initial) {
+                Ok(_) => {
+                    if tab == 1 {
+                        window.set_custom_popup_outer_css(initial.into());
+                    } else {
+                        window.set_custom_popup_css(initial.into());
+                    }
+                }
+                Err(error) => {
+                    window.set_settings_status(error.into());
+                    return;
+                }
+            }
+        }
+        match spawn_and_reap(open_directory_command(&css_path)) {
+            Ok(_) => window.set_settings_status(
+                format!("Opened {filename} — external edits hot-reload automatically").into(),
+            ),
+            Err(error) => window.set_settings_status(
+                format!("Could not open {}: {error}", css_path.display()).into(),
+            ),
+        }
+    });
+
     let apply_window = settings.as_weak();
     let apply_config = config_ctrl.clone();
     let apply_cache = cache_dir.clone();
@@ -870,6 +1004,32 @@ pub(crate) fn create_settings_session(
     let apply_mpv = mpv.clone();
     let apply_coord = coordinator.clone();
     settings.on_apply_settings(move |category| {
+        if category == 5 {
+            if let Some(window) = apply_window.upgrade() {
+                let inner_text = window.get_custom_popup_css().to_string();
+                let inner_path = apply_cache.join(CUSTOM_POPUP_CSS_FILENAME);
+                if !inner_text.trim().is_empty() || inner_path.exists() {
+                    if let Err(error) =
+                        save_custom_css_file(&apply_cache, CUSTOM_POPUP_CSS_FILENAME, &inner_text)
+                    {
+                        window.set_settings_status(error.into());
+                        return;
+                    }
+                }
+                let outer_text = window.get_custom_popup_outer_css().to_string();
+                let outer_path = apply_cache.join(CUSTOM_POPUP_OUTER_CSS_FILENAME);
+                if !outer_text.trim().is_empty() || outer_path.exists() {
+                    if let Err(error) = save_custom_css_file(
+                        &apply_cache,
+                        CUSTOM_POPUP_OUTER_CSS_FILENAME,
+                        &outer_text,
+                    ) {
+                        window.set_settings_status(error.into());
+                        return;
+                    }
+                }
+            }
+        }
         let result =
             apply_config.apply_settings(category, &apply_cache, "memento.conf", &apply_anki);
         if result.is_ok() {

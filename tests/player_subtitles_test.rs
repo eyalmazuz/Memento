@@ -1803,3 +1803,35 @@ fn test_screensaver_playback_inhibition_lifecycle() {
     ss.uninhibit();
     assert!(!ss.is_inhibited());
 }
+
+#[test]
+fn refresh_active_rows_clears_previous_highlights_even_when_previous_slice_is_stale() {
+    use memento_app::controller::player::refresh_active_rows;
+    use memento_app::SubEntry;
+    use slint::{Model, VecModel};
+
+    let model = VecModel::from(vec![
+        SubEntry { id: 1, start: 91.0, end: 94.0, text: "ニア殿".into(), selected: false, is_active: true, search_match: false },
+        SubEntry { id: 2, start: 95.0, end: 97.5, text: "よくぞお越しくださいました!".into(), selected: false, is_active: false, search_match: false },
+        SubEntry { id: 3, start: 98.0, end: 99.5, text: "そういうのやめて".into(), selected: false, is_active: false, search_match: false },
+    ]);
+
+    // Simulate update_active_cue mutating SubtitleController::active_indices to [1] before
+    // sync() captured before_active=[1] and called refresh_active_rows(model, &[1], &[1]).
+    refresh_active_rows(&model, &[1], &[1]);
+    assert!(!model.row_data(0).unwrap().is_active, "previous row 0 highlight must be cleared");
+    assert!(model.row_data(1).unwrap().is_active, "new row 1 must be highlighted");
+    assert!(!model.row_data(2).unwrap().is_active);
+
+    // Advance again with stale previous slice -> row 1 cleared, only row 2 active.
+    refresh_active_rows(&model, &[2], &[2]);
+    assert!(!model.row_data(0).unwrap().is_active);
+    assert!(!model.row_data(1).unwrap().is_active, "previous row 1 highlight must be cleared");
+    assert!(model.row_data(2).unwrap().is_active);
+
+    // Gap between cues -> every highlight cleared.
+    refresh_active_rows(&model, &[], &[]);
+    assert!(!model.row_data(0).unwrap().is_active);
+    assert!(!model.row_data(1).unwrap().is_active);
+    assert!(!model.row_data(2).unwrap().is_active);
+}

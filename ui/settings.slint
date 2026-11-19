@@ -1,4 +1,5 @@
-import { Button, ComboBox, LineEdit, ScrollView, Slider } from "std-widgets.slint";
+import { ComboBox, LineEdit, ScrollView, Slider, TextEdit } from "std-widgets.slint";
+import { MementoPalette } from "palette.slint";
 
 // Values and choices are supplied by ConfigController, not by sample settings.
 export struct SettingsField {
@@ -43,22 +44,104 @@ export struct AsrModelStatusRow {
     status-text: string,
 }
 
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> ghost: false;
+    in property <bool> compact: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: root.compact ? 28px : 32px;
+    width: max(root.compact ? 32px : 72px, btn-lbl.preferred-width + (root.compact ? 18px : 26px));
+    border-radius: 7px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    border-width: 1px;
+    border-color: root.primary
+        ? (touch.has-hover && root.enabled ? #14B8A6 : #0F9B88)
+        : (root.ghost
+            ? (touch.has-hover && root.enabled ? MementoPalette.border-light : transparent)
+            : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light));
+    background: root.primary
+        ? (touch.pressed ? #0A6B5C : (touch.has-hover && root.enabled ? #109B87 : #0D8269))
+        : (root.ghost
+            ? (touch.has-hover && root.enabled ? MementoPalette.hover-bg : transparent)
+            : (touch.pressed
+                ? MementoPalette.active-bg
+                : (touch.has-hover && root.enabled
+                    ? (MementoPalette.dark ? #262C38 : #E2E8F0)
+                    : (MementoPalette.dark ? #1B2029 : #F1F5F9))));
+
+    btn-lbl := Text {
+        text: root.text;
+        color: root.primary ? #FFFFFF : MementoPalette.text;
+        font-size: root.compact ? 12px : 12.5px;
+        font-weight: root.primary ? 700 : 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if root.enabled { root.clicked(); } }
+    }
+}
+
+component PresetChip inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 28px;
+    width: chip-lbl.preferred-width + 22px;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
+    background: touch.pressed
+        ? (MementoPalette.dark ? #16324A : #BAE6FD)
+        : (touch.has-hover
+            ? (MementoPalette.dark ? #1B2E42 : #E0F2FE)
+            : (MementoPalette.dark ? #161A22 : #F1F5F9));
+
+    chip-lbl := Text {
+        text: root.label;
+        color: touch.has-hover
+            ? (MementoPalette.dark ? #7DD3FC : #0369A1)
+            : MementoPalette.text;
+        font-size: 12px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 component SettingsSwitch inherits Rectangle {
     in-out property <bool> checked;
     in property <bool> enabled: true;
     callback toggled(bool);
-    width: 38px;
-    height: 20px;
-    border-radius: 10px;
-    opacity: enabled ? 1 : 0.45;
-    background: checked ? #00867c : #384045;
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    opacity: enabled ? 1.0 : 0.45;
+    border-width: 1px;
+    border-color: checked ? #14B8A6 : MementoPalette.border-light;
+    background: checked
+        ? #0D8269
+        : (MementoPalette.dark ? #262C36 : #CBD5E1);
     Rectangle {
         x: root.checked ? 20px : 2px;
         y: 2px;
         width: 16px;
         height: 16px;
         border-radius: 8px;
-        background: #ffffff;
+        background: #FFFFFF;
+        drop-shadow-blur: 3px;
+        drop-shadow-color: #00000044;
         animate x { duration: 120ms; }
     }
     TouchArea {
@@ -71,31 +154,57 @@ component SettingsSwitch inherits Rectangle {
     }
 }
 
+component SidebarGroupLabel inherits Text {
+    color: MementoPalette.text-muted;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    height: 22px;
+    vertical-alignment: bottom;
+}
+
 component SidebarItem inherits Rectangle {
     in property <string> label;
     in property <image> icon;
     in property <bool> selected;
     callback clicked();
-    height: 32px;
-    border-radius: 4px;
-    background: selected ? #007A65 : (touch.has-hover ? #2e353a : transparent);
+    height: 34px;
+    border-radius: 7px;
+    background: selected
+        ? (MementoPalette.dark ? #1B2B3A : #E0F2FE)
+        : (touch.has-hover ? MementoPalette.hover-bg : transparent);
+
+    // Subtle vertical accent bar on active category
+    if root.selected : Rectangle {
+        x: 3px;
+        y: 7px;
+        width: 3px;
+        height: parent.height - 14px;
+        border-radius: 2px;
+        background: MementoPalette.cyan-accent;
+    }
+
     Image {
-        x: 12px;
+        x: 14px;
         y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
+        width: 16px;
+        height: 16px;
         source: root.icon;
-        colorize: root.selected ? white : #b0b8bc;
+        colorize: root.selected
+            ? (MementoPalette.dark ? #7DD3FC : #0284C7)
+            : MementoPalette.icon-muted;
     }
     Text {
-        x: 40px;
+        x: 39px;
         y: 0;
-        width: parent.width - 50px;
+        width: parent.width - 48px;
         height: parent.height;
         text: root.label;
-        color: root.selected ? white : #dce0e2;
+        color: root.selected
+            ? (MementoPalette.dark ? #FFFFFF : #0369A1)
+            : MementoPalette.text-secondary;
         font-size: 13px;
-        font-weight: root.selected ? 600 : 400;
+        font-weight: root.selected ? 700 : 500;
         vertical-alignment: center;
         overflow: elide;
     }
@@ -107,20 +216,22 @@ component SidebarItem inherits Rectangle {
 
 component ToolIcon inherits Rectangle {
     in property <image> icon;
-    in property <color> tint: #d8dcde;
+    in property <color> tint: MementoPalette.icon;
     in property <bool> enabled: true;
     callback clicked();
     width: 30px;
     height: 30px;
-    background: (root.enabled && touch.has-hover) ? #384046 : transparent;
-    border-radius: 4px;
+    background: (root.enabled && touch.has-hover) ? MementoPalette.hover-bg : transparent;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: (root.enabled && touch.has-hover) ? MementoPalette.border-light : transparent;
     Image {
         x: 6px;
         y: 6px;
-        width: 18px;
-        height: 18px;
+        width: 16px;
+        height: 16px;
         source: root.icon;
-        colorize: root.enabled ? root.tint : #5a6469;
+        colorize: root.enabled ? root.tint : MementoPalette.text-muted;
     }
     touch := TouchArea {
         enabled: root.enabled;
@@ -138,16 +249,18 @@ component ToggleChip inherits Rectangle {
     callback clicked();
     width: 30px;
     height: 28px;
-    border-radius: 4px;
+    border-radius: 6px;
     border-width: 1px;
-    border-color: root.active ? #00a896 : #485259;
-    background: root.active ? #007A65 : (chip-touch.has-hover && root.enabled ? #333b41 : #2a3035);
+    border-color: root.active ? #14B8A6 : MementoPalette.border-light;
+    background: root.active
+        ? #0D8269
+        : (chip-touch.has-hover && root.enabled ? MementoPalette.hover-bg : MementoPalette.surface-bg);
     opacity: root.enabled ? 1.0 : 0.45;
     Text {
         text: root.text;
-        color: root.active ? white : #dce0e2;
-        font-size: 13px;
-        font-weight: root.bold-text ? 700 : 500;
+        color: root.active ? #FFFFFF : MementoPalette.text;
+        font-size: 12.5px;
+        font-weight: root.bold-text ? 700 : 600;
         font-italic: root.italic-text;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -175,7 +288,7 @@ component FontPickerControl inherits HorizontalLayout {
     }
 
     if !root.custom-family : ComboBox {
-        width: 190px;
+        width: 185px;
         enabled: root.field.enabled;
         model: root.font-families;
         current-value: root.field.font-family;
@@ -191,7 +304,7 @@ component FontPickerControl inherits HorizontalLayout {
         }
     }
     if root.custom-family : LineEdit {
-        width: 190px;
+        width: 185px;
         enabled: root.field.enabled;
         text: root.custom-family-text;
         placeholder-text: "Font family";
@@ -217,8 +330,9 @@ component FontPickerControl inherits HorizontalLayout {
             }
         }
     }
-    Button {
-        text: "-";
+    ActionButton {
+        text: "−";
+        compact: true;
         enabled: root.field.enabled;
         clicked => {
             let next = max(1, Math.round(size-edit.text.to-float()) - 1);
@@ -232,7 +346,7 @@ component FontPickerControl inherits HorizontalLayout {
         }
     }
     size-edit := LineEdit {
-        width: 54px;
+        width: 52px;
         enabled: root.field.enabled;
         text: root.field.font-size;
         edited(value) => {
@@ -245,8 +359,9 @@ component FontPickerControl inherits HorizontalLayout {
             );
         }
     }
-    Button {
+    ActionButton {
         text: "+";
+        compact: true;
         enabled: root.field.enabled;
         clicked => {
             let next = min(500, max(1, Math.round(size-edit.text.to-float()) + 1));
@@ -302,31 +417,18 @@ component ColorSwatchControl inherits HorizontalLayout {
     Rectangle {
         width: 38px;
         height: 28px;
-        border-radius: 5px;
+        border-radius: 6px;
         border-width: 1px;
-        border-color: swatch-touch.has-hover ? #00a896 : #50606A;
+        border-color: swatch-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
         background: #14181b;
-        // Subtle checkerboard cue for alpha-transparent colors
-        Rectangle {
-            x: 3px;
-            y: 3px;
-            width: 16px;
-            height: 11px;
-            background: #2f383e;
-        }
-        Rectangle {
-            x: 19px;
-            y: 14px;
-            width: 16px;
-            height: 11px;
-            background: #2f383e;
-        }
+        Rectangle { x: 3px; y: 3px; width: 16px; height: 11px; background: #2f383e; }
+        Rectangle { x: 19px; y: 14px; width: 16px; height: 11px; background: #2f383e; }
         Rectangle {
             x: 1px;
             y: 1px;
             width: parent.width - 2px;
             height: parent.height - 2px;
-            border-radius: 4px;
+            border-radius: 5px;
             background: root.field.color-swatch;
         }
         swatch-touch := TouchArea {
@@ -336,14 +438,15 @@ component ColorSwatchControl inherits HorizontalLayout {
         }
     }
     LineEdit {
-        width: 116px;
+        width: 118px;
         enabled: root.field.enabled;
         text: root.field.value;
         edited(value) => { root.edited(root.field.key, value); }
         accepted(value) => { root.color-hex-committed(root.field.key, value); }
     }
-    Button {
+    ActionButton {
         text: "Pick…";
+        compact: true;
         enabled: root.field.enabled;
         clicked => { root.open-color-picker(root.field); }
     }
@@ -354,13 +457,13 @@ component KeybindCaptureControl inherits VerticalLayout {
     property <bool> recording: false;
     callback edited(string, string);
     callback keybind-captured(string, string, bool, bool, bool, bool);
-    spacing: 3px;
+    spacing: 4px;
 
     HorizontalLayout {
         spacing: 6px;
         alignment: end;
         capture-focus := FocusScope {
-            width: 196px;
+            width: 210px;
             height: 30px;
             enabled: root.field.enabled;
             changed has-focus => {
@@ -406,12 +509,14 @@ component KeybindCaptureControl inherits VerticalLayout {
             Rectangle {
                 width: 100%;
                 height: 100%;
-                border-radius: 5px;
+                border-radius: 6px;
                 border-width: root.recording || root.field.conflict != "" ? 1.5px : 1px;
                 border-color: root.recording
-                    ? #00a896
-                    : (root.field.conflict != "" ? #eab308 : (cap-touch.has-hover ? #677680 : #485259));
-                background: root.recording ? #1a3330 : #2a3035;
+                    ? MementoPalette.cyan-accent
+                    : (root.field.conflict != "" ? #EAB308 : (cap-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light));
+                background: root.recording
+                    ? (MementoPalette.dark ? #162C3D : #E0F2FE)
+                    : MementoPalette.surface-bg;
                 Text {
                     x: 10px;
                     width: parent.width - 20px;
@@ -420,10 +525,11 @@ component KeybindCaptureControl inherits VerticalLayout {
                         ? "Press shortcut… (Esc)"
                         : (root.field.value == "" ? "Unassigned" : root.field.value);
                     color: root.recording
-                        ? #6ee7b7
-                        : (root.field.value == "" ? #7a8387 : #dce0e2);
+                        ? (MementoPalette.dark ? #7DD3FC : #0369A1)
+                        : (root.field.value == "" ? MementoPalette.text-muted : MementoPalette.text);
+                    font-family: root.recording || root.field.value == "" ? "Noto Sans, sans-serif" : "monospace";
                     font-size: 12px;
-                    font-weight: root.recording ? 600 : 500;
+                    font-weight: root.recording ? 700 : 600;
                     vertical-alignment: center;
                     horizontal-alignment: center;
                     overflow: elide;
@@ -450,7 +556,7 @@ component KeybindCaptureControl inherits VerticalLayout {
     }
     if root.field.conflict != "" : Text {
         text: "⚠ " + root.field.conflict;
-        color: #fbbf24;
+        color: #FBBF24;
         font-size: 11px;
         horizontal-alignment: right;
         overflow: elide;
@@ -471,18 +577,19 @@ component FieldRow inherits VerticalLayout {
     callback open-color-picker(SettingsField);
     callback keybind-captured(string, string, bool, bool, bool, bool);
     visible: root.field.visible;
-    padding-top: 6px;
-    padding-bottom: 6px;
-    min-height: 42px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    min-height: 44px;
     alignment: center;
 
     HorizontalLayout {
-        spacing: 12px;
+        spacing: 16px;
         alignment: space-between;
         Text {
             text: root.field.label;
             font-size: 13px;
-            color: root.field.enabled ? #dce0e2 : #7a8387;
+            font-weight: 500;
+            color: root.field.enabled ? MementoPalette.text : MementoPalette.text-muted;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
@@ -498,7 +605,7 @@ component FieldRow inherits VerticalLayout {
         if root.field.kind == "choice" : VerticalLayout {
             alignment: center;
             ComboBox {
-                width: 220px;
+                width: 260px;
                 enabled: root.field.enabled;
                 model: root.field.choices;
                 current-value: root.field.value;
@@ -540,7 +647,7 @@ component FieldRow inherits VerticalLayout {
         if root.field.kind == "text" && (root.use-anki-decks || root.use-anki-models) : VerticalLayout {
             alignment: center;
             ComboBox {
-                width: 220px;
+                width: 260px;
                 enabled: root.field.enabled;
                 model: root.use-anki-decks ? root.anki-decks : root.anki-models;
                 current-value: root.field.value;
@@ -550,7 +657,7 @@ component FieldRow inherits VerticalLayout {
         if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : VerticalLayout {
             alignment: center;
             LineEdit {
-                width: 220px;
+                width: 260px;
                 enabled: root.field.enabled;
                 text: root.field.value;
                 edited(value) => { root.edited(root.field.key, value); }
@@ -579,19 +686,29 @@ component SettingsSection inherits VerticalLayout {
     callback test-anki-connection();
     callback load-anki-fields(string);
 
-    spacing: 6px;
+    spacing: 8px;
     horizontal-stretch: 1;
 
     HorizontalLayout {
-        padding-left: 4px;
-        padding-right: 4px;
+        padding-left: 2px;
+        padding-right: 2px;
         alignment: space-between;
-        Text {
-            text: root.group.title;
-            font-size: 13px;
-            font-weight: 700;
-            color: #dce0e2;
-            vertical-alignment: center;
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Rectangle {
+                width: 3px;
+                height: 14px;
+                border-radius: 2px;
+                background: MementoPalette.cyan-accent;
+            }
+            Text {
+                text: root.group.title;
+                font-size: 13px;
+                font-weight: 700;
+                color: MementoPalette.text;
+                vertical-alignment: center;
+            }
         }
         if root.group.entry_id != "" : HorizontalLayout {
             spacing: 4px;
@@ -605,41 +722,46 @@ component SettingsSection inherits VerticalLayout {
             }
             ToolIcon {
                 icon: @image-url("icons/delete.svg");
-                tint: #ed6b72;
+                tint: MementoPalette.danger;
                 clicked => { root.remove-entry(root.group.entry_id); }
             }
         }
     }
+
     if root.group.category == 6 && root.group.title == "Keyboard Shortcuts" && root.keybind-conflict-count > 0 : Rectangle {
-        height: 36px;
-        background: #493a24;
+        height: 38px;
+        background: #422006;
         border-width: 1px;
-        border-color: #b45309;
-        border-radius: 6px;
+        border-color: #B45309;
+        border-radius: 8px;
         Text {
             x: 14px;
             width: parent.width - 28px;
             text: "⚠ Duplicate shortcut conflict detected in this profile. Click any shortcut to reassign.";
-            color: #fde68a;
+            color: #FDE68A;
             font-size: 12px;
+            font-weight: 600;
             vertical-alignment: center;
             overflow: elide;
         }
     }
+
     Rectangle {
-        background: #21262a;
+        background: MementoPalette.card-bg;
         border-width: 1px;
-        border-color: #384046;
-        border-radius: 8px;
+        border-color: MementoPalette.border;
+        border-radius: 10px;
+
         VerticalLayout {
-            padding-left: 14px;
-            padding-right: 14px;
+            padding-left: 18px;
+            padding-right: 18px;
             padding-top: 4px;
             padding-bottom: 4px;
             spacing: 0px;
+
             for field[index] in root.group.fields : VerticalLayout {
                 spacing: 0px;
-                if index > 0 : Rectangle { height: 1px; background: #2f363b; }
+                if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
                 FieldRow {
                     field: field;
                     anki-decks: root.anki-decks;
@@ -659,54 +781,92 @@ component SettingsSection inherits VerticalLayout {
                     }
                 }
             }
+
             if root.group.category == 0 && root.group.title == "Term Notes" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: #2f363b; }
+                Rectangle { height: 1px; background: MementoPalette.border; }
                 HorizontalLayout {
-                    height: 44px;
-                    spacing: 6px;
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 10px;
+                    alignment: space-between;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        spacing: 1px;
+                        Text {
+                            text: "One-click presets";
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: MementoPalette.text;
+                        }
+                        Text {
+                            text: "Pre-fill field markers for popular Anki note types";
+                            font-size: 11px;
+                            color: MementoPalette.text-muted;
+                            overflow: elide;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: end;
+                        PresetChip { label: "Lapis"; clicked => { root.apply-anki-preset("Lapis"); } }
+                        PresetChip { label: "Kiku"; clicked => { root.apply-anki-preset("Kiku"); } }
+                        PresetChip { label: "Senren"; clicked => { root.apply-anki-preset("Senren"); } }
+                        PresetChip { label: "Animecards"; clicked => { root.apply-anki-preset("Animecards"); } }
+                        PresetChip { label: "JPMN"; clicked => { root.apply-anki-preset("JPMN"); } }
+                    }
+                }
+            }
+
+            if root.group.category == 0 && (root.group.title == "Term Notes" || root.group.title == "Kanji Notes") : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                HorizontalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 10px;
+                    spacing: 12px;
                     alignment: space-between;
                     Text {
-                        text: "One-click presets";
-                        font-size: 12px;
-                        color: #9ca6aa;
-                        vertical-alignment: center;
+                        text: root.group.fields.length <= 2
+                            ? "No model fields loaded yet — connect to Anki or load fields to map them."
+                            : "Refresh fields from the selected Anki note model";
+                        color: MementoPalette.text-muted;
                         horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        font-size: 12px;
+                        overflow: elide;
                     }
-                    Button { text: "Lapis"; clicked => { root.apply-anki-preset("Lapis"); } }
-                    Button { text: "Kiku"; clicked => { root.apply-anki-preset("Kiku"); } }
-                    Button { text: "Senren"; clicked => { root.apply-anki-preset("Senren"); } }
-                    Button { text: "Animecards"; clicked => { root.apply-anki-preset("Animecards"); } }
-                    Button { text: "JPMN"; clicked => { root.apply-anki-preset("JPMN"); } }
+                    ActionButton {
+                        text: "Load Model Fields";
+                        clicked => { root.load-anki-fields(root.group.title == "Term Notes" ? "term" : "kanji"); }
+                    }
                 }
             }
-            if root.group.category == 0 && (root.group.title == "Term Notes" || root.group.title == "Kanji Notes") : HorizontalLayout {
-                height: 44px;
-                alignment: end;
-                if root.group.fields.length <= 2 : Text {
-                    text: "No model fields loaded.";
-                    color: #9CA6AA;
-                    horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    font-size: 12px;
-                }
-                Button {
-                    text: "Load model fields";
-                    clicked => { root.load-anki-fields(root.group.title == "Term Notes" ? "term" : "kanji"); }
-                }
-            }
+
             if root.group.category == 0 && root.group.title == "General" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: #2f363b; }
+                Rectangle { height: 1px; background: MementoPalette.border; }
                 HorizontalLayout {
-                    height: 42px;
+                    padding-top: 10px;
+                    padding-bottom: 10px;
                     alignment: space-between;
-                    Text {
-                        text: "Show advanced settings";
-                        font-size: 13px;
-                        color: #dce0e2;
-                        vertical-alignment: center;
+                    VerticalLayout {
+                        alignment: center;
                         horizontal-stretch: 1;
+                        spacing: 1px;
+                        Text {
+                            text: "Show advanced settings";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: MementoPalette.text;
+                        }
+                        Text {
+                            text: "Reveal duplicate-check, audio normalization, and media quality options";
+                            font-size: 11px;
+                            color: MementoPalette.text-muted;
+                            overflow: elide;
+                        }
                     }
                     VerticalLayout {
                         alignment: center;
@@ -720,25 +880,25 @@ component SettingsSection inherits VerticalLayout {
                     }
                 }
             }
+
             if root.group.category == 0 && root.group.title == "AnkiConnect" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: #2f363b; }
+                Rectangle { height: 1px; background: MementoPalette.border; }
                 HorizontalLayout {
-                    height: 42px;
+                    padding-top: 10px;
+                    padding-bottom: 10px;
                     alignment: space-between;
                     Text {
-                        text: "Test connection";
-                        font-size: 13px;
-                        color: #dce0e2;
+                        text: "Verify AnkiConnect endpoint and load decks & note models";
+                        font-size: 12px;
+                        color: MementoPalette.text-muted;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                        overflow: elide;
                     }
-                    VerticalLayout {
-                        alignment: center;
-                        Button {
-                            text: "Connect";
-                            clicked => { root.test-anki-connection(); }
-                        }
+                    ActionButton {
+                        text: "Test Connection";
+                        clicked => { root.test-anki-connection(); }
                     }
                 }
             }
@@ -746,15 +906,15 @@ component SettingsSection inherits VerticalLayout {
     }
 }
 
-// Apply/Reset/Defaults operate on the selected category, as in the QML pages.
+// Apply/Reset/Defaults operate on the selected category.
 // The owner refreshes settings-groups after reset/default/profile/list/category actions.
 export component SettingsWindow inherits Window {
-    title: "Options";
-    preferred-width: 1000px;
-    preferred-height: 700px;
-    min-width: 800px;
-    min-height: 550px;
-    background: #282e32;
+    title: "Options — Memento";
+    preferred-width: 1040px;
+    preferred-height: 720px;
+    min-width: 820px;
+    min-height: 560px;
+    background: MementoPalette.window-bg;
     default-font-family: "Noto Sans, sans-serif";
 
     in-out property <int> active-category: 0;
@@ -802,6 +962,13 @@ export component SettingsWindow inherits Window {
     in-out property <int> color-picker-b: 255;
     in-out property <string> color-picker-hex: "#FFFFFFFF";
 
+    // Custom Popup CSS editor state (Interface category — split like Yomitan)
+    in-out property <int> custom-css-tab: 0;
+    in-out property <string> custom-popup-css: "";
+    in property <string> custom-popup-css-path: "";
+    in-out property <string> custom-popup-outer-css: "";
+    in property <string> custom-popup-outer-css-path: "";
+
     callback close();
     callback anki-help-requested();
     callback category-changed(int);
@@ -832,98 +999,225 @@ export component SettingsWindow inherits Window {
     callback dictionary-archive-picked(string);
     callback dictionary-op-completed();
     callback asr-download-finished(bool, string);
+    callback save-custom-popup-css(string, string);
+    callback open-custom-popup-css(int);
+    callback insert-custom-popup-css-template(int);
 
     HorizontalLayout {
         spacing: 0px;
+
+        // ── Modern Categorized Sidebar ────────────────────────────────────
         Rectangle {
-            width: 240px;
-            background: #1e2225;
+            width: 236px;
+            background: MementoPalette.sidebar-bg;
+
             VerticalLayout {
-                padding-top: 20px;
-                padding-left: 8px;
-                padding-right: 8px;
+                padding-top: 16px;
+                padding-bottom: 14px;
+                padding-left: 10px;
+                padding-right: 10px;
                 spacing: 3px;
+
+                // Sidebar Brand Header
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-bottom: 12px;
+                    spacing: 10px;
+                    alignment: start;
+
+                    Image {
+                        width: 26px;
+                        height: 26px;
+                        source: @image-url("../res/memento.svg");
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 0px;
+                        Text {
+                            text: "Options";
+                            color: MementoPalette.text;
+                            font-size: 15px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Memento Preferences";
+                            color: MementoPalette.text-muted;
+                            font-size: 10.5px;
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: MementoPalette.border; }
+
+                HorizontalLayout { padding-left: 10px; padding-top: 6px; SidebarGroupLabel { text: "STUDY & MINING"; } }
                 SidebarItem { label: "Anki Integration"; icon: @image-url("icons/anki.svg"); selected: root.active-category == 0; clicked => { root.active-category = 0; root.adding-entry = false; root.category-changed(0); } }
-                SidebarItem { label: "Application"; icon: @image-url("icons/settings.svg"); selected: root.active-category == 1; clicked => { root.active-category = 1; root.adding-entry = false; root.category-changed(1); } }
-                SidebarItem { label: "Audio Sources"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 2; clicked => { root.active-category = 2; root.adding-entry = false; root.category-changed(2); } }
-                SidebarItem { label: "Behavior"; icon: @image-url("icons/gear.svg"); selected: root.active-category == 3; clicked => { root.active-category = 3; root.adding-entry = false; root.category-changed(3); } }
                 SidebarItem { label: "Dictionary"; icon: @image-url("icons/dictionary.svg"); selected: root.active-category == 4; clicked => { root.active-category = 4; root.adding-entry = false; root.category-changed(4); } }
-                SidebarItem { label: "Interface"; icon: @image-url("icons/window.svg"); selected: root.active-category == 5; clicked => { root.active-category = 5; root.adding-entry = false; root.category-changed(5); } }
-                SidebarItem { label: "Keybinds"; icon: @image-url("icons/keyboard.svg"); selected: root.active-category == 6; clicked => { root.active-category = 6; root.adding-entry = false; root.category-changed(6); } }
-                if root.ocr-built : SidebarItem { label: "OCR"; icon: @image-url("icons/eye.svg"); selected: root.active-category == 7; clicked => { root.active-category = 7; root.adding-entry = false; root.category-changed(7); } }
-                if root.asr-available : SidebarItem { label: "ASR"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 8; clicked => { root.active-category = 8; root.adding-entry = false; root.category-changed(8); } }
                 SidebarItem { label: "Search"; icon: @image-url("icons/search.svg"); selected: root.active-category == 9; clicked => { root.active-category = 9; root.adding-entry = false; root.category-changed(9); } }
+                SidebarItem { label: "Audio Sources"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 2; clicked => { root.active-category = 2; root.adding-entry = false; root.category-changed(2); } }
+
+                HorizontalLayout { padding-left: 10px; padding-top: 10px; SidebarGroupLabel { text: "PLAYER & UI"; } }
+                SidebarItem { label: "Interface"; icon: @image-url("icons/window.svg"); selected: root.active-category == 5; clicked => { root.active-category = 5; root.adding-entry = false; root.category-changed(5); } }
+                SidebarItem { label: "Behavior"; icon: @image-url("icons/gear.svg"); selected: root.active-category == 3; clicked => { root.active-category = 3; root.adding-entry = false; root.category-changed(3); } }
+                SidebarItem { label: "Keybinds"; icon: @image-url("icons/keyboard.svg"); selected: root.active-category == 6; clicked => { root.active-category = 6; root.adding-entry = false; root.category-changed(6); } }
+                SidebarItem { label: "Application"; icon: @image-url("icons/settings.svg"); selected: root.active-category == 1; clicked => { root.active-category = 1; root.adding-entry = false; root.category-changed(1); } }
+
+                if root.ocr-built || root.asr-available : HorizontalLayout {
+                    padding-left: 10px;
+                    padding-top: 10px;
+                    SidebarGroupLabel { text: "RECOGNITION"; }
+                }
+                if root.asr-available : SidebarItem { label: "ASR (Speech)"; icon: @image-url("icons/volume-on.svg"); selected: root.active-category == 8; clicked => { root.active-category = 8; root.adding-entry = false; root.category-changed(8); } }
+                if root.ocr-built : SidebarItem { label: "OCR"; icon: @image-url("icons/eye.svg"); selected: root.active-category == 7; clicked => { root.active-category = 7; root.adding-entry = false; root.category-changed(7); } }
+
                 Rectangle { vertical-stretch: 1; background: transparent; }
             }
         }
-        Rectangle { width: 1px; background: #384046; }
+
+        Rectangle { width: 1px; background: MementoPalette.border; }
+
+        // ── Main Content Area ─────────────────────────────────────────────
         VerticalLayout {
             spacing: 0px;
+
+            // Contextual Category Header Bar
             Rectangle {
-                height: 40px;
-                background: #262c30;
+                height: 60px;
+                background: MementoPalette.surface-bg;
+
                 HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
+                    padding-left: 24px;
+                    padding-right: 24px;
                     alignment: space-between;
-                    spacing: 12px;
-                    HorizontalLayout {
-                        spacing: 10px;
-                        alignment: start;
-                        if root.active-category == 0 : Text {
-                            text: "Profile:";
-                            color: #9ca6aa;
-                            font-size: 12px;
-                            vertical-alignment: center;
+                    spacing: 14px;
+
+                    // Page Title & Subtitle
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: root.active-category == 0 ? "Anki Integration"
+                                : root.active-category == 1 ? "Application"
+                                : root.active-category == 2 ? "Audio Sources"
+                                : root.active-category == 3 ? "Behavior"
+                                : root.active-category == 4 ? "Dictionaries"
+                                : root.active-category == 5 ? "Interface"
+                                : root.active-category == 6 ? "Keybinds"
+                                : root.active-category == 7 ? "Manga OCR"
+                                : root.active-category == 8 ? "Speech Recognition (ASR)"
+                                : "Dictionary Search";
+                            color: MementoPalette.text;
+                            font-size: 17px;
+                            font-weight: 700;
                         }
-                        if root.active-category == 0 : ComboBox {
-                            width: 150px;
-                            model: root.anki-profile-list;
-                            current-value: root.current-anki-profile;
-                            selected(profile) => { root.setting-edited("anki/profile", profile); }
-                        }
-                        if root.active-category == 0 : Text {
-                            text: "Show tag";
-                            color: #dce0e2;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        if root.active-category == 0 : VerticalLayout {
-                            alignment: center;
-                            SettingsSwitch {
-                                checked: root.anki-show-tag;
-                                toggled(value) => {
-                                    root.setting-edited("anki/profile/show-tag", value ? "true" : "false");
-                                }
-                            }
+                        Text {
+                            text: root.active-category == 0 ? "Configure AnkiConnect profiles, card templates, and field mappings"
+                                : root.active-category == 1 ? "Theme, updates, and general application preferences"
+                                : root.active-category == 2 ? "Manage word pronunciation audio endpoints and fallback priority"
+                                : root.active-category == 3 ? "Playback controls, auto-pause, OSC, and subtitle list behavior"
+                                : root.active-category == 4 ? "Import Yomitan .zip dictionaries, toggle visibility, and set priority order"
+                                : root.active-category == 5 ? "Customize subtitle fonts, stroke, colors, popup sizing, and styling"
+                                : root.active-category == 6 ? "Click any shortcut pill to record a new keyboard binding"
+                                : root.active-category == 7 ? "Configure Manga OCR model and GPU acceleration"
+                                : root.active-category == 8 ? "Select Whisper or ONNX speech models and manage local downloads"
+                                : "Configure hover/modifier lookup triggers, MeCab matching, and glossary layout";
+                            color: MementoPalette.text-muted;
+                            font-size: 11.5px;
+                            overflow: elide;
                         }
                     }
+
+                    // Contextual Right Controls (Profiles / Quick Toggles)
                     HorizontalLayout {
                         alignment: end;
                         spacing: 8px;
-                        if root.adding-entry : LineEdit {
-                            width: 180px;
-                            text <=> root.new-entry-name;
-                            placeholder-text: "Profile name";
-                        }
-                        if root.adding-entry : Button {
-                            text: "Add profile";
-                            enabled: root.new-entry-name != "";
-                            clicked => {
-                                root.add-entry(root.active-category, root.new-entry-name);
-                                root.new-entry-name = "";
-                                root.adding-entry = false;
+
+                        if root.active-category == 0 && !root.adding-entry : HorizontalLayout {
+                            spacing: 8px;
+                            alignment: end;
+                            Text {
+                                text: "Profile";
+                                color: MementoPalette.text-muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            ComboBox {
+                                width: 136px;
+                                model: root.anki-profile-list;
+                                current-value: root.current-anki-profile;
+                                selected(profile) => { root.setting-edited("anki/profile", profile); }
+                            }
+                            Rectangle {
+                                height: 30px;
+                                width: tag-row.preferred-width + 18px;
+                                border-radius: 7px;
+                                background: MementoPalette.card-bg;
+                                border-width: 1px;
+                                border-color: MementoPalette.border;
+                                tag-row := HorizontalLayout {
+                                    padding-left: 9px;
+                                    padding-right: 9px;
+                                    spacing: 8px;
+                                    alignment: center;
+                                    Text {
+                                        text: "Show tag";
+                                        color: MementoPalette.text-secondary;
+                                        font-size: 11.5px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        SettingsSwitch {
+                                            checked: root.anki-show-tag;
+                                            toggled(value) => {
+                                                root.setting-edited("anki/profile/show-tag", value ? "true" : "false");
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        if root.active-category == 0 || root.active-category == 6 : ToolIcon {
+
+                        if root.adding-entry : HorizontalLayout {
+                            spacing: 6px;
+                            alignment: end;
+                            LineEdit {
+                                width: 165px;
+                                text <=> root.new-entry-name;
+                                placeholder-text: "New profile name";
+                            }
+                            ActionButton {
+                                text: "Add";
+                                primary: true;
+                                compact: true;
+                                enabled: root.new-entry-name != "";
+                                clicked => {
+                                    root.add-entry(root.active-category, root.new-entry-name);
+                                    root.new-entry-name = "";
+                                    root.adding-entry = false;
+                                }
+                            }
+                            ActionButton {
+                                text: "Cancel";
+                                compact: true;
+                                clicked => {
+                                    root.new-entry-name = "";
+                                    root.adding-entry = false;
+                                }
+                            }
+                        }
+
+                        if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : ToolIcon {
                             icon: @image-url("icons/delete.svg");
-                            tint: #ed6b72;
+                            tint: MementoPalette.danger;
                             clicked => {
                                 root.remove-entry(root.active-category, root.active-category == 0 ? root.current-anki-profile : root.current-keybind-profile);
                             }
                         }
-                        if root.active-category == 0 || root.active-category == 2 || root.active-category == 6 : ToolIcon {
+                        if (root.active-category == 0 || root.active-category == 2 || root.active-category == 6) && !root.adding-entry : ToolIcon {
                             icon: @image-url("icons/add.svg");
+                            tint: MementoPalette.cyan-accent;
                             clicked => {
                                 if root.active-category == 2 { root.add-entry(2, ""); }
                                 else { root.adding-entry = true; }
@@ -932,40 +1226,54 @@ export component SettingsWindow inherits Window {
                     }
                 }
             }
-            Rectangle { height: 1px; background: #384046; }
+
+            Rectangle { height: 1px; background: MementoPalette.border; }
+
+            // Scrollable Settings Body
             ScrollView {
                 VerticalLayout {
                     width: parent.width;
-                    padding-top: 16px;
-                    padding-bottom: 24px;
+                    padding-top: 18px;
+                    padding-bottom: 26px;
                     padding-left: 24px;
                     padding-right: 24px;
-                    spacing: 16px;
+                    spacing: 18px;
                     alignment: start;
+
                     if root.active-category == 7 && !root.ocr-available : Rectangle {
-                        height: 38px;
-                        background: #493a24;
-                        border-radius: 6px;
+                        height: 40px;
+                        background: #422006;
+                        border-width: 1px;
+                        border-color: #B45309;
+                        border-radius: 8px;
                         Text {
                             x: 14px;
-                            text: "OCR runtime unavailable; preferences remain editable.";
-                            color: #ffe0a3;
+                            width: parent.width - 28px;
+                            text: "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable.";
+                            color: #FDE68A;
                             font-size: 12px;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
+
                     if root.active-category == 8 && !root.asr-available : Rectangle {
-                        height: 38px;
-                        background: #493a24;
-                        border-radius: 6px;
+                        height: 40px;
+                        background: #422006;
+                        border-width: 1px;
+                        border-color: #B45309;
+                        border-radius: 8px;
                         Text {
                             x: 14px;
-                            text: "ASR runtime unavailable; preferences remain editable.";
-                            color: #ffe0a3;
+                            width: parent.width - 28px;
+                            text: "⚠ ASR runtime unavailable; preferences remain editable.";
+                            color: #FDE68A;
                             font-size: 12px;
                             vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
+
                     for group in root.settings-groups : VerticalLayout {
                         if group.category != 4 &&
                             (group.category != 0 || group.title != "Advanced" || root.showing-advanced) : SettingsSection {
@@ -997,60 +1305,235 @@ export component SettingsWindow inherits Window {
                             load-anki-fields(section) => { root.load-anki-fields(section); }
                         }
                     }
+
+                    // ── Custom Popup CSS Card (Interface category) ───────
+                    if root.active-category == 5 : VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            padding-left: 2px;
+                            padding-right: 2px;
+                            alignment: space-between;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Rectangle {
+                                    width: 3px;
+                                    height: 14px;
+                                    border-radius: 2px;
+                                    background: MementoPalette.cyan-accent;
+                                }
+                                Text {
+                                    text: "Custom Popup CSS";
+                                    color: MementoPalette.text;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            if (root.custom-css-tab == 0 ? root.custom-popup-css-path : root.custom-popup-outer-css-path) != "" : Rectangle {
+                                height: 22px;
+                                width: min(css-path-lbl.preferred-width + 16px, 380px);
+                                border-radius: 5px;
+                                background: MementoPalette.surface-bg;
+                                border-width: 1px;
+                                border-color: MementoPalette.border;
+                                css-path-lbl := Text {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    height: parent.height;
+                                    text: root.custom-css-tab == 0 ? root.custom-popup-css-path : root.custom-popup-outer-css-path;
+                                    color: MementoPalette.text-muted;
+                                    font-family: "monospace";
+                                    font-size: 10.5px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            background: MementoPalette.card-bg;
+                            border-width: 1px;
+                            border-color: MementoPalette.border;
+                            border-radius: 10px;
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 10px;
+
+                                // Split tabs: Popup CSS (inner) | Popup Outer CSS (window frame)
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Rectangle {
+                                        height: 30px;
+                                        width: tab-inner-lbl.preferred-width + 24px;
+                                        border-radius: 7px;
+                                        border-width: 1px;
+                                        border-color: root.custom-css-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border-light;
+                                        background: root.custom-css-tab == 0
+                                            ? (MementoPalette.dark ? #1B2B3A : #E0F2FE)
+                                            : (tab-inner-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.surface-bg);
+                                        tab-inner-lbl := Text {
+                                            text: "Popup CSS";
+                                            color: root.custom-css-tab == 0
+                                                ? (MementoPalette.dark ? #7DD3FC : #0369A1)
+                                                : MementoPalette.text-secondary;
+                                            font-size: 12px;
+                                            font-weight: root.custom-css-tab == 0 ? 700 : 600;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        tab-inner-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.custom-css-tab = 0; }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 30px;
+                                        width: tab-outer-lbl.preferred-width + 24px;
+                                        border-radius: 7px;
+                                        border-width: 1px;
+                                        border-color: root.custom-css-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border-light;
+                                        background: root.custom-css-tab == 1
+                                            ? (MementoPalette.dark ? #1B2B3A : #E0F2FE)
+                                            : (tab-outer-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.surface-bg);
+                                        tab-outer-lbl := Text {
+                                            text: "Popup Outer CSS";
+                                            color: root.custom-css-tab == 1
+                                                ? (MementoPalette.dark ? #7DD3FC : #0369A1)
+                                                : MementoPalette.text-secondary;
+                                            font-size: 12px;
+                                            font-weight: root.custom-css-tab == 1 ? 700 : 600;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        tab-outer-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.custom-css-tab = 1; }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: root.custom-css-tab == 0
+                                        ? "Inner popup styling (popup.css): fonts, text/pitch headword colors, 2-column card grid (--definition-columns: 2), per-dictionary badge/tint colors & hover-to-reveal ([data-dictionary^=\"...\"]), frequency colors ([data-frequency^=\"...\"]), and glossary rules. External edits hot-reload automatically."
+                                        : "Outer popup frame styling (popup-outer.css): translucent background (rgba), border, radius, drop shadow, padding, and popup width/height (--popup-width / width). External edits hot-reload automatically.";
+                                    color: MementoPalette.text-secondary;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+
+                                if root.custom-css-tab == 0 : TextEdit {
+                                    height: 240px;
+                                    text <=> root.custom-popup-css;
+                                    font-family: "monospace";
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                    placeholder-text: "/* Add inner Popup CSS or click Insert Starter Template… */";
+                                }
+
+                                if root.custom-css-tab == 1 : TextEdit {
+                                    height: 240px;
+                                    text <=> root.custom-popup-outer-css;
+                                    font-family: "monospace";
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                    placeholder-text: "/* Add Popup Outer CSS (background, border, radius, shadow, width) or click Insert Starter Template… */";
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: end;
+                                    ActionButton {
+                                        text: "Insert Starter Template";
+                                        compact: true;
+                                        clicked => { root.insert-custom-popup-css-template(root.custom-css-tab); }
+                                    }
+                                    ActionButton {
+                                        text: "Open File";
+                                        compact: true;
+                                        clicked => { root.open-custom-popup-css(root.custom-css-tab); }
+                                    }
+                                    ActionButton {
+                                        text: "Save & Reload CSS";
+                                        primary: true;
+                                        compact: true;
+                                        clicked => { root.save-custom-popup-css(root.custom-popup-css, root.custom-popup-outer-css); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── ASR Models Card ───────────────────────────────────
                     if root.active-category == 8 : VerticalLayout {
                         spacing: 8px;
                         HorizontalLayout {
                             alignment: space-between;
-                            Text {
-                                text: "ASR Models";
-                                color: #dce0e2;
-                                font-size: 13px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
                             HorizontalLayout {
                                 spacing: 8px;
+                                Rectangle {
+                                    width: 3px;
+                                    height: 14px;
+                                    border-radius: 2px;
+                                    background: MementoPalette.cyan-accent;
+                                }
+                                Text {
+                                    text: "Local ASR Models";
+                                    color: MementoPalette.text;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
                                 Text {
                                     text: root.asr-models-dir;
-                                    color: #8a9499;
+                                    color: MementoPalette.text-muted;
+                                    font-family: "monospace";
                                     font-size: 11px;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
-                                Button {
+                                ActionButton {
                                     text: "Refresh";
+                                    compact: true;
                                     clicked => { root.refresh-asr-models(); }
                                 }
                             }
                         }
+
                         if root.asr-download-active : Rectangle {
-                            background: #1b282b;
+                            background: MementoPalette.dark ? #14262B : #ECFEFF;
                             border-width: 1px;
-                            border-color: #00867c;
-                            border-radius: 6px;
+                            border-color: #14B8A6;
+                            border-radius: 8px;
                             VerticalLayout {
-                                padding: 12px;
+                                padding: 14px;
                                 spacing: 8px;
                                 HorizontalLayout {
-                                    spacing: 8px;
+                                    spacing: 10px;
                                     alignment: space-between;
                                     Text {
                                         text: root.asr-download-text;
-                                        color: #dce0e2;
+                                        color: MementoPalette.text;
                                         font-size: 12px;
+                                        font-weight: 600;
                                         vertical-alignment: center;
                                         horizontal-stretch: 1;
                                         overflow: elide;
                                     }
-                                    Button {
+                                    ActionButton {
                                         text: "Cancel";
+                                        compact: true;
                                         clicked => { root.cancel-asr-download(); }
                                     }
                                 }
                                 Rectangle {
-                                    height: 8px;
+                                    height: 7px;
                                     border-radius: 4px;
-                                    background: #2f383e;
+                                    background: MementoPalette.border;
                                     clip: true;
                                     Rectangle {
                                         x: root.asr-download-progress >= 0.0
@@ -1061,71 +1544,85 @@ export component SettingsWindow inherits Window {
                                             : parent.width * 0.28;
                                         height: parent.height;
                                         border-radius: 4px;
-                                        background: #00a896;
+                                        background: #14B8A6;
                                     }
                                 }
                             }
                         }
+
                         Rectangle {
-                            background: #21262a;
+                            background: MementoPalette.card-bg;
                             border-width: 1px;
-                            border-color: #384046;
-                            border-radius: 8px;
+                            border-color: MementoPalette.border;
+                            border-radius: 10px;
                             VerticalLayout {
-                                padding-left: 14px;
-                                padding-right: 14px;
+                                padding-left: 18px;
+                                padding-right: 18px;
                                 padding-top: 4px;
                                 padding-bottom: 4px;
                                 spacing: 0px;
                                 for model[index] in root.asr-model-rows : VerticalLayout {
                                     spacing: 0px;
-                                    if index > 0 : Rectangle { height: 1px; background: #2f363b; }
+                                    if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
                                     HorizontalLayout {
-                                        min-height: 44px;
-                                        padding-top: 6px;
-                                        padding-bottom: 6px;
-                                        spacing: 10px;
+                                        min-height: 48px;
+                                        padding-top: 8px;
+                                        padding-bottom: 8px;
+                                        spacing: 12px;
                                         VerticalLayout {
                                             alignment: center;
                                             horizontal-stretch: 1;
                                             spacing: 2px;
                                             HorizontalLayout {
-                                                spacing: 6px;
+                                                spacing: 8px;
+                                                alignment: start;
                                                 Text {
                                                     text: (model.backend == "whisper"
-                                                        ? "Whisper: "
+                                                        ? "Whisper · "
                                                         : (model.backend == "whisper-vad"
-                                                            ? "Whisper VAD: "
-                                                            : "ONNX: ")) + model.name;
-                                                    color: #dce0e2;
+                                                            ? "Whisper VAD · "
+                                                            : "ONNX · ")) + model.name;
+                                                    color: MementoPalette.text;
                                                     font-size: 13px;
                                                     font-weight: model.selected ? 700 : 500;
                                                 }
-                                                if model.selected : Text {
-                                                    text: "(Active)";
-                                                    color: #6ee7b7;
-                                                    font-size: 11px;
-                                                    vertical-alignment: center;
+                                                if model.selected : Rectangle {
+                                                    height: 18px;
+                                                    width: act-lbl.preferred-width + 12px;
+                                                    border-radius: 9px;
+                                                    background: #064E3B;
+                                                    border-width: 1px;
+                                                    border-color: #10B981;
+                                                    act-lbl := Text {
+                                                        text: "Active";
+                                                        color: #6EE7B7;
+                                                        font-size: 10px;
+                                                        font-weight: 700;
+                                                        horizontal-alignment: center;
+                                                        vertical-alignment: center;
+                                                    }
                                                 }
                                             }
                                             Text {
                                                 text: model.path;
-                                                color: #7a8387;
-                                                font-size: 11px;
+                                                color: MementoPalette.text-muted;
+                                                font-family: "monospace";
+                                                font-size: 10.5px;
                                                 overflow: elide;
                                             }
                                         }
                                         Text {
                                             text: model.status-text;
-                                            color: model.installed ? #6ee7b7 : #fbbf24;
+                                            color: model.installed ? #34D399 : #FBBF24;
                                             font-size: 12px;
                                             font-weight: 600;
                                             vertical-alignment: center;
                                         }
                                         if !model.installed : VerticalLayout {
                                             alignment: center;
-                                            Button {
+                                            ActionButton {
                                                 text: "Download";
+                                                compact: true;
                                                 enabled: !root.asr-download-active;
                                                 clicked => { root.download-asr-model(model.backend, model.name); }
                                             }
@@ -1135,110 +1632,159 @@ export component SettingsWindow inherits Window {
                             }
                         }
                     }
+
+                    // ── Installed Dictionaries Section ────────────────────
                     if root.active-category == 4 : VerticalLayout {
-                        spacing: 10px;
+                        spacing: 12px;
+
                         HorizontalLayout {
-                            Text {
-                                text: "Installed dictionaries";
-                                color: #dce0e2;
-                                font-size: 15px;
-                                font-weight: 700;
-                                horizontal-stretch: 1;
-                                vertical-alignment: center;
+                            alignment: space-between;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    width: 3px;
+                                    height: 14px;
+                                    border-radius: 2px;
+                                    background: MementoPalette.cyan-accent;
+                                }
+                                Text {
+                                    text: "Installed Dictionaries (" + root.installed-dictionaries.length + ")";
+                                    color: MementoPalette.text;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
                             }
-                            Button {
-                                text: "Add ZIP…";
+                            ActionButton {
+                                text: "+ Import ZIP…";
+                                primary: true;
                                 enabled: !root.dictionary-busy;
                                 clicked => { root.add-dictionary-archive(); }
                             }
                         }
+
                         if root.dictionary-busy : Rectangle {
-                            background: #1b282b;
+                            background: MementoPalette.dark ? #14262B : #ECFEFF;
                             border-width: 1px;
-                            border-color: #00867c;
-                            border-radius: 6px;
+                            border-color: #14B8A6;
+                            border-radius: 8px;
                             VerticalLayout {
-                                padding: 12px;
+                                padding: 14px;
                                 spacing: 8px;
                                 Text {
                                     text: root.dictionary-progress-text != "" ? root.dictionary-progress-text : "Working on dictionary database…";
-                                    color: #dce0e2;
+                                    color: MementoPalette.text;
                                     font-size: 12px;
+                                    font-weight: 600;
                                     overflow: elide;
                                 }
                                 Rectangle {
-                                    height: 8px;
+                                    height: 7px;
                                     border-radius: 4px;
-                                    background: #2f383e;
+                                    background: MementoPalette.border;
                                     clip: true;
                                     Rectangle {
                                         x: (parent.width * 0.72) * abs(sin(animation-tick() / 900ms * 180deg));
                                         width: parent.width * 0.28;
                                         height: parent.height;
                                         border-radius: 4px;
-                                        background: #00a896;
+                                        background: #14B8A6;
                                     }
                                 }
                             }
                         }
-                        if root.installed-dictionaries.length == 0 : Text {
-                            text: "No dictionaries installed.";
-                            color: #8a9499;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                        }
-                        for dictionary[index] in root.installed-dictionaries : Rectangle {
-                            height: 48px;
-                            background: #21262a;
+
+                        if root.installed-dictionaries.length == 0 : Rectangle {
+                            height: 90px;
+                            border-radius: 10px;
+                            background: MementoPalette.card-bg;
                             border-width: 1px;
-                            border-color: #384046;
-                            border-radius: 6px;
-                            HorizontalLayout {
-                                width: 100%;
-                                height: 100%;
-                                padding-left: 14px;
-                                padding-right: 14px;
-                                spacing: 14px;
-                                VerticalLayout {
-                                    alignment: center;
-                                    SettingsSwitch {
-                                        checked: !dictionary.disabled;
-                                        enabled: !root.dictionary-busy;
-                                        toggled(val) => {
-                                            root.dictionary-enabled-changed(dictionary.id, !val);
-                                        }
-                                    }
-                                }
-                                Text {
-                                    text: dictionary.title + " [" + dictionary.id + "]";
-                                    color: dictionary.disabled ? #7a8387 : #dce0e2;
-                                    font-size: 13px;
-                                    font-weight: 500;
-                                    horizontal-stretch: 1;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 0;
+                            border-color: MementoPalette.border;
+                            Text {
+                                text: "No dictionaries installed yet. Click \"+ Import ZIP…\" to add Yomitan dictionaries.";
+                                color: MementoPalette.text-muted;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        if root.installed-dictionaries.length > 0 : Rectangle {
+                            background: MementoPalette.card-bg;
+                            border-width: 1px;
+                            border-color: MementoPalette.border;
+                            border-radius: 10px;
+                            VerticalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                spacing: 0px;
+                                for dictionary[index] in root.installed-dictionaries : VerticalLayout {
+                                    spacing: 0px;
+                                    if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
                                     HorizontalLayout {
-                                        spacing: 4px;
-                                        alignment: end;
-                                        ToolIcon {
-                                            icon: @image-url("icons/arrow-up.svg");
-                                            enabled: !root.dictionary-busy && index > 0;
-                                            clicked => { root.move-dictionary-up(dictionary.id); }
+                                        height: 48px;
+                                        spacing: 14px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            SettingsSwitch {
+                                                checked: !dictionary.disabled;
+                                                enabled: !root.dictionary-busy;
+                                                toggled(val) => {
+                                                    root.dictionary-enabled-changed(dictionary.id, !val);
+                                                }
+                                            }
                                         }
-                                        ToolIcon {
-                                            icon: @image-url("icons/arrow-down.svg");
-                                            enabled: !root.dictionary-busy && index < root.installed-dictionaries.length - 1;
-                                            clicked => { root.move-dictionary-down(dictionary.id); }
+                                        Text {
+                                            text: dictionary.title;
+                                            color: dictionary.disabled ? MementoPalette.text-muted : MementoPalette.text;
+                                            font-size: 13px;
+                                            font-weight: 500;
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                            overflow: elide;
                                         }
-                                        ToolIcon {
-                                            icon: @image-url("icons/delete.svg");
-                                            tint: #ed6b72;
-                                            enabled: !root.dictionary-busy;
-                                            clicked => { root.delete-dictionary(dictionary.id); }
+                                        Rectangle {
+                                            height: 20px;
+                                            width: id-lbl.preferred-width + 14px;
+                                            border-radius: 5px;
+                                            background: MementoPalette.surface-bg;
+                                            border-width: 1px;
+                                            border-color: MementoPalette.border;
+                                            id-lbl := Text {
+                                                text: "ID " + dictionary.id;
+                                                color: MementoPalette.text-muted;
+                                                font-family: "monospace";
+                                                font-size: 10.5px;
+                                                font-weight: 600;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            horizontal-stretch: 0;
+                                            HorizontalLayout {
+                                                spacing: 4px;
+                                                alignment: end;
+                                                ToolIcon {
+                                                    icon: @image-url("icons/arrow-up.svg");
+                                                    enabled: !root.dictionary-busy && index > 0;
+                                                    clicked => { root.move-dictionary-up(dictionary.id); }
+                                                }
+                                                ToolIcon {
+                                                    icon: @image-url("icons/arrow-down.svg");
+                                                    enabled: !root.dictionary-busy && index < root.installed-dictionaries.length - 1;
+                                                    clicked => { root.move-dictionary-down(dictionary.id); }
+                                                }
+                                                ToolIcon {
+                                                    icon: @image-url("icons/delete.svg");
+                                                    tint: MementoPalette.danger;
+                                                    enabled: !root.dictionary-busy;
+                                                    clicked => { root.delete-dictionary(dictionary.id); }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1247,56 +1793,90 @@ export component SettingsWindow inherits Window {
                     }
                 }
             }
-            Rectangle { height: 1px; background: #384046; }
+
+            Rectangle { height: 1px; background: MementoPalette.border; }
+
+            // ── Modern Footer Bar ─────────────────────────────────────────
             Rectangle {
-                height: 48px;
-                background: #21262a;
+                height: 54px;
+                background: MementoPalette.surface-bg;
+
                 HorizontalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    spacing: 8px;
-                    alignment: end;
-                    Text {
-                        text: root.settings-status;
-                        color: #9ca6aa;
-                        font-size: 12px;
-                        vertical-alignment: center;
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 10px;
+                    alignment: space-between;
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
                         horizontal-stretch: 1;
-                        overflow: elide;
+
+                        if root.active-category == 0 : ActionButton {
+                            text: "Marker Help";
+                            clicked => { root.anki-help-requested(); }
+                        }
+                        if root.active-category == 2 : ActionButton {
+                            text: "Audio Help";
+                            clicked => { root.showing-audio-help = true; }
+                        }
+                        Text {
+                            text: root.settings-status;
+                            color: MementoPalette.text-secondary;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
                     }
-                    if root.active-category == 0 : Button { text: "Help"; clicked => { root.anki-help-requested(); } }
-                    if root.active-category == 2 : Button { text: "Help"; clicked => { root.showing-audio-help = true; } }
-                    Button { text: "Reset"; clicked => { root.reset-settings(root.active-category); } }
-                    Button { text: "Defaults"; clicked => { root.defaults-settings(root.active-category); } }
-                    Button { text: "Apply"; clicked => { root.apply-settings(root.active-category); } }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        ActionButton {
+                            text: "Reset";
+                            ghost: true;
+                            clicked => { root.reset-settings(root.active-category); }
+                        }
+                        ActionButton {
+                            text: "Defaults";
+                            clicked => { root.defaults-settings(root.active-category); }
+                        }
+                        ActionButton {
+                            text: "Apply";
+                            primary: true;
+                            clicked => { root.apply-settings(root.active-category); }
+                        }
+                    }
                 }
             }
         }
     }
 
+    // ── Color Picker Modal ────────────────────────────────────────────────
     if root.color-picker-open : Rectangle {
         width: 100%;
         height: 100%;
         background: #00000099;
         TouchArea { clicked => { root.color-picker-open = false; } }
         Rectangle {
-            width: 420px;
-            height: 400px;
+            width: 440px;
+            height: 410px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #21262a;
+            background: MementoPalette.card-bg;
             border-width: 1px;
-            border-color: #50606A;
-            border-radius: 10px;
-            drop-shadow-blur: 24px;
+            border-color: MementoPalette.border-light;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
             drop-shadow-color: #000000DD;
             TouchArea { }
             VerticalLayout {
-                padding: 18px;
+                padding: 20px;
                 spacing: 12px;
                 Text {
-                    text: "Pick Color: " + root.color-picker-label;
-                    color: white;
+                    text: "Pick Color · " + root.color-picker-label;
+                    color: MementoPalette.text;
                     font-size: 15px;
                     font-weight: 700;
                     overflow: elide;
@@ -1304,18 +1884,18 @@ export component SettingsWindow inherits Window {
                 HorizontalLayout {
                     spacing: 12px;
                     Rectangle {
-                        width: 64px;
+                        width: 66px;
                         height: 44px;
-                        border-radius: 6px;
+                        border-radius: 8px;
                         border-width: 1px;
-                        border-color: #50606A;
+                        border-color: MementoPalette.border-light;
                         background: #14181b;
                         Rectangle {
                             x: 1px;
                             y: 1px;
                             width: parent.width - 2px;
                             height: parent.height - 2px;
-                            border-radius: 5px;
+                            border-radius: 7px;
                             background: Colors.rgba(
                                 root.color-picker-r / 255.0,
                                 root.color-picker-g / 255.0,
@@ -1326,67 +1906,45 @@ export component SettingsWindow inherits Window {
                     }
                     VerticalLayout {
                         alignment: center;
-                        spacing: 4px;
+                        spacing: 3px;
                         horizontal-stretch: 1;
                         Text {
                             text: "RGBA (" + root.color-picker-r + ", " + root.color-picker-g + ", " + root.color-picker-b + ", " + root.color-picker-a + ")";
-                            color: #dce0e2;
-                            font-size: 13px;
+                            color: MementoPalette.text;
+                            font-family: "monospace";
+                            font-size: 12.5px;
                         }
                         Text {
                             text: "Previous: " + root.color-picker-hex;
-                            color: #8a9499;
+                            color: MementoPalette.text-muted;
+                            font-family: "monospace";
                             font-size: 11px;
                         }
                     }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { width: 58px; text: "Red"; color: #f87171; font-size: 12px; vertical-alignment: center; }
-                    Slider {
-                        horizontal-stretch: 1;
-                        minimum: 0;
-                        maximum: 255;
-                        value: root.color-picker-r;
-                        changed(val) => { root.color-picker-r = Math.round(val); }
-                    }
-                    Text { width: 32px; text: root.color-picker-r + ""; color: #dce0e2; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                    Text { width: 52px; text: "Red"; color: #F87171; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Slider { horizontal-stretch: 1; minimum: 0; maximum: 255; value: root.color-picker-r; changed(val) => { root.color-picker-r = Math.round(val); } }
+                    Text { width: 32px; text: root.color-picker-r + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { width: 58px; text: "Green"; color: #4ade80; font-size: 12px; vertical-alignment: center; }
-                    Slider {
-                        horizontal-stretch: 1;
-                        minimum: 0;
-                        maximum: 255;
-                        value: root.color-picker-g;
-                        changed(val) => { root.color-picker-g = Math.round(val); }
-                    }
-                    Text { width: 32px; text: root.color-picker-g + ""; color: #dce0e2; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                    Text { width: 52px; text: "Green"; color: #4ADE80; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Slider { horizontal-stretch: 1; minimum: 0; maximum: 255; value: root.color-picker-g; changed(val) => { root.color-picker-g = Math.round(val); } }
+                    Text { width: 32px; text: root.color-picker-g + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { width: 58px; text: "Blue"; color: #60a5fa; font-size: 12px; vertical-alignment: center; }
-                    Slider {
-                        horizontal-stretch: 1;
-                        minimum: 0;
-                        maximum: 255;
-                        value: root.color-picker-b;
-                        changed(val) => { root.color-picker-b = Math.round(val); }
-                    }
-                    Text { width: 32px; text: root.color-picker-b + ""; color: #dce0e2; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                    Text { width: 52px; text: "Blue"; color: #60A5FA; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Slider { horizontal-stretch: 1; minimum: 0; maximum: 255; value: root.color-picker-b; changed(val) => { root.color-picker-b = Math.round(val); } }
+                    Text { width: 32px; text: root.color-picker-b + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Text { width: 58px; text: "Alpha"; color: #cbd5e1; font-size: 12px; vertical-alignment: center; }
-                    Slider {
-                        horizontal-stretch: 1;
-                        minimum: 0;
-                        maximum: 255;
-                        value: root.color-picker-a;
-                        changed(val) => { root.color-picker-a = Math.round(val); }
-                    }
-                    Text { width: 32px; text: root.color-picker-a + ""; color: #dce0e2; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                    Text { width: 52px; text: "Alpha"; color: MementoPalette.text-secondary; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Slider { horizontal-stretch: 1; minimum: 0; maximum: 255; value: root.color-picker-a; changed(val) => { root.color-picker-a = Math.round(val); } }
+                    Text { width: 32px; text: root.color-picker-a + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
                 HorizontalLayout {
                     spacing: 6px;
@@ -1401,11 +1959,11 @@ export component SettingsWindow inherits Window {
                         { a: 255, r: 41,  g: 90,  b: 138, c: #295A8AFF },
                         { a: 255, r: 237, g: 107, b: 114, c: #ED6B72FF },
                     ] : Rectangle {
-                        width: 28px;
+                        width: 30px;
                         height: 24px;
-                        border-radius: 4px;
+                        border-radius: 5px;
                         border-width: 1px;
-                        border-color: #50606A;
+                        border-color: MementoPalette.border-light;
                         background: swatch.c;
                         TouchArea {
                             mouse-cursor: pointer;
@@ -1421,9 +1979,10 @@ export component SettingsWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
-                    Button { text: "Cancel"; clicked => { root.color-picker-open = false; } }
-                    Button {
+                    ActionButton { text: "Cancel"; ghost: true; clicked => { root.color-picker-open = false; } }
+                    ActionButton {
                         text: "Apply Color";
+                        primary: true;
                         clicked => {
                             root.color-edited(
                                 root.color-picker-key,
@@ -1440,6 +1999,7 @@ export component SettingsWindow inherits Window {
         }
     }
 
+    // ── Audio Sources Help Modal ──────────────────────────────────────────
     if root.showing-audio-help : Rectangle {
         width: 100%;
         height: 100%;
@@ -1450,66 +2010,68 @@ export component SettingsWindow inherits Window {
             height: 270px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #21262a;
+            background: MementoPalette.card-bg;
             border-width: 1px;
-            border-color: #50606A;
-            border-radius: 8px;
+            border-color: MementoPalette.border-light;
+            border-radius: 12px;
+            drop-shadow-blur: 28px;
+            drop-shadow-color: #000000DD;
             TouchArea { }
             VerticalLayout {
-                padding: 20px;
+                padding: 22px;
                 spacing: 14px;
                 Text {
                     text: "Audio Sources Help";
-                    color: white;
-                    font-size: 20px;
+                    color: MementoPalette.text;
+                    font-size: 18px;
                     font-weight: 700;
                 }
                 Text {
                     text: "Source Name: The name of the audio source as it will appear in Memento.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
-                    color: #DCE3E7;
-                    font-size: 14px;
+                    color: MementoPalette.text-secondary;
+                    font-size: 13.5px;
                     wrap: word-wrap;
                     vertical-stretch: 1;
                 }
                 HorizontalLayout {
                     alignment: end;
-                    Button { text: "OK"; clicked => { root.showing-audio-help = false; } }
+                    ActionButton { text: "OK"; primary: true; clicked => { root.showing-audio-help = false; } }
                 }
             }
         }
     }
 
-    // Modal result popup for the AnkiConnect "Connect" button.
+    // ── AnkiConnect Result Modal ──────────────────────────────────────────
     if root.connection-popup-open : Rectangle {
         width: 100%;
         height: 100%;
         background: #00000088;
         TouchArea { clicked => { root.connection-popup-open = false; } }
         Rectangle {
-            width: 380px;
-            height: 170px;
+            width: 390px;
+            height: 175px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            background: #21262a;
-            border-radius: 10px;
-            border-width: 2px;
-            border-color: root.connection-popup-ok ? #2F8F5B : #ED6B72;
-            drop-shadow-blur: 24px;
+            background: MementoPalette.card-bg;
+            border-radius: 12px;
+            border-width: 1.5px;
+            border-color: root.connection-popup-ok ? #10B981 : MementoPalette.danger;
+            drop-shadow-blur: 28px;
             drop-shadow-color: #000000DD;
             TouchArea { }
             VerticalLayout {
-                padding: 18px;
+                padding: 20px;
                 spacing: 10px;
                 Text {
                     text: root.connection-popup-ok ? "✔ Connected to Anki" : "✖ Connection failed";
-                    color: root.connection-popup-ok ? #6EE7B7 : #ED6B72;
-                    font-size: 18px;
+                    color: root.connection-popup-ok ? #6EE7B7 : MementoPalette.danger;
+                    font-size: 17px;
                     font-weight: 700;
                     horizontal-alignment: center;
                 }
                 Text {
                     text: root.connection-popup-text;
-                    color: #dce0e2;
+                    color: MementoPalette.text-secondary;
                     font-size: 13px;
                     wrap: word-wrap;
                     horizontal-alignment: center;
@@ -1517,7 +2079,7 @@ export component SettingsWindow inherits Window {
                 }
                 HorizontalLayout {
                     alignment: center;
-                    Button { text: "OK"; clicked => { root.connection-popup-open = false; } }
+                    ActionButton { text: "OK"; primary: true; clicked => { root.connection-popup-open = false; } }
                 }
             }
         }

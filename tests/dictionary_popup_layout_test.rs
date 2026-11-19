@@ -278,14 +278,10 @@ fn paging_and_collapse_preserve_every_dictionary_and_its_selection() {
         })
         .collect();
     memento_app::set_dictionary_rows(&app, rows);
-    assert_eq!(app.get_popup_results().row_count(), 2);
+    assert_eq!(app.get_popup_results().row_count(), 12);
     app.invoke_toggle_definition_selection(1);
     app.invoke_toggle_term_collapse(0);
-    assert_eq!(app.get_popup_results().row_count(), 1);
-    for _ in 0..10 {
-        app.invoke_load_more_definition_results(true);
-        slint::platform::update_timers_and_animations();
-    }
+    assert_eq!(app.get_popup_results().row_count(), 3);
     app.invoke_toggle_term_collapse(0);
     let full = app.get_dict_results();
     let visible = app.get_popup_results();
@@ -1263,5 +1259,267 @@ mod rich_popup_phase4_tests {
         assert_eq!(app.get_anki_added_result_index(), -1);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn color_flag_emojis_multi_link_non_overlap_and_monochrome_svg_mask_cutout() {
+        init_no_event_loop();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "memento-rich-emoji-links-svg-{}-{nanos}",
+            std::process::id()
+        ));
+        let res_dir = root.join("res");
+        let smk_dir = res_dir.join("dict-5").join("smk8");
+        fs::create_dir_all(&smk_dir).unwrap();
+
+        // Exact `smk8/運用-fill.svg` structure using `<mask>` + `<text font-family="sans-serif">`
+        let svg_path = smk_dir.join("運用-fill.svg");
+        fs::write(
+            &svg_path,
+            r#"<svg lang='ja' width='256' height='128' viewBox='0 0 256 128'
+     xmlns='http://www.w3.org/2000/svg' version='1.1'>
+    <mask id='a'>
+        <rect width='256' height='128' fill='white'/>
+        <text text-anchor='middle' x='50%' y='50%' dy='.35em'
+              font-family='sans-serif' font-size='100px'
+              fill='black'>運用</text>
+    </mask>
+    <rect width='256' height='128' ry='20'
+          fill='black' mask='url(#a)'/>
+</svg>"#,
+        )
+        .unwrap();
+
+        // 1. Monochrome SVG mask badge must render BOTH opaque tinted pill pixels AND
+        //    transparent interior cutout pixels for `運用` (never a solid white rectangle).
+        let pixmap = memento_app::load_dictionary_image_pixmap(
+            &svg_path,
+            Some(30.0),
+            Some(15.0),
+            Some([248, 250, 252, 255]),
+            "#F8FAFC",
+        )
+        .expect("monochrome mask SVG must rasterize");
+        let w = pixmap.width() as usize;
+        let h = pixmap.height() as usize;
+        let mut opaque_inside = 0usize;
+        let mut transparent_cutout_inside = 0usize;
+        for y in 2..(h.saturating_sub(2)) {
+            for x in 4..(w.saturating_sub(4)) {
+                let a = pixmap.pixels()[y * w + x].alpha();
+                if a >= 200 {
+                    opaque_inside += 1;
+                } else if a <= 80 {
+                    transparent_cutout_inside += 1;
+                }
+            }
+        }
+        assert!(opaque_inside > 20, "badge pill must have opaque pixels ({opaque_inside})");
+        assert!(
+            transparent_cutout_inside > 10,
+            "SVG mask text cutout `運用` must leave transparent pixels inside badge (cutout={transparent_cutout_inside}, opaque={opaque_inside})"
+        );
+
+        // 2. Multi-span link line (`⇨あんな・こんな・どんな：こそあど`) must NOT duplicate/overlap
+        //    clusters across GlyphRuns sharing the same shaped Run.
+        let multi_link_json = r#"[{"type":"structured-content","content":["⇨",{"tag":"span","content":{"tag":"a","href":"?query=あんな&wildcards=off","content":"あんな"}},"・",{"tag":"span","content":{"tag":"a","href":"?query=こんな&wildcards=off","content":"こんな"}},"・",{"tag":"span","content":{"tag":"a","href":"?query=どんな&wildcards=off","content":"どんな"}},"：",{"tag":"span","content":{"tag":"a","href":"?query=こそあど&wildcards=off","content":"こそあど"}}]}]"#;
+        let link_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            multi_link_json,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[res_dir.clone()],
+            5,
+            "SMK8",
+            440.0,
+            true,
+        )
+        .expect("multi-link entry must render");
+        assert_eq!(
+            link_doc.plain_text, "⇨あんな・こんな・どんな：こそあど",
+            "multi-span GlyphRuns must emit each character exactly once without overlapping duplicates"
+        );
+        let non_nl: Vec<_> = link_doc
+            .selectable_chars
+            .iter()
+            .filter(|c| c.ch != '\n')
+            .collect();
+        for pair in non_nl.windows(2) {
+            assert!(
+                pair[1].x >= pair[0].x + 2.0,
+                "adjacent characters '{}' (x={}) and '{}' (x={}) must advance monotonically without overlapping",
+                pair[0].ch,
+                pair[0].x,
+                pair[1].ch,
+                pair[1].x
+            );
+        }
+
+        // 3. JMdict flag emoji list markers (`'🇯🇵 '` and `'🇬🇧 '`) must render color emoji bitmaps
+        //    (containing real red flag pixels when Noto Color Emoji is installed) rather than cyan `JP`/`GB`.
+        let flag_json = r#"[{"type":"structured-content","content":[{"tag":"ul","style":{"listStyleType":"'🇯🇵 '"},"content":[{"tag":"li","content":"あなたが呼べば、彼は来るでしょう。"},{"tag":"li","style":{"listStyleType":"'🇬🇧 '"},"content":"He will come if you call him."}]}]}]"#;
+        let flag_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            flag_json,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[res_dir],
+            9,
+            "JMdict",
+            440.0,
+            true,
+        )
+        .expect("flag emoji entry must render");
+        if let Some(rgba) = flag_doc.image.to_rgba8() {
+            let red_flag_pixels = rgba
+                .as_slice()
+                .iter()
+                .filter(|px| px.a > 120 && px.r > 150 && px.r > px.g.saturating_add(50) && px.r > px.b.saturating_add(50))
+                .count();
+            assert!(
+                red_flag_pixels > 0,
+                "flag emoji markers 🇯🇵/🇬🇧 must render full-color emoji pixels (red_flag_pixels={red_flag_pixels})"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn custom_popup_css_applies_to_popup_bridge_and_hot_reloads() {
+        init_no_event_loop();
+        let fixture = build_rich_fixture();
+        let css_path = fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME);
+        fs::write(
+            &css_path,
+            r#"
+            :root {
+                --popup-bg: #0D1117;
+                --popup-radius: 12px;
+                --headword-color: #FF79C6;
+                --headword-size: 27px;
+                --dict-badge-bg: #2563EB;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
+
+        let pb = app.global::<PopupBridge>();
+        let bg = pb.get_css_popup_bg().to_argb_u8();
+        assert_eq!((bg.red, bg.green, bg.blue), (0x0D, 0x11, 0x17));
+        assert!((pb.get_css_popup_radius() - 12.0).abs() < 0.01);
+        let hw = pb.get_css_headword_color().to_argb_u8();
+        assert_eq!((hw.red, hw.green, hw.blue), (0xFF, 0x79, 0xC6));
+        assert!((pb.get_css_headword_size() - 27.0).abs() < 0.01);
+        let badge = pb.get_css_dict_badge_bg().to_argb_u8();
+        assert_eq!((badge.red, badge.green, badge.blue), (0x25, 0x63, 0xEB));
+
+        // Edit popup.css on disk and reload via refresh_rich_ui_bridges.
+        let rev_before = pb.get_rich_revision();
+        fs::write(
+            &css_path,
+            r#"
+            .popup {
+                background-color: #FAF9F6;
+                border: 2px solid #D1D5DB;
+                border-radius: 6px;
+            }
+            .headword {
+                color: #111827;
+                font-size: 25px;
+            }
+            "#,
+        )
+        .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+
+        let bg2 = pb.get_css_popup_bg().to_argb_u8();
+        assert_eq!((bg2.red, bg2.green, bg2.blue), (0xFA, 0xF9, 0xF6));
+        assert!((pb.get_css_popup_border_width() - 2.0).abs() < 0.01);
+        assert!((pb.get_css_popup_radius() - 6.0).abs() < 0.01);
+        let hw2 = pb.get_css_headword_color().to_argb_u8();
+        assert_eq!((hw2.red, hw2.green, hw2.blue), (0x11, 0x18, 0x27));
+        assert!((pb.get_css_headword_size() - 25.0).abs() < 0.01);
+        assert!(pb.get_rich_revision() > rev_before);
+
+        // Write split popup-outer.css + 2-column inner popup.css and verify both reload together.
+        let outer_path = fixture
+            .config_dir
+            .join(memento_app::CUSTOM_POPUP_OUTER_CSS_FILENAME);
+        fs::write(
+            &outer_path,
+            r#"
+            .popup {
+                background: rgba(45, 45, 55, 0.85);
+                border-radius: 12px;
+                width: 780px;
+            }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            &css_path,
+            r#"
+            :root {
+                --definition-columns: 2;
+                --definition-gap: 10px;
+            }
+            [data-dictionary="JMdict"] {
+                --dict-color: #0084FF;
+                --glossary-opacity: 0;
+                --glossary-hover-opacity: 1;
+            }
+            [data-frequency^="JPDB"] {
+                background-color: #FF3E3D;
+            }
+            "#,
+        )
+        .unwrap();
+        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+
+        let bg3 = pb.get_css_popup_bg().to_argb_u8();
+        assert_eq!((bg3.red, bg3.green, bg3.blue), (45, 45, 55));
+        assert!((pb.get_css_popup_width() - 780.0).abs() < 0.01);
+        assert_eq!(pb.get_css_definition_columns(), 2);
+
+        let dstyle = pb.invoke_dict_entry_style("JMdict".into(), false, pb.get_rich_revision());
+        let d_bg = dstyle.badge_bg.to_argb_u8();
+        assert_eq!((d_bg.red, d_bg.green, d_bg.blue), (0x00, 0x84, 0xFF));
+        assert_eq!(dstyle.glossary_opacity, 0.0);
+        assert_eq!(dstyle.glossary_hover_opacity, 1.0);
+
+        let fstyle = pb.invoke_freq_badge_style("JPDB".into(), pb.get_rich_revision());
+        let f_bg = fstyle.bg.to_argb_u8();
+        assert_eq!((f_bg.red, f_bg.green, f_bg.blue), (0xFF, 0x3E, 0x3D));
+
+        // Verify 2-column grid pairing: 3 definitions in one term -> 2 grid rows (2 + 1);
+        // 1 definition in second term -> 1 solo full-width row.
+        let sample_rows = Rc::new(VecModel::from(vec![
+            DictResult { index: 1, term_start: true, term_end: false, expression: "呼ぶ".into(), dict_name: "D1".into(), ..DictResult::default() },
+            DictResult { index: 2, term_start: false, term_end: false, expression: "呼ぶ".into(), dict_name: "D2".into(), ..DictResult::default() },
+            DictResult { index: 3, term_start: false, term_end: true, expression: "呼ぶ".into(), dict_name: "D3".into(), ..DictResult::default() },
+            DictResult { index: 4, term_start: true, term_end: true, expression: "単".into(), dict_name: "D4".into(), ..DictResult::default() },
+        ]));
+        let term1_pairs = pb.invoke_definition_grid_rows(sample_rows.clone().into(), 1);
+        assert_eq!(term1_pairs.row_count(), 2);
+        let p0 = term1_pairs.row_data(0).unwrap();
+        assert!(p0.has_right && !p0.is_solo && p0.left.index == 1 && p0.right.index == 2);
+        let p1 = term1_pairs.row_data(1).unwrap();
+        assert!(!p1.has_right && !p1.is_solo && p1.left.index == 3);
+
+        let term2_pairs = pb.invoke_definition_grid_rows(sample_rows.into(), 4);
+        assert_eq!(term2_pairs.row_count(), 1);
+        let s0 = term2_pairs.row_data(0).unwrap();
+        assert!(!s0.has_right && s0.is_solo && s0.left.index == 4);
     }
 }

@@ -1,204 +1,181 @@
-# Memento — Rust
+# Memento
 
-Memento is a free and open-source video player for studying Japanese. This fork
-uses Rust for the application, Slint for the interface, and libmpv for playback.
-It builds on the original [Memento](https://github.com/ripose-jp/Memento).
+**Memento** is a fast, open-source video player built for learning Japanese — written in Rust with a Slint interface and powered by `libmpv`.
 
-## Branches
+Watch anime, dramas, or YouTube videos with instant hover dictionary lookups, pitch accent graphs, frequency rankings, automatic furigana, live speech-to-text subtitles, OCR, and one-click Anki card creation.
 
-| Branch | Contents |
-| --- | --- |
-| [`master`](https://github.com/eyalmazuz/Memento/tree/master) | Active Rust application, promoted from the `rust` branch. |
-| [`cpp`](https://github.com/eyalmazuz/Memento/tree/cpp) | Preserved C++/Qt `master`, including its source, build instructions, and history. |
+![Memento Screenshot](example.png)
 
-The earlier C++ ASR work also remains on
-[`feature/whisper-subtitle-provider-refactor`](https://github.com/eyalmazuz/Memento/tree/feature/whisper-subtitle-provider-refactor).
-For the C++ application, use the [C++ README](https://github.com/eyalmazuz/Memento/blob/cpp/README.md).
-Previously packaged C++ releases have separate installation instructions.
+> Built upon the original [ripose-jp/Memento](https://github.com/ripose-jp/Memento) and inspired by [Yomitan](https://github.com/yomidevs/yomitan).
 
-The Rust migration is still in progress; see the ASR integration limitation below.
+---
 
 ## Features
 
-* Grammar aware subtitle search
-* Yomitan-style term and kanji lookup with multiple dictionary results
-* Yomitan dictionaries, frequency badges, and pitch-accent graphs
-* Anki card creation through [AnkiConnect](https://ankiweb.net/shared/info/2055492159)
-* Selectable subtitle overlay, subtitle sidebar, and optional furigana
-* Optional Whisper/ONNX speech recognition and Manga OCR
-* mpv configuration, shaders, and scripts, subject to the ASR limitation below
+### Video & Subtitles
+* **Full `libmpv` playback** — supports your own `mpv.conf`, `input.conf`, shaders, scripts, playlists, hardware decoding, drag-and-drop, and streaming URLs via `yt-dlp`.
+* **Crisp vector-stroked subtitles** — smooth per-glyph hover scanning (hover, modifier key, or middle-mouse), top-edge secondary subtitles, and auto-hiding controls/cursor in fullscreen.
+* **Automatic furigana** — fast in-process MeCab tokenization supporting both **IPADic** and **UniDic** dictionaries.
+* **Interactive subtitle drawer** — Primary and Secondary tabs, instant search with match navigation, resizable split view, and multi-row selection for context/cloze mining.
+* **Timeline navigation** — hover thumbnail previews and chapter markers.
 
-## Build and run
+### Yomitan-Style Dictionary Lookup
+* **Rich formatted definitions** — renders Yomitan `structured-content` (tables, ruby text, collapsible `<details>`, local images, monochrome SVGs) with scoped dictionary `styles.css`.
+* **Accurate Japanese lookup** — grammar-aware deconjugation, NFKC/kana normalization, conjugation hover tooltips, and optional MeCab compound/lemma matching.
+* **Deep exploration** — clickable `?query=` cross-links with Back/Forward history, per-kanji lookup view, `かな` reading toggle, glossary text selection (`Ctrl+C`), and a dedicated Dictionary Search panel.
+* **Pitch accent & frequencies** — pitch accent graphs (with nasal and devoice markers), frequency pills (JPDB, BCCWJ, etc.), and category-colored tags.
 
-Install current stable [Rust](https://rustup.rs/) and the system libraries below once. Then:
+### Anki Integration
+* **One-click card presets** — built-in templates for **Lapis**, **Kiku**, **Senren**, **Animecards**, and **JPMN**, or fully custom field mappings via [AnkiConnect](https://ankiweb.net/shared/info/2055492159).
+* **Live card status** — non-blocking duplicate detection, **Browse in Anki** buttons, and existing note tag pills right inside the popup.
+* **Rich media & markers** — stereo `.aac` audio clips, screenshots/video, multi-source word audio, multi-subtitle cloze, `{selection | clipboard | glossary}`, pitch graphs, frequencies, part-of-speech, and Yomitan HTML glossaries.
+
+### Optional Speech Recognition (ASR) & OCR
+* **Real-time ASR subtitles** — transcribe video audio on the fly using **Whisper** (CPU OpenMP/AVX2, Vulkan, or CUDA) or **ONNX Runtime** models. Generated cues feed natively into an in-memory `libmpv` subtitle track, so pause, seek, auto-pause, `sub-seek`, `sub-delay`, and audio track switching keep working seamlessly.
+* **Manga OCR** — press `Ctrl+L` (customizable) to drag a box over hardcoded subtitles or on-screen Japanese text for instant recognition and lookup.
+
+---
+
+## Quick Start
+
+Install stable [Rust](https://rustup.rs/) and the system libraries below, then build and run:
 
 ```bash
 git clone https://github.com/eyalmazuz/Memento.git
 cd Memento
-cargo build
+cargo build --release
+./target/release/memento
 ```
 
-Run `cargo run`, or launch `target/debug/memento`. Add `--release` for a release build.
-The default build includes playback, dictionaries, subtitles and Anki integration.
+The default build includes video playback, dictionaries, MeCab furigana/lookup, subtitles, and Anki integration. Pass a file path, URL, or standard `mpv` options directly on the command line:
+
+```bash
+./target/release/memento "/path/to/video.mkv"
+```
 
 <details>
-<summary>System packages (Linux)</summary>
+<summary><strong>Linux system dependencies</strong></summary>
 
-Arch Linux:
-
+**Arch Linux:**
 ```bash
-sudo pacman -S --needed base-devel clang pkgconf mpv sqlite libzip json-c
+sudo pacman -S --needed base-devel clang pkgconf mpv sqlite
 ```
 
-Debian / Ubuntu:
-
+**Debian / Ubuntu:**
 ```bash
-sudo apt install build-essential libclang-dev pkg-config libmpv-dev libsqlite3-dev libzip-dev libjson-c-dev
+sudo apt install build-essential libclang-dev pkg-config libmpv-dev libsqlite3-dev
 ```
 
-Other distributions need the equivalent C/C++ toolchain, libclang, pkg-config,
-and development libraries for libmpv, SQLite, libzip and json-c.
-Cargo finds the installed libmpv automatically. No custom SDK or existing build
-folder is needed. Linux is the currently tested platform.
+**Recommended runtime extras:**
+* **Japanese fonts** (e.g., Noto Sans CJK JP) for clean subtitle and popup rendering
+* **`mecab`** + an IPADic or UniDic dictionary for automatic furigana and MeCab lookup matching
+* **`yt-dlp`** for opening streaming URLs
 
 </details>
 
-### Optional build flags
+### Optional Build Features
 
-ASR and OCR are disabled by default. Enable them with Cargo features:
+ASR and OCR are opt-in via Cargo feature flags (unbuilt features are automatically hidden in Settings):
 
-| Feature | Command |
-| --- | --- |
-| Whisper ASR (CPU) | `cargo build --features asr` |
-| Whisper ASR (CUDA) | `cargo build --features whisper-cuda` |
-| Whisper ASR (Vulkan) | `cargo build --features whisper-vulkan` |
-| ONNX ASR (CPU) | `cargo build --features asr-onnx` |
-| OCR | `cargo build --features ocr` |
-| Whisper ASR + OCR | `cargo build --features asr,ocr` |
+| Feature | Cargo flag | Notes |
+| --- | --- | --- |
+| **Whisper ASR (CPU)** | `--features asr` | OpenMP + AVX2/SIMD enabled by default |
+| **Whisper ASR (Vulkan GPU)** | `--features whisper-vulkan` | Needs Vulkan headers & `glslc` |
+| **Whisper ASR (CUDA GPU)** | `--features whisper-cuda` | Needs NVIDIA CUDA Toolkit |
+| **ONNX ASR** | `--features asr-onnx` | Auto-discovers or fetches ONNX Runtime |
+| **Manga OCR** | `--features ocr` | Loads `libmocr` at runtime |
 
-Use the same flags with `cargo run`, for example `cargo run --features asr,ocr`.
-Unavailable features are hidden in Settings.
+**Build everything together** (example with Whisper Vulkan + ONNX + OCR):
 
-Whisper builds need CMake and a C++ compiler. Cargo downloads and builds the pinned
-Whisper sources automatically; ONNX builds download the matching official runtime.
-Downloads are checksum-verified and cached in Cargo's build directory. CUDA requires
-the CUDA toolkit; Vulkan requires the Vulkan SDK (including `glslc`). GPU support
-is selected by the build flag; the **Use GPU** setting controls its use at runtime.
+```bash
+cargo build --release --features ocr,asr,asr-onnx,whisper-vulkan
+```
 
-OCR runtime requirements and speech models are described below. Optional streaming
-URL playback uses `yt-dlp`. Japanese fonts such as Noto Sans CJK JP are recommended.
+> Whisper builds require `cmake` and a system toolchain (included in `base-devel` / `build-essential`). GPU backend support is chosen at build time; you can toggle **Use GPU** on or off anytime in Settings.
+>
+> For advanced build overrides, tests, and playback profiling, see [docs/development.md](docs/development.md).
 
-See [development and playback diagnostics](docs/development.md) for tests,
-performance measurements, and advanced build overrides.
+---
 
-## Dictionaries
+## Recommended Dictionaries
 
-* [JMdict](https://github.com/yomidevs/jmdict-yomitan/) (English)
-  * [JMdict_english_with_examples.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_with_examples.zip)
-    * This is the version of JMdict with example sentences from the [Tatoeba Project](http://tatoeba.org/home).
+Import `.zip` dictionaries directly in **Settings → Dictionaries** (drag-and-drop or file picker).
+
+### Japanese Definitions & Names
+* **[Jitendex](https://jitendex.org/)** *(Recommended English)* — [jitendex-yomitan.zip](https://github.com/stephenmk/stephenmk.github.io/releases/latest/download/jitendex-yomitan.zip)
+* **[JMdict](https://github.com/yomidevs/jmdict-yomitan/)** *(English)*:
+  * [JMdict_english_with_examples.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_with_examples.zip) *(includes Tatoeba example sentences)*
   * [JMdict_english.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english.zip)
-    * This is the same JMdict but without example sentences.
-  * [JMdict_english_legacy.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_legacy.zip)
-    * This is the same JMdict with legacy formatting instead of structured content.
   * [JMdict_english_without_proper_names.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_without_proper_names.zip)
-    * This is `JMdict_english` but without several thousand entries from JMnedict.
-  * [JMdict_english_legacy_without_proper_names.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_legacy_without_proper_names.zip)
-* [JMdict](https://github.com/yomidevs/jmdict-yomitan/) (Other Languages)
-  * [JMdict_dutch.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_dutch.zip)
-  * [JMdict_french.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_french.zip)
-  * [JMdict_german.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_german.zip)
-  * [JMdict_hungarian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_hungarian.zip)
-  * [JMdict_russian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_russian.zip)
-  * [JMdict_slovenian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_slovenian.zip)
-  * [JMdict_spanish.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_spanish.zip)
-  * [JMdict_swedish.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_swedish.zip)
-* [Jitendex](https://jitendex.org/) (English)
-  * [jitendex-yomitan.zip](https://github.com/stephenmk/stephenmk.github.io/releases/latest/download/jitendex-yomitan.zip)
-    * Similar to `JMdict_english_with_examples` with additional formatting.
-* [JMnedict](https://github.com/yomidevs/jmdict-yomitan/) (Japanese Names)
-  * [JMnedict.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMnedict.zip)
-* [JPDB](https://github.com/Kuuuube/yomitan-dictionaries) (Frequency)
-  * [JPDB v2.2 Kana](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/JPDB_v2.2_Frequency_Kana_2024-10-13.zip) (Recommended)
-  * [JPDB v2.2 Frequency Kana Display Only](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/JPDB_v2.2_Frequency_Kana_Display_Only_2024-10-13.zip)
-  * [JPDB v2.2](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/JPDB_v2.2_Frequency_2024-10-13.zip)
-* [BCCWJ SUW LUW Combined](https://github.com/Kuuuube/yomitan-dictionaries) (Frequency)
-  * [BCCWJ_SUW_LUW_combined.zip](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/BCCWJ_SUW_LUW_combined.zip)
-* Kanjium (Pitch)
-  * [kanjium_pitch_accents.zip](https://github.com/FooSoft/yomichan/raw/dictionaries/kanjium_pitch_accents.zip)
-* [KANJIDIC](https://github.com/yomidevs/jmdict-yomitan/) (Kanji)
-  * [KANJIDIC_english.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_english.zip)
-  * [KANJIDIC_french.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_french.zip)
-  * [KANJIDIC_portuguese.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_portuguese.zip)
-  * [KANJIDIC_spanish.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_spanish.zip)
+* **[JMnedict](https://github.com/yomidevs/jmdict-yomitan/)** *(Japanese Names)* — [JMnedict.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMnedict.zip)
+
+<details>
+<summary>Other JMdict languages &amp; legacy formats</summary>
+
+* [JMdict_dutch.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_dutch.zip)
+* [JMdict_french.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_french.zip)
+* [JMdict_german.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_german.zip)
+* [JMdict_hungarian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_hungarian.zip)
+* [JMdict_russian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_russian.zip)
+* [JMdict_slovenian.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_slovenian.zip)
+* [JMdict_spanish.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_spanish.zip)
+* [JMdict_swedish.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_swedish.zip)
+* [JMdict_english_legacy.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_legacy.zip)
+* [JMdict_english_legacy_without_proper_names.zip](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/JMdict_english_legacy_without_proper_names.zip)
+
+</details>
+
+### Frequencies, Pitch Accent & Kanji
+* **[JPDB Frequency](https://github.com/Kuuuube/yomitan-dictionaries)** *(Recommended)* — [JPDB v2.2 Kana](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/JPDB_v2.2_Frequency_Kana_2024-10-13.zip) · [JPDB v2.2](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/JPDB_v2.2_Frequency_2024-10-13.zip)
+* **[BCCWJ Frequency](https://github.com/Kuuuube/yomitan-dictionaries)** — [BCCWJ_SUW_LUW_combined.zip](https://github.com/Kuuuube/yomitan-dictionaries/raw/main/dictionaries/BCCWJ_SUW_LUW_combined.zip)
+* **Kanjium Pitch Accents** — [kanjium_pitch_accents.zip](https://github.com/FooSoft/yomichan/raw/dictionaries/kanjium_pitch_accents.zip)
+* **[KANJIDIC](https://github.com/yomidevs/jmdict-yomitan/)** — [English](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_english.zip) · [French](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_french.zip) · [Portuguese](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_portuguese.zip) · [Spanish](https://github.com/yomidevs/jmdict-yomitan/releases/latest/download/KANJIDIC_spanish.zip)
+
+---
+
+## Feature Setup Notes
+
+### Speech-to-Text (ASR)
+* **Whisper**: Download models directly from **Settings → ASR**, or drop GGML models (such as `ggml-large-v3-turbo.bin` and optional Silero VAD `ggml-silero-v6.2.0.bin`) into `~/.config/memento/models/`.
+* **ONNX Runtime**: Supports local or downloaded ONNX speech models (e.g., `kitsune-transcribe-t0.6b-ja`) inside `~/.config/memento/models/`.
+
+### Manga OCR
+* Compile with `--features ocr`.
+* At runtime, install [libmocr](https://github.com/ripose-jp/libmocr) and the Python [`manga-ocr`](https://github.com/kha-white/manga-ocr) package in your Python environment.
+* Press **`Ctrl+L`** (default) to select a screen region on the video for instant OCR + dictionary lookup.
+
+### MeCab (Furigana & Compound Matching)
+* Built in automatically — no Cargo feature flag required.
+* Just install `mecab` along with an IPADic or UniDic dictionary on your system; Memento loads `libmecab` in-process (or falls back to the `mecab` CLI) with sub-millisecond warm lookups.
+
+---
+
+## Configuration & Directories
+
+Memento keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its own config folder, separate from your global `mpv` setup.
+
+| Purpose | Environment variable | Default path |
+| --- | --- | --- |
+| Settings, `mpv.conf`, Anki profiles, ASR models | `XDG_CONFIG_HOME` | `~/.config/memento` |
+| Dictionary database & extracted dictionary assets | `XDG_DATA_HOME` | `~/.local/share/memento` |
+| Cache | `XDG_CACHE_HOME` | `~/.cache/memento` |
+
+---
 
 ## Troubleshooting
 
-### Can't Add Cards: Only the "Show in Anki" Button is Available
+* **Can't add Anki cards (only "Browse in Anki" shows up):** Usually means the first field of your Anki note type is empty or misconfigured in your card template. Check your field mappings (or try a built-in preset under **Settings → Anki**).
+* **Streaming URLs fail to open:** Make sure `yt-dlp` is installed, up to date, and on your `PATH`.
+* **Looking for an alternative?** Check out [asbplayer](https://app.asbplayer.dev/) for browser-based sentence mining.
 
-This means there is a mistake in your card template.
-When this happens, AnkiConnect will report that all potential cards are not addable.
-Double check your card template to see if the front of the card is missing something.
+---
 
-### Streaming URLs fail to open
+## Acknowledgements & License
 
-Install or update `yt-dlp` and make it available to libmpv. See the C++ branch
-for troubleshooting older packaged releases.
+* Original project by [ripose-jp/Memento](https://github.com/ripose-jp/Memento)
+* Dictionary design & formatting inspired by [Yomitan](https://github.com/yomidevs/yomitan) and [Yomichan](https://github.com/FooSoft/yomichan)
+* Icons from [Google Material Symbols](https://fonts.google.com/icons)
+* OCR powered by [manga-ocr](https://github.com/kha-white/manga-ocr)
+* Dictionary links from [jmdict-yomitan](https://github.com/yomidevs/jmdict-yomitan) and [yomitan-dictionaries](https://github.com/Kuuuube/yomitan-dictionaries)
 
-### OCR Support
-
-Build with `--features ocr`. At runtime, OCR currently requires
-[libmocr](https://github.com/ripose-jp/libmocr) and the Python `manga-ocr` package
-in the Python environment used by libmocr. These are not required to compile
-Memento. Installing `manga-ocr` alone does not install libmocr.
-
-The OCR keybind (default: `Ctrl+L`) selects a video region for text recognition
-and dictionary lookup.
-
-### ASR (Speech-to-Text) Subtitles
-
-Memento transcribes audio in a background worker and displays generated cues
-in its Rust subtitle overlay and sidebar.
-Speech recognition supports:
-
-* **Whisper**: Local GGML models (e.g. `ggml-large-v3-turbo.bin` placed in `~/.config/memento/models/`).
-* **ONNX Runtime**: HuggingFace ONNX-based speech models.
-
-**Current integration limitation:** generated ASR cues are stored in Rust and
-are not inserted into an mpv subtitle track. mpv subtitle properties, events,
-and scripts therefore cannot see those cues. The current subtitle-seek and
-auto-pause handlers still use mpv's subtitle state and are not correctly wired
-to ASR cues. Loading the patched SDK alone does not fix this; the ASR controller
-still needs to feed its in-memory subtitle API or another real mpv track.
-
-## Configuration
-
-Place mpv configuration files and scripts for this application in Memento's
-configuration directory, separate from mpv's own configuration.
-
-The Rust application uses these XDG directories, falling back to the paths
-shown when the corresponding environment variable is unset:
-
-| Purpose | Environment variable | Default directory |
-| --- | --- | --- |
-| Settings, mpv configuration, Anki profiles | `XDG_CONFIG_HOME` | `~/.config/memento` |
-| Dictionaries and application data | `XDG_DATA_HOME` | `~/.local/share/memento` |
-| Cache | `XDG_CACHE_HOME` | `~/.cache/memento` |
-
-The Windows and macOS paths documented for the C++ application are available
-in the [C++ README](https://github.com/eyalmazuz/Memento/blob/cpp/README.md).
-
-## asbplayer
-
-If you hate Memento, try [asbplayer](https://app.asbplayer.dev/).
-
-## Acknowledgements
-
-* UI inspired by Yomichan
-  * https://github.com/FooSoft/yomichan
-* Icons sourced from Google Material Symbols and Icons
-  * https://fonts.google.com/icons
-* OCR backend written by kha-white and contributors
-  * https://github.com/kha-white/manga-ocr
-* Most dictionary links taken from jmdict-yomitan and yomitan-dictionaries
-  * https://github.com/yomidevs/jmdict-yomitan
-  * https://github.com/Kuuuube/yomitan-dictionaries
+Licensed under the [GNU General Public License v2.0](LICENSE).

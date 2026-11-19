@@ -39,6 +39,7 @@ url = "=2.5.8"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 copypasta = "=0.10.2"
 parley = "=0.8.0"
+swash = "=0.2.10"
 resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
 webbrowser = "=1.2.4"
 zbus = "=4.4.0"

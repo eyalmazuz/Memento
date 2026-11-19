@@ -584,13 +584,13 @@ pub fn refresh_subtitle_marks(model: &VecModel<SubEntry>, subtitles: &SubtitleCo
     }
 }
 
-pub fn refresh_active_rows(model: &VecModel<SubEntry>, previous: &[usize], active: &[usize]) {
-    for index in previous.iter().chain(active) {
-        if let Some(mut row) = model.row_data(*index) {
-            let now_active = active.contains(index);
+pub fn refresh_active_rows(model: &VecModel<SubEntry>, _previous: &[usize], active: &[usize]) {
+    for index in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(index) {
+            let now_active = active.contains(&index);
             if row.is_active != now_active {
                 row.is_active = now_active;
-                model.set_row_data(*index, row);
+                model.set_row_data(index, row);
             }
         }
     }

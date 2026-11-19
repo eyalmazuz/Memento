@@ -12,16 +12,20 @@ export struct SubtitleLine {
 export struct SubtitleTokenMetrics {
     width-px: float,
     height-px: float,
+    bleed-x-px: float,
     glyph-y-px: float,
     glyph-height-px: float,
     sel-x-px: float,
     sel-width-px: float,
+    sel-join-left: bool,
+    sel-join-right: bool,
     has-selection: bool,
     rendered: image,
 }
 
 export global SubtitleOverlayBridge {
     in-out property <bool> rich-enabled: false;
+    in-out property <color> subtitle-bg-color: #00000000;
     in-out property <int> style-revision: 0;
     in-out property <int> highlight-revision: 0;
     in-out property <int> hovered-token-index: -1;
@@ -65,10 +69,13 @@ export component InteractiveSubtitleToken inherits Rectangle {
         : {
             width-px: 0.0,
             height-px: 0.0,
+            bleed-x-px: 0.0,
             glyph-y-px: 0.0,
             glyph-height-px: 0.0,
             sel-x-px: 0.0,
             sel-width-px: 0.0,
+            sel-join-left: false,
+            sel-join-right: false,
             has-selection: false,
         };
     private property <bool> use-rich: SubtitleOverlayBridge.rich-enabled && root.rich-metrics.width-px > 0.0;
@@ -89,7 +96,10 @@ export component InteractiveSubtitleToken inherits Rectangle {
         y: root.rich-metrics.glyph-y-px * 1px;
         width: root.rich-metrics.sel-width-px * 1px;
         height: root.rich-metrics.glyph-height-px * 1px;
-        border-radius: 2px;
+        border-top-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
+        border-bottom-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
+        border-top-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
+        border-bottom-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
         background: #38a6d6;
     }
 
@@ -102,9 +112,9 @@ export component InteractiveSubtitleToken inherits Rectangle {
     }
 
     if root.use-rich : Image {
-        x: 0px;
+        x: -root.rich-metrics.bleed-x-px * 1px;
         y: 0px;
-        width: root.rich-metrics.width-px * 1px;
+        width: (root.rich-metrics.width-px + root.rich-metrics.bleed-x-px * 2.0) * 1px;
         height: root.rich-metrics.height-px * 1px;
         source: root.rich-metrics.rendered;
         image-fit: fill;

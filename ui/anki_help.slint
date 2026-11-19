@@ -1,5 +1,5 @@
 import { MementoPalette } from "palette.slint";
-import { ScrollView } from "std-widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
 
 export struct HelpArgument {
     name: string,
@@ -13,99 +13,709 @@ export struct HelpMarker {
     arguments: [HelpArgument],
 }
 
-component HelpHeading inherits Text {
-    color: MementoPalette.text;
-    font-size: 26px;
-    font-weight: 500;
-    height: self.preferred-height;
+export struct HelpSection {
+    title: string,
+    subtitle: string,
+    markers: [HelpMarker],
 }
 
-component HelpParagraph inherits Text {
-    color: MementoPalette.text-secondary;
-    font-size: 14px;
-    wrap: word-wrap;
-    height: self.preferred-height;
-}
+component TabPill inherits Rectangle {
+    in property <string> label;
+    in property <string> badge: "";
+    in property <bool> active: false;
+    callback clicked();
 
-component MarkerDescription inherits VerticalLayout {
-    in property <HelpMarker> marker;
-    spacing: 4px;
+    height: 34px;
+    border-radius: 7px;
+    background: root.active
+        ? (MementoPalette.dark ? #1E2D3D : #E0F2FE)
+        : (touch.has-hover ? MementoPalette.hover-bg : transparent);
+    border-width: 1px;
+    border-color: root.active
+        ? MementoPalette.cyan-accent
+        : transparent;
 
-    Text {
-        text: "{" + root.marker.name + "}";
-        color: MementoPalette.text;
-        font-family: "monospace";
-        font-size: 14px;
-        font-weight: 700;
-        height: self.preferred-height;
-    }
-    HelpParagraph { text: root.marker.description; }
-    for argument in root.marker.arguments : HorizontalLayout {
-        spacing: 10px;
-        padding-left: 20px;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 7px;
+        alignment: center;
+
         Text {
-            text: argument.name;
-            color: MementoPalette.text;
-            font-family: "monospace";
-            font-size: 14px;
-            font-weight: 700;
-            width: 125px;
-            height: self.preferred-height;
+            text: root.label;
+            color: root.active ? (MementoPalette.dark ? #FFFFFF : #0369A1) : MementoPalette.text-secondary;
+            font-size: 13px;
+            font-weight: root.active ? 700 : 500;
+            vertical-alignment: center;
         }
-        VerticalLayout {
-            spacing: 3px;
-            horizontal-stretch: 1;
-            HelpParagraph { text: "Default Value: " + argument.default-value; }
-            HelpParagraph { text: argument.description; }
+
+        if root.badge != "" : Rectangle {
+            height: 18px;
+            width: max(22px, badge-lbl.preferred-width + 10px);
+            border-radius: 9px;
+            background: root.active
+                ? (MementoPalette.dark ? #0EA5E933 : #BAE6FD)
+                : (MementoPalette.dark ? #2B313C : #E2E8F0);
+            badge-lbl := Text {
+                text: root.badge;
+                color: root.active ? (MementoPalette.dark ? #7DD3FC : #0369A1) : MementoPalette.text-muted;
+                font-size: 10px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component FilterChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+
+    height: 26px;
+    width: chip-lbl.preferred-width + 20px;
+    border-radius: 13px;
+    background: root.active
+        ? (MementoPalette.dark ? #0D8269 : #0D9488)
+        : (touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-bg);
+    border-width: 1px;
+    border-color: root.active ? #14B8A6 : MementoPalette.border-light;
+
+    chip-lbl := Text {
+        text: root.label;
+        color: root.active ? #FFFFFF : MementoPalette.text-secondary;
+        font-size: 11px;
+        font-weight: root.active ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component CodeExampleChip inherits Rectangle {
+    in property <string> snippet;
+    callback clicked(string);
+
+    height: 28px;
+    width: code-row.preferred-width + 20px;
+    border-radius: 6px;
+    background: touch.has-hover
+        ? (MementoPalette.dark ? #1B3044 : #E0F2FE)
+        : (MementoPalette.dark ? #12161E : #F1F5F9);
+    border-width: 1px;
+    border-color: touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
+
+    code-row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: start;
+
+        Text {
+            text: root.snippet;
+            color: MementoPalette.dark ? #7DD3FC : #0369A1;
+            font-family: "monospace";
+            font-size: 12px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+        Text {
+            text: touch.has-hover ? "Copy" : "";
+            color: MementoPalette.text-muted;
+            font-size: 10px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(root.snippet); }
+    }
+}
+
+component SyntaxCard inherits Rectangle {
+    in property <string> title;
+    in property <string> badge;
+    in property <string> body;
+    in property <[string]> examples: [];
+    callback copy-snippet(string);
+
+    background: MementoPalette.card-bg;
+    border-width: 1px;
+    border-color: MementoPalette.border;
+    border-radius: 10px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            Text {
+                text: root.title;
+                color: MementoPalette.text;
+                font-size: 15px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            if root.badge != "" : Rectangle {
+                height: 20px;
+                width: b-lbl.preferred-width + 14px;
+                border-radius: 10px;
+                background: MementoPalette.dark ? #0D826933 : #CCFBF1;
+                border-width: 1px;
+                border-color: MementoPalette.dark ? #14B8A666 : #5EEAD4;
+                b-lbl := Text {
+                    text: root.badge;
+                    color: MementoPalette.dark ? #5EEAD4 : #0F766E;
+                    font-size: 10px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: root.body;
+            color: MementoPalette.text-secondary;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        if root.examples.length > 0 : VerticalLayout {
+            spacing: 6px;
+            for ex in root.examples : HorizontalLayout {
+                alignment: start;
+                CodeExampleChip {
+                    snippet: ex;
+                    clicked(s) => { root.copy-snippet(s); }
+                }
+            }
         }
     }
 }
 
-// Matches the separate, scrollable Anki Integration Help window in Memento C++.
+component MarkerCard inherits Rectangle {
+    in property <HelpMarker> marker;
+    callback copy-marker(string);
+
+    background: MementoPalette.card-bg;
+    border-width: 1px;
+    border-color: MementoPalette.border;
+    border-radius: 9px;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            alignment: space-between;
+            spacing: 8px;
+
+            // Clickable marker pill copies `{name}`
+            marker-pill := Rectangle {
+                height: 26px;
+                width: pill-row.preferred-width + 18px;
+                border-radius: 6px;
+                background: pill-touch.has-hover
+                    ? (MementoPalette.dark ? #1E3A5F : #BAE6FD)
+                    : (MementoPalette.dark ? #141923 : #E2E8F0);
+                border-width: 1px;
+                border-color: pill-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
+
+                pill-row := HorizontalLayout {
+                    padding-left: 9px;
+                    padding-right: 9px;
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text {
+                        text: "{" + root.marker.name + "}";
+                        color: MementoPalette.dark ? #7DD3FC : #0369A1;
+                        font-family: "monospace";
+                        font-size: 13px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: pill-touch.has-hover ? "Copy" : "";
+                        color: MementoPalette.text-muted;
+                        font-size: 10px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                }
+
+                pill-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.copy-marker("{" + root.marker.name + "}"); }
+                }
+            }
+
+            if root.marker.arguments.length > 0 : Rectangle {
+                height: 22px;
+                width: arg-cnt.preferred-width + 14px;
+                border-radius: 11px;
+                background: MementoPalette.dark ? #262C38 : #E2E8F0;
+                arg-cnt := Text {
+                    text: root.marker.arguments.length == 1
+                        ? "1 argument"
+                        : root.marker.arguments.length + " arguments";
+                    color: MementoPalette.text-muted;
+                    font-size: 10px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Text {
+            text: root.marker.description;
+            color: MementoPalette.text-secondary;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        if root.marker.arguments.length > 0 : Rectangle {
+            background: MementoPalette.dark ? #151820 : #F8FAFC;
+            border-width: 1px;
+            border-color: MementoPalette.border;
+            border-radius: 7px;
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+
+                for argument[idx] in root.marker.arguments : VerticalLayout {
+                    spacing: 4px;
+                    if idx > 0 : Rectangle {
+                        height: 1px;
+                        background: MementoPalette.border;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        Rectangle {
+                            height: 20px;
+                            width: arg-name.preferred-width + 12px;
+                            border-radius: 4px;
+                            background: MementoPalette.dark ? #1E293B : #E0F2FE;
+                            arg-name := Text {
+                                text: argument.name;
+                                color: MementoPalette.dark ? #93C5FD : #0369A1;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "Default: " + argument.default-value;
+                            color: MementoPalette.text-muted;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    Text {
+                        text: argument.description;
+                        color: MementoPalette.text-secondary;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}
+
 export component AnkiHelpWindow inherits Window {
     title: "Anki Integration Help";
-    preferred-width: 920px;
-    preferred-height: 700px;
-    min-width: 540px;
-    min-height: 420px;
-    background: MementoPalette.surface-bg;
+    preferred-width: 960px;
+    preferred-height: 720px;
+    min-width: 600px;
+    min-height: 460px;
+    background: MementoPalette.window-bg;
     default-font-family: "Noto Sans, sans-serif";
+
+    in-out property <int> active-tab: 0; // 0: Overview & Syntax, 1: Term Markers, 2: Kanji Markers
+    in-out property <int> active-term-section: -1; // -1: All, 0..N: specific section
+    in-out property <int> active-kanji-section: -1;
+    in-out property <string> search-query: "";
+    in-out property <string> copied-notice: "";
 
     in property <[HelpMarker]> term-markers;
     in property <[HelpMarker]> kanji-markers;
+    in property <[HelpSection]> term-sections;
+    in property <[HelpSection]> kanji-sections;
+    in property <[string]> term-section-names;
+    in property <[string]> kanji-section-names;
+    in property <int> term-total-count: 0;
+    in property <int> kanji-total-count: 0;
 
-    ScrollView {
-        width: 100%;
-        height: 100%;
-        VerticalLayout {
-            width: min(parent.width - 20px, 900px);
-            padding-top: 10px;
-            padding-bottom: 20px;
-            spacing: 10px;
+    callback search-changed(string);
+    callback copy-marker(string);
 
-            HelpHeading { text: "Introduction"; }
-            HelpParagraph {
-                text: "This document describes the syntax and the associated markers available for use in note templates.";
+    VerticalLayout {
+        spacing: 0px;
+
+        // Top Header + Tabs + Filter
+        Rectangle {
+            background: MementoPalette.surface-bg;
+
+            VerticalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 16px;
+                padding-bottom: 12px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    alignment: space-between;
+                    spacing: 12px;
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Anki Integration Help";
+                            color: MementoPalette.text;
+                            font-size: 19px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Click any {marker} badge to copy it straight to your clipboard.";
+                            color: MementoPalette.text-muted;
+                            font-size: 12px;
+                        }
+                    }
+
+                    if root.copied-notice != "" : Rectangle {
+                        height: 28px;
+                        width: copied-lbl.preferred-width + 20px;
+                        border-radius: 14px;
+                        background: #064E3B;
+                        border-width: 1px;
+                        border-color: #10B981;
+                        copied-lbl := Text {
+                            text: root.copied-notice;
+                            color: #A7F3D0;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: end;
+                        search-input := LineEdit {
+                            width: 240px;
+                            text <=> root.search-query;
+                            placeholder-text: "Filter markers…";
+                            edited(q) => {
+                                if q != "" && root.active-tab == 0 {
+                                    root.active-tab = 1;
+                                }
+                                root.search-changed(q);
+                            }
+                        }
+                        if root.search-query != "" : Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 6px;
+                            background: clr-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-bg;
+                            border-width: 1px;
+                            border-color: MementoPalette.border-light;
+                            Text {
+                                text: "×";
+                                color: MementoPalette.text-secondary;
+                                font-size: 14px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            clr-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.search-query = "";
+                                    root.search-changed("");
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Main Tab Strip
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    TabPill {
+                        label: "Overview & Syntax";
+                        active: root.active-tab == 0;
+                        clicked => { root.active-tab = 0; }
+                    }
+                    TabPill {
+                        label: "Term Markers";
+                        badge: root.term-total-count + "";
+                        active: root.active-tab == 1;
+                        clicked => { root.active-tab = 1; }
+                    }
+                    TabPill {
+                        label: "Kanji Markers";
+                        badge: root.kanji-total-count + "";
+                        active: root.active-tab == 2;
+                        clicked => { root.active-tab = 2; }
+                    }
+                }
+
+                // Category Sub-filter Strip (Term Markers)
+                if root.active-tab == 1 : HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    FilterChip {
+                        label: "All Sections";
+                        active: root.active-term-section == -1;
+                        clicked => { root.active-term-section = -1; }
+                    }
+                    for name[idx] in root.term-section-names : FilterChip {
+                        label: name;
+                        active: root.active-term-section == idx;
+                        clicked => { root.active-term-section = idx; }
+                    }
+                }
+
+                // Category Sub-filter Strip (Kanji Markers)
+                if root.active-tab == 2 : HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    FilterChip {
+                        label: "All Sections";
+                        active: root.active-kanji-section == -1;
+                        clicked => { root.active-kanji-section = -1; }
+                    }
+                    for name[idx] in root.kanji-section-names : FilterChip {
+                        label: name;
+                        active: root.active-kanji-section == idx;
+                        clicked => { root.active-kanji-section = idx; }
+                    }
+                }
             }
+        }
 
-            HelpHeading { text: "Syntax"; }
-            HelpParagraph {
-                text: "A marker is a section of text enclosed in curly braces like {subtitle}. When Memento's template processor sees a marker, it replaces it with its associated value. In the case of {subtitle} that is the currently displayed subtitle.";
-            }
-            HelpParagraph {
-                text: "Some markers have arguments that allow their functionality to be modified. For example, {glossary : dict = 1} makes it so the glossary marker only uses entries from the dictionary with the ID of 1. The : character indicates the beginning of marker arguments. Arguments are set in the form of name = value. If a marker has multiple arguments, arguments are separated by the , character. An example of a marker with multiple arguments is {screenshot : max-width = 1280, max-height = 720}.";
-            }
-            HelpParagraph {
-                text: "A single marker can specify whether to use one or another value. For example, {selection | clipboard} specifies if {selection} is empty, use {clipboard} instead. This functionality is triggered by the | character. Multiple ors can be chained together like {selection | clipboard | glossary : dict = 1}.";
-            }
+        Rectangle { height: 1px; background: MementoPalette.border; }
 
-            HelpHeading { text: "Term Markers"; }
-            HelpParagraph { text: "This section describes the markers available for use in term notes."; }
-            for marker in root.term-markers : MarkerDescription { marker: marker; }
+        // Tab Body
+        ScrollView {
+            vertical-stretch: 1;
 
-            HelpHeading { text: "Kanji Markers"; }
-            HelpParagraph { text: "This section describes the markers available for use in kanji notes."; }
-            for marker in root.kanji-markers : MarkerDescription { marker: marker; }
+            VerticalLayout {
+                width: min(parent.width - 12px, 920px);
+                padding-left: 20px;
+                padding-right: 20px;
+                padding-top: 16px;
+                padding-bottom: 24px;
+                spacing: 14px;
+                alignment: start;
+
+                // ── Tab 0: Overview & Syntax ───────────────────────────────
+                if root.active-tab == 0 : VerticalLayout {
+                    spacing: 14px;
+
+                    SyntaxCard {
+                        title: "Basic Markers";
+                        badge: "{name}";
+                        body: "Wrap a marker name in curly braces inside any Anki field mapping. When Memento exports a card, each marker is replaced with live data from the active subtitle, lookup popup, or video frame.";
+                        examples: [
+                            "{expression}",
+                            "{furigana}",
+                            "{subtitle}",
+                            "{glossary}",
+                        ];
+                        copy-snippet(s) => { root.copy-marker(s); }
+                    }
+
+                    SyntaxCard {
+                        title: "Marker Arguments";
+                        badge: ": key = value";
+                        body: "Some markers accept arguments after a colon (:). Separate multiple arguments with commas (,). For example, you can target a single dictionary ID (shown in Options → Dictionary) or cap screenshot dimensions.";
+                        examples: [
+                            "{glossary : dict = 1}",
+                            "{frequencies : min-value = true, value-only = true}",
+                            "{screenshot : max-width = 1280, max-height = 720}",
+                            "{video : source = context, subtitles = false}",
+                        ];
+                        copy-snippet(s) => { root.copy-marker(s); }
+                    }
+
+                    SyntaxCard {
+                        title: "Fallback Chains";
+                        badge: "a | b";
+                        body: "Separate alternatives with a pipe (|) to fall back gracefully when earlier values are empty. Evaluation stops at the first non-empty result — ideal for preferring selected glossary text or your clipboard before falling back to full definitions.";
+                        examples: [
+                            "{selection | clipboard}",
+                            "{selection | clipboard | glossary : dict = 1}",
+                            "{audio | audio-media}",
+                        ];
+                        copy-snippet(s) => { root.copy-marker(s); }
+                    }
+
+                    SyntaxCard {
+                        title: "Context Selection & One-Click Presets";
+                        badge: "Tips";
+                        body: "Click or drag across rows in the Subtitle List drawer (or Shift-click a range) to mark multi-line context for {context}, {context-2}, {audio-context}, {video}, and {cloze-prefix}/{cloze-suffix}. Need a fast starting point? Use the one-click Lapis, Kiku, Senren, Animecards, or JPMN preset buttons right under Term Notes in Options → Anki Integration.";
+                        examples: [
+                            "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
+                            "{audio-context}",
+                        ];
+                        copy-snippet(s) => { root.copy-marker(s); }
+                    }
+                }
+
+                // ── Tab 1: Term Markers ────────────────────────────────────
+                if root.active-tab == 1 : VerticalLayout {
+                    spacing: 18px;
+
+                    if root.term-sections.length == 0 : Rectangle {
+                        height: 80px;
+                        border-radius: 10px;
+                        background: MementoPalette.card-bg;
+                        border-width: 1px;
+                        border-color: MementoPalette.border;
+                        Text {
+                            text: "No term markers match \"" + root.search-query + "\".";
+                            color: MementoPalette.text-muted;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    for section[s-idx] in root.term-sections : VerticalLayout {
+                        spacing: 10px;
+                        visible: root.active-term-section == -1 || root.active-term-section == s-idx;
+
+                        if (root.active-term-section == -1 || root.active-term-section == s-idx) && section.markers.length > 0 : VerticalLayout {
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+                                Rectangle {
+                                    width: 3px;
+                                    height: 18px;
+                                    border-radius: 2px;
+                                    background: MementoPalette.cyan-accent;
+                                }
+                                Text {
+                                    text: section.title;
+                                    color: MementoPalette.text;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "· " + section.subtitle;
+                                    color: MementoPalette.text-muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            for marker in section.markers : MarkerCard {
+                                marker: marker;
+                                copy-marker(s) => { root.copy-marker(s); }
+                            }
+                        }
+                    }
+                }
+
+                // ── Tab 2: Kanji Markers ───────────────────────────────────
+                if root.active-tab == 2 : VerticalLayout {
+                    spacing: 18px;
+
+                    if root.kanji-sections.length == 0 : Rectangle {
+                        height: 80px;
+                        border-radius: 10px;
+                        background: MementoPalette.card-bg;
+                        border-width: 1px;
+                        border-color: MementoPalette.border;
+                        Text {
+                            text: "No kanji markers match \"" + root.search-query + "\".";
+                            color: MementoPalette.text-muted;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    for section[s-idx] in root.kanji-sections : VerticalLayout {
+                        spacing: 10px;
+                        visible: root.active-kanji-section == -1 || root.active-kanji-section == s-idx;
+
+                        if (root.active-kanji-section == -1 || root.active-kanji-section == s-idx) && section.markers.length > 0 : VerticalLayout {
+                            spacing: 10px;
+
+                            HorizontalLayout {
+                                spacing: 10px;
+                                alignment: start;
+                                Rectangle {
+                                    width: 3px;
+                                    height: 18px;
+                                    border-radius: 2px;
+                                    background: #14B8A6;
+                                }
+                                Text {
+                                    text: section.title;
+                                    color: MementoPalette.text;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "· " + section.subtitle;
+                                    color: MementoPalette.text-muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            for marker in section.markers : MarkerCard {
+                                marker: marker;
+                                copy-marker(s) => { root.copy-marker(s); }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -642,4 +642,118 @@ mod rich_subtitle_phase4_tests {
         );
         app.hide().unwrap();
     }
+
+    #[test]
+    fn subtitle_stroke_does_not_inflate_spacing_and_popup_anchor_does_not_chase_mouse() {
+        i_slint_backend_testing::init_no_event_loop();
+        let fixture = TempSubConfig::new();
+        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        // Match heavy stroke (`15.0`), transparent bg, Modifier mode (`Shift`)
+        config
+            .edit_setting(
+                &format!("{}/{}", raw::interface::GROUP, raw::interface::subtitle::STROKE),
+                "15.0",
+            )
+            .unwrap();
+        config
+            .edit_setting(
+                &format!("{}/{}", raw::interface::GROUP, raw::interface::subtitle::BACKGROUND_COLOR),
+                "#00000000",
+            )
+            .unwrap();
+        config
+            .edit_setting(&format!("{}/{}", raw::search::GROUP, raw::search::METHOD), "1")
+            .unwrap();
+        config
+            .edit_setting(
+                &format!("{}/{}", raw::search::GROUP, raw::search::MODIFIER),
+                "2",
+            )
+            .unwrap();
+        config.save(&fixture.dir, "memento.conf").unwrap();
+
+        let word = memento_app::SubtitleWord {
+            text: "私".into(),
+            reading: "".into(),
+            query: "私は違う".into(),
+            index: 0,
+        };
+        let mut no_stroke = memento_app::SubtitleRenderStyle::default();
+        no_stroke.stroke_size = 0.0;
+        let mut heavy_stroke = memento_app::SubtitleRenderStyle::default();
+        heavy_stroke.stroke_size = 15.0;
+        let w_no = memento_app::subtitle_token_width_with_style(&word, 40.0, false, &no_stroke);
+        let w_heavy = memento_app::subtitle_token_width_with_style(&word, 40.0, false, &heavy_stroke);
+        assert!(
+            (w_no - w_heavy).abs() < 0.01,
+            "heavy subtitle stroke must bleed visually instead of adding gaps between characters (no_stroke={w_no}, heavy_stroke={w_heavy})"
+        );
+
+        let db_path = fixture.dir.join("dictionaries.sqlite");
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_duration(120.);
+        app.set_subtitle_scale(0.04);
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &fixture.dir, &config);
+        app.show().unwrap();
+
+        let (requests, _worker) = mpsc::channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let sentence = "私は違うけど、そんな私を死と呼んでいいの？";
+        publish_active_subtitle(&app, sentence, &requests, &epoch);
+        assert_eq!(
+            app.get_active_sub_lines().row_count(),
+            1,
+            "21-char Japanese subtitle must fit cleanly on 1 line at 1280px without stroke-gap wrapping"
+        );
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        assert_eq!(sb.get_subtitle_bg_color().alpha(), 0);
+        let first_word = app.get_active_sub_words().row_data(0).unwrap();
+        let second_word = app.get_active_sub_words().row_data(1).unwrap();
+        let m0 = sb.invoke_render_token(first_word.clone(), 40.0, false, false, 0, 0);
+        assert!(m0.bleed_x_px > 2.0, "heavy stroke must reserve bleed_x_px ({})", m0.bleed_x_px);
+
+        // Multi-character word selection (`私は`, tokens 0..2) must produce a continuous
+        // blue bar across adjacent tokens with zero gap or inner corner seams!
+        app.set_dict_open(true);
+        app.set_selected_token_index(0);
+        app.set_selected_token_count(2);
+        let sel0 = sb.invoke_render_token(first_word, 40.0, false, true, 0, 1);
+        let sel1 = sb.invoke_render_token(second_word, 40.0, false, true, 0, 1);
+        assert!(sel0.has_selection && sel1.has_selection);
+        assert!(!sel0.sel_join_left && sel0.sel_join_right);
+        assert!(sel1.sel_join_left && !sel1.sel_join_right);
+        assert!(
+            sel0.sel_x_px + sel0.sel_width_px >= sel0.width_px,
+            "first selected token must extend flush to its right edge ({} + {} vs {})",
+            sel0.sel_x_px,
+            sel0.sel_width_px,
+            sel0.width_px
+        );
+        assert!(
+            sel1.sel_x_px.abs() < 0.01,
+            "continuing selected token must start flush at x=0 ({})",
+            sel1.sel_x_px
+        );
+
+        // Moving the mouse across subtitles while popup is open (without triggering a new scan)
+        // must NOT drag `popup_offset_x` along with the cursor!
+        app.set_popup_offset_x(-140.0);
+        app.set_pending_popup_offset_x(220.0);
+        let probe_y = 720.0 - 62.0 - 20.0;
+        for x in [450.0, 620.0, 810.0] {
+            app.window().dispatch_event(WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(x, probe_y),
+            });
+        }
+        assert!(
+            (app.get_popup_offset_x() - (-140.0)).abs() < 0.01,
+            "moving mouse across subtitles must NOT drag open popup (popup_offset_x={})",
+            app.get_popup_offset_x()
+        );
+
+        app.hide().unwrap();
+    }
 }

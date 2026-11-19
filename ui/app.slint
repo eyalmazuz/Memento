@@ -1,20 +1,22 @@
 import { MementoPalette } from "palette.slint";
 import { ListView, LineEdit, Button, CheckBox, ComboBox, Slider, ScrollView } from "std-widgets.slint";
 import { SettingsWindow } from "settings.slint";
-import { AnkiHelpWindow, HelpArgument, HelpMarker } from "anki_help.slint";
+import { AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection } from "anki_help.slint";
 import {
     PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult,
+    PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
     PopupLayout, YomitanPopup, DictionarySearchPanel, PopupBridge,
 } from "popup.slint";
 import {
     SubtitleWord, SubtitleLine, InteractiveSubtitleToken, SubtitleOverlayBridge,
 } from "subtitle_overlay.slint";
 
-export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker }
+export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection }
 export {
     PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult, PopupLayout,
+    PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
     PopupBridge,
 }
 export { SubtitleWord, SubtitleLine, SubtitleOverlayBridge }
@@ -57,16 +59,27 @@ component PlayerOscBar inherits Rectangle {
 
     property <bool> ocr-btn-hovered: false;
     out property <bool> timeline-hovered: slider-touch.has-hover || slider-touch.pressed;
-    out property <float> hover-time: root.duration > 0.0 && slider-touch.width > 0px
-        ? max(0.0, min(root.duration, root.duration * (slider-touch.mouse-x / slider-touch.width)))
-        : 0.0;
-    out property <length> hover-x: timeline.x + max(0px, min(timeline.width, slider-touch.mouse-x));
+    // Stored imperatively from `slider-touch` pointer events (not reactive bindings on
+    // `slider-touch.width`), so evaluating the timeline hover preview's `Text` never
+    // triggers `PlayerOscBar`'s `HorizontalLayout` and re-enters `sharedparley`'s
+    // `font_context().borrow_mut()` when `current-time` changes during a seek.
+    out property <float> hover-time: 0.0;
+    out property <length> hover-x: 0px;
     out property <bool> is-hovered:
         bar-touch.has-hover || p-touch.has-hover || sp-touch.has-hover
         || rw-touch.has-hover || ff-touch.has-hover || sn-touch.has-hover
         || slider-touch.has-hover || slider-touch.pressed
         || vol-touch.has-hover || sub-t-touch.has-hover
         || root.ocr-btn-hovered || fs-touch.has-hover;
+
+    function update-hover() {
+        if root.duration > 0.0 && slider-touch.width > 0px {
+            let clamped-x = max(0px, min(slider-touch.width, slider-touch.mouse-x));
+            let ratio = max(0.0, min(1.0, clamped-x / slider-touch.width));
+            root.hover-x = timeline.x + clamped-x;
+            root.hover-time = root.duration * ratio;
+        }
+    }
 
     callback toggle-play();
     callback seek(float);
@@ -283,30 +296,38 @@ component PlayerOscBar inherits Rectangle {
                 width: 100%;
                 height: 100%;
                 mouse-cursor: pointer;
+                changed has-hover => {
+                    if self.has-hover && root.duration > 0.0 && self.width > 0px {
+                        root.update-hover();
+                        root.timeline-hover-moved(root.hover-time);
+                    }
+                }
                 pointer-event(event) => {
                     if event.kind == PointerEventKind.move {
                         root.activity();
                         if root.duration > 0.0 && self.width > 0px {
-                            let ratio = max(0.0, min(1.0, self.mouse-x / self.width));
-                            root.timeline-hover-moved(root.duration * ratio);
+                            root.update-hover();
+                            root.timeline-hover-moved(root.hover-time);
                         }
                     } else if event.kind == PointerEventKind.down {
                         root.interacted();
+                        root.update-hover();
                     }
                 }
                 moved => {
                     if root.duration > 0.0 && self.width > 0px {
-                        let ratio = max(0.0, min(1.0, self.mouse-x / self.width));
-                        let target = root.duration * ratio;
-                        root.timeline-hover-moved(target);
+                        root.update-hover();
+                        root.timeline-hover-moved(root.hover-time);
                         if (self.pressed) {
-                            root.seek(target);
+                            root.seek(root.hover-time);
                         }
                     }
                 }
                 clicked => {
-                    let ratio = self.mouse-x / max(1px, self.width);
-                    root.seek(max(0.0, min(root.duration, root.duration * ratio)));
+                    if root.duration > 0.0 && self.width > 0px {
+                        root.update-hover();
+                        root.seek(root.hover-time);
+                    }
                 }
             }
         }
@@ -1468,6 +1489,7 @@ export component MementoApp inherits Window {
     in-out property <[SubtitleWord]> active-sub-words: [];
     in-out property <[SubtitleLine]> active-sub-lines: [];
     in-out property <length> popup-offset-x: 0px;
+    in-out property <length> pending-popup-offset-x: 0px;
 
     callback toggle-play();
     callback seek-to(float);
@@ -1980,14 +2002,14 @@ export component MementoApp inherits Window {
                         y: max(10px, parent.height - self.height - max(62px, parent.height * root.subtitle-offset));
                         width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
                         height: subtitle-lines-layout.preferred-height + 16px;
-                        background: #00000099;
+                        background: SubtitleOverlayBridge.rich-enabled ? SubtitleOverlayBridge.subtitle-bg-color : #00000099;
                         border-radius: 4px;
                         subtitle-hover-area := TouchArea {
                             width: 100%;
                             height: 100%;
                         }
                         subtitle-lines-layout := VerticalLayout {
-                            x: 16px;
+                            x: (parent.width - self.width) / 2;
                             y: 8px;
                             width: self.preferred-width;
                             height: self.preferred-height;
@@ -2002,12 +2024,12 @@ export component MementoApp inherits Window {
                                     show-furigana: root.furigana-visible;
                                     selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
                                     popup-anchor-requested(local-x) => {
-                                        root.popup-offset-x = (16px + self.x + local-x) - subtitle-box.width / 2;
+                                        root.pending-popup-offset-x = (16px + self.x + local-x) - subtitle-box.width / 2;
                                     }
                                     hover-state(hovering) => {
                                         root.token-hovered = hovering;
                                         if hovering && word.query != "" && !SubtitleOverlayBridge.rich-enabled {
-                                            root.popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
+                                            root.pending-popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
                                         }
                                     }
                                     hovered(query, control, shift, alt, meta) => {
@@ -2015,6 +2037,7 @@ export component MementoApp inherits Window {
                                         root.hover-word(query, word.index, control, shift, alt, meta);
                                     }
                                     clicked => {
+                                        root.popup-offset-x = root.pending-popup-offset-x;
                                         root.selected-token-index = word.index;
                                         root.hover-word("", word.index, false, false, false, false);
                                         root.lookup-word(word.query);
@@ -2034,9 +2057,12 @@ export component MementoApp inherits Window {
                         property <length> space-below: max(0px, parent.height - self.sub-bottom - 22px);
                         property <bool> place-below: subtitle-box.visible && self.space-above < 220px && self.space-below > self.space-above;
 
-                        width: min(root.popup-configured-width, parent.width - 40px);
+                        width: min(
+                            PopupBridge.css-popup-width > 0px ? PopupBridge.css-popup-width : root.popup-configured-width,
+                            parent.width - 40px
+                        );
                         height: min(
-                            root.popup-configured-height,
+                            PopupBridge.css-popup-height > 0px ? PopupBridge.css-popup-height : root.popup-configured-height,
                             subtitle-box.visible
                                 ? max(80px, self.place-below ? self.space-below : self.space-above)
                                 : (parent.height - 80px)
@@ -2074,6 +2100,41 @@ export component MementoApp inherits Window {
                         load-more-results(force) => { root.load-more-definition-results(force); }
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
+                    }
+
+                    // Bottom OSC Bar (Floating, 50px)
+                    osc := PlayerOscBar {
+                        visible: root.osc-visible && !root.ocr-mode;
+                        x: 16px;
+                        y: parent.height - self.height - 12px;
+                        width: parent.width - 32px;
+                        playing: root.is-playing;
+                        position: root.position;
+                        duration: root.duration;
+                        volume: root.volume;
+                        volume-max: root.volume-max;
+                        is-muted: root.is-muted;
+                        current-time: root.current-time;
+                        duration-time: root.duration-time;
+                        is-fullscreen: root.is-fullscreen;
+                        ocr-enabled: root.ocr-enabled;
+                        chapters: root.chapters;
+                        chapter-marks: root.chapter-marks;
+                        toggle-play => { root.toggle-play(); }
+                        seek(val) => { root.seek-to(val); }
+                        subtitle-seek(dir) => { root.sub-seek(dir); }
+                        playlist-prev => { root.playlist-prev(); }
+                        playlist-next => { root.playlist-next(); }
+                        toggle-mute => { root.toggle-mute(); }
+                        start-ocr => { root.start-ocr(); }
+                        volume-changed(val) => { root.set-volume(val); }
+                        timeline-hover-moved(sec) => { root.timeline-hover-moved(sec); }
+                        toggle-sub-list => {
+                            root.sub-drawer-open = !root.sub-drawer-open;
+                        }
+                        toggle-fullscreen => { root.toggle-fullscreen(); }
+                        activity => { root.osc-activity(); }
+                        interacted => { root.dismiss-definition(); }
                     }
 
                     // Timeline Hover Preview Card (Thumbnail + Chapter Label + Timestamp)
@@ -2117,48 +2178,13 @@ export component MementoApp inherits Window {
                             }
 
                             Text {
-                                text: root.format-timestamp(osc.hover-time);
+                                text: root.format-timestamp(min(root.duration, osc.hover-time));
                                 font-size: 12px;
                                 font-weight: 700;
                                 color: MementoPalette.text;
                                 horizontal-alignment: center;
                             }
                         }
-                    }
-
-                    // Bottom OSC Bar (Floating, 50px)
-                    osc := PlayerOscBar {
-                        visible: root.osc-visible && !root.ocr-mode;
-                        x: 16px;
-                        y: parent.height - self.height - 12px;
-                        width: parent.width - 32px;
-                        playing: root.is-playing;
-                        position: root.position;
-                        duration: root.duration;
-                        volume: root.volume;
-                        volume-max: root.volume-max;
-                        is-muted: root.is-muted;
-                        current-time: root.current-time;
-                        duration-time: root.duration-time;
-                        is-fullscreen: root.is-fullscreen;
-                        ocr-enabled: root.ocr-enabled;
-                        chapters: root.chapters;
-                        chapter-marks: root.chapter-marks;
-                        toggle-play => { root.toggle-play(); }
-                        seek(val) => { root.seek-to(val); }
-                        subtitle-seek(dir) => { root.sub-seek(dir); }
-                        playlist-prev => { root.playlist-prev(); }
-                        playlist-next => { root.playlist-next(); }
-                        toggle-mute => { root.toggle-mute(); }
-                        start-ocr => { root.start-ocr(); }
-                        volume-changed(val) => { root.set-volume(val); }
-                        timeline-hover-moved(sec) => { root.timeline-hover-moved(sec); }
-                        toggle-sub-list => {
-                            root.sub-drawer-open = !root.sub-drawer-open;
-                        }
-                        toggle-fullscreen => { root.toggle-fullscreen(); }
-                        activity => { root.osc-activity(); }
-                        interacted => { root.dismiss-definition(); }
                     }
 
                     // Drag a rectangle over the current video frame for OCR.

@@ -25,8 +25,8 @@ use ui::{publish_active_subtitle, dictionary_result_rows, set_dictionary_rows, p
 #[cfg(test)]
 use ui::{subtitle_lines_from_words, subtitle_token_width};
 use settings_ui::{
-    create_settings_session, refresh_category_settings, refresh_dictionary_settings,
-    SettingsSession,
+    create_settings_session, refresh_category_settings, refresh_custom_popup_css,
+    refresh_dictionary_settings, SettingsSession,
 };
 #[cfg(test)]
 use settings_ui::clear_asr_for_settings;
@@ -495,7 +495,7 @@ fn record_recent_media(
     Ok(())
 }
 
-fn open_directory_command(path: &Path) -> Command {
+pub(crate) fn open_directory_command(path: &Path) -> Command {
     #[cfg(target_os = "macos")]
     let mut cmd = Command::new("open");
     #[cfg(target_os = "windows")]
@@ -506,7 +506,7 @@ fn open_directory_command(path: &Path) -> Command {
     cmd
 }
 
-fn spawn_and_reap(mut cmd: Command) -> std::io::Result<u32> {
+pub(crate) fn spawn_and_reap(mut cmd: Command) -> std::io::Result<u32> {
     let mut child = cmd.spawn()?;
     let pid = child.id();
     std::thread::spawn(move || {
@@ -2038,6 +2038,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.set_connection_popup_open(false);
         let category = settings.get_active_category();
         refresh_category_settings(&settings, &open_config, category);
+        refresh_custom_popup_css(&settings, &open_cache);
         if category == 4 {
             refresh_dictionary_settings(&settings, open_manager.as_deref(), &open_config);
         }
@@ -3777,6 +3778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if index >= 0 && app.get_active_sub_words().row_data(index as usize)
                     .is_some_and(|token| token.query.as_str() == word)
                 {
+                    app.set_popup_offset_x(app.get_pending_popup_offset_x());
                     app.invoke_lookup_word(word.into());
                 }
             },
