@@ -1642,6 +1642,7 @@ export component MementoApp inherits Window {
     in-out property <string> key-sub-list-find-next: "F3";
     in-out property <string> key-sub-list-find-prev: "Shift+F3";
     in-out property <bool> custom-key-handler-installed: false;
+    in-out property <length> window-bottom-margin: 0px;
 
     in-out property <bool> dict-open: false;
     in-out property <string> dict-query: "";
@@ -2069,6 +2070,7 @@ export component MementoApp inherits Window {
         VerticalLayout {
             width: 100%;
             height: 100%;
+            padding-bottom: root.window-bottom-margin;
             spacing: 0;
 
             // Top Native Menu Bar

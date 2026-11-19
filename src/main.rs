@@ -696,6 +696,434 @@ fn maybe_auto_play_first_term_audio(app: &MementoApp, expression: &str, reading:
     }
 }
 
+fn install_auto_play_first_term_audio(app: &MementoApp) {
+    let auto_audio_app = app.as_weak();
+    app.global::<PopupBridge>()
+        .on_first_term_ready(move |expression, reading| {
+            if let Some(app) = auto_audio_app.upgrade() {
+                maybe_auto_play_first_term_audio(&app, expression.as_str(), reading.as_str());
+            }
+        });
+}
+
+struct PreparedAnkiNoteRequest {
+    profile: controller::config::AnkiNoteConfig,
+    context: controller::anki::NoteFieldsContext,
+    selected_occurrences: Vec<(String, usize)>,
+    screenshot_request: Option<Result<memento_player::mpv::ScreenshotRequest, String>>,
+    video_screenshot_request: Option<Result<memento_player::mpv::ScreenshotRequest, String>>,
+    media_input: controller::anki_media::NoteMediaInput,
+    unavailable: Vec<String>,
+    show_tag: bool,
+}
+
+fn prepare_anki_note_request(
+    app: &MementoApp,
+    definitions: &slint::ModelRc<DictResult>,
+    row_idx: usize,
+    config: &ConfigController,
+    audio_cache: &Arc<Mutex<PopupAudioState>>,
+    subtitles: &RefCell<SubtitleController>,
+    mpv: &RefCell<Option<MpvInstance>>,
+) -> Result<PreparedAnkiNoteRequest, Option<String>> {
+    let Some(hit) = definitions.row_data(row_idx) else {
+        return Err(None);
+    };
+    let profile = if hit.is_kanji {
+        config.anki_kanji_note_config()
+    } else {
+        config.anki_profile_note_config()
+    };
+    let Some(profile) = profile else {
+        return Err(Some(
+            "Select an Anki profile and configure this note type".to_owned(),
+        ));
+    };
+    if !profile.enabled {
+        return Err(Some("Enable Anki integration in Preferences".to_owned()));
+    }
+    let mut context = controller::anki::NoteFieldsContext::new(
+        hit.expression.to_string(),
+        hit.reading.to_string(),
+        app.get_active_sub_text().to_string(),
+    );
+    context.is_kanji = hit.is_kanji;
+    let selected_glossary = app.global::<PopupBridge>().get_selected_glossary_text();
+    if !selected_glossary.is_empty() {
+        context.selection = selected_glossary.to_string();
+    }
+    // Never assign the scanned subtitle token into `context.selection` (#262);
+    // use it purely to locate `cloze_prefix` / `cloze_body` / `cloze_suffix`.
+    let start = app.get_selected_token_index();
+    let (scanned_surface, token_offset_in_sentence) = if start >= 0 {
+        let words = app.get_active_sub_words();
+        let start_idx = start as usize;
+        let count = app.get_selected_token_count().max(1) as usize;
+        let byte_offset: usize = (0..start_idx)
+            .filter_map(|i| words.row_data(i))
+            .map(|word| word.text.len())
+            .sum();
+        let surface: String = (start_idx..start_idx.saturating_add(count))
+            .filter_map(|i| words.row_data(i))
+            .map(|word| word.text.to_string())
+            .collect();
+        (surface, Some(byte_offset))
+    } else {
+        (String::new(), None)
+    };
+    let (remove_regex, replace_lines, replace_with) = (
+        app.get_search_remove_regex().to_string(),
+        app.get_search_replace_lines(),
+        app.get_search_replace_with().to_string(),
+    );
+    let (
+        active_start,
+        active_end,
+        context_start,
+        context_end,
+        selected_cues,
+        active_pos_in_selected,
+    ) = {
+        let subs = subtitles.borrow();
+        let selected_indices = subs.selected_indices();
+        let active_indices = subs.active_indices(subs.primary_sid());
+        let active_pos = selected_indices
+            .iter()
+            .position(|idx| active_indices.contains(idx));
+        let cues = subs
+            .selected_cues()
+            .iter()
+            .map(|cue| {
+                let raw = String::from_utf16_lossy(&cue.text);
+                filter_subtitle_text(&raw, &remove_regex, replace_lines, &replace_with)
+            })
+            .collect::<Vec<_>>();
+        let active = subs.active_cue();
+        let start = active.map(|cue| cue.start).unwrap_or(0.0);
+        let end = active.map(|cue| cue.end).unwrap_or(0.0);
+        let (ctx_start, ctx_end) = subs.selected_time_range().unwrap_or((start, end));
+        (start, end, ctx_start, ctx_end, cues, active_pos)
+    };
+    controller::anki::apply_subtitle_cloze(
+        &mut context,
+        &selected_cues,
+        active_pos_in_selected,
+        &scanned_surface,
+        token_offset_in_sentence,
+    );
+    context.secondary_subtitle = app.get_secondary_sub_text().to_string();
+    context.title = app.get_media_title().to_string();
+    context.dictionary_name = hit.dict_name.to_string();
+    let mut occ_by_dict: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut selected = Vec::new();
+    let mut selected_occurrences = Vec::new();
+    for row in (0..definitions.row_count()).filter_map(|r| definitions.row_data(r)) {
+        if row.expression == hit.expression
+            && row.reading == hit.reading
+            && row.is_kanji == hit.is_kanji
+        {
+            let dict_name = row.dict_name.to_string();
+            let occ = *occ_by_dict
+                .entry(dict_name.clone())
+                .and_modify(|c| *c += 1)
+                .or_insert(0);
+            if row.selected {
+                selected_occurrences.push((dict_name, occ));
+                selected.push(row);
+            }
+        }
+    }
+    if selected.is_empty() {
+        return Err(Some(
+            "Select at least one dictionary entry for this term".to_owned(),
+        ));
+    }
+    context.glossary_definitions = selected
+        .iter()
+        .map(|row| controller::anki::GlossaryDefinition {
+            dictionary_id: 0,
+            dictionary_name: row.dict_name.to_string(),
+            glossary: row.glossary.to_string(),
+            tags: row
+                .pos_tags
+                .split(|character: char| character == ',' || character.is_whitespace())
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            notes: row.notes.to_string(),
+            example_ja: row.example_ja.to_string(),
+            example_en: row.example_en.to_string(),
+            ..Default::default()
+        })
+        .collect();
+    context.glossary_items = selected
+        .iter()
+        .map(|row| row.glossary.to_string())
+        .collect();
+    context.tags = selected
+        .iter()
+        .flat_map(|row| {
+            row.pos_tags
+                .split(|character: char| character == ',' || character.is_whitespace())
+        })
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect();
+    context.tags.sort();
+    context.tags.dedup();
+    if hit.is_kanji {
+        context.character = hit.expression.to_string();
+        for component in hit.reading.split(';') {
+            let component = component.trim();
+            if let Some(on) = component.strip_prefix("On:") {
+                context.onyomi = on.trim().to_owned();
+            }
+            if let Some(kun) = component.strip_prefix("Kun:") {
+                context.kunyomi = kun.trim().to_owned();
+            }
+        }
+        context.stroke_count = hit
+            .notes
+            .split(';')
+            .filter_map(|part| {
+                let (label, value) = part.split_once(':')?;
+                (label.to_ascii_lowercase().contains("stroke") || label.contains("画数"))
+                    .then(|| value.trim().to_owned())
+            })
+            .next()
+            .unwrap_or_default();
+    }
+    let (wants_screenshot, wants_video_screenshot) =
+        controller::anki_media::requested_screenshots(&profile);
+    let mut screenshot_request = None;
+    let mut video_screenshot_request = None;
+    let media_input = {
+        let player_ref = mpv.borrow();
+        let player = player_ref.as_ref();
+        let media = player
+            .and_then(MpvInstance::capture_encode_context)
+            .map(|ctx| controller::media::MediaContext::new(ctx.path, ctx.audio_id));
+        let mpv_start = player.map(MpvInstance::get_sub_start).unwrap_or(0.0);
+        let mpv_end = player.map(MpvInstance::get_sub_end).unwrap_or(0.0);
+        let subtitle_start = if active_end > active_start {
+            active_start
+        } else {
+            mpv_start
+        };
+        let subtitle_end = if active_end > active_start {
+            active_end
+        } else {
+            mpv_end
+        };
+        for (wanted, with_subs, request) in [
+            (wants_screenshot, true, &mut screenshot_request),
+            (wants_video_screenshot, false, &mut video_screenshot_request),
+        ] {
+            if wanted {
+                *request = Some(
+                    player
+                        .ok_or_else(|| "No video is loaded".to_owned())
+                        .and_then(|player| player.request_screenshot(with_subs)),
+                );
+            }
+        }
+        controller::anki_media::NoteMediaInput {
+            media,
+            subtitle_start,
+            subtitle_end,
+            context_start: if context_end > context_start {
+                context_start
+            } else {
+                subtitle_start
+            },
+            context_end: if context_end > context_start {
+                context_end
+            } else {
+                subtitle_end
+            },
+            screenshot: None,
+            screenshot_video: None,
+            subtitle_id: player.map(MpvInstance::primary_sid).unwrap_or(0),
+            audio_sources: {
+                let state = audio_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let matching = state.expression == hit.expression.as_str()
+                    && state.reading == hit.reading.as_str();
+                let mut sources = if matching {
+                    state.sources.clone()
+                } else {
+                    Vec::new()
+                };
+                drop(state);
+                if sources.is_empty() {
+                    sources = config.audio_source_entries();
+                }
+                let selected_src = if matching {
+                    app.get_popup_selected_audio_source()
+                } else {
+                    -1
+                };
+                if selected_src >= 0 {
+                    sources = sources
+                        .into_iter()
+                        .nth(selected_src as usize)
+                        .into_iter()
+                        .collect();
+                }
+                sources
+            },
+        }
+    };
+    context.secondary_context = controller::anki::secondary_context_for_range(
+        subtitles.borrow().secondary_entries(),
+        media_input.context_start,
+        media_input.context_end,
+        &context.secondary_subtitle,
+    );
+    let unavailable = controller::anki::unavailable_profile_markers(&profile);
+    let show_tag = config.anki_show_tag();
+    Ok(PreparedAnkiNoteRequest {
+        profile,
+        context,
+        selected_occurrences,
+        screenshot_request,
+        video_screenshot_request,
+        media_input,
+        unavailable,
+        show_tag,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_update_anki_note_handler(
+    app: &MementoApp,
+    config: Rc<ConfigController>,
+    audio_cache: Arc<Mutex<PopupAudioState>>,
+    subtitles: Rc<RefCell<SubtitleController>>,
+    mpv: Rc<RefCell<Option<MpvInstance>>>,
+    database_path: PathBuf,
+    resources_path: PathBuf,
+    config_dir: PathBuf,
+    lookup_epoch: Arc<AtomicU64>,
+) {
+    let update_app = app.as_weak();
+    app.global::<PopupBridge>().on_update_anki_note_requested(
+        move |row_idx, raw_note_id, _expression, _reading, _glossary_summary| {
+            let Some(app) = update_app.upgrade() else {
+                return;
+            };
+            if row_idx < 0 {
+                return;
+            }
+            let row_usize = row_idx as usize;
+            let Some(note_id) = ui::popup_row_anki_note_id_i64(&app, row_usize)
+                .or_else(|| (raw_note_id > 0).then_some(i64::from(raw_note_id)))
+            else {
+                app.set_status_message("Could not resolve Anki note ID to update".into());
+                return;
+            };
+            let pb = app.global::<PopupBridge>();
+            let nested_depth = pb.get_nested_depth();
+            let definitions = if nested_depth > 0 {
+                pb.get_nested_results()
+            } else {
+                app.get_dict_results()
+            };
+            let prepared = match prepare_anki_note_request(
+                &app,
+                &definitions,
+                row_usize,
+                &config,
+                &audio_cache,
+                &subtitles,
+                &mpv,
+            ) {
+                Ok(prepared) => prepared,
+                Err(Some(msg)) => {
+                    app.set_status_message(msg.into());
+                    return;
+                }
+                Err(None) => return,
+            };
+            let PreparedAnkiNoteRequest {
+                profile,
+                mut context,
+                selected_occurrences,
+                screenshot_request,
+                video_screenshot_request,
+                mut media_input,
+                unavailable,
+                show_tag,
+            } = prepared;
+            app.set_status_message(format!("Updating Anki note #{note_id}…").into());
+            let response_app = update_app.clone();
+            let response_epoch = lookup_epoch.clone();
+            let request_epoch = response_epoch.load(Ordering::Acquire);
+            let metadata_path = database_path.clone();
+            let res_dir = resources_path.clone();
+            let cfg_dir = config_dir.clone();
+            std::thread::spawn(move || {
+                media_input.screenshot = screenshot_request
+                    .and_then(|request| request.ok())
+                    .and_then(|request| request.wait().ok());
+                media_input.screenshot_video = video_screenshot_request
+                    .and_then(|request| request.ok())
+                    .and_then(|request| request.wait().ok());
+                let controller = AnkiController::new(profile.endpoint());
+                let resource_roots = vec![cfg_dir.join("dict_resources"), res_dir];
+                let _ = controller::anki::populate_note_context_from_sqlite(
+                    &mut context,
+                    &metadata_path,
+                    &resource_roots,
+                    &selected_occurrences,
+                );
+                let result = controller.update_existing_note_with_media(
+                    note_id,
+                    &profile,
+                    &mut context,
+                    media_input,
+                    controller::anki::AnkiUpdateMode::OverwriteNonEmpty,
+                );
+                let updated_profile = profile.clone();
+                let _ = response_app.upgrade_in_event_loop(move |app| {
+                    if app.get_dict_open()
+                        && response_epoch.load(Ordering::Acquire) == request_epoch
+                    {
+                        if let Ok(updated_id) = &result {
+                            ui::mark_popup_term_anki_updated(
+                                &app,
+                                row_usize,
+                                nested_depth,
+                                *updated_id,
+                                &updated_profile,
+                                show_tag,
+                            );
+                        }
+                    }
+                    app.set_status_message(match result {
+                        Ok(updated_id) if unavailable.is_empty() => {
+                            format!("Updated Anki note #{updated_id}").into()
+                        }
+                        Ok(updated_id) => {
+                            eprintln!(
+                                "Anki note #{updated_id}: unavailable profile markers left empty: {}",
+                                unavailable.join(", ")
+                            );
+                            format!("Updated Anki note #{updated_id}; some fields are empty").into()
+                        }
+                        Err(error) => {
+                            eprintln!("Could not update Anki note #{note_id}: {error}");
+                            format!("Could not update Anki note #{note_id}: {error}").into()
+                        }
+                    });
+                });
+            });
+        },
+    );
+}
+
 struct WordLookupRequest {
     generation: u64,
     query: String,
@@ -971,12 +1399,12 @@ struct GlVideoSurface {
     texture: Option<glow::NativeTexture>,
     framebuffer: Option<glow::NativeFramebuffer>,
     internal_format: i32,
+    prefer_16f: bool,
     size: (u32, u32),
 }
 
 impl GlVideoSurface {
-    fn new(resolver: &dyn Fn(&std::ffi::CStr) -> *const std::ffi::c_void, player: &MpvInstance) -> Self {
-        let gl = unsafe { glow::Context::from_loader_function_cstr(resolver) };
+    fn from_context(gl: glow::Context, player: &MpvInstance, prefer_16f: bool) -> Self {
         let renderer = unsafe { gl.get_parameter_string(glow::RENDERER) };
         let version = unsafe { gl.get_parameter_string(glow::VERSION) };
         eprintln!("OpenGL video device: {renderer}; {version}");
@@ -988,6 +1416,7 @@ impl GlVideoSurface {
             texture: None,
             framebuffer: None,
             internal_format: glow::RGBA8 as i32,
+            prefer_16f,
             size: (0, 0),
         }
     }
@@ -1014,12 +1443,13 @@ impl GlVideoSurface {
         if !self.should_reallocate(size) {
             return Ok(());
         }
-        let target = video_gl::create_video_fbo_texture(
+        let target = video_gl::create_video_fbo_texture_with_preference(
             &self.gl,
             self.texture,
             self.framebuffer,
             size.0,
             size.1,
+            self.prefer_16f,
         )?;
         self.texture = Some(target.texture);
         self.framebuffer = Some(target.framebuffer);
@@ -1054,6 +1484,19 @@ impl GlVideoSurface {
             if let Some(framebuffer) = self.framebuffer.take() { self.gl.delete_framebuffer(framebuffer); }
             if let Some(texture) = self.texture.take() { self.gl.delete_texture(texture); }
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn native_window_hwnd(window: &slint::Window) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle();
+    let Ok(win) = handle.window_handle() else {
+        return None;
+    };
+    match win.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
     }
 }
 
@@ -1220,9 +1663,6 @@ fn display_word_lookup(app: &MementoApp, result: WordLookupResult, query: &str, 
         }
     }
     app.set_selected_token_count(match_count);
-    if let Some(first_term) = result.hits.iter().find(|hit| !hit.is_kanji) {
-        maybe_auto_play_first_term_audio(app, &first_term.expression, &first_term.reading);
-    }
 }
 
 
@@ -2402,10 +2842,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-select matching GPU offload env vars from CLI `--hwdec=...` / `mpv.conf`
     // BEFORE creating Slint's OpenGL context or initializing libmpv.
     graphics_device::select_for_config_dir(&config_dir);
+    let raw_cli_args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_arg_refs: Vec<&str> = raw_cli_args.iter().map(String::as_str).collect();
+    let renderer_overrides =
+        memento_app::platform_renderer::RendererOverrides::from_config_dir_and_args(
+            &config_dir,
+            cli_arg_refs,
+        );
+    let renderer_caps =
+        memento_app::platform_renderer::VideoRendererCapabilities::detect_current();
+    let renderer_plan = memento_app::platform_renderer::PlatformRendererConfig::select(
+        &renderer_caps,
+        &renderer_overrides,
+    );
+    eprintln!(
+        "Video renderer plan: {} ({})",
+        renderer_plan.primary, renderer_plan.reason
+    );
     // libmpv shares the UI's context. On desktop platforms prefer desktop GL
     // with the driver's supported version, rather than Slint's GLES 2 default.
     // An explicitly selected Slint backend (including software) still wins.
-    if std::env::var_os("SLINT_BACKEND").is_none() {
+    if std::env::var_os("SLINT_BACKEND").is_none()
+        && renderer_plan.primary != memento_app::platform_renderer::PlatformRendererKind::Software
+    {
         slint::BackendSelector::new().require_opengl().select()?;
     }
     let _ = slint::set_xdg_app_id(memento_os::WAYLAND_APP_ID);
@@ -4175,17 +4634,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_fs = app.as_weak();
+    let fullscreen_ctrl = Rc::new(RefCell::new(
+        memento_app::platform_window::PlatformFullscreenController::for_platform(
+            memento_app::platform_renderer::TargetOs::current(),
+            renderer_plan.primary,
+            renderer_overrides.disable_windows_borderless_workaround,
+        ),
+    ));
+    #[cfg(target_os = "windows")]
+    let win32_fs_snapshot: Rc<RefCell<Option<memento_os::Win32WindowStyleSnapshot>>> =
+        Rc::new(RefCell::new(None));
     app.on_toggle_fullscreen(move || {
-        if let Some(app) = weak_fs.upgrade() {
-            let next = !(app.window().is_fullscreen() || app.get_is_fullscreen());
-            app.window().set_fullscreen(next);
-            app.set_is_fullscreen(next);
-            app.set_cursor_hidden(false);
-            if app.get_osc_visibility_mode() != 2 {
-                app.set_osc_visible(true);
+        let Some(app) = weak_fs.upgrade() else {
+            return;
+        };
+        let mut fs = fullscreen_ctrl.borrow_mut();
+        fs.sync_external_native_fullscreen(
+            app.window().is_fullscreen() || app.get_is_fullscreen(),
+        );
+        let pos = app.window().position();
+        let size = app.window().size();
+        let scale = f64::from(app.window().scale_factor().max(1.0));
+        let current_rect = memento_os::WindowRect::new(pos.x, pos.y, size.width, size.height);
+        let currently_maximized = app.window().is_maximized();
+        #[cfg(target_os = "windows")]
+        let monitor = native_window_hwnd(app.window())
+            .and_then(|hwnd| memento_os::query_window_monitor(hwnd).ok())
+            .unwrap_or_else(|| {
+                memento_os::MonitorRect::new(pos.x, pos.y, size.width, size.height, scale)
+            });
+        #[cfg(not(target_os = "windows"))]
+        let monitor = memento_os::MonitorRect::new(pos.x, pos.y, size.width, size.height, scale);
+
+        let action = fs.toggle_fullscreen(current_rect, currently_maximized, monitor);
+        let next = match &action {
+            memento_app::platform_window::FullscreenAction::NoOp => fs.is_fullscreen(),
+            memento_app::platform_window::FullscreenAction::SetNativeFullscreen { fullscreen } => {
+                app.window().set_fullscreen(*fullscreen);
+                app.set_window_bottom_margin(0.0);
+                *fullscreen
             }
-            app.invoke_osc_activity();
+            memento_app::platform_window::FullscreenAction::EnterWindowsBorderless {
+                bottom_margin_px,
+                ..
+            } => {
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = native_window_hwnd(app.window()) {
+                    let mut snap = win32_fs_snapshot.borrow_mut();
+                    if let Err(err) = memento_app::platform_window::apply_windows_fullscreen_action(
+                        hwnd, &action, &mut snap,
+                    ) {
+                        eprintln!("Windows borderless fullscreen enter failed: {err}");
+                        app.window().set_fullscreen(true);
+                    }
+                } else {
+                    app.window().set_fullscreen(true);
+                }
+                #[cfg(not(target_os = "windows"))]
+                app.window().set_fullscreen(true);
+                app.set_window_bottom_margin(*bottom_margin_px as f32);
+                true
+            }
+            memento_app::platform_window::FullscreenAction::ExitWindowsBorderless {
+                bottom_margin_px,
+                ..
+            } => {
+                #[cfg(target_os = "windows")]
+                if let Some(hwnd) = native_window_hwnd(app.window()) {
+                    let mut snap = win32_fs_snapshot.borrow_mut();
+                    if let Err(err) = memento_app::platform_window::apply_windows_fullscreen_action(
+                        hwnd, &action, &mut snap,
+                    ) {
+                        eprintln!("Windows borderless fullscreen exit failed: {err}");
+                        app.window().set_fullscreen(false);
+                    }
+                } else {
+                    app.window().set_fullscreen(false);
+                }
+                #[cfg(not(target_os = "windows"))]
+                app.window().set_fullscreen(false);
+                app.set_window_bottom_margin(*bottom_margin_px as f32);
+                false
+            }
+        };
+        app.set_is_fullscreen(next);
+        app.set_cursor_hidden(false);
+        if app.get_osc_visibility_mode() != 2 {
+            app.set_osc_visible(true);
         }
+        app.invoke_osc_activity();
     });
 
     install_subtitle_selection(&app, sub_ctrl.clone(), sub_model.clone());
@@ -4521,9 +5058,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.invoke_dismiss_definition();
         set_dictionary_rows(&app, dictionary_result_rows(&hits, &search_dict_config.anki_excluded_glossaries()));
         app.invoke_reset_definition_scroll();
-        if let Some(first_term) = hits.iter().find(|hit| !hit.is_kanji) {
-            maybe_auto_play_first_term_audio(&app, &first_term.expression, &first_term.reading);
-        }
     });
     let kanji_app = app.as_weak();
     let kanji_dict = dict_ctrl.clone();
@@ -4654,9 +5188,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui::install_popup_navigation(&app);
     ui::install_rich_ui_bridges(&app, &dictionary_database_path, &config_dir, &config_ctrl);
     ui::bind_rich_bridge_lookup_epoch(&app, lookup_epoch.clone());
-    // INTEGRATION NOTE (popup-features -> PopupBridge.first-term-ready):
-    // Connect `app.global::<PopupBridge>().on_first_term_ready(...)` here to
-    // `maybe_auto_play_first_term_audio(&app, expression.as_str(), reading.as_str())`.
+    install_auto_play_first_term_audio(&app);
+    install_update_anki_note_handler(
+        &app,
+        config_ctrl.clone(),
+        popup_audio_cache.clone(),
+        sub_ctrl.clone(),
+        mpv.clone(),
+        dictionary_database_path.clone(),
+        dictionary_resources_path.clone(),
+        config_dir.clone(),
+        lookup_epoch.clone(),
+    );
 
     let note_app = app.as_weak();
     let note_config = config_ctrl.clone();
@@ -4673,183 +5216,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_anki_added_note_id("".into());
         app.set_anki_added_result_index(-1);
         let definitions = app.get_dict_results();
-        let Some(hit) = definitions.row_data(index as usize) else { return };
-        let profile = if hit.is_kanji {
-            note_config.anki_kanji_note_config()
-        } else {
-            note_config.anki_profile_note_config()
-        };
-        let Some(profile) = profile else {
-            app.set_status_message("Select an Anki profile and configure this note type".into());
-            return;
-        };
-        if !profile.enabled {
-            app.set_status_message("Enable Anki integration in Preferences".into());
-            return;
-        }
-        let mut context = controller::anki::NoteFieldsContext::new(
-            hit.expression.to_string(), hit.reading.to_string(),
-            app.get_active_sub_text().to_string(),
-        );
-        context.is_kanji = hit.is_kanji;
-        let selected_glossary = app.global::<PopupBridge>().get_selected_glossary_text();
-        if !selected_glossary.is_empty() {
-            context.selection = selected_glossary.to_string();
-        }
-        // Never assign the scanned subtitle token into `context.selection` (#262);
-        // use it purely to locate `cloze_prefix` / `cloze_body` / `cloze_suffix`.
-        let start = app.get_selected_token_index();
-        let (scanned_surface, token_offset_in_sentence) = if start >= 0 {
-            let words = app.get_active_sub_words();
-            let start_idx = start as usize;
-            let count = app.get_selected_token_count().max(1) as usize;
-            let byte_offset: usize = (0..start_idx)
-                .filter_map(|i| words.row_data(i))
-                .map(|word| word.text.len())
-                .sum();
-            let surface: String = (start_idx..start_idx.saturating_add(count))
-                .filter_map(|i| words.row_data(i))
-                .map(|word| word.text.to_string())
-                .collect();
-            (surface, Some(byte_offset))
-        } else {
-            (String::new(), None)
-        };
-        let (remove_regex, replace_lines, replace_with) = (
-            app.get_search_remove_regex().to_string(),
-            app.get_search_replace_lines(),
-            app.get_search_replace_with().to_string(),
-        );
-        let (active_start, active_end, context_start, context_end, selected_cues, active_pos_in_selected) = {
-            let subtitles = note_subtitles.borrow();
-            let selected_indices = subtitles.selected_indices();
-            let active_indices = subtitles.active_indices(subtitles.primary_sid());
-            let active_pos = selected_indices.iter().position(|idx| active_indices.contains(idx));
-            let cues = subtitles.selected_cues()
-                .iter()
-                .map(|cue| {
-                    let raw = String::from_utf16_lossy(&cue.text);
-                    filter_subtitle_text(&raw, &remove_regex, replace_lines, &replace_with)
-                })
-                .collect::<Vec<_>>();
-            let active = subtitles.active_cue();
-            let start = active.map(|cue| cue.start).unwrap_or(0.0);
-            let end = active.map(|cue| cue.end).unwrap_or(0.0);
-            let (ctx_start, ctx_end) = subtitles.selected_time_range().unwrap_or((start, end));
-            (start, end, ctx_start, ctx_end, cues, active_pos)
-        };
-        controller::anki::apply_subtitle_cloze(
-            &mut context,
-            &selected_cues,
-            active_pos_in_selected,
-            &scanned_surface,
-            token_offset_in_sentence,
-        );
-        context.secondary_subtitle = app.get_secondary_sub_text().to_string();
-        context.title = app.get_media_title().to_string();
-        context.dictionary_name = hit.dict_name.to_string();
-        let mut occ_by_dict: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut selected = Vec::new();
-        let mut selected_occurrences = Vec::new();
-        for row in (0..definitions.row_count()).filter_map(|r| definitions.row_data(r)) {
-            if row.expression == hit.expression && row.reading == hit.reading
-                && row.is_kanji == hit.is_kanji
-            {
-                let dict_name = row.dict_name.to_string();
-                let occ = *occ_by_dict.entry(dict_name.clone()).and_modify(|c| *c += 1).or_insert(0);
-                if row.selected {
-                    selected_occurrences.push((dict_name, occ));
-                    selected.push(row);
-                }
+        let prepared = match prepare_anki_note_request(
+            &app,
+            &definitions,
+            index as usize,
+            &note_config,
+            &note_audio_cache,
+            &note_subtitles,
+            &note_mpv,
+        ) {
+            Ok(prepared) => prepared,
+            Err(Some(msg)) => {
+                app.set_status_message(msg.into());
+                return;
             }
-        }
-        if selected.is_empty() {
-            app.set_status_message("Select at least one dictionary entry for this term".into());
-            return;
-        }
-        context.glossary_definitions = selected.iter().map(|row| controller::anki::GlossaryDefinition {
-            dictionary_id: 0,
-            dictionary_name: row.dict_name.to_string(),
-            glossary: row.glossary.to_string(),
-            tags: row.pos_tags.split(|character: char| character == ',' || character.is_whitespace())
-                .filter(|tag| !tag.is_empty()).map(str::to_owned).collect(),
-            notes: row.notes.to_string(),
-            example_ja: row.example_ja.to_string(),
-            example_en: row.example_en.to_string(),
-            ..Default::default()
-        }).collect();
-        context.glossary_items = selected.iter().map(|row| row.glossary.to_string()).collect();
-        context.tags = selected.iter().flat_map(|row| row.pos_tags.split(|character: char| {
-            character == ',' || character.is_whitespace()
-        })).filter(|tag| !tag.is_empty()).map(str::to_owned).collect();
-        context.tags.sort();
-        context.tags.dedup();
-        if hit.is_kanji {
-            context.character = hit.expression.to_string();
-            for component in hit.reading.split(';') {
-                let component = component.trim();
-                if let Some(on) = component.strip_prefix("On:") { context.onyomi = on.trim().to_owned(); }
-                if let Some(kun) = component.strip_prefix("Kun:") { context.kunyomi = kun.trim().to_owned(); }
-            }
-            context.stroke_count = hit.notes.split(';').filter_map(|part| {
-                let (label, value) = part.split_once(':')?;
-                (label.to_ascii_lowercase().contains("stroke") || label.contains("画数"))
-                    .then(|| value.trim().to_owned())
-            }).next().unwrap_or_default();
-        }
-        let (wants_screenshot, wants_video_screenshot) =
-            controller::anki_media::requested_screenshots(&profile);
-        let mut screenshot_request = None;
-        let mut video_screenshot_request = None;
-        let mut media_input = {
-            let player_ref = note_mpv.borrow();
-            let player = player_ref.as_ref();
-            let media = player.and_then(MpvInstance::capture_encode_context)
-                .map(|ctx| controller::media::MediaContext::new(ctx.path, ctx.audio_id));
-            let mpv_start = player.map(MpvInstance::get_sub_start).unwrap_or(0.0);
-            let mpv_end = player.map(MpvInstance::get_sub_end).unwrap_or(0.0);
-            let subtitle_start = if active_end > active_start { active_start } else { mpv_start };
-            let subtitle_end = if active_end > active_start { active_end } else { mpv_end };
-            for (wanted, subtitles, request) in [
-                (wants_screenshot, true, &mut screenshot_request),
-                (wants_video_screenshot, false, &mut video_screenshot_request),
-            ] {
-                if wanted {
-                    *request = Some(player.ok_or_else(|| "No video is loaded".to_owned())
-                        .and_then(|player| player.request_screenshot(subtitles)));
-                }
-            }
-            controller::anki_media::NoteMediaInput {
-                media,
-                subtitle_start,
-                subtitle_end,
-                context_start: if context_end > context_start { context_start } else { subtitle_start },
-                context_end: if context_end > context_start { context_end } else { subtitle_end },
-                screenshot: None,
-                screenshot_video: None,
-                subtitle_id: player.map(MpvInstance::primary_sid).unwrap_or(0),
-                audio_sources: {
-                    let state = note_audio_cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let matching = state.expression == hit.expression.as_str() && state.reading == hit.reading.as_str();
-                    let mut sources = if matching { state.sources.clone() } else { Vec::new() };
-                    drop(state);
-                    if sources.is_empty() { sources = note_config.audio_source_entries(); }
-                    let selected = if matching { app.get_popup_selected_audio_source() } else { -1 };
-                    if selected >= 0 {
-                        sources = sources.into_iter().nth(selected as usize).into_iter().collect();
-                    }
-                    sources
-                },
-            }
+            Err(None) => return,
         };
-        context.secondary_context = controller::anki::secondary_context_for_range(
-            note_subtitles.borrow().secondary_entries(),
-            media_input.context_start,
-            media_input.context_end,
-            &context.secondary_subtitle,
-        );
-        let unavailable = controller::anki::unavailable_profile_markers(&profile);
-        let show_tag = note_config.anki_show_tag();
+        let PreparedAnkiNoteRequest {
+            profile,
+            mut context,
+            selected_occurrences,
+            screenshot_request,
+            video_screenshot_request,
+            mut media_input,
+            unavailable,
+            show_tag,
+        } = prepared;
         app.set_status_message("Adding note to Anki…".into());
         let response_app = note_app.clone();
         let response_epoch = note_lookup_epoch.clone();
@@ -5412,7 +5804,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let notifier_timings = video_timings.clone();
     let notifier_pending_frame = pending_playback_frame.clone();
     let notifier_trigger_initial = trigger_initial_loads.clone();
-    if let Err(error) = app.window().set_rendering_notifier(move |state, graphics_api| {
+    let gl_prefer_16f = !renderer_overrides.force_rgba8;
+    if renderer_plan.primary == memento_app::platform_renderer::PlatformRendererKind::Software {
+        eprintln!("Video renderer: libmpv software (per startup renderer plan)");
+        trigger_initial_loads();
+    } else if let Err(error) = app.window().set_rendering_notifier(move |state, graphics_api| {
         let slint::GraphicsAPI::NativeOpenGL { get_proc_address } = graphics_api else {
             if matches!(state, slint::RenderingState::RenderingSetup) {
                 notifier_trigger_initial();
@@ -5424,36 +5820,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let player_ref = gl_mpv.borrow();
                     if let Some(player) = player_ref.as_ref() {
+                        let gl =
+                            unsafe { glow::Context::from_loader_function_cstr(*get_proc_address) };
                         let (x11_display, wl_display) = notifier_app
                             .upgrade()
                             .map(|app| native_window_display_pointers(app.window()))
                             .unwrap_or((None, None));
-                        #[cfg(target_os = "linux")]
-                        let gl_res = if let Some(owned_resolver) =
-                            build_owned_gl_proc_resolver(*get_proc_address, wl_display.is_some())
-                        {
-                            player.activate_opengl_owned_with_display(
-                                owned_resolver,
-                                x11_display,
-                                wl_display,
-                            )
-                        } else {
-                            player.activate_opengl_with_display(
-                                *get_proc_address,
-                                x11_display,
-                                wl_display,
-                            )
-                        };
-                        #[cfg(not(target_os = "linux"))]
-                        let gl_res = player.activate_opengl_with_display(
-                            *get_proc_address,
-                            x11_display,
-                            wl_display,
-                        );
+                        let gl_res = video_gl::with_saved_state(&gl, || {
+                            #[cfg(target_os = "linux")]
+                            {
+                                if let Some(owned_resolver) = build_owned_gl_proc_resolver(
+                                    *get_proc_address,
+                                    wl_display.is_some(),
+                                ) {
+                                    player.activate_opengl_owned_with_display(
+                                        owned_resolver,
+                                        x11_display,
+                                        wl_display,
+                                    )
+                                } else {
+                                    player.activate_opengl_with_display(
+                                        *get_proc_address,
+                                        x11_display,
+                                        wl_display,
+                                    )
+                                }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                player.activate_opengl_with_display(
+                                    *get_proc_address,
+                                    x11_display,
+                                    wl_display,
+                                )
+                            }
+                        });
                         match gl_res {
                             Ok(()) => {
                                 *notifier_surface.borrow_mut() =
-                                    Some(GlVideoSurface::new(*get_proc_address, player));
+                                    Some(GlVideoSurface::from_context(gl, player, gl_prefer_16f));
                                 notifier_pending.set(true);
                                 eprintln!("Video renderer: libmpv OpenGL");
                             }
@@ -5476,6 +5881,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let size = notifier_size.get();
                 if size == (0, 0) {
+                    let player_ref = gl_mpv.borrow();
+                    let surface_ref = notifier_surface.borrow();
+                    if let (Some(player), Some(surface)) =
+                        (player_ref.as_ref(), surface_ref.as_ref())
+                    {
+                        if player.has_render_update() {
+                            let flags = video_gl::with_saved_state(&surface.gl, || {
+                                player.pump_render_update()
+                            });
+                            if flags != 0 {
+                                notifier_pending.set(true);
+                            }
+                        }
+                    }
                     return;
                 }
                 let player_ref = gl_mpv.borrow();
@@ -5550,10 +5969,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slint::RenderingState::RenderingTeardown => {
                 notifier_texture.set(None);
                 notifier_render_size.set((0, 0));
+                let surface = notifier_surface.borrow_mut().take();
                 if let Some(player) = gl_mpv.borrow().as_ref() {
-                    player.deactivate_opengl();
+                    if let Some(ref surface) = surface {
+                        video_gl::with_saved_state(&surface.gl, || {
+                            player.deactivate_opengl();
+                        });
+                    } else {
+                        player.deactivate_opengl();
+                    }
                 }
-                if let Some(surface) = notifier_surface.borrow_mut().take() {
+                if let Some(surface) = surface {
                     surface.destroy();
                 }
             }
@@ -6447,6 +6873,7 @@ mod window_ux_tests {
     fn auto_play_audio_triggers_on_first_term_result_when_enabled() {
         i_slint_backend_testing::init_no_event_loop();
         let app = MementoApp::new().unwrap();
+        install_auto_play_first_term_audio(&app);
         let cfg = ConfigController::new();
         cfg.edit_setting("search/auto-play-audio", "true").unwrap();
         refresh_player_preferences(&app, &cfg);
@@ -6476,10 +6903,31 @@ mod window_ux_tests {
             "食べる",
             &[],
         );
+        // Must fire exactly ONCE via PopupBridge.first-term-ready (never double-triggered).
         assert_eq!(
             played.borrow().as_slice(),
             &[("食べる".to_owned(), "たべる".to_owned())]
         );
+
+        // Kanji-only lookups must not auto-play audio.
+        played.borrow_mut().clear();
+        display_word_lookup(
+            &app,
+            WordLookupResult {
+                hits: vec![kanji],
+                error: None,
+                database_open: true,
+                matched_units: 1,
+                headword: "食".into(),
+                reading: "しょく".into(),
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+            },
+            "食",
+            &[],
+        );
+        assert!(played.borrow().is_empty());
 
         // Disabled setting must not auto-play.
         played.borrow_mut().clear();
@@ -6503,6 +6951,171 @@ mod window_ux_tests {
             &[],
         );
         assert!(played.borrow().is_empty());
+    }
+
+    #[test]
+    fn update_anki_note_requested_resolves_lossless_64bit_id_and_updates_note() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target_note_id: i64 = 1_732_012_345_678;
+
+        let server_actions = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_actions_bg = server_actions.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if header_end.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let hdr = String::from_utf8_lossy(&buf[..pos]);
+                            for line in hdr.lines() {
+                                if let Some((k, v)) = line.split_once(':') {
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                            header_end = Some(pos + 4);
+                        }
+                    }
+                    if let Some(start) = header_end {
+                        if buf.len() >= start + content_len {
+                            break;
+                        }
+                    }
+                }
+                let start = header_end.unwrap_or(buf.len());
+                let body: serde_json::Value =
+                    serde_json::from_slice(&buf[start..]).unwrap_or(serde_json::Value::Null);
+                let action = body
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                server_actions_bg.lock().unwrap().push(body);
+                let reply = match action.as_str() {
+                    "notesInfo" => serde_json::json!({
+                        "result": [{
+                            "noteId": target_note_id,
+                            "modelName": "JP Mining",
+                            "tags": ["existing-tag"],
+                            "fields": {
+                                "Expression": { "value": "食べる", "order": 0 },
+                                "Sentence": { "value": "", "order": 1 },
+                                "Glossary": { "value": "old def", "order": 2 }
+                            }
+                        }],
+                        "error": null
+                    }),
+                    "updateNoteFields" | "addTags" => serde_json::json!({
+                        "result": null,
+                        "error": null
+                    }),
+                    _ => serde_json::json!({ "result": null, "error": "unexpected action" }),
+                };
+                let payload = reply.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ConfigController::new();
+        cfg.edit_setting("anki/enabled", "true").unwrap();
+        cfg.edit_setting("anki/profile/host", "127.0.0.1").unwrap();
+        cfg.edit_setting("anki/profile/port", &port.to_string())
+            .unwrap();
+        cfg.edit_setting("anki/profile/term/deck", "Mining")
+            .unwrap();
+        cfg.edit_setting("anki/profile/term/model", "JP Mining")
+            .unwrap();
+        cfg.edit_setting(
+            "anki/profile/term/fields",
+            &serde_json::json!([
+                ["Expression", "{expression}"],
+                ["Sentence", "{sentence}"],
+                ["Glossary", "{glossary}"]
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        cfg.edit_setting("anki/profile/tags", "memento-updated")
+            .unwrap();
+        let config_ctrl = Rc::new(cfg);
+
+        let app = MementoApp::new().unwrap();
+        app.set_dict_open(true);
+        app.set_active_sub_text("今日ご飯を食べる。".into());
+        let hit = controller::dict::SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        set_dictionary_rows(&app, dictionary_result_rows(&[hit], &[]));
+
+        let pb = app.global::<PopupBridge>();
+        pb.set_row_anki_duplicates(Rc::new(VecModel::from(vec![true])).into());
+        pb.set_row_anki_note_ids(Rc::new(VecModel::from(vec![i32::MAX])).into());
+        pb.set_row_anki_note_id_strings(
+            Rc::new(VecModel::from(vec![slint::SharedString::from(
+                target_note_id.to_string(),
+            )]))
+            .into(),
+        );
+
+        let audio_cache = Arc::new(Mutex::new(PopupAudioState::default()));
+        let sub_ctrl = Rc::new(RefCell::new(SubtitleController::new()));
+        let mpv_slot: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
+        let epoch = Arc::new(AtomicU64::new(1));
+
+        install_update_anki_note_handler(
+            &app,
+            config_ctrl,
+            audio_cache,
+            sub_ctrl,
+            mpv_slot,
+            dir.path().join("dictionaries.sqlite"),
+            dir.path().join("res"),
+            dir.path().to_path_buf(),
+            epoch,
+        );
+
+        // Simulate Slint passing the saturated i32::MAX; handler must recover full 64-bit ID.
+        pb.invoke_update_anki_note_requested(
+            0,
+            i32::MAX,
+            "食べる".into(),
+            "たべる".into(),
+            "to eat".into(),
+        );
+        assert!(app.get_status_message().contains(&target_note_id.to_string()));
+
+        server.join().unwrap();
+        let actions = server_actions.lock().unwrap();
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0]["action"], "notesInfo");
+        assert_eq!(actions[0]["params"]["notes"][0], target_note_id);
+        assert_eq!(actions[1]["action"], "updateNoteFields");
+        assert_eq!(actions[1]["params"]["note"]["id"], target_note_id);
+        assert_eq!(actions[1]["params"]["note"]["fields"]["Sentence"], "今日ご飯を食べる。");
+        assert_eq!(actions[2]["action"], "addTags");
+        assert_eq!(actions[2]["params"]["notes"][0], target_note_id);
+        assert_eq!(actions[2]["params"]["tags"], "memento-updated");
     }
 
     #[test]

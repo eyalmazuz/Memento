@@ -7457,6 +7457,27 @@ fn parse_interface_font_setting(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DictSearchConfig {
+    dict_order: Vec<i64>,
+    exact_enabled: bool,
+    deconj_enabled: bool,
+    mecab_enabled: bool,
+    remove_regex: String,
+    replace_lines: bool,
+    replace_with: String,
+}
+
+impl DictSearchConfig {
+    fn apply_to(&self, dict: &mut DictController) {
+        dict.set_order(&self.dict_order);
+        dict.set_exact_enabled(self.exact_enabled);
+        dict.set_deconj_enabled(self.deconj_enabled);
+        dict.set_mecab_enabled(self.mecab_enabled);
+        dict.set_search_text_filters(&self.remove_regex, self.replace_lines, &self.replace_with);
+    }
+}
+
 struct CachedConfigSettings {
     subtitle_style: SubtitleRenderStyle,
     popup_fonts: PopupInterfaceFonts,
@@ -7464,7 +7485,12 @@ struct CachedConfigSettings {
     search_modifier: i32,
     search_delay_ms: u64,
     middle_mouse_scan: bool,
+    exact_enabled: bool,
+    deconj_enabled: bool,
     mecab_enabled: bool,
+    remove_regex: String,
+    replace_lines: bool,
+    replace_with: String,
     glossary_style: LegacyGlossaryStyle,
     dict_order: Vec<i64>,
     excluded_glossaries: Vec<String>,
@@ -7485,7 +7511,12 @@ impl CachedConfigSettings {
             search_modifier: raw::search::MODIFIER_DEFAULT as i32,
             search_delay_ms: raw::search::DELAY_DEFAULT as u64,
             middle_mouse_scan: raw::search::MIDDLE_MOUSE_SCAN_DEFAULT,
+            exact_enabled: raw::search::matcher::EXACT_DEFAULT,
+            deconj_enabled: raw::search::matcher::DECONJ_DEFAULT,
             mecab_enabled: raw::search::matcher::MECAB_IPADIC_DEFAULT,
+            remove_regex: raw::search::REMOVE_REGEX_DEFAULT.to_owned(),
+            replace_lines: raw::search::REPLACE_NEWLINES_DEFAULT,
+            replace_with: raw::search::REPLACE_NEWLINES_WITH_DEFAULT.to_owned(),
             glossary_style: LegacyGlossaryStyle::Bullet,
             dict_order: Vec::new(),
             excluded_glossaries: Vec::new(),
@@ -7502,6 +7533,18 @@ impl CachedConfigSettings {
         };
         out.apply_controller(config);
         out
+    }
+
+    fn dict_search_config(&self) -> DictSearchConfig {
+        DictSearchConfig {
+            dict_order: self.dict_order.clone(),
+            exact_enabled: self.exact_enabled,
+            deconj_enabled: self.deconj_enabled,
+            mecab_enabled: self.mecab_enabled,
+            remove_regex: self.remove_regex.clone(),
+            replace_lines: self.replace_lines,
+            replace_with: self.replace_with.clone(),
+        }
     }
 
     fn apply_controller(&mut self, config: &ConfigController) {
@@ -7641,12 +7684,42 @@ impl CachedConfigSettings {
         {
             self.middle_mouse_scan = b;
         }
+        self.exact_enabled = match config
+            .effective_setting(raw::search::GROUP, raw::search::matcher::EXACT)
+        {
+            Some(Value::Bool(b)) => b,
+            _ => raw::search::matcher::EXACT_DEFAULT,
+        };
+        self.deconj_enabled = match config
+            .effective_setting(raw::search::GROUP, raw::search::matcher::DECONJ)
+        {
+            Some(Value::Bool(b)) => b,
+            _ => raw::search::matcher::DECONJ_DEFAULT,
+        };
         self.mecab_enabled = match config.effective_setting(
             raw::search::GROUP,
             raw::search::matcher::MECAB_IPADIC,
         ) {
             Some(Value::Bool(b)) => b,
             _ => raw::search::matcher::MECAB_IPADIC_DEFAULT,
+        };
+        self.remove_regex = match config
+            .effective_setting(raw::search::GROUP, raw::search::REMOVE_REGEX)
+        {
+            Some(Value::Text(s)) => s,
+            _ => raw::search::REMOVE_REGEX_DEFAULT.to_owned(),
+        };
+        self.replace_lines = match config
+            .effective_setting(raw::search::GROUP, raw::search::REPLACE_NEWLINES)
+        {
+            Some(Value::Bool(b)) => b,
+            _ => raw::search::REPLACE_NEWLINES_DEFAULT,
+        };
+        self.replace_with = match config
+            .effective_setting(raw::search::GROUP, raw::search::REPLACE_NEWLINES_WITH)
+        {
+            Some(Value::Text(s)) => s,
+            _ => raw::search::REPLACE_NEWLINES_WITH_DEFAULT.to_owned(),
         };
         if let Some(Value::Int(gs)) =
             config.effective_setting(raw::search::GROUP, raw::search::GLOSSARY_STYLE)
@@ -7974,9 +8047,8 @@ struct NestedScanRequest {
     anchor_x: f32,
     anchor_y: f32,
     locked: bool,
-    dict_order: Vec<i64>,
     excluded_glossaries: Vec<String>,
-    mecab_enabled: bool,
+    search_config: DictSearchConfig,
 }
 
 struct NestedScanResponse {
@@ -8015,7 +8087,7 @@ struct RichUiBridge {
     app_weak: slint::Weak<MementoApp>,
     db_path: PathBuf,
     state: RefCell<RichUiMutable>,
-    panel_tx: mpsc::Sender<(u64, String, bool, Vec<i64>, Vec<String>, bool)>,
+    panel_tx: mpsc::Sender<(u64, String, bool, Vec<String>, DictSearchConfig)>,
     panel_res_rx: Arc<std::sync::Mutex<mpsc::Receiver<(u64, Vec<SearchHit>, Vec<String>)>>>,
     panel_poll_timer: slint::Timer,
     panel_epoch: Arc<AtomicU64>,
@@ -8058,10 +8130,8 @@ impl RichUiBridge {
                 st.db_sig = sig;
                 st.dict_ctrl = DictController::open(&self.db_path).unwrap_or_default();
             }
-            let order = st.settings.dict_order.clone();
-            let mecab_enabled = st.settings.mecab_enabled;
-            st.dict_ctrl.set_order(&order);
-            st.dict_ctrl.set_mecab_enabled(mecab_enabled);
+            let search_cfg = st.settings.dict_search_config();
+            search_cfg.apply_to(&mut st.dict_ctrl);
             st.db_helper.refresh_if_needed();
         }
         if let Some(theme) = reloaded_css_theme {
@@ -9247,14 +9317,13 @@ impl RichUiBridge {
         if target.depth < 0 || (target.depth as usize) >= MAX_NESTED_POPUP_DEPTH {
             return;
         }
-        let (order, excluded, mecab_enabled) = {
+        let (excluded, search_config) = {
             let st = self.state.borrow();
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
             (
-                st.settings.dict_order.clone(),
                 st.settings.excluded_glossaries.clone(),
-                st.settings.mecab_enabled,
+                st.settings.dict_search_config(),
             )
         };
         let epoch = self.nested_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -9269,9 +9338,8 @@ impl RichUiBridge {
             anchor_x: target.anchor_x,
             anchor_y: target.anchor_y,
             locked,
-            dict_order: order,
             excluded_glossaries: excluded,
-            mecab_enabled,
+            search_config,
         });
         let weak_br = Rc::downgrade(self);
         self.nested_poll_timer.start(
@@ -10400,13 +10468,12 @@ pub fn install_rich_ui_bridges(
     let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
     let db_sig = crate::controller::dict::db_file_fingerprint(dictionary_db_path);
     let mut dict_ctrl = DictController::open(dictionary_db_path).unwrap_or_default();
-    dict_ctrl.set_order(&settings.dict_order);
-    dict_ctrl.set_mecab_enabled(settings.mecab_enabled);
+    settings.dict_search_config().apply_to(&mut dict_ctrl);
 
     // Independent async worker thread for DictionarySearchPanel so panel searches NEVER
     // block the UI thread and NEVER overwrite or get overwritten by subtitle hover popups!
     let (panel_tx, panel_rx) =
-        mpsc::channel::<(u64, String, bool, Vec<i64>, Vec<String>, bool)>();
+        mpsc::channel::<(u64, String, bool, Vec<String>, DictSearchConfig)>();
     let (panel_res_tx, raw_panel_res_rx) =
         mpsc::channel::<(u64, Vec<SearchHit>, Vec<String>)>();
     let panel_res_rx = Arc::new(std::sync::Mutex::new(raw_panel_res_rx));
@@ -10422,7 +10489,7 @@ pub fn install_rich_ui_bridges(
             while let Ok(newer) = panel_rx.try_recv() {
                 req = newer;
             }
-            let (gen_id, query, kana_only, order, excluded, mecab_enabled) = req;
+            let (gen_id, query, kana_only, excluded, search_cfg) = req;
             if gen_id != worker_epoch.load(Ordering::Acquire) {
                 continue;
             }
@@ -10441,8 +10508,7 @@ pub fn install_rich_ui_bridges(
                 sig = cur_sig;
                 dict = DictController::open(&worker_db_path).unwrap_or_default();
             }
-            dict.set_order(&order);
-            dict.set_mecab_enabled(mecab_enabled);
+            search_cfg.apply_to(&mut dict);
             let search_key = if kana_only {
                 crate::controller::dict::normalize_reading(&trimmed)
             } else {
@@ -10492,8 +10558,7 @@ pub fn install_rich_ui_bridges(
                 sig = cur_sig;
                 dict = DictController::open(&worker_nested_db_path).unwrap_or_default();
             }
-            dict.set_order(&req.dict_order);
-            dict.set_mecab_enabled(req.mecab_enabled);
+            req.search_config.apply_to(&mut dict);
 
             let mut hits = dict.search(&req.query).to_vec();
             let match_units = dict.last_match_units();
@@ -11464,12 +11529,11 @@ pub fn install_rich_ui_bridges(
         let pb = app.global::<PopupBridge>();
         pb.set_panel_query(query.clone());
         let kana_only = pb.get_panel_kana_only();
-        let (order, excluded, mecab_enabled) = {
+        let (excluded, search_cfg) = {
             let st = b_panel_search.state.borrow();
             (
-                st.settings.dict_order.clone(),
                 st.settings.excluded_glossaries.clone(),
-                st.settings.mecab_enabled,
+                st.settings.dict_search_config(),
             )
         };
         let gen_id = b_panel_search.panel_epoch.fetch_add(1, Ordering::AcqRel) + 1;
@@ -11484,9 +11548,8 @@ pub fn install_rich_ui_bridges(
             gen_id,
             query.to_string(),
             kana_only,
-            order,
             excluded,
-            mecab_enabled,
+            search_cfg,
         ));
         let weak_br = Rc::downgrade(&b_panel_search);
         b_panel_search.panel_poll_timer.start(
@@ -11923,10 +11986,8 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
             st.db_sig = sig;
             st.dict_ctrl = DictController::open(&bridge.db_path).unwrap_or_default();
         }
-        let order = st.settings.dict_order.clone();
-        let mecab_enabled = st.settings.mecab_enabled;
-        st.dict_ctrl.set_order(&order);
-        st.dict_ctrl.set_mecab_enabled(mecab_enabled);
+        let search_cfg = st.settings.dict_search_config();
+        search_cfg.apply_to(&mut st.dict_ctrl);
         st.db_helper.refresh_if_needed();
         st.clear_all_glossary_caches();
         (
@@ -12207,6 +12268,161 @@ pub fn mark_popup_term_anki_added(
     pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
 }
 
+/// Immediately refreshes `PopupBridge` Anki duplicate/browse/tag/note-id state for a term right
+/// after `update_existing_note_with_media` succeeds (supporting both root and nested popups).
+pub fn mark_popup_term_anki_updated(
+    app: &MementoApp,
+    updated_index: usize,
+    nested_depth: i32,
+    note_id: i64,
+    profile: &crate::controller::config::AnkiNoteConfig,
+    show_tags: bool,
+) {
+    let pb = app.global::<PopupBridge>();
+    let instance_id = pb.get_bridge_instance_id();
+    let active_bridge = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .cloned()
+    });
+    let nid_query = format!("nid:{note_id}");
+    let joined_profile_tags = profile.tags.join(" ");
+
+    if nested_depth > 0 {
+        if let Some(ref br) = active_bridge {
+            let updated_nested = {
+                let mut st = br.state.borrow_mut();
+                if let Some(lvl) = st.nested_level_mut(nested_depth) {
+                    if let Some(target) = lvl.rows.get(updated_index).cloned() {
+                        let count = lvl.rows.len();
+                        lvl.row_anki_duplicates.resize(count, false);
+                        lvl.row_anki_note_ids_i64.resize(count, 0);
+                        lvl.row_anki_browse_queries
+                            .resize(count, SharedString::default());
+                        lvl.row_anki_tags.resize(count, SharedString::default());
+                        for idx in 0..count {
+                            let row = &lvl.rows[idx];
+                            if row.expression == target.expression
+                                && row.reading == target.reading
+                                && row.is_kanji == target.is_kanji
+                            {
+                                lvl.row_anki_duplicates[idx] = true;
+                                lvl.row_anki_note_ids_i64[idx] = note_id;
+                                if lvl.row_anki_browse_queries[idx].is_empty() {
+                                    lvl.row_anki_browse_queries[idx] =
+                                        SharedString::from(nid_query.as_str());
+                                }
+                                if show_tags && !joined_profile_tags.is_empty() {
+                                    let t = &lvl.row_anki_tags[idx];
+                                    let combined = if t.is_empty() {
+                                        joined_profile_tags.clone()
+                                    } else {
+                                        format!("{t} {joined_profile_tags}")
+                                    };
+                                    let dedup: Vec<String> = split_anki_tags_str(&combined)
+                                        .into_iter()
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    lvl.row_anki_tags[idx] = SharedString::from(dedup.join(" "));
+                                }
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if updated_nested {
+                pb.set_anki_show_tags(show_tags);
+                br.sync_nested_popup_to_bridge(app, false);
+            }
+        }
+        return;
+    }
+
+    let full = app.get_dict_results();
+    let count = full.row_count();
+    let Some(target) = full.row_data(updated_index) else {
+        return;
+    };
+    let existing_dups = pb.get_row_anki_duplicates();
+    let existing_note_ids = pb.get_row_anki_note_ids();
+    let existing_note_id_strings = pb.get_row_anki_note_id_strings();
+    let existing_queries = pb.get_row_anki_browse_queries();
+    let existing_tags = pb.get_row_anki_tags();
+
+    let mut dups = Vec::with_capacity(count);
+    let mut note_ids_i32 = Vec::with_capacity(count);
+    let mut note_ids_i64 = Vec::with_capacity(count);
+    let mut note_id_strings = Vec::with_capacity(count);
+    let mut queries = Vec::with_capacity(count);
+    let mut tags = Vec::with_capacity(count);
+    for idx in 0..count {
+        let mut d = existing_dups.row_data(idx).unwrap_or(false);
+        let mut nid32 = existing_note_ids.row_data(idx).unwrap_or(0);
+        let mut nid_str = existing_note_id_strings.row_data(idx).unwrap_or_default();
+        let mut nid64 = nid_str
+            .as_str()
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .unwrap_or_else(|| i64::from(nid32));
+        let mut q = existing_queries.row_data(idx).unwrap_or_default();
+        let mut t = existing_tags.row_data(idx).unwrap_or_default();
+        if let Some(row) = full.row_data(idx) {
+            if row.expression == target.expression
+                && row.reading == target.reading
+                && row.is_kanji == target.is_kanji
+            {
+                d = true;
+                nid64 = note_id;
+                nid32 = encode_note_id_i32(note_id);
+                nid_str = if note_id > 0 {
+                    SharedString::from(note_id.to_string())
+                } else {
+                    SharedString::default()
+                };
+                if q.is_empty() {
+                    q = SharedString::from(nid_query.as_str());
+                }
+                if show_tags && !joined_profile_tags.is_empty() {
+                    let combined = if t.is_empty() {
+                        joined_profile_tags.clone()
+                    } else {
+                        format!("{t} {joined_profile_tags}")
+                    };
+                    let dedup: Vec<String> = split_anki_tags_str(&combined)
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    t = SharedString::from(dedup.join(" "));
+                }
+            }
+        }
+        dups.push(d);
+        note_ids_i32.push(nid32);
+        note_ids_i64.push(nid64);
+        note_id_strings.push(nid_str);
+        queries.push(q);
+        tags.push(t);
+    }
+    if let Some(ref br) = active_bridge {
+        br.state.borrow_mut().root_row_anki_note_ids_i64 = note_ids_i64;
+    }
+    pb.set_anki_show_tags(show_tags);
+    pb.set_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+    pb.set_row_anki_note_ids(Rc::new(VecModel::from(note_ids_i32)).into());
+    pb.set_row_anki_note_id_strings(Rc::new(VecModel::from(note_id_strings)).into());
+    pb.set_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+    pb.set_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+    pb.set_popup_revision(pb.get_popup_revision().wrapping_add(1));
+    pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+}
+
 #[cfg(test)]
 mod mecab_settings_tests {
     use super::*;
@@ -12216,15 +12432,46 @@ mod mecab_settings_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = ConfigController::new();
         let cached = CachedConfigSettings::from_controller(&cfg, dir.path());
+        assert_eq!(cached.exact_enabled, raw::search::matcher::EXACT_DEFAULT);
+        assert_eq!(cached.deconj_enabled, raw::search::matcher::DECONJ_DEFAULT);
         assert_eq!(cached.mecab_enabled, raw::search::matcher::MECAB_IPADIC_DEFAULT);
+        assert_eq!(cached.remove_regex, raw::search::REMOVE_REGEX_DEFAULT);
+        assert_eq!(cached.replace_lines, raw::search::REPLACE_NEWLINES_DEFAULT);
+        assert_eq!(cached.replace_with, raw::search::REPLACE_NEWLINES_WITH_DEFAULT);
 
-        let key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::MECAB_IPADIC);
-        cfg.edit_setting(&key, "false").unwrap();
+        let exact_key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::EXACT);
+        let deconj_key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::DECONJ);
+        let mecab_key = format!("{}/{}", raw::search::GROUP, raw::search::matcher::MECAB_IPADIC);
+        let regex_key = format!("{}/{}", raw::search::GROUP, raw::search::REMOVE_REGEX);
+        let lines_key = format!("{}/{}", raw::search::GROUP, raw::search::REPLACE_NEWLINES);
+        let with_key = format!("{}/{}", raw::search::GROUP, raw::search::REPLACE_NEWLINES_WITH);
+
+        cfg.edit_setting(&exact_key, "false").unwrap();
+        cfg.edit_setting(&deconj_key, "false").unwrap();
+        cfg.edit_setting(&mecab_key, "false").unwrap();
+        cfg.edit_setting(&regex_key, "\\[.*?\\]").unwrap();
+        cfg.edit_setting(&lines_key, "true").unwrap();
+        cfg.edit_setting(&with_key, " ").unwrap();
         let mut updated = CachedConfigSettings::from_controller(&cfg, dir.path());
+        assert!(!updated.exact_enabled);
+        assert!(!updated.deconj_enabled);
         assert!(!updated.mecab_enabled);
+        assert_eq!(updated.remove_regex, "\\[.*?\\]");
+        assert!(updated.replace_lines);
+        assert_eq!(updated.replace_with, " ");
 
-        cfg.edit_setting(&key, "true").unwrap();
+        let mut dict = DictController::new();
+        updated.dict_search_config().apply_to(&mut dict);
+        assert!(!dict.exact_enabled());
+        assert!(!dict.deconj_enabled());
+        assert!(!dict.mecab_enabled());
+
+        cfg.edit_setting(&exact_key, "true").unwrap();
+        cfg.edit_setting(&deconj_key, "true").unwrap();
+        cfg.edit_setting(&mecab_key, "true").unwrap();
         updated.apply_controller(&cfg);
+        assert!(updated.exact_enabled);
+        assert!(updated.deconj_enabled);
         assert!(updated.mecab_enabled);
     }
 
