@@ -2068,3 +2068,469 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
         icons_field.description
     );
 }
+
+#[test]
+fn embedded_mkv_ass_track_never_inserts_combined_duplicate_and_highlights_simultaneous_rows() {
+    use memento_app::controller::anki::{apply_subtitle_cloze, NoteFieldsContext};
+    use memento_app::controller::player::{refresh_active_rows, refresh_subtitle_list};
+    use memento_app::{MementoApp, SubEntry};
+    use slint::{Model, VecModel};
+
+    let mut ctrl = SubtitleController::new();
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 1,
+        external: false,
+        external_path: String::new(),
+    }]);
+    ctrl.set_primary_sid(1);
+    assert!(ctrl.set_track_cues(
+        1,
+        vec![
+            create_cue("いいわけあるか〜っ！！", 1021.99, 1024.16),
+            create_cue("うわっ！", 1021.99, 1024.16),
+        ],
+    ));
+    let track = ctrl.track(1).expect("embedded ASS track");
+    assert!(!track.is_external());
+    assert!(track.is_loaded_complete());
+    assert!(!track.is_memory_track());
+    assert_eq!(ctrl.primary_entries().len(), 2);
+
+    // During playback mpv emits combined `sub-text` for overlapping ASS events.
+    let combined = create_cue("いいわけあるか〜っ！！\nうわっ！", 1021.99, 1024.16);
+    assert!(ctrl.update_active_cue(1, Some(&combined), 1022.5));
+    assert_eq!(
+        ctrl.primary_entries().len(),
+        2,
+        "upfront-extracted embedded ASS track must NOT insert mpv's combined sub-text as a 3rd row"
+    );
+    assert_eq!(ctrl.active_indices(1), &[0, 1]);
+    assert!(!ctrl.track(1).unwrap().is_memory_track());
+
+    // Transient `sub-lines` updates must NOT overwrite or duplicate a `loaded_complete` track.
+    let mem_changed = ctrl.update_memory_cues(
+        1,
+        &[MemorySubtitleCue {
+            id: 1,
+            text: "いいわけあるか〜っ！！\nうわっ！".encode_utf16().collect(),
+            start: 1021.99,
+            end: 1024.16,
+        }],
+        1022.5,
+    );
+    assert!(!mem_changed);
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.active_indices(1), &[0, 1]);
+    assert!(!ctrl.track(1).unwrap().is_memory_track());
+
+    // UI model highlights BOTH simultaneous rows cleanly with zero 3rd duplicate row.
+    i_slint_backend_testing::init_no_event_loop();
+    let app = MementoApp::new().unwrap();
+    let model = VecModel::<SubEntry>::default();
+    refresh_subtitle_list(&app, &model, &ctrl);
+    assert_eq!(model.row_count(), 2);
+    assert!(model.row_data(0).unwrap().is_active);
+    assert!(model.row_data(1).unwrap().is_active);
+    assert_eq!(model.row_data(0).unwrap().text.as_str(), "いいわけあるか〜っ！！");
+    assert_eq!(model.row_data(1).unwrap().text.as_str(), "うわっ！");
+
+    // Advancing past the cue clears both active highlights cleanly.
+    ctrl.update_position(1025.0);
+    refresh_active_rows(&model, &[0, 1], ctrl.active_indices(1));
+    assert!(!model.row_data(0).unwrap().is_active);
+    assert!(!model.row_data(1).unwrap().is_active);
+
+    // Multi-row Anki context selection contains each line once with accurate time range.
+    ctrl.select_row(0, false);
+    ctrl.select_row(1, true);
+    assert_eq!(ctrl.selected_indices(), &[0, 1]);
+    assert_eq!(ctrl.selected_time_range(), Some((1021.99, 1024.16)));
+    let selected_texts: Vec<String> = ctrl
+        .selected_cues()
+        .iter()
+        .map(|cue| String::from_utf16_lossy(&cue.text))
+        .collect();
+    assert_eq!(selected_texts, vec!["いいわけあるか〜っ！！", "うわっ！"]);
+    let mut ctx = NoteFieldsContext::default();
+    ctx.sentence = "いいわけあるか〜っ！！".to_owned();
+    ctx.expression = "いいわけ".to_owned();
+    apply_subtitle_cloze(&mut ctx, &selected_texts, Some(0), "いいわけ", Some(0));
+    assert_eq!(ctx.context, "いいわけあるか〜っ！！\nうわっ！");
+    assert_eq!(ctx.cloze_body, "いいわけ");
+}
+
+#[test]
+fn embedded_mkv_srt_track_normalizes_blank_lines_crlf_and_never_duplicates() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 2,
+        external: false,
+        external_path: String::new(),
+    }]);
+    ctrl.set_primary_sid(2);
+    assert!(ctrl.set_track_cues(
+        2,
+        vec![
+            create_cue("あっ。\n\n勝った勝った！", 926.526, 929.028),
+            // Exact duplicate packet (CRLF variant within 0.01s) must also deduplicate.
+            create_cue("あっ。\r\n勝った勝った！\r\n", 926.530, 929.030),
+        ],
+    ));
+    assert_eq!(ctrl.primary_entries().len(), 1);
+    assert_eq!(
+        ctrl.cue_text(0).as_deref(),
+        Some("あっ。\n勝った勝った！"),
+        "SRT cue text must normalize CRLF and collapse blank gap lines"
+    );
+    assert!(ctrl.track(2).unwrap().is_loaded_complete());
+    assert!(!ctrl.track(2).unwrap().is_memory_track());
+
+    // Playback update with mpv's normalized `sub-text` must NOT append a duplicate row.
+    let live = create_cue("あっ。\n勝った勝った！", 926.526, 929.028);
+    assert!(ctrl.update_active_cue(2, Some(&live), 927.0));
+    assert_eq!(ctrl.primary_entries().len(), 1);
+    assert_eq!(ctrl.active_indices(2), &[0]);
+    assert!(!ctrl.track(2).unwrap().is_memory_track());
+
+    // Transient `sub-lines` updates also must NOT duplicate or overwrite the track.
+    assert!(!ctrl.update_memory_cues(
+        2,
+        &[MemorySubtitleCue {
+            id: 1,
+            text: "あっ。\n勝った勝った！".encode_utf16().collect(),
+            start: 926.526,
+            end: 929.028,
+        }],
+        927.0,
+    ));
+    assert_eq!(ctrl.primary_entries().len(), 1);
+    assert_eq!(ctrl.active_indices(2), &[0]);
+}
+
+#[test]
+fn live_memory_track_accumulation_still_works_when_not_loaded_complete_and_resets_cleanly() {
+    let mut ctrl = SubtitleController::new();
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 1,
+        external: false,
+        external_path: String::new(),
+    }]);
+    ctrl.set_primary_sid(1);
+    assert!(!ctrl.track(1).unwrap().is_loaded_complete());
+
+    // Streaming / non-MKV embedded tracks still accumulate live `sub-text` cues.
+    assert!(ctrl.update_active_cue(1, Some(&create_cue("First live line", 1.0, 2.5)), 1.5));
+    assert!(ctrl.update_active_cue(
+        1,
+        Some(&create_cue("Second\r\n\r\nlive line", 3.0, 4.5)),
+        3.5
+    ));
+    // Re-emitting normalized form at the same timestamp must NOT duplicate.
+    assert!(ctrl.update_active_cue(
+        1,
+        Some(&create_cue("Second\nlive line", 3.0, 4.5)),
+        3.8
+    ));
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.cue_text(0).as_deref(), Some("First live line"));
+    assert_eq!(ctrl.cue_text(1).as_deref(), Some("Second\nlive line"));
+    assert!(ctrl.track(1).unwrap().is_memory_track());
+    assert_eq!(ctrl.active_indices(1), &[1]);
+
+    // `update_memory_cues` continues working while `loaded_complete == false`.
+    assert!(ctrl.update_memory_cues(
+        1,
+        &[
+            MemorySubtitleCue {
+                id: 10,
+                text: "Mem A".encode_utf16().collect(),
+                start: 1.0,
+                end: 2.0,
+            },
+            MemorySubtitleCue {
+                id: 11,
+                text: "Mem B".encode_utf16().collect(),
+                start: 3.0,
+                end: 4.0,
+            },
+        ],
+        1.5,
+    ));
+    assert_eq!(ctrl.primary_entries().len(), 2);
+    assert_eq!(ctrl.cue_text(0).as_deref(), Some("Mem A"));
+
+    // Once upfront extraction finishes (`set_track_cues`), it replaces live cues and locks out transient inserts.
+    assert!(ctrl.set_track_cues(1, vec![create_cue("Extracted full track", 1.0, 4.0)]));
+    assert!(ctrl.track(1).unwrap().is_loaded_complete());
+    assert!(!ctrl.track(1).unwrap().is_memory_track());
+    assert!(ctrl.update_active_cue(1, Some(&create_cue("Should not insert", 1.0, 4.0)), 2.0));
+    assert_eq!(ctrl.primary_entries().len(), 1);
+
+    // Removing the track or clearing the controller resets `loaded_complete` cleanly.
+    ctrl.sync_tracks(&[]);
+    assert!(ctrl.track(1).is_none());
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 1,
+        external: false,
+        external_path: String::new(),
+    }]);
+    assert!(!ctrl.track(1).unwrap().is_loaded_complete());
+
+    // Reloading an external track resets `loaded_complete` until `set_external_cues` completes,
+    // and switching back to embedded via `ClearExternal` also resets `loaded_complete`.
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 1,
+        external: true,
+        external_path: "/tmp/sub.srt".to_owned(),
+    }]);
+    assert!(!ctrl.track(1).unwrap().is_loaded_complete());
+    assert!(ctrl.set_external_cues(1, "/tmp/sub.srt", vec![create_cue("Ext cue", 1.0, 2.0)]));
+    assert!(ctrl.track(1).unwrap().is_loaded_complete());
+    ctrl.sync_tracks(&[SubtitleTrackInfo {
+        id: 1,
+        external: false,
+        external_path: String::new(),
+    }]);
+    assert!(!ctrl.track(1).unwrap().is_loaded_complete());
+
+    // Secondary embedded track populated via `set_track_cues` also ignores transient inserts.
+    ctrl.sync_tracks(&[
+        SubtitleTrackInfo { id: 1, external: false, external_path: String::new() },
+        SubtitleTrackInfo { id: 2, external: false, external_path: String::new() },
+    ]);
+    ctrl.set_secondary_sid(2);
+    assert!(ctrl.set_track_cues(2, vec![create_cue("Secondary extracted", 5.0, 7.0)]));
+    assert!(ctrl.update_active_cue(2, Some(&create_cue("Transient secondary", 5.0, 7.0)), 6.0));
+    assert_eq!(ctrl.secondary_entries().len(), 1);
+    assert_eq!(ctrl.active_indices(2), &[0]);
+
+    ctrl.clear();
+    assert!(ctrl.tracks().is_empty());
+}
+
+#[test]
+fn filter_and_sort_cues_normalizes_line_breaks_and_deduplicates_exact_matches_within_10ms() {
+    let cues = vec![
+        // CRLF + leading/trailing blank lines + exact duplicate within 0.01s at large timestamp.
+        create_cue("\r\n\nLine A\r\n\r\nLine B \r\n", 100.00, 102.00),
+        create_cue("Line A\nLine B", 100.01, 102.01),
+        // Same text at a later timestamp (> 0.01s away) must NOT be deduplicated.
+        create_cue("Line A\nLine B", 105.00, 107.00),
+        // Distinct simultaneous ASS cues at identical timestamps must BOTH survive in order.
+        create_cue("いいわけあるか〜っ！！", 50.00, 52.00),
+        create_cue("うわっ！", 50.00, 52.00),
+        // Whitespace-only cue must be discarded.
+        create_cue("  \r\n\t\n  ", 10.00, 12.00),
+    ];
+
+    let filtered = filter_and_sort_cues(&cues);
+    let texts: Vec<String> = filtered
+        .iter()
+        .map(|c| String::from_utf16_lossy(&c.text))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "いいわけあるか〜っ！！",
+            "うわっ！",
+            "Line A\nLine B",
+            "Line A\nLine B",
+        ]
+    );
+    assert_eq!(filtered[0].start, 50.0);
+    assert_eq!(filtered[1].start, 50.0);
+    assert_eq!(filtered[2].start, 100.0);
+    assert_eq!(filtered[3].start, 105.0);
+}
+
+#[test]
+fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines() {
+    use std::cell::{Cell, RefCell};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use memento_app::controller::asr::AsrController;
+    use memento_app::controller::player::{refresh_subtitle_list, LivePlayerCoordinator};
+    use memento_app::{MementoApp, SubEntry};
+    use memento_player::{CliOption, MpvInstance};
+    use slint::{Model as _, VecModel};
+
+    let mkv_path = Path::new(
+        "/home/eyalm/Desktop/japanese/anime/[NanakoRaws] Summer Pockets (AT-X 1920x1080 x265 AAC)/[NanakoRaws] Summer Pockets - 01 (AT-X 1920x1080 x265 AAC).mkv",
+    );
+    if !mkv_path.is_file() {
+        return;
+    }
+
+    // Extract both embedded tracks with memento-ass exactly like src/main.rs does.
+    let ass_extracted =
+        memento_ass::extract_mkv_subtitle_track(mkv_path, 3).expect("extract ep01 ASS track");
+    let srt_extracted =
+        memento_ass::extract_mkv_subtitle_track(mkv_path, 4).expect("extract ep01 SRT track");
+    assert_eq!(ass_extracted.cues.len(), 430);
+    assert_eq!(srt_extracted.cues.len(), 297);
+    assert!(
+        srt_extracted
+            .cues
+            .iter()
+            .all(|c| !c.plain_text.contains('\r') && !c.plain_text.contains("\n\n")),
+        "extracted MKV SRT cues must not contain CR or double blank lines"
+    );
+    assert!(
+        srt_extracted
+            .cues
+            .iter()
+            .any(|c| c.plain_text == "あっ。\n勝った勝った！"),
+        "ep01 SRT cue 197 must normalize cleanly to 'あっ。\\n勝った勝った！'"
+    );
+
+    let to_entries = |cues: &[memento_ass::MkvSubtitleCue]| {
+        cues.iter()
+            .filter_map(|c| {
+                if c.plain_text.trim().is_empty() || c.end_ms <= c.start_ms {
+                    return None;
+                }
+                Some(create_cue(
+                    &c.plain_text,
+                    c.start_ms as f64 / 1000.0,
+                    c.end_ms as f64 / 1000.0,
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    i_slint_backend_testing::init_no_event_loop();
+    let app = MementoApp::new().unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
+    std::fs::write(temp.path().join("input.conf"), "").unwrap();
+    std::fs::write(
+        temp.path().join("mpv.conf"),
+        "ao=null\nvo=libmpv\nhwdec=no\nmsg-level=all=error\n",
+    )
+    .unwrap();
+    let player = MpvInstance::new_with_options(
+        Some(temp.path()),
+        &[CliOption {
+            name: "sub-font-size".into(),
+            value: "36".into(),
+        }],
+    )
+    .expect("headless MpvInstance");
+    let mut coord = LivePlayerCoordinator::new(&player);
+    let mut subtitles = SubtitleController::new();
+    let sub_model = VecModel::<SubEntry>::default();
+    let mut asr = AsrController::new();
+    let media_gen = Cell::new(1u64);
+    let current_media = RefCell::new(None);
+    let asr_restart = Cell::new(false);
+    let hover_owned = Cell::new(false);
+
+    coord.mark_explicit_media_load(1);
+    player.pause().unwrap();
+    player.load_file(&mkv_path.to_string_lossy()).unwrap();
+
+    let mut pump = |subtitles: &mut SubtitleController,
+                    timeout: Duration,
+                    mut pred: Box<dyn FnMut(&LivePlayerCoordinator, &MementoApp, &SubtitleController) -> bool>|
+     -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let _ = coord.sync(
+                &app,
+                &player,
+                subtitles,
+                &sub_model,
+                &mut asr,
+                &media_gen,
+                &current_media,
+                &asr_restart,
+                &hover_owned,
+                || Err("no settings".into()),
+                |app, text| app.set_active_sub_text(text.into()),
+            );
+            if pred(&coord, &app, subtitles) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        false
+    };
+
+    assert!(pump(
+        &mut subtitles,
+        Duration::from_secs(6),
+        Box::new(|c, _, _| c.playback_state().file_loaded && c.playback_state().subtitle_tracks.len() >= 2),
+    ));
+
+    // Populate both embedded tracks via `set_track_cues` just like MKV_EXTRACT_SINK.
+    subtitles.ensure_track(1);
+    subtitles.set_track_cues(1, to_entries(&ass_extracted.cues));
+    let ass_expected_len = subtitles.track(1).unwrap().entries().len();
+    subtitles.ensure_track(2);
+    subtitles.set_track_cues(2, to_entries(&srt_extracted.cues));
+    let srt_expected_len = subtitles.track(2).unwrap().entries().len();
+    assert_eq!(srt_expected_len, 297);
+    refresh_subtitle_list(&app, &sub_model, &subtitles);
+
+    // 1. Seek into the overlapping ASS scene (`1021.99..1024.16`: いいわけあるか～っ！！ + うわっ！).
+    player.set_sid(1).unwrap();
+    player.seek(1022.5).unwrap();
+    assert!(
+        pump(
+            &mut subtitles,
+            Duration::from_secs(6),
+            Box::new(|c, app, _| c.playback_state().primary_sid == 1
+                && app.get_active_sub_text().as_str().contains("いいわけあるか")),
+        ),
+        "libmpv did not emit ASS sub-text at 1022.5s (got {:?})",
+        app.get_active_sub_text()
+    );
+    assert_eq!(
+        subtitles.primary_entries().len(),
+        ass_expected_len,
+        "ASS track entry count must not grow when mpv emits combined sub-text"
+    );
+    assert_eq!(sub_model.row_count(), ass_expected_len);
+    let active_ass_texts: Vec<String> = (0..sub_model.row_count())
+        .filter_map(|i| sub_model.row_data(i))
+        .filter(|r| r.is_active)
+        .map(|r| r.text.to_string())
+        .collect();
+    assert_eq!(
+        active_ass_texts,
+        vec!["いいわけあるか～っ！！", "うわっ！"],
+        "both overlapping ASS rows must highlight with ZERO 3rd combined duplicate row"
+    );
+
+    // 2. Switch to embedded SRT track (`sid = 2`) and seek to `927.0s` (あっ。\n勝った勝った！).
+    player.set_sid(2).unwrap();
+    player.seek(927.0).unwrap();
+    assert!(
+        pump(
+            &mut subtitles,
+            Duration::from_secs(6),
+            Box::new(|c, app, _| c.playback_state().primary_sid == 2
+                && app.get_active_sub_text().as_str().contains("勝った勝った")),
+        ),
+        "libmpv did not emit SRT sub-text at 927.0s (got {:?})",
+        app.get_active_sub_text()
+    );
+    assert_eq!(
+        subtitles.primary_entries().len(),
+        srt_expected_len,
+        "SRT track entry count must stay 297 with ZERO duplicates during playback"
+    );
+    assert_eq!(sub_model.row_count(), srt_expected_len);
+    let active_srt_texts: Vec<String> = (0..sub_model.row_count())
+        .filter_map(|i| sub_model.row_data(i))
+        .filter(|r| r.is_active)
+        .map(|r| r.text.to_string())
+        .collect();
+    assert_eq!(active_srt_texts, vec!["あっ。\n勝った勝った！"]);
+    assert!(
+        (0..sub_model.row_count())
+            .filter_map(|i| sub_model.row_data(i))
+            .all(|r| !r.text.as_str().contains('\r') && !r.text.as_str().contains("\n\n")),
+        "SRT list rows must have zero CR or blank gap lines"
+    );
+}

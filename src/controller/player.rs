@@ -243,8 +243,8 @@ use slint::{Model as _, VecModel};
 use crate::controller::asr::{AsrController, AsrEvent, AsrSettings, SessionStart};
 use crate::controller::media::MediaContext;
 use crate::controller::subtitles::{
-    create_cue, ExternalSubtitleLoad, MemorySubtitleCue, SubtitleController, SubtitleTrackInfo,
-    ASR_TRACK_ID,
+    create_cue, normalize_subtitle_text, ExternalSubtitleLoad, MemorySubtitleCue,
+    SubtitleController, SubtitleTrackInfo, ASR_TRACK_ID,
 };
 use crate::{MementoApp, PlayerTrack, SubEntry};
 
@@ -1036,8 +1036,9 @@ impl LivePlayerCoordinator {
         self.state.sub_end = player.get_sub_end();
         self.state.sub_delay = player.get_sub_delay();
         self.state.sub_speed = player.get_sub_speed().max(f64::EPSILON);
-        self.state.sub_text = player.get_sub_text().unwrap_or_default();
-        self.state.secondary_sub_text = player.get_secondary_sub_text().unwrap_or_default();
+        self.state.sub_text = normalize_subtitle_text(&player.get_sub_text().unwrap_or_default());
+        self.state.secondary_sub_text =
+            normalize_subtitle_text(&player.get_secondary_sub_text().unwrap_or_default());
         self.state.secondary_sub_start = player.get_secondary_sub_start();
         self.state.secondary_sub_end = player.get_secondary_sub_end();
         self.state.secondary_sub_delay = player.get_secondary_sub_delay();
@@ -1907,11 +1908,12 @@ impl LivePlayerCoordinator {
                         sub_times_dirty = true;
                     }
                     "sub-text" => {
-                        let text = match value {
-                            MpvPropertyValue::String(s) => s.trim().to_owned(),
+                        let raw_text = match value {
+                            MpvPropertyValue::String(s) => s.clone(),
                             MpvPropertyValue::None => String::new(),
                             _ => player.get_sub_text().unwrap_or_default(),
                         };
+                        let text = normalize_subtitle_text(&raw_text);
                         if text.is_empty() {
                             self.state.sub_text.clear();
                             self.state.sub_start = 0.0;
@@ -2015,11 +2017,12 @@ impl LivePlayerCoordinator {
                         }
                     }
                     "secondary-sub-text" => {
-                        let text = match value {
-                            MpvPropertyValue::String(s) => s.trim().to_owned(),
+                        let raw_text = match value {
+                            MpvPropertyValue::String(s) => s.clone(),
                             MpvPropertyValue::None => String::new(),
                             _ => player.get_secondary_sub_text().unwrap_or_default(),
                         };
+                        let text = normalize_subtitle_text(&raw_text);
                         if text.is_empty() {
                             self.state.secondary_sub_text.clear();
                             self.state.secondary_sub_start = 0.0;

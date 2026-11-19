@@ -8,24 +8,77 @@ use memento_subtitle::model::{
 };
 use memento_subtitle::SubtitleEntry;
 
-/// Validates and stably sorts subtitle cues by start timestamp.
+/// Normalize subtitle cue text: converts CRLF (`\r\n`) and CR (`\r`) line
+/// endings to `\n`, collapses redundant empty blank lines inside multi-line
+/// cues (e.g. `"あっ。\n\n勝った勝った！"` -> `"あっ。\n勝った勝った！"`),
+/// and trims leading/trailing blank lines and whitespace.
+pub fn normalize_subtitle_text(text: &str) -> String {
+    let stripped = text.trim_end_matches('\0');
+    let normalized = stripped.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line.trim_end_matches([' ', '\t']));
+    }
+    out.trim().to_string()
+}
+
+/// Timestamp tolerance (seconds) for deduplicating exact duplicate cues.
+const DUPLICATE_CUE_TIME_EPSILON: f64 = 0.01 + 1e-9;
+
+/// Validates, normalizes, deduplicates, and stably sorts subtitle cues by start timestamp.
 ///
 /// Discards cues where:
 /// - `start < 0.0`
 /// - `end <= start`
 /// - `!start.is_finite()`
 /// - `!end.is_finite()`
+/// - normalized text is empty
+///
+/// Normalizes `\r\n`/`\r` line endings, collapses redundant empty blank lines
+/// inside cues, and removes exact duplicate cues (identical trimmed/normalized
+/// text with matching `start` and `end` within `0.01s`).
 pub fn filter_and_sort_cues<C: AsRef<[SubtitleEntry]>>(cues: C) -> Vec<SubtitleEntry> {
     let slice = cues.as_ref();
     let mut valid: Vec<SubtitleEntry> = slice
         .iter()
         .filter(|c| c.start >= 0.0 && c.end > c.start && c.start.is_finite() && c.end.is_finite())
-        .cloned()
+        .filter_map(|c| {
+            let norm = normalize_subtitle_text(&String::from_utf16_lossy(&c.text));
+            if norm.is_empty() {
+                return None;
+            }
+            Some(SubtitleEntry {
+                text: norm.encode_utf16().collect(),
+                start: c.start,
+                end: c.end,
+            })
+        })
         .collect();
     valid.sort_by(|a, b| {
         a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal)
     });
-    valid
+    let mut deduped: Vec<SubtitleEntry> = Vec::with_capacity(valid.len());
+    for cue in valid {
+        let is_dup = deduped
+            .iter()
+            .rev()
+            .take_while(|prev| cue.start - prev.start <= DUPLICATE_CUE_TIME_EPSILON)
+            .any(|prev| {
+                (cue.start - prev.start).abs() <= DUPLICATE_CUE_TIME_EPSILON
+                    && (cue.end - prev.end).abs() <= DUPLICATE_CUE_TIME_EPSILON
+                    && cue.text == prev.text
+            });
+        if !is_dup {
+            deduped.push(cue);
+        }
+    }
+    deduped
 }
 
 /// Helper to create a SubtitleEntry with text encoded as UTF-16 code units.
@@ -74,6 +127,7 @@ pub struct SubtitleTrackModel {
     active_indices: Vec<usize>,
     is_memory_track: bool,
     is_asr_track: bool,
+    loaded_complete: bool,
 }
 
 impl SubtitleTrackModel {
@@ -88,6 +142,7 @@ impl SubtitleTrackModel {
             active_indices: Vec::new(),
             is_memory_track: false,
             is_asr_track: false,
+            loaded_complete: false,
         }
     }
 
@@ -121,6 +176,10 @@ impl SubtitleTrackModel {
 
     pub fn is_asr_track(&self) -> bool {
         self.is_asr_track
+    }
+
+    pub fn is_loaded_complete(&self) -> bool {
+        self.loaded_complete
     }
 
     fn replace_memory_entries(&mut self, entries: Vec<SubtitleEntry>) {
@@ -237,6 +296,7 @@ impl SubtitleController {
                         track.selection_anchor = None;
                         track.active_indices.clear();
                         track.is_memory_track = false;
+                        track.loaded_complete = false;
                         if read_file && !path.is_empty() {
                             reloads.push(ExternalSubtitleLoad {
                                 track_id,
@@ -254,6 +314,7 @@ impl SubtitleController {
                         track.selection_anchor = None;
                         track.active_indices.clear();
                         track.is_memory_track = false;
+                        track.loaded_complete = false;
                     }
                 }
                 TrackAction::RemoveTrack { track_id } => {
@@ -493,6 +554,7 @@ impl SubtitleController {
             track.selection_anchor = None;
             track.active_indices.clear();
             track.is_memory_track = false;
+            track.loaded_complete = false;
         }
     }
 
@@ -505,8 +567,16 @@ impl SubtitleController {
     }
 
     pub fn filter_and_sort(&mut self) {
+        let was_complete = self
+            .track(self.primary_sid)
+            .is_some_and(|track| track.loaded_complete);
         let entries = filter_and_sort_cues(self.primary_entries());
         self.set_entries(entries);
+        if was_complete {
+            if let Some(track) = self.track_mut(self.primary_sid) {
+                track.loaded_complete = true;
+            }
+        }
     }
 
     pub fn filter_and_sort_cues<C: AsRef<[SubtitleEntry]>>(cues: C) -> Vec<SubtitleEntry> {
@@ -523,6 +593,7 @@ impl SubtitleController {
         track.selection_anchor = None;
         track.active_indices.clear();
         track.is_memory_track = false;
+        track.loaded_complete = true;
         true
     }
 
@@ -546,12 +617,18 @@ impl SubtitleController {
         track.selection_anchor = None;
         track.active_indices.clear();
         track.is_memory_track = false;
+        track.loaded_complete = true;
         true
     }
 
     /// Replace the dynamically reported `sub-lines` list for a memory track.
     /// Empty updates clear cues only for a SID previously marked as a memory
     /// track, matching mpv's transient subtitle-line behavior.
+    ///
+    /// Tracks that are already completely populated (external subtitle files,
+    /// upfront-extracted embedded MKV tracks, or ASR tracks) are never
+    /// overwritten by transient `sub-lines` updates; only their active row
+    /// indices are refreshed.
     pub fn update_memory_cues(
         &mut self,
         sid: i64,
@@ -561,7 +638,10 @@ impl SubtitleController {
         let Some(index) = self.track_index(sid) else {
             return false;
         };
-        if self.tracks[index].is_asr_track {
+        if self.tracks[index].is_asr_track
+            || self.tracks[index].external
+            || self.tracks[index].loaded_complete
+        {
             self.tracks[index].active_indices =
                 select_active_indices(&self.tracks[index].entries, raw_position);
             return false;
@@ -594,20 +674,32 @@ impl SubtitleController {
             .collect();
         let sorted_indices = model::filter_and_sort_cues(&candidates);
         let track = &mut self.tracks[index];
-        let entries = sorted_indices.into_iter().map(|cue_index| {
-            let cue = &cues[cue_index];
-            SubtitleEntry {
-                text: cue.text.clone(),
-                start: cue.start,
-                end: cue.end,
-            }
-        }).collect();
+        let entries = sorted_indices
+            .into_iter()
+            .filter_map(|cue_index| {
+                let cue = &cues[cue_index];
+                let norm = normalize_subtitle_text(&String::from_utf16_lossy(&cue.text));
+                if norm.is_empty() {
+                    return None;
+                }
+                Some(SubtitleEntry {
+                    text: norm.encode_utf16().collect(),
+                    start: cue.start,
+                    end: cue.end,
+                })
+            })
+            .collect();
         track.replace_memory_entries(entries);
         track.active_indices = select_active_indices(&track.entries, raw_position);
         true
     }
 
     /// Add or select mpv's current transient subtitle cue for one SID.
+    ///
+    /// When a track is external, ASR-owned, or upfront-loaded (`loaded_complete`),
+    /// transient `sub-text` values are never inserted into `track.entries` (so
+    /// simultaneous overlapping cues or combined `sub-text` strings do not create
+    /// duplicate rows); only `active_indices` is updated from `raw_position`.
     pub fn update_active_cue(
         &mut self,
         sid: i64,
@@ -622,7 +714,7 @@ impl SubtitleController {
             return false;
         };
         let track = &mut self.tracks[index];
-        if track.is_asr_track {
+        if track.is_asr_track || track.external || track.loaded_complete {
             if cue.text.is_empty() {
                 track.active_indices.clear();
             } else {
@@ -637,17 +729,30 @@ impl SubtitleController {
             raw_position,
         );
         if action.action == ActiveCueActionKind::AddAndSelect {
+            let norm_text: Vec<u16> =
+                normalize_subtitle_text(&String::from_utf16_lossy(&cue.text))
+                    .encode_utf16()
+                    .collect();
+            if norm_text.is_empty() {
+                track.active_indices.clear();
+                return true;
+            }
+            let normalized_cue = SubtitleEntry {
+                text: norm_text,
+                start: cue.start,
+                end: cue.end,
+            };
             let views: Vec<_> = track.entries.iter().map(model::SubtitleCueView::from).collect();
             let add_plan = model::plan_add_subtitle(
                 &views,
-                track.external,
-                &cue.text,
-                cue.start,
-                cue.end,
+                false,
+                &normalized_cue.text,
+                normalized_cue.start,
+                normalized_cue.end,
             );
             if add_plan.action == model::AddAction::Insert {
                 let insert_at = (add_plan.index as usize).min(track.entries.len());
-                track.entries.insert(insert_at, cue.clone());
+                track.entries.insert(insert_at, normalized_cue);
                 for index in &mut track.selected_indices {
                     if *index >= insert_at { *index += 1; }
                 }
@@ -655,9 +760,7 @@ impl SubtitleController {
                     if *anchor >= insert_at { *anchor += 1; }
                 }
             }
-            if !track.external {
-                track.is_memory_track = true;
-            }
+            track.is_memory_track = true;
             track.active_indices = select_active_indices(&track.entries, action.raw_position);
         } else if action.action == ActiveCueActionKind::ClearSelection {
             track.active_indices.clear();
