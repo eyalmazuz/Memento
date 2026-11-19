@@ -48,6 +48,7 @@ memento-config = { path = "crates/memento-config" }
 memento-setting = { path = "crates/memento-setting" }
 memento-player = { path = "crates/memento-player" }
 memento-subtitle = { path = "crates/memento-subtitle" }
+memento-ass = { path = "crates/memento-ass" }
 memento-dict = { path = "crates/memento-dict" }
 memento-definition = { path = "crates/memento-definition" }
 memento-anki = { path = "crates/memento-anki" }

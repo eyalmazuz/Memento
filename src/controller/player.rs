@@ -265,10 +265,53 @@ pub fn is_image_subtitle_codec(codec: &str) -> bool {
 /// Compute `(sub-visibility, secondary-sub-visibility)` for `libmpv` without
 /// toggling visibility during silence gaps between text cues.
 ///
-/// Keeps `sub-visibility = false` whenever Memento's overlay owns the active
-/// text track (`hide_mpv_subtitles && subtitles_visible && !(hide_while_playing && playing)`),
-/// while keeping `secondary-sub-visibility = true` if the selected secondary
-/// track is image/bitmap-based (`dvd_subtitle`, `hdmv_pgs_subtitle`, `dvb_subtitle`).
+/// Honors `Ctrl+0` (`subtitles_visible == false`), `behavior/subtitle-cursor-show`
+/// reveal zones, native ASS/SSA rendering (`primary_is_native_ass`), bitmap/image
+/// tracks, and `search/hide-bar` (`hide_while_playing`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_mpv_subtitle_visibility_ex(
+    hide_mpv_subtitles: bool,
+    subtitles_visible: bool,
+    hide_while_playing: bool,
+    playing: bool,
+    primary_is_image: bool,
+    secondary_is_image: bool,
+    primary_is_native_ass: bool,
+    primary_cursor_show_enabled: bool,
+    primary_cursor_reveal: bool,
+    secondary_cursor_show_enabled: bool,
+    secondary_cursor_reveal: bool,
+) -> (bool, bool) {
+    let primary_visible = if primary_is_native_ass {
+        if primary_cursor_show_enabled {
+            primary_cursor_reveal
+        } else {
+            subtitles_visible
+        }
+    } else if !subtitles_visible && !(primary_cursor_show_enabled && primary_cursor_reveal) {
+        false
+    } else if primary_is_image {
+        true
+    } else {
+        let overlay_owns_text = hide_mpv_subtitles && !(hide_while_playing && playing);
+        !overlay_owns_text
+    };
+
+    let secondary_visible =
+        if !subtitles_visible && !(secondary_cursor_show_enabled && secondary_cursor_reveal) {
+            false
+        } else if secondary_is_image {
+            true
+        } else {
+            let overlay_owns_text = hide_mpv_subtitles && !(hide_while_playing && playing);
+            !overlay_owns_text
+        };
+
+    (primary_visible, secondary_visible)
+}
+
+/// Convenience wrapper for [`compute_mpv_subtitle_visibility_ex`] with native ASS
+/// and cursor-show reveal disabled.
 pub fn compute_mpv_subtitle_visibility(
     hide_mpv_subtitles: bool,
     subtitles_visible: bool,
@@ -277,11 +320,19 @@ pub fn compute_mpv_subtitle_visibility(
     primary_is_image: bool,
     secondary_is_image: bool,
 ) -> (bool, bool) {
-    let overlay_owns_text =
-        hide_mpv_subtitles && subtitles_visible && !(hide_while_playing && playing);
-    let primary_visible = primary_is_image || !overlay_owns_text;
-    let secondary_visible = secondary_is_image || !overlay_owns_text;
-    (primary_visible, secondary_visible)
+    compute_mpv_subtitle_visibility_ex(
+        hide_mpv_subtitles,
+        subtitles_visible,
+        hide_while_playing,
+        playing,
+        primary_is_image,
+        secondary_is_image,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 /// Apply Memento's configured `search/remove-regex`, `search/replace-lines`, and
@@ -1020,6 +1071,24 @@ impl LivePlayerCoordinator {
         &mut self.asr_track
     }
 
+    /// Returns true if the active primary subtitle track is ASS/SSA and native
+    /// `libmpv`/`libass` rendering (`interface/sub-ass-native`) is enabled.
+    pub fn primary_is_native_ass(&self, app: &MementoApp) -> bool {
+        let primary_sid = self.state.primary_sid;
+        primary_sid > 0
+            && app.get_sub_ass_native()
+            && !app.get_asr_track_selected()
+            && self
+                .subtitle_codecs
+                .get(&primary_sid)
+                .is_some_and(|codec| crate::controller::ass::is_ass_subtitle_codec(codec))
+    }
+
+    /// Codec reported by mpv for a subtitle SID (e.g. `"ass"`, `"subrip"`, `"hdmv_pgs_subtitle"`).
+    pub fn subtitle_codec(&self, sid: i64) -> Option<&str> {
+        self.subtitle_codecs.get(&sid).map(String::as_str)
+    }
+
     pub fn auto_pause_state(&self) -> &AutoPauseState {
         &self.auto_pause
     }
@@ -1264,6 +1333,8 @@ impl LivePlayerCoordinator {
         self.state.secondary_sid = 0;
         self.state.video_id = 0;
         self.state.sub_text.clear();
+        self.state.sub_ass_extradata.clear();
+        self.state.sub_text_ass_full.clear();
         self.state.secondary_sub_text.clear();
         self.state.sub_start = 0.0;
         self.state.sub_end = 0.0;
@@ -1465,6 +1536,8 @@ impl LivePlayerCoordinator {
                     self.state.audio_id = 0;
                     self.state.primary_sid = 0;
                     self.state.secondary_sid = 0;
+                    self.state.sub_ass_extradata.clear();
+                    self.state.sub_text_ass_full.clear();
                     sub_times_dirty = false;
                     self.auto_pause = AutoPauseState::default();
                 }
@@ -1764,6 +1837,10 @@ impl LivePlayerCoordinator {
                                 self.previous_sub_times = (0.0, 0.0);
                                 self.state.sub_start = 0.0;
                                 self.state.sub_end = 0.0;
+                                self.state.sub_text_ass_full.clear();
+                                if new_sid == 0 {
+                                    self.state.sub_ass_extradata.clear();
+                                }
                                 sub_times_dirty = false;
                             }
                         }
@@ -1843,6 +1920,77 @@ impl LivePlayerCoordinator {
                             self.state.sub_text = text;
                         }
                         sub_times_dirty = true;
+                    }
+                    "sub-ass-extradata" => {
+                        self.state.sub_ass_extradata = match value {
+                            MpvPropertyValue::String(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                    }
+                    "sub-text/ass-full" => {
+                        self.state.sub_text_ass_full = match value {
+                            MpvPropertyValue::String(s) => s.clone(),
+                            _ => String::new(),
+                        };
+                    }
+                    "osd-dimensions" => {
+                        if let MpvPropertyValue::OsdDimensions(dims) = value {
+                            self.state.osd_dimensions = *dims;
+                        }
+                    }
+                    "sub-scale" => {
+                        let v = match value {
+                            MpvPropertyValue::Double(d) => *d,
+                            MpvPropertyValue::Int64(i) => *i as f64,
+                            _ => 1.0,
+                        };
+                        self.state.sub_scale = v.max(0.05);
+                    }
+                    "sub-pos" => {
+                        let v = match value {
+                            MpvPropertyValue::Double(d) => *d,
+                            MpvPropertyValue::Int64(i) => *i as f64,
+                            _ => 100.0,
+                        };
+                        self.state.sub_pos = v.clamp(0.0, 150.0);
+                    }
+                    "sub-font" => {
+                        if let MpvPropertyValue::String(s) = value {
+                            if !s.is_empty() {
+                                self.state.sub_font = s.clone();
+                            }
+                        }
+                    }
+                    "sub-ass-override" => {
+                        if let MpvPropertyValue::String(s) = value {
+                            if !s.is_empty() {
+                                self.state.sub_ass_override = s.clone();
+                            }
+                        }
+                    }
+                    "sub-scale-signs" => {
+                        if let MpvPropertyValue::Flag(v) = value {
+                            self.state.sub_scale_signs = *v;
+                        }
+                    }
+                    "sub-use-margins" => {
+                        if let MpvPropertyValue::Flag(v) = value {
+                            self.state.sub_use_margins = *v;
+                        }
+                    }
+                    "sub-hinting" => {
+                        if let MpvPropertyValue::String(s) = value {
+                            if !s.is_empty() {
+                                self.state.sub_hinting = s.clone();
+                            }
+                        }
+                    }
+                    "sub-shaper" => {
+                        if let MpvPropertyValue::String(s) = value {
+                            if !s.is_empty() {
+                                self.state.sub_shaper = s.clone();
+                            }
+                        }
                     }
                     "secondary-sub-start" => {
                         match value {
@@ -2252,7 +2400,8 @@ impl LivePlayerCoordinator {
         }
 
         // Update mpv subtitle visibility without flashing during cue gaps,
-        // keeping bitmap secondary tracks visible in libmpv.
+        // preserving native ASS/SSA rendering, bitmap secondary tracks, Ctrl+0,
+        // and cursor-show reveal zones.
         let primary_is_image = primary_sid > 0
             && !app.get_asr_track_selected()
             && self
@@ -2264,13 +2413,19 @@ impl LivePlayerCoordinator {
                 .subtitle_codecs
                 .get(&secondary_sid)
                 .is_some_and(|codec| is_image_subtitle_codec(codec));
-        let (want_primary_vis, want_secondary_vis) = compute_mpv_subtitle_visibility(
+        let primary_is_native_ass = self.primary_is_native_ass(app);
+        let (want_primary_vis, want_secondary_vis) = compute_mpv_subtitle_visibility_ex(
             app.get_hide_mpv_subtitles(),
             app.get_subtitles_visible(),
             app.get_hide_memento_while_playing(),
             !paused,
             primary_is_image,
             secondary_is_image,
+            primary_is_native_ass,
+            app.get_subtitle_cursor_show_enabled(),
+            app.get_primary_cursor_reveal_active(),
+            app.get_secondary_subtitle_cursor_show_enabled(),
+            app.get_secondary_cursor_reveal_active(),
         );
         if self.previous_primary_mpv_visible != Some(want_primary_vis) {
             let vis = if want_primary_vis { "yes" } else { "no" };

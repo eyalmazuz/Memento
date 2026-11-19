@@ -293,12 +293,40 @@ pub struct AudioTrack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrack {
     pub id: i64,
+    pub src_id: i64,
+    pub codec: String,
     pub external_path: String,
     pub language: String,
     pub title: String,
     pub external: bool,
     pub default_track: bool,
     pub selected: bool,
+}
+
+/// Snapshot of mpv's `osd-dimensions` property (framebuffer & margin geometry for ASS layout).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OsdDimensions {
+    pub w: u32,
+    pub h: u32,
+    pub mt: i32,
+    pub mb: i32,
+    pub ml: i32,
+    pub mr: i32,
+    pub par: f64,
+}
+
+impl Default for OsdDimensions {
+    fn default() -> Self {
+        Self {
+            w: 0,
+            h: 0,
+            mt: 0,
+            mb: 0,
+            ml: 0,
+            mr: 0,
+            par: 1.0,
+        }
+    }
 }
 
 /// Snapshot of the currently loaded media needed by an off-thread encoder.
@@ -1294,6 +1322,7 @@ pub enum MpvPropertyValue {
         all: Vec<Track>,
     },
     SubLines(Vec<SubLine>),
+    OsdDimensions(OsdDimensions),
     CursorAutohide(CursorAutohide),
     Other,
 }
@@ -1603,7 +1632,6 @@ unsafe impl Send for MpvInstance {}
 
 /// Owned values delivered by mpv's property notifications. Reading these does
 /// not wait on mpv's core, which must never block the UI's render thread.
-#[derive(Default)]
 pub struct PlaybackState {
     pub path: String,
     pub media_title: String,
@@ -1625,6 +1653,17 @@ pub struct PlaybackState {
     pub secondary_sid: i64,
     pub video_id: i64,
     pub sub_text: String,
+    pub sub_ass_extradata: String,
+    pub sub_text_ass_full: String,
+    pub osd_dimensions: OsdDimensions,
+    pub sub_scale: f64,
+    pub sub_pos: f64,
+    pub sub_font: String,
+    pub sub_ass_override: String,
+    pub sub_scale_signs: bool,
+    pub sub_use_margins: bool,
+    pub sub_hinting: String,
+    pub sub_shaper: String,
     pub secondary_sub_text: String,
     pub sub_start: f64,
     pub sub_end: f64,
@@ -1645,6 +1684,62 @@ pub struct PlaybackState {
     pub cursor_autohide_fs_only: bool,
 }
 
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            media_title: String::new(),
+            file_loaded: false,
+            playback_ready: false,
+            position: 0.0,
+            duration: 0.0,
+            paused: false,
+            mute: false,
+            volume: 0.0,
+            volume_max: 0,
+            fullscreen: false,
+            dimensions: (0, 0),
+            video_width: 0,
+            video_height: 0,
+            chapters: Vec::new(),
+            audio_id: 0,
+            primary_sid: 0,
+            secondary_sid: 0,
+            video_id: 0,
+            sub_text: String::new(),
+            sub_ass_extradata: String::new(),
+            sub_text_ass_full: String::new(),
+            osd_dimensions: OsdDimensions::default(),
+            sub_scale: 1.0,
+            sub_pos: 100.0,
+            sub_font: "sans-serif".to_string(),
+            sub_ass_override: "scale".to_string(),
+            sub_scale_signs: false,
+            sub_use_margins: true,
+            sub_hinting: "none".to_string(),
+            sub_shaper: "complex".to_string(),
+            secondary_sub_text: String::new(),
+            sub_start: 0.0,
+            sub_end: 0.0,
+            sub_delay: 0.0,
+            sub_speed: 1.0,
+            sub_visibility: false,
+            secondary_sub_start: 0.0,
+            secondary_sub_end: 0.0,
+            secondary_sub_delay: 0.0,
+            secondary_sub_visibility: false,
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            sub_lines: Vec::new(),
+            frame_drops: 0,
+            decoder_drops: 0,
+            hwdec_current: String::new(),
+            cursor_autohide: CursorAutohide::default(),
+            cursor_autohide_fs_only: false,
+        }
+    }
+}
+
 const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
     (c"chapter-list", ffi::MPV_FORMAT_NODE),
     (c"chapters", ffi::MPV_FORMAT_INT64),
@@ -1661,6 +1756,7 @@ const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
     (c"dheight", ffi::MPV_FORMAT_INT64),
     (c"video-params/w", ffi::MPV_FORMAT_INT64),
     (c"video-params/h", ffi::MPV_FORMAT_INT64),
+    (c"osd-dimensions", ffi::MPV_FORMAT_NODE),
     (c"aid", ffi::MPV_FORMAT_INT64),
     (c"aid", ffi::MPV_FORMAT_FLAG),
     (c"sid", ffi::MPV_FORMAT_INT64),
@@ -1672,6 +1768,16 @@ const PLAYBACK_PROPERTIES: &[(&CStr, ffi::mpv_format)] = &[
     (c"sub-start", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-end", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-text", ffi::MPV_FORMAT_STRING),
+    (c"sub-ass-extradata", ffi::MPV_FORMAT_STRING),
+    (c"sub-text/ass-full", ffi::MPV_FORMAT_STRING),
+    (c"sub-scale", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-pos", ffi::MPV_FORMAT_DOUBLE),
+    (c"sub-font", ffi::MPV_FORMAT_STRING),
+    (c"sub-ass-override", ffi::MPV_FORMAT_STRING),
+    (c"sub-scale-signs", ffi::MPV_FORMAT_FLAG),
+    (c"sub-use-margins", ffi::MPV_FORMAT_FLAG),
+    (c"sub-hinting", ffi::MPV_FORMAT_STRING),
+    (c"sub-shaper", ffi::MPV_FORMAT_STRING),
     (c"sub-delay", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-speed", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-visibility", ffi::MPV_FORMAT_FLAG),
@@ -1713,6 +1819,8 @@ fn extract_tracks_from_node(
         .filter(|t| t.track_type == TrackType::Subtitle as i32)
         .map(|t| SubtitleTrack {
             id: t.id,
+            src_id: t.src_id,
+            codec: copy_mpv_string(t.codec),
             language: copy_mpv_string(t.lang),
             title: copy_mpv_string(t.title),
             external_path: copy_mpv_string(t.external_filename),
@@ -1769,6 +1877,85 @@ fn extract_chapters_from_node(node: *const ffi::mpv_node) -> Vec<f64> {
     };
     unsafe { memento_player_f64_list_free(list) };
     chapters
+}
+
+fn extract_osd_dimensions_from_node(node: *const ffi::mpv_node) -> OsdDimensions {
+    let mut dims = OsdDimensions::default();
+    let Some(root) = (unsafe { node.as_ref() }) else {
+        return dims;
+    };
+    if root.format != ffi::MPV_FORMAT_NODE_MAP {
+        return dims;
+    }
+    let Some(map) = (unsafe { root.u.list.as_ref() }) else {
+        return dims;
+    };
+    if map.num <= 0 || map.keys.is_null() || map.values.is_null() {
+        return dims;
+    }
+    for i in 0..map.num as usize {
+        let key_ptr = unsafe { *map.keys.add(i) };
+        if key_ptr.is_null() {
+            continue;
+        }
+        let key = unsafe { CStr::from_ptr(key_ptr) }.to_bytes();
+        let val = unsafe { &*map.values.add(i) };
+        let as_i64 = || -> Option<i64> {
+            match val.format {
+                ffi::MPV_FORMAT_INT64 => Some(unsafe { val.u.int64 }),
+                ffi::MPV_FORMAT_DOUBLE => Some(unsafe { val.u.double_ }.round() as i64),
+                _ => None,
+            }
+        };
+        let as_f64 = || -> Option<f64> {
+            match val.format {
+                ffi::MPV_FORMAT_DOUBLE => Some(unsafe { val.u.double_ }),
+                ffi::MPV_FORMAT_INT64 => Some(unsafe { val.u.int64 } as f64),
+                _ => None,
+            }
+        };
+        match key {
+            b"w" => {
+                if let Some(v) = as_i64() {
+                    dims.w = u32::try_from(v).unwrap_or(0);
+                }
+            }
+            b"h" => {
+                if let Some(v) = as_i64() {
+                    dims.h = u32::try_from(v).unwrap_or(0);
+                }
+            }
+            b"mt" => {
+                if let Some(v) = as_i64() {
+                    dims.mt = v as i32;
+                }
+            }
+            b"mb" => {
+                if let Some(v) = as_i64() {
+                    dims.mb = v as i32;
+                }
+            }
+            b"ml" => {
+                if let Some(v) = as_i64() {
+                    dims.ml = v as i32;
+                }
+            }
+            b"mr" => {
+                if let Some(v) = as_i64() {
+                    dims.mr = v as i32;
+                }
+            }
+            b"par" => {
+                if let Some(v) = as_f64() {
+                    if v.is_finite() && v > 0.0 {
+                        dims.par = v;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    dims
 }
 
 impl PlaybackState {
@@ -1852,6 +2039,11 @@ impl PlaybackState {
             b"dheight" => self.dimensions.1 = u32::try_from(integer()).unwrap_or(0),
             b"video-params/w" => self.video_width = integer(),
             b"video-params/h" => self.video_height = integer(),
+            b"osd-dimensions" => {
+                if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    self.osd_dimensions = extract_osd_dimensions_from_node(data.cast());
+                }
+            }
             b"chapter-list" => {
                 self.chapters = if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
                     extract_chapters_from_node(data.cast())
@@ -1860,10 +2052,69 @@ impl PlaybackState {
                 };
             }
             b"aid" => update_track_id(&mut self.audio_id),
-            b"sid" => update_track_id(&mut self.primary_sid),
+            b"sid" => {
+                let prev = self.primary_sid;
+                update_track_id(&mut self.primary_sid);
+                if self.primary_sid != prev {
+                    self.sub_text_ass_full.clear();
+                    if self.primary_sid == 0 {
+                        self.sub_ass_extradata.clear();
+                    }
+                }
+            }
             b"secondary-sid" => update_track_id(&mut self.secondary_sid),
             b"vid" => update_track_id(&mut self.video_id),
             b"sub-text" => self.sub_text = string().trim().to_owned(),
+            b"sub-ass-extradata" => {
+                self.sub_ass_extradata = if property.format == ffi::MPV_FORMAT_STRING {
+                    string()
+                } else {
+                    String::new()
+                };
+            }
+            b"sub-text/ass-full" => {
+                self.sub_text_ass_full = if property.format == ffi::MPV_FORMAT_STRING {
+                    string()
+                } else {
+                    String::new()
+                };
+            }
+            b"sub-scale" => self.sub_scale = number(1.0).max(0.05),
+            b"sub-pos" => self.sub_pos = number(100.0).clamp(0.0, 150.0),
+            b"sub-font" => {
+                let s = string();
+                if !s.is_empty() {
+                    self.sub_font = s;
+                }
+            }
+            b"sub-ass-override" => {
+                let s = string();
+                if !s.is_empty() {
+                    self.sub_ass_override = s;
+                }
+            }
+            b"sub-scale-signs" => {
+                if let Some(v) = flag() {
+                    self.sub_scale_signs = v;
+                }
+            }
+            b"sub-use-margins" => {
+                if let Some(v) = flag() {
+                    self.sub_use_margins = v;
+                }
+            }
+            b"sub-hinting" => {
+                let s = string();
+                if !s.is_empty() {
+                    self.sub_hinting = s;
+                }
+            }
+            b"sub-shaper" => {
+                let s = string();
+                if !s.is_empty() {
+                    self.sub_shaper = s;
+                }
+            }
             b"secondary-sub-text" => self.secondary_sub_text = string().trim().to_owned(),
             b"sub-start" => self.sub_start = number(0.0),
             b"sub-end" => self.sub_end = number(0.0),
@@ -2556,6 +2807,8 @@ impl MpvInstance {
                 state.primary_sid = 0;
                 state.secondary_sid = 0;
                 state.video_id = 0;
+                state.sub_ass_extradata.clear();
+                state.sub_text_ass_full.clear();
                 let playlist_entry_id = unsafe { raw.data.cast::<ffi::mpv_event_start_file>().as_ref() }
                     .map_or(0, |e| e.playlist_entry_id);
                 Some(MpvEvent::StartFile { playlist_entry_id })
@@ -2602,6 +2855,8 @@ impl MpvInstance {
                 state.primary_sid = 0;
                 state.secondary_sid = 0;
                 state.video_id = 0;
+                state.sub_ass_extradata.clear();
+                state.sub_text_ass_full.clear();
                 let (reason, playlist_entry_id) = unsafe { raw.data.cast::<ffi::mpv_event_end_file>().as_ref() }
                     .map_or((EndFileReason::Unknown(-1), 0), |info| {
                         let reason = match info.reason {
@@ -2697,6 +2952,13 @@ impl MpvInstance {
                             MpvPropertyValue::None
                         }
                     }
+                    "osd-dimensions" => {
+                        if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                            MpvPropertyValue::OsdDimensions(state.osd_dimensions)
+                        } else {
+                            MpvPropertyValue::None
+                        }
+                    }
                     "cursor-autohide" => {
                         let int64_val =
                             if property.format == ffi::MPV_FORMAT_INT64 && !data.is_null() {
@@ -2749,7 +3011,12 @@ impl MpvInstance {
                 matches!(
                     ev,
                     MpvEvent::PropertyChange { name, .. }
-                        if name != "track-list" && name != "sid" && name != "aid"
+                        if name != "track-list"
+                            && name != "sid"
+                            && name != "aid"
+                            && name != "sub-ass-extradata"
+                            && name != "sub-text/ass-full"
+                            && name != "osd-dimensions"
                 )
             }) {
                 queued.remove(drop_idx);
@@ -3548,6 +3815,43 @@ impl MpvInstance {
 
     pub fn set_secondary_sid(&self, id: i64) -> Result<(), String> {
         self.set_track_property(c"secondary-sid", id)
+    }
+
+    /// Set mpv's `sub-scale` for native ASS/SSA rendering, enabling `sub-scale-signs`
+    /// only when `scale != 1.0` so default `1.0` matches stock `mpv` identically.
+    pub fn set_sub_scale(&self, scale: f64) -> Result<(), String> {
+        let clamped = scale.clamp(0.1, 5.0);
+        let scale_signs = if (clamped - 1.0).abs() > 1e-3 { "yes" } else { "no" };
+        self.command_async(&["set", "sub-scale-signs", scale_signs])?;
+        let val = format!("{clamped:.3}");
+        self.command_async(&["set", "sub-scale", &val])
+    }
+
+    /// Set mpv's `sub-pos` (`0..=150`, default `100`) for native ASS/SSA vertical offset.
+    pub fn set_sub_pos(&self, pos: f64) -> Result<(), String> {
+        let clamped = pos.clamp(0.0, 150.0);
+        let val = format!("{clamped:.2}");
+        self.command_async(&["set", "sub-pos", &val])
+    }
+
+    pub fn sub_ass_extradata(&self) -> String {
+        self.playback.borrow().sub_ass_extradata.clone()
+    }
+
+    pub fn sub_text_ass_full(&self) -> String {
+        self.playback.borrow().sub_text_ass_full.clone()
+    }
+
+    pub fn osd_dimensions(&self) -> OsdDimensions {
+        self.playback.borrow().osd_dimensions
+    }
+
+    pub fn sub_scale(&self) -> f64 {
+        self.playback.borrow().sub_scale
+    }
+
+    pub fn sub_pos(&self) -> f64 {
+        self.playback.borrow().sub_pos
     }
 
     /// Queue a command without blocking the render/UI thread on mpv's core.

@@ -762,4 +762,121 @@ mod rich_subtitle_phase4_tests {
 
         app.hide().unwrap();
     }
+
+    #[test]
+    fn native_ass_overlay_anchors_popup_passes_outside_clicks_and_switches_tracks_cleanly() {
+        use memento_app::controller::ass::AssOverlayController;
+        use memento_ass::MpvAssParams;
+        use slint::platform::{PointerEventButton, WindowEvent};
+        use std::cell::Cell;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 750.0));
+        app.set_duration(120.0);
+        app.set_osc_visible(false);
+        app.set_osc_fade_ms(0);
+        app.show().unwrap();
+        assert_eq!(app.get_video_width(), 1280);
+        assert_eq!(app.get_video_height(), 720);
+
+        let video_clicks = Rc::new(Cell::new(0));
+        let vc = video_clicks.clone();
+        app.on_video_pointer_button(move |_, _, btn, pressed, _, _, _, _| {
+            if btn == 1 && pressed {
+                vc.set(vc.get() + 1);
+            }
+        });
+
+        let header = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,1,0,0,0,100,100,2,0,1,2,1,2,20,20,20,1
+";
+        // Two simultaneous speakers: Event 0 near TOP (y=60), Event 1 near BOTTOM (y=660).
+        let ass_full = "\
+Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,80)\\an8}上部テロップ\n\
+Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,660)\\an2}鳥白島に到着\n";
+
+        let mut ass = AssOverlayController::new();
+        let params = MpvAssParams::for_frame(1280, 720);
+        ass.sync_from_playback(&app, true, header, ass_full, &params, 12_000, true, 0.4);
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        assert!(sb.get_ass_native_active());
+        assert_eq!(sb.get_ass_line_hitboxes().row_count(), 2);
+        assert!(app.get_primary_subtitle_effective_visible());
+
+        // Clicking empty center video (far from top y=80 and bottom y=660) MUST pass straight to video-motion!
+        let mid_pos = slint::LogicalPosition::new(640.0, 390.0); // 30px menu + 360px video center
+        app.window().dispatch_event(WindowEvent::PointerPressed {
+            position: mid_pos,
+            button: PointerEventButton::Left,
+        });
+        app.window().dispatch_event(WindowEvent::PointerReleased {
+            position: mid_pos,
+            button: PointerEventButton::Left,
+        });
+        assert_eq!(
+            video_clicks.get(),
+            1,
+            "clicks outside ASS line hitboxes must pass through to video-motion"
+        );
+
+        // Highlight bottom event ("鳥白島") -> YomitanPopup must anchor ABOVE the bottom line!
+        let hb_bottom = sb.get_ass_line_hitboxes().row_data(1).unwrap();
+        let hit_bottom = ass
+            .hit_test_logical(&app, hb_bottom.x + 20.0, hb_bottom.y + hb_bottom.height * 0.5)
+            .expect("hit bottom ASS line");
+        assert_eq!(hit_bottom.event_index, 1);
+        assert!(hit_bottom.scan_substring.starts_with("鳥白島"));
+        ass.apply_lookup_highlight(&app, &hit_bottom, 3);
+        app.set_dict_open(true);
+        assert_eq!(sb.get_ass_highlight_patches().row_count(), 1);
+        assert!(sb.get_ass_highlight_patches().row_data(0).unwrap().has_patch);
+        assert!(sb.get_ass_anchor_active());
+        assert!(
+            app.get_popup_y() + app.get_popup_height() <= sb.get_ass_anchor_top() + 1.0,
+            "popup for bottom ASS line must sit above anchor (popup_bottom={}, anchor_top={})",
+            app.get_popup_y() + app.get_popup_height(),
+            sb.get_ass_anchor_top()
+        );
+
+        // Highlight top event ("上部テロップ" at y=80) -> YomitanPopup must flip BELOW the top line!
+        let hb_top = sb.get_ass_line_hitboxes().row_data(0).unwrap();
+        let hit_top = ass
+            .hit_test_logical(&app, hb_top.x + 20.0, hb_top.y + hb_top.height * 0.5)
+            .expect("hit top ASS line");
+        assert_eq!(hit_top.event_index, 0);
+        assert_eq!(hit_top.event_plain_text, "上部テロップ");
+        ass.apply_lookup_highlight(&app, &hit_top, 2);
+        assert!(
+            app.get_popup_y() >= sb.get_ass_anchor_bottom() - 1.0,
+            "popup for top-screen ASS line must automatically flip BELOW anchor (popup_y={}, anchor_bottom={})",
+            app.get_popup_y(),
+            sb.get_ass_anchor_bottom()
+        );
+
+        // Ctrl+0 (`subtitles-visible = false`) hides the ASS overlay cleanly.
+        app.set_subtitles_visible(false);
+        assert!(!app.get_primary_subtitle_effective_visible());
+        app.set_subtitles_visible(true);
+        assert!(app.get_primary_subtitle_effective_visible());
+
+        // Switching track ASS -> SRT (`native_ass_active = false`) clears all ASS overlay state.
+        ass.sync_from_playback(&app, false, "", "", &params, 12_000, true, 0.4);
+        assert!(!sb.get_ass_native_active());
+        assert_eq!(sb.get_ass_line_hitboxes().row_count(), 0);
+        assert_eq!(sb.get_ass_highlight_patches().row_count(), 0);
+        assert!(!sb.get_ass_anchor_active());
+        assert!(ass.active_lookup().is_none());
+
+        app.hide().unwrap();
+    }
 }

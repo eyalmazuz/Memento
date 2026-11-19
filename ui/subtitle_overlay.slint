@@ -23,6 +23,36 @@ export struct SubtitleTokenMetrics {
     rendered: image,
 }
 
+export struct AssLineHitbox {
+    event-index: int,
+    line-index: int,
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+}
+
+export struct AssHighlightPatch {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+    patch-x: length,
+    patch-y: length,
+    patch-width: length,
+    patch-height: length,
+    glyph-patch: image,
+    has-patch: bool,
+}
+
+export struct AssRubyItem {
+    text: string,
+    x: length,
+    y: length,
+    width: length,
+    font-size: length,
+}
+
 export global SubtitleOverlayBridge {
     in-out property <bool> rich-enabled: false;
     in-out property <color> subtitle-bg-color: #00000000;
@@ -34,6 +64,18 @@ export global SubtitleOverlayBridge {
     in-out property <string> hovered-query: "";
     in-out property <bool> middle-mouse-scan-enabled: false;
 
+    // Native libmpv/libass interactive overlay state
+    in-out property <bool> ass-native-active: false;
+    in-out property <[AssLineHitbox]> ass-line-hitboxes: [];
+    in-out property <[AssHighlightPatch]> ass-highlight-patches: [];
+    in-out property <[AssRubyItem]> ass-ruby-items: [];
+    in-out property <bool> ass-anchor-active: false;
+    in-out property <length> ass-anchor-x: 0px;
+    in-out property <length> ass-anchor-top: 0px;
+    in-out property <length> ass-anchor-bottom: 0px;
+    in-out property <length> ass-anchor-width: 0px;
+    in-out property <bool> ass-hovered: false;
+
     pure callback render-token(SubtitleWord, float, bool, bool, int, int) -> SubtitleTokenMetrics;
     pure callback cluster-char-offset(SubtitleWord, float, bool, float, float) -> int;
     pure callback should-capture-hover-focus() -> bool;
@@ -44,6 +86,12 @@ export global SubtitleOverlayBridge {
     callback token-middle-clicked(SubtitleWord, float, bool, float, float);
     callback hover-key-pressed(string, bool, bool, bool, bool) -> bool;
     callback stationary-modifier-changed(bool, bool, bool, bool);
+
+    callback ass-pointer-hovered(float, float, bool, bool, bool, bool);
+    callback ass-line-hover-changed(int, int, bool);
+    callback ass-pointer-left();
+    callback ass-left-clicked(float, float);
+    callback ass-middle-clicked(float, float);
 }
 
 export component InteractiveSubtitleToken inherits Rectangle {

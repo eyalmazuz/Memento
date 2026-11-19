@@ -10,6 +10,7 @@ import {
 } from "popup.slint";
 import {
     SubtitleWord, SubtitleLine, InteractiveSubtitleToken, SubtitleOverlayBridge,
+    AssLineHitbox, AssHighlightPatch, AssRubyItem,
 } from "subtitle_overlay.slint";
 
 export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection }
@@ -19,7 +20,10 @@ export {
     PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
     PopupBridge,
 }
-export { SubtitleWord, SubtitleLine, SubtitleOverlayBridge }
+export {
+    SubtitleWord, SubtitleLine, SubtitleOverlayBridge,
+    AssLineHitbox, AssHighlightPatch, AssRubyItem,
+}
 
 export struct SubEntry {
     id: int,
@@ -1589,9 +1593,14 @@ export component MementoApp inherits Window {
     out property <bool> osc-hovered:
         osc.is-hovered || menu-bar.is-hovered || root.menu-open
         || subtitle-hover-area.has-hover || secondary-hover-area.has-hover
-        || root.token-hovered;
-    out property <bool> primary-subtitle-effective-visible: subtitle-box.visible;
+        || root.token-hovered || SubtitleOverlayBridge.ass-hovered;
+    out property <bool> primary-subtitle-effective-visible:
+        SubtitleOverlayBridge.ass-native-active
+            ? root.ass-overlay-visible
+            : subtitle-box.visible;
     out property <bool> secondary-subtitle-effective-visible: secondary-subtitle-box.visible;
+    out property <bool> primary-cursor-reveal-active: root.primary-cursor-reveal;
+    out property <bool> secondary-cursor-reveal-active: root.secondary-cursor-reveal;
     out property <float> osc-opacity: osc.opacity;
     out property <float> menu-bar-opacity: menu-bar.opacity;
     in-out property <bool> token-hovered: false;
@@ -1602,6 +1611,7 @@ export component MementoApp inherits Window {
     in-out property <bool> asr-track-selected: false;
     in-out property <bool> auto-pause: false;
     in-out property <bool> subtitles-visible: true;
+    in-out property <bool> sub-ass-native: true;
     in-out property <bool> furigana-visible: false;
     // Loading the first reading must finish before releasing the playback clock.
     in-out property <bool> subtitle-furigana-pending: false;
@@ -1800,6 +1810,8 @@ export component MementoApp inherits Window {
         root.selected-token-count = 1;
         root.popup-focused-index = 0;
         root.popup-offset-x = 0px;
+        SubtitleOverlayBridge.ass-highlight-patches = [];
+        SubtitleOverlayBridge.ass-anchor-active = false;
         // Cancel delayed hover searches and invalidate results already in flight.
         root.hover-word("", -1, false, false, false, false);
     }
@@ -1851,11 +1863,17 @@ export component MementoApp inherits Window {
         || root.url-dialog-open
         || root.update-dialog-open
         || root.ocr-mode;
+    property <bool> ass-overlay-visible:
+        SubtitleOverlayBridge.ass-native-active
+        && (root.subtitle-cursor-show-enabled
+            ? root.primary-cursor-reveal
+            : root.subtitles-visible);
     property <bool> primary-cursor-reveal:
         root.subtitle-cursor-show-enabled
         && (root.cursor-in-bottom-sub-zone
             || subtitle-hover-area.has-hover
             || root.token-hovered
+            || SubtitleOverlayBridge.ass-hovered
             || hover-bridge.has-hover
             || osc.is-hovered
             || (root.dict-open && root.subtitle-hover-latched));
@@ -1868,6 +1886,7 @@ export component MementoApp inherits Window {
         subtitle-hover-area.has-hover
         || secondary-hover-area.has-hover
         || root.token-hovered
+        || SubtitleOverlayBridge.ass-hovered
         || hover-bridge.has-hover;
     changed direct-subtitle-hovered => {
         if self.direct-subtitle-hovered {
@@ -2117,7 +2136,7 @@ export component MementoApp inherits Window {
                                 root.cursor-in-top-sub-zone = false;
                                 root.cursor-in-bottom-sub-zone = false;
                             }
-                            if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
+                            if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered {
                                 root.subtitle-hover-changed(false);
                             }
                         }
@@ -2132,7 +2151,7 @@ export component MementoApp inherits Window {
                                     root.cursor-in-top-sub-zone = false;
                                     root.cursor-in-bottom-sub-zone = false;
                                 }
-                                if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered {
+                                if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered {
                                     root.subtitle-hover-changed(false);
                                 }
                                 root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
@@ -2227,18 +2246,171 @@ export component MementoApp inherits Window {
                         }
                     }
 
-                    // Invisible hover bridge between active primary subtitles and YomitanPopup so moving
-                    // the cursor between subtitle-box and yomi-card keeps hover-pause continuously active.
-                    // Placed BEFORE subtitle-box and yomi-card in z-order and sized to the exact 12px gap
+                    // Invisible hover bridge between active primary subtitles (subtitle-box or active ASS anchor)
+                    // and YomitanPopup so moving the cursor between subtitle and yomi-card keeps hover-pause active.
+                    // Placed BEFORE subtitle overlays and yomi-card in z-order and sized to the exact 12px gap
                     // so it never overlaps subtitle tokens or the popup card.
                     hover-bridge := TouchArea {
-                        visible: yomi-card.visible && subtitle-box.visible;
-                        property <length> gap-top: min(subtitle-box.y + subtitle-box.height, yomi-card.y + yomi-card.height);
-                        property <length> gap-bottom: max(subtitle-box.y, yomi-card.y);
-                        x: min(subtitle-box.x, yomi-card.x);
+                        property <bool> anchor-vis: SubtitleOverlayBridge.ass-native-active
+                            ? (root.ass-overlay-visible && SubtitleOverlayBridge.ass-anchor-active)
+                            : subtitle-box.visible;
+                        property <length> anchor-x: SubtitleOverlayBridge.ass-native-active
+                            ? SubtitleOverlayBridge.ass-anchor-x
+                            : subtitle-box.x;
+                        property <length> anchor-top: SubtitleOverlayBridge.ass-native-active
+                            ? SubtitleOverlayBridge.ass-anchor-top
+                            : subtitle-box.y;
+                        property <length> anchor-bottom: SubtitleOverlayBridge.ass-native-active
+                            ? SubtitleOverlayBridge.ass-anchor-bottom
+                            : (subtitle-box.y + subtitle-box.height);
+                        property <length> anchor-width: SubtitleOverlayBridge.ass-native-active
+                            ? SubtitleOverlayBridge.ass-anchor-width
+                            : subtitle-box.width;
+                        visible: yomi-card.visible && self.anchor-vis;
+                        property <length> gap-top: min(self.anchor-bottom, yomi-card.y + yomi-card.height);
+                        property <length> gap-bottom: max(self.anchor-top, yomi-card.y);
+                        x: min(self.anchor-x, yomi-card.x);
                         y: self.gap-top;
-                        width: max(subtitle-box.x + subtitle-box.width, yomi-card.x + yomi-card.width) - self.x;
+                        width: max(self.anchor-x + self.anchor-width, yomi-card.x + yomi-card.width) - self.x;
                         height: max(0px, self.gap-bottom - self.gap-top);
+                    }
+
+                    // Native ASS/SSA Interactive Overlay (above video-motion, strictly below yomi-card).
+                    // Only individual AssLineHitbox TouchAreas capture pointer input; areas outside
+                    // subtitle lines pass clicks, scrolls, and double-clicks straight through to video-motion.
+                    ass-overlay := Rectangle {
+                        visible: root.ass-overlay-visible;
+                        width: parent.width;
+                        height: parent.height;
+                        background: transparent;
+
+                        ass-focus := FocusScope {
+                            width: 0px;
+                            height: 0px;
+                            enabled: root.ass-overlay-visible;
+                            key-pressed(event) => {
+                                if (SubtitleOverlayBridge.hover-key-pressed(
+                                    event.text,
+                                    event.modifiers.control,
+                                    event.modifiers.shift,
+                                    event.modifiers.alt,
+                                    event.modifiers.meta
+                                )) {
+                                    return accept;
+                                }
+                                reject
+                            }
+                            key-released(event) => {
+                                SubtitleOverlayBridge.stationary-modifier-changed(
+                                    event.modifiers.control,
+                                    event.modifiers.shift,
+                                    event.modifiers.alt,
+                                    event.modifiers.meta
+                                );
+                                reject
+                            }
+                        }
+
+                        // Solid #38a6d6 continuous highlight pill BEHIND tight libass glyph patch on top.
+                        for hl in SubtitleOverlayBridge.ass-highlight-patches : Rectangle {
+                            x: hl.x;
+                            y: hl.y;
+                            width: hl.width;
+                            height: hl.height;
+                            border-radius: 3px;
+                            background: #38a6d6;
+                        }
+
+                        for hl in SubtitleOverlayBridge.ass-highlight-patches : Image {
+                            visible: hl.has-patch;
+                            x: hl.patch-x;
+                            y: hl.patch-y;
+                            width: hl.patch-width;
+                            height: hl.patch-height;
+                            source: hl.glyph-patch;
+                            image-fit: fill;
+                        }
+
+                        // Optional Alt+A furigana mapped directly above exact libass kanji bounding boxes.
+                        if root.furigana-visible : Rectangle {
+                            width: parent.width;
+                            height: parent.height;
+                            background: transparent;
+                            for ruby in SubtitleOverlayBridge.ass-ruby-items : Rectangle {
+                                x: ruby.x;
+                                y: ruby.y;
+                                width: max(ruby.width, ruby-txt.preferred-width + 6px);
+                                height: ruby-txt.preferred-height + 2px;
+                                border-radius: 3px;
+                                background: #000000A8;
+                                ruby-txt := Text {
+                                    x: (parent.width - self.preferred-width) / 2;
+                                    y: 1px;
+                                    text: ruby.text;
+                                    font-size: ruby.font-size;
+                                    font-weight: 700;
+                                    font-family: "Noto Sans CJK JP";
+                                    color: #F8FAFC;
+                                    wrap: no-wrap;
+                                }
+                            }
+                        }
+
+                        // Per-line ASS hitboxes (positioned in logical video-area coordinates).
+                        for hb in SubtitleOverlayBridge.ass-line-hitboxes : TouchArea {
+                            x: hb.x;
+                            y: hb.y;
+                            width: hb.width;
+                            height: hb.height;
+                            mouse-cursor: pointer;
+                            clicked => {
+                                SubtitleOverlayBridge.ass-left-clicked(
+                                    (hb.x + self.mouse-x) / 1px,
+                                    (hb.y + self.mouse-y) / 1px
+                                );
+                            }
+                            pointer-event(event) => {
+                                let vx = (hb.x + self.mouse-x) / 1px;
+                                let vy = (hb.y + self.mouse-y) / 1px;
+                                if (event.kind == PointerEventKind.move
+                                    && !ass-focus.has-focus
+                                    && SubtitleOverlayBridge.should-capture-hover-focus())
+                                {
+                                    ass-focus.focus();
+                                }
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                                    SubtitleOverlayBridge.ass-middle-clicked(vx, vy);
+                                } else if (event.kind == PointerEventKind.move
+                                    || (event.kind == PointerEventKind.down && event.button == PointerEventButton.left))
+                                {
+                                    root.osc-activity();
+                                    SubtitleOverlayBridge.ass-pointer-hovered(
+                                        vx,
+                                        vy,
+                                        event.modifiers.control,
+                                        event.modifiers.shift,
+                                        event.modifiers.alt,
+                                        event.modifiers.meta
+                                    );
+                                } else if (event.kind == PointerEventKind.cancel) {
+                                    SubtitleOverlayBridge.ass-line-hover-changed(hb.event-index, hb.line-index, false);
+                                    SubtitleOverlayBridge.ass-pointer-left();
+                                }
+                            }
+                            changed has-hover => {
+                                SubtitleOverlayBridge.ass-line-hover-changed(hb.event-index, hb.line-index, self.has-hover);
+                                if self.has-hover {
+                                    if (SubtitleOverlayBridge.should-capture-hover-focus()) {
+                                        ass-focus.focus();
+                                    }
+                                } else {
+                                    SubtitleOverlayBridge.ass-pointer-left();
+                                    if !SubtitleOverlayBridge.ass-hovered && !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+                                        f-scope.focus();
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Secondary Subtitles cleanly positioned at the top edge of the video viewport
@@ -2272,7 +2444,8 @@ export component MementoApp inherits Window {
 
                     // Clickable primary subtitle tokens supply the search suffix at each token.
                     subtitle-box := Rectangle {
-                        visible: root.active-sub-text != ""
+                        visible: !SubtitleOverlayBridge.ass-native-active
+                            && root.active-sub-text != ""
                             && (root.subtitle-cursor-show-enabled
                                 ? root.primary-cursor-reveal
                                 : (root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing)));
@@ -2326,14 +2499,24 @@ export component MementoApp inherits Window {
                     }
 
                     // Floating Yomitan Dictionary Card
-                    // Anchored horizontally to hovered word (`popup-offset-x`) and clamped above/below
-                    // active primary subtitles so it NEVER covers active subtitles.
+                    // Anchored horizontally to hovered word (`popup-offset-x` or active ASS anchor) and
+                    // clamped above/below active primary subtitles so it NEVER covers active subtitles.
                     yomi-card := YomitanPopup {
-                        property <length> sub-top: subtitle-box.visible ? subtitle-box.y : (parent.height - 62px);
-                        property <length> sub-bottom: subtitle-box.visible ? (subtitle-box.y + subtitle-box.height) : (parent.height - 62px);
+                        property <bool> has-sub-anchor: SubtitleOverlayBridge.ass-native-active
+                            ? (root.ass-overlay-visible && SubtitleOverlayBridge.ass-anchor-active)
+                            : subtitle-box.visible;
+                        property <length> sub-top: SubtitleOverlayBridge.ass-native-active
+                            ? (self.has-sub-anchor ? SubtitleOverlayBridge.ass-anchor-top : (parent.height - 62px))
+                            : (subtitle-box.visible ? subtitle-box.y : (parent.height - 62px));
+                        property <length> sub-bottom: SubtitleOverlayBridge.ass-native-active
+                            ? (self.has-sub-anchor ? SubtitleOverlayBridge.ass-anchor-bottom : (parent.height - 62px))
+                            : (subtitle-box.visible ? (subtitle-box.y + subtitle-box.height) : (parent.height - 62px));
+                        property <length> anchor-center-x: SubtitleOverlayBridge.ass-native-active
+                            ? (SubtitleOverlayBridge.ass-anchor-x + SubtitleOverlayBridge.ass-anchor-width / 2)
+                            : (subtitle-box.x + subtitle-box.width / 2 + root.popup-offset-x);
                         property <length> space-above: max(0px, self.sub-top - 22px);
                         property <length> space-below: max(0px, parent.height - self.sub-bottom - 22px);
-                        property <bool> place-below: subtitle-box.visible && self.space-above < 220px && self.space-below > self.space-above;
+                        property <bool> place-below: self.has-sub-anchor && self.space-above < 220px && self.space-below > self.space-above;
 
                         width: min(
                             PopupBridge.css-popup-width > 0px ? PopupBridge.css-popup-width : root.popup-configured-width,
@@ -2341,13 +2524,13 @@ export component MementoApp inherits Window {
                         );
                         height: min(
                             PopupBridge.css-popup-height > 0px ? PopupBridge.css-popup-height : root.popup-configured-height,
-                            subtitle-box.visible
+                            self.has-sub-anchor
                                 ? max(80px, self.place-below ? self.space-below : self.space-above)
                                 : (parent.height - 80px)
                         );
                         x: min(
                             parent.width - self.width - 20px,
-                            max(20px, subtitle-box.x + (subtitle-box.width - self.width) / 2 + root.popup-offset-x)
+                            max(20px, self.anchor-center-x - self.width / 2)
                         );
                         y: self.place-below
                             ? min(parent.height - self.height - 10px, self.sub-bottom + 12px)

@@ -742,10 +742,26 @@ fn prepare_anki_note_request(
     if !profile.enabled {
         return Err(Some("Enable Anki integration in Preferences".to_owned()));
     }
+    let (remove_regex, replace_lines, replace_with) = (
+        app.get_search_remove_regex().to_string(),
+        app.get_search_replace_lines(),
+        app.get_search_replace_with().to_string(),
+    );
+    let ass_lookup = ui::active_ass_lookup_for_app(app);
+    let base_subtitle = if let Some(ref ass_hit) = ass_lookup {
+        filter_subtitle_text(
+            &ass_hit.event_plain_text,
+            &remove_regex,
+            replace_lines,
+            &replace_with,
+        )
+    } else {
+        app.get_active_sub_text().to_string()
+    };
     let mut context = controller::anki::NoteFieldsContext::new(
         hit.expression.to_string(),
         hit.reading.to_string(),
-        app.get_active_sub_text().to_string(),
+        base_subtitle,
     );
     context.is_kanji = hit.is_kanji;
     let selected_glossary = app.global::<PopupBridge>().get_selected_glossary_text();
@@ -754,28 +770,32 @@ fn prepare_anki_note_request(
     }
     // Never assign the scanned subtitle token into `context.selection` (#262);
     // use it purely to locate `cloze_prefix` / `cloze_body` / `cloze_suffix`.
-    let start = app.get_selected_token_index();
-    let (scanned_surface, token_offset_in_sentence) = if start >= 0 {
-        let words = app.get_active_sub_words();
-        let start_idx = start as usize;
-        let count = app.get_selected_token_count().max(1) as usize;
-        let byte_offset: usize = (0..start_idx)
-            .filter_map(|i| words.row_data(i))
-            .map(|word| word.text.len())
-            .sum();
-        let surface: String = (start_idx..start_idx.saturating_add(count))
-            .filter_map(|i| words.row_data(i))
-            .map(|word| word.text.to_string())
-            .collect();
-        (surface, Some(byte_offset))
+    let (scanned_surface, token_offset_in_sentence) = if let Some(ref ass_hit) = ass_lookup {
+        let off = if remove_regex.is_empty() && !replace_lines {
+            Some(ass_hit.byte_offset_in_event)
+        } else {
+            None
+        };
+        (ass_hit.scanned_surface.clone(), off)
     } else {
-        (String::new(), None)
+        let start = app.get_selected_token_index();
+        if start >= 0 {
+            let words = app.get_active_sub_words();
+            let start_idx = start as usize;
+            let count = app.get_selected_token_count().max(1) as usize;
+            let byte_offset: usize = (0..start_idx)
+                .filter_map(|i| words.row_data(i))
+                .map(|word| word.text.len())
+                .sum();
+            let surface: String = (start_idx..start_idx.saturating_add(count))
+                .filter_map(|i| words.row_data(i))
+                .map(|word| word.text.to_string())
+                .collect();
+            (surface, Some(byte_offset))
+        } else {
+            (String::new(), None)
+        }
     };
-    let (remove_regex, replace_lines, replace_with) = (
-        app.get_search_remove_regex().to_string(),
-        app.get_search_replace_lines(),
-        app.get_search_replace_with().to_string(),
-    );
     let (
         active_start,
         active_end,
@@ -799,8 +819,21 @@ fn prepare_anki_note_request(
             })
             .collect::<Vec<_>>();
         let active = subs.active_cue();
-        let start = active.map(|cue| cue.start).unwrap_or(0.0);
-        let end = active.map(|cue| cue.end).unwrap_or(0.0);
+        let (start, end) = if let Some(ref ass_hit) = ass_lookup {
+            if ass_hit.event_end_s > ass_hit.event_start_s {
+                (ass_hit.event_start_s, ass_hit.event_end_s)
+            } else {
+                (
+                    active.map(|cue| cue.start).unwrap_or(0.0),
+                    active.map(|cue| cue.end).unwrap_or(0.0),
+                )
+            }
+        } else {
+            (
+                active.map(|cue| cue.start).unwrap_or(0.0),
+                active.map(|cue| cue.end).unwrap_or(0.0),
+            )
+        };
         let (ctx_start, ctx_end) = subs.selected_time_range().unwrap_or((start, end));
         (start, end, ctx_start, ctx_end, cues, active_pos)
     };
@@ -2636,6 +2669,12 @@ fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
         raw::search::SUBTITLE_FURIGANA_DEFAULT,
     ));
     app.set_furigana_enabled(true);
+    app.set_sub_ass_native(setting_enabled(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::ASS_NATIVE,
+        raw::interface::subtitle::ASS_NATIVE_DEFAULT,
+    ));
     app.set_autofit_enabled(setting_enabled(
         config, raw::behavior::GROUP, raw::behavior::AUTO_FIT,
         raw::behavior::AUTO_FIT_DEFAULT,
@@ -4022,8 +4061,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scale_config = config_ctrl.clone();
     let scale_cache = config_dir.clone();
     let scale_anki = anki_json_path.clone();
+    let scale_mpv = mpv.clone();
     app.on_adjust_subtitle_scale(move |delta| {
         if let Some(app) = scale_app.upgrade() {
+            if app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
+                if let Some(player) = scale_mpv.borrow().as_ref() {
+                    let cur = player.sub_scale();
+                    let raw_next = (cur + f64::from(delta) * 20.0).clamp(0.2, 3.0);
+                    let next = if (raw_next - 1.0).abs() < 0.025 {
+                        1.0
+                    } else {
+                        raw_next
+                    };
+                    if let Err(error) = player.set_sub_scale(next) {
+                        eprintln!("Cannot adjust ASS subtitle scale: {error}");
+                    } else {
+                        app.set_status_message(
+                            format!("ASS subtitle scale: {}%", (next * 100.0).round() as i32)
+                                .into(),
+                        );
+                    }
+                }
+                return;
+            }
             let new_scale = (app.get_subtitle_scale() + delta).clamp(0.001, 1.0);
             let result = scale_config
                 .edit_setting("interface/sub-scale", &new_scale.to_string())
@@ -4040,8 +4100,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let offset_config = config_ctrl.clone();
     let offset_cache = config_dir.clone();
     let offset_anki = anki_json_path.clone();
+    let offset_mpv = mpv.clone();
     app.on_adjust_subtitle_offset(move |delta| {
         if let Some(app) = offset_app.upgrade() {
+            if app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
+                if let Some(player) = offset_mpv.borrow().as_ref() {
+                    let cur = player.sub_pos();
+                    let next = (cur - f64::from(delta) * 200.0).clamp(0.0, 150.0);
+                    if let Err(error) = player.set_sub_pos(next) {
+                        eprintln!("Cannot adjust ASS subtitle position: {error}");
+                    } else {
+                        app.set_status_message(
+                            format!("ASS subtitle position: {}%", next.round() as i32).into(),
+                        );
+                    }
+                }
+                return;
+            }
             let new_offset = (app.get_subtitle_offset() + delta).clamp(0.0, 1.0);
             let result = offset_config
                 .edit_setting("interface/sub-offset", &new_offset.to_string())
@@ -4967,6 +5042,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hover_cursor_callback.borrow_mut().take();
             hover_pending_callback.borrow_mut().take();
             hover_generation.fetch_add(1, Ordering::AcqRel);
+            if index < 0 {
+                ui::clear_rich_bridge_ass_lookup(&app);
+            }
             return;
         }
         hover_cursor_callback.replace(Some((word.to_string(), index)));
@@ -5185,9 +5263,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.set_status_message(format!("Could not start pronunciation: {error}").into());
         }
     });
+    let ass_ctrl = Rc::new(RefCell::new(controller::ass::AssOverlayController::new()));
     ui::install_popup_navigation(&app);
     ui::install_rich_ui_bridges(&app, &dictionary_database_path, &config_dir, &config_ctrl);
     ui::bind_rich_bridge_lookup_epoch(&app, lookup_epoch.clone());
+    ui::bind_rich_bridge_ass_controller(&app, ass_ctrl.clone());
     install_auto_play_first_term_audio(&app);
     install_update_anki_note_handler(
         &app,
@@ -5396,8 +5476,187 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     thread_local! {
         static EXTERNAL_SUBTITLE_SINK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+        static MKV_EXTRACT_SINK: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
         static MPV_EVENT_SYNC: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     }
+
+    // ── Async Non-Blocking MKV EBML Worker (Embedded Fonts + Subtitle List Cues) ──
+    enum MkvExtractRequest {
+        Fonts {
+            generation: u64,
+            path: PathBuf,
+        },
+        Track {
+            generation: u64,
+            sid: i64,
+            track_number: u64,
+            path: PathBuf,
+        },
+    }
+    enum MkvExtractResult {
+        Fonts {
+            generation: u64,
+            fonts: Vec<memento_ass::MkvFontAttachment>,
+        },
+        Track {
+            generation: u64,
+            sid: i64,
+            cues: Vec<memento_ass::MkvSubtitleCue>,
+        },
+    }
+    let (mkv_extract_tx, mkv_extract_rx) = std::sync::mpsc::channel::<MkvExtractRequest>();
+    let (mkv_result_tx, mkv_result_rx) = std::sync::mpsc::channel::<MkvExtractResult>();
+    let mkv_worker_gen = shared_media_generation.clone();
+    std::thread::spawn(move || {
+        while let Ok(req) = mkv_extract_rx.recv() {
+            match req {
+                MkvExtractRequest::Fonts { generation, path } => {
+                    if mkv_worker_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    if let Ok(fonts) = memento_ass::extract_mkv_fonts(&path) {
+                        if mkv_worker_gen.load(Ordering::Acquire) == generation
+                            && !fonts.is_empty()
+                            && mkv_result_tx
+                                .send(MkvExtractResult::Fonts { generation, fonts })
+                                .is_ok()
+                        {
+                            let _ = slint::invoke_from_event_loop(|| {
+                                MKV_EXTRACT_SINK.with(|slot| {
+                                    let cb = slot.borrow().clone();
+                                    if let Some(apply) = cb {
+                                        apply();
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }
+                MkvExtractRequest::Track {
+                    generation,
+                    sid,
+                    track_number,
+                    path,
+                } => {
+                    if mkv_worker_gen.load(Ordering::Acquire) != generation {
+                        continue;
+                    }
+                    if let Ok(extracted) =
+                        memento_ass::extract_mkv_subtitle_track(&path, track_number)
+                    {
+                        if mkv_worker_gen.load(Ordering::Acquire) == generation
+                            && !extracted.cues.is_empty()
+                            && mkv_result_tx
+                                .send(MkvExtractResult::Track {
+                                    generation,
+                                    sid,
+                                    cues: extracted.cues,
+                                })
+                                .is_ok()
+                        {
+                            let _ = slint::invoke_from_event_loop(|| {
+                                MKV_EXTRACT_SINK.with(|slot| {
+                                    let cb = slot.borrow().clone();
+                                    if let Some(apply) = cb {
+                                        apply();
+                                    }
+                                });
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    MKV_EXTRACT_SINK.with(|slot| {
+        let app_weak = app.as_weak();
+        let ui_gen = media_generation.clone();
+        let subs_rc = sub_ctrl.clone();
+        let model_rc = sub_model.clone();
+        let sec_model_rc = secondary_sub_model.clone();
+        let coord_rc = coordinator.clone();
+        let ass_rc = ass_ctrl.clone();
+        *slot.borrow_mut() = Some(Rc::new(move || {
+            let mut need_ass_resync = false;
+            while let Ok(res) = mkv_result_rx.try_recv() {
+                let Some(app) = app_weak.upgrade() else {
+                    continue;
+                };
+                match res {
+                    MkvExtractResult::Fonts { generation, fonts } => {
+                        if ui_gen.get() != generation {
+                            continue;
+                        }
+                        if let Ok(mut ass) = ass_rc.try_borrow_mut() {
+                            ass.set_memory_fonts(fonts);
+                            need_ass_resync = true;
+                        }
+                    }
+                    MkvExtractResult::Track {
+                        generation,
+                        sid,
+                        cues,
+                    } => {
+                        if ui_gen.get() != generation {
+                            continue;
+                        }
+                        let Ok(mut subtitles) = subs_rc.try_borrow_mut() else {
+                            continue;
+                        };
+                        if subtitles
+                            .track(sid)
+                            .is_some_and(|t| t.is_external() || t.is_asr_track())
+                        {
+                            continue;
+                        }
+                        let entries: Vec<memento_subtitle::SubtitleEntry> = cues
+                            .into_iter()
+                            .filter_map(|cue| {
+                                if cue.plain_text.trim().is_empty() || cue.end_ms <= cue.start_ms {
+                                    return None;
+                                }
+                                Some(controller::subtitles::create_cue(
+                                    &cue.plain_text,
+                                    cue.start_ms as f64 / 1000.0,
+                                    cue.end_ms as f64 / 1000.0,
+                                ))
+                            })
+                            .collect();
+                        if app.get_furigana_visible() {
+                            let lines: Vec<String> = entries
+                                .iter()
+                                .take(2048)
+                                .map(|e| String::from_utf16_lossy(&e.text))
+                                .collect();
+                            controller::subtitles::prewarm_subtitle_furigana(lines);
+                        }
+                        subtitles.ensure_track(sid);
+                        subtitles.set_track_cues(sid, entries);
+                        if let Ok(coord_guard) = coord_rc.try_borrow() {
+                            if let Some(coord) = coord_guard.as_ref() {
+                                let st = coord.playback_state();
+                                let speed = st.sub_speed.max(f64::EPSILON);
+                                let raw_primary = (st.position - st.sub_delay) / speed;
+                                let raw_secondary = (st.position - st.secondary_sub_delay) / speed;
+                                subtitles.update_positions(raw_primary, raw_secondary);
+                            }
+                        }
+                        refresh_subtitle_list(&app, &model_rc, &subtitles);
+                        refresh_secondary_subtitle_list(&app, &sec_model_rc, &subtitles);
+                    }
+                }
+            }
+            if need_ass_resync {
+                MPV_EVENT_SYNC.with(|sync_slot| {
+                    let cb = sync_slot.borrow().clone();
+                    if let Some(sync_fn) = cb {
+                        sync_fn();
+                    }
+                });
+            }
+        }));
+    });
 
     EXTERNAL_SUBTITLE_SINK.with(|slot| {
         let app_weak = ext_sub_app.clone();
@@ -5471,8 +5730,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sync_video_timings = video_timings.clone();
         let sync_pending_frame = pending_playback_frame.clone();
         let sync_ext_sub_tx = ext_sub_sender.clone();
+        let sync_mkv_tx = mkv_extract_tx.clone();
+        let sync_ass_ctrl = ass_ctrl.clone();
         let sync_screensaver = screensaver.clone();
         let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
+        let extracted_mkv_fonts_gen: Cell<Option<u64>> = Cell::new(None);
+        let extracted_mkv_tracks: RefCell<std::collections::HashSet<(u64, i64)>> =
+            RefCell::new(std::collections::HashSet::new());
         let previous_furigana_visible = Cell::new(app.get_furigana_visible());
         let previous_subtitle_layout: Cell<Option<(i32, i32, u32, bool)>> = Cell::new(None);
         let previous_chapters: RefCell<Vec<f64>> = RefCell::new(Vec::new());
@@ -5550,12 +5814,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let gen_after = sync_media_generation.get();
             if gen_after != gen_before {
                 sync_shared_gen.store(gen_after, Ordering::Release);
+                extracted_mkv_fonts_gen.set(None);
+                extracted_mkv_tracks.borrow_mut().clear();
+                if let Ok(mut ass) = sync_ass_ctrl.try_borrow_mut() {
+                    ass.clear_for_new_media(&app);
+                }
             }
             for load in external_loads {
                 let _ = sync_ext_sub_tx.send((gen_after, load));
             }
 
+            let primary_is_native_ass = coord.primary_is_native_ass(&app);
             let state = coord.playback_state();
+
+            // Trigger non-blocking MKV EBML extraction for embedded fonts and embedded subtitle tracks.
+            if state.file_loaded && !state.path.is_empty() {
+                let media_path = Path::new(&state.path);
+                if controller::ass::is_matroska_path(media_path) && media_path.is_file() {
+                    if extracted_mkv_fonts_gen.get() != Some(gen_after) {
+                        extracted_mkv_fonts_gen.set(Some(gen_after));
+                        let _ = sync_mkv_tx.send(MkvExtractRequest::Fonts {
+                            generation: gen_after,
+                            path: media_path.to_path_buf(),
+                        });
+                    }
+                    let asr_sid = subtitles.asr_mpv_sid().or_else(|| coord.asr_track().sid());
+                    let mut done_tracks = extracted_mkv_tracks.borrow_mut();
+                    for sid in [state.primary_sid, state.secondary_sid] {
+                        if sid <= 0 || Some(sid) == asr_sid || done_tracks.contains(&(gen_after, sid)) {
+                            continue;
+                        }
+                        if let Some(track) = state.subtitle_tracks.iter().find(|t| t.id == sid) {
+                            if !track.external
+                                && track.src_id > 0
+                                && !controller::player::is_image_subtitle_codec(&track.codec)
+                            {
+                                done_tracks.insert((gen_after, sid));
+                                let _ = sync_mkv_tx.send(MkvExtractRequest::Track {
+                                    generation: gen_after,
+                                    sid,
+                                    track_number: track.src_id as u64,
+                                    path: media_path.to_path_buf(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Synchronize native ASS/SSA interactive hitboxes, highlight patches, and optional furigana.
+            if let Ok(mut ass) = sync_ass_ctrl.try_borrow_mut() {
+                let fallback_dims = if state.dimensions.0 > 0 && state.dimensions.1 > 0 {
+                    state.dimensions
+                } else {
+                    (
+                        app.get_video_width().max(1) as u32,
+                        app.get_video_height().max(1) as u32,
+                    )
+                };
+                let ass_params =
+                    controller::ass::mpv_ass_params_from_playback(state, fallback_dims);
+                let raw_sub_s =
+                    (state.position - state.sub_delay) / state.sub_speed.max(f64::EPSILON);
+                let now_ms = (raw_sub_s.max(0.0) * 1000.0).round() as i64;
+                let furigana_ratio = setting_number(
+                    &sync_asr_config,
+                    raw::interface::GROUP,
+                    raw::interface::subtitle::FURIGANA_RATIO,
+                    raw::interface::subtitle::FURIGANA_RATIO_DEFAULT,
+                ) as f32;
+                ass.sync_from_playback(
+                    &app,
+                    primary_is_native_ass,
+                    &state.sub_ass_extradata,
+                    &state.sub_text_ass_full,
+                    &ass_params,
+                    now_ms,
+                    state.paused,
+                    furigana_ratio,
+                );
+            }
             if state.file_loaded && last_autofit_generation.get() != Some(gen_after) {
                 let (vw, vh) = if state.dimensions.0 > 0 && state.dimensions.1 > 0 {
                     state.dimensions
@@ -6136,8 +6474,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     screensaver.borrow_mut().uninhibit();
     MPV_EVENT_SYNC.with(|slot| *slot.borrow_mut() = None);
     EXTERNAL_SUBTITLE_SINK.with(|slot| *slot.borrow_mut() = None);
+    MKV_EXTRACT_SINK.with(|slot| *slot.borrow_mut() = None);
     OPEN_PATHS_SINK.with(|slot| *slot.borrow_mut() = None);
     drop(ext_sub_sender);
+    drop(mkv_extract_tx);
     drop(thumb_tx);
     // Also cover an event-loop error or any exit that bypasses the close callback.
     asr_session.borrow_mut().shutdown();

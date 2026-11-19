@@ -645,7 +645,9 @@ pub fn publish_active_subtitle(
     app.set_selected_token_index(-1);
     app.set_active_sub_text(text.into());
     let epoch = furigana_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-    let pending = app.get_furigana_visible()
+    let ass_native = app.global::<SubtitleOverlayBridge>().get_ass_native_active();
+    let pending = !ass_native
+        && app.get_furigana_visible()
         && !text.is_empty()
         && furigana_sender.send((epoch, text.to_owned())).is_ok();
     app.set_subtitle_furigana_pending(pending);
@@ -7805,6 +7807,9 @@ struct RichUiMutable {
     pending_nested_anki_add: Option<(usize, String, String, bool)>,
 
     hovered_cluster: Option<HoveredSubtitleCluster>,
+    hovered_ass_target: Option<crate::controller::ass::AssHoveredTarget>,
+    pending_ass_scan: Option<crate::controller::ass::AssHoveredTarget>,
+    ass_controller: Option<Rc<RefCell<crate::controller::ass::AssOverlayController>>>,
     active_scan_utf16_range: Option<(usize, usize)>,
     pending_scan_utf16_start: Option<usize>,
     pending_scan_sub_query: Option<String>,
@@ -8152,13 +8157,22 @@ impl RichUiBridge {
     }
 
     fn clear_subtitle_scan_state(&self, app: &MementoApp) {
-        let mut st = self.state.borrow_mut();
-        st.scan_timer.stop();
-        st.hovered_cluster = None;
-        st.active_scan_utf16_range = None;
-        st.pending_scan_utf16_start = None;
-        st.pending_scan_sub_query = None;
-        drop(st);
+        let ass_ctrl = {
+            let mut st = self.state.borrow_mut();
+            st.scan_timer.stop();
+            st.hovered_cluster = None;
+            st.hovered_ass_target = None;
+            st.pending_ass_scan = None;
+            st.active_scan_utf16_range = None;
+            st.pending_scan_utf16_start = None;
+            st.pending_scan_sub_query = None;
+            st.ass_controller.clone()
+        };
+        if let Some(ass_ctrl) = ass_ctrl {
+            if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
+                ctrl.clear_lookup_highlight(app);
+            }
+        }
         let bridge = app.global::<SubtitleOverlayBridge>();
         bridge.set_hovered_token_index(-1);
         bridge.set_hovered_char_offset(-1);
@@ -8345,13 +8359,12 @@ impl RichUiBridge {
             }
 
             let pending_sub = st.pending_scan_sub_query.take();
-            if let Some(utf16_start) = st.pending_scan_utf16_start.take() {
-                let matched_u16 = if let (Some(first), Some(sub_q)) =
-                    (candidate_hits.first(), pending_sub.as_deref())
+            let compute_matched_u16 = |dict_ctrl: &mut DictController| -> usize {
+                if let (Some(first), Some(sub_q)) = (candidate_hits.first(), pending_sub.as_deref())
                 {
                     if !first.derivation.is_empty() {
-                        let _ = st.dict_ctrl.search(sub_q);
-                        let units = st.dict_ctrl.last_match_units();
+                        let _ = dict_ctrl.search(sub_q);
+                        let units = dict_ctrl.last_match_units();
                         if units > 0 {
                             units
                         } else {
@@ -8366,13 +8379,31 @@ impl RichUiBridge {
                         .map(|h| h.expression.encode_utf16().count())
                         .unwrap_or(1)
                 }
-                .max(1);
+                .max(1)
+            };
+            if let Some(utf16_start) = st.pending_scan_utf16_start.take() {
+                let matched_u16 = compute_matched_u16(&mut st.dict_ctrl);
                 st.active_scan_utf16_range = Some((utf16_start, utf16_start + matched_u16));
+                st.pending_ass_scan = None;
+            } else if let Some(ass_target) = st.pending_ass_scan.take() {
+                let matched_u16 = compute_matched_u16(&mut st.dict_ctrl);
+                if let Some(ass_ctrl) = st.ass_controller.clone() {
+                    if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
+                        ctrl.apply_lookup_highlight(app, &ass_target, matched_u16);
+                    }
+                }
             }
         } else {
             st.current_hits.clear();
             st.pending_scan_utf16_start = None;
             st.pending_scan_sub_query = None;
+            if st.pending_ass_scan.take().is_some() || rows.is_empty() {
+                if let Some(ass_ctrl) = st.ass_controller.clone() {
+                    if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
+                        ctrl.clear_lookup_highlight(app);
+                    }
+                }
+            }
         }
 
         let can_back = !st.back_stack.is_empty();
@@ -10215,12 +10246,33 @@ impl RichUiBridge {
         {
             let mut st = self.state.borrow_mut();
             st.scan_timer.stop();
+            st.pending_ass_scan = None;
             st.pending_scan_utf16_start = Some(cluster.global_utf16_offset);
             st.pending_scan_sub_query = Some(cluster.sub_query.clone());
         }
         app.set_popup_offset_x(app.get_pending_popup_offset_x());
         app.set_selected_token_index(cluster.word.index);
         app.invoke_lookup_word(cluster.sub_query.into());
+    }
+
+    fn trigger_ass_scan_now(
+        &self,
+        app: &MementoApp,
+        target: crate::controller::ass::AssHoveredTarget,
+    ) {
+        let query = target.scan_substring.clone();
+        if query.trim().is_empty() {
+            return;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.scan_timer.stop();
+            st.pending_scan_utf16_start = None;
+            st.pending_ass_scan = Some(target);
+            st.pending_scan_sub_query = Some(query.clone());
+        }
+        app.set_selected_token_index(0);
+        app.invoke_lookup_word(query.into());
     }
 }
 
@@ -10780,6 +10832,9 @@ pub fn install_rich_ui_bridges(
             nested_dismiss_timer: slint::Timer::default(),
             pending_nested_anki_add: None,
             hovered_cluster: None,
+            hovered_ass_target: None,
+            pending_ass_scan: None,
+            ass_controller: None,
             active_scan_utf16_range: None,
             pending_scan_utf16_start: None,
             pending_scan_sub_query: None,
@@ -11925,16 +11980,19 @@ pub fn install_rich_ui_bridges(
             return;
         };
         b_stat_mod.ensure_fresh_db_and_config(&app);
-        let (mod_setting, cluster_opt, gloss_target_opt) = {
+        let (mod_setting, cluster_opt, ass_target_opt, gloss_target_opt) = {
             let st = b_stat_mod.state.borrow();
             (
                 st.settings.search_modifier,
                 st.hovered_cluster.clone(),
+                st.hovered_ass_target.clone(),
                 st.hovered_glossary_target.clone(),
             )
         };
         if modifier_matches_setting(mod_setting, control, shift, alt, meta) {
-            if let Some(cluster) = cluster_opt {
+            if let Some(ass_target) = ass_target_opt {
+                b_stat_mod.trigger_ass_scan_now(&app, ass_target);
+            } else if let Some(cluster) = cluster_opt {
                 b_stat_mod.trigger_subtitle_scan_now(&app, cluster);
             } else if app.get_dict_open() {
                 if let Some(target) = gloss_target_opt {
@@ -11942,6 +12000,170 @@ pub fn install_rich_ui_bridges(
                         b_stat_mod.dispatch_nested_scan(&app, target, false);
                     }
                 }
+            }
+        }
+    });
+
+    let b_ass_line_hover = bridge.clone();
+    sb.on_ass_line_hover_changed(move |event_idx, line_idx, hovering| {
+        let Some(app) = b_ass_line_hover.app_weak.upgrade() else {
+            return;
+        };
+        let ass_ctrl = b_ass_line_hover.state.borrow().ass_controller.clone();
+        if let Some(ass_ctrl) = ass_ctrl {
+            if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
+                ctrl.on_line_hover_changed(&app, event_idx, line_idx, hovering);
+            }
+        }
+    });
+
+    let b_ass_hover = bridge.clone();
+    sb.on_ass_pointer_hovered(move |vx, vy, control, shift, alt, meta| {
+        let Some(app) = b_ass_hover.app_weak.upgrade() else {
+            return;
+        };
+        app.invoke_osc_activity();
+        b_ass_hover.ensure_fresh_db_and_config(&app);
+
+        let ass_ctrl = b_ass_hover.state.borrow().ass_controller.clone();
+        let Some(ass_ctrl) = ass_ctrl else {
+            return;
+        };
+        let target = {
+            let Ok(ctrl) = ass_ctrl.try_borrow() else {
+                return;
+            };
+            ctrl.hit_test_logical(&app, vx, vy)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if target.ch.is_whitespace() {
+            return;
+        }
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        let prev_target = b_ass_hover.state.borrow().hovered_ass_target.clone();
+        let same_char = prev_target.as_ref().is_some_and(|p| {
+            p.event_index == target.event_index && p.char_index == target.char_index
+        });
+        sb.set_hovered_global_char_index(target.global_char_index as i32);
+        sb.set_hovered_query(target.scan_substring.clone().into());
+
+        let (method, mod_setting, delay_ms) = {
+            let mut st = b_ass_hover.state.borrow_mut();
+            st.hovered_ass_target = Some(target.clone());
+            (
+                st.settings.search_method,
+                st.settings.search_modifier,
+                st.settings.search_delay_ms,
+            )
+        };
+        let mod_held = modifier_matches_setting(mod_setting, control, shift, alt, meta);
+        if method == 1 && !mod_held {
+            b_ass_hover.state.borrow_mut().scan_timer.stop();
+            return;
+        }
+        if app.get_dict_open() && app.get_selected_token_index() >= 0 && !mod_held {
+            return;
+        }
+        if same_char && app.get_dict_open() {
+            return;
+        }
+        if !memento_ass::is_japanese_or_alnum_lookup_char(target.ch) && !mod_held {
+            return;
+        }
+
+        let wait_ms = if mod_held { delay_ms.min(50) } else { delay_ms };
+        let target_key = (target.event_index, target.char_index);
+        let weak_bridge = Rc::downgrade(&b_ass_hover);
+        b_ass_hover.state.borrow_mut().scan_timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(wait_ms),
+            move || {
+                let Some(br) = weak_bridge.upgrade() else {
+                    return;
+                };
+                let Some(app) = br.app_weak.upgrade() else {
+                    return;
+                };
+                let current = br.state.borrow().hovered_ass_target.clone();
+                if let Some(cur) = current {
+                    if (cur.event_index, cur.char_index) == target_key {
+                        br.trigger_ass_scan_now(&app, cur);
+                    }
+                }
+            },
+        );
+    });
+
+    let b_ass_left = bridge.clone();
+    sb.on_ass_pointer_left(move || {
+        let Some(app) = b_ass_left.app_weak.upgrade() else {
+            return;
+        };
+        let still_hovered = app.global::<SubtitleOverlayBridge>().get_ass_hovered();
+        if !still_hovered {
+            let mut st = b_ass_left.state.borrow_mut();
+            st.scan_timer.stop();
+            st.hovered_ass_target = None;
+            drop(st);
+            let sb = app.global::<SubtitleOverlayBridge>();
+            sb.set_hovered_global_char_index(-1);
+            sb.set_hovered_query("".into());
+        }
+    });
+
+    let b_ass_click = bridge.clone();
+    sb.on_ass_left_clicked(move |vx, vy| {
+        let Some(app) = b_ass_click.app_weak.upgrade() else {
+            return;
+        };
+        b_ass_click.ensure_fresh_db_and_config(&app);
+        let ass_ctrl = b_ass_click.state.borrow().ass_controller.clone();
+        let Some(ass_ctrl) = ass_ctrl else {
+            return;
+        };
+        let target = {
+            let Ok(ctrl) = ass_ctrl.try_borrow() else {
+                return;
+            };
+            ctrl.hit_test_logical(&app, vx, vy)
+        };
+        if let Some(target) = target {
+            if !target.ch.is_whitespace() {
+                b_ass_click.state.borrow_mut().hovered_ass_target = Some(target.clone());
+                b_ass_click.trigger_ass_scan_now(&app, target);
+            }
+        }
+    });
+
+    let b_ass_mid = bridge.clone();
+    sb.on_ass_middle_clicked(move |vx, vy| {
+        let Some(app) = b_ass_mid.app_weak.upgrade() else {
+            return;
+        };
+        b_ass_mid.ensure_fresh_db_and_config(&app);
+        if !app
+            .global::<SubtitleOverlayBridge>()
+            .get_middle_mouse_scan_enabled()
+        {
+            return;
+        }
+        let ass_ctrl = b_ass_mid.state.borrow().ass_controller.clone();
+        let Some(ass_ctrl) = ass_ctrl else {
+            return;
+        };
+        let target = {
+            let Ok(ctrl) = ass_ctrl.try_borrow() else {
+                return;
+            };
+            ctrl.hit_test_logical(&app, vx, vy)
+        };
+        if let Some(target) = target {
+            if !target.ch.is_whitespace() {
+                b_ass_mid.state.borrow_mut().hovered_ass_target = Some(target.clone());
+                b_ass_mid.trigger_ass_scan_now(&app, target);
             }
         }
     });
@@ -12033,6 +12255,61 @@ pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU
             }
         }
     });
+}
+
+/// Binds an [`AssOverlayController`](crate::controller::ass::AssOverlayController) onto the
+/// active `RichUiBridge` so hover/modifier/left-click/middle-click events on native ASS lines
+/// trigger dictionary scanning, continuous `#38a6d6` highlight bars + crisp `libass` glyph
+/// patches, and per-speaker popup anchoring.
+pub fn bind_rich_bridge_ass_controller(
+    app: &MementoApp,
+    ass_controller: Rc<RefCell<crate::controller::ass::AssOverlayController>>,
+) {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    ACTIVE_RICH_BRIDGES.with(|slot| {
+        if let Some(bridge) = slot.borrow().iter().find(|b| b.instance_id == instance_id) {
+            bridge.state.borrow_mut().ass_controller = Some(ass_controller);
+        }
+    });
+}
+
+/// Immediately clears any active ASS lookup highlight / anchor on the bound `AssOverlayController`.
+pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    let ass_ctrl = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .and_then(|bridge| {
+                let mut st = bridge.state.borrow_mut();
+                st.pending_ass_scan = None;
+                st.ass_controller.clone()
+            })
+    });
+    if let Some(ass_ctrl) = ass_ctrl {
+        if let Ok(mut ctrl) = ass_ctrl.try_borrow_mut() {
+            ctrl.clear_lookup_highlight(app);
+        }
+    }
+}
+
+/// Returns the active ASS per-speaker lookup context (if the open popup came from
+/// hovering/clicking a native ASS line) for accurate `{subtitle}`, `{cloze-*}`, and `{audio-media}`.
+pub fn active_ass_lookup_for_app(
+    app: &MementoApp,
+) -> Option<crate::controller::ass::AssActiveLookup> {
+    if !app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
+        return None;
+    }
+    let instance_id = app.global::<PopupBridge>().get_bridge_instance_id();
+    let ass_ctrl = ACTIVE_RICH_BRIDGES.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|b| b.instance_id == instance_id)
+            .and_then(|bridge| bridge.state.borrow().ass_controller.clone())
+    })?;
+    let lookup = ass_ctrl.try_borrow().ok()?.active_lookup().cloned();
+    lookup
 }
 
 /// Returns the lossless 64-bit Anki note ID for a popup row (or active nested row if
