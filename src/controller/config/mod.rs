@@ -17,30 +17,49 @@ use std::thread::{self, JoinHandle};
 
 use memento_config::config::{ChangelogEntry, Config};
 use memento_config::{ArgbColor, QtFontSpec, Value};
+use memento_dict::searchcontroller::TextReplacementOptions;
 use memento_net::anki::AnkiEndpoint;
+use memento_setting::enums::ThemeMode;
 use memento_setting::keys as raw;
 
 use crate::ui::SettingsGroup;
 
-pub use anki_profiles::{anki_note_preset_fields, AnkiNoteConfig, AnkiNotePreset};
+pub use anki_profiles::{
+    anki_note_preset_fields, build_excluded_glossaries_checklist,
+    excluded_glossaries_from_checklist, parse_excluded_glossaries, serialize_excluded_glossaries,
+    toggle_excluded_glossary, validate_profile_name, AnkiNoteConfig, AnkiNotePreset,
+    ExcludedGlossaryItem,
+};
 pub use audio_sources::AudioSourceEntry;
+pub use keybinds::{
+    reserved_shortcut_reason, AudioContextKeybindAction, KEYBIND_CLEAR_AUDIO_CONTEXT,
+    KEYBIND_MARK_AUDIO_CONTEXT, QUIT_SHORTCUT_MACOS, SETTINGS_SHORTCUT_DEFAULT,
+    SETTINGS_SHORTCUT_MACOS,
+};
+pub use migration::is_volatile_cache_key;
+pub use schema::{
+    format_browse_selection, setting_browse_metadata, BrowseKind, SettingBrowseMetadata,
+};
 
 use anki_profiles::{AnkiProfile, AnkiProfilesFile};
 use audio_sources::{
     audio_sources, default_audio_source, ensure_default_audio_source, write_audio_sources,
 };
 use keybinds::{
-    active_keybind_profile_name, add_keybind_profile, compute_keybind_conflicts,
-    ensure_default_keybind_profile, keybind_profile_names, remove_keybind_profile,
-    reset_keybind_profiles,
+    active_keybind_profile_name, add_keybind_profile_with_options, compute_keybind_conflicts,
+    ensure_default_keybind_profile, keybind_profile_names, keybind_profile_prefix,
+    remove_keybind_profile, reset_keybind_profiles, validate_keybind_assignment,
 };
-use migration::load_config_store;
+use migration::{
+    load_config_store, load_config_store_with_fallback, overlay_volatile_keys, strip_volatile_keys,
+    MigrationPaths,
+};
 use schema::{
     asr_paths, behavior_paths, category_snapshot, declared_setting_default, effective_text,
     effective_value, interface_paths, normalize_loaded_asr_values, normalize_setting_value,
     ocr_paths, onnx_paths, parse_config_value, path_in_category, restore_category, search_paths,
-    value_text, whisper_paths, write_default_paths, write_default_value, SettingsCategory,
-    INTERFACE_FONT_KEYS,
+    text_replacement_options_from_config, value_text, whisper_paths, write_default_paths,
+    write_default_value, SettingsCategory, INTERFACE_FONT_KEYS,
 };
 use ui_groups::{
     application_settings_groups, asr_settings_groups, audio_settings_groups,
@@ -51,6 +70,13 @@ use ui_groups::{
 struct PersistedBaseline {
     target: PathBuf,
     config: Config,
+}
+
+struct CacheSplitState {
+    dir: PathBuf,
+    file_name: String,
+    target: PathBuf,
+    baseline: Config,
 }
 
 enum PendingWrite {
@@ -257,6 +283,7 @@ fn write_atomic_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 pub struct ConfigController {
     store: RefCell<Config>,
     persisted_baseline: RefCell<Option<PersistedBaseline>>,
+    cache_split: RefCell<Option<CacheSplitState>>,
     anki_profiles: RefCell<AnkiProfilesFile>,
     async_saver: RefCell<Option<BackgroundSaver>>,
 }
@@ -285,6 +312,7 @@ impl ConfigController {
         Self {
             store: RefCell::new(config),
             persisted_baseline: RefCell::new(None),
+            cache_split: RefCell::new(None),
             anki_profiles: RefCell::new(AnkiProfilesFile::default()),
             async_saver: RefCell::new(None),
         }
@@ -292,7 +320,103 @@ impl ConfigController {
 
     pub fn load<P: AsRef<Path>>(config_dir: P, file_name: &str) -> Result<Self, String> {
         let dir = config_dir.as_ref();
-        let store = load_config_store(dir, file_name)?;
+        let (fallback_dir, cache_dir, data_dir) = match crate::app::paths::resolve_app_dirs() {
+            Some(dirs) if dirs.config_dir == dir => (
+                dirs.legacy_config_fallback_dir,
+                dirs.use_cache_config_split.then_some(dirs.cache_dir),
+                Some(dirs.data_dir),
+            ),
+            _ => (None, None, None),
+        };
+        Self::load_with_fallback_and_cache(
+            dir,
+            file_name,
+            fallback_dir.as_deref(),
+            cache_dir.as_deref(),
+            data_dir.as_deref(),
+        )
+    }
+
+    /// Load config with explicit Linux XDG cache config split (`#337`):
+    /// volatile keys (`recent/files`, `dictionary/order`, `main-window/*`) are
+    /// read from and written to `cache_dir/file_name` while persistent settings
+    /// stay in `config_dir/file_name`.
+    pub fn load_with_cache_split<P: AsRef<Path>, Q: AsRef<Path>>(
+        config_dir: P,
+        cache_dir: Q,
+        file_name: &str,
+    ) -> Result<Self, String> {
+        Self::load_with_fallback_and_cache(
+            config_dir,
+            file_name,
+            None,
+            Some(cache_dir.as_ref()),
+            None,
+        )
+    }
+
+    /// Load config with optional legacy fallback read directory (macOS
+    /// `~/.config/memento`, Windows `%APPDATA%\memento`), optional Linux XDG
+    /// cache split directory (`#337`), and optional data directory for legacy
+    /// migrations (`v1→6`).
+    pub fn load_with_fallback_and_cache<P: AsRef<Path>>(
+        config_dir: P,
+        file_name: &str,
+        fallback_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+        data_dir: Option<&Path>,
+    ) -> Result<Self, String> {
+        let dir = config_dir.as_ref();
+        let effective_cache_dir = cache_dir.filter(|c| *c != dir);
+        let migration_paths = MigrationPaths {
+            config_dir: Some(dir),
+            data_dir,
+        };
+
+        if let Some(cdir) = effective_cache_dir {
+            let mut cache_store = load_config_store(cdir, file_name)?;
+            let mut primary_store = load_config_store_with_fallback(
+                dir,
+                file_name,
+                fallback_dir,
+                migration_paths,
+                Some(&mut cache_store),
+            )?;
+            ensure_default_audio_source(&mut primary_store);
+            ensure_default_keybind_profile(&mut primary_store);
+            normalize_loaded_asr_values(&mut primary_store);
+
+            let mut unified = clone_config_state(&primary_store);
+            overlay_volatile_keys(&mut unified, &cache_store);
+            let ctrl = Self::from_config(unified);
+
+            let mut primary_baseline = clone_config_state(&primary_store);
+            strip_volatile_keys(&mut primary_baseline);
+            primary_baseline.mark_persisted_with(
+                primary_store.revision(),
+                primary_store.changelog().to_vec(),
+                |_| true,
+            );
+            *ctrl.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
+                target: dir.join(file_name),
+                config: primary_baseline,
+            });
+            *ctrl.cache_split.borrow_mut() = Some(CacheSplitState {
+                dir: cdir.to_path_buf(),
+                file_name: file_name.to_owned(),
+                target: cdir.join(file_name),
+                baseline: cache_store,
+            });
+            return Ok(ctrl);
+        }
+
+        let store = load_config_store_with_fallback(
+            dir,
+            file_name,
+            fallback_dir,
+            migration_paths,
+            None,
+        )?;
         let ctrl = Self::from_config(store);
         let baseline = clone_config_state(&ctrl.store.borrow());
         *ctrl.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
@@ -300,6 +424,32 @@ impl ConfigController {
             config: baseline,
         });
         Ok(ctrl)
+    }
+
+    /// Enable or reconfigure Linux XDG cache config splitting (`#337`) on an
+    /// existing controller, overlaying any volatile keys already stored in
+    /// `cache_dir/file_name`.
+    pub fn set_cache_split_dir<P: AsRef<Path>>(
+        &self,
+        cache_dir: P,
+        file_name: &str,
+    ) -> Result<(), String> {
+        let _ = self.flush_async_saves();
+        let cdir = cache_dir.as_ref();
+        let cache_store = load_config_store(cdir, file_name)?;
+        overlay_volatile_keys(&mut self.store.borrow_mut(), &cache_store);
+        *self.cache_split.borrow_mut() = Some(CacheSplitState {
+            dir: cdir.to_path_buf(),
+            file_name: file_name.to_owned(),
+            target: cdir.join(file_name),
+            baseline: cache_store,
+        });
+        Ok(())
+    }
+
+    /// Return the active cache config path when Linux XDG cache splitting is enabled.
+    pub fn cache_split_path(&self) -> Option<PathBuf> {
+        self.cache_split.borrow().as_ref().map(|c| c.target.clone())
     }
 
     /// Waits for any pending background atomic writes to finish and synchronizes
@@ -323,6 +473,13 @@ impl ConfigController {
                     .mark_persisted_against(&baseline.config, |_| false);
             }
         }
+        if let Some(cache) = self.cache_split.borrow_mut().as_mut() {
+            if let Some((rev, changelog)) = meta.get(&cache.target) {
+                cache
+                    .baseline
+                    .mark_persisted_with(*rev, changelog.clone(), |_| true);
+            }
+        }
         status
     }
 
@@ -340,6 +497,12 @@ impl ConfigController {
         ensure_default_audio_source(&mut persisted);
         ensure_default_keybind_profile(&mut persisted);
         normalize_loaded_asr_values(&mut persisted);
+        if self.cache_split.borrow().is_some() {
+            let rev = persisted.revision();
+            let log = persisted.changelog().to_vec();
+            strip_volatile_keys(&mut persisted);
+            persisted.mark_persisted_with(rev, log, |_| true);
+        }
         *self.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
             target,
             config: persisted,
@@ -400,6 +563,30 @@ impl ConfigController {
 
     pub fn save(&self, dir: &Path, file_name: &str) -> Result<(), String> {
         let _ = self.flush_async_saves();
+        if self.cache_split.borrow().is_some() {
+            let mut store = self.store.borrow_mut();
+            let mut cache_guard = self.cache_split.borrow_mut();
+            let cache = cache_guard.as_mut().expect("cache split initialized");
+            let mut cache_to_save = clone_config_state(&cache.baseline);
+            strip_volatile_keys(&mut cache_to_save);
+            overlay_volatile_keys(&mut cache_to_save, &store);
+            cache_to_save
+                .save(&cache.dir, &cache.file_name)
+                .map_err(|e| format!("{e:?}"))?;
+            cache.baseline = clone_config_state(&cache_to_save);
+
+            let mut primary_to_save = clone_config_state(&store);
+            strip_volatile_keys(&mut primary_to_save);
+            primary_to_save
+                .save(dir, file_name)
+                .map_err(|e| format!("{e:?}"))?;
+            store.mark_persisted_against(&primary_to_save, |_| true);
+            *self.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
+                target: dir.join(file_name),
+                config: clone_config_state(&primary_to_save),
+            });
+            return Ok(());
+        }
         let mut store = self.store.borrow_mut();
         store.save(dir, file_name).map_err(|e| format!("{e:?}"))?;
         *self.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
@@ -411,6 +598,48 @@ impl ConfigController {
 
     /// Non-blocking atomic save of the full store on a background thread.
     pub fn save_async(&self, dir: &Path, file_name: &str) -> Result<(), String> {
+        if self.cache_split.borrow().is_some() {
+            let store_ref = self.store.borrow();
+            let (cache_target, cache_dir, cache_file, cache_snapshot) = {
+                let mut cache_guard = self.cache_split.borrow_mut();
+                let cache = cache_guard.as_mut().expect("cache split initialized");
+                let mut cache_snap = clone_config_state(&cache.baseline);
+                strip_volatile_keys(&mut cache_snap);
+                overlay_volatile_keys(&mut cache_snap, &store_ref);
+                cache.baseline = clone_config_state(&cache_snap);
+                (
+                    cache.target.clone(),
+                    cache.dir.clone(),
+                    cache.file_name.clone(),
+                    cache_snap,
+                )
+            };
+            let mut primary_snapshot = clone_config_state(&store_ref);
+            strip_volatile_keys(&mut primary_snapshot);
+            drop(store_ref);
+
+            let target = dir.join(file_name);
+            *self.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
+                target: target.clone(),
+                config: clone_config_state(&primary_snapshot),
+            });
+            self.enqueue_async_write(
+                target,
+                PendingWrite::Config {
+                    dir: dir.to_path_buf(),
+                    file_name: file_name.to_owned(),
+                    config: primary_snapshot,
+                },
+            )?;
+            return self.enqueue_async_write(
+                cache_target,
+                PendingWrite::Config {
+                    dir: cache_dir,
+                    file_name: cache_file,
+                    config: cache_snapshot,
+                },
+            );
+        }
         let snapshot = clone_config_state(&self.store.borrow());
         let target = dir.join(file_name);
         *self.persisted_baseline.borrow_mut() = Some(PersistedBaseline {
@@ -472,6 +701,69 @@ impl ConfigController {
 
     pub fn current_keybind_profile(&self) -> String {
         active_keybind_profile_name(&self.store.borrow())
+    }
+
+    pub fn keybind_profile_names(&self) -> Vec<String> {
+        keybind_profile_names(&self.store.borrow())
+    }
+
+    /// Validate a candidate new profile name for `SettingsCategory::Anki` (0)
+    /// or `SettingsCategory::Keybind` (6) before creation.
+    pub fn validate_new_profile_name(&self, category: i32, name: &str) -> Result<String, String> {
+        match SettingsCategory::from_i32(category)? {
+            SettingsCategory::Anki => {
+                validate_profile_name(name, &self.anki_profile_names(), true, None)
+            }
+            SettingsCategory::Keybind => {
+                validate_profile_name(name, &self.keybind_profile_names(), false, None)
+            }
+            _ => Err(format!("settings category {category} does not use profiles")),
+        }
+    }
+
+    /// Return the configured text replacement rules + search-original flag (`H6.5`).
+    pub fn text_replacement_options(&self) -> TextReplacementOptions {
+        text_replacement_options_from_config(&self.store.borrow())
+    }
+
+    /// Return the configured UI theme mode (`System`, `Dark`, `Light` — `#357`).
+    pub fn theme_mode(&self) -> ThemeMode {
+        match self.effective_setting(raw::interface::GROUP, raw::interface::THEME) {
+            Some(Value::Text(s)) => ThemeMode::from_str_lossy(&s),
+            _ => ThemeMode::System,
+        }
+    }
+
+    /// Return the configured audio download timeout in milliseconds (`#1876`).
+    pub fn audio_download_timeout_ms(&self) -> u64 {
+        match self.effective_setting(raw::audio::GROUP, raw::audio::DOWNLOAD_TIMEOUT_MS) {
+            Some(Value::Int(v)) => v.max(1000) as u64,
+            _ => raw::audio::DOWNLOAD_TIMEOUT_MS_DEFAULT as u64,
+        }
+    }
+
+    /// Return whether compact glossaries layout (`#220`) is enabled.
+    pub fn compact_glossaries(&self) -> bool {
+        matches!(
+            self.effective_setting(raw::interface::GROUP, raw::interface::COMPACT_GLOSSARIES),
+            Some(Value::Bool(true))
+        )
+    }
+
+    /// Return whether compact dictionary tags (`#220`) is enabled.
+    pub fn compact_tags(&self) -> bool {
+        matches!(
+            self.effective_setting(raw::interface::GROUP, raw::interface::COMPACT_TAGS),
+            Some(Value::Bool(true))
+        )
+    }
+
+    /// Return whether leaving a hover-paused subtitle resumes playback.
+    pub fn hover_pause_resume(&self) -> bool {
+        !matches!(
+            self.effective_setting(raw::search::GROUP, raw::search::HOVER_PAUSE_RESUME),
+            Some(Value::Bool(false))
+        )
     }
 
     pub fn anki_endpoint(&self) -> AnkiEndpoint {
@@ -601,6 +893,27 @@ impl ConfigController {
             .unwrap_or_default()
     }
 
+    /// Structured dictionary checklist for the active Anki profile's `ex-glos`.
+    pub fn anki_excluded_glossaries_checklist(
+        &self,
+        installed_dictionaries: &[String],
+    ) -> Vec<ExcludedGlossaryItem> {
+        self.anki_profiles
+            .borrow()
+            .excluded_glossaries_checklist(installed_dictionaries)
+    }
+
+    /// Toggle whether `dictionary_name` is excluded from `{glossary}` on the active Anki profile.
+    pub fn set_anki_glossary_excluded(
+        &self,
+        dictionary_name: &str,
+        excluded: bool,
+    ) -> Result<(), String> {
+        self.anki_profiles
+            .borrow_mut()
+            .set_glossary_excluded(dictionary_name, excluded)
+    }
+
     pub fn anki_note_model(&self, section: &str) -> Option<String> {
         self.anki_profiles
             .borrow()
@@ -670,6 +983,9 @@ impl ConfigController {
         }
 
         let mut store = self.store.borrow_mut();
+        if group.starts_with(&keybind_profile_prefix()) {
+            validate_keybind_assignment(&store, group, raw_key, value)?;
+        }
         let current = effective_value(&store, group, raw_key);
         let parsed = parse_config_value(group, raw_key, value, current)?;
         store
@@ -683,7 +999,9 @@ impl ConfigController {
     /// draft edits from the Options window.
     ///
     /// Reuses the in-memory last-persisted baseline so edits do not re-read
-    /// `memento.conf` from disk.
+    /// `memento.conf` from disk. When Linux XDG cache splitting (`#337`) is active,
+    /// volatile keys (`recent/files`, `dictionary/order`, `main-window/*`) are
+    /// persisted strictly to the cache file.
     pub fn persist_single_setting(
         &self,
         key: &str,
@@ -697,6 +1015,9 @@ impl ConfigController {
             .ok_or_else(|| format!("invalid setting key: {key}"))?;
         let parsed = {
             let mut store = self.store.borrow_mut();
+            if group.starts_with(&keybind_profile_prefix()) {
+                validate_keybind_assignment(&store, group, raw_key, value)?;
+            }
             let current = effective_value(&store, group, raw_key);
             let parsed = parse_config_value(group, raw_key, value, current)?;
             store
@@ -704,6 +1025,27 @@ impl ConfigController {
                 .map_err(|error| format!("{error:?}"))?;
             parsed
         };
+        if is_volatile_cache_key(group, raw_key) && self.cache_split.borrow().is_some() {
+            let mut cache_guard = self.cache_split.borrow_mut();
+            let cache = cache_guard.as_mut().expect("cache split initialized");
+            cache
+                .baseline
+                .put_at(group, raw_key, &parsed)
+                .map_err(|error| format!("{error:?}"))?;
+            cache
+                .baseline
+                .save(&cache.dir, &cache.file_name)
+                .map_err(|error| format!("{error:?}"))?;
+            let target_group = group.to_owned();
+            let target_key = raw_key.to_owned();
+            let mut store = self.store.borrow_mut();
+            let rev = store.revision();
+            let log = store.changelog().to_vec();
+            store.mark_persisted_with(rev, log, |path| {
+                path.group == target_group && path.key == target_key
+            });
+            return Ok(());
+        }
         self.ensure_baseline_for(config_dir, settings_file)?;
         let mut baseline_guard = self.persisted_baseline.borrow_mut();
         let persisted = &mut baseline_guard
@@ -741,6 +1083,9 @@ impl ConfigController {
             .ok_or_else(|| format!("invalid setting key: {key}"))?;
         let parsed = {
             let mut store = self.store.borrow_mut();
+            if group.starts_with(&keybind_profile_prefix()) {
+                validate_keybind_assignment(&store, group, raw_key, value)?;
+            }
             let current = effective_value(&store, group, raw_key);
             let parsed = parse_config_value(group, raw_key, value, current)?;
             store
@@ -748,6 +1093,42 @@ impl ConfigController {
                 .map_err(|error| format!("{error:?}"))?;
             parsed
         };
+        if is_volatile_cache_key(group, raw_key) && self.cache_split.borrow().is_some() {
+            let (target, cache_dir, cache_file, job_config) = {
+                let mut cache_guard = self.cache_split.borrow_mut();
+                let cache = cache_guard.as_mut().expect("cache split initialized");
+                let mut snapshot = clone_config_state(&cache.baseline);
+                snapshot
+                    .put_at(group, raw_key, &parsed)
+                    .map_err(|error| format!("{error:?}"))?;
+                cache
+                    .baseline
+                    .put_at(group, raw_key, &parsed)
+                    .map_err(|error| format!("{error:?}"))?;
+                let target_group = group.to_owned();
+                let target_key = raw_key.to_owned();
+                let mut store = self.store.borrow_mut();
+                let rev = store.revision();
+                let log = store.changelog().to_vec();
+                store.mark_persisted_with(rev, log, |path| {
+                    path.group == target_group && path.key == target_key
+                });
+                (
+                    cache.target.clone(),
+                    cache.dir.clone(),
+                    cache.file_name.clone(),
+                    snapshot,
+                )
+            };
+            return self.enqueue_async_write(
+                target,
+                PendingWrite::Config {
+                    dir: cache_dir,
+                    file_name: cache_file,
+                    config: job_config,
+                },
+            );
+        }
         self.ensure_baseline_for(config_dir, settings_file)?;
         let (target, job_config) = {
             let mut baseline_guard = self.persisted_baseline.borrow_mut();
@@ -793,6 +1174,20 @@ impl ConfigController {
         let _ = self.flush_async_saves();
 
         let snapshot = category_snapshot(&self.store.borrow(), cat);
+        if cat == SettingsCategory::Dictionary && self.cache_split.borrow().is_some() {
+            let mut cache_guard = self.cache_split.borrow_mut();
+            let cache = cache_guard.as_mut().expect("cache split initialized");
+            restore_category(&mut cache.baseline, &snapshot);
+            cache
+                .baseline
+                .save(&cache.dir, &cache.file_name)
+                .map_err(|error| format!("{error:?}"))?;
+            let mut store = self.store.borrow_mut();
+            let rev = store.revision();
+            let log = store.changelog().to_vec();
+            store.mark_persisted_with(rev, log, |path| path_in_category(cat, path));
+            return Ok(());
+        }
         self.ensure_baseline_for(config_dir, settings_file)?;
         let mut baseline_guard = self.persisted_baseline.borrow_mut();
         let persisted = &mut baseline_guard
@@ -822,6 +1217,33 @@ impl ConfigController {
             return self.save_anki_profiles_async(anki_json_path);
         }
         let snapshot = category_snapshot(&self.store.borrow(), cat);
+        if cat == SettingsCategory::Dictionary && self.cache_split.borrow().is_some() {
+            let (target, cache_dir, cache_file, job_config) = {
+                let mut cache_guard = self.cache_split.borrow_mut();
+                let cache = cache_guard.as_mut().expect("cache split initialized");
+                let mut job_cfg = clone_config_state(&cache.baseline);
+                restore_category(&mut job_cfg, &snapshot);
+                restore_category(&mut cache.baseline, &snapshot);
+                let mut store = self.store.borrow_mut();
+                let rev = store.revision();
+                let log = store.changelog().to_vec();
+                store.mark_persisted_with(rev, log, |path| path_in_category(cat, path));
+                (
+                    cache.target.clone(),
+                    cache.dir.clone(),
+                    cache.file_name.clone(),
+                    job_cfg,
+                )
+            };
+            return self.enqueue_async_write(
+                target,
+                PendingWrite::Config {
+                    dir: cache_dir,
+                    file_name: cache_file,
+                    config: job_config,
+                },
+            );
+        }
         self.ensure_baseline_for(config_dir, settings_file)?;
         let (target, job_config) = {
             let mut baseline_guard = self.persisted_baseline.borrow_mut();
@@ -856,6 +1278,20 @@ impl ConfigController {
             return self.load_anki_profiles(anki_json_path);
         }
         let _ = self.flush_async_saves();
+
+        if cat == SettingsCategory::Dictionary && self.cache_split.borrow().is_some() {
+            let snapshot = {
+                let cache_guard = self.cache_split.borrow();
+                let cache = cache_guard.as_ref().expect("cache split initialized");
+                category_snapshot(&cache.baseline, cat)
+            };
+            let mut store = self.store.borrow_mut();
+            restore_category(&mut store, &snapshot);
+            let rev = store.revision();
+            let log = store.changelog().to_vec();
+            store.mark_persisted_with(rev, log, |path| path_in_category(cat, path));
+            return Ok(());
+        }
 
         self.ensure_baseline_for(config_dir, settings_file)?;
         let (snapshot, revision, changelog) = {
@@ -907,7 +1343,14 @@ impl ConfigController {
                     raw::application::AUTO_UPDATE_CHECK,
                 );
             }
-            SettingsCategory::Audio => write_audio_sources(&mut store, &[default_audio_source()])?,
+            SettingsCategory::Audio => {
+                write_audio_sources(&mut store, &[default_audio_source()])?;
+                write_default_value(
+                    &mut store,
+                    raw::audio::GROUP,
+                    raw::audio::DOWNLOAD_TIMEOUT_MS,
+                );
+            }
             SettingsCategory::Behavior => write_default_paths(&mut store, behavior_paths()),
             SettingsCategory::Dictionary => {
                 write_default_value(&mut store, raw::dictionary::GROUP, raw::dictionary::ORDER);
@@ -943,9 +1386,20 @@ impl ConfigController {
         Ok(())
     }
 
-    pub fn add_entry(&self, category: i32, name: &str) -> Result<(), String> {
+    /// Create a new Anki/Keybind profile or Audio source entry. For Anki and
+    /// Keybind profiles, `copy_current` controls whether the new profile clones
+    /// the active profile (`true`) or starts from factory defaults (`false`).
+    pub fn add_entry_with_options(
+        &self,
+        category: i32,
+        name: &str,
+        copy_current: bool,
+    ) -> Result<(), String> {
         match SettingsCategory::from_i32(category).ok() {
-            Some(SettingsCategory::Anki) => self.anki_profiles.borrow_mut().add_profile(name),
+            Some(SettingsCategory::Anki) => self
+                .anki_profiles
+                .borrow_mut()
+                .add_profile_with_options(name, copy_current),
             Some(SettingsCategory::Audio) => {
                 let mut store = self.store.borrow_mut();
                 let mut sources = audio_sources(&store);
@@ -958,12 +1412,16 @@ impl ConfigController {
                 write_audio_sources(&mut store, &sources)
             }
             Some(SettingsCategory::Keybind) => {
-                add_keybind_profile(&mut self.store.borrow_mut(), name)
+                add_keybind_profile_with_options(&mut self.store.borrow_mut(), name, copy_current)
             }
             _ => Err(format!(
                 "settings category {category} does not support entries"
             )),
         }
+    }
+
+    pub fn add_entry(&self, category: i32, name: &str) -> Result<(), String> {
+        self.add_entry_with_options(category, name, true)
     }
 
     pub fn remove_entry(&self, category: i32, id: &str) -> Result<(), String> {
@@ -1286,22 +1744,385 @@ mod tests {
     }
 
     #[test]
-    fn keybind_conflicts_detect_duplicates_case_and_modifier_order_insensitively() {
-        let ctrl = ConfigController::new();
+    fn keybind_conflicts_reject_duplicates_and_reserved_and_detect_loaded_conflicts() {
+        let mut ctrl = ConfigController::new();
         assert!(ctrl.keybind_conflicts().is_empty());
 
         let profile = ctrl.current_keybind_profile();
-        ctrl.edit_setting(
-            &format!("keybind/profiles/{profile}/open-file"),
-            "Shift+Ctrl+C",
-        )
-        .unwrap();
+        // Live edits reject duplicate chords (case- & modifier-order-insensitively).
+        let dup_chord = if cfg!(target_os = "macos") {
+            "Shift+Cmd+C"
+        } else {
+            "Shift+Ctrl+C"
+        };
+        let dup_err = ctrl
+            .edit_setting(&format!("keybind/profiles/{profile}/open-file"), dup_chord)
+            .unwrap_err();
+        assert!(
+            dup_err.contains("already assigned"),
+            "unexpected duplicate error: {dup_err}"
+        );
+
+        // Reserved Settings shortcut (`Ctrl+,` / `Cmd+,`) is rejected.
+        for reserved in ["Ctrl+,", "Cmd+,", "Control+Comma"] {
+            let err = ctrl
+                .edit_setting(&format!("keybind/profiles/{profile}/open-file"), reserved)
+                .unwrap_err();
+            assert!(
+                err.contains("reserved for Settings"),
+                "expected reserved Settings error for {reserved}, got: {err}"
+            );
+        }
+        // `Cmd+Q` is reserved on macOS.
+        assert_eq!(reserved_shortcut_reason("Cmd+Q", true), Some("Quit"));
+        assert_eq!(reserved_shortcut_reason("Cmd+Q", false), None);
+
+        // Clearing a shortcut to empty string is allowed, and assigning a unique chord succeeds.
+        ctrl.edit_setting(&format!("keybind/profiles/{profile}/open-file"), "")
+            .unwrap();
+        ctrl.edit_setting(&format!("keybind/profiles/{profile}/open-file"), "Ctrl+Alt+O")
+            .unwrap();
+
+        // Pre-existing duplicates loaded from disk are still detected by `keybind_conflicts()`.
+        ctrl.store_mut()
+            .put_at(
+                &format!("keybind/profiles/{profile}"),
+                "open-file",
+                &Value::Text(dup_chord.to_owned()),
+            )
+            .unwrap();
         let conflicts = ctrl.keybind_conflicts();
         assert_eq!(conflicts.len(), 2);
         assert!(conflicts.iter().any(|(k, _, _)| k == "open-file"));
         assert!(conflicts
             .iter()
             .any(|(k, _, _)| k == "sub-list-copy-selected"));
+    }
+
+    #[test]
+    fn keybind_macos_defaults_audio_context_actions_and_ocr_gating() {
+        use super::keybinds::{keybind_default_for_os, visible_keybind_fields_for};
+
+        assert_eq!(keybind_default_for_os(raw::keybind::profile::OPEN_FILE, true), "Cmd+O");
+        assert_eq!(keybind_default_for_os(raw::keybind::profile::OPEN_URL, true), "Cmd+Shift+O");
+        assert_eq!(keybind_default_for_os(raw::keybind::profile::SUBTITLE_LIST_FIND, true), "Cmd+F");
+        assert_eq!(keybind_default_for_os(raw::keybind::profile::SUBTITLE_LIST_FIND_NEXT, true), "Cmd+G");
+        assert_eq!(
+            keybind_default_for_os(raw::keybind::profile::SUBTITLE_LIST_FIND_PREVIOUS, true),
+            "Cmd+Shift+G"
+        );
+        assert_eq!(keybind_default_for_os(KEYBIND_MARK_AUDIO_CONTEXT, true), "Cmd+B");
+        assert_eq!(keybind_default_for_os(KEYBIND_CLEAR_AUDIO_CONTEXT, true), "Cmd+Shift+B");
+        assert_eq!(keybind_default_for_os(KEYBIND_MARK_AUDIO_CONTEXT, false), "Ctrl+B");
+        assert_eq!(keybind_default_for_os(KEYBIND_CLEAR_AUDIO_CONTEXT, false), "Ctrl+Shift+B");
+
+        let without_ocr = visible_keybind_fields_for(false);
+        assert!(!without_ocr.iter().any(|(k, _)| *k == raw::keybind::profile::START_OCR));
+        assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_MARK_AUDIO_CONTEXT));
+        assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_CLEAR_AUDIO_CONTEXT));
+
+        let with_ocr = visible_keybind_fields_for(true);
+        assert!(with_ocr.iter().any(|(k, _)| *k == raw::keybind::profile::START_OCR));
+    }
+
+    #[test]
+    fn new_schema_fields_dead_switch_hiding_and_browse_metadata() {
+        use slint::Model;
+
+        let dir = temp_dir("new-schema");
+        let anki = dir.join("anki_connect.json");
+        let ctrl = ConfigController::new();
+
+        // Exposed in UI groups: theme, compact-glossaries, compact-tags,
+        // text-replacements, text-replacements-search-original, hover-pause-resume,
+        // audio/download-timeout-ms.
+        let all_keys: Vec<String> = ctrl
+            .settings_groups()
+            .into_iter()
+            .flat_map(|g| {
+                (0..g.fields.row_count())
+                    .filter_map(move |i| g.fields.row_data(i).map(|f| f.key.to_string()))
+            })
+            .collect();
+        for expected in [
+            "interface/theme",
+            "interface/compact-glossaries",
+            "interface/compact-tags",
+            "search/text-replacements",
+            "search/text-replacements-search-original",
+            "search/hover-pause-resume",
+            "audio/download-timeout-ms",
+            "behavior/file-open-custom",
+        ] {
+            assert!(
+                all_keys.iter().any(|k| k == expected),
+                "expected {expected} in UI groups"
+            );
+        }
+
+        // Dead switches must NOT appear in UI groups, while still loading cleanly from config.
+        for hidden in [
+            "interface/search-window",
+            "interface/sub-list-window",
+            "interface/system-icons",
+        ] {
+            assert!(
+                !all_keys.iter().any(|k| k == hidden),
+                "dead switch {hidden} must be hidden from UI groups"
+            );
+        }
+
+        // Theme round-trip & invalid rejection.
+        assert_eq!(ctrl.theme_mode(), ThemeMode::System);
+        ctrl.edit_setting("interface/theme", "dark").unwrap();
+        assert_eq!(ctrl.theme_mode(), ThemeMode::Dark);
+        ctrl.edit_setting("interface/theme", "Light").unwrap();
+        assert_eq!(ctrl.theme_mode(), ThemeMode::Light);
+        assert!(ctrl.edit_setting("interface/theme", "neon").is_err());
+
+        // Compact glossaries/tags & hover-pause-resume.
+        assert!(!ctrl.compact_glossaries());
+        assert!(ctrl.compact_tags());
+        assert!(ctrl.hover_pause_resume());
+        ctrl.edit_setting("interface/compact-glossaries", "true").unwrap();
+        ctrl.edit_setting("interface/compact-tags", "false").unwrap();
+        ctrl.edit_setting("search/hover-pause-resume", "false").unwrap();
+        assert!(ctrl.compact_glossaries());
+        assert!(!ctrl.compact_tags());
+        assert!(!ctrl.hover_pause_resume());
+
+        // Audio download timeout clamping (1000..=30000) & defaults reset.
+        assert_eq!(ctrl.audio_download_timeout_ms(), 8000);
+        ctrl.edit_setting("audio/download-timeout-ms", "200").unwrap();
+        assert_eq!(ctrl.audio_download_timeout_ms(), 1000);
+        ctrl.edit_setting("audio/download-timeout-ms", "99999").unwrap();
+        assert_eq!(ctrl.audio_download_timeout_ms(), 30000);
+        ctrl.defaults_settings(2).unwrap();
+        assert_eq!(ctrl.audio_download_timeout_ms(), 8000);
+
+        // Text replacements JSON validation & structured options parsing.
+        assert!(ctrl.edit_setting("search/text-replacements", "not-json").is_err());
+        ctrl.edit_setting(
+            "search/text-replacements",
+            r#"[{"pattern":"ー","replacement":"","ignore_case":false,"enabled":true}]"#,
+        )
+        .unwrap();
+        ctrl.edit_setting("search/text-replacements-search-original", "false")
+            .unwrap();
+        let tr_opts = ctrl.text_replacement_options();
+        assert_eq!(tr_opts.rules.len(), 1);
+        assert_eq!(tr_opts.rules[0].pattern, "ー");
+        assert!(!tr_opts.search_original);
+
+        // Folder browse metadata for behavior/file-open-custom.
+        let browse = setting_browse_metadata("behavior/file-open-custom").unwrap();
+        assert_eq!(browse.kind, BrowseKind::Folder);
+        assert!(browse.store_as_file_uri);
+        assert_eq!(
+            format_browse_selection("behavior/file-open-custom", Path::new("/tmp/My Anime")),
+            "file:///tmp/My%20Anime"
+        );
+
+        // Old config containing hidden dead switches still loads without error.
+        fs::write(
+            dir.join("memento.conf"),
+            "version=6\n[interface]\nsearch-window=true\nsub-list-window=true\nsystem-icons=true\n",
+        )
+        .unwrap();
+        let legacy = ConfigController::load(&dir, "memento.conf").unwrap();
+        assert_eq!(
+            legacy.effective_setting(raw::interface::GROUP, raw::interface::SEARCH_WINDOW),
+            Some(Value::Bool(true))
+        );
+        legacy.apply_settings(5, &dir, "memento.conf", &anki).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_qol_copy_current_delete_default_validation_and_ex_glos_checklist() {
+        let ctrl = ConfigController::new();
+
+        // Anki: edit Default, create with copy_current=true vs false.
+        ctrl.edit_setting("anki/profile/port", "9999").unwrap();
+        ctrl.add_entry_with_options(0, "Cloned", true).unwrap();
+        assert_eq!(ctrl.current_anki_profile(), "Cloned");
+        assert_eq!(ctrl.anki_endpoint().port, 9999);
+
+        ctrl.add_entry_with_options(0, "Fresh", false).unwrap();
+        assert_eq!(ctrl.current_anki_profile(), "Fresh");
+        assert_eq!(ctrl.anki_endpoint().port, 8765);
+
+        // Duplicate name validation (case-insensitive).
+        assert!(ctrl.validate_new_profile_name(0, "fresh").is_err());
+        assert!(ctrl.validate_new_profile_name(0, "   ").is_err());
+        assert_eq!(
+            ctrl.validate_new_profile_name(0, "  Mining  ").unwrap(),
+            "Mining"
+        );
+
+        // Deleting Default succeeds when other profiles exist, and deleting the last
+        // remaining profile resets cleanly to factory Default!
+        ctrl.remove_entry(0, "Default").unwrap();
+        ctrl.remove_entry(0, "Cloned").unwrap();
+        ctrl.remove_entry(0, "Fresh").unwrap();
+        assert_eq!(ctrl.anki_profile_names(), vec!["Default"]);
+        assert_eq!(ctrl.current_anki_profile(), "Default");
+        assert_eq!(ctrl.anki_endpoint().port, 8765);
+
+        // Keybind: copy_current=true vs false, and deleting last profile resets cleanly.
+        ctrl.edit_setting("keybind/profiles/Default/open-file", "Ctrl+Alt+F")
+            .unwrap();
+        ctrl.add_entry_with_options(6, "KBCloned", true).unwrap();
+        assert_eq!(
+            ctrl.effective_setting("keybind/profiles/KBCloned", "open-file"),
+            Some(Value::Text("Ctrl+Alt+F".to_owned()))
+        );
+        ctrl.add_entry_with_options(6, "KBFresh", false).unwrap();
+        assert_ne!(
+            ctrl.effective_setting("keybind/profiles/KBFresh", "open-file"),
+            Some(Value::Text("Ctrl+Alt+F".to_owned()))
+        );
+        assert!(ctrl.validate_new_profile_name(6, "kbfresh").is_err());
+        assert!(ctrl.validate_new_profile_name(6, "bad/name").is_err());
+
+        ctrl.remove_entry(6, "Default").unwrap();
+        ctrl.remove_entry(6, "KBCloned").unwrap();
+        ctrl.remove_entry(6, "KBFresh").unwrap();
+        assert_eq!(ctrl.keybind_profile_names(), vec!["Default"]);
+        assert_eq!(ctrl.current_keybind_profile(), "Default");
+        assert_ne!(
+            ctrl.effective_setting("keybind/profiles/Default", "open-file"),
+            Some(Value::Text("Ctrl+Alt+F".to_owned()))
+        );
+
+        // Anki ex-glos structured checklist round-trip (including commas & uninstalled dicts).
+        ctrl.set_anki_glossary_excluded("JMdict, Extra", true)
+            .unwrap();
+        ctrl.set_anki_glossary_excluded("UninstalledDict", true)
+            .unwrap();
+        let installed = vec!["JMdict, Extra".to_owned(), "Daijirin".to_owned()];
+        let checklist = ctrl.anki_excluded_glossaries_checklist(&installed);
+        assert_eq!(
+            checklist,
+            vec![
+                ExcludedGlossaryItem {
+                    dictionary_name: "JMdict, Extra".to_owned(),
+                    excluded: true,
+                },
+                ExcludedGlossaryItem {
+                    dictionary_name: "Daijirin".to_owned(),
+                    excluded: false,
+                },
+                ExcludedGlossaryItem {
+                    dictionary_name: "UninstalledDict".to_owned(),
+                    excluded: true,
+                },
+            ]
+        );
+        let serialized = serialize_excluded_glossaries(&excluded_glossaries_from_checklist(&checklist));
+        assert_eq!(
+            parse_excluded_glossaries(&serialized),
+            vec!["JMdict, Extra".to_owned(), "UninstalledDict".to_owned()]
+        );
+        ctrl.set_anki_glossary_excluded("JMdict, Extra", false)
+            .unwrap();
+        assert_eq!(
+            ctrl.anki_excluded_glossaries(),
+            vec!["UninstalledDict".to_owned()]
+        );
+    }
+
+    #[test]
+    fn linux_xdg_cache_config_split_and_legacy_fallback_read() {
+        let root = temp_dir("xdg-cache-split");
+        let cfg_dir = root.join("config/memento");
+        let cache_dir = root.join("cache/memento");
+        let anki = cfg_dir.join("anki_connect.json");
+
+        let ctrl = ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf")
+            .unwrap();
+        assert_eq!(ctrl.cache_split_path(), Some(cache_dir.join("memento.conf")));
+
+        ctrl.edit_setting("behavior/autofit", "false").unwrap();
+        ctrl.recent_files_add("/tmp/episode01.mkv").unwrap();
+        ctrl.edit_setting("main-window/subtitle-list", "true")
+            .unwrap();
+        ctrl.edit_setting("dictionary/order", "1, 2").unwrap();
+        ctrl.save(&cfg_dir, "memento.conf").unwrap();
+
+        let primary_text = fs::read_to_string(cfg_dir.join("memento.conf")).unwrap();
+        let cache_text = fs::read_to_string(cache_dir.join("memento.conf")).unwrap();
+        assert!(primary_text.contains("autofit"), "persistent key missing from config");
+        assert!(!primary_text.contains("episode01.mkv"), "recent/files leaked into config");
+        assert!(!primary_text.contains("[main-window]"), "main-window leaked into config");
+        assert!(!primary_text.contains("[dictionary]"), "dictionary/order leaked into config");
+
+        assert!(cache_text.contains("episode01.mkv"), "recent/files missing from cache");
+        assert!(cache_text.contains("subtitle-list"), "main-window missing from cache");
+        assert!(cache_text.contains("order"), "dictionary/order missing from cache");
+        assert!(!cache_text.contains("autofit"), "persistent key leaked into cache");
+
+        // Reload combines both files transparently.
+        let reloaded =
+            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf").unwrap();
+        assert_eq!(
+            reloaded.effective_setting(raw::behavior::GROUP, raw::behavior::AUTO_FIT),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(reloaded.recent_files(), vec!["/tmp/episode01.mkv"]);
+        assert_eq!(
+            reloaded.effective_setting(raw::window::GROUP, raw::window::SUBTITLE_LIST),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            reloaded.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER),
+            Some(Value::Ints(vec![1, 2]))
+        );
+
+        // Single-setting persist for volatile key writes ONLY to cache, not config.
+        reloaded
+            .persist_single_setting("main-window/subtitle-list", "false", &cfg_dir, "memento.conf")
+            .unwrap();
+        reloaded.edit_setting("dictionary/order", "3, 1").unwrap();
+        reloaded
+            .apply_settings(4, &cfg_dir, "memento.conf", &anki)
+            .unwrap();
+        let reloaded2 =
+            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf").unwrap();
+        assert_eq!(
+            reloaded2.effective_setting(raw::window::GROUP, raw::window::SUBTITLE_LIST),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            reloaded2.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER),
+            Some(Value::Ints(vec![3, 1]))
+        );
+
+        // Fallback read when OS-native config dir doesn't exist yet (macOS ~/.config / Windows %APPDATA%).
+        let native_dir = root.join("Library/Application Support/memento");
+        let fallback_dir = root.join(".config/memento");
+        fs::create_dir_all(&fallback_dir).unwrap();
+        fs::write(
+            fallback_dir.join("memento.conf"),
+            "version=6\n[behavior]\nautofit=false\n",
+        )
+        .unwrap();
+        let migrated = ConfigController::load_with_fallback_and_cache(
+            &native_dir,
+            "memento.conf",
+            Some(&fallback_dir),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            migrated.effective_setting(raw::behavior::GROUP, raw::behavior::AUTO_FIT),
+            Some(Value::Bool(false))
+        );
+        migrated.save(&native_dir, "memento.conf").unwrap();
+        assert!(native_dir.join("memento.conf").is_file());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

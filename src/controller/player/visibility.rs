@@ -18,6 +18,14 @@ pub fn is_image_subtitle_codec(codec: &str) -> bool {
 
 /// Compute `(sub-visibility, secondary-sub-visibility)` for `libmpv` without
 /// toggling visibility during silence gaps between text cues.
+///
+/// Precedence:
+/// 1. Explicit `Show Subtitles` off (`!subtitles_visible`) always hides both
+///    tracks — `subtitle-cursor-show` never overrides it.
+/// 2. When cursor-show is enabled for a track and the cursor is outside its
+///    reveal zone, mpv hides that track even when `hide_mpv_subtitles == false`.
+/// 3. Otherwise native ASS / bitmap image tracks render via mpv, and plain text
+///    tracks render via mpv whenever Memento's overlay does not own text.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_mpv_subtitle_visibility_ex(
     hide_mpv_subtitles: bool,
@@ -32,30 +40,27 @@ pub fn compute_mpv_subtitle_visibility_ex(
     secondary_cursor_show_enabled: bool,
     secondary_cursor_reveal: bool,
 ) -> (bool, bool) {
-    let primary_visible = if primary_is_native_ass {
-        if primary_cursor_show_enabled {
-            primary_cursor_reveal
-        } else {
-            subtitles_visible
-        }
-    } else if !subtitles_visible && !(primary_cursor_show_enabled && primary_cursor_reveal) {
+    if !subtitles_visible {
+        return (false, false);
+    }
+
+    let overlay_owns_text = hide_mpv_subtitles && !(hide_while_playing && playing);
+
+    let primary_visible = if primary_cursor_show_enabled && !primary_cursor_reveal {
         false
-    } else if primary_is_image {
+    } else if primary_is_native_ass || primary_is_image {
         true
     } else {
-        let overlay_owns_text = hide_mpv_subtitles && !(hide_while_playing && playing);
         !overlay_owns_text
     };
 
-    let secondary_visible =
-        if !subtitles_visible && !(secondary_cursor_show_enabled && secondary_cursor_reveal) {
-            false
-        } else if secondary_is_image {
-            true
-        } else {
-            let overlay_owns_text = hide_mpv_subtitles && !(hide_while_playing && playing);
-            !overlay_owns_text
-        };
+    let secondary_visible = if secondary_cursor_show_enabled && !secondary_cursor_reveal {
+        false
+    } else if secondary_is_image {
+        true
+    } else {
+        !overlay_owns_text
+    };
 
     (primary_visible, secondary_visible)
 }
@@ -136,8 +141,8 @@ pub fn compute_autofit_window_size(
 }
 
 /// Classify a pointer Y position inside the video area into `(in_top_zone, in_bottom_zone)`
-/// for `behavior/subtitle-cursor-show-secondary` (top 20%) and
-/// `behavior/subtitle-cursor-show` (bottom 20%).
+/// for `behavior/subtitle-cursor-show-secondary` (top 25%) and
+/// `behavior/subtitle-cursor-show` (bottom 25%).
 pub fn subtitle_cursor_zones(pointer_y: f32, video_height: f32) -> (bool, bool) {
     if !pointer_y.is_finite()
         || !video_height.is_finite()
@@ -148,10 +153,13 @@ pub fn subtitle_cursor_zones(pointer_y: f32, video_height: f32) -> (bool, bool) 
         return (false, false);
     }
     let ratio = pointer_y / video_height;
-    (ratio <= 0.20, ratio >= 0.80)
+    (ratio <= 0.25, ratio >= 0.75)
 }
 
 /// Compute effective subtitle overlay visibility accounting for `subtitle-cursor-show`.
+///
+/// Precedence: `subtitle-cursor-show` NEVER overrides explicit `Show Subtitles`
+/// off (`!subtitles_visible`) or `hide-memento-while-playing` while playing.
 pub fn compute_subtitle_overlay_visibility(
     has_text: bool,
     subtitles_visible: bool,
@@ -160,14 +168,27 @@ pub fn compute_subtitle_overlay_visibility(
     cursor_show_enabled: bool,
     cursor_in_zone: bool,
 ) -> bool {
-    if !has_text {
+    if !has_text || !subtitles_visible || (hide_while_playing && is_playing) {
         return false;
     }
-    if cursor_show_enabled {
-        cursor_in_zone
-    } else {
-        subtitles_visible && !(hide_while_playing && is_playing)
+    !cursor_show_enabled || cursor_in_zone
+}
+
+/// Compute effective visibility of the interactive ASS hover/selection overlay
+/// (`ass-overlay`), enforcing `subtitles_visible`, `hide-memento-while-playing`,
+/// and `subtitle-cursor-show` precedence.
+pub fn compute_ass_overlay_visibility(
+    ass_native_active: bool,
+    subtitles_visible: bool,
+    hide_while_playing: bool,
+    is_playing: bool,
+    cursor_show_enabled: bool,
+    cursor_in_zone: bool,
+) -> bool {
+    if !ass_native_active || !subtitles_visible || (hide_while_playing && is_playing) {
+        return false;
     }
+    !cursor_show_enabled || cursor_in_zone
 }
 
 /// Compute whether `mpv`'s `cursor-autohide` policy wants the video cursor hidden when
@@ -268,5 +289,119 @@ pub fn compute_video_render_size(
         )
     } else {
         (viewport_w, viewport_h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_zones_use_25_percent_top_and_bottom_bands() {
+        assert_eq!(subtitle_cursor_zones(0.0, 1000.0), (true, false));
+        assert_eq!(subtitle_cursor_zones(250.0, 1000.0), (true, false));
+        assert_eq!(subtitle_cursor_zones(251.0, 1000.0), (false, false));
+        assert_eq!(subtitle_cursor_zones(500.0, 1000.0), (false, false));
+        assert_eq!(subtitle_cursor_zones(749.0, 1000.0), (false, false));
+        assert_eq!(subtitle_cursor_zones(750.0, 1000.0), (false, true));
+        assert_eq!(subtitle_cursor_zones(1000.0, 1000.0), (false, true));
+        assert_eq!(subtitle_cursor_zones(-1.0, 1000.0), (false, false));
+        assert_eq!(subtitle_cursor_zones(1001.0, 1000.0), (false, false));
+        assert_eq!(subtitle_cursor_zones(100.0, 0.0), (false, false));
+    }
+
+    #[test]
+    fn cursor_show_never_overrides_show_subtitles_off_or_hide_while_playing() {
+        // Explicit Show Subtitles OFF (`subtitles_visible = false`) wins even in zone.
+        assert!(!compute_subtitle_overlay_visibility(
+            true, false, false, false, true, true
+        ));
+        assert!(!compute_ass_overlay_visibility(
+            true, false, false, false, true, true
+        ));
+
+        // `hide-memento-while-playing` while playing wins even in zone (both plain & ASS overlay).
+        assert!(!compute_subtitle_overlay_visibility(
+            true, true, true, true, true, true
+        ));
+        assert!(!compute_ass_overlay_visibility(
+            true, true, true, true, true, true
+        ));
+        // Paused + in zone -> visible.
+        assert!(compute_subtitle_overlay_visibility(
+            true, true, true, false, true, true
+        ));
+        assert!(compute_ass_overlay_visibility(
+            true, true, true, false, true, true
+        ));
+        // Paused + outside zone with cursor-show -> hidden.
+        assert!(!compute_subtitle_overlay_visibility(
+            true, true, true, false, true, false
+        ));
+        assert!(!compute_ass_overlay_visibility(
+            true, true, true, false, true, false
+        ));
+        // Without cursor-show, ASS overlay still respects `hide-memento-while-playing`.
+        assert!(!compute_ass_overlay_visibility(
+            true, true, true, true, false, false
+        ));
+        assert!(compute_ass_overlay_visibility(
+            true, true, true, false, false, false
+        ));
+        assert!(!compute_ass_overlay_visibility(
+            false, true, false, false, false, true
+        ));
+    }
+
+    #[test]
+    fn mpv_visibility_enforces_show_subtitles_off_and_secondary_cursor_show_when_mpv_renders() {
+        // Explicit Show Subtitles OFF hides mpv subtitles even when cursor reveal is active.
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                false, false, false, true, false, false, false, true, true, true, true
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                true, false, false, true, false, false, true, true, true, true, true
+            ),
+            (false, false)
+        );
+
+        // `hide_mpv_subtitles == false`: secondary-subtitle-cursor-show MUST hide secondary
+        // mpv subtitles when cursor is outside the top zone, and show when inside.
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                false, true, false, true, false, false, false, false, false, true, false
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                false, true, false, true, false, false, false, false, false, true, true
+            ),
+            (true, true)
+        );
+
+        // `hide_mpv_subtitles == false`: primary-subtitle-cursor-show hides primary when outside zone.
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                false, true, false, true, false, false, false, true, false, false, false
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            compute_mpv_subtitle_visibility_ex(
+                false, true, false, true, false, false, false, true, true, false, false
+            ),
+            (true, true)
+        );
+
+        // Classic hide_while_playing && playing hands off to mpv when cursor-show is disabled.
+        assert_eq!(
+            compute_mpv_subtitle_visibility(true, true, true, true, false, false),
+            (true, true)
+        );
     }
 }

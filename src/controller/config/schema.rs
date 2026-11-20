@@ -2,19 +2,22 @@
 //! ranges, defaults, value parsing/normalization, and category snapshots.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
+use memento_audio::{MAX_AUDIO_DOWNLOAD_TIMEOUT_MS, MIN_AUDIO_DOWNLOAD_TIMEOUT_MS};
 use memento_config::config::Config;
 use memento_config::keys::lookup;
-use memento_config::{ArgbColor, KeyPath, QtFontSpec, Value};
+use memento_config::{ArgbColor, KeyPath, QtFontSpec, Value, ValueType};
+use memento_dict::searchcontroller::{TextReplacementOptions, TextReplacementRule};
 use memento_setting::enums::{
-    AudioSourceType, Directory, GlossaryStyle, Language, Modifier, SearchMethod,
+    AudioSourceType, Directory, GlossaryStyle, Language, Modifier, SearchMethod, ThemeMode,
 };
 use memento_setting::keys as raw;
 
 use super::audio_sources::audio_sources;
 use super::keybinds::{
-    active_keybind_profile_name, keybind_profile_names, keybind_profile_prefix, keybind_value,
-    KEYBIND_FIELDS,
+    active_keybind_profile_name, keybind_default, keybind_profile_names, keybind_profile_prefix,
+    keybind_value, KEYBIND_FIELDS,
 };
 
 #[repr(i32)]
@@ -98,6 +101,80 @@ pub(crate) const GLOSSARY_STYLE_CHOICES: &[(GlossaryStyle, &str)] = &[
     (GlossaryStyle::GlossaryStyleLineBreak, "Line Breaks"),
     (GlossaryStyle::GlossaryStylePipe, "Pipes"),
 ];
+
+pub(crate) const THEME_CHOICES: &[(ThemeMode, &str)] = &[
+    (ThemeMode::System, "System"),
+    (ThemeMode::Dark, "Dark"),
+    (ThemeMode::Light, "Light"),
+];
+
+/// Browse dialog kind for filesystem path settings (C1.1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BrowseKind {
+    Folder,
+    File,
+}
+
+/// Metadata describing native Browse button behavior for a path/folder setting.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SettingBrowseMetadata {
+    pub key: &'static str,
+    pub kind: BrowseKind,
+    pub dialog_title: &'static str,
+    pub store_as_file_uri: bool,
+}
+
+/// Return folder/file browse metadata for settings that support a native
+/// Browse button in Settings UI (including `behavior/file-open-custom`).
+pub fn setting_browse_metadata(key: &str) -> Option<SettingBrowseMetadata> {
+    match key {
+        "behavior/file-open-custom" => Some(SettingBrowseMetadata {
+            key: "behavior/file-open-custom",
+            kind: BrowseKind::Folder,
+            dialog_title: "Choose Custom Open Folder",
+            store_as_file_uri: true,
+        }),
+        "onnx/custom-model" => Some(SettingBrowseMetadata {
+            key: "onnx/custom-model",
+            kind: BrowseKind::Folder,
+            dialog_title: "Choose Custom ONNX Model Directory",
+            store_as_file_uri: false,
+        }),
+        "whisper/custom-model" => Some(SettingBrowseMetadata {
+            key: "whisper/custom-model",
+            kind: BrowseKind::File,
+            dialog_title: "Choose Custom Whisper Model",
+            store_as_file_uri: false,
+        }),
+        "whisper/vad-model" => Some(SettingBrowseMetadata {
+            key: "whisper/vad-model",
+            kind: BrowseKind::File,
+            dialog_title: "Choose Whisper VAD Model",
+            store_as_file_uri: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Format a path picked from a native file/folder browse dialog for storage
+/// under `key` (converting to a `file://` URI for `behavior/file-open-custom`).
+pub fn format_browse_selection(key: &str, selected_path: &Path) -> String {
+    if setting_browse_metadata(key).is_some_and(|meta| meta.store_as_file_uri) {
+        if let Ok(url) = url::Url::from_file_path(selected_path) {
+            return url.into();
+        }
+        return format!("file://{}", selected_path.to_string_lossy());
+    }
+    selected_path.to_string_lossy().into_owned()
+}
+
+pub(crate) fn theme_label(raw_value: &str) -> &'static str {
+    let mode = ThemeMode::from_str_lossy(raw_value);
+    THEME_CHOICES
+        .iter()
+        .find(|(item, _)| *item == mode)
+        .map_or("System", |(_, label)| *label)
+}
 
 pub(crate) fn language_label(raw_value: i64) -> &'static str {
     let variant = i32::try_from(raw_value)
@@ -261,6 +338,47 @@ pub(crate) fn declared_setting_default(config: &Config, group: &str, key: &str) 
         if let Some(value) = qt_font_default(key) {
             return Some(value);
         }
+        match key {
+            raw::interface::THEME => {
+                return Some(Value::Text(raw::interface::THEME_DEFAULT.to_owned()));
+            }
+            raw::interface::COMPACT_GLOSSARIES => {
+                return Some(Value::Bool(raw::interface::COMPACT_GLOSSARIES_DEFAULT));
+            }
+            raw::interface::COMPACT_TAGS => {
+                return Some(Value::Bool(raw::interface::COMPACT_TAGS_DEFAULT));
+            }
+            _ => {}
+        }
+    }
+    if group == raw::search::GROUP {
+        match key {
+            raw::search::HOVER_PAUSE_RESUME => {
+                return Some(Value::Bool(raw::search::HOVER_PAUSE_RESUME_DEFAULT));
+            }
+            raw::search::TEXT_REPLACEMENTS => {
+                return Some(Value::Text(
+                    raw::search::TEXT_REPLACEMENTS_DEFAULT.to_owned(),
+                ));
+            }
+            raw::search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL => {
+                return Some(Value::Bool(
+                    raw::search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL_DEFAULT,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if group == raw::audio::GROUP && key == raw::audio::DOWNLOAD_TIMEOUT_MS {
+        return Some(Value::Int(i64::from(
+            raw::audio::DOWNLOAD_TIMEOUT_MS_DEFAULT,
+        )));
+    }
+    if group.starts_with(&keybind_profile_prefix()) {
+        let default = keybind_default(key);
+        if !default.is_empty() {
+            return Some(Value::Text(default.to_owned()));
+        }
     }
     lookup(group, key).and_then(|typed| typed.declared_default(config.context()))
 }
@@ -289,7 +407,39 @@ pub(crate) fn normalize_setting_value(group: &str, key: &str, value: Value) -> V
         | (raw::whisper::GROUP, raw::whisper::BEAM_SIZE, Value::Int(value)) => {
             Value::Int(value.clamp(1, 10))
         }
+        (raw::audio::GROUP, raw::audio::DOWNLOAD_TIMEOUT_MS, Value::Int(value)) => Value::Int(
+            value.clamp(
+                MIN_AUDIO_DOWNLOAD_TIMEOUT_MS as i64,
+                MAX_AUDIO_DOWNLOAD_TIMEOUT_MS as i64,
+            ),
+        ),
+        (raw::interface::GROUP, raw::interface::THEME, Value::Text(raw_theme)) => {
+            Value::Text(ThemeMode::from_str_lossy(&raw_theme).as_str().to_owned())
+        }
         (_, _, value) => value,
+    }
+}
+
+/// Parse configured `search/text-replacements` and
+/// `search/text-replacements-search-original` into typed [`TextReplacementOptions`].
+pub(crate) fn text_replacement_options_from_config(config: &Config) -> TextReplacementOptions {
+    let raw_rules = match effective_value(config, raw::search::GROUP, raw::search::TEXT_REPLACEMENTS)
+    {
+        Value::Text(text) => text,
+        _ => config
+            .raw_at(raw::search::GROUP, raw::search::TEXT_REPLACEMENTS)
+            .unwrap_or(raw::search::TEXT_REPLACEMENTS_DEFAULT)
+            .to_owned(),
+    };
+    let rules = serde_json::from_str::<Vec<TextReplacementRule>>(raw_rules.trim()).unwrap_or_default();
+    let search_original = effective_bool(
+        config,
+        raw::search::GROUP,
+        raw::search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL,
+    );
+    TextReplacementOptions {
+        rules,
+        search_original,
     }
 }
 
@@ -315,7 +465,17 @@ pub(crate) fn effective_value(config: &Config, group: &str, key: &str) -> Value 
         .get_at(group, key)
         .or_else(|| declared_setting_default(config, group, key))
         .map(|value| normalize_setting_value(group, key, value))
-        .unwrap_or_else(|| Value::Text(String::new()))
+        .unwrap_or_else(|| {
+            match lookup(group, key).map(|k| k.value_type(config.context())) {
+                Some(ValueType::Bool) => Value::Bool(false),
+                Some(ValueType::Int) => Value::Int(0),
+                Some(ValueType::Real) => Value::Real(0.0),
+                Some(ValueType::Strings) => Value::Strings(Vec::new()),
+                Some(ValueType::Ints) => Value::Ints(Vec::new()),
+                Some(ValueType::Map) => Value::Map(BTreeMap::new()),
+                Some(ValueType::Text) | None => Value::Text(String::new()),
+            }
+        })
 }
 
 pub(crate) fn effective_text(config: &Config, group: &str, key: &str) -> Option<String> {
@@ -364,6 +524,7 @@ pub(crate) fn path_in_category(category: SettingsCategory, path: &KeyPath) -> bo
                 || path
                     .group
                     .starts_with(&format!("{}/", raw::audio_source::GROUP))
+                || (path.group == raw::audio::GROUP && path.key == raw::audio::DOWNLOAD_TIMEOUT_MS)
         }
         SettingsCategory::Keybind => {
             (path.group == raw::keybind::GROUP && path.key == raw::keybind::CURRENT_PROFILE)
@@ -413,7 +574,9 @@ pub(crate) fn behavior_paths() -> Vec<(&'static str, &'static str)> {
 pub(crate) fn interface_paths() -> Vec<(&'static str, &'static str)> {
     let group = raw::interface::GROUP;
     vec![
-        (group, raw::interface::SYSTEM_ICONS),
+        (group, raw::interface::THEME),
+        (group, raw::interface::COMPACT_GLOSSARIES),
+        (group, raw::interface::COMPACT_TAGS),
         (group, raw::interface::subtitle::FONT),
         (group, raw::interface::subtitle::LINE_SPACING),
         (group, raw::interface::subtitle::SCALE),
@@ -426,14 +589,12 @@ pub(crate) fn interface_paths() -> Vec<(&'static str, &'static str)> {
         (group, raw::interface::subtitle::ASS_NATIVE),
         (group, raw::interface::POPUP_WIDTH),
         (group, raw::interface::POPUP_HEIGHT),
-        (group, raw::interface::SEARCH_WINDOW),
         (group, raw::interface::SEARCH_EXPRESSION_FONT),
         (group, raw::interface::SEARCH_READING_FONT),
         (group, raw::interface::SEARCH_CONJ_FONT),
         (group, raw::interface::SEARCH_TAG_FONT),
         (group, raw::interface::SEARCH_GLOSSARY_FONT),
         (group, raw::interface::SEARCH_KANJI_FONT),
-        (group, raw::interface::subtitle_list::WINDOW),
         (group, raw::interface::subtitle_list::TIMESTAMPS),
         (group, raw::interface::subtitle_list::BACKGROUND_COLOR),
         (group, raw::interface::subtitle_list::TEXT_COLOR),
@@ -509,11 +670,14 @@ pub(crate) fn search_paths() -> Vec<(&'static str, &'static str)> {
         (group, raw::search::HIDE_MPV_SUBS),
         (group, raw::search::HIDE_SUBS),
         (group, raw::search::PAUSE_ON_HOVER),
+        (group, raw::search::HOVER_PAUSE_RESUME),
         (group, raw::search::AUTO_PLAY_AUDIO),
         (group, raw::search::GLOSSARY_STYLE),
         (group, raw::search::REPLACE_NEWLINES),
         (group, raw::search::REPLACE_NEWLINES_WITH),
         (group, raw::search::REMOVE_REGEX),
+        (group, raw::search::TEXT_REPLACEMENTS),
+        (group, raw::search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL),
         (group, raw::search::SUBTITLE_FURIGANA),
         (group, raw::search::SHOW_ANKI_GLOSSARY_CHECKBOX),
         (group, raw::search::MAX_RECURSION_DEPTH),
@@ -523,11 +687,22 @@ pub(crate) fn search_paths() -> Vec<(&'static str, &'static str)> {
 pub(crate) fn category_snapshot(config: &Config, category: SettingsCategory) -> ConfigSnapshot {
     if category == SettingsCategory::Audio {
         let sources = audio_sources(config);
-        let mut values = vec![(
-            raw::audio_source::GROUP.to_owned(),
-            "size".to_owned(),
-            Some(Value::Int(sources.len() as i64)),
-        )];
+        let mut values = vec![
+            (
+                raw::audio::GROUP.to_owned(),
+                raw::audio::DOWNLOAD_TIMEOUT_MS.to_owned(),
+                Some(effective_value(
+                    config,
+                    raw::audio::GROUP,
+                    raw::audio::DOWNLOAD_TIMEOUT_MS,
+                )),
+            ),
+            (
+                raw::audio_source::GROUP.to_owned(),
+                "size".to_owned(),
+                Some(Value::Int(sources.len() as i64)),
+            ),
+        ];
         for (index, source) in sources.iter().enumerate() {
             let group = format!("{}/{}", raw::audio_source::GROUP, index + 1);
             values.extend([
@@ -636,6 +811,22 @@ pub(crate) fn parse_config_value(
     value: &str,
     current: Value,
 ) -> Result<Value, String> {
+    if group == raw::interface::GROUP && key == raw::interface::THEME {
+        let mode = ThemeMode::try_from(value).map_err(|()| {
+            format!("interface/theme must be System, Dark, or Light (received {value:?})")
+        })?;
+        return Ok(Value::Text(mode.as_str().to_owned()));
+    }
+    if group == raw::search::GROUP && key == raw::search::TEXT_REPLACEMENTS {
+        let trimmed = value.trim();
+        let canonical = if trimmed.is_empty() { "[]" } else { trimmed };
+        let parsed: Vec<TextReplacementRule> = serde_json::from_str(canonical).map_err(|error| {
+            format!("search/text-replacements must be a JSON array of replacement rules: {error}")
+        })?;
+        let serialized = serde_json::to_string(&parsed)
+            .map_err(|error| format!("could not encode search/text-replacements: {error}"))?;
+        return Ok(Value::Text(serialized));
+    }
     if group == raw::asr::GROUP && key == raw::asr::BACKEND {
         return match value {
             "Whisper" | raw::asr::BACKEND_WHISPER => {
@@ -751,6 +942,10 @@ fn integer_range(group: &str, key: &str) -> Option<(i64, i64)> {
         }
         (raw::whisper::GROUP, raw::whisper::BEST_OF)
         | (raw::whisper::GROUP, raw::whisper::BEAM_SIZE) => Some((1, 10)),
+        (raw::audio::GROUP, raw::audio::DOWNLOAD_TIMEOUT_MS) => Some((
+            MIN_AUDIO_DOWNLOAD_TIMEOUT_MS as i64,
+            MAX_AUDIO_DOWNLOAD_TIMEOUT_MS as i64,
+        )),
         (group, raw::audio_source::TYPE)
             if group.starts_with(&format!("{}/", raw::audio_source::GROUP)) =>
         {

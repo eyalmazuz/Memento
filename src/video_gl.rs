@@ -182,6 +182,14 @@ pub struct VideoFboTarget {
     pub internal_format: i32,
 }
 
+/// Convert a signed GL object name queried via `glGetIntegerv` into a
+/// validated non-zero handle, mapping `<= 0` (unbind or error sentinel `-1`)
+/// cleanly to `None` so OpenGL 4.1 Core Profile never receives invalid names.
+#[inline]
+fn gl_object_id(raw: i32) -> Option<std::num::NonZeroU32> {
+    u32::try_from(raw).ok().and_then(std::num::NonZeroU32::new)
+}
+
 /// Cached OpenGL context version capabilities to avoid redundant version checks
 /// on every video frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,20 +200,33 @@ pub struct GlCapabilities {
 }
 
 impl GlCapabilities {
-    pub fn from_context(gl: &glow::Context) -> Self {
-        let ver = gl.version();
-        let has_gl3 = !ver.is_embedded || ver.major >= 3;
-        let has_srgb = !ver.is_embedded && ver.major >= 3;
-        let has_samplers = if ver.is_embedded {
-            ver.major >= 3
+    /// Derive feature capabilities from an OpenGL `(major, minor, is_embedded)`
+    /// version tuple. Desktop OpenGL 3.3+ / macOS OpenGL 4.1 Core Profile sets
+    /// all three capabilities; GL 2.x and GLES 2.0 disable GL3-only queries.
+    pub const fn from_version(major: u32, minor: u32, is_embedded: bool) -> Self {
+        let has_gl3 = major >= 3;
+        let has_srgb = !is_embedded && major >= 3;
+        let has_samplers = if is_embedded {
+            major >= 3
         } else {
-            ver.major > 3 || (ver.major == 3 && ver.minor >= 3)
+            major > 3 || (major == 3 && minor >= 3)
         };
         Self {
             has_gl3,
             has_srgb,
             has_samplers,
         }
+    }
+
+    pub fn from_context(gl: &glow::Context) -> Self {
+        let ver = gl.version();
+        Self::from_version(ver.major, ver.minor, ver.is_embedded)
+    }
+
+    /// True when the context satisfies macOS OpenGL 4.1 / desktop GL 3.3+ Core
+    /// Profile requirements (VAOs, separate read/draw FBOs, sampler objects, sRGB).
+    pub const fn supports_core_profile_state_guard(self) -> bool {
+        self.has_gl3 && self.has_srgb && self.has_samplers
     }
 }
 
@@ -253,26 +274,25 @@ impl Drop for FboBindingGuard<'_> {
             if self.has_gl3 {
                 self.gl.bind_buffer(
                     glow::PIXEL_UNPACK_BUFFER,
-                    std::num::NonZeroU32::new(self.old_unpack_buffer as u32)
-                        .map(glow::NativeBuffer),
+                    gl_object_id(self.old_unpack_buffer).map(glow::NativeBuffer),
                 );
                 self.gl.bind_framebuffer(
                     glow::DRAW_FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_draw_fb as u32).map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_draw_fb).map(glow::NativeFramebuffer),
                 );
                 self.gl.bind_framebuffer(
                     glow::READ_FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_read_fb as u32).map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_read_fb).map(glow::NativeFramebuffer),
                 );
             } else {
                 self.gl.bind_framebuffer(
                     glow::FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_draw_fb as u32).map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_draw_fb).map(glow::NativeFramebuffer),
                 );
             }
             self.gl.bind_texture(
                 glow::TEXTURE_2D,
-                std::num::NonZeroU32::new(self.old_texture as u32).map(glow::NativeTexture),
+                gl_object_id(self.old_texture).map(glow::NativeTexture),
             );
         }
     }
@@ -389,6 +409,10 @@ pub fn create_video_fbo_texture_with_caps(
             glow::TEXTURE_WRAP_T,
             glow::CLAMP_TO_EDGE as i32,
         );
+        if caps.has_gl3 {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_BASE_LEVEL, 0);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, 0);
+        }
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
         if caps.has_gl3 && guard.old_unpack_buffer != 0 {
             gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
@@ -570,7 +594,11 @@ impl<'a> GlStateGuard<'a> {
             0
         };
         let old_array_buffer = gl.get_parameter_i32(glow::ARRAY_BUFFER_BINDING);
-        let old_element_array_buffer = gl.get_parameter_i32(glow::ELEMENT_ARRAY_BUFFER_BINDING);
+        let old_element_array_buffer = if !has_gl3 || old_vertex_array != 0 {
+            gl.get_parameter_i32(glow::ELEMENT_ARRAY_BUFFER_BINDING)
+        } else {
+            0
+        };
         let old_pixel_unpack_buffer = if has_gl3 {
             gl.get_parameter_i32(glow::PIXEL_UNPACK_BUFFER_BINDING)
         } else {
@@ -734,79 +762,66 @@ impl Drop for GlStateGuard<'_> {
             if has_gl3 {
                 gl.bind_framebuffer(
                     glow::DRAW_FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_draw_framebuffer as u32)
-                        .map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_draw_framebuffer).map(glow::NativeFramebuffer),
                 );
                 gl.bind_framebuffer(
                     glow::READ_FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_read_framebuffer as u32)
-                        .map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_read_framebuffer).map(glow::NativeFramebuffer),
                 );
             } else {
                 gl.bind_framebuffer(
                     glow::FRAMEBUFFER,
-                    std::num::NonZeroU32::new(self.old_draw_framebuffer as u32)
-                        .map(glow::NativeFramebuffer),
+                    gl_object_id(self.old_draw_framebuffer).map(glow::NativeFramebuffer),
                 );
             }
             if let Some(tex0) = self.old_texture0 {
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(
                     glow::TEXTURE_2D,
-                    std::num::NonZeroU32::new(tex0 as u32).map(glow::NativeTexture),
+                    gl_object_id(tex0).map(glow::NativeTexture),
                 );
                 if has_samplers {
                     if let Some(samp0) = self.old_sampler0 {
-                        gl.bind_sampler(
-                            0,
-                            std::num::NonZeroU32::new(samp0 as u32).map(glow::NativeSampler),
-                        );
+                        gl.bind_sampler(0, gl_object_id(samp0).map(glow::NativeSampler));
                     }
                 }
             }
             gl.active_texture(self.old_active_texture);
             gl.bind_texture(
                 glow::TEXTURE_2D,
-                std::num::NonZeroU32::new(self.old_texture_active as u32).map(glow::NativeTexture),
+                gl_object_id(self.old_texture_active).map(glow::NativeTexture),
             );
             if has_samplers {
                 let unit = self.old_active_texture - glow::TEXTURE0;
                 gl.bind_sampler(
                     unit,
-                    std::num::NonZeroU32::new(self.old_sampler_active as u32)
-                        .map(glow::NativeSampler),
+                    gl_object_id(self.old_sampler_active).map(glow::NativeSampler),
                 );
             }
-            gl.use_program(
-                std::num::NonZeroU32::new(self.old_program as u32).map(glow::NativeProgram),
-            );
+            gl.use_program(gl_object_id(self.old_program).map(glow::NativeProgram));
             if has_gl3 {
                 gl.bind_vertex_array(
-                    std::num::NonZeroU32::new(self.old_vertex_array as u32)
-                        .map(glow::NativeVertexArray),
+                    gl_object_id(self.old_vertex_array).map(glow::NativeVertexArray),
                 );
             }
             gl.bind_buffer(
                 glow::ARRAY_BUFFER,
-                std::num::NonZeroU32::new(self.old_array_buffer as u32).map(glow::NativeBuffer),
+                gl_object_id(self.old_array_buffer).map(glow::NativeBuffer),
             );
-            if !has_gl3 || self.old_vertex_array != 0 {
+            if !has_gl3 || self.old_vertex_array > 0 {
                 gl.bind_buffer(
                     glow::ELEMENT_ARRAY_BUFFER,
-                    std::num::NonZeroU32::new(self.old_element_array_buffer as u32)
-                        .map(glow::NativeBuffer),
+                    gl_object_id(self.old_element_array_buffer).map(glow::NativeBuffer),
                 );
             }
             if has_gl3 {
                 gl.bind_buffer(
                     glow::PIXEL_UNPACK_BUFFER,
-                    std::num::NonZeroU32::new(self.old_pixel_unpack_buffer as u32)
-                        .map(glow::NativeBuffer),
+                    gl_object_id(self.old_pixel_unpack_buffer).map(glow::NativeBuffer),
                 );
                 gl.bind_buffer(
                     glow::PIXEL_PACK_BUFFER,
-                    std::num::NonZeroU32::new(self.old_pixel_pack_buffer as u32)
-                        .map(glow::NativeBuffer),
+                    gl_object_id(self.old_pixel_pack_buffer).map(glow::NativeBuffer),
                 );
                 gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, self.old_unpack_row_length);
                 gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, self.old_unpack_skip_pixels);
@@ -875,10 +890,12 @@ impl Drop for GlStateGuard<'_> {
                 self.old_blend[2] as u32,
                 self.old_blend[3] as u32,
             );
-            gl.blend_equation_separate(
-                self.old_blend_eq_rgb as u32,
-                self.old_blend_eq_alpha as u32,
-            );
+            if self.old_blend_eq_rgb != 0 && self.old_blend_eq_alpha != 0 {
+                gl.blend_equation_separate(
+                    self.old_blend_eq_rgb as u32,
+                    self.old_blend_eq_alpha as u32,
+                );
+            }
         }
     }
 }
@@ -983,5 +1000,41 @@ mod tests {
             Some("yuv420p"),
             None,
         ));
+    }
+
+    #[test]
+    fn opengl_41_core_profile_capabilities_and_object_ids_are_strict() {
+        let macos_gl41 = GlCapabilities::from_version(4, 1, false);
+        assert!(macos_gl41.has_gl3);
+        assert!(macos_gl41.has_srgb);
+        assert!(macos_gl41.has_samplers);
+        assert!(macos_gl41.supports_core_profile_state_guard());
+
+        let legacy_gl21 = GlCapabilities::from_version(2, 1, false);
+        assert!(!legacy_gl21.has_gl3);
+        assert!(!legacy_gl21.has_srgb);
+        assert!(!legacy_gl21.has_samplers);
+        assert!(!legacy_gl21.supports_core_profile_state_guard());
+
+        let gles2 = GlCapabilities::from_version(2, 0, true);
+        assert!(!gles2.has_gl3);
+        assert!(!gles2.has_samplers);
+
+        let gles3 = GlCapabilities::from_version(3, 0, true);
+        assert!(gles3.has_gl3);
+        assert!(!gles3.has_srgb);
+        assert!(gles3.has_samplers);
+
+        // Negative error sentinels and zero must never turn into non-zero GL names.
+        assert_eq!(gl_object_id(-1), None);
+        assert_eq!(gl_object_id(i32::MIN), None);
+        assert_eq!(gl_object_id(0), None);
+        assert_eq!(gl_object_id(42).map(std::num::NonZeroU32::get), Some(42));
+
+        // Core Profile requires sized internal formats (GL_RGBA16F / GL_RGBA8).
+        assert_eq!(VideoFboFormat::Rgba16F.gl_internal_format(), glow::RGBA16F as i32);
+        assert_eq!(VideoFboFormat::Rgba16F.gl_pixel_type(), glow::HALF_FLOAT);
+        assert_eq!(VideoFboFormat::Rgba8.gl_internal_format(), glow::RGBA8 as i32);
+        assert_eq!(VideoFboFormat::Rgba8.gl_pixel_type(), glow::UNSIGNED_BYTE);
     }
 }

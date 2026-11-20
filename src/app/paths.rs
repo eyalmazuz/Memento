@@ -10,12 +10,51 @@ use crate::controller::config::ConfigController;
 use memento_config::Value;
 use memento_setting::keys as raw;
 
-/// Resolve a Memento XDG/platform directory (`config`, `data`, or `cache`)
-/// using an injectable environment lookup (fully deterministic for tests).
-pub(crate) fn memento_xdg_dir_with(
+/// Platform family used to resolve OS-native config/data/cache directories.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PathPlatform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl PathPlatform {
+    pub(crate) const fn current() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self::MacOs
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Self::Linux
+        }
+    }
+}
+
+/// Complete resolved OS-native application directories and fallback/split metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppDirs {
+    pub(crate) config_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) cache_dir: PathBuf,
+    /// Legacy config directory checked automatically on read when `config_dir/memento.conf`
+    /// does not exist yet (macOS `~/.config/memento`, Windows `%APPDATA%\memento`).
+    pub(crate) legacy_config_fallback_dir: Option<PathBuf>,
+    /// True on Linux when volatile keys (`recent/files`, `dictionary/order`, `main-window/*`)
+    /// split into `~/.cache/memento/memento.conf` (Memento `#337`).
+    pub(crate) use_cache_config_split: bool,
+}
+
+/// Resolve a Memento platform directory (`config`, `data`, or `cache`)
+/// using an explicit [`PathPlatform`] and injectable environment lookup.
+pub(crate) fn memento_platform_dir_with(
     variable: &str,
     home_suffix: &str,
-    is_windows: bool,
+    platform: PathPlatform,
     env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
     let non_empty = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -24,20 +63,29 @@ pub(crate) fn memento_xdg_dir_with(
         return Some(explicit.join("memento"));
     }
 
-    if is_windows {
-        let win_base = match variable {
-            "XDG_CONFIG_HOME" => non_empty("APPDATA").or_else(|| non_empty("LOCALAPPDATA")),
-            "XDG_DATA_HOME" | "XDG_CACHE_HOME" => {
-                non_empty("LOCALAPPDATA").or_else(|| non_empty("APPDATA"))
+    match platform {
+        PathPlatform::Windows => {
+            // Align config, data, and cache under %LOCALAPPDATA%\memento (with
+            // %APPDATA% fallback if LOCALAPPDATA is absent).
+            if let Some(root) = non_empty("LOCALAPPDATA").or_else(|| non_empty("APPDATA")) {
+                return Some(root.join("memento"));
             }
-            _ => non_empty("APPDATA").or_else(|| non_empty("LOCALAPPDATA")),
-        };
-        if let Some(root) = win_base {
-            return Some(root.join("memento"));
+            if let Some(profile) = non_empty("USERPROFILE") {
+                return Some(profile.join(home_suffix).join("memento"));
+            }
         }
-        if let Some(profile) = non_empty("USERPROFILE") {
-            return Some(profile.join(home_suffix).join("memento"));
+        PathPlatform::MacOs => {
+            if let Some(home) = non_empty("HOME") {
+                return Some(match variable {
+                    "XDG_CACHE_HOME" => home.join("Library").join("Caches").join("memento"),
+                    _ => home
+                        .join("Library")
+                        .join("Application Support")
+                        .join("memento"),
+                });
+            }
         }
+        PathPlatform::Linux => {}
     }
 
     non_empty("HOME")
@@ -45,11 +93,111 @@ pub(crate) fn memento_xdg_dir_with(
         .map(|home| home.join(home_suffix).join("memento"))
 }
 
-/// Match Qt's AppConfigLocation/AppDataLocation across Linux, macOS, and Windows.
+/// Resolve a Memento XDG/platform directory (`config`, `data`, or `cache`)
+/// using an injectable environment lookup (fully deterministic for tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn memento_xdg_dir_with(
+    variable: &str,
+    home_suffix: &str,
+    is_windows: bool,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let platform = if is_windows {
+        PathPlatform::Windows
+    } else {
+        PathPlatform::Linux
+    };
+    memento_platform_dir_with(variable, home_suffix, platform, env)
+}
+
+/// Match OS-native config/data/cache locations across Linux (XDG), macOS
+/// (`~/Library/Application Support/memento` & `~/Library/Caches/memento`), and
+/// Windows (`%LOCALAPPDATA%\memento`).
 pub(crate) fn memento_xdg_dir(variable: &str, home_suffix: &str) -> Option<PathBuf> {
-    memento_xdg_dir_with(variable, home_suffix, cfg!(target_os = "windows"), |key| {
+    memento_platform_dir_with(variable, home_suffix, PathPlatform::current(), |key| {
         std::env::var_os(key)
     })
+}
+
+/// Return the legacy config fallback directory for existing Rust users whose
+/// settings predate OS-native path alignment:
+/// - macOS: `~/.config/memento`
+/// - Windows: `%APPDATA%\memento` (when distinct from `%LOCALAPPDATA%\memento`)
+/// - Linux: `None`
+pub(crate) fn legacy_config_fallback_dir_for(
+    platform: PathPlatform,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let non_empty = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    match platform {
+        PathPlatform::MacOs => non_empty("HOME").map(|home| home.join(".config").join("memento")),
+        PathPlatform::Windows => {
+            let roaming = non_empty("APPDATA")?.join("memento");
+            let local = non_empty("LOCALAPPDATA").map(|p| p.join("memento"));
+            if local.as_deref() == Some(roaming.as_path()) {
+                None
+            } else {
+                Some(roaming)
+            }
+        }
+        PathPlatform::Linux => None,
+    }
+}
+
+/// Return the legacy config fallback directory for the current OS.
+#[allow(dead_code)]
+pub(crate) fn legacy_config_fallback_dir() -> Option<PathBuf> {
+    legacy_config_fallback_dir_for(PathPlatform::current(), |key| std::env::var_os(key))
+}
+
+/// Resolve all application directories and legacy/cache-split policies for `platform`.
+pub(crate) fn resolve_app_dirs_for(
+    platform: PathPlatform,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Option<AppDirs> {
+    let config_dir = memento_platform_dir_with("XDG_CONFIG_HOME", ".config", platform, &env)?;
+    let data_dir = memento_platform_dir_with("XDG_DATA_HOME", ".local/share", platform, &env)?;
+    let cache_dir = memento_platform_dir_with("XDG_CACHE_HOME", ".cache", platform, &env)?;
+    let legacy_config_fallback_dir =
+        legacy_config_fallback_dir_for(platform, &env).filter(|fb| fb != &config_dir);
+    let use_cache_config_split = platform == PathPlatform::Linux && cache_dir != config_dir;
+    Some(AppDirs {
+        config_dir,
+        data_dir,
+        cache_dir,
+        legacy_config_fallback_dir,
+        use_cache_config_split,
+    })
+}
+
+/// Resolve all application directories for the current OS.
+#[allow(dead_code)]
+pub(crate) fn resolve_app_dirs() -> Option<AppDirs> {
+    resolve_app_dirs_for(PathPlatform::current(), |key| std::env::var_os(key))
+}
+
+/// Choose the file to read for `file_name`: prefers `config_dir/file_name`,
+/// falling back automatically to `fallback_dir/file_name` if the primary file
+/// does not exist yet so macOS/Windows users migrating from legacy paths never
+/// lose settings.
+pub(crate) fn resolve_config_read_path(
+    config_dir: &Path,
+    file_name: &str,
+    fallback_dir: Option<&Path>,
+) -> PathBuf {
+    let primary = config_dir.join(file_name);
+    if primary.is_file() {
+        return primary;
+    }
+    if let Some(fallback) = fallback_dir {
+        if fallback != config_dir {
+            let legacy = fallback.join(file_name);
+            if legacy.is_file() {
+                return legacy;
+            }
+        }
+    }
+    primary
 }
 
 /// Migrate a legacy config file from `legacy_dir` (`~/.cache/memento`) into
@@ -264,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn memento_xdg_dir_supports_windows_appdata_localappdata_and_userprofile() {
+    fn memento_xdg_dir_supports_windows_macos_and_linux_native_paths_with_fallbacks() {
         let env_from = |pairs: &[(&str, &str)]| {
             let map: HashMap<String, OsString> = pairs
                 .iter()
@@ -273,21 +421,32 @@ mod tests {
             move |key: &str| map.get(key).cloned()
         };
 
+        // Windows: config, data, and cache align under %LOCALAPPDATA%\memento with %APPDATA%\memento fallback.
         let win_env = env_from(&[
             ("APPDATA", "C:\\Users\\Alice\\AppData\\Roaming"),
             ("LOCALAPPDATA", "C:\\Users\\Alice\\AppData\\Local"),
             ("USERPROFILE", "C:\\Users\\Alice"),
         ]);
+        let win_dirs = resolve_app_dirs_for(PathPlatform::Windows, &win_env).unwrap();
         assert_eq!(
-            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &win_env),
+            win_dirs.config_dir,
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+        );
+        assert_eq!(
+            win_dirs.data_dir,
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+        );
+        assert_eq!(
+            win_dirs.cache_dir,
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+        );
+        assert_eq!(
+            win_dirs.legacy_config_fallback_dir,
             Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming").join("memento"))
         );
+        assert!(!win_dirs.use_cache_config_split);
         assert_eq!(
-            memento_xdg_dir_with("XDG_DATA_HOME", ".local/share", true, &win_env),
-            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento"))
-        );
-        assert_eq!(
-            memento_xdg_dir_with("XDG_CACHE_HOME", ".cache", true, &win_env),
+            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &win_env),
             Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento"))
         );
 
@@ -306,17 +465,69 @@ mod tests {
         let xdg_override = env_from(&[
             ("XDG_CONFIG_HOME", "/custom/cfg"),
             ("APPDATA", "C:\\Users\\Alice\\AppData\\Roaming"),
+            ("LOCALAPPDATA", "C:\\Users\\Alice\\AppData\\Local"),
         ]);
         assert_eq!(
             memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &xdg_override),
             Some(PathBuf::from("/custom/cfg/memento"))
         );
 
-        // Unix falls back to HOME/<suffix>/memento.
-        let unix_env = env_from(&[("HOME", "/home/alice")]);
+        // macOS: ~/Library/Application Support/memento for config/data, ~/Library/Caches/memento
+        // for cache, and ~/.config/memento as automatic fallback read directory.
+        let mac_env = env_from(&[("HOME", "/Users/alice")]);
+        let mac_dirs = resolve_app_dirs_for(PathPlatform::MacOs, &mac_env).unwrap();
         assert_eq!(
-            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", false, &unix_env),
-            Some(PathBuf::from("/home/alice/.config/memento"))
+            mac_dirs.config_dir,
+            PathBuf::from("/Users/alice/Library/Application Support/memento")
+        );
+        assert_eq!(
+            mac_dirs.data_dir,
+            PathBuf::from("/Users/alice/Library/Application Support/memento")
+        );
+        assert_eq!(
+            mac_dirs.cache_dir,
+            PathBuf::from("/Users/alice/Library/Caches/memento")
+        );
+        assert_eq!(
+            mac_dirs.legacy_config_fallback_dir,
+            Some(PathBuf::from("/Users/alice/.config/memento"))
+        );
+        assert!(!mac_dirs.use_cache_config_split);
+
+        // Linux: XDG layout with cache config split enabled (#337).
+        let linux_env = env_from(&[("HOME", "/home/alice")]);
+        let linux_dirs = resolve_app_dirs_for(PathPlatform::Linux, &linux_env).unwrap();
+        assert_eq!(
+            linux_dirs.config_dir,
+            PathBuf::from("/home/alice/.config/memento")
+        );
+        assert_eq!(
+            linux_dirs.data_dir,
+            PathBuf::from("/home/alice/.local/share/memento")
+        );
+        assert_eq!(
+            linux_dirs.cache_dir,
+            PathBuf::from("/home/alice/.cache/memento")
+        );
+        assert_eq!(linux_dirs.legacy_config_fallback_dir, None);
+        assert!(linux_dirs.use_cache_config_split);
+
+        // Fallback read prefers primary file, otherwise reads existing legacy file.
+        let root = tempfile::TempDir::new().unwrap();
+        let primary_dir = root.path().join("Library/Application Support/memento");
+        let legacy_dir = root.path().join(".config/memento");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("memento.conf"), "legacy=1\n").unwrap();
+
+        assert_eq!(
+            resolve_config_read_path(&primary_dir, "memento.conf", Some(&legacy_dir)),
+            legacy_dir.join("memento.conf")
+        );
+        std::fs::create_dir_all(&primary_dir).unwrap();
+        std::fs::write(primary_dir.join("memento.conf"), "primary=1\n").unwrap();
+        assert_eq!(
+            resolve_config_read_path(&primary_dir, "memento.conf", Some(&legacy_dir)),
+            primary_dir.join("memento.conf")
         );
     }
 

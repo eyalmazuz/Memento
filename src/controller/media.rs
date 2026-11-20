@@ -3,7 +3,8 @@
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx", test))]
 use memento_asr::audio::wavreader::{read_pcm16_wav_bytes, SAMPLE_RATE_16K};
 use memento_player::mpv::ffi as mpv;
-use std::ffi::{c_char, c_int, CStr, CString};
+use memento_player::EncodeContext;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;
 #[cfg(all(
     target_os = "linux",
@@ -19,12 +20,22 @@ use tempfile::TempDir;
 /// Default maximum wall-clock duration for a background libmpv encode job.
 pub const DEFAULT_ENCODE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// An immutable snapshot of the media and selected mpv audio track. Capture it
-/// on the UI thread with `MpvInstance::capture_encode_context` before starting.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An immutable snapshot of the media, selected mpv audio track, and streaming
+/// metadata (yt-dlp/HTTP headers/cookies/split DASH audio). Capture it on the
+/// UI thread with `MpvInstance::capture_encode_context` before starting.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaContext {
     pub path: String,
     pub audio_id: i64,
+    pub stream_open_filename: String,
+    pub script_opts: String,
+    pub http_header_fields: Vec<String>,
+    pub referrer: String,
+    pub user_agent: String,
+    pub cookies: bool,
+    pub cookies_file: String,
+    pub ytdl_raw_options: String,
+    pub external_audio_filename: Option<String>,
 }
 
 impl MediaContext {
@@ -32,6 +43,46 @@ impl MediaContext {
         Self {
             path: path.into(),
             audio_id,
+            ..Self::default()
+        }
+    }
+
+    pub fn from_encode_context(ctx: EncodeContext) -> Self {
+        Self::from(ctx)
+    }
+
+    /// Resolve the effective media path/URL for off-thread encoding, preferring
+    /// `stream_open_filename` when non-empty and not an internal `memento-asr://`
+    /// stream URI.
+    pub fn effective_media_path(&self) -> &str {
+        EncodeContext::resolve_media_path(&self.stream_open_filename, &self.path)
+    }
+
+    /// Returns the trimmed external audio path/URL when configured for split
+    /// DASH / external audio tracks (filtering out empty strings and internal
+    /// `memento-asr://` URIs).
+    pub fn effective_external_audio(&self) -> Option<&str> {
+        self.external_audio_filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !EncodeContext::is_internal_asr_uri(s))
+    }
+}
+
+impl From<EncodeContext> for MediaContext {
+    fn from(ctx: EncodeContext) -> Self {
+        Self {
+            path: ctx.path,
+            audio_id: ctx.audio_id,
+            stream_open_filename: ctx.stream_open_filename,
+            script_opts: ctx.script_opts,
+            http_header_fields: ctx.http_header_fields,
+            referrer: ctx.referrer,
+            user_agent: ctx.user_agent,
+            cookies: ctx.cookies,
+            cookies_file: ctx.cookies_file,
+            ytdl_raw_options: ctx.ytdl_raw_options,
+            external_audio_filename: ctx.external_audio_filename,
         }
     }
 }
@@ -100,8 +151,8 @@ fn mpv_error(status: c_int) -> String {
 }
 
 fn validate_audio_clip_args(media: &MediaContext, start: f64, end: f64) -> Result<(), String> {
-    if media.path.is_empty()
-        || media.audio_id <= 0
+    if media.effective_media_path().trim().is_empty()
+        || (media.audio_id <= 0 && media.effective_external_audio().is_none())
         || !start.is_finite()
         || !end.is_finite()
         || start < 0.0
@@ -133,6 +184,14 @@ fn build_loadfile_options(
     load_options
 }
 
+fn loadfile_audio_id(media: &MediaContext, include_audio: bool) -> Option<i64> {
+    if !include_audio || media.effective_external_audio().is_some() {
+        None
+    } else {
+        Some(media.audio_id)
+    }
+}
+
 fn ytdl_flag(media_path: &str) -> &'static str {
     if media_path.contains("://") {
         "yes"
@@ -141,20 +200,71 @@ fn ytdl_flag(media_path: &str) -> &'static str {
     }
 }
 
+fn append_streaming_options(
+    media: &MediaContext,
+    include_audio: bool,
+    options: &mut Vec<(&'static str, String)>,
+) {
+    let script_opts = media.script_opts.trim();
+    if !script_opts.is_empty() {
+        options.push(("script-opts", script_opts.to_owned()));
+    }
+    let referrer = media.referrer.trim();
+    if !referrer.is_empty() {
+        options.push(("referrer", referrer.to_owned()));
+    }
+    let user_agent = media.user_agent.trim();
+    if !user_agent.is_empty() {
+        options.push(("user-agent", user_agent.to_owned()));
+    }
+    if media.cookies {
+        options.push(("cookies", "yes".to_owned()));
+    }
+    let cookies_file = media.cookies_file.trim();
+    if !cookies_file.is_empty() {
+        options.push(("cookies-file", cookies_file.to_owned()));
+    }
+    let ytdl_raw_options = media.ytdl_raw_options.trim();
+    if !ytdl_raw_options.is_empty() {
+        options.push(("ytdl-raw-options", ytdl_raw_options.to_owned()));
+    }
+    if include_audio {
+        if let Some(ext_audio) = media.effective_external_audio() {
+            options.push(("audio-files", ext_audio.to_owned()));
+        }
+    }
+}
+
+fn non_empty_http_headers(headers: &[String]) -> Vec<&str> {
+    headers
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|header| !header.is_empty())
+        .collect()
+}
+
 /// Build libmpv encoder options for 16 kHz mono PCM16 WAV extraction used by ASR.
 fn build_asr_audio_options(
     media: &MediaContext,
     output: &str,
     force_wav_format: bool,
 ) -> Result<Vec<(&'static str, String)>, String> {
-    if media.path.is_empty() || media.audio_id <= 0 {
+    let media_path = media.effective_media_path();
+    let has_external_audio = media.effective_external_audio().is_some();
+    if media_path.trim().is_empty() || (media.audio_id <= 0 && !has_external_audio) {
         return Err(
             "Could not extract audio: media path or selected audio track is invalid.".into(),
         );
     }
+    let aid_value = if has_external_audio {
+        "auto".to_owned()
+    } else {
+        media.audio_id.to_string()
+    };
     let mut options = vec![
         ("vid", "no".to_owned()),
-        ("aid", media.audio_id.to_string()),
+        ("aid", aid_value),
         ("sid", "no".to_owned()),
         ("secondary-sid", "no".to_owned()),
         ("oac", "pcm_s16le".to_owned()),
@@ -163,12 +273,13 @@ fn build_asr_audio_options(
         ("cover-art-auto", "no".to_owned()),
         ("keep-open", "no".to_owned()),
         ("config", "no".to_owned()),
-        ("ytdl", ytdl_flag(&media.path).to_owned()),
+        ("ytdl", ytdl_flag(media_path).to_owned()),
         ("o", output.to_owned()),
     ];
     if force_wav_format {
         options.push(("of", "wav".to_owned()));
     }
+    append_streaming_options(media, true, &mut options);
     Ok(options)
 }
 
@@ -181,7 +292,9 @@ fn build_anki_audio_clip_options(
     normalize_db: Option<f64>,
     wav_compat: bool,
 ) -> Result<Vec<(&'static str, String)>, String> {
-    if media.path.is_empty() || media.audio_id <= 0 {
+    let media_path = media.effective_media_path();
+    let has_external_audio = media.effective_external_audio().is_some();
+    if media_path.trim().is_empty() || (media.audio_id <= 0 && !has_external_audio) {
         return Err(
             "Could not extract audio: media path or selected audio track is invalid.".into(),
         );
@@ -189,18 +302,25 @@ fn build_anki_audio_clip_options(
     let mut options = if wav_compat {
         build_asr_audio_options(media, output, false)?
     } else {
-        vec![
+        let aid_value = if has_external_audio {
+            "auto".to_owned()
+        } else {
+            media.audio_id.to_string()
+        };
+        let mut opts = vec![
             ("vid", "no".to_owned()),
-            ("aid", media.audio_id.to_string()),
+            ("aid", aid_value),
             ("sid", "no".to_owned()),
             ("secondary-sid", "no".to_owned()),
             ("oac", "aac".to_owned()),
             ("cover-art-auto", "no".to_owned()),
             ("keep-open", "no".to_owned()),
             ("config", "no".to_owned()),
-            ("ytdl", ytdl_flag(&media.path).to_owned()),
+            ("ytdl", ytdl_flag(media_path).to_owned()),
             ("o", output.to_owned()),
-        ]
+        ];
+        append_streaming_options(media, true, &mut opts);
+        opts
     };
     if let Some(db) = normalize_db {
         if !db.is_finite() {
@@ -220,16 +340,20 @@ fn build_anki_video_clip_options(
     normalize_db: Option<f64>,
     output: &str,
 ) -> Result<Vec<(&'static str, String)>, String> {
-    if audio && media.audio_id <= 0 {
+    let media_path = media.effective_media_path();
+    let has_external_audio = media.effective_external_audio().is_some();
+    if audio && media.audio_id <= 0 && !has_external_audio {
         return Err("Could not extract Anki video: no audio track is selected".into());
     }
     if subtitles && subtitle_id <= 0 {
         return Err("Could not extract Anki video with subtitles: no subtitle track is selected; use {video:subtitles=false} for this card".into());
     }
-    let aid_value = if audio {
-        media.audio_id.to_string()
-    } else {
+    let aid_value = if !audio {
         "no".to_owned()
+    } else if has_external_audio {
+        "auto".to_owned()
+    } else {
+        media.audio_id.to_string()
     };
     let sid_value = if subtitles {
         subtitle_id.to_string()
@@ -246,9 +370,10 @@ fn build_anki_video_clip_options(
         ("cover-art-auto", "no".to_owned()),
         ("keep-open", "no".to_owned()),
         ("config", "no".to_owned()),
-        ("ytdl", ytdl_flag(&media.path).to_owned()),
+        ("ytdl", ytdl_flag(media_path).to_owned()),
         ("o", output.to_owned()),
     ];
+    append_streaming_options(media, audio, &mut options);
     if let Some(db) = normalize_db.filter(|_| audio) {
         if !db.is_finite() {
             return Err("Invalid Anki video audio normalization dB".into());
@@ -337,9 +462,103 @@ fn check_abort_or_timeout(
     Ok(None)
 }
 
+fn set_string_list_option(
+    handle: *mut mpv::mpv_handle,
+    name: &str,
+    values: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let name_c = CString::new(name)
+        .map_err(|_| format!("Invalid libmpv option name '{name}' for {context}"))?;
+    let mut c_values = Vec::with_capacity(values.len());
+    for value in values {
+        let c_val = CString::new(value.as_bytes()).map_err(|_| {
+            format!("libmpv option '{name}' contains an invalid NUL byte for {context}")
+        })?;
+        c_values.push(c_val);
+    }
+    let mut nodes: Vec<mpv::mpv_node> = c_values
+        .iter()
+        .map(|s| {
+            let mut node: mpv::mpv_node = unsafe { std::mem::zeroed() };
+            node.format = mpv::MPV_FORMAT_STRING;
+            node.u.string = s.as_ptr().cast_mut();
+            node
+        })
+        .collect();
+    let num = c_int::try_from(nodes.len())
+        .map_err(|_| format!("Too many entries for libmpv option '{name}' during {context}"))?;
+    let mut list = mpv::mpv_node_list {
+        num,
+        values: nodes.as_mut_ptr(),
+        keys: ptr::null_mut(),
+    };
+    let mut array_node: mpv::mpv_node = unsafe { std::mem::zeroed() };
+    array_node.format = mpv::MPV_FORMAT_NODE_ARRAY;
+    array_node.u.list = &mut list;
+
+    let status = unsafe {
+        mpv::mpv_set_option(
+            handle,
+            name_c.as_ptr(),
+            mpv::MPV_FORMAT_NODE,
+            (&mut array_node as *mut mpv::mpv_node).cast::<c_void>(),
+        )
+    };
+    if status < 0 {
+        let err = mpv_error(status);
+        log::warn!(
+            "Could not configure libmpv {context} list option '{name}' ({} entries): {err}",
+            values.len()
+        );
+        return Err(format!(
+            "Could not configure libmpv {context} option {name}: {err}"
+        ));
+    }
+    Ok(())
+}
+
+fn apply_encode_handle_options(
+    handle: *mut mpv::mpv_handle,
+    options: &[(&str, String)],
+    http_header_fields: &[String],
+    context: &str,
+) -> Result<(), String> {
+    for (name, value) in options {
+        if *name == "audio-files" || *name == "audio-file" {
+            // Pass external audio URLs/paths as a 1-element MPV_FORMAT_NODE_ARRAY
+            // so libmpv never splits `https://...` on ':' (Unix) or ';' (Windows).
+            set_string_list_option(handle, "audio-files", &[value.as_str()], context)?;
+            continue;
+        }
+        let name_c = CString::new(*name)
+            .map_err(|_| format!("Invalid libmpv option name '{name}' for {context}"))?;
+        let value_c = CString::new(value.as_bytes())
+            .map_err(|_| format!("libmpv option '{name}' contains an invalid NUL byte"))?;
+        let status =
+            unsafe { mpv::mpv_set_option_string(handle, name_c.as_ptr(), value_c.as_ptr()) };
+        if status < 0 {
+            let err = mpv_error(status);
+            log::warn!("Could not configure libmpv {context} option '{name}': {err}");
+            return Err(format!(
+                "Could not configure libmpv {context} option {name}: {err}"
+            ));
+        }
+    }
+    let headers = non_empty_http_headers(http_header_fields);
+    if !headers.is_empty() {
+        set_string_list_option(handle, "http-header-fields", &headers, context)?;
+    }
+    Ok(())
+}
+
 fn run_encode_job(
     media_path: &str,
     options: &[(&str, String)],
+    http_header_fields: &[String],
     load_options: &str,
     abort: Option<&AtomicBool>,
     timeout: Option<Duration>,
@@ -355,31 +574,18 @@ fn run_encode_job(
 
     let handle = unsafe { mpv::mpv_create() };
     if handle.is_null() {
+        log::warn!("Could not create a libmpv {context} instance for '{media_path}'.");
         return Err(format!("Could not create a libmpv {context} instance."));
     }
     let handle = MpvHandle(handle);
 
-    for (name, value) in options {
-        let name_c = CString::new(*name)
-            .map_err(|_| format!("Invalid libmpv option name '{name}' for {context}"))?;
-        let value_c = CString::new(value.as_bytes())
-            .map_err(|_| format!("libmpv option '{name}' contains an invalid NUL byte"))?;
-        let status =
-            unsafe { mpv::mpv_set_option_string(handle.0, name_c.as_ptr(), value_c.as_ptr()) };
-        if status < 0 {
-            return Err(format!(
-                "Could not configure libmpv {context} option {name}: {}",
-                mpv_error(status)
-            ));
-        }
-    }
+    apply_encode_handle_options(handle.0, options, http_header_fields, context)?;
 
     let status = unsafe { mpv::mpv_initialize(handle.0) };
     if status < 0 {
-        return Err(format!(
-            "Could not initialize libmpv {context}: {}",
-            mpv_error(status)
-        ));
+        let err = mpv_error(status);
+        log::warn!("Could not initialize libmpv {context} for '{media_path}': {err}");
+        return Err(format!("Could not initialize libmpv {context}: {err}"));
     }
     check_abort_or_timeout(abort, deadline, context)?;
 
@@ -394,10 +600,9 @@ fn run_encode_job(
     command.extend([load_options_c.as_ptr(), ptr::null()]);
     let status = unsafe { mpv::mpv_command(handle.0, command.as_mut_ptr()) };
     if status < 0 {
-        return Err(format!(
-            "Could not start libmpv {context}: {}",
-            mpv_error(status)
-        ));
+        let err = mpv_error(status);
+        log::warn!("Could not start libmpv {context} for '{media_path}': {err}");
+        return Err(format!("Could not start libmpv {context}: {err}"));
     }
 
     loop {
@@ -405,6 +610,7 @@ fn run_encode_job(
             .map_or(0.1, |remaining| remaining.as_secs_f64().min(0.1));
         let event = unsafe { mpv::mpv_wait_event(handle.0, wait_secs) };
         if event.is_null() {
+            log::warn!("libmpv returned no event during {context} for '{media_path}'.");
             return Err(format!("libmpv returned no event during {context}."));
         }
         let event_id = unsafe { (*event).event_id };
@@ -424,7 +630,10 @@ fn run_encode_job(
                 drop(handle);
                 return Ok(());
             }
-            EncodeEventAction::Failed(message) => return Err(message),
+            EncodeEventAction::Failed(message) => {
+                log::warn!("{message}");
+                return Err(message);
+            }
         }
     }
 }
@@ -463,10 +672,11 @@ pub fn extract_clip_audio_with_cancel(
     let temporary = create_temp_aac_path()?;
     let output = temporary.path.to_string_lossy().into_owned();
     let options = build_anki_audio_clip_options(media, &output, normalize_db, false)?;
-    let load_options = build_loadfile_options(start, end, Some(media.audio_id), None);
+    let load_options = build_loadfile_options(start, end, loadfile_audio_id(media, true), None);
     run_encode_job(
-        &media.path,
+        media.effective_media_path(),
         &options,
+        &media.http_header_fields,
         &load_options,
         abort,
         timeout,
@@ -552,7 +762,7 @@ pub fn extract_clip_mp4_with_cancel(
     abort: Option<&AtomicBool>,
     timeout: Option<Duration>,
 ) -> Result<Vec<u8>, String> {
-    if media.path.is_empty()
+    if media.effective_media_path().trim().is_empty()
         || !start.is_finite()
         || !end.is_finite()
         || start < 0.0
@@ -569,12 +779,13 @@ pub fn extract_clip_mp4_with_cancel(
     let load_options = build_loadfile_options(
         start,
         end,
-        audio.then_some(media.audio_id),
+        loadfile_audio_id(media, audio),
         subtitles.then_some(subtitle_id),
     );
     run_encode_job(
-        &media.path,
+        media.effective_media_path(),
         &options,
+        &media.http_header_fields,
         &load_options,
         abort,
         timeout,
@@ -631,14 +842,15 @@ pub(super) fn extract_audio_samples(
         return Err("Audio extraction canceled.".into());
     }
 
-    let load_options = build_loadfile_options(start, end, Some(media.audio_id), None);
+    let load_options = build_loadfile_options(start, end, loadfile_audio_id(media, true), None);
 
     #[cfg(target_os = "linux")]
     if let Some((mut memfd, memfd_path)) = create_memfd_wav() {
         let options = build_asr_audio_options(media, &memfd_path, true)?;
         run_encode_job(
-            &media.path,
+            media.effective_media_path(),
             &options,
+            &media.http_header_fields,
             &load_options,
             Some(abort),
             Some(DEFAULT_ENCODE_TIMEOUT),
@@ -694,10 +906,11 @@ fn extract_audio_with_cancel(
     let temporary = create_temp_wav_path()?;
     let output = temporary.path.to_string_lossy().into_owned();
     let options = build_anki_audio_clip_options(media, &output, normalize_db, true)?;
-    let load_options = build_loadfile_options(start, end, Some(media.audio_id), None);
+    let load_options = build_loadfile_options(start, end, loadfile_audio_id(media, true), None);
     run_encode_job(
-        &media.path,
+        media.effective_media_path(),
         &options,
+        &media.http_header_fields,
         &load_options,
         abort,
         timeout,
@@ -706,7 +919,7 @@ fn extract_audio_with_cancel(
     if !temporary.path.is_file() {
         return Err(format!(
             "libmpv did not create an audio clip for '{}'. Check that the selected audio track is available.",
-            media.path,
+            media.effective_media_path(),
         ));
     }
     Ok(temporary)
@@ -892,6 +1105,105 @@ mod tests {
         assert!(extract_clip_audio(&valid, -0.3, 1.0, None).is_err());
         assert!(extract_clip_wav(&valid, -0.3, 1.0, None).is_err());
         assert!(extract_clip_mp4(&valid, 1, -0.3, 1.0, false, false, None).is_err());
+    }
+
+    #[test]
+    fn streaming_encode_context_forwards_all_properties_and_split_dash_audio() {
+        let encode_ctx = EncodeContext {
+            path: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_owned(),
+            audio_id: 2,
+            stream_open_filename: "edl://!no_clip;https://rr1.googlevideo.com/videoplayback"
+                .to_owned(),
+            script_opts: "ytdl_hook-ytdl_path=yt-dlp".to_owned(),
+            http_header_fields: vec![
+                "Authorization: Bearer tok123".to_owned(),
+                "Accept: text/html, application/xhtml+xml".to_owned(),
+                "   ".to_owned(),
+            ],
+            referrer: "https://www.youtube.com/".to_owned(),
+            user_agent: "Memento/2.0.2".to_owned(),
+            cookies: true,
+            cookies_file: "/tmp/cookies.txt".to_owned(),
+            ytdl_raw_options: "cookies-from-browser=firefox".to_owned(),
+            external_audio_filename: Some(
+                "https://rr1.googlevideo.com/audioplayback?itag=251".to_owned(),
+            ),
+        };
+        let media = MediaContext::from(encode_ctx);
+        assert_eq!(
+            media.effective_media_path(),
+            "edl://!no_clip;https://rr1.googlevideo.com/videoplayback"
+        );
+        assert_eq!(
+            media.effective_external_audio(),
+            Some("https://rr1.googlevideo.com/audioplayback?itag=251")
+        );
+
+        let audio_opts = build_anki_audio_clip_options(&media, "/tmp/clip.aac", None, false)
+            .expect("streaming audio options");
+        assert_eq!(option_value(&audio_opts, "ytdl"), Some("yes"));
+        assert_eq!(option_value(&audio_opts, "aid"), Some("auto"));
+        assert_eq!(
+            option_value(&audio_opts, "script-opts"),
+            Some("ytdl_hook-ytdl_path=yt-dlp")
+        );
+        assert_eq!(
+            option_value(&audio_opts, "referrer"),
+            Some("https://www.youtube.com/")
+        );
+        assert_eq!(
+            option_value(&audio_opts, "user-agent"),
+            Some("Memento/2.0.2")
+        );
+        assert_eq!(option_value(&audio_opts, "cookies"), Some("yes"));
+        assert_eq!(
+            option_value(&audio_opts, "cookies-file"),
+            Some("/tmp/cookies.txt")
+        );
+        assert_eq!(
+            option_value(&audio_opts, "ytdl-raw-options"),
+            Some("cookies-from-browser=firefox")
+        );
+        assert_eq!(
+            option_value(&audio_opts, "audio-files"),
+            Some("https://rr1.googlevideo.com/audioplayback?itag=251")
+        );
+        assert_eq!(
+            build_loadfile_options(1.0, 2.0, loadfile_audio_id(&media, true), None),
+            "start=1.000,end=2.000"
+        );
+
+        // Video clip without audio must NOT attach external `audio-files`, while still keeping headers/cookies.
+        let video_no_audio =
+            build_anki_video_clip_options(&media, 0, false, false, None, "/tmp/clip.mp4").unwrap();
+        assert_eq!(option_value(&video_no_audio, "aid"), Some("no"));
+        assert_eq!(option_value(&video_no_audio, "audio-files"), None);
+        assert_eq!(
+            option_value(&video_no_audio, "user-agent"),
+            Some("Memento/2.0.2")
+        );
+
+        // Verify libmpv accepts every configured streaming option & list option on a real handle.
+        let raw_handle = unsafe { mpv::mpv_create() };
+        assert!(!raw_handle.is_null());
+        let handle = MpvHandle(raw_handle);
+        apply_encode_handle_options(
+            handle.0,
+            &audio_opts,
+            &media.http_header_fields,
+            "streaming unit test",
+        )
+        .expect("libmpv must accept all streaming options and http-header-fields");
+    }
+
+    #[test]
+    fn internal_asr_uri_is_ignored_for_effective_media_path_and_external_audio() {
+        let mut media = MediaContext::new("/tmp/local.mkv", 1);
+        media.stream_open_filename = "memento-asr://live.vtt".to_owned();
+        media.external_audio_filename = Some("memento-asr://live.vtt".to_owned());
+        assert_eq!(media.effective_media_path(), "/tmp/local.mkv");
+        assert_eq!(media.effective_external_audio(), None);
+        assert_eq!(loadfile_audio_id(&media, true), Some(1));
     }
 
     #[test]

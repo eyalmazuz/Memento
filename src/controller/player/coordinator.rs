@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use memento_player::{
     AsrCue, AsrSubtitleTrack, AutoPauseState, MpvEvent, MpvInstance, MpvPropertyValue, TrackType,
-    ASR_STREAM_URI,
+    VideoTrack, ASR_STREAM_URI,
 };
 use slint::VecModel;
 
@@ -23,7 +23,8 @@ use super::format_time;
 use super::mouse::MouseInputForwarder;
 use super::subtitle_sync::{
     clear_primary_subtitle, clear_subtitle_marks_on_advance, record_model_active,
-    refresh_active_rows, refresh_subtitle_list, sync_player_tracks, CachedSubtitleFilter,
+    refresh_active_rows, refresh_subtitle_list_with_timing, sync_player_tracks,
+    CachedSubtitleFilter,
 };
 use super::visibility::{
     compute_mpv_subtitle_visibility_ex, effective_media_title, is_image_subtitle_codec,
@@ -32,6 +33,7 @@ use super::visibility::{
 struct EventBatchSummary {
     saw_tracks_event: bool,
     saw_title_or_path_event: bool,
+    saw_sub_timing_event: bool,
 }
 
 /// Event-driven coordinator bridging `MpvInstance::drain_events()`,
@@ -74,6 +76,9 @@ pub struct LivePlayerCoordinator {
     last_ui_playing: Option<bool>,
     last_ui_time_sec: i64,
     last_ui_dur_sec: i64,
+    shutdown_requested: bool,
+    last_mpv_fullscreen: bool,
+    pending_mpv_fullscreen_change: Option<bool>,
 }
 
 impl LivePlayerCoordinator {
@@ -128,6 +133,9 @@ impl LivePlayerCoordinator {
             last_ui_playing: None,
             last_ui_time_sec: -1,
             last_ui_dur_sec: -1,
+            shutdown_requested: false,
+            last_mpv_fullscreen: false,
+            pending_mpv_fullscreen_change: None,
         }
     }
 
@@ -137,12 +145,16 @@ impl LivePlayerCoordinator {
         self.state.position = player.get_position();
         self.state.duration = player.get_duration();
         self.state.paused = player.is_paused();
+        self.state.fullscreen = player.is_fullscreen();
+        self.last_mpv_fullscreen = self.state.fullscreen;
         self.state.volume = player.get_volume();
         self.state.dimensions = player.video_dimensions();
         self.state.audio_tracks = player.audio_tracks();
+        self.state.video_tracks = player.video_tracks();
         self.state.subtitle_tracks = player.subtitle_tracks();
         self.state.sub_lines = player.primary_sub_lines();
         self.state.audio_id = player.selected_aid();
+        self.state.video_id = player.selected_vid();
         self.state.primary_sid = player.primary_sid();
         self.state.secondary_sid = player.secondary_sid();
         self.state.sub_start = player.get_sub_start();
@@ -169,6 +181,55 @@ impl LivePlayerCoordinator {
 
     pub fn playback_state(&self) -> &memento_player::mpv::PlaybackState {
         &self.state
+    }
+
+    /// Consume and return whether `libmpv` delivered [`MpvEvent::Shutdown`]
+    /// (e.g., user pressed `q`, mpv script invoked `quit`, or backend exited)
+    /// so the UI sync loop can exit cleanly (C5.1).
+    pub fn take_shutdown_requested(&mut self) -> bool {
+        std::mem::replace(&mut self.shutdown_requested, false)
+    }
+
+    /// Inspect whether `MpvEvent::Shutdown` has been received without clearing it.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// Consume and return any external mpv `fullscreen` property change (e.g.,
+    /// user pressed `f` in mpv or double-clicked video) for bidirectional
+    /// fullscreen sync with the Slint/winit window (H3.1).
+    pub fn take_mpv_fullscreen_change(&mut self) -> Option<bool> {
+        self.pending_mpv_fullscreen_change.take()
+    }
+
+    /// Notify the coordinator when the application window itself changed
+    /// fullscreen state (preventing an echo loop when mpv mirrors the flag).
+    pub fn note_window_fullscreen_state(&mut self, fullscreen: bool) {
+        self.state.fullscreen = fullscreen;
+        self.last_mpv_fullscreen = fullscreen;
+        self.pending_mpv_fullscreen_change = None;
+    }
+
+    /// Current video tracks reported by `mpv`'s `track-list`.
+    pub fn video_tracks(&self) -> &[VideoTrack] {
+        &self.state.video_tracks
+    }
+
+    /// Currently selected `mpv` video track id (`vid`, or `0` when disabled).
+    pub fn selected_vid(&self) -> i64 {
+        self.state.video_id
+    }
+
+    pub fn sub_delay(&self) -> f64 {
+        self.state.sub_delay
+    }
+
+    pub fn secondary_sub_delay(&self) -> f64 {
+        self.state.secondary_sub_delay
+    }
+
+    pub fn sub_speed(&self) -> f64 {
+        self.state.sub_speed
     }
 
     pub fn remove_asr_track(&mut self, player: Option<&MpvInstance>) {
@@ -280,7 +341,13 @@ impl LivePlayerCoordinator {
             app.set_asr_running(false);
             app.set_primary_sid(0);
             subtitles.set_primary_sid(0);
-            refresh_subtitle_list(app, sub_model, subtitles);
+            refresh_subtitle_list_with_timing(
+                app,
+                sub_model,
+                subtitles,
+                self.state.sub_speed,
+                self.state.sub_delay,
+            );
             self.sync_highlighted_rows_from(subtitles);
             clear_primary_subtitle(app);
             app.set_status_message("ASR paused; subtitles and model kept in memory".into());
@@ -295,10 +362,11 @@ impl LivePlayerCoordinator {
             app.set_status_message("Open a video before starting ASR subtitles".into());
             return;
         }
+        let encode_ctx = player.capture_encode_context();
         let path = if !self.state.path.is_empty() {
             self.state.path.clone()
-        } else if let Some(ctx) = player.capture_encode_context() {
-            ctx.path
+        } else if let Some(ctx) = encode_ctx.as_ref() {
+            ctx.path.clone()
         } else {
             String::new()
         };
@@ -322,7 +390,18 @@ impl LivePlayerCoordinator {
             && settings.whisper.use_gpu
             && settings.whisper.gpu_device.max(0) as usize
                 >= crate::controller::asr::whisper_gpu_device_count();
-        let media = MediaContext::new(path, aid);
+        let media = match encode_ctx {
+            Some(mut ctx) => {
+                if ctx.audio_id <= 0 {
+                    ctx.audio_id = aid;
+                }
+                if ctx.path.is_empty() {
+                    ctx.path = path;
+                }
+                MediaContext::from(ctx)
+            }
+            None => MediaContext::new(path, aid),
+        };
         let pos = player.get_position();
         match asr.start(settings, media, dur, pos) {
             Ok(session) => {
@@ -384,7 +463,13 @@ impl LivePlayerCoordinator {
                 asr_restart_pending.set(false);
                 app.set_asr_track_selected(true);
                 app.set_asr_running(true);
-                refresh_subtitle_list(app, sub_model, subtitles);
+                refresh_subtitle_list_with_timing(
+                    app,
+                    sub_model,
+                    subtitles,
+                    self.state.sub_speed,
+                    self.state.sub_delay,
+                );
                 self.sync_highlighted_rows_from(subtitles);
                 app.set_status_message(
                     if session == SessionStart::Resumed {
@@ -454,6 +539,7 @@ impl LivePlayerCoordinator {
         self.state.secondary_sub_start = 0.0;
         self.state.secondary_sub_end = 0.0;
         self.state.audio_tracks.clear();
+        self.state.video_tracks.clear();
         self.state.subtitle_tracks.clear();
         self.state.sub_lines.clear();
 
@@ -549,6 +635,7 @@ impl LivePlayerCoordinator {
         let mut sub_times_dirty = false;
         let mut saw_tracks_event = false;
         let mut saw_title_or_path_event = false;
+        let mut saw_sub_timing_event = false;
 
         let auto_pause_enabled = app.get_auto_pause();
         if auto_pause_enabled != self.previous_auto_pause {
@@ -577,7 +664,13 @@ impl LivePlayerCoordinator {
                     subtitles.bind_asr_sid(new_sid);
                     if app.get_asr_track_selected() {
                         subtitles.set_primary_sid(new_sid);
-                        refresh_subtitle_list(app, sub_model, subtitles);
+                        refresh_subtitle_list_with_timing(
+                            app,
+                            sub_model,
+                            subtitles,
+                            self.state.sub_speed,
+                            self.state.sub_delay,
+                        );
                         self.sync_highlighted_rows_from(subtitles);
                     }
                 }
@@ -588,6 +681,9 @@ impl LivePlayerCoordinator {
             }
 
             match event {
+                MpvEvent::Shutdown => {
+                    self.shutdown_requested = true;
+                }
                 MpvEvent::StartFile { .. } => {
                     sub_times_dirty = false;
                     if self.suppress_next_start_file_increment {
@@ -699,6 +795,10 @@ impl LivePlayerCoordinator {
                     "fullscreen" => {
                         if let MpvPropertyValue::Flag(f) = value {
                             self.state.fullscreen = *f;
+                            if *f != self.last_mpv_fullscreen {
+                                self.last_mpv_fullscreen = *f;
+                                self.pending_mpv_fullscreen_change = Some(*f);
+                            }
                         }
                     }
                     "mute" => {
@@ -774,11 +874,19 @@ impl LivePlayerCoordinator {
                         MpvPropertyValue::Flag(false) => self.state.secondary_sid = 0,
                         _ => {}
                     },
-                    "vid" => match value {
-                        MpvPropertyValue::Int64(v) => self.state.video_id = *v,
-                        MpvPropertyValue::Flag(false) => self.state.video_id = 0,
-                        _ => {}
-                    },
+                    "vid" => {
+                        let updated = match value {
+                            MpvPropertyValue::Int64(v) => Some(*v),
+                            MpvPropertyValue::Flag(false) => Some(0),
+                            _ => None,
+                        };
+                        if let Some(vid) = updated {
+                            self.state.video_id = vid;
+                            for track in &mut self.state.video_tracks {
+                                track.selected = track.id == vid;
+                            }
+                        }
+                    }
                     "track-list" => {
                         saw_tracks_event = true;
                         if let MpvPropertyValue::Tracks {
@@ -791,6 +899,19 @@ impl LivePlayerCoordinator {
                                 self.tracks_known_for_file = true;
                             }
                             self.state.audio_tracks.clone_from(audio);
+                            self.state.video_tracks = all
+                                .iter()
+                                .filter(|t| t.track_type == TrackType::Video)
+                                .map(|t| VideoTrack {
+                                    id: t.id,
+                                    title: t.title.clone(),
+                                    language: t.language.clone(),
+                                    codec: t.codec.clone(),
+                                    external: t.external,
+                                    default_track: t.default_track,
+                                    selected: t.selected,
+                                })
+                                .collect();
                             self.state.subtitle_tracks.clone_from(subtitle);
                             let mut primary_sid = 0;
                             let mut secondary_sid = 0;
@@ -859,6 +980,7 @@ impl LivePlayerCoordinator {
                             }
                         } else {
                             self.state.audio_tracks.clear();
+                            self.state.video_tracks.clear();
                             self.state.subtitle_tracks.clear();
                             self.state.primary_sid = 0;
                             self.state.secondary_sid = 0;
@@ -919,6 +1041,7 @@ impl LivePlayerCoordinator {
                         if (d - self.previous_sub_delay).abs() > 1e-9 {
                             self.previous_sub_delay = d;
                             self.auto_pause = AutoPauseState::default();
+                            saw_sub_timing_event = true;
                         }
                     }
                     "sub-speed" => {
@@ -931,6 +1054,7 @@ impl LivePlayerCoordinator {
                         if (s - self.previous_sub_speed).abs() > 1e-9 {
                             self.previous_sub_speed = s;
                             self.auto_pause = AutoPauseState::default();
+                            saw_sub_timing_event = true;
                         }
                     }
                     "secondary-sub-delay" => {
@@ -1130,6 +1254,7 @@ impl LivePlayerCoordinator {
         EventBatchSummary {
             saw_tracks_event,
             saw_title_or_path_event,
+            saw_sub_timing_event,
         }
     }
 
@@ -1158,7 +1283,13 @@ impl LivePlayerCoordinator {
                     asr_restart_pending.set(false);
                     let _ = self.asr_track.remove_track(player);
                     subtitles.clear_asr_track();
-                    refresh_subtitle_list(app, sub_model, subtitles);
+                    refresh_subtitle_list_with_timing(
+                        app,
+                        sub_model,
+                        subtitles,
+                        self.state.sub_speed,
+                        self.state.sub_delay,
+                    );
                     self.sync_highlighted_rows_from(subtitles);
                     if app.get_asr_track_selected() {
                         clear_primary_subtitle(app);
@@ -1169,13 +1300,25 @@ impl LivePlayerCoordinator {
                 } else if asr.is_active() {
                     asr.notify_audio_track_changed(self.state.audio_id);
                     if app.get_asr_track_selected() {
-                        refresh_subtitle_list(app, sub_model, subtitles);
+                        refresh_subtitle_list_with_timing(
+                            app,
+                            sub_model,
+                            subtitles,
+                            self.state.sub_speed,
+                            self.state.sub_delay,
+                        );
                         self.sync_highlighted_rows_from(subtitles);
                         clear_primary_subtitle(app);
                         app.set_asr_running(true);
                     }
                 } else if app.get_asr_track_selected() {
-                    refresh_subtitle_list(app, sub_model, subtitles);
+                    refresh_subtitle_list_with_timing(
+                        app,
+                        sub_model,
+                        subtitles,
+                        self.state.sub_speed,
+                        self.state.sub_delay,
+                    );
                     self.sync_highlighted_rows_from(subtitles);
                     clear_primary_subtitle(app);
                     app.set_asr_running(false);
@@ -1214,7 +1357,18 @@ impl LivePlayerCoordinator {
         {
             match asr_settings_provider() {
                 Ok(settings) => {
-                    let media = MediaContext::new(self.state.path.clone(), self.state.audio_id);
+                    let media = match player.capture_encode_context() {
+                        Some(mut ctx) => {
+                            if ctx.audio_id <= 0 {
+                                ctx.audio_id = self.state.audio_id;
+                            }
+                            if ctx.path.is_empty() {
+                                ctx.path = self.state.path.clone();
+                            }
+                            MediaContext::from(ctx)
+                        }
+                        None => MediaContext::new(self.state.path.clone(), self.state.audio_id),
+                    };
                     match asr.start(settings, media, duration, pos) {
                         Ok(session) => {
                             asr_restart_pending.set(false);
@@ -1235,7 +1389,13 @@ impl LivePlayerCoordinator {
                                     if let Some(sid) = self.asr_track.sid() {
                                         subtitles.bind_asr_sid(sid);
                                     }
-                                    refresh_subtitle_list(app, sub_model, subtitles);
+                                    refresh_subtitle_list_with_timing(
+                                        app,
+                                        sub_model,
+                                        subtitles,
+                                        self.state.sub_speed,
+                                        self.state.sub_delay,
+                                    );
                                     self.sync_highlighted_rows_from(subtitles);
                                     app.set_asr_track_selected(true);
                                     app.set_asr_running(true);
@@ -1366,6 +1526,7 @@ impl LivePlayerCoordinator {
         asr: &mut AsrController,
         asr_restart_pending: &Cell<bool>,
         saw_tracks_event: bool,
+        saw_sub_timing_event: bool,
         pos: f64,
         duration: f64,
         paused: bool,
@@ -1374,6 +1535,7 @@ impl LivePlayerCoordinator {
         on_publish_primary_subtitle: &mut impl FnMut(&MementoApp, &str),
     ) -> Vec<ExternalSubtitleLoad> {
         let mut external_loads = Vec::new();
+        let mut list_refreshed = false;
         if saw_tracks_event
             || self.state.audio_tracks != self.previous_audio
             || self.state.subtitle_tracks != self.previous_tracks
@@ -1399,6 +1561,7 @@ impl LivePlayerCoordinator {
                 subtitles.asr_mpv_sid().or_else(|| self.asr_track.sid()),
             );
             self.sync_highlighted_rows_from(subtitles);
+            list_refreshed = true;
         }
 
         let primary_sid = self.state.primary_sid;
@@ -1423,8 +1586,15 @@ impl LivePlayerCoordinator {
                 })
                 .collect();
             if subtitles.update_memory_cues(primary_sid, &cues, raw_primary) {
-                refresh_subtitle_list(app, sub_model, subtitles);
+                refresh_subtitle_list_with_timing(
+                    app,
+                    sub_model,
+                    subtitles,
+                    self.state.sub_speed,
+                    self.state.sub_delay,
+                );
                 self.sync_highlighted_rows_from(subtitles);
+                list_refreshed = true;
             }
             self.previous_lines.clone_from(&self.state.sub_lines);
         }
@@ -1432,6 +1602,16 @@ impl LivePlayerCoordinator {
         // Recompile `remove-regex` ONLY when filter config actually changes, and
         // skip filtering/cloning completely on steady-state 60Hz ticks.
         let filter_changed = self.subtitle_filter.sync_from_app(app);
+        if (saw_sub_timing_event || filter_changed) && !list_refreshed {
+            refresh_subtitle_list_with_timing(
+                app,
+                sub_model,
+                subtitles,
+                self.state.sub_speed,
+                self.state.sub_delay,
+            );
+            self.sync_highlighted_rows_from(subtitles);
+        }
 
         let primary_times = (self.state.sub_start, self.state.sub_end);
         let primary_inputs_changed = filter_changed
@@ -1451,7 +1631,13 @@ impl LivePlayerCoordinator {
             if self.state.sub_text.is_empty() || primary_times.1 > primary_times.0 {
                 subtitles.update_active_cue(primary_sid, cue.as_ref(), raw_primary);
                 if subtitles.primary_entries().len() != previous_count {
-                    refresh_subtitle_list(app, sub_model, subtitles);
+                    refresh_subtitle_list_with_timing(
+                        app,
+                        sub_model,
+                        subtitles,
+                        self.state.sub_speed,
+                        self.state.sub_delay,
+                    );
                     self.sync_highlighted_rows_from(subtitles);
                 }
             }
@@ -1500,7 +1686,13 @@ impl LivePlayerCoordinator {
                 }
             });
             if refreshed_subtitles && app.get_asr_track_selected() {
-                refresh_subtitle_list(app, sub_model, subtitles);
+                refresh_subtitle_list_with_timing(
+                    app,
+                    sub_model,
+                    subtitles,
+                    self.state.sub_speed,
+                    self.state.sub_delay,
+                );
                 self.sync_highlighted_rows_from(subtitles);
             }
         }
@@ -1669,6 +1861,7 @@ impl LivePlayerCoordinator {
             asr,
             asr_restart_pending,
             summary.saw_tracks_event,
+            summary.saw_sub_timing_event,
             pos,
             duration,
             paused,
@@ -1776,5 +1969,219 @@ impl LivePlayerCoordinator {
             }
         }
         refreshed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::subtitles::create_cue;
+    use memento_player::{MpvInstance, Track};
+    use slint::Model;
+
+    fn make_test_mpv() -> MpvInstance {
+        MpvInstance::new_software(None)
+            .expect("create headless libmpv instance for coordinator unit test")
+    }
+
+    #[test]
+    fn shutdown_event_sets_and_consumes_shutdown_requested() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let player = make_test_mpv();
+        let mut coord = LivePlayerCoordinator::new(&player);
+        let mut subs = SubtitleController::new();
+        let sub_model = VecModel::<SubEntry>::default();
+        let mut asr = AsrController::new();
+        let media_gen = Cell::new(0u64);
+        let asr_restart = Cell::new(false);
+        let hover_pause = Cell::new(false);
+
+        assert!(!coord.is_shutdown_requested());
+        assert!(!coord.take_shutdown_requested());
+
+        coord.apply_mpv_events(
+            &[MpvEvent::Shutdown],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert!(coord.is_shutdown_requested());
+        assert!(coord.take_shutdown_requested());
+        assert!(!coord.is_shutdown_requested());
+        assert!(!coord.take_shutdown_requested());
+    }
+
+    #[test]
+    fn mpv_fullscreen_property_surfaces_changes_and_suppresses_window_echoes() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let player = make_test_mpv();
+        let mut coord = LivePlayerCoordinator::new(&player);
+        let mut subs = SubtitleController::new();
+        let sub_model = VecModel::<SubEntry>::default();
+        let mut asr = AsrController::new();
+        let media_gen = Cell::new(0u64);
+        let asr_restart = Cell::new(false);
+        let hover_pause = Cell::new(false);
+
+        assert_eq!(coord.take_mpv_fullscreen_change(), None);
+
+        // External mpv fullscreen toggle (`f` key in mpv) surfaces `Some(true)`.
+        coord.apply_mpv_events(
+            &[MpvEvent::PropertyChange {
+                name: "fullscreen".into(),
+                value: MpvPropertyValue::Flag(true),
+            }],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert_eq!(coord.take_mpv_fullscreen_change(), Some(true));
+        assert_eq!(coord.take_mpv_fullscreen_change(), None);
+
+        // Window itself exits fullscreen and notes state; matching mpv echo does not re-trigger.
+        coord.note_window_fullscreen_state(false);
+        coord.apply_mpv_events(
+            &[MpvEvent::PropertyChange {
+                name: "fullscreen".into(),
+                value: MpvPropertyValue::Flag(false),
+            }],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert_eq!(coord.take_mpv_fullscreen_change(), None);
+    }
+
+    #[test]
+    fn video_tracks_and_selected_vid_update_from_track_list_and_vid_events() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let player = make_test_mpv();
+        let mut coord = LivePlayerCoordinator::new(&player);
+        let mut subs = SubtitleController::new();
+        let sub_model = VecModel::<SubEntry>::default();
+        let mut asr = AsrController::new();
+        let media_gen = Cell::new(0u64);
+        let asr_restart = Cell::new(false);
+        let hover_pause = Cell::new(false);
+
+        let all = vec![
+            Track {
+                id: 1,
+                track_type: TrackType::Video,
+                src_id: 1,
+                title: "Main 1080p".to_owned(),
+                language: "und".to_owned(),
+                album_art: false,
+                default_track: true,
+                selected: true,
+                main_selection: 0,
+                external: false,
+                external_filename: String::new(),
+                codec: "hevc".to_owned(),
+            },
+            Track {
+                id: 2,
+                track_type: TrackType::Video,
+                src_id: 2,
+                title: "Commentary".to_owned(),
+                language: "ja".to_owned(),
+                album_art: false,
+                default_track: false,
+                selected: false,
+                main_selection: -1,
+                external: false,
+                external_filename: String::new(),
+                codec: "h264".to_owned(),
+            },
+        ];
+
+        coord.apply_mpv_events(
+            &[MpvEvent::PropertyChange {
+                name: "track-list".into(),
+                value: MpvPropertyValue::Tracks {
+                    audio: Vec::new(),
+                    subtitle: Vec::new(),
+                    all,
+                },
+            }],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert_eq!(coord.selected_vid(), 1);
+        assert_eq!(coord.video_tracks().len(), 2);
+        assert!(coord.video_tracks()[0].selected);
+        assert!(!coord.video_tracks()[1].selected);
+
+        coord.apply_mpv_events(
+            &[MpvEvent::PropertyChange {
+                name: "vid".into(),
+                value: MpvPropertyValue::Int64(2),
+            }],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert_eq!(coord.selected_vid(), 2);
+        assert!(!coord.video_tracks()[0].selected);
+        assert!(coord.video_tracks()[1].selected);
+
+        // Verify sub-delay change marks timing event and refreshes displayed subtitle timestamps.
+        subs.ensure_track(1);
+        subs.set_primary_sid(1);
+        subs.load_cues(vec![create_cue("Line", 5.0, 7.0)]);
+        let summary = coord.apply_mpv_events(
+            &[MpvEvent::PropertyChange {
+                name: "sub-delay".into(),
+                value: MpvPropertyValue::Double(1.5),
+            }],
+            &app,
+            &player,
+            &mut subs,
+            &sub_model,
+            &mut asr,
+            &media_gen,
+            &asr_restart,
+            &hover_pause,
+        );
+        assert!(summary.saw_sub_timing_event);
+        assert!((coord.sub_delay() - 1.5).abs() < 1e-9);
+        refresh_subtitle_list_with_timing(
+            &app,
+            &sub_model,
+            &subs,
+            coord.sub_speed(),
+            coord.sub_delay(),
+        );
+        assert!((sub_model.row_data(0).unwrap().start - 6.5).abs() < 1e-4);
+        assert!((sub_model.row_data(0).unwrap().end - 8.5).abs() < 1e-4);
     }
 }

@@ -17,6 +17,154 @@ const ANKI_DEFAULT_HOST: &str = "http://localhost";
 const ANKI_CONFIG_DEFAULT_PORT: &str = "8765";
 const ANKI_CONFIG_DEFAULT_PORT_NUM: u16 = 8765;
 
+/// Validate a candidate Anki or Keybind profile name for emptiness, illegal
+/// path separators, and duplicate collisions (case-insensitive).
+pub fn validate_profile_name(
+    requested_name: &str,
+    existing_names: &[String],
+    allow_slash: bool,
+    ignore_existing: Option<&str>,
+) -> Result<String, String> {
+    let name = requested_name.trim();
+    if name.is_empty() {
+        return Err("profile name cannot be empty".to_owned());
+    }
+    if !allow_slash && name.contains('/') {
+        return Err("profile name cannot contain '/'".to_owned());
+    }
+    if existing_names.iter().any(|existing| {
+        let ignored = ignore_existing.is_some_and(|cur| existing == cur);
+        !ignored && existing.eq_ignore_ascii_case(name)
+    }) {
+        return Err(format!("profile {name:?} already exists"));
+    }
+    Ok(name.to_owned())
+}
+
+/// One row in the structured Anki excluded-glossaries (`ex-glos`) checklist for
+/// Settings UI rendering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExcludedGlossaryItem {
+    pub dictionary_name: String,
+    pub excluded: bool,
+}
+
+/// Parse an `ex-glos` setting value (either a JSON array of dictionary names
+/// or a comma-separated string) into trimmed, deduplicated dictionary names.
+pub fn parse_excluded_glossaries(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let items: Vec<String> = if trimmed.starts_with('[') {
+        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(trimmed) {
+            parsed
+        } else {
+            trimmed.split(',').map(str::to_owned).collect()
+        }
+    } else {
+        trimmed.split(',').map(str::to_owned).collect()
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let clean = item.trim();
+        if !clean.is_empty() && !out.iter().any(|existing: &String| existing == clean) {
+            out.push(clean.to_owned());
+        }
+    }
+    out
+}
+
+/// Serialize excluded dictionary names for `edit_setting("anki/profile/ex-glos", ...)`.
+/// Uses JSON array encoding when any dictionary name contains a comma so round-trips
+/// stay lossless, otherwise emits clean human-readable comma-separated text.
+pub fn serialize_excluded_glossaries(excluded: &[String]) -> String {
+    let mut clean = Vec::new();
+    for name in excluded {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !clean.iter().any(|existing: &String| existing == trimmed) {
+            clean.push(trimmed.to_owned());
+        }
+    }
+    if clean.iter().any(|name| name.contains(',')) {
+        serde_json::to_string(&clean).unwrap_or_else(|_| clean.join(", "))
+    } else {
+        clean.join(", ")
+    }
+}
+
+/// Build a structured dictionary checklist from installed dictionaries and the
+/// active profile's `ex-glos` list, preserving any saved exclusions for
+/// dictionaries not currently installed.
+pub fn build_excluded_glossaries_checklist(
+    installed_dictionaries: &[String],
+    excluded: &[String],
+) -> Vec<ExcludedGlossaryItem> {
+    let mut items = Vec::with_capacity(installed_dictionaries.len() + excluded.len());
+    let mut seen = Vec::new();
+    for dict in installed_dictionaries {
+        let name = dict.trim();
+        if name.is_empty() || seen.iter().any(|existing: &String| existing == name) {
+            continue;
+        }
+        seen.push(name.to_owned());
+        items.push(ExcludedGlossaryItem {
+            dictionary_name: name.to_owned(),
+            excluded: excluded.iter().any(|ex| ex == name),
+        });
+    }
+    for ex in excluded {
+        let name = ex.trim();
+        if !name.is_empty() && !seen.iter().any(|existing: &String| existing == name) {
+            seen.push(name.to_owned());
+            items.push(ExcludedGlossaryItem {
+                dictionary_name: name.to_owned(),
+                excluded: true,
+            });
+        }
+    }
+    items
+}
+
+/// Extract the excluded dictionary names from a structured UI checklist.
+pub fn excluded_glossaries_from_checklist(items: &[ExcludedGlossaryItem]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in items {
+        let name = item.dictionary_name.trim();
+        if item.excluded
+            && !name.is_empty()
+            && !out.iter().any(|existing: &String| existing == name)
+        {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// Toggle a single dictionary's excluded flag in `excluded`, returning the
+/// deduplicated updated list.
+pub fn toggle_excluded_glossary(
+    excluded: &[String],
+    dictionary_name: &str,
+    should_exclude: bool,
+) -> Vec<String> {
+    let target = dictionary_name.trim();
+    let mut next: Vec<String> = excluded
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if target.is_empty() {
+        return next;
+    }
+    next.retain(|name| name != target);
+    if should_exclude {
+        next.push(target.to_owned());
+    }
+    next
+}
+
 #[derive(Clone, Debug)]
 pub struct AnkiNoteConfig {
     pub enabled: bool,
@@ -683,24 +831,15 @@ impl AnkiProfilesFile {
             .ok_or_else(|| format!("unknown Anki setting: {key}"))?;
         let current_name = self.current_profile_name();
         if relative == "name" {
-            let name = value.trim();
-            if name.is_empty() {
-                return Err("Anki profile name cannot be empty".to_owned());
-            }
-            if self
-                .profiles
-                .iter()
-                .any(|profile| profile.name == name && name != current_name)
-            {
-                return Err(format!("Anki profile {name:?} already exists"));
-            }
+            let existing = self.profile_names();
+            let name = validate_profile_name(value, &existing, true, Some(&current_name))?;
             let profile = self
                 .profiles
                 .iter_mut()
                 .find(|profile| profile.name == current_name)
                 .ok_or_else(|| format!("Anki profile {current_name:?} does not exist"))?;
-            profile.name = name.to_owned();
-            self.set_profile = name.to_owned();
+            profile.name = name.clone();
+            self.set_profile = name;
             sort_profiles_slice(&mut self.profiles);
             return Ok(());
         }
@@ -713,19 +852,50 @@ impl AnkiProfilesFile {
         edit_anki_profile_field(profile, relative, value)
     }
 
-    pub(crate) fn add_profile(&mut self, requested_name: &str) -> Result<(), String> {
-        let name = requested_name.trim();
-        if name.is_empty() {
-            return Err("Anki profile name cannot be empty".to_owned());
-        }
-        if self.profiles.iter().any(|profile| profile.name == name) {
-            return Err(format!("Anki profile {name:?} already exists"));
-        }
-        let mut new_profile = self.current_profile().cloned().unwrap_or_default();
-        new_profile.name = name.to_owned();
+    pub(crate) fn add_profile_with_options(
+        &mut self,
+        requested_name: &str,
+        copy_current: bool,
+    ) -> Result<(), String> {
+        let existing = self.profile_names();
+        let name = validate_profile_name(requested_name, &existing, true, None)?;
+        let mut new_profile = if copy_current {
+            self.current_profile().cloned().unwrap_or_default()
+        } else {
+            AnkiProfile::default()
+        };
+        new_profile.name = name.clone();
         self.profiles.push(new_profile);
         sort_profiles_slice(&mut self.profiles);
-        self.set_profile = name.to_owned();
+        self.set_profile = name;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_profile(&mut self, requested_name: &str) -> Result<(), String> {
+        self.add_profile_with_options(requested_name, true)
+    }
+
+    pub(crate) fn excluded_glossaries_checklist(
+        &self,
+        installed_dictionaries: &[String],
+    ) -> Vec<ExcludedGlossaryItem> {
+        let excluded = self
+            .current_profile()
+            .map(|p| p.ex_glos.as_slice())
+            .unwrap_or(&[]);
+        build_excluded_glossaries_checklist(installed_dictionaries, excluded)
+    }
+
+    pub(crate) fn set_glossary_excluded(
+        &mut self,
+        dictionary_name: &str,
+        excluded: bool,
+    ) -> Result<(), String> {
+        let profile = self
+            .current_profile_mut()
+            .ok_or_else(|| "Anki profile is missing".to_owned())?;
+        profile.ex_glos = toggle_excluded_glossary(&profile.ex_glos, dictionary_name, excluded);
         Ok(())
     }
 
@@ -845,7 +1015,7 @@ impl AnkiProfilesFile {
                     text_field(
                         "anki/profile/ex-glos",
                         "Exclude dictionaries from glossary (comma-separated)",
-                        profile.ex_glos.join(", "),
+                        serialize_excluded_glossaries(&profile.ex_glos),
                     ),
                 ],
             ),
@@ -1020,12 +1190,7 @@ fn edit_anki_profile_field(
                 .collect();
         }
         "ex-glos" => {
-            profile.ex_glos = value
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect();
+            profile.ex_glos = parse_excluded_glossaries(value);
         }
         _ => return Err(format!("unknown Anki profile setting {key:?}")),
     }

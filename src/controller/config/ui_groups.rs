@@ -15,14 +15,14 @@ use crate::ui::{SettingsField, SettingsGroup};
 use super::audio_sources::audio_sources;
 use super::keybinds::{
     active_keybind_profile_name, compute_keybind_conflicts, keybind_profile_group,
-    keybind_profile_names, keybind_value, KEYBIND_FIELDS,
+    keybind_profile_names, keybind_value, visible_keybind_fields,
 };
 use super::schema::{
     asr_thread_limit, audio_source_type_label, directory_label, effective_bool, effective_i64,
     effective_text, effective_value, glossary_style_label, language_label, modifier_label,
-    search_method_label, value_text, SettingsCategory, AUDIO_SOURCE_TYPE_CHOICES,
+    search_method_label, theme_label, value_text, SettingsCategory, AUDIO_SOURCE_TYPE_CHOICES,
     DIRECTORY_CHOICES, GLOSSARY_STYLE_CHOICES, LANGUAGE_CHOICES, MODIFIER_CHOICES,
-    SEARCH_METHOD_CHOICES,
+    SEARCH_METHOD_CHOICES, THEME_CHOICES,
 };
 
 fn strings_model(values: &[String]) -> ModelRc<SharedString> {
@@ -220,42 +220,61 @@ pub(crate) fn application_settings_groups(config: &Config) -> Vec<SettingsGroup>
 
 pub(crate) fn audio_settings_groups(config: &Config) -> Vec<SettingsGroup> {
     let type_labels = choice_labels(AUDIO_SOURCE_TYPE_CHOICES);
-    audio_sources(config)
-        .into_iter()
-        .enumerate()
-        .map(|(index, source)| {
-            let entry_id = (index + 1).to_string();
-            let source_group = format!("{}/{}", raw::audio_source::GROUP, entry_id);
-            group(
-                SettingsCategory::Audio,
-                &format!("Source {}", index + 1),
-                &entry_id,
-                vec![
-                    text_field(
-                        &format!("{source_group}/{}", raw::audio_source::NAME),
-                        "Source name",
-                        source.name,
-                    ),
-                    text_field(
-                        &format!("{source_group}/{}", raw::audio_source::URL),
-                        "URL ({expression}, {reading})",
-                        source.url,
-                    ),
-                    choice_field(
-                        &format!("{source_group}/{}", raw::audio_source::TYPE),
-                        "Source type",
-                        audio_source_type_label(source.kind).to_owned(),
-                        &type_labels,
-                    ),
-                    text_field(
-                        &format!("{source_group}/{}", raw::audio_source::MD5),
-                        "MD5 skip hash",
-                        source.md5,
-                    ),
-                ],
-            )
-        })
-        .collect()
+    let mut groups = vec![group(
+        SettingsCategory::Audio,
+        "General",
+        "",
+        vec![with_description(
+            text_field(
+                "audio/download-timeout-ms",
+                "Download timeout (milliseconds)",
+                value_text(&effective_value(
+                    config,
+                    raw::audio::GROUP,
+                    raw::audio::DOWNLOAD_TIMEOUT_MS,
+                )),
+            ),
+            "Per-source network timeout for external dictionary pronunciation audio downloads (1000–30000 ms).",
+        )],
+    )];
+    groups.extend(
+        audio_sources(config)
+            .into_iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let entry_id = (index + 1).to_string();
+                let source_group = format!("{}/{}", raw::audio_source::GROUP, entry_id);
+                group(
+                    SettingsCategory::Audio,
+                    &format!("Source {}", index + 1),
+                    &entry_id,
+                    vec![
+                        text_field(
+                            &format!("{source_group}/{}", raw::audio_source::NAME),
+                            "Source name",
+                            source.name,
+                        ),
+                        text_field(
+                            &format!("{source_group}/{}", raw::audio_source::URL),
+                            "URL ({expression}, {reading})",
+                            source.url,
+                        ),
+                        choice_field(
+                            &format!("{source_group}/{}", raw::audio_source::TYPE),
+                            "Source type",
+                            audio_source_type_label(source.kind).to_owned(),
+                            &type_labels,
+                        ),
+                        text_field(
+                            &format!("{source_group}/{}", raw::audio_source::MD5),
+                            "MD5 skip hash",
+                            source.md5,
+                        ),
+                    ],
+                )
+            }),
+    );
+    groups
 }
 
 pub(crate) fn behavior_settings_groups(config: &Config) -> Vec<SettingsGroup> {
@@ -365,16 +384,19 @@ pub(crate) fn behavior_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     directory_label(dir).to_owned(),
                     &dir_labels,
                 ),
-                conditional_text_field(
-                    "behavior/file-open-custom",
-                    "Custom open folder URL",
-                    value_text(&effective_value(
-                        config,
-                        group_name,
-                        raw::behavior::FILE_OPEN_CUSTOM,
-                    )),
-                    dir == i64::from(Directory::DirectoryCustom.as_i32()),
-                    true,
+                with_description(
+                    conditional_text_field(
+                        "behavior/file-open-custom",
+                        "Custom open folder URL",
+                        value_text(&effective_value(
+                            config,
+                            group_name,
+                            raw::behavior::FILE_OPEN_CUSTOM,
+                        )),
+                        dir == i64::from(Directory::DirectoryCustom.as_i32()),
+                        true,
+                    ),
+                    "Folder path or file:// URL used when starting location is set to Custom (supports native folder browse).",
                 ),
             ],
         ),
@@ -401,18 +423,21 @@ pub(crate) fn dictionary_settings_groups(config: &Config) -> Vec<SettingsGroup> 
 
 pub(crate) fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
     let group_name = raw::interface::GROUP;
+    let theme_labels = choice_labels(THEME_CHOICES);
+    let theme_value = value_text(&effective_value(config, group_name, raw::interface::THEME));
     vec![
         group(
             SettingsCategory::Interface,
             "Theme",
             "",
             vec![with_description(
-                switch_field(
-                    "interface/system-icons",
-                    "Use system icons",
-                    effective_bool(config, group_name, raw::interface::SYSTEM_ICONS),
+                choice_field(
+                    "interface/theme",
+                    "Color theme",
+                    theme_label(&theme_value).to_owned(),
+                    &theme_labels,
                 ),
-                "Saved for config compatibility. The Slint UI currently renders Memento's bundled SVG icon set.",
+                "Follow system dark/light preference or force Dark or Light appearance.",
             )],
         ),
         group(
@@ -517,9 +542,14 @@ pub(crate) fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             "",
             vec![
                 switch_field(
-                    "interface/search-window",
-                    "Open search in a separate window",
-                    effective_bool(config, group_name, raw::interface::SEARCH_WINDOW),
+                    "interface/compact-glossaries",
+                    "Compact glossaries",
+                    effective_bool(config, group_name, raw::interface::COMPACT_GLOSSARIES),
+                ),
+                switch_field(
+                    "interface/compact-tags",
+                    "Compact tags",
+                    effective_bool(config, group_name, raw::interface::COMPACT_TAGS),
                 ),
                 text_field(
                     "interface/sub-popup-width",
@@ -600,11 +630,6 @@ pub(crate) fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             "Subtitle List",
             "",
             vec![
-                switch_field(
-                    "interface/sub-list-window",
-                    "Show subtitle list window",
-                    effective_bool(config, group_name, raw::interface::subtitle_list::WINDOW),
-                ),
                 switch_field(
                     "interface/sub-list-timestamps",
                     "Show timestamps",
@@ -726,10 +751,10 @@ pub(crate) fn keybind_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             SettingsCategory::Keybind,
             "Keyboard Shortcuts",
             "",
-            KEYBIND_FIELDS
-                .iter()
+            visible_keybind_fields()
+                .into_iter()
                 .map(|(key, label)| {
-                    let conflict = conflicts.get(*key).cloned().unwrap_or_default();
+                    let conflict = conflicts.get(key).cloned().unwrap_or_default();
                     keybind_field(
                         &format!("{profile_group}/{key}"),
                         label,
@@ -1109,6 +1134,11 @@ pub(crate) fn search_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                     effective_bool(config, group_name, raw::search::PAUSE_ON_HOVER),
                 ),
                 switch_field(
+                    "search/hover-pause-resume",
+                    "Resume playback when leaving subtitles after hover-pause",
+                    effective_bool(config, group_name, raw::search::HOVER_PAUSE_RESUME),
+                ),
+                switch_field(
                     "search/subtitle-furigana",
                     "Show furigana over subtitles (inaccurate)",
                     effective_bool(config, group_name, raw::search::SUBTITLE_FURIGANA),
@@ -1135,6 +1165,34 @@ pub(crate) fn search_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         group_name,
                         raw::search::REMOVE_REGEX,
                     )),
+                ),
+            ],
+        ),
+        group(
+            SettingsCategory::Search,
+            "Text Replacements",
+            "",
+            vec![
+                with_description(
+                    text_field(
+                        "search/text-replacements",
+                        "Custom text replacement rules (JSON)",
+                        value_text(&effective_value(
+                            config,
+                            group_name,
+                            raw::search::TEXT_REPLACEMENTS,
+                        )),
+                    ),
+                    "JSON array of {\"pattern\", \"replacement\", \"ignore_case\", \"enabled\"} regex rules applied before dictionary lookup.",
+                ),
+                switch_field(
+                    "search/text-replacements-search-original",
+                    "Also search original unmodified text",
+                    effective_bool(
+                        config,
+                        group_name,
+                        raw::search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL,
+                    ),
                 ),
             ],
         ),

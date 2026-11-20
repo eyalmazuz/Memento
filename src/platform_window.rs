@@ -297,7 +297,7 @@ pub fn compute_auto_fit_window_rect(
     if monitor.width == 0 || monitor.height == 0 {
         return None;
     }
-    let percent = auto_fit_percent.clamp(10, 100) as f64 / 100.0;
+    let percent = auto_fit_percent.clamp(1, 1000) as f64 / 100.0;
     let req_w = (video_width.saturating_add(sidebar_width) as f64) * percent;
     let req_h = (video_height as f64) * percent;
     let max_w = monitor.width as f64;
@@ -348,5 +348,42 @@ pub fn apply_windows_fullscreen_action(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_fit_percent_supports_full_1_to_1000_range_within_monitor_bounds() {
+        let monitor = MonitorRect::new(0, 0, 1920, 1080, 1.0);
+
+        // 5% scales down below the old 10% floor.
+        let tiny = compute_auto_fit_window_rect(1000, 500, 0, 5, monitor, false, false).unwrap();
+        assert_eq!((tiny.width, tiny.height), (50, 25));
+
+        // 0% clamps cleanly to 1%.
+        let min_clamped =
+            compute_auto_fit_window_rect(1000, 500, 0, 0, monitor, false, false).unwrap();
+        assert_eq!((min_clamped.width, min_clamped.height), (10, 5));
+
+        // 200% upscales small SD video beyond 100% up to monitor bounds.
+        let upscaled =
+            compute_auto_fit_window_rect(640, 360, 0, 200, monitor, false, false).unwrap();
+        assert_eq!((upscaled.width, upscaled.height), (1280, 720));
+
+        // 1000% and >1000% upscale tiny video and still clamp cleanly to monitor bounds.
+        let large_monitor = MonitorRect::new(0, 0, 3840, 2160, 1.0);
+        let at_1000 =
+            compute_auto_fit_window_rect(100, 50, 0, 1000, large_monitor, false, false).unwrap();
+        assert_eq!((at_1000.width, at_1000.height), (1000, 500));
+        let above_1000 =
+            compute_auto_fit_window_rect(100, 50, 0, 2500, large_monitor, false, false).unwrap();
+        assert_eq!(above_1000, at_1000);
+
+        let monitor_bounded =
+            compute_auto_fit_window_rect(640, 360, 0, 1000, monitor, false, false).unwrap();
+        assert_eq!((monitor_bounded.width, monitor_bounded.height), (1920, 1080));
     }
 }

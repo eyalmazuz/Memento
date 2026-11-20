@@ -26,6 +26,7 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "raw-window-handle-06",
     "renderer-femtovg",
     "unstable-fontique-08",
+    "unstable-winit-030",
 ] }
 raw-window-handle = "=0.6.2"
 libloading = { version = "=0.8.9", optional = true }

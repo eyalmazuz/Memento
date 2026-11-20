@@ -16,10 +16,11 @@ pub use memento_player::controller::{
 pub use mouse::MouseInputForwarder;
 pub use subtitle_sync::{
     clear_primary_subtitle, clear_subtitle_marks_on_advance, refresh_active_rows,
-    refresh_subtitle_list, refresh_subtitle_marks, sync_player_tracks, track_label,
+    refresh_secondary_subtitle_list_with_timing, refresh_subtitle_list,
+    refresh_subtitle_list_with_timing, refresh_subtitle_marks, sync_player_tracks, track_label,
 };
 pub use visibility::{
-    compute_autofit_window_size, compute_mpv_subtitle_visibility,
+    compute_ass_overlay_visibility, compute_autofit_window_size, compute_mpv_subtitle_visibility,
     compute_mpv_subtitle_visibility_ex, compute_subtitle_overlay_visibility,
     compute_video_render_size, effective_media_title, filter_subtitle_text,
     is_image_subtitle_codec, mpv_cursor_should_hide, quantize_render_dimension,

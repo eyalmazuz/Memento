@@ -75,13 +75,18 @@ pub(crate) fn determine_startup_update_action(config: &ConfigController) -> Star
     }
 }
 
+pub(crate) fn update_opt_in_message(is_macos: bool) -> &'static str {
+    if is_macos {
+        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Cmd+,) → Application.\nThis will query GitHub's releases API when Memento starts."
+    } else {
+        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Ctrl+,) → Application.\nThis will query GitHub's releases API when Memento starts."
+    }
+}
+
 pub(crate) fn open_update_opt_in_dialog(app: &MementoApp) {
     app.set_update_dialog_opt_in(true);
     app.set_update_dialog_title("Auto Update".into());
-    app.set_update_dialog_message(
-        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts."
-            .into(),
-    );
+    app.set_update_dialog_message(update_opt_in_message(cfg!(target_os = "macos")).into());
     app.set_update_dialog_release_tag("".into());
     app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
     app.set_update_dialog_open(true);
@@ -305,5 +310,10 @@ mod tests {
         assert!(app.get_update_dialog_open());
         assert_eq!(app.get_update_dialog_title().as_str(), "Up to Date");
         assert!(app.get_update_dialog_release_tag().is_empty());
+
+        assert!(update_opt_in_message(true).contains("Cmd+,"));
+        assert!(!update_opt_in_message(true).contains("Ctrl+,"));
+        assert!(update_opt_in_message(false).contains("Ctrl+,"));
+        assert!(!update_opt_in_message(false).contains("Cmd+,"));
     }
 }

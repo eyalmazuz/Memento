@@ -20,11 +20,12 @@
 
 //! Unified cross-platform video renderer selection and capability planning.
 //!
-//! Coordinates backend selection across macOS (Metal via IOSurface/CGL or
-//! `CAMetalLayer`, with OpenGL and Software fallbacks), Linux (Wayland/X11
-//! OpenGL with `GL_RGBA16F` -> `GL_RGBA8` FBOs and Software fallback), and
-//! Windows (OpenGL with `+1px` borderless fullscreen workaround and Software
-//! fallback), honoring CLI arguments, environment variables, and `mpv.conf`.
+//! Coordinates backend selection across macOS (OpenGL 4.1 Core +
+//! `videotoolbox-copy` matching FemtoVG's OpenGL-native pipeline, with Software
+//! fallback), Linux (Wayland/X11 OpenGL with `GL_RGBA16F` -> `GL_RGBA8` FBOs
+//! and Software fallback), and Windows (OpenGL with `+1px` borderless
+//! fullscreen workaround and Software fallback), honoring CLI arguments,
+//! environment variables, and `mpv.conf`.
 
 use std::fmt;
 use std::path::Path;
@@ -34,9 +35,7 @@ use crate::graphics_device::{
     is_software_gl_renderer, read_mpv_conf_renderer_hints, LinuxDisplayServer,
     MpvConfRendererHints,
 };
-use crate::video_metal::{
-    is_metal_device_available, resolve_macos_metal_hwdec, MetalPresentationMode,
-};
+use crate::video_metal::{is_metal_device_available, MetalPresentationMode};
 use memento_player::mpv::{compatible_opengl_hwdec_for_session, compatible_software_hwdec};
 
 /// Supported operating system families for platform renderer selection.
@@ -389,72 +388,35 @@ impl PlatformRendererConfig {
         self.fallback_chain.get(pos + 1).copied()
     }
 
+    /// Effective `hwdec` string computed for the chosen renderer and session.
+    pub fn effective_hwdec(&self) -> &str {
+        &self.effective_hwdec
+    }
+
+    /// Whether `MPV_RENDER_PARAM_ADVANCED_CONTROL` should be enabled for the
+    /// active libmpv render context.
+    pub const fn use_advanced_control(&self) -> bool {
+        self.use_advanced_control
+    }
+
     fn select_macos(
         caps: &VideoRendererCapabilities,
         overrides: &RendererOverrides,
         requested_hwdec: &str,
     ) -> Self {
-        let force_gl = overrides.explicit_renderer == Some(PlatformRendererKind::OpenGl);
-        if !force_gl && caps.metal_available {
-            let prefer_native_layer = overrides.gpu_api.as_deref().is_some_and(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "vulkan" | "moltenvk" | "metal"
-                )
-            }) || overrides.gpu_context.as_deref().is_some_and(|v| {
-                matches!(v.trim().to_ascii_lowercase().as_str(), "macvk" | "moltenvk")
-            }) || !caps.iosurface_available;
-
-            let metal_mode = if prefer_native_layer {
-                MetalPresentationMode::NativeMetalLayer
-            } else {
-                MetalPresentationMode::IoSurfaceOpenGlBridge
-            };
-
-            let mut fallback_chain = vec![PlatformRendererKind::Metal];
-            if caps.opengl_available {
-                fallback_chain.push(PlatformRendererKind::OpenGl);
-            }
-            fallback_chain.push(PlatformRendererKind::Software);
-
-            let preferred_fbo_formats = if overrides.prefer_hdr && caps.edr_supported {
-                vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Bgra8Unorm]
-            } else {
-                vec![VideoColorFormat::Bgra8Unorm]
-            };
-
-            let effective_hwdec = resolve_macos_metal_hwdec(metal_mode, Some(requested_hwdec));
-            let reason = match metal_mode {
-                MetalPresentationMode::IoSurfaceOpenGlBridge => {
-                    "macOS Metal IOSurface/CGL bridge selected with OpenGL/Software fallback"
-                }
-                MetalPresentationMode::NativeMetalLayer => {
-                    "macOS native CAMetalLayer/MoltenVK selected per gpu-api/gpu-context override"
-                }
-            };
-
-            return Self {
-                primary: PlatformRendererKind::Metal,
-                fallback_chain,
-                preferred_fbo_formats,
-                effective_hwdec,
-                use_advanced_control: false,
-                windows_borderless_fullscreen: false,
-                metal_mode: Some(metal_mode),
-                reason: reason.to_owned(),
-            };
-        }
-
         if caps.opengl_available {
             let formats = opengl_fbo_formats(caps.opengl_rgba16f_supported, overrides.force_rgba8);
-            let effective_hwdec = match caps.gpu_renderer_name.as_deref() {
-                Some(name) => compatible_opengl_hwdec_for_session(requested_hwdec, name, false),
-                None => requested_hwdec.to_owned(),
-            };
-            let reason = if force_gl {
-                "macOS OpenGL explicitly requested; Software fallback enabled"
+            let effective_hwdec = resolve_macos_opengl_hwdec(
+                requested_hwdec,
+                caps.gpu_renderer_name.as_deref(),
+                overrides.libgl_always_software,
+            );
+            let reason = if overrides.explicit_renderer == Some(PlatformRendererKind::Metal) {
+                "macOS standardized on OpenGL 4.1 Core + videotoolbox-copy (FemtoVG OpenGL pipeline); Software fallback enabled"
+            } else if overrides.explicit_renderer == Some(PlatformRendererKind::OpenGl) {
+                "macOS OpenGL 4.1 Core + videotoolbox-copy explicitly requested; Software fallback enabled"
             } else {
-                "macOS Metal unavailable; falling back to OpenGL with Software fallback"
+                "macOS OpenGL 4.1 Core + videotoolbox-copy selected (matching FemtoVG OpenGL pipeline) with Software fallback"
             };
             return Self {
                 primary: PlatformRendererKind::OpenGl,
@@ -470,7 +432,7 @@ impl PlatformRendererConfig {
 
         Self::software_config(
             requested_hwdec,
-            "macOS Metal and OpenGL unavailable; falling back to Software renderer",
+            "macOS OpenGL unavailable; falling back to Software renderer",
         )
     }
 
@@ -587,6 +549,48 @@ pub fn has_drm_render_node_in(dir: &Path) -> bool {
     })
 }
 
+/// Resolve the safe copyback `hwdec` string for macOS OpenGL 4.1 Core +
+/// FemtoVG (`videotoolbox-copy` by default, preserving explicit `"no"` or
+/// copyback overrides and adapting direct/foreign decoders cleanly).
+pub fn resolve_macos_opengl_hwdec(
+    requested_hwdec: &str,
+    gpu_renderer_name: Option<&str>,
+    libgl_always_software: bool,
+) -> String {
+    if libgl_always_software || gpu_renderer_name.is_some_and(is_software_gl_renderer) {
+        return compatible_software_hwdec(requested_hwdec);
+    }
+    let trimmed = requested_hwdec.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "auto-safe" | "auto" | "yes"
+        )
+    {
+        return "videotoolbox-copy".to_owned();
+    }
+    let mut resolved = Vec::new();
+    for token in trimmed.split(',') {
+        let entry = token.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mapped = match entry.to_ascii_lowercase().as_str() {
+            "auto-safe" | "auto" | "yes" | "videotoolbox" | "nvdec" | "cuda" | "vaapi"
+            | "vdpau" | "d3d11va" | "dxva2" | "vulkan" => "videotoolbox-copy",
+            _ => entry,
+        };
+        if !resolved.iter().any(|existing: &String| existing == mapped) {
+            resolved.push(mapped.to_owned());
+        }
+    }
+    if resolved.is_empty() {
+        "videotoolbox-copy".to_owned()
+    } else {
+        resolved.join(",")
+    }
+}
+
 fn opengl_fbo_formats(rgba16f_supported: bool, force_rgba8: bool) -> Vec<VideoColorFormat> {
     if rgba16f_supported && !force_rgba8 {
         vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Rgba8Unorm]
@@ -611,5 +615,85 @@ mod tests {
 
         std::fs::write(dir.path().join("renderD129"), b"").unwrap();
         assert!(has_drm_render_node_in(dir.path()));
+    }
+
+    #[test]
+    fn macos_standardizes_on_opengl_41_core_and_videotoolbox_copy() {
+        let caps = VideoRendererCapabilities::for_macos(true, true);
+        let cfg = PlatformRendererConfig::select(&caps, &RendererOverrides::default());
+
+        assert_eq!(cfg.primary, PlatformRendererKind::OpenGl);
+        assert_eq!(
+            cfg.fallback_chain,
+            vec![PlatformRendererKind::OpenGl, PlatformRendererKind::Software]
+        );
+        assert_eq!(cfg.effective_hwdec(), "videotoolbox-copy");
+        assert!(cfg.use_advanced_control());
+        assert_eq!(cfg.metal_mode, None);
+        assert!(!cfg.windows_borderless_fullscreen);
+        assert_eq!(
+            cfg.preferred_fbo_formats,
+            vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Rgba8Unorm]
+        );
+        assert_eq!(
+            cfg.next_fallback(PlatformRendererKind::OpenGl),
+            Some(PlatformRendererKind::Software)
+        );
+        assert_eq!(cfg.next_fallback(PlatformRendererKind::Software), None);
+
+        // Even with a Metal override, macOS remains aligned to OpenGL 4.1 Core for FemtoVG.
+        let metal_override = RendererOverrides {
+            explicit_renderer: Some(PlatformRendererKind::Metal),
+            ..Default::default()
+        };
+        let cfg_metal = PlatformRendererConfig::select(&caps, &metal_override);
+        assert_eq!(cfg_metal.primary, PlatformRendererKind::OpenGl);
+        assert_eq!(cfg_metal.effective_hwdec(), "videotoolbox-copy");
+        assert!(cfg_metal.use_advanced_control());
+        assert_eq!(cfg_metal.metal_mode, None);
+
+        // Explicit Software override still wins on macOS.
+        let sw_override = RendererOverrides {
+            explicit_renderer: Some(PlatformRendererKind::Software),
+            ..Default::default()
+        };
+        let cfg_sw = PlatformRendererConfig::select(&caps, &sw_override);
+        assert_eq!(cfg_sw.primary, PlatformRendererKind::Software);
+        assert!(!cfg_sw.use_advanced_control());
+
+        // No OpenGL falls back cleanly to Software.
+        let no_gl = VideoRendererCapabilities::for_macos(true, false);
+        let cfg_no_gl = PlatformRendererConfig::select(&no_gl, &RendererOverrides::default());
+        assert_eq!(cfg_no_gl.primary, PlatformRendererKind::Software);
+        assert_eq!(cfg_no_gl.fallback_chain, vec![PlatformRendererKind::Software]);
+    }
+
+    #[test]
+    fn resolve_macos_opengl_hwdec_preserves_no_and_maps_direct_decoders_to_copyback() {
+        assert_eq!(
+            resolve_macos_opengl_hwdec("auto-safe", None, false),
+            "videotoolbox-copy"
+        );
+        assert_eq!(
+            resolve_macos_opengl_hwdec("videotoolbox", None, false),
+            "videotoolbox-copy"
+        );
+        assert_eq!(
+            resolve_macos_opengl_hwdec("videotoolbox,auto-safe", None, false),
+            "videotoolbox-copy"
+        );
+        assert_eq!(
+            resolve_macos_opengl_hwdec("vaapi,nvdec", None, false),
+            "videotoolbox-copy"
+        );
+        assert_eq!(resolve_macos_opengl_hwdec("no", None, false), "no");
+        assert_eq!(
+            resolve_macos_opengl_hwdec("videotoolbox-copy,no", None, false),
+            "videotoolbox-copy,no"
+        );
+        assert_eq!(
+            resolve_macos_opengl_hwdec("auto-safe", Some("llvmpipe"), false),
+            "auto-copy-safe"
+        );
     }
 }

@@ -10,7 +10,7 @@ use libloading::Library;
 use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -63,6 +63,98 @@ fn python_library_candidates() -> &'static [&'static str] {
     ]
 }
 
+const WINDOWS_MOCR_DLL_NAMES: &[&str] = &["libmocr.dll", "mocr.dll"];
+
+/// Build ordered Windows `libmocr.dll` discovery candidates (#135):
+/// 1. Executable directory (`<exe_dir>/libmocr.dll`, `<exe_dir>/mocr.dll`, `<exe_dir>/mocr/...`)
+/// 2. `%LOCALAPPDATA%\memento` (and `%LOCALAPPDATA%\memento\ocr`)
+/// 3. Existing `libmocr.dll` / `mocr.dll` matches on `PATH` (when present)
+/// 4. Bare DLL names so Windows `LoadLibraryW` default search order still runs.
+pub fn windows_mocr_library_candidates(
+    exe_dir: Option<&Path>,
+    local_app_data: Option<&Path>,
+    path_var: Option<&OsStr>,
+    path_exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push_unique = |candidate: PathBuf| {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    };
+
+    if let Some(dir) = exe_dir.filter(|d| !d.as_os_str().is_empty()) {
+        for name in WINDOWS_MOCR_DLL_NAMES {
+            push_unique(dir.join(name));
+        }
+        let nested = dir.join("mocr");
+        for name in WINDOWS_MOCR_DLL_NAMES {
+            push_unique(nested.join(name));
+        }
+    }
+
+    if let Some(local) = local_app_data.filter(|d| !d.as_os_str().is_empty()) {
+        let memento_dir = local.join("memento");
+        for name in WINDOWS_MOCR_DLL_NAMES {
+            push_unique(memento_dir.join(name));
+        }
+        let ocr_dir = memento_dir.join("ocr");
+        for name in WINDOWS_MOCR_DLL_NAMES {
+            push_unique(ocr_dir.join(name));
+        }
+    }
+
+    if let Some(raw_path) = path_var.and_then(OsStr::to_str) {
+        for entry in raw_path.split(';') {
+            let trimmed = entry.trim().trim_matches('"');
+            if trimmed.is_empty() {
+                continue;
+            }
+            let dir = Path::new(trimmed);
+            for name in WINDOWS_MOCR_DLL_NAMES {
+                let candidate = dir.join(name);
+                if path_exists(&candidate) {
+                    push_unique(candidate);
+                }
+            }
+        }
+    }
+
+    for name in WINDOWS_MOCR_DLL_NAMES {
+        push_unique(PathBuf::from(name));
+    }
+
+    candidates
+}
+
+fn format_library_unavailable_message(
+    is_windows: bool,
+    found_on_disk: &[String],
+    errors: &[String],
+) -> String {
+    let detail = if errors.is_empty() {
+        "no library candidates configured".to_owned()
+    } else {
+        errors.join("; ")
+    };
+    if is_windows {
+        if !found_on_disk.is_empty() {
+            format!(
+                "libmocr.dll was found at {} but failed to load (verify Python 3 and MSVC/CUDA runtime DLLs are installed and match 64-bit architecture). Details: {detail}",
+                found_on_disk.join(", ")
+            )
+        } else {
+            format!(
+                "libmocr.dll was not found. Install libmocr (manga-ocr) and place libmocr.dll next to memento.exe, in %LOCALAPPDATA%\\memento, or on PATH. Details: {detail}"
+            )
+        }
+    } else {
+        format!(
+            "libmocr shared library was not found or could not be loaded. Install libmocr and ensure it is in your library search path. Details: {detail}"
+        )
+    }
+}
+
 struct MocrApi {
     // Keep libmocr loaded until every context and returned text is released,
     // and drop it before any explicitly retained libpython handle.
@@ -78,17 +170,39 @@ struct MocrApi {
 impl MocrApi {
     fn load() -> Result<Self, OcrError> {
         #[cfg(target_os = "linux")]
-        let candidates = ["/usr/local/lib/libmocr.so", "libmocr.so"];
+        let candidates: Vec<PathBuf> = [
+            "/usr/local/lib/libmocr.so",
+            "/usr/lib/libmocr.so",
+            "libmocr.so",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
         #[cfg(target_os = "macos")]
-        let candidates = [
+        let candidates: Vec<PathBuf> = [
             "/usr/local/lib/libmocr.dylib",
             "/opt/homebrew/lib/libmocr.dylib",
             "libmocr.dylib",
-        ];
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
         #[cfg(target_os = "windows")]
-        let candidates = ["libmocr.dll", "mocr.dll"];
+        let candidates: Vec<PathBuf> = {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf));
+            let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+            let path_var = std::env::var_os("PATH");
+            windows_mocr_library_candidates(
+                exe_dir.as_deref(),
+                local_app_data.as_deref(),
+                path_var.as_deref(),
+                |candidate| candidate.is_file(),
+            )
+        };
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let candidates = ["libmocr.so"];
+        let candidates: Vec<PathBuf> = vec![PathBuf::from("libmocr.so")];
 
         // On Unix, embedded Python C-extensions (e.g. `unicodedata.so`) often do
         // not link directly against `libpython` and expect its C API symbols
@@ -113,14 +227,24 @@ impl MocrApi {
         };
 
         let mut errors = Vec::new();
+        let mut found_on_disk = Vec::new();
         for candidate in candidates {
+            let display = candidate.display().to_string();
+            let has_explicit_dir = candidate.parent().is_some_and(|p| !p.as_os_str().is_empty());
+            if has_explicit_dir {
+                if !candidate.is_file() {
+                    errors.push(format!("{display}: not found"));
+                    continue;
+                }
+                found_on_disk.push(display.clone());
+            }
             // SAFETY: We load only known library names/absolute install paths
             // with RTLD_LOCAL (default `Library::new`), then validate every
             // required symbol before exposing the API.
-            let library = match unsafe { Library::new(candidate) } {
+            let library = match unsafe { Library::new(candidate.as_os_str()) } {
                 Ok(library) => library,
                 Err(error) => {
-                    errors.push(format!("{candidate}: {error}"));
+                    errors.push(format!("{display}: {error}"));
                     continue;
                 }
             };
@@ -146,11 +270,13 @@ impl MocrApi {
                     });
                 }
                 Err(error) => errors.push(format!(
-                    "{candidate}: missing/incompatible libmocr symbol: {error}"
+                    "{display}: missing/incompatible libmocr symbol: {error}"
                 )),
             }
         }
-        Err(OcrError::LibraryUnavailable(errors.join("; ")))
+        Err(OcrError::LibraryUnavailable(
+            format_library_unavailable_message(cfg!(target_os = "windows"), &found_on_disk, &errors),
+        ))
     }
 }
 
@@ -941,10 +1067,10 @@ mod tests {
         assert_eq!(latest.frame.pixels[0], 3);
 
         assert!(slot.close().is_none());
-        assert_eq!(
-            slot.push_latest(make_req(4)).unwrap_err(),
-            OcrError::WorkerUnavailable
-        );
+        assert!(matches!(
+            slot.push_latest(make_req(4)),
+            Err(OcrError::WorkerUnavailable)
+        ));
     }
 
     #[test]
@@ -1059,5 +1185,64 @@ mod tests {
             cvar.notify_one();
         }
         bg.join().unwrap();
+    }
+
+    #[test]
+    fn windows_libmocr_discovery_checks_exe_dir_localappdata_path_and_explains_missing_dll() {
+        let exe_dir = Path::new("/win/ProgramFiles/Memento");
+        let local_app_data = Path::new("/win/Users/Alice/AppData/Local");
+        let path_env = OsStr::new("/win/tools/ocr;/win/empty");
+        let candidates = windows_mocr_library_candidates(
+            Some(exe_dir),
+            Some(local_app_data),
+            Some(path_env),
+            |p| p == Path::new("/win/tools/ocr/libmocr.dll"),
+        );
+
+        assert_eq!(candidates[0], exe_dir.join("libmocr.dll"));
+        assert_eq!(candidates[1], exe_dir.join("mocr.dll"));
+        assert!(candidates.contains(&local_app_data.join("memento").join("libmocr.dll")));
+        assert!(candidates.contains(&PathBuf::from("/win/tools/ocr/libmocr.dll")));
+        assert!(!candidates.contains(&PathBuf::from("/win/empty/libmocr.dll")));
+        assert_eq!(
+            candidates.last().map(PathBuf::as_path),
+            Some(Path::new("mocr.dll"))
+        );
+
+        // Priority order: exe dir -> %LOCALAPPDATA%\memento -> PATH -> bare DLL fallback.
+        let idx_exe = candidates
+            .iter()
+            .position(|p| p == &exe_dir.join("libmocr.dll"))
+            .unwrap();
+        let idx_local = candidates
+            .iter()
+            .position(|p| p == &local_app_data.join("memento").join("libmocr.dll"))
+            .unwrap();
+        let idx_path = candidates
+            .iter()
+            .position(|p| p == Path::new("/win/tools/ocr/libmocr.dll"))
+            .unwrap();
+        let idx_bare = candidates
+            .iter()
+            .position(|p| p == Path::new("libmocr.dll"))
+            .unwrap();
+        assert!(idx_exe < idx_local && idx_local < idx_path && idx_path < idx_bare);
+
+        let missing_msg = format_library_unavailable_message(
+            true,
+            &[],
+            &["libmocr.dll: not found".to_owned()],
+        );
+        assert!(missing_msg.contains("libmocr.dll"));
+        assert!(missing_msg.contains("%LOCALAPPDATA%\\memento"));
+        assert!(missing_msg.contains("PATH"));
+
+        let broken_deps_msg = format_library_unavailable_message(
+            true,
+            &["C:\\Memento\\libmocr.dll".to_owned()],
+            &["missing python312.dll".to_owned()],
+        );
+        assert!(broken_deps_msg.contains("found at C:\\Memento\\libmocr.dll"));
+        assert!(broken_deps_msg.contains("Python 3"));
     }
 }
