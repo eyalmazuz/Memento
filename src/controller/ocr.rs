@@ -35,6 +35,7 @@ type MocrDestroy = unsafe extern "C" fn(*mut MocrContextOpaque) -> c_int;
 type MocrRead =
     unsafe extern "C" fn(*mut MocrContextOpaque, *const c_void, usize, usize, c_int) -> *mut c_char;
 type MocrFree = unsafe extern "C" fn(*mut c_void) -> c_int;
+type MocrFinalize = unsafe extern "C" fn() -> c_int;
 
 #[cfg(target_os = "macos")]
 fn python_library_candidates() -> &'static [&'static str] {
@@ -167,11 +168,23 @@ struct MocrApi {
     destroy: MocrDestroy,
     read: MocrRead,
     free: MocrFree,
+    finalize: Option<MocrFinalize>,
 }
 
 impl MocrApi {
     #[cfg(test)]
     fn mock(init: MocrInit, destroy: MocrDestroy, read: MocrRead, free: MocrFree) -> Self {
+        Self::mock_with_finalize(init, destroy, read, free, None)
+    }
+
+    #[cfg(test)]
+    fn mock_with_finalize(
+        init: MocrInit,
+        destroy: MocrDestroy,
+        read: MocrRead,
+        free: MocrFree,
+        finalize: Option<MocrFinalize>,
+    ) -> Self {
         Self {
             _library: None,
             #[cfg(unix)]
@@ -180,6 +193,7 @@ impl MocrApi {
             destroy,
             read,
             free,
+            finalize,
         }
     }
 
@@ -265,15 +279,20 @@ impl MocrApi {
             };
             // SAFETY: libmocr exports these symbols with the declared C ABI.
             let symbols: Result<_, libloading::Error> = (|| unsafe {
+                let finalize = library
+                    .get::<MocrFinalize>(b"mocr_finalize\0")
+                    .ok()
+                    .map(|symbol| *symbol);
                 Ok((
                     *library.get::<MocrInit>(b"mocr_init\0")?,
                     *library.get::<MocrDestroy>(b"mocr_destroy\0")?,
                     *library.get::<MocrRead>(b"mocr_read\0")?,
                     *library.get::<MocrFree>(b"mocr_free\0")?,
+                    finalize,
                 ))
             })();
             match symbols {
-                Ok((init, destroy, read, free)) => {
+                Ok((init, destroy, read, free, finalize)) => {
                     return Ok(Self {
                         _library: Some(library),
                         #[cfg(unix)]
@@ -282,6 +301,7 @@ impl MocrApi {
                         destroy,
                         read,
                         free,
+                        finalize,
                     });
                 }
                 Err(error) => errors.push(format!(
@@ -730,6 +750,7 @@ fn worker_loop(queue: Arc<(Mutex<RequestSlot>, Condvar)>, idle_timeout: Duration
         OcrWorker {
             model: None,
             api: None,
+            python_initialized: false,
         },
         deliver_to_slint,
     );
@@ -758,7 +779,7 @@ fn worker_loop_with(
         );
         deliver(request.callback, result);
     }
-    worker.unload_model();
+    worker.finalize_runtime();
 }
 
 fn normalize_model_name(raw: &str) -> Result<&str, OcrError> {
@@ -774,6 +795,7 @@ struct OcrWorker {
     // `libmocr` is unloaded, and `libmocr` before `libpython`.
     model: Option<LoadedModel>,
     api: Option<MocrApi>,
+    python_initialized: bool,
 }
 
 struct LoadedModel {
@@ -799,6 +821,26 @@ impl OcrWorker {
             true
         } else {
             false
+        }
+    }
+
+    /// Destroy any active model context and finalize the embedded Python runtime
+    /// once when the dedicated OCR worker exits on application shutdown so
+    /// Python `atexit` handlers (e.g. `joblib`/`loky` semaphores and
+    /// `multiprocessing.resource_tracker`) clean up without leaked-resource warnings.
+    fn finalize_runtime(&mut self) {
+        self.unload_model();
+        if self.python_initialized {
+            if let Some(finalize) = self.api.as_ref().and_then(|api| api.finalize) {
+                // SAFETY: All `mocr_ctx` contexts were destroyed above, this runs
+                // once on the OCR worker thread at shutdown, and no further
+                // `mocr_init` calls will happen afterwards.
+                let status = unsafe { finalize() };
+                if status != 0 {
+                    eprintln!("Could not finalize OCR Python runtime (libmocr status {status}).");
+                }
+            }
+            self.python_initialized = false;
         }
     }
 
@@ -848,7 +890,11 @@ impl OcrWorker {
             if let Some(previous) = self.model.take() {
                 previous.context.destroy()?;
             }
-            let api = self.ensure_api()?;
+            self.ensure_api()?;
+            // Mark initialized before `mocr_init` so `mocr_finalize` still runs
+            // if Python initialized cleanly before a model load error.
+            self.python_initialized = true;
+            let api = self.api.as_ref().expect("api initialized above");
             let context = MocrContext::new(api, model_name, use_gpu)?;
             self.model = Some(LoadedModel {
                 name: model_name.to_owned(),
@@ -1442,6 +1488,7 @@ mod tests {
                 test_mock_read,
                 test_mock_free,
             )),
+            python_initialized: false,
         };
 
         assert!(!worker.is_model_loaded());
@@ -1487,6 +1534,7 @@ mod tests {
 
         static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
         static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static FINALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
         static DESTROY_TX: Mutex<Option<mpsc::Sender<usize>>> = Mutex::new(None);
 
         unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
@@ -1507,6 +1555,16 @@ mod tests {
             0
         }
 
+        unsafe extern "C" fn mock_finalize() -> c_int {
+            assert_eq!(
+                DESTROY_CALLS.load(Ordering::SeqCst),
+                INIT_CALLS.load(Ordering::SeqCst),
+                "all mocr contexts must be destroyed before mocr_finalize runs"
+            );
+            FINALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
         let (destroy_tx, destroy_rx) = mpsc::channel();
         *DESTROY_TX.lock().unwrap() = Some(destroy_tx);
 
@@ -1514,12 +1572,14 @@ mod tests {
         controller.start_test_worker(
             || OcrWorker {
                 model: None,
-                api: Some(MocrApi::mock(
+                api: Some(MocrApi::mock_with_finalize(
                     mock_init,
                     mock_destroy,
                     test_mock_read,
                     test_mock_free,
+                    Some(mock_finalize),
                 )),
+                python_initialized: false,
             },
             |callback, result| callback(result),
         );
@@ -1538,11 +1598,12 @@ mod tests {
         );
         assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
 
-        // After the 30 ms idle timeout, the model unloads automatically.
+        // After the 30 ms idle timeout, the model unloads automatically without finalizing Python.
         let first_destroy = destroy_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("model should unload after idle timeout");
         assert_eq!(first_destroy, 1);
+        assert_eq!(FINALIZE_CALLS.load(Ordering::SeqCst), 0);
 
         // A subsequent request after idle unload reloads MocrContext cleanly.
         let (res2_tx, res2_rx) = mpsc::channel();
@@ -1558,10 +1619,11 @@ mod tests {
         );
         assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 2);
 
-        // Dropping the controller shuts down the worker and destroys the reloaded model.
+        // Dropping the controller shuts down the worker, destroys the reloaded model, and finalizes Python once.
         drop(controller);
         *DESTROY_TX.lock().unwrap() = None;
         assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(FINALIZE_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1592,6 +1654,7 @@ mod tests {
                     test_mock_read,
                     test_mock_free,
                 )),
+                python_initialized: false,
             },
             |callback, result| callback(result),
         );

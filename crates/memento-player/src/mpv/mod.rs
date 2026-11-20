@@ -477,6 +477,35 @@ mod tests {
     }
 
     #[test]
+    fn mode1_asr_track_defers_reload_until_create_completes_and_resets_on_shutdown() {
+        let player = MpvInstance::new_software(None).unwrap();
+        let mut asr = AsrSubtitleTrack::with_mode(AsrTrackMode::StreamCallback);
+        asr.pending_create_req = Some(42);
+        asr.sid = Some(3);
+
+        // Adding a cue while `sub-add` (`pending_create_req`) is still in flight
+        // must queue `reload_dirty` instead of firing `sub-reload` early.
+        asr.add_cue(
+            &player,
+            AsrCue {
+                id: 1,
+                start: 1.0,
+                end: 2.0,
+                text: "hello".into(),
+            },
+        )
+        .unwrap();
+        assert!(asr.reload_dirty);
+        assert!(asr.reload_in_flight.is_none());
+
+        // Shutdown clears local track state so late ASR updates cannot reload.
+        asr.on_event(&player, &MpvEvent::Shutdown).unwrap();
+        assert!(!asr.is_active());
+        assert_eq!(asr.sid(), None);
+        assert!(asr.reload_in_flight.is_none());
+    }
+
+    #[test]
     fn cli_option_helpers_preserve_copy_mpv_string() {
         let dir = std::env::temp_dir().join(format!("memento-cli-opt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

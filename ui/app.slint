@@ -757,6 +757,7 @@ export component MementoApp inherits Window {
 
                     // libmpv frame shares the same Slint scene as all interactive overlays.
                     Image {
+                        visible: root.duration > 0.0;
                         width: parent.width;
                         height: parent.height;
                         source: root.video-frame;
@@ -864,40 +865,46 @@ export component MementoApp inherits Window {
                         }
                     }
 
-                    // Branded Empty / Placeholder State (sits over #000000 canvas, uses OSC light foreground tokens)
-                    if root.duration <= 0.0 : VerticalLayout {
-                        alignment: center;
-                        spacing: 14px;
+                    // Branded Empty / Placeholder State (opaque #000000 canvas so a stale video frame never bleeds through)
+                    if root.duration <= 0.0 : Rectangle {
+                        width: 100%;
+                        height: 100%;
+                        background: #000000;
 
-                        HorizontalLayout {
+                        VerticalLayout {
                             alignment: center;
-                            Image {
-                                width: 68px;
-                                height: 68px;
-                                source: @image-url("../res/memento.svg");
-                                image-fit: contain;
+                            spacing: 14px;
+
+                            HorizontalLayout {
+                                alignment: center;
+                                Image {
+                                    width: 68px;
+                                    height: 68px;
+                                    source: @image-url("../res/memento.svg");
+                                    image-fit: contain;
+                                }
                             }
-                        }
-                        Text {
-                            text: "Memento";
-                            font-size: 26px;
-                            font-weight: 700;
-                            color: MementoPalette.osc-text;
-                            horizontal-alignment: center;
-                        }
-                        Text {
-                            text: "Open a video file (Ctrl+O) or drag and drop media to start";
-                            font-size: 13.5px;
-                            color: MementoPalette.osc-text-secondary;
-                            horizontal-alignment: center;
-                        }
-                        HorizontalLayout {
-                            alignment: center;
-                            padding-top: 4px;
-                            ActionButton {
-                                text: "Open Media…";
-                                primary: true;
-                                clicked => { root.open-file(); }
+                            Text {
+                                text: "Memento";
+                                font-size: 26px;
+                                font-weight: 700;
+                                color: MementoPalette.osc-text;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "Open a video file (Ctrl+O) or drag and drop media to start";
+                                font-size: 13.5px;
+                                color: MementoPalette.osc-text-secondary;
+                                horizontal-alignment: center;
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                padding-top: 4px;
+                                ActionButton {
+                                    text: "Open Media…";
+                                    primary: true;
+                                    clicked => { root.open-file(); }
+                                }
                             }
                         }
                     }

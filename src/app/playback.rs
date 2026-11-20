@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slint::{ComponentHandle, Model as _, VecModel};
 
@@ -32,7 +32,7 @@ use crate::ui::{self, MementoApp, SubEntry};
 use memento_player::{MpvInstance, PlaylistLoad};
 use memento_setting::keys as raw;
 
-pub(crate) const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Complete set of subtitle extensions recognized for drag-and-drop and CLI loads (C5.3).
 const SUPPORTED_SUBTITLE_EXTENSIONS: &[&str] = &[
@@ -257,10 +257,8 @@ pub(crate) struct PlaybackHandles {
     pub(crate) trigger_initial_loads: Rc<dyn Fn()>,
     pub(crate) handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)>,
     pub(crate) handle_add_subtitle_paths: Rc<dyn Fn(Vec<PathBuf>)>,
-    pub(crate) quit_timer: Rc<slint::Timer>,
     pub(crate) hover_resume_timer: Rc<slint::Timer>,
     pub(crate) hover_pause_owned: Rc<Cell<bool>>,
-    pub(crate) asr_shutdown_timed_out: Rc<Cell<bool>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1192,10 +1190,8 @@ pub(crate) fn install_playback_handlers(
         crate::app::trim_os_heap();
     });
 
-    // ── Bounded Graceful Quit / Close Window Handler (C5.1 & M3) ────────────
-    let quit_timer = Rc::new(slint::Timer::default());
-    let asr_shutdown_timed_out = Rc::new(Cell::new(false));
-    let quit_poll = quit_timer.clone();
+    // ── Immediate Window Hide + Bounded Teardown in `app::run` (C5.1 & M3) ──
+    let close_request_active = Rc::new(Cell::new(false));
     let quit_asr = asr_session;
     let quit_restart = asr_restart_pending;
     let quit_closing = closing;
@@ -1203,10 +1199,10 @@ pub(crate) fn install_playback_handlers(
     let quit_hover_resume = hover_resume_timer.clone();
     let quit_hover_owned = hover_pause_owned.clone();
     let quit_screensaver = screensaver;
-    let quit_timed_out = asr_shutdown_timed_out.clone();
     let quit_config = config_ctrl.clone();
     let quit_config_dir = config_dir;
     let quit_ocr_epoch = ocr_epoch.clone();
+    let quit_in_close_request = close_request_active.clone();
     let quit_app = app.as_weak();
     app.on_quit_app(move || {
         if quit_closing.replace(true) {
@@ -1224,50 +1220,28 @@ pub(crate) fn install_playback_handlers(
             app.set_asr_track_selected(false);
             app.set_asr_running(false);
             app.set_pending_playback_generation(-1);
-            app.set_status_message("Closing Memento — stopping speech recognition…".into());
+            // Hide the main window immediately so closing never freezes on a stale
+            // frame while ASR finishes aborting in `app::run()`'s shutdown sequence.
+            if !quit_in_close_request.get() {
+                let _ = app.hide();
+            }
         }
         if let Some(player) = quit_player.borrow().as_ref() {
             let _ = player.command_async(&["set", "pause", "yes"]);
         }
-        if quit_asr.borrow_mut().try_finish_shutdown() {
-            if let Err(error) = slint::quit_event_loop() {
-                eprintln!("Could not close Memento: {error}");
-            }
-            return;
+        if let Err(error) = slint::quit_event_loop() {
+            eprintln!("Could not close Memento: {error}");
         }
-        let deadline = Instant::now() + ASR_SHUTDOWN_TIMEOUT;
-        let asr = quit_asr.clone();
-        let stop_timer = quit_poll.clone();
-        let timed_out_flag = quit_timed_out.clone();
-        quit_poll.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(25),
-            move || {
-                let done = asr.borrow_mut().try_finish_shutdown();
-                let expired = Instant::now() >= deadline;
-                if done || expired {
-                    if expired && !done {
-                        timed_out_flag.set(true);
-                        eprintln!(
-                            "ASR shutdown timed out after {}s; forcing window close",
-                            ASR_SHUTDOWN_TIMEOUT.as_secs()
-                        );
-                    }
-                    stop_timer.stop();
-                    if let Err(error) = slint::quit_event_loop() {
-                        eprintln!("Could not close Memento: {error}");
-                    }
-                }
-            },
-        );
     });
 
     let close_app = app.as_weak();
     app.window().on_close_requested(move || {
+        close_request_active.set(true);
         if let Some(app) = close_app.upgrade() {
             app.invoke_quit_app();
         }
-        slint::CloseRequestResponse::KeepWindowShown
+        close_request_active.set(false);
+        slint::CloseRequestResponse::HideWindow
     });
 
     // ── Subtitle Helpers & OCR ──────────────────────────────────────────────
@@ -1496,10 +1470,8 @@ pub(crate) fn install_playback_handlers(
         trigger_initial_loads,
         handle_open_or_drop_paths,
         handle_add_subtitle_paths,
-        quit_timer,
         hover_resume_timer,
         hover_pause_owned,
-        asr_shutdown_timed_out,
     }
 }
 

@@ -335,8 +335,15 @@ impl AsrSubtitleTrack {
         Ok(())
     }
 
+    /// Synchronously mark the ASR track deselected when the caller issues `set_sid`
+    /// away from ASR, preventing an in-flight cue from sending `sub-reload` before
+    /// libmpv echoes the `sid` property change.
+    pub fn mark_deselected(&mut self) {
+        self.deselected_by_user = true;
+    }
+
     fn trigger_stream_reload(&mut self, mpv: &MpvInstance) -> Result<(), String> {
-        if self.sid.is_none() || self.deselected_by_user {
+        if self.sid.is_none() || self.pending_create_req.is_some() || self.deselected_by_user {
             self.reload_dirty = true;
             return Ok(());
         }
@@ -359,7 +366,7 @@ impl AsrSubtitleTrack {
         event: &MpvEvent,
     ) -> Result<Option<i64>, String> {
         match event {
-            MpvEvent::EndFile { .. } => {
+            MpvEvent::EndFile { .. } | MpvEvent::Shutdown => {
                 self.abandoned_create_reqs.clear();
                 self.reset_local_state();
                 Ok(None)
@@ -487,20 +494,12 @@ impl AsrSubtitleTrack {
                     match self.mode {
                         AsrTrackMode::StreamCallback => {
                             let mut became_ready = false;
-                            if self.sid.is_none() {
-                                if let Some(track) = mpv
-                                    .subtitle_tracks()
-                                    .into_iter()
-                                    .rfind(|t| {
-                                        t.external
-                                            && t.external_path == ASR_STREAM_URI
-                                            && t.id > 0
-                                    })
-                                {
-                                    became_ready = self.sid.replace(track.id) != Some(track.id);
-                                    self.awaiting_stream_sid = false;
-                                    self.deselected_by_user = !track.selected;
-                                }
+                            if let Some(track) = mpv.subtitle_tracks().into_iter().rfind(|t| {
+                                t.external && t.external_path == ASR_STREAM_URI && t.id > 0
+                            }) {
+                                became_ready = self.sid.replace(track.id) != Some(track.id);
+                                self.awaiting_stream_sid = false;
+                                self.deselected_by_user = !track.selected;
                             }
                             if self.reload_dirty && self.sid.is_some() && !self.deselected_by_user {
                                 self.trigger_stream_reload(mpv)?;

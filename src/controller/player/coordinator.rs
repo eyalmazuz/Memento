@@ -275,6 +275,9 @@ impl LivePlayerCoordinator {
     /// Synchronously update primary `sid` tracking when the user explicitly selects
     /// a non-ASR subtitle track (or `"None"`) from Memento's UI menu.
     pub fn on_manual_primary_sid(&mut self, sid: i64) {
+        if self.asr_track.sid() != Some(sid) {
+            self.asr_track.mark_deselected();
+        }
         self.state.primary_sid = sid;
         self.previous_primary_sid = sid;
         self.auto_pause = AutoPauseState::default();
@@ -332,6 +335,7 @@ impl LivePlayerCoordinator {
         if app.get_asr_track_selected() {
             asr.suspend();
             asr_restart_pending.set(false);
+            self.asr_track.mark_deselected();
             let _ = player.set_sid(0);
             self.state.primary_sid = 0;
             self.previous_primary_sid = 0;
@@ -1822,6 +1826,12 @@ impl LivePlayerCoordinator {
             asr_restart_pending,
             hover_pause_owned,
         );
+        // Stop immediately when libmpv is shutting down (e.g. `q` / `quit`) so
+        // pre-shutdown `duration = 0` events do not flash the empty-state welcome
+        // screen and pending ASR cues do not issue `sub-reload` to an uninitialized track.
+        if self.shutdown_requested {
+            return Vec::new();
+        }
 
         let pos = self.state.position;
         let duration = self.state.duration;

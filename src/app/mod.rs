@@ -68,6 +68,22 @@ use self::video_pipeline::{install_video_pipeline, VideoParamsObserver, VideoTim
 use self::window_chrome::install_window_chrome_handlers;
 use self::workers::{install_dictionary_lookup_handlers, UiEvent, UiRelay, WorkerPool};
 
+/// Terminate the process without running C/C++ `atexit` static destructors.
+///
+/// Used only as a last resort after `ASR_SHUTDOWN_TIMEOUT` when a native ASR
+/// worker thread is still running inside a GPU backend (e.g. `ggml-vulkan`):
+/// returning normally from `main()` would invoke C++ static destructors such as
+/// `vk_instance_t` -> `~vk_device_struct()` (`vkDestroyDevice`) while that
+/// thread still holds the Vulkan device, deadlocking or crashing on exit.
+fn terminate_process_bypassing_atexit(code: i32) -> ! {
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code);
+}
+
 /// Format the About-modal / menu version string from `CARGO_PKG_VERSION` + optional `MEMENTO_GIT_HASH` (H1.6).
 pub(crate) fn format_app_version_display(pkg_version: &str, git_hash: Option<&str>) -> String {
     match git_hash.map(str::trim).filter(|hash| !hash.is_empty()) {
@@ -770,7 +786,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     detach_external_open_relay();
     persist_window_panel_state(&app, &config_ctrl, &config_dir);
     sync_handles.housekeeping_timer.stop();
-    playback_handles.quit_timer.stop();
     playback_handles.hover_resume_timer.stop();
     chrome_handles.osc_timer.stop();
     chrome_handles.cursor_timer.stop();
@@ -784,16 +799,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Close all background worker channels and join worker threads cleanly.
     workers.shutdown();
 
-    // Bounded ASR teardown covering event-loop exits that bypassed `on_quit_app`.
-    let mut asr_still_hung = playback_handles.asr_shutdown_timed_out.get();
-    if !asr_still_hung {
+    // Join software render thread before `mpv` can drop.
+    drop(render_worker);
+    // Release libmecab / piped MeCab daemon cleanly on shutdown.
+    memento_util::mecab::unload_mecab();
+
+    // Bounded ASR teardown after the window is already hidden so closing feels
+    // instant while giving an active inference step time to abort and release
+    // native GPU buffers cleanly.
+    let mut asr_still_hung = false;
+    {
         let mut asr = asr_session.borrow_mut();
         asr.begin_shutdown();
         let deadline = Instant::now() + ASR_SHUTDOWN_TIMEOUT;
         while !asr.try_finish_shutdown() {
             if Instant::now() >= deadline {
                 eprintln!(
-                    "ASR shutdown timed out after {}s during exit cleanup",
+                    "ASR shutdown timed out after {}s; forcing process exit",
                     ASR_SHUTDOWN_TIMEOUT.as_secs()
                 );
                 asr_still_hung = true;
@@ -803,16 +825,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Join software render thread before `mpv` can drop.
-    drop(render_worker);
-    // Release libmecab / piped MeCab daemon cleanly on shutdown.
-    memento_util::mecab::unload_mecab();
-
     if asr_still_hung {
-        // Avoid hanging forever inside `AsrController::drop` -> `worker.join()` on a stuck native call.
-        // Drop the Slint UI and mpv cleanly first, then forget the hung ASR controller.
-        drop(mpv);
+        // Leak `asr_session` first so dropping `app` never blocks forever in
+        // `AsrController::drop -> worker.join()`, then drop `app` (tearing down
+        // OpenGL and finalizing the OCR worker) and `mpv` (saving watch-later
+        // resume state) before bypassing C++ `atexit` static destructors.
         std::mem::forget(asr_session);
+        drop(app);
+        if let Some(player) = mpv.borrow_mut().take() {
+            drop(player);
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        terminate_process_bypassing_atexit(if run_result.is_ok() { 0 } else { 1 });
     }
 
     run_result?;
