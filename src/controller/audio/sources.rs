@@ -496,6 +496,7 @@ pub fn fetch_word_audio(
     )
 }
 
+#[cfg(test)]
 pub(super) fn fetch_word_audio_with_client(
     http: &HttpClient,
     expression: &str,

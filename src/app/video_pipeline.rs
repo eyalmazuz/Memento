@@ -202,6 +202,14 @@ impl VideoTimings {
         }
     }
 
+    fn should_report(&self, drops_changed: bool, verbose: bool, debug_build: bool) -> bool {
+        (verbose && self.frames > 0)
+            || (debug_build
+                && (drops_changed
+                    || self.paint_max.as_millis() > 40
+                    || self.queue_max.as_millis() > 40))
+    }
+
     pub(crate) fn report(
         &mut self,
         state: &memento_player::mpv::PlaybackState,
@@ -209,11 +217,7 @@ impl VideoTimings {
         verbose: bool,
         pending: Duration,
     ) {
-        if (verbose && self.frames > 0)
-            || drops_changed
-            || self.paint_max.as_millis() > 40
-            || self.queue_max.as_millis() > 40
-        {
+        if self.should_report(drops_changed, verbose, cfg!(debug_assertions)) {
             eprintln!(
                 "[video] frames={} drops={} decoder-drops={} hwdec={} paused={} queue-max={:.1}ms mpv-max={:.1}ms draw-max={:.1}ms draw-popup-rows={} wake-max={:.1}ms sync-max={:.1}ms sync-gap={:.1}ms pending={:.1}ms present-max={:.1}ms",
                 self.frames,
@@ -1004,4 +1008,26 @@ pub(crate) fn install_video_pipeline(
     app.invoke_update_video();
 
     render_worker
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_timings_auto_logging_is_debug_only_unless_verbose() {
+        let mut timings = VideoTimings {
+            frames: 13,
+            paint_max: Duration::from_millis(71),
+            ..VideoTimings::default()
+        };
+        assert!(timings.should_report(false, false, true));
+        assert!(timings.should_report(true, false, true));
+        assert!(!timings.should_report(false, false, false));
+        assert!(!timings.should_report(true, false, false));
+        assert!(timings.should_report(false, true, false));
+
+        timings.frames = 0;
+        assert!(!timings.should_report(false, true, false));
+    }
 }

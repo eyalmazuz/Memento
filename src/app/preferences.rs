@@ -364,6 +364,7 @@ pub(crate) fn compute_audio_config_hash(config: &ConfigController) -> u64 {
 }
 
 /// Returns the monotonically increasing audio configuration generation counter.
+#[cfg(test)]
 pub(crate) fn audio_config_generation() -> u64 {
     AUDIO_CONFIG_GENERATION.load(Ordering::Acquire)
 }

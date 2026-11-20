@@ -810,24 +810,6 @@ export component YomitanPopup inherits Rectangle {
         && root.width >= PopupBridge.css-definition-columns-min-width;
     property <int> watched-nested-depth: PopupBridge.nested-depth;
 
-    function scroll-to-row-y(row-y: length, row-h: length) {
-        let view-h = definition-list.height;
-        let content-h = definition-list.viewport-height;
-        if view-h <= 0px || content-h <= view-h {
-            return;
-        }
-        let min-vy = min(0px, view-h - content-h);
-        let cur-top = -definition-list.viewport-y;
-        let cur-bottom = cur-top + view-h;
-        let desired-top = row-y < cur-top
-            ? row-y
-            : (row-y + row-h > cur-bottom ? (row-y + row-h - view-h) : cur-top);
-        let clamped = max(min-vy, min(0px, -desired-top));
-        root.programmatic-scroll = true;
-        definition-list.viewport-y = clamped;
-        root.programmatic-scroll = false;
-    }
-
     visible: root.is-open && root.results.length > 0;
     width: 480px;
     height: 500px;
@@ -1020,17 +1002,10 @@ export component YomitanPopup inherits Rectangle {
                 for res[idx] in root.results : row-wrapper := Rectangle {
                     property <bool> hidden-by-grid: root.use-two-columns && !res.term-start;
                     property <bool> row-hidden: self.hidden-by-grid || (res.collapsed && !res.term-start);
-                    property <bool> is-focused: !self.row-hidden && root.focused-index >= 0 && idx == root.focused-index;
                     width: parent.width - 6px;
                     height: self.row-hidden ? 0px : term-segment.height + ((res.term-end || root.use-two-columns || (res.collapsed && res.term-start)) ? 10px : 0px);
                     visible: !self.row-hidden;
                     background: transparent;
-
-                    changed is-focused => {
-                        if self.is-focused && root.is-open {
-                            root.scroll-to-row-y(self.y, self.height);
-                        }
-                    }
 
                     term-segment := Rectangle {
                         property <int> row-zero-idx: res.index - 1;
@@ -1089,19 +1064,7 @@ export component YomitanPopup inherits Rectangle {
 
                         width: parent.width;
                         height: row-wrapper.row-hidden ? 0px : card-content.preferred-height + 10px;
-                        border-radius: 5px;
-                        background: (row-wrapper.is-focused && root.results.length > 1) ? MementoPalette.accent-subtle : transparent;
-                        border-width: (row-wrapper.is-focused && root.results.length > 1) ? 1px : 0px;
-                        border-color: (row-wrapper.is-focused && root.results.length > 1) ? MementoPalette.cyan-accent : transparent;
-                        // Left keyboard-focus accent bar (visible on focused term card for Ctrl+Up/Down & Ctrl+D)
-                        if row-wrapper.is-focused && res.term-start && root.results.length > 1 : Rectangle {
-                            x: 0px;
-                            y: 4px;
-                            width: 3px;
-                            height: max(0px, parent.height - 8px);
-                            border-radius: 1.5px;
-                            background: MementoPalette.cyan-accent;
-                        }
+                        background: transparent;
                         Rectangle {
                             visible: !row-wrapper.row-hidden && res.term-start && res.index > 1;
                             y: 0px;

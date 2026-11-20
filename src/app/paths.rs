@@ -11,6 +11,7 @@ use memento_config::Value;
 use memento_setting::keys as raw;
 
 /// Platform family used to resolve OS-native config/data/cache directories.
+#[allow(dead_code)] // Non-host variants are constructed on their target OS and in cross-platform tests.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PathPlatform {
     Linux,
@@ -180,6 +181,7 @@ pub(crate) fn resolve_app_dirs() -> Option<AppDirs> {
 /// falling back automatically to `fallback_dir/file_name` if the primary file
 /// does not exist yet so macOS/Windows users migrating from legacy paths never
 /// lose settings.
+#[cfg(test)]
 pub(crate) fn resolve_config_read_path(
     config_dir: &Path,
     file_name: &str,

@@ -2490,6 +2490,7 @@ pub(super) struct StylesheetCache {
 }
 
 impl StylesheetCache {
+    #[cfg(test)]
     pub(super) fn new(config_dir: &Path) -> Self {
         Self::new_with_theme(config_dir, CssTheme::Dark)
     }
