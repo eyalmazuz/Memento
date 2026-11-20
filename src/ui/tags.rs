@@ -148,3 +148,158 @@ pub fn suppress_redundant_tags(
     let inline_tags = extract_inline_structured_tags(raw_glossary);
     suppress_redundant_tags_with_inline(term_tags, def_tags, &inline_tags)
 }
+
+/// Yomitan-aligned `compactTags` sense filter (H5.3 / Memento `#220`).
+///
+/// Always deduplicates `term_tags` and removes `def_tags` already shown in `term_tags` or
+/// inline inside `structured-content`. When `compact_tags` is `true`, also tracks tags
+/// already emitted on earlier senses within the same entry in `seen_sense_tags` and omits
+/// repeated definition tags on subsequent senses.
+#[allow(dead_code)]
+pub fn suppress_redundant_tags_for_sense(
+    term_tags: &[DictTag],
+    def_tags: &[DictTag],
+    inline_tags: &HashSet<String>,
+    seen_sense_tags: &mut HashSet<String>,
+    compact_tags: bool,
+) -> (Vec<DictTag>, Vec<DictTag>) {
+    let (filtered_term, base_def) =
+        suppress_redundant_tags_with_inline(term_tags, def_tags, inline_tags);
+    if !compact_tags {
+        return (filtered_term, base_def);
+    }
+
+    let mut compact_def = Vec::with_capacity(base_def.len());
+    for tag in base_def {
+        let key = normalize_tag_key(&tag.name);
+        if key.is_empty() || !seen_sense_tags.insert(key) {
+            continue;
+        }
+        compact_def.push(tag);
+    }
+    (filtered_term, compact_def)
+}
+
+/// Deduplicates term and definition tags across all senses within a single term entry
+/// according to Yomitan's `compactTags` setting (`compact_tags: bool`).
+#[allow(dead_code)]
+pub fn compact_sense_tags(
+    term_tags: &[DictTag],
+    sense_def_tags: &[Vec<DictTag>],
+    sense_inline_tags: &[HashSet<String>],
+    compact_tags: bool,
+) -> (Vec<DictTag>, Vec<Vec<DictTag>>) {
+    let empty_inline = HashSet::new();
+    let mut seen_sense_tags = HashSet::new();
+    let mut dedup_term = Vec::new();
+    let mut per_sense = Vec::with_capacity(sense_def_tags.len());
+
+    for (idx, def_tags) in sense_def_tags.iter().enumerate() {
+        let inline = sense_inline_tags.get(idx).unwrap_or(&empty_inline);
+        let (t, d) = suppress_redundant_tags_for_sense(
+            term_tags,
+            def_tags,
+            inline,
+            &mut seen_sense_tags,
+            compact_tags,
+        );
+        if idx == 0 {
+            dedup_term = t;
+        }
+        per_sense.push(d);
+    }
+    if sense_def_tags.is_empty() {
+        dedup_term = suppress_redundant_tags_with_inline(term_tags, &[], &empty_inline).0;
+    }
+    (dedup_term, per_sense)
+}
+
+/// Compacts comma-separated tag display strings across senses of the same entry.
+/// When `compact_tags` is `true`, identical tag names already shown on an earlier sense
+/// of the same entry are omitted from subsequent senses.
+pub fn compact_tag_names_across_senses(
+    sense_tag_strings: &[&str],
+    compact_tags: bool,
+) -> Vec<String> {
+    let mut seen_entry: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(sense_tag_strings.len());
+
+    for raw in sense_tag_strings {
+        let mut seen_in_sense: HashSet<String> = HashSet::new();
+        let mut kept: Vec<String> = Vec::new();
+        for part in raw.split(',') {
+            let display = part.replace('⭐', "★");
+            let trimmed = display.trim();
+            let key = normalize_tag_key(trimmed);
+            if key.is_empty() || !seen_in_sense.insert(key.clone()) {
+                continue;
+            }
+            if compact_tags && !seen_entry.insert(key) {
+                continue;
+            }
+            kept.push(trimmed.to_owned());
+        }
+        out.push(kept.join(", "));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_tags_deduplicates_identical_tags_across_senses_within_entry() {
+        let term = vec![DictTag::with_details("common", "popular", "", 0, 10)];
+        let sense1 = vec![
+            DictTag::with_details("common", "popular", "", 0, 10),
+            DictTag::with_details("n", "partOfSpeech", "noun", 1, 0),
+            DictTag::with_details("vs", "partOfSpeech", "suru verb", 2, 0),
+        ];
+        let sense2 = vec![
+            DictTag::with_details("n", "partOfSpeech", "noun", 1, 0),
+            DictTag::with_details("adj-no", "partOfSpeech", "no-adjective", 3, 0),
+        ];
+        let sense3 = vec![
+            DictTag::with_details("vs", "partOfSpeech", "suru verb", 2, 0),
+            DictTag::with_details("adj-no", "partOfSpeech", "no-adjective", 3, 0),
+        ];
+
+        // compact_tags = false keeps repeated sense-level tags across senses (while still dropping term dupes)
+        let (t_off, d_off) = compact_sense_tags(
+            &term,
+            &[sense1.clone(), sense2.clone(), sense3.clone()],
+            &[],
+            false,
+        );
+        assert_eq!(t_off.len(), 1);
+        assert_eq!(
+            d_off[0].iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["n", "vs"]
+        );
+        assert_eq!(
+            d_off[1].iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["n", "adj-no"]
+        );
+        assert_eq!(
+            d_off[2].iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["vs", "adj-no"]
+        );
+
+        // compact_tags = true suppresses tags already shown on earlier senses
+        let (t_on, d_on) = compact_sense_tags(&term, &[sense1, sense2, sense3], &[], true);
+        assert_eq!(t_on.len(), 1);
+        assert_eq!(
+            d_on[0].iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["n", "vs"]
+        );
+        assert_eq!(
+            d_on[1].iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["adj-no"]
+        );
+        assert!(d_on[2].is_empty());
+
+        let names = compact_tag_names_across_senses(&["n, vs", "n, adj-no", "vs"], true);
+        assert_eq!(names, vec!["n, vs", "adj-no", ""]);
+    }
+}

@@ -5,11 +5,12 @@ use std::sync::atomic::AtomicI32;
 
 use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
-use crate::controller::dict::{SearchHit, TermPitchDetail};
+use crate::controller::dict::{PitchPosition, SearchHit, TermFrequency, TermPitchDetail};
 
 use super::bridge::RichUiBridge;
+use super::tags::compact_tag_names_across_senses;
 use super::{
-    DictResult, MementoApp, PitchGraph, PitchMora, PopupBridge, PopupFrequencyLine,
+    DictResult, MementoApp, PitchGraph, PitchMora, PopupBridge, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupLayout, RichPitchGraph, RichPitchMora,
 };
 
@@ -147,32 +148,102 @@ pub(super) fn latest_active_rich_bridge() -> Option<Rc<RichUiBridge>> {
     })
 }
 
+/// Returns `true` if `character` is a CJK ideograph (including Extensions A–J,
+/// covering Extension H `U+31350..=U+323AF` and Extension J `U+323B0..=U+3347F`,
+/// Yomitan PR #2504).
 pub fn is_kanji_char(character: char) -> bool {
-    ('\u{3400}'..='\u{9fff}').contains(&character)
-        || ('\u{f900}'..='\u{faff}').contains(&character)
-        || ('\u{20000}'..='\u{3134f}').contains(&character)
+    memento_dict::normalize::is_cjk_ideograph(character)
+}
+
+#[allow(dead_code)]
+fn is_headword_kanji_char(character: char) -> bool {
+    is_kanji_char(character) || matches!(character, '\u{3005}' | '\u{3006}' | '\u{3007}')
+}
+
+/// Formats a plain multi-line glossary string into compact inline ` | `-separated text
+/// (H5.3 / Memento `#220`).
+pub fn compact_glossary_inline_text(glossary: &str) -> String {
+    let parts: Vec<&str> = glossary
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['◦', '•']).trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.join(" | ")
 }
 
 pub(super) fn build_dictionary_result_rows_grouped(
     hits: &[SearchHit],
     excluded: &[String],
 ) -> (Vec<DictResult>, Vec<SearchHit>) {
-    let mut grouped: Vec<&SearchHit> = Vec::with_capacity(hits.len());
-    let mut terms: Vec<(&str, &str, bool)> = Vec::new();
-    let mut by_term: HashMap<(&str, &str, bool), Vec<&SearchHit>> = HashMap::new();
-    for hit in hits {
+    build_dictionary_result_rows_grouped_with_options(hits, excluded, None, false, false)
+}
+
+/// Groups search hits by `(expression, reading, is_kanji)`, accumulates `term.score` across
+/// dictionaries per group, optionally ranks `expression == cloze_body` ahead of reading-only
+/// matches, and supports Yomitan-aligned `compact_glossaries` and `compact_tags` options.
+pub(super) fn build_dictionary_result_rows_grouped_with_options(
+    hits: &[SearchHit],
+    excluded: &[String],
+    cloze_body: Option<&str>,
+    compact_glossaries: bool,
+    compact_tags: bool,
+) -> (Vec<DictResult>, Vec<SearchHit>) {
+    struct TermGroup<'a> {
+        key: (&'a str, &'a str, bool),
+        hits: Vec<&'a SearchHit>,
+        accumulated_score: i64,
+        first_order: usize,
+    }
+
+    let mut groups: Vec<TermGroup<'_>> = Vec::new();
+    let mut by_term: HashMap<(&str, &str, bool), usize> = HashMap::new();
+    for (order_idx, hit) in hits.iter().enumerate() {
         let key = (hit.expression.as_str(), hit.reading.as_str(), hit.is_kanji);
-        match by_term.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                terms.push(key);
-                entry.insert(vec![hit]);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().push(hit),
+        if let Some(&group_idx) = by_term.get(&key) {
+            let group = &mut groups[group_idx];
+            group.accumulated_score = group.accumulated_score.saturating_add(hit.score);
+            group.hits.push(hit);
+        } else {
+            let group_idx = groups.len();
+            by_term.insert(key, group_idx);
+            groups.push(TermGroup {
+                key,
+                hits: vec![hit],
+                accumulated_score: hit.score,
+                first_order: order_idx,
+            });
         }
     }
-    for key in terms {
-        if let Some(rows) = by_term.remove(&key) {
-            grouped.extend(rows);
+
+    if let Some(body) = cloze_body.map(str::trim).filter(|s| !s.is_empty()) {
+        groups.sort_by(|a, b| {
+            let a_is_kanji = a.key.2;
+            let b_is_kanji = b.key.2;
+            let a_expr_eq = a.key.0 == body;
+            let b_expr_eq = b.key.0 == body;
+            a_is_kanji
+                .cmp(&b_is_kanji)
+                .then_with(|| b_expr_eq.cmp(&a_expr_eq))
+                .then_with(|| b.accumulated_score.cmp(&a.accumulated_score))
+                .then_with(|| a.first_order.cmp(&b.first_order))
+        });
+    } else {
+        // Keep kanji footer groups cleanly below non-kanji term groups while preserving
+        // upstream longest-prefix-first term group order.
+        groups.sort_by(|a, b| a.key.2.cmp(&b.key.2).then_with(|| a.first_order.cmp(&b.first_order)));
+    }
+
+    let mut grouped: Vec<&SearchHit> = Vec::with_capacity(hits.len());
+    let mut group_scores_per_row: Vec<i64> = Vec::with_capacity(hits.len());
+    let mut compact_pos_tags_per_row: Vec<String> = Vec::with_capacity(hits.len());
+
+    for group in groups {
+        let sense_tag_refs: Vec<&str> = group.hits.iter().map(|h| h.tags.as_str()).collect();
+        let formatted_tags = compact_tag_names_across_senses(&sense_tag_refs, compact_tags);
+        for (hit, tag_str) in group.hits.into_iter().zip(formatted_tags) {
+            grouped.push(hit);
+            group_scores_per_row.push(group.accumulated_score);
+            compact_pos_tags_per_row.push(tag_str);
         }
     }
 
@@ -180,50 +251,63 @@ pub(super) fn build_dictionary_result_rows_grouped(
     let rows = grouped
         .iter()
         .enumerate()
-        .map(|(index, hit)| DictResult {
-            index: (index + 1) as i32,
-            expression: hit.expression.clone().into(),
-            reading: hit.reading.clone().into(),
-            pos_tags: hit.tags.replace('⭐', "★").into(),
-            dict_name: hit.dict_name.clone().into(),
-            glossary: hit.glossary.clone().into(),
-            glossary_blocks: if hit.rich_glossary.is_empty() {
-                Default::default()
+        .map(|(index, hit)| {
+            let score_val = group_scores_per_row[index];
+            let glossary_text = if compact_glossaries && !hit.is_kanji {
+                compact_glossary_inline_text(&hit.glossary)
             } else {
-                Rc::new(VecModel::from(
-                    hit.rich_glossary
-                        .iter()
-                        .map(|block| PopupGlossaryBlock {
-                            text: block.text.clone().into(),
-                            kind: block.kind,
-                            href: block.href.clone().into(),
-                        })
-                        .collect::<Vec<_>>(),
-                ))
-                .into()
-            },
-            notes: hit.notes.clone().into(),
-            example_ja: hit.example_ja.clone().into(),
-            example_en: hit.example_en.clone().into(),
-            selected: !excluded.iter().any(|name| name == &hit.dict_name),
-            score: i32::try_from(hit.score).unwrap_or(if hit.score < 0 {
-                i32::MIN
+                hit.glossary.clone()
+            };
+            let pos_tags = if compact_tags {
+                compact_pos_tags_per_row[index].clone()
             } else {
-                i32::MAX
-            }),
-            is_kanji: hit.is_kanji,
-            has_kanji: hit.expression.chars().any(is_kanji_char),
-            term_start: index == 0
-                || grouped[index - 1].expression != hit.expression
-                || grouped[index - 1].reading != hit.reading
-                || grouped[index - 1].is_kanji != hit.is_kanji,
-            term_end: index + 1 == grouped.len()
-                || grouped[index + 1].expression != hit.expression
-                || grouped[index + 1].reading != hit.reading
-                || grouped[index + 1].is_kanji != hit.is_kanji,
-            collapsed: false,
-            pitch_graphs: Default::default(),
-            frequencies: Default::default(),
+                hit.tags.replace('⭐', "★")
+            };
+            DictResult {
+                index: (index + 1) as i32,
+                expression: hit.expression.clone().into(),
+                reading: hit.reading.clone().into(),
+                pos_tags: pos_tags.into(),
+                dict_name: hit.dict_name.clone().into(),
+                glossary: glossary_text.into(),
+                glossary_blocks: if hit.rich_glossary.is_empty() {
+                    Default::default()
+                } else {
+                    Rc::new(VecModel::from(
+                        hit.rich_glossary
+                            .iter()
+                            .map(|block| PopupGlossaryBlock {
+                                text: block.text.clone().into(),
+                                kind: block.kind,
+                                href: block.href.clone().into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                    .into()
+                },
+                notes: hit.notes.clone().into(),
+                example_ja: hit.example_ja.clone().into(),
+                example_en: hit.example_en.clone().into(),
+                selected: !excluded.iter().any(|name| name == &hit.dict_name),
+                score: i32::try_from(score_val).unwrap_or(if score_val < 0 {
+                    i32::MIN
+                } else {
+                    i32::MAX
+                }),
+                is_kanji: hit.is_kanji,
+                has_kanji: hit.expression.chars().any(is_kanji_char),
+                term_start: index == 0
+                    || grouped[index - 1].expression != hit.expression
+                    || grouped[index - 1].reading != hit.reading
+                    || grouped[index - 1].is_kanji != hit.is_kanji,
+                term_end: index + 1 == grouped.len()
+                    || grouped[index + 1].expression != hit.expression
+                    || grouped[index + 1].reading != hit.reading
+                    || grouped[index + 1].is_kanji != hit.is_kanji,
+                collapsed: false,
+                pitch_graphs: Default::default(),
+                frequencies: Default::default(),
+            }
         })
         .collect();
     (rows, grouped_owned)
@@ -231,6 +315,27 @@ pub(super) fn build_dictionary_result_rows_grouped(
 
 pub fn dictionary_result_rows(hits: &[SearchHit], excluded: &[String]) -> Vec<DictResult> {
     let (rows, grouped_owned) = build_dictionary_result_rows_grouped(hits, excluded);
+    set_last_grouped_hits(grouped_owned);
+    rows
+}
+
+/// Additive options-aware wrapper around [`dictionary_result_rows`] supporting cloze-body
+/// headword ranking, Yomitan-aligned `compact_glossaries`, and `compact_tags`.
+#[allow(dead_code)]
+pub fn dictionary_result_rows_with_options(
+    hits: &[SearchHit],
+    excluded: &[String],
+    cloze_body: Option<&str>,
+    compact_glossaries: bool,
+    compact_tags: bool,
+) -> Vec<DictResult> {
+    let (rows, grouped_owned) = build_dictionary_result_rows_grouped_with_options(
+        hits,
+        excluded,
+        cloze_body,
+        compact_glossaries,
+        compact_tags,
+    );
     set_last_grouped_hits(grouped_owned);
     rows
 }
@@ -324,28 +429,275 @@ fn refresh_popup_rows(app: &MementoApp) {
     }
 }
 
+/// Resolves per-mora high/low levels and following particle pitch `(mora_highs, particle_high)`
+/// for either an exact `H`/`L` string pitch pattern (Yomitan PR #2055) or a numeric downstep.
+#[must_use]
+pub fn resolve_pitch_mora_levels(
+    mora_len: usize,
+    position: i32,
+    pattern: Option<&str>,
+) -> (Vec<bool>, bool) {
+    if mora_len == 0 {
+        return (Vec::new(), false);
+    }
+    if let Some(pat) = pattern {
+        if PitchPosition::is_valid_pattern(pat) {
+            let levels = PitchPosition::Pattern(pat.to_owned()).to_levels(mora_len);
+            if levels.len() > mora_len {
+                return (levels[..mora_len].to_vec(), levels[mora_len]);
+            }
+            if !levels.is_empty() {
+                let mut mora_highs = Vec::with_capacity(mora_len);
+                mora_highs.extend_from_slice(&levels);
+                let tail = *levels.last().unwrap_or(&false);
+                mora_highs.resize(mora_len, tail);
+                return (mora_highs, tail);
+            }
+        }
+    }
+
+    let mut mora_highs = vec![false; mora_len];
+    let particle_high = if position == 0 {
+        for h in mora_highs.iter_mut().skip(1) {
+            *h = true;
+        }
+        true
+    } else if position == 1 {
+        mora_highs[0] = true;
+        false
+    } else if position > 1 {
+        let limit = (position as usize).min(mora_len);
+        for h in mora_highs.iter_mut().take(limit).skip(1) {
+            *h = true;
+        }
+        false
+    } else {
+        false
+    };
+    (mora_highs, particle_high)
+}
+
+/// Formats a pitch badge label (`"[2]"` or `"[LHHL]"`) from numeric downstep and optional
+/// exact string pattern.
+#[allow(dead_code)]
+#[must_use]
+pub fn popup_pitch_badge_text(position: i32, pattern: Option<&str>) -> String {
+    if let Some(pat) = pattern {
+        let trimmed = pat.trim();
+        if !trimmed.is_empty() {
+            return format!("[{}]", trimmed.to_ascii_uppercase());
+        }
+    }
+    format!("[{position}]")
+}
+
+/// A single SVG/vector point on a pitch accent graph (`x` in `25 + 50*i`, `y` in `{25, 75}`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PitchGraphPoint {
+    pub x: f32,
+    pub y: f32,
+    pub high: bool,
+    pub is_particle: bool,
+    pub downstep: bool,
+}
+
+/// Full popup pitch graph geometry & notation supporting both integer downsteps and exact
+/// `H`/`L` string pitch patterns (`"LHH"`, `"HLL"`, `"LHHL"`, `"HLHL"`, etc.).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PopupPitchPatternData {
+    pub dictionary: String,
+    pub position: i32,
+    pub pattern: Option<String>,
+    pub badge_text: String,
+    pub mora_highs: Vec<bool>,
+    pub particle_high: bool,
+    pub points: Vec<PitchGraphPoint>,
+    pub svg: Option<String>,
+    pub compact_notation: String,
+}
+
+/// Generates an inline SVG pitch graph for `detail` (handling both integer downsteps and
+/// exact `H`/`L` string patterns).
+#[allow(dead_code)]
+#[must_use]
+pub fn pitch_graph_svg_for_detail(
+    detail: &TermPitchDetail,
+    fill: &str,
+    stroke: &str,
+) -> Option<String> {
+    if detail.mora.is_empty() {
+        return None;
+    }
+    let spec = if let Some(ref pat) = detail.pattern {
+        memento_anki::note::PitchSpec::Pattern(pat.as_str())
+    } else {
+        let pos = u8::try_from(detail.position).ok()?;
+        memento_anki::note::PitchSpec::Downstep(pos)
+    };
+    memento_anki::note::generate_pitch_graph_svg(detail.mora.len(), spec, fill, stroke)
+}
+
+/// Formats a single `TermPitchDetail` into compact inline notation (e.g. `たべ↓る [2]` or
+/// `おとこ↓ [LHHL]`).
+#[allow(dead_code)]
+#[must_use]
+pub fn format_single_compact_pitch(detail: &TermPitchDetail) -> String {
+    let (mora_highs, particle_high) =
+        resolve_pitch_mora_levels(detail.mora.len(), detail.position, detail.pattern.as_deref());
+    let mut reading_marked = String::new();
+    for (idx, mora) in detail.mora.iter().enumerate() {
+        reading_marked.push_str(mora);
+        let high = mora_highs.get(idx).copied().unwrap_or(false);
+        let next_high = if idx + 1 < detail.mora.len() {
+            mora_highs[idx + 1]
+        } else {
+            particle_high
+        };
+        if high && !next_high {
+            reading_marked.push('↓');
+        }
+    }
+    let badge = popup_pitch_badge_text(detail.position, detail.pattern.as_deref());
+    if reading_marked.is_empty() {
+        badge
+    } else {
+        format!("{reading_marked} {badge}")
+    }
+}
+
+/// Builds complete L/H mora levels, SVG/vector pitch graph points, SVG markup, badge text,
+/// and compact notation for a `TermPitchDetail`.
+#[allow(dead_code)]
+#[must_use]
+pub fn popup_pitch_pattern_data(detail: &TermPitchDetail) -> PopupPitchPatternData {
+    let n = detail.mora.len();
+    let (mora_highs, particle_high) =
+        resolve_pitch_mora_levels(n, detail.position, detail.pattern.as_deref());
+    let mut points = Vec::with_capacity(if n > 0 { n + 1 } else { 0 });
+    for i in 0..n {
+        let high = mora_highs[i];
+        let next_high = if i + 1 < n {
+            mora_highs[i + 1]
+        } else {
+            particle_high
+        };
+        points.push(PitchGraphPoint {
+            x: 25.0 + 50.0 * (i as f32),
+            y: if high { 25.0 } else { 75.0 },
+            high,
+            is_particle: false,
+            downstep: high && !next_high,
+        });
+    }
+    if n > 0 {
+        points.push(PitchGraphPoint {
+            x: 25.0 + 50.0 * (n as f32),
+            y: if particle_high { 25.0 } else { 75.0 },
+            high: particle_high,
+            is_particle: true,
+            downstep: false,
+        });
+    }
+    let badge_text = popup_pitch_badge_text(detail.position, detail.pattern.as_deref());
+    let svg = pitch_graph_svg_for_detail(
+        detail,
+        memento_anki::note::DEFAULT_PITCH_GRAPH_FILL,
+        memento_anki::note::DEFAULT_PITCH_GRAPH_STROKE,
+    );
+    let compact_notation = format_single_compact_pitch(detail);
+    PopupPitchPatternData {
+        dictionary: detail.dictionary.clone(),
+        position: detail.position,
+        pattern: detail.pattern.clone(),
+        badge_text,
+        mora_highs,
+        particle_high,
+        points,
+        svg,
+        compact_notation,
+    }
+}
+
+/// Compact per-dictionary pitch group joining multiple accents with ` | ` (H5.3 / Memento `#220`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactPitchGroup {
+    pub dictionary: String,
+    pub notations: String,
+    pub badges: String,
+}
+
+/// Formats a list of pitch details into ` | `-separated compact pitch notation.
+#[allow(dead_code)]
+#[must_use]
+pub fn format_compact_pitches(details: &[TermPitchDetail]) -> String {
+    let mut parts = Vec::with_capacity(details.len());
+    for detail in details {
+        let s = format_single_compact_pitch(detail);
+        if !s.is_empty() && !parts.contains(&s) {
+            parts.push(s);
+        }
+    }
+    parts.join(" | ")
+}
+
+/// Groups pitch details by dictionary (preserving encounter order) and joins multiple pitch
+/// notations/badges within each dictionary with ` | ` for compact popup layout.
+#[allow(dead_code)]
+#[must_use]
+pub fn compact_pitch_groups(details: &[TermPitchDetail]) -> Vec<CompactPitchGroup> {
+    let mut groups: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    let mut index_by_dict: HashMap<&str, usize> = HashMap::new();
+    for detail in details {
+        let notation = format_single_compact_pitch(detail);
+        let badge = popup_pitch_badge_text(detail.position, detail.pattern.as_deref());
+        if let Some(&idx) = index_by_dict.get(detail.dictionary.as_str()) {
+            if !groups[idx].1.contains(&notation) {
+                groups[idx].1.push(notation);
+            }
+            if !groups[idx].2.contains(&badge) {
+                groups[idx].2.push(badge);
+            }
+        } else {
+            let idx = groups.len();
+            index_by_dict.insert(detail.dictionary.as_str(), idx);
+            groups.push((detail.dictionary.clone(), vec![notation], vec![badge]));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(dictionary, notations, badges)| CompactPitchGroup {
+            dictionary,
+            notations: notations.join(" | "),
+            badges: badges.join(" | "),
+        })
+        .collect()
+}
+
 pub fn popup_pitch_graphs(graphs: Vec<crate::controller::dict::TermPitchGraph>) -> Vec<PitchGraph> {
     graphs
         .into_iter()
         .map(|graph| {
             let len = graph.mora.len();
+            let (mora_highs, particle_high) = resolve_pitch_mora_levels(len, graph.position, None);
             let mora: Vec<PitchMora> = graph
                 .mora
                 .into_iter()
                 .enumerate()
                 .map(|(index, text)| {
-                    let high = if graph.position == 1 {
-                        index == 0
-                    } else if graph.position == 0 {
-                        index > 0
+                    let high = mora_highs[index];
+                    let next_high = if index + 1 < len {
+                        mora_highs[index + 1]
                     } else {
-                        index > 0 && index < graph.position as usize
+                        particle_high
                     };
                     PitchMora {
                         text: text.into(),
                         high,
-                        rises_after: index == 0 && graph.position != 1 && len > 1,
-                        falls_after: index + 1 == graph.position as usize && index + 1 < len,
+                        rises_after: index + 1 < len && !high && next_high,
+                        falls_after: high && !next_high,
                     }
                 })
                 .collect();
@@ -358,31 +710,32 @@ pub fn popup_pitch_graphs(graphs: Vec<crate::controller::dict::TermPitchGraph>) 
         .collect()
 }
 
-/// Convert detailed pitch entries (with 1-based `nasal` and `devoice` mora indices) into
-/// Slint `RichPitchGraph` rows.
+/// Convert detailed pitch entries (with 1-based `nasal`/`devoice` mora indices and optional
+/// exact `H`/`L` string patterns) into Slint `RichPitchGraph` rows.
 pub fn rich_pitch_graphs_from_details(details: &[TermPitchDetail]) -> Vec<RichPitchGraph> {
     details
         .iter()
         .map(|detail| {
             let len = detail.mora.len();
+            let (mora_highs, particle_high) =
+                resolve_pitch_mora_levels(len, detail.position, detail.pattern.as_deref());
             let mora: Vec<RichPitchMora> = detail
                 .mora
                 .iter()
                 .enumerate()
                 .map(|(index, text)| {
-                    let high = if detail.position == 1 {
-                        index == 0
-                    } else if detail.position == 0 {
-                        index > 0
+                    let high = mora_highs[index];
+                    let next_high = if index + 1 < len {
+                        mora_highs[index + 1]
                     } else {
-                        index > 0 && index < detail.position as usize
+                        particle_high
                     };
                     let one_based = index + 1;
                     RichPitchMora {
                         text: text.clone().into(),
                         high,
-                        rises_after: index == 0 && detail.position != 1 && len > 1,
-                        falls_after: index + 1 == detail.position as usize && index + 1 < len,
+                        rises_after: index + 1 < len && !high && next_high,
+                        falls_after: high && !next_high,
                         nasal: detail.nasal.contains(&one_based),
                         devoice: detail.devoice.contains(&one_based),
                     }
@@ -396,6 +749,374 @@ pub fn rich_pitch_graphs_from_details(details: &[TermPitchDetail]) -> Vec<RichPi
             }
         })
         .collect()
+}
+
+/// Compact frequency badge descriptor (`dcd58c3` / `dc2c3eb`) omitting repeated dictionary
+/// names on consecutive/grouped frequency badges from the same dictionary while retaining
+/// `dictionary` for CSS `[data-frequency="..."]` styling.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactFrequencyBadge {
+    pub dictionary: String,
+    pub value: String,
+    pub show_dictionary: bool,
+    pub display_text: String,
+}
+
+/// Groups frequency entries by dictionary (preserving first-seen dictionary order and
+/// deduplicating identical `(dictionary, value)` pairs) and omits repeated dictionary names
+/// on subsequent badges from the same dictionary.
+#[allow(dead_code)]
+#[must_use]
+pub fn compact_frequency_badges(frequencies: &[TermFrequency]) -> Vec<CompactFrequencyBadge> {
+    let mut dict_order: Vec<&str> = Vec::new();
+    let mut by_dict: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in frequencies {
+        let dict = entry.dictionary.as_str();
+        let val = entry.value.as_str();
+        if val.is_empty() {
+            continue;
+        }
+        let values = by_dict.entry(dict).or_insert_with(|| {
+            dict_order.push(dict);
+            Vec::new()
+        });
+        if !values.contains(&val) {
+            values.push(val);
+        }
+    }
+
+    let mut out = Vec::new();
+    for dict in dict_order {
+        let Some(values) = by_dict.remove(dict) else {
+            continue;
+        };
+        for (idx, val) in values.into_iter().enumerate() {
+            let show_dictionary = idx == 0 && !dict.is_empty();
+            let display_text = if show_dictionary {
+                format!("{dict} {val}")
+            } else {
+                val.to_owned()
+            };
+            out.push(CompactFrequencyBadge {
+                dictionary: dict.to_owned(),
+                value: val.to_owned(),
+                show_dictionary,
+                display_text,
+            });
+        }
+    }
+    out
+}
+
+/// Same as [`compact_frequency_badges`] accepting Slint `PopupFrequency` slices.
+#[allow(dead_code)]
+#[must_use]
+pub fn compact_frequency_badges_from_popup(
+    frequencies: &[PopupFrequency],
+) -> Vec<CompactFrequencyBadge> {
+    let owned: Vec<TermFrequency> = frequencies
+        .iter()
+        .map(|f| TermFrequency {
+            dictionary: f.dictionary.to_string(),
+            value: f.value.to_string(),
+        })
+        .collect();
+    compact_frequency_badges(&owned)
+}
+
+/// Merges grouped frequency entries from the same dictionary into a single `TermFrequency`
+/// badge whose `value` joins distinct ranks with `", "` (e.g. `JPDB 2058, 86009㋕`).
+#[allow(dead_code)]
+#[must_use]
+pub fn compact_frequency_groups(frequencies: &[TermFrequency]) -> Vec<TermFrequency> {
+    let mut dict_order: Vec<&str> = Vec::new();
+    let mut by_dict: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in frequencies {
+        let dict = entry.dictionary.as_str();
+        let val = entry.value.as_str();
+        if val.is_empty() {
+            continue;
+        }
+        let values = by_dict.entry(dict).or_insert_with(|| {
+            dict_order.push(dict);
+            Vec::new()
+        });
+        if !values.contains(&val) {
+            values.push(val);
+        }
+    }
+    dict_order
+        .into_iter()
+        .filter_map(|dict| {
+            let values = by_dict.remove(dict)?;
+            Some(TermFrequency {
+                dictionary: dict.to_owned(),
+                value: values.join(", "),
+            })
+        })
+        .collect()
+}
+
+/// Wraps compacted frequency badges into horizontal lines using `badge.display_text` width.
+#[allow(dead_code)]
+#[must_use]
+pub fn compact_frequency_lines(
+    badges: &[CompactFrequencyBadge],
+    available_width: f32,
+) -> Vec<Vec<CompactFrequencyBadge>> {
+    let available_width = available_width.max(1.0);
+    let mut lines = Vec::new();
+    let mut entries: Vec<CompactFrequencyBadge> = Vec::new();
+    let mut line_width = 0.0f32;
+    for badge in badges {
+        let width = badge
+            .display_text
+            .chars()
+            .map(|ch| if ch.is_ascii() { 6.0 } else { 10.0 })
+            .sum::<f32>()
+            + 10.0;
+        let gap = if entries.is_empty() { 0.0 } else { 4.0 };
+        if !entries.is_empty() && line_width + gap + width > available_width {
+            lines.push(std::mem::take(&mut entries));
+            line_width = 0.0;
+        }
+        if !entries.is_empty() {
+            line_width += 4.0;
+        }
+        entries.push(badge.clone());
+        line_width += width;
+    }
+    if !entries.is_empty() {
+        lines.push(entries);
+    }
+    lines
+}
+
+/// One aligned headword furigana segment (`reading` is empty for kana segments).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadwordFuriganaSegment {
+    pub text: String,
+    pub reading: String,
+}
+
+/// Result of headword furigana alignment (Yomitan `#505`), guaranteeing that kana-only
+/// expressions never receive duplicate ruby and unaligned mixed kanji+kana readings fall
+/// back cleanly without slapping whole-word ruby over kana.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadwordFurigana {
+    pub segments: Vec<HeadwordFuriganaSegment>,
+    pub aligned: bool,
+    pub fallback_reading: Option<String>,
+}
+
+#[allow(dead_code)]
+fn peel_headword_kana_affixes(
+    expression: &str,
+    reading: &str,
+) -> Option<(Vec<HeadwordFuriganaSegment>, bool)> {
+    let expr_chars: Vec<char> = expression.chars().collect();
+    let read_chars: Vec<char> = reading.chars().collect();
+    let fold = |c: char| -> char {
+        let s = c.to_string();
+        memento_dict::normalize::normalize_reading_str(&s)
+            .chars()
+            .next()
+            .unwrap_or(c)
+    };
+
+    let mut prefix_len = 0usize;
+    while prefix_len < expr_chars.len()
+        && prefix_len < read_chars.len()
+        && !is_headword_kanji_char(expr_chars[prefix_len])
+        && !matches!(expr_chars[prefix_len], '\u{30F5}' | '\u{30F6}')
+        && fold(expr_chars[prefix_len]) == fold(read_chars[prefix_len])
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0usize;
+    while suffix_len < (expr_chars.len() - prefix_len)
+        && suffix_len < (read_chars.len() - prefix_len)
+        && !is_headword_kanji_char(expr_chars[expr_chars.len() - 1 - suffix_len])
+        && !matches!(
+            expr_chars[expr_chars.len() - 1 - suffix_len],
+            '\u{30F5}' | '\u{30F6}'
+        )
+        && fold(expr_chars[expr_chars.len() - 1 - suffix_len])
+            == fold(read_chars[read_chars.len() - 1 - suffix_len])
+    {
+        suffix_len += 1;
+    }
+
+    if prefix_len == 0 && suffix_len == 0 {
+        return None;
+    }
+
+    let core_expr: String = expr_chars[prefix_len..expr_chars.len() - suffix_len]
+        .iter()
+        .collect();
+    let core_read: String = read_chars[prefix_len..read_chars.len() - suffix_len]
+        .iter()
+        .collect();
+
+    if core_expr.is_empty() || core_read.is_empty() {
+        return None;
+    }
+    // Only consider peeled alignment clean if the remaining core has no unaligned kana.
+    let core_all_kanji = core_expr.chars().all(is_headword_kanji_char);
+    if !core_all_kanji {
+        return None;
+    }
+
+    let mut segments = Vec::with_capacity(3);
+    if prefix_len > 0 {
+        segments.push(HeadwordFuriganaSegment {
+            text: expr_chars[..prefix_len].iter().collect(),
+            reading: String::new(),
+        });
+    }
+    segments.push(HeadwordFuriganaSegment {
+        text: core_expr,
+        reading: core_read,
+    });
+    if suffix_len > 0 {
+        segments.push(HeadwordFuriganaSegment {
+            text: expr_chars[expr_chars.len() - suffix_len..].iter().collect(),
+            reading: String::new(),
+        });
+    }
+    Some((segments, true))
+}
+
+/// Aligns `reading` over `expression` for popup headword furigana (Yomitan `#505`):
+/// - Pure-kana or reading-identical expressions emit plain segments with empty ruby.
+/// - Aligned kanji+kana expressions attach ruby strictly to kanji spans (including CJK Ext H & J).
+/// - Unaligned mixed kanji+kana readings fall back cleanly (`aligned = false`,
+///   `fallback_reading = Some(reading)`) without duplicating whole-word ruby over kana.
+#[allow(dead_code)]
+#[must_use]
+pub fn align_headword_furigana(expression: &str, reading: &str) -> HeadwordFurigana {
+    if expression.is_empty() {
+        return HeadwordFurigana {
+            segments: Vec::new(),
+            aligned: true,
+            fallback_reading: None,
+        };
+    }
+    let reading_trimmed = reading.trim();
+    if reading_trimmed.is_empty() || reading_trimmed == "*" {
+        return HeadwordFurigana {
+            segments: vec![HeadwordFuriganaSegment {
+                text: expression.to_owned(),
+                reading: String::new(),
+            }],
+            aligned: true,
+            fallback_reading: None,
+        };
+    }
+
+    let norm_expr = memento_dict::normalize::normalize_reading_str(expression);
+    let norm_read = memento_dict::normalize::normalize_reading_str(reading_trimmed);
+    if norm_expr == norm_read {
+        return HeadwordFurigana {
+            segments: vec![HeadwordFuriganaSegment {
+                text: expression.to_owned(),
+                reading: String::new(),
+            }],
+            aligned: true,
+            fallback_reading: None,
+        };
+    }
+
+    let has_kanji = expression.chars().any(is_headword_kanji_char);
+    if !has_kanji {
+        // Never duplicate whole-word ruby over pure kana expressions (#505).
+        return HeadwordFurigana {
+            segments: vec![HeadwordFuriganaSegment {
+                text: expression.to_owned(),
+                reading: String::new(),
+            }],
+            aligned: false,
+            fallback_reading: Some(reading_trimmed.to_owned()),
+        };
+    }
+
+    let all_kanji = expression.chars().all(is_headword_kanji_char);
+    if all_kanji {
+        return HeadwordFurigana {
+            segments: vec![HeadwordFuriganaSegment {
+                text: expression.to_owned(),
+                reading: reading_trimmed.to_owned(),
+            }],
+            aligned: true,
+            fallback_reading: None,
+        };
+    }
+
+    let spans = memento_util::furiganautils::simplify_surface_str(expression, reading_trimmed);
+    let fell_back_whole = spans.len() == 1
+        && spans[0].surface_start == 0
+        && spans[0].surface_end == expression.len() as u64
+        && spans[0].reading_start == 0
+        && spans[0].reading_end == reading_trimmed.len() as u64;
+
+    if fell_back_whole {
+        if let Some((segments, aligned)) = peel_headword_kana_affixes(expression, reading_trimmed) {
+            return HeadwordFurigana {
+                segments,
+                aligned,
+                fallback_reading: None,
+            };
+        }
+        // Unaligned mixed kanji+kana reading: fall back cleanly without duplicating
+        // whole-word ruby over unaligned kana (#505).
+        return HeadwordFurigana {
+            segments: vec![HeadwordFuriganaSegment {
+                text: expression.to_owned(),
+                reading: String::new(),
+            }],
+            aligned: false,
+            fallback_reading: Some(reading_trimmed.to_owned()),
+        };
+    }
+
+    let mut segments = Vec::with_capacity(spans.len());
+    for span in spans {
+        let s_start = span.surface_start as usize;
+        let s_end = span.surface_end as usize;
+        let surf = expression.get(s_start..s_end).unwrap_or_default();
+        if surf.is_empty() {
+            continue;
+        }
+        let seg_reading =
+            if span.reading_start < span.reading_end && surf.chars().any(is_headword_kanji_char) {
+                let r_start = span.reading_start as usize;
+                let r_end = span.reading_end as usize;
+                let r = reading_trimmed.get(r_start..r_end).unwrap_or_default();
+                if memento_dict::normalize::normalize_reading_str(surf)
+                    == memento_dict::normalize::normalize_reading_str(r)
+                {
+                    String::new()
+                } else {
+                    r.to_owned()
+                }
+            } else {
+                String::new()
+            };
+        segments.push(HeadwordFuriganaSegment {
+            text: surf.to_owned(),
+            reading: seg_reading,
+        });
+    }
+
+    HeadwordFurigana {
+        segments,
+        aligned: true,
+        fallback_reading: None,
+    }
 }
 
 /// Splits a whitespace- or comma-separated Anki card tag list into deduplicated pills (#346).
@@ -543,4 +1264,199 @@ pub fn install_popup_navigation(app: &MementoApp) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cjk_extensions_h_and_j_are_recognized_as_kanji() {
+        // Basic CJK + Extension H (U+31350..=U+323AF) + Extension J (U+323B0..=U+3347F)
+        assert!(is_kanji_char('漢'));
+        assert!(is_kanji_char('\u{31350}'));
+        assert!(is_kanji_char('\u{323AF}'));
+        assert!(is_kanji_char('\u{323B0}'));
+        assert!(is_kanji_char('\u{3347F}'));
+        assert!(!is_kanji_char('あ'));
+        assert!(!is_kanji_char('A'));
+    }
+
+    #[test]
+    fn string_pitch_patterns_compute_exact_levels_points_svg_and_compact_notation() {
+        let lhh = TermPitchDetail {
+            dictionary: "Kanjium".to_owned(),
+            mora: vec!["さ".into(), "く".into(), "ら".into()],
+            position: 0,
+            pattern: Some("LHH".to_owned()),
+            nasal: Vec::new(),
+            devoice: Vec::new(),
+            tags: Vec::new(),
+        };
+        let data_lhh = popup_pitch_pattern_data(&lhh);
+        assert_eq!(data_lhh.badge_text, "[LHH]");
+        assert_eq!(data_lhh.mora_highs, vec![false, true, true]);
+        assert!(data_lhh.particle_high);
+        assert_eq!(data_lhh.points.len(), 4);
+        assert_eq!(data_lhh.points[0].y, 75.0);
+        assert_eq!(data_lhh.points[1].y, 25.0);
+        assert!(data_lhh.svg.as_deref().unwrap_or("").contains("<svg"));
+
+        // Non-standard double-peak pattern "HLHL"
+        let hlhl = TermPitchDetail {
+            dictionary: "Kanjium".to_owned(),
+            mora: vec!["あ".into(), "い".into(), "う".into(), "え".into()],
+            position: 1,
+            pattern: Some("HLHL".to_owned()),
+            nasal: Vec::new(),
+            devoice: Vec::new(),
+            tags: Vec::new(),
+        };
+        let data_hlhl = popup_pitch_pattern_data(&hlhl);
+        assert_eq!(data_hlhl.badge_text, "[HLHL]");
+        assert_eq!(data_hlhl.mora_highs, vec![true, false, true, false]);
+        assert!(!data_hlhl.particle_high);
+        assert!(data_hlhl.points[0].downstep);
+        assert!(data_hlhl.points[2].downstep);
+        assert_eq!(data_hlhl.compact_notation, "あ↓いう↓え [HLHL]");
+
+        // Odaka exact string pattern "LHHL" (4 chars for 3 morae -> drop onto particle)
+        let odaka = TermPitchDetail {
+            dictionary: "Kanjium".to_owned(),
+            mora: vec!["お".into(), "と".into(), "こ".into()],
+            position: 3,
+            pattern: Some("LHHL".to_owned()),
+            nasal: Vec::new(),
+            devoice: Vec::new(),
+            tags: Vec::new(),
+        };
+        let data_odaka = popup_pitch_pattern_data(&odaka);
+        assert_eq!(data_odaka.mora_highs, vec![false, true, true]);
+        assert!(!data_odaka.particle_high);
+        assert!(data_odaka.points[2].downstep);
+        assert_eq!(data_odaka.compact_notation, "おとこ↓ [LHHL]");
+
+        let compact = format_compact_pitches(&[lhh.clone(), odaka.clone()]);
+        assert_eq!(compact, "さくら [LHH] | おとこ↓ [LHHL]");
+
+        let groups = compact_pitch_groups(&[lhh, odaka]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].dictionary, "Kanjium");
+        assert_eq!(groups[0].notations, "さくら [LHH] | おとこ↓ [LHHL]");
+        assert_eq!(groups[0].badges, "[LHH] | [LHHL]");
+    }
+
+    #[test]
+    fn frequency_badge_compacting_omits_repeated_dictionary_names() {
+        let freqs = vec![
+            TermFrequency {
+                dictionary: "JPDB".to_owned(),
+                value: "2058".to_owned(),
+            },
+            TermFrequency {
+                dictionary: "JPDB".to_owned(),
+                value: "86009㋕".to_owned(),
+            },
+            TermFrequency {
+                dictionary: "JPDB".to_owned(),
+                value: "2058".to_owned(),
+            },
+            TermFrequency {
+                dictionary: "Jiten".to_owned(),
+                value: "375".to_owned(),
+            },
+        ];
+        let badges = compact_frequency_badges(&freqs);
+        assert_eq!(badges.len(), 3);
+        assert!(badges[0].show_dictionary);
+        assert_eq!(badges[0].display_text, "JPDB 2058");
+        assert!(!badges[1].show_dictionary);
+        assert_eq!(badges[1].display_text, "86009㋕");
+        assert_eq!(badges[1].dictionary, "JPDB");
+        assert!(badges[2].show_dictionary);
+        assert_eq!(badges[2].display_text, "Jiten 375");
+
+        let groups = compact_frequency_groups(&freqs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].dictionary, "JPDB");
+        assert_eq!(groups[0].value, "2058, 86009㋕");
+
+        let lines = compact_frequency_lines(&badges, 100.0);
+        assert!(!lines.is_empty());
+        assert_eq!(lines.iter().map(Vec::len).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn grouped_rows_accumulate_scores_rank_cloze_body_and_apply_compact_options() {
+        let mut h1 = SearchHit::new("端", "はし", "◦ edge\n◦ tip", "n, common", 30, false);
+        h1.dict_name = "JMdict".to_owned();
+        let mut h2 = SearchHit::new("はし", "はし", "◦ bridge\n◦ chopsticks", "n, common", 5, false);
+        h2.dict_name = "JMdict".to_owned();
+        let mut h3 = SearchHit::new("はし", "はし", "◦ edge (sense 2)", "n, common, arch", 5, false);
+        h3.dict_name = "Daijisen".to_owned();
+
+        let rows = dictionary_result_rows_with_options(
+            &[h1, h2, h3],
+            &[],
+            Some("はし"),
+            true,
+            true,
+        );
+        assert_eq!(rows.len(), 3);
+        // Exact expression == cloze_body ('はし') must rank ahead of reading-only '端'
+        assert_eq!(rows[0].expression.as_str(), "はし");
+        assert_eq!(rows[1].expression.as_str(), "はし");
+        assert_eq!(rows[2].expression.as_str(), "端");
+        // compact_glossaries joins multi-line glossary into ` | `
+        assert_eq!(rows[0].glossary.as_str(), "bridge | chopsticks");
+        // compact_tags removes tags already displayed on earlier sense of the same entry
+        assert!(rows[0].pos_tags.contains("n"));
+        assert!(rows[0].pos_tags.contains("common"));
+        assert!(!rows[1].pos_tags.contains("common"));
+        assert!(rows[1].pos_tags.contains("arch"));
+    }
+
+    #[test]
+    fn headword_furigana_alignment_avoids_duplicating_ruby_over_kana() {
+        // Pure kana -> never gets ruby
+        let kana = align_headword_furigana("ひらがな", "ひらがな");
+        assert!(kana.aligned);
+        assert_eq!(kana.segments.len(), 1);
+        assert_eq!(kana.segments[0].reading, "");
+
+        // Standard kanji + okurigana -> ruby only over kanji
+        let taberu = align_headword_furigana("食べる", "たべる");
+        assert!(taberu.aligned);
+        assert_eq!(
+            taberu.segments,
+            vec![
+                HeadwordFuriganaSegment {
+                    text: "食".to_owned(),
+                    reading: "た".to_owned(),
+                },
+                HeadwordFuriganaSegment {
+                    text: "べる".to_owned(),
+                    reading: String::new(),
+                },
+            ]
+        );
+
+        // CJK Extension J kanji + okurigana -> ruby only over Ext J kanji
+        let ext_j = align_headword_furigana("\u{323B0}る", "みる");
+        assert!(ext_j.aligned);
+        assert_eq!(ext_j.segments[0].text, "\u{323B0}");
+        assert_eq!(ext_j.segments[0].reading, "み");
+        assert_eq!(ext_j.segments[1].text, "る");
+        assert_eq!(ext_j.segments[1].reading, "");
+
+        // Unaligned mixed kanji+kana reading (e.g. gikun/ateji where kana does not match reading)
+        // must fall back cleanly instead of putting whole-word ruby over kana (#505)
+        let unaligned = align_headword_furigana("お姉さん", "あね");
+        assert!(!unaligned.aligned);
+        assert_eq!(unaligned.fallback_reading.as_deref(), Some("あね"));
+        assert!(
+            unaligned.segments.iter().all(|s| s.reading.is_empty()),
+            "unaligned mixed kanji+kana must not attach whole-word ruby over kana"
+        );
+    }
 }

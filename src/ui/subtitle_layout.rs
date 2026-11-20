@@ -124,11 +124,20 @@ pub fn subtitle_token_width_with_style(
     }
     let base_width = estimated_subtitle_text_width(word.text.as_str(), font_px);
     let reading_width = if furigana && !word.reading.is_empty() {
-        estimated_subtitle_text_width(word.reading.as_str(), font_px * style.furigana_ratio)
+        let nominal_ruby_px = (font_px * style.furigana_ratio.clamp(0.25, 0.75)).max(8.0);
+        let nominal_w = estimated_subtitle_text_width(word.reading.as_str(), nominal_ruby_px);
+        if nominal_w > base_width && nominal_w > 0.0 {
+            let fit_scale = (base_width / nominal_w).clamp(0.72, 1.0);
+            let fitted_px = (nominal_ruby_px * fit_scale).max(7.0).min(nominal_ruby_px);
+            estimated_subtitle_text_width(word.reading.as_str(), fitted_px)
+        } else {
+            nominal_w
+        }
     } else {
         0.0
     };
-    base_width.max(reading_width) + 2.0
+    let max_ruby_bleed = (font_px * 0.25).max(0.0);
+    base_width.max(reading_width - max_ruby_bleed * 2.0) + 2.0
 }
 
 pub fn subtitle_token_width(word: &SubtitleWord, font_px: f32, furigana: bool) -> f32 {

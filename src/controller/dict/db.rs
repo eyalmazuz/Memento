@@ -13,12 +13,25 @@ const REFRESH_THROTTLE: Duration = Duration::from_millis(50);
 const TERM_META_LRU_CAPACITY: usize = 2048;
 const TERM_META_LRU_EVICT_BATCH: usize = 256;
 
-/// Cheaply cloneable, lock-free snapshot of cached dictionary names, tags, and disabled flags.
+/// Cheaply cloneable, lock-free snapshot of cached dictionary names, tags, disabled flags,
+/// and `frequencyMode` (`rank-based` vs `occurrence-based`).
 #[derive(Debug, Clone)]
 pub struct DictionaryMetadataSnapshot {
     pub names: Arc<HashMap<i64, String>>,
     pub tags: Arc<HashMap<(i64, String), DictTag>>,
     pub disabled: Arc<HashSet<i64>>,
+    pub frequency_modes: Arc<HashMap<i64, sqlite_db::FrequencyMode>>,
+}
+
+impl DictionaryMetadataSnapshot {
+    /// Returns the `frequencyMode` for `dic_id`, defaulting to [`sqlite_db::FrequencyMode::RankBased`].
+    #[inline]
+    pub fn frequency_mode_for(&self, dic_id: i64) -> sqlite_db::FrequencyMode {
+        self.frequency_modes
+            .get(&dic_id)
+            .copied()
+            .unwrap_or(sqlite_db::FrequencyMode::RankBased)
+    }
 }
 
 struct TermMetaLru {
@@ -87,6 +100,7 @@ struct DictionaryMetadataCache {
     tags: Arc<HashMap<(i64, String), DictTag>>,
     names: Arc<HashMap<i64, String>>,
     disabled: Arc<HashSet<i64>>,
+    frequency_modes: Arc<HashMap<i64, sqlite_db::FrequencyMode>>,
     recent_term_meta: TermMetaLru,
 }
 
@@ -96,6 +110,7 @@ impl DictionaryMetadataCache {
             names: Arc::clone(&self.names),
             tags: Arc::clone(&self.tags),
             disabled: Arc::clone(&self.disabled),
+            frequency_modes: Arc::clone(&self.frequency_modes),
         }
     }
 }
@@ -115,6 +130,8 @@ impl ReadOnlyDictionaryDb {
         let tags = load_dictionary_tags_conn(&conn).map_err(DictControllerError::Sqlite)?;
         let (names, disabled) =
             load_dictionary_names_and_disabled_conn(&conn).map_err(DictControllerError::Sqlite)?;
+        let frequency_modes = sqlite_db::query_dictionary_frequency_modes_conn(&conn)
+            .map_err(DictControllerError::Sqlite)?;
         let data_version = sqlite_db::query_data_version_conn(&conn).ok();
         let fingerprint = sqlite_db::db_file_fingerprint(path);
 
@@ -129,6 +146,7 @@ impl ReadOnlyDictionaryDb {
                 tags: Arc::new(tags),
                 names: Arc::new(names),
                 disabled: Arc::new(disabled),
+                frequency_modes: Arc::new(frequency_modes),
                 recent_term_meta: TermMetaLru::new(),
             }),
         })
@@ -195,6 +213,7 @@ impl ReadOnlyDictionaryDb {
         let (names, disabled) = load_dictionary_names_and_disabled_conn(&conn)?;
         cache.names = Arc::new(names);
         cache.disabled = Arc::new(disabled);
+        cache.frequency_modes = Arc::new(sqlite_db::query_dictionary_frequency_modes_conn(&conn)?);
         cache.recent_term_meta.clear();
         cache.data_version = current_version;
         cache.fingerprint = current_fingerprint;

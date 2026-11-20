@@ -857,29 +857,89 @@ impl TextEngine {
             .unwrap_or(0.0)
             .max(1.0);
 
-        let furigana_ratio = style.furigana_ratio.clamp(0.25, 0.75);
-        let ruby_font_px = (font_px * furigana_ratio).max(8.0);
-        let ruby_width = if show_furigana && !word.reading.is_empty() {
-            let layout = self.shape_single_line(
-                word.reading.as_str(),
-                &style.font_family,
-                ruby_font_px,
-                600,
-                style.italic,
-                style.text_rgba,
-            );
-            let adv = layout
-                .lines()
-                .next()
-                .map(|l| l.metrics().advance)
-                .unwrap_or(0.0);
-            adv
-        } else {
-            0.0
-        };
-
-        let layout_width = base_width.max(ruby_width).ceil().max(1.0);
+        let (_, _, _, layout_width) = self.compute_fitted_subtitle_ruby(
+            word.reading.as_str(),
+            base_width,
+            font_px,
+            show_furigana,
+            style,
+        );
         (layout_width > 0.0).then_some(layout_width)
+    }
+
+    /// Shape furigana for a subtitle token while fitting it tightly over the base kanji
+    /// (C++ `SubtitleText.qml:183-216` fit behavior): when nominal ruby exceeds `base_width`,
+    /// scale ruby font size down gently (readable floor `0.72x`, minimum `7.0px`) and allow a
+    /// modest horizontal overhang (`0.25 * font_px` per side) into `bleed_x` rather than
+    /// widening the base token advance and creating jarring gaps in subtitles.
+    ///
+    /// Returns `(ruby_layout, ruby_width, ruby_height, layout_width)`.
+    fn compute_fitted_subtitle_ruby(
+        &mut self,
+        reading: &str,
+        base_width: f32,
+        font_px: f32,
+        show_furigana: bool,
+        style: &SubtitleRenderStyle,
+    ) -> (Option<Layout<[u8; 4]>>, f32, f32, f32) {
+        const FURIGANA_MIN_FIT_SCALE: f32 = 0.72;
+        const FURIGANA_MIN_FONT_PX: f32 = 7.0;
+
+        if !show_furigana || reading.is_empty() {
+            return (None, 0.0, 0.0, base_width.ceil().max(1.0));
+        }
+
+        let furigana_ratio = style.furigana_ratio.clamp(0.25, 0.75);
+        let nominal_ruby_px = (font_px * furigana_ratio).max(8.0);
+        let mut layout = self.shape_single_line(
+            reading,
+            &style.font_family,
+            nominal_ruby_px,
+            600,
+            style.italic,
+            style.text_rgba,
+        );
+        let mut ruby_width = layout
+            .lines()
+            .next()
+            .map(|l| l.metrics().advance)
+            .unwrap_or(0.0);
+        let mut used_ruby_px = nominal_ruby_px;
+
+        if ruby_width > base_width && ruby_width > 0.0 {
+            let fit_scale = (base_width / ruby_width).clamp(FURIGANA_MIN_FIT_SCALE, 1.0);
+            let fitted_ruby_px = (nominal_ruby_px * fit_scale)
+                .max(FURIGANA_MIN_FONT_PX)
+                .min(nominal_ruby_px);
+            if (nominal_ruby_px - fitted_ruby_px) > 0.25 {
+                used_ruby_px = fitted_ruby_px;
+                layout = self.shape_single_line(
+                    reading,
+                    &style.font_family,
+                    used_ruby_px,
+                    600,
+                    style.italic,
+                    style.text_rgba,
+                );
+                ruby_width = layout
+                    .lines()
+                    .next()
+                    .map(|l| l.metrics().advance)
+                    .unwrap_or(0.0);
+            }
+        }
+
+        let ruby_height = layout
+            .lines()
+            .next()
+            .map(|l| l.metrics().line_height)
+            .unwrap_or(used_ruby_px * 1.2);
+        let max_ruby_bleed = (font_px * 0.25).max(0.0);
+        let layout_width = base_width
+            .max(ruby_width - max_ruby_bleed * 2.0)
+            .ceil()
+            .max(1.0);
+        (Some(layout), ruby_width, ruby_height, layout_width)
     }
 
     /// Extract vector outlines via `swash` + `tiny_skia::PathBuilder` and color emoji
@@ -1115,9 +1175,9 @@ impl TextEngine {
             (style.stroke_size * (font_px / 48.0)).clamp(1.2, font_px * 0.28)
         };
         // Keep token layout advance equal to the true typographic width so adjacent tokens
-        // never develop artificial gaps, while letting strokes/shadows bleed visually into
-        // `bleed_x` on each side of the rendered image.
-        let bleed_x = if stroke_px > 0.0 {
+        // never develop artificial gaps, while letting strokes/shadows and modest ruby
+        // overhang bleed visually into `bleed_x` on each side of the rendered image.
+        let stroke_bleed_x = if stroke_px > 0.0 {
             (stroke_px * 0.75 + 1.5).ceil()
         } else {
             1.0
@@ -1125,38 +1185,16 @@ impl TextEngine {
         let pad_y = (stroke_px * 0.55).ceil().max(1.0);
 
         let furigana_ratio = style.furigana_ratio.clamp(0.25, 0.75);
-        let ruby_font_px = (font_px * furigana_ratio).max(8.0);
         let ruby_space = if show_furigana {
             (font_px * furigana_ratio.max(0.45) + 3.0).ceil()
         } else {
             0.0
         };
 
-        let (ruby_layout, ruby_width, ruby_height) = if show_furigana && !reading.is_empty() {
-            let layout = self.shape_single_line(
-                reading,
-                &style.font_family,
-                ruby_font_px,
-                600,
-                style.italic,
-                style.text_rgba,
-            );
-            let rw = layout
-                .lines()
-                .next()
-                .map(|l| l.metrics().advance)
-                .unwrap_or(0.0);
-            let rh = layout
-                .lines()
-                .next()
-                .map(|l| l.metrics().line_height)
-                .unwrap_or(ruby_font_px * 1.2);
-            (Some(layout), rw, rh)
-        } else {
-            (None, 0.0, 0.0)
-        };
-
-        let layout_width = base_width.max(ruby_width).ceil().max(1.0);
+        let (ruby_layout, ruby_width, ruby_height, layout_width) =
+            self.compute_fitted_subtitle_ruby(reading, base_width, font_px, show_furigana, style);
+        let ruby_overhang_x = ((ruby_width - layout_width) * 0.5).max(0.0).ceil();
+        let bleed_x = stroke_bleed_x + ruby_overhang_x;
         let half_line_spacing = line_spacing_extra * 0.5;
         let total_height = (ruby_space + base_height + pad_y * 2.0 + line_spacing_extra)
             .ceil()
@@ -1754,5 +1792,70 @@ mod tests {
         assert!(cache.contains_key(&0), "recently accessed entry must survive");
         assert!(cache.contains_key(&16), "newly inserted entry must be present");
         assert!(!cache.contains_key(&1), "oldest untouched entry must be evicted");
+    }
+
+    #[test]
+    fn furigana_scales_down_to_fit_kanji_without_widening_base_gaps() {
+        let mut engine = TextEngine::new();
+        let style = SubtitleRenderStyle::default();
+        let font_px = 40.0;
+
+        let base_word = SubtitleWord {
+            text: "心".into(),
+            reading: "".into(),
+            ..SubtitleWord::default()
+        };
+        let ruby_word = SubtitleWord {
+            text: "心".into(),
+            reading: "こころ".into(),
+            ..SubtitleWord::default()
+        };
+        let long_ruby_word = SubtitleWord {
+            text: "承".into(),
+            reading: "うけたまわ".into(),
+            ..SubtitleWord::default()
+        };
+
+        let base_tok = engine.rasterize_subtitle_token("心", "", font_px, true, &style);
+        let ruby_tok = engine.rasterize_subtitle_token("心", "こころ", font_px, true, &style);
+        let measured_ruby_w = engine
+            .measure_subtitle_token_width(&ruby_word, font_px, true, &style)
+            .expect("measured ruby width");
+        let measured_base_w = engine
+            .measure_subtitle_token_width(&base_word, font_px, true, &style)
+            .expect("measured base width");
+
+        // Modestly wider reading ("こころ" over "心") scales down and fits within base + bleed
+        // without creating ugly horizontal gaps between adjacent subtitle tokens.
+        assert_eq!(
+            ruby_tok.width_px, base_tok.width_px,
+            "3-kana furigana over 1 kanji should fit without widening base token advance ({} vs {})",
+            ruby_tok.width_px, base_tok.width_px
+        );
+        assert_eq!(measured_ruby_w, ruby_tok.width_px);
+        assert_eq!(measured_base_w, base_tok.width_px);
+
+        // Very long reading ("うけたまわ" over "承") scales down to the readable floor and keeps
+        // overhang safely inside `bleed_x_px` without clipping.
+        let long_base = engine.rasterize_subtitle_token("承", "", font_px, true, &style);
+        let long_tok =
+            engine.rasterize_subtitle_token("承", "うけたまわ", font_px, true, &style);
+        let measured_long_w = engine
+            .measure_subtitle_token_width(&long_ruby_word, font_px, true, &style)
+            .expect("measured long ruby width");
+        assert_eq!(measured_long_w, long_tok.width_px);
+        assert!(
+            long_tok.bleed_x_px > long_base.bleed_x_px,
+            "overhanging ruby must expand bleed_x_px so glyphs are never clipped ({} vs {})",
+            long_tok.bleed_x_px,
+            long_base.bleed_x_px
+        );
+        // Must still be substantially tighter than unscaled 5-kana ruby (~100px at 40px base)
+        assert!(
+            long_tok.width_px < long_base.width_px * 1.75,
+            "scaled ruby layout width ({}) should stay tight over base ({})",
+            long_tok.width_px,
+            long_base.width_px
+        );
     }
 }

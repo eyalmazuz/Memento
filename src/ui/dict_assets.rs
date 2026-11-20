@@ -416,15 +416,61 @@ fn decode_and_rasterize_dictionary_asset(
     let iw = decoded.width().max(1);
     let ih = decoded.height().max(1);
     let mut src_pixmap = tiny_skia::Pixmap::new(iw, ih)?;
-    for (dst, src) in src_pixmap.pixels_mut().iter_mut().zip(decoded.pixels()) {
-        let [r, g, b, a] = src.0;
-        let pr = (u32::from(r) * u32::from(a) + 127) / 255;
-        let pg = (u32::from(g) * u32::from(a) + 127) / 255;
-        let pb = (u32::from(b) * u32::from(a) + 127) / 255;
-        if let Some(pm) =
-            tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, a)
-        {
-            *dst = pm;
+    if let Some([tr, tg, tb, ta]) = monochrome_tint {
+        let mut has_transparency = false;
+        let mut min_lum = 255u32;
+        let mut max_lum = 0u32;
+        let mut visible_count = 0usize;
+        for src in decoded.pixels() {
+            let [r, g, b, a] = src.0;
+            if a < 255 {
+                has_transparency = true;
+            }
+            if a >= 128 {
+                let lum = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b) + 128) >> 8;
+                min_lum = min_lum.min(lum);
+                max_lum = max_lum.max(lum);
+                visible_count += 1;
+            }
+        }
+        // Monochrome raster tinting (fb5287f):
+        // - Opaque images (e.g. black-on-white EPWING gaiji PNGs) or transparent-corner
+        //   images with both dark ink and white interior map inverted luminance onto alpha
+        //   so white paper becomes transparent and dark strokes take the active foreground tint.
+        // - Alpha-masked images (black-on-transparent or white-on-transparent icons, matching
+        //   Yomitan CSS `mask-image`) preserve pixel alpha and replace RGB with the tint color.
+        let use_inverted_luminance =
+            !has_transparency || (visible_count > 0 && min_lum <= 55 && max_lum >= 200);
+        for (dst, src) in src_pixmap.pixels_mut().iter_mut().zip(decoded.pixels()) {
+            let [r, g, b, a] = src.0;
+            let mask = if use_inverted_luminance {
+                let lum = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b) + 128) >> 8;
+                let ink = 255u32.saturating_sub(lum);
+                (ink * u32::from(a) + 127) / 255
+            } else {
+                u32::from(a)
+            };
+            let out_a = (mask * u32::from(ta) + 127) / 255;
+            let pr = (u32::from(tr) * out_a + 127) / 255;
+            let pg = (u32::from(tg) * out_a + 127) / 255;
+            let pb = (u32::from(tb) * out_a + 127) / 255;
+            if let Some(pm) =
+                tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, out_a as u8)
+            {
+                *dst = pm;
+            }
+        }
+    } else {
+        for (dst, src) in src_pixmap.pixels_mut().iter_mut().zip(decoded.pixels()) {
+            let [r, g, b, a] = src.0;
+            let pr = (u32::from(r) * u32::from(a) + 127) / 255;
+            let pg = (u32::from(g) * u32::from(a) + 127) / 255;
+            let pb = (u32::from(b) * u32::from(a) + 127) / 255;
+            if let Some(pm) =
+                tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, a)
+            {
+                *dst = pm;
+            }
         }
     }
     let (target_w, target_h) = match (requested_w, requested_h) {
@@ -464,4 +510,81 @@ fn decode_and_rasterize_dictionary_asset(
         None,
     );
     Some((Arc::new(dst_pixmap), logical_w, logical_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_png(path: &Path, img: &image::RgbaImage) {
+        img.save(path).expect("save test png");
+    }
+
+    #[test]
+    fn monochrome_tint_tints_opaque_black_on_white_and_alpha_masked_raster_pngs() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // 1. Opaque black-on-white gaiji PNG (left pixel black ink, right pixel white paper)
+        let opaque_path = dir.path().join("gaiji_opaque.png");
+        let mut opaque_img = image::RgbaImage::new(2, 1);
+        opaque_img.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        opaque_img.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+        write_test_png(&opaque_path, &opaque_img);
+
+        let dark_fg = [240, 244, 248, 255];
+        let light_fg = [20, 40, 200, 255];
+        let (dark_pm, _, _) = load_dictionary_image_pixmap_scaled_inner(
+            None,
+            &opaque_path,
+            None,
+            None,
+            Some(dark_fg),
+            "#f0f4f8",
+            1.0,
+        )
+        .expect("load dark tinted opaque png");
+        let (light_pm, _, _) = load_dictionary_image_pixmap_scaled_inner(
+            None,
+            &opaque_path,
+            None,
+            None,
+            Some(light_fg),
+            "#1428c8",
+            1.0,
+        )
+        .expect("load light tinted opaque png");
+
+        // Ink pixel takes active theme foreground; white paper becomes fully transparent
+        let dark_ink = dark_pm.pixel(0, 0).unwrap();
+        let dark_paper = dark_pm.pixel(1, 0).unwrap();
+        assert_eq!((dark_ink.red(), dark_ink.green(), dark_ink.blue(), dark_ink.alpha()), (240, 244, 248, 255));
+        assert_eq!(dark_paper.alpha(), 0);
+
+        let light_ink = light_pm.pixel(0, 0).unwrap();
+        let light_paper = light_pm.pixel(1, 0).unwrap();
+        assert_eq!((light_ink.red(), light_ink.green(), light_ink.blue(), light_ink.alpha()), (20, 40, 200, 255));
+        assert_eq!(light_paper.alpha(), 0);
+
+        // 2. White-on-transparent alpha-masked icon PNG (Yomitan CSS mask-image style)
+        let alpha_path = dir.path().join("icon_alpha.png");
+        let mut alpha_img = image::RgbaImage::new(2, 1);
+        alpha_img.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
+        alpha_img.put_pixel(1, 0, image::Rgba([0, 0, 0, 0]));
+        write_test_png(&alpha_path, &alpha_img);
+
+        let (alpha_pm, _, _) = load_dictionary_image_pixmap_scaled_inner(
+            None,
+            &alpha_path,
+            None,
+            None,
+            Some(light_fg),
+            "#1428c8",
+            1.0,
+        )
+        .expect("load tinted alpha-masked png");
+        let icon_px = alpha_pm.pixel(0, 0).unwrap();
+        let bg_px = alpha_pm.pixel(1, 0).unwrap();
+        assert_eq!((icon_px.red(), icon_px.green(), icon_px.blue(), icon_px.alpha()), (20, 40, 200, 255));
+        assert_eq!(bg_px.alpha(), 0);
+    }
 }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use memento_definition::{self as mdef, Color as DefColor, ParsedStylesheet};
+pub use memento_definition::CssTheme;
 use slint::ComponentHandle;
 
 use super::{MementoApp, PopupBridge};
@@ -282,6 +283,10 @@ pub struct PopupCssTheme {
     pub card_radius: f32,
     pub card_padding: f32,
 
+    // Active CSS theme & Yomitan-aligned compact glossary mode (H2 / H5.3)
+    pub css_theme: CssTheme,
+    pub compact_glossaries: bool,
+
     // Visibility & UI toggles
     pub show_term_tags: bool,
     pub show_pitch_dict: bool,
@@ -352,6 +357,8 @@ impl Default for PopupCssTheme {
             card_border_width: 0.0,
             card_radius: 0.0,
             card_padding: 0.0,
+            css_theme: CssTheme::Dark,
+            compact_glossaries: false,
             show_term_tags: true,
             show_pitch_dict: true,
             show_kanji_extra: true,
@@ -370,6 +377,53 @@ impl Default for PopupCssTheme {
 }
 
 impl PopupCssTheme {
+    /// Built-in light-theme palette defaults (`#357`).
+    pub fn light_default() -> Self {
+        Self {
+            popup_bg: [0xFF, 0xFF, 0xFF, 0xFF],
+            popup_border: [0xD0, 0xD7, 0xDE, 0xFF],
+            popup_shadow_color: [0x00, 0x00, 0x00, 0x33],
+            text_color: [0x1C, 0x20, 0x24, 0xFF],
+            muted_color: [0x57, 0x60, 0x6A, 0xFF],
+            headword_color: [0x11, 0x18, 0x27, 0xFF],
+            reading_color: [0x57, 0x60, 0x6A, 0xFF],
+            link_color: [0x09, 0x69, 0xDA, 0xFF],
+            divider_color: [0xD0, 0xD7, 0xDE, 0xFF],
+            term_divider_color: [0xAF, 0xB8, 0xC1, 0xFF],
+            freq_bg: [0xDA, 0xFB, 0xE1, 0xFF],
+            freq_color: [0x11, 0x63, 0x29, 0xFF],
+            pitch_color: [0x66, 0x39, 0xBA, 0xFF],
+            pitch_dict_bg: [0x66, 0x40, 0xBE, 0xFF],
+            dict_badge_bg: [0x6D, 0x28, 0xD9, 0xFF],
+            dict_badge_color: [0xFF, 0xFF, 0xFF, 0xFF],
+            anki_tag_bg: [0xDD, 0xF4, 0xFF, 0xFF],
+            anki_tag_border: [0x54, 0xAE, 0xFF, 0x99],
+            anki_tag_color: [0x09, 0x69, 0xDA, 0xFF],
+            css_theme: CssTheme::Light,
+            ..Self::default()
+        }
+    }
+
+    /// Returns default popup styling for `css_theme` (`Dark` or `Light`).
+    pub fn default_for_theme(css_theme: CssTheme) -> Self {
+        match css_theme {
+            CssTheme::Dark => Self::default(),
+            CssTheme::Light => Self::light_default(),
+        }
+    }
+
+    /// Returns `true` when this popup theme uses the light color scheme.
+    pub fn is_light_theme(&self) -> bool {
+        self.css_theme == CssTheme::Light
+    }
+
+    /// Theme & compact-layout cache discriminant so rendered glossary caches invalidate
+    /// immediately on dark/light theme or compact-glossaries toggling.
+    #[allow(dead_code)]
+    pub fn render_cache_key(&self) -> (CssTheme, bool) {
+        (self.css_theme, self.compact_glossaries)
+    }
+
     pub fn with_interface_font_fallbacks(
         &self,
         overrides: &PopupCssExplicitOverrides,
@@ -832,6 +886,23 @@ fn parse_attr_matcher(selector: &str, attr_name: &str) -> Option<CssAttrMatcher>
 }
 
 fn resolve_css_var_refs(value: &str, vars: &HashMap<String, String>, depth: u8) -> String {
+    resolve_css_var_refs_inner(value, vars, depth, false)
+}
+
+fn resolve_css_var_refs_for_glossary(
+    value: &str,
+    vars: &HashMap<String, String>,
+    depth: u8,
+) -> String {
+    resolve_css_var_refs_inner(value, vars, depth, true)
+}
+
+fn resolve_css_var_refs_inner(
+    value: &str,
+    vars: &HashMap<String, String>,
+    depth: u8,
+    preserve_unknown_fallbacks: bool,
+) -> String {
     if depth >= 8 || (!value.contains("var(") && !value.contains("VAR(")) {
         return value.to_owned();
     }
@@ -865,7 +936,16 @@ fn resolve_css_var_refs(value: &str, vars: &HashMap<String, String>, depth: u8) 
             None => (inner.trim(), None),
         };
         if let Some(replacement) = vars.get(&var_name.to_ascii_lowercase()) {
-            out.push_str(&resolve_css_var_refs(replacement, vars, depth + 1));
+            out.push_str(&resolve_css_var_refs_inner(
+                replacement,
+                vars,
+                depth + 1,
+                preserve_unknown_fallbacks,
+            ));
+        } else if preserve_unknown_fallbacks {
+            // Preserve `var(--dict-var, fallback)` so `memento_definition::Renderer`
+            // can resolve dictionary-scoped `:root` / `:root[data-theme="..."]` variables.
+            out.push_str(&rest[pos..pos + 4 + end + 1]);
         } else if let Some(fb) = fallback {
             let lower_name = var_name.to_ascii_lowercase();
             if matches!(
@@ -874,7 +954,12 @@ fn resolve_css_var_refs(value: &str, vars: &HashMap<String, String>, depth: u8) 
             ) {
                 out.push_str(&rest[pos..pos + 4 + end + 1]);
             } else {
-                out.push_str(&resolve_css_var_refs(fb, vars, depth + 1));
+                out.push_str(&resolve_css_var_refs_inner(
+                    fb,
+                    vars,
+                    depth + 1,
+                    preserve_unknown_fallbacks,
+                ));
             }
         } else {
             out.push_str(&rest[pos..pos + 4 + end + 1]);
@@ -946,14 +1031,74 @@ fn parse_flat_declarations(body: &str) -> Vec<(String, String)> {
     decls
 }
 
+/// Classifies a standalone root selector:
+/// - `Some(None)` for unconditional `:root` / `html`
+/// - `Some(Some(CssTheme::Dark))` for `:root[data-theme="dark"]` / `html[data-theme="dark"]` / `[data-theme="dark"]`
+/// - `Some(Some(CssTheme::Light))` for `:root[data-theme="light"]` / `html[data-theme="light"]` / `[data-theme="light"]`
+/// - `None` for any non-root or compound selector.
+fn classify_root_theme_selector(sel: &str) -> Option<Option<CssTheme>> {
+    let trimmed = sel.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), ":root" | "html") {
+        return Some(None);
+    }
+    let base = lower
+        .strip_prefix(":root")
+        .or_else(|| lower.strip_prefix("html"))
+        .unwrap_or(lower.as_str());
+    if base.starts_with('[') && base.ends_with(']') {
+        let matcher = parse_attr_matcher(trimmed, "data-theme")?;
+        if matcher.op == CssAttrMatchOp::Equals {
+            return CssTheme::from_data_theme(&matcher.value).map(Some);
+        }
+    }
+    None
+}
+
+/// Extracts an explicit `[data-theme="dark"|"light"]` restriction anywhere in `sel`.
+fn selector_theme_restriction(sel: &str) -> Option<CssTheme> {
+    let matcher = parse_attr_matcher(sel, "data-theme")?;
+    if matcher.op == CssAttrMatchOp::Equals {
+        CssTheme::from_data_theme(&matcher.value)
+    } else {
+        None
+    }
+}
+
+/// Filters `sel` against `active_theme`, returning `None` if scoped to the opposite theme,
+/// or stripping a leading matching `:root[data-theme="..."]` / `html[data-theme="..."]` /
+/// `[data-theme="..."]` ancestor prefix for inner chrome rule matching.
+fn strip_matching_theme_prefix(sel: &str, active_theme: CssTheme) -> Option<&str> {
+    let trimmed = sel.trim();
+    if let Some(required) = selector_theme_restriction(trimmed) {
+        if required != active_theme {
+            return None;
+        }
+    }
+    if let Some((first, rest)) = trimmed.split_once(char::is_whitespace) {
+        if matches!(
+            classify_root_theme_selector(first),
+            Some(None) | Some(Some(_))
+        ) {
+            return Some(rest.trim());
+        }
+    }
+    Some(trimmed)
+}
+
 fn combine_nested_selectors(parent: &str, child: &str) -> String {
     let p_trimmed = parent.trim();
-    if p_trimmed.is_empty()
-        || p_trimmed.eq_ignore_ascii_case(":root")
-        || p_trimmed.eq_ignore_ascii_case(":root[data-theme=\"dark\"]")
-        || p_trimmed.eq_ignore_ascii_case(":root[data-theme='dark']")
+    let c_trimmed = child.trim();
+    if p_trimmed.is_empty() {
+        return c_trimmed.to_owned();
+    }
+    if !c_trimmed.contains('&')
+        && (p_trimmed.eq_ignore_ascii_case(":root") || p_trimmed.eq_ignore_ascii_case("html"))
     {
-        return child.trim().to_owned();
+        return c_trimmed.to_owned();
     }
     let mut combined = Vec::new();
     for p in p_trimmed.split(',') {
@@ -961,7 +1106,7 @@ fn combine_nested_selectors(parent: &str, child: &str) -> String {
         if p.is_empty() {
             continue;
         }
-        for c in child.split(',') {
+        for c in c_trimmed.split(',') {
             let c = c.trim();
             if c.is_empty() {
                 continue;
@@ -1099,313 +1244,350 @@ fn parse_css_collapsible_lines(value: &str) -> Option<usize> {
     None
 }
 
+fn apply_root_declarations(
+    decls: &[(String, String)],
+    vars: &HashMap<String, String>,
+    theme: &mut PopupCssTheme,
+    overrides: &mut PopupCssExplicitOverrides,
+) {
+    for (prop, raw_val) in decls {
+        let val = resolve_css_var_refs(raw_val, vars, 0);
+        match prop.as_str() {
+            "--popup-bg" | "--background-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.popup_bg = c;
+                }
+            }
+            "--popup-border" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.popup_border = c;
+                }
+            }
+            "--popup-border-width" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_border_width = px.clamp(0.0, 12.0);
+                }
+            }
+            "--popup-radius" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_radius = px.clamp(0.0, 32.0);
+                }
+            }
+            "--popup-padding" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_padding = px.clamp(0.0, 40.0);
+                }
+            }
+            "--popup-shadow-blur" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_shadow_blur = px.clamp(0.0, 64.0);
+                }
+            }
+            "--popup-shadow-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.popup_shadow_color = c;
+                }
+            }
+            "--popup-width" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_width = if px == 0.0 {
+                        0.0
+                    } else {
+                        px.clamp(280.0, 1600.0)
+                    };
+                }
+            }
+            "--popup-height" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.popup_height = if px == 0.0 {
+                        0.0
+                    } else {
+                        px.clamp(200.0, 1200.0)
+                    };
+                }
+            }
+            "--text-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.text_color = c;
+                }
+            }
+            "--muted-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.muted_color = c;
+                }
+            }
+            "--headword-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.headword_color = c;
+                }
+            }
+            "--headword-size" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.headword_size = px.clamp(12.0, 48.0);
+                    overrides.headword_size = true;
+                }
+            }
+            "--headword-font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.headword_font_family = ff;
+                    overrides.headword_font_family = true;
+                }
+            }
+            "--reading-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.reading_color = c;
+                }
+            }
+            "--reading-size" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.reading_size = px.clamp(8.0, 28.0);
+                    overrides.reading_size = true;
+                }
+            }
+            "--reading-font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.reading_font_family = ff;
+                    overrides.reading_font_family = true;
+                }
+            }
+            "--conj-font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.conj_font_family = ff;
+                    overrides.conj_font_family = true;
+                }
+            }
+            "--conj-font-size" => {
+                if let Some(px) = parse_css_length_px(&val, 11.0) {
+                    theme.conj_font_size = px.clamp(8.0, 24.0);
+                    overrides.conj_font_size = true;
+                }
+            }
+            "--tag-font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.tag_font_family = ff;
+                    overrides.tag_font_family = true;
+                }
+            }
+            "--tag-font-size" => {
+                if let Some(px) = parse_css_length_px(&val, 11.0) {
+                    theme.tag_font_size = px.clamp(8.0, 22.0);
+                    overrides.tag_font_size = true;
+                }
+            }
+            "--kanji-font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.kanji_font_family = ff;
+                    overrides.kanji_font_family = true;
+                }
+            }
+            "--kanji-font-size" => {
+                if let Some(px) = parse_css_length_px(&val, theme.headword_size) {
+                    theme.kanji_font_size = px.clamp(16.0, 96.0);
+                    overrides.kanji_font_size = true;
+                }
+            }
+            "--font-family" => {
+                let ff = clean_css_font_family(&val);
+                if !ff.is_empty() {
+                    theme.font_family = ff;
+                    overrides.font_family = true;
+                }
+            }
+            "--glossary-font-size" => {
+                if let Some(px) = parse_css_length_px(&val, 14.5) {
+                    theme.glossary_font_size = px.clamp(9.0, 32.0);
+                    overrides.glossary_font_size = true;
+                }
+            }
+            "--link-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.link_color = c;
+                }
+            }
+            "--divider-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.divider_color = c;
+                    theme.term_divider_color = c;
+                }
+            }
+            "--term-divider-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.term_divider_color = c;
+                }
+            }
+            "--freq-bg" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.freq_bg = c;
+                }
+            }
+            "--freq-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.freq_color = c;
+                }
+            }
+            "--freq-font-size" => {
+                if let Some(px) = parse_css_length_px(&val, 10.0) {
+                    theme.freq_font_size = px.clamp(7.0, 18.0);
+                }
+            }
+            "--pitch-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.pitch_color = c;
+                }
+            }
+            "--pitch-dict-bg" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.pitch_dict_bg = c;
+                }
+            }
+            "--dict-badge-bg" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.dict_badge_bg = c;
+                }
+            }
+            "--dict-badge-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.dict_badge_color = c;
+                }
+            }
+            "--anki-tag-bg" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.anki_tag_bg = c;
+                }
+            }
+            "--anki-tag-border" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.anki_tag_border = c;
+                }
+            }
+            "--anki-tag-color" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.anki_tag_color = c;
+                }
+            }
+            "--definition-columns" => {
+                if let Ok(cols) = val.trim().parse::<i32>() {
+                    theme.definition_columns = cols.clamp(1, 2);
+                }
+            }
+            "--definition-columns-min-width" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.definition_columns_min_width = px.clamp(320.0, 1400.0);
+                }
+            }
+            "--definition-gap" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.definition_gap = px.clamp(0.0, 32.0);
+                }
+            }
+            "--collapsible-definition-line-count" => {
+                if let Some(lines) = parse_css_collapsible_lines(&val) {
+                    theme.collapsible_definition_line_count = lines;
+                }
+            }
+            "--card-bg" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.card_bg = c;
+                }
+            }
+            "--card-border" => {
+                if let Some(c) = parse_css_theme_color(&val) {
+                    theme.card_border = c;
+                }
+            }
+            "--card-border-width" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.card_border_width = px.clamp(0.0, 8.0);
+                }
+            }
+            "--card-radius" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.card_radius = px.clamp(0.0, 24.0);
+                }
+            }
+            "--card-padding" => {
+                if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
+                    theme.card_padding = px.clamp(0.0, 32.0);
+                }
+            }
+            "--dict-color-opacity" => {
+                if let Some(op) = parse_css_unit_float(&val) {
+                    theme.dict_color_opacity = op;
+                }
+            }
+            "--derivations-compact" => {
+                theme.compact_derivations = matches!(
+                    val.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                );
+            }
+            "--compact-glossaries" => {
+                theme.compact_glossaries = matches!(
+                    val.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                );
+            }
+            "--pitch-heiban-color" => {
+                theme.pitch_heiban_color = parse_css_theme_color(&val);
+            }
+            "--pitch-atamadaka-color" => {
+                theme.pitch_atamadaka_color = parse_css_theme_color(&val);
+            }
+            "--pitch-nakadaka-color" => {
+                theme.pitch_nakadaka_color = parse_css_theme_color(&val);
+            }
+            "--pitch-odaka-color" => {
+                theme.pitch_odaka_color = parse_css_theme_color(&val);
+            }
+            "--pitch-kifuku-color" => {
+                theme.pitch_kifuku_color = parse_css_theme_color(&val);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn apply_theme_rules(
     rules: &[(String, Vec<(String, String)>)],
     vars: &HashMap<String, String>,
+    active_theme: CssTheme,
     theme: &mut PopupCssTheme,
     overrides: &mut PopupCssExplicitOverrides,
     is_outer: bool,
 ) {
+    // Pass 1: unconditional `:root` / `html` custom properties
+    for (selector_list, decls) in rules {
+        if selector_list
+            .split(',')
+            .any(|raw_sel| classify_root_theme_selector(raw_sel) == Some(None))
+        {
+            apply_root_declarations(decls, vars, theme, overrides);
+        }
+    }
+    // Pass 2: higher-specificity `:root[data-theme="dark"|"light"]` custom properties
+    for (selector_list, decls) in rules {
+        if selector_list
+            .split(',')
+            .any(|raw_sel| classify_root_theme_selector(raw_sel) == Some(Some(active_theme)))
+        {
+            apply_root_declarations(decls, vars, theme, overrides);
+        }
+    }
+    // Pass 3: non-root selectors (ignoring rules scoped to the inactive theme)
     for (selector_list, decls) in rules {
         for raw_sel in selector_list.split(',') {
-            let sel = raw_sel.trim();
-            let lower = sel.to_ascii_lowercase();
-
-            // 1. `:root` / `:root[data-theme="dark"]` / `html` custom properties
-            if matches!(
-                lower.as_str(),
-                ":root" | "html" | ":root[data-theme=\"dark\"]" | ":root[data-theme='dark']"
-            ) {
-                for (prop, raw_val) in decls {
-                    let val = resolve_css_var_refs(raw_val, vars, 0);
-                    match prop.as_str() {
-                        "--popup-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.popup_bg = c;
-                            }
-                        }
-                        "--popup-border" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.popup_border = c;
-                            }
-                        }
-                        "--popup-border-width" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_border_width = px.clamp(0.0, 12.0);
-                            }
-                        }
-                        "--popup-radius" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_radius = px.clamp(0.0, 32.0);
-                            }
-                        }
-                        "--popup-padding" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_padding = px.clamp(0.0, 40.0);
-                            }
-                        }
-                        "--popup-shadow-blur" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_shadow_blur = px.clamp(0.0, 64.0);
-                            }
-                        }
-                        "--popup-shadow-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.popup_shadow_color = c;
-                            }
-                        }
-                        "--popup-width" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_width =
-                                    if px == 0.0 { 0.0 } else { px.clamp(280.0, 1600.0) };
-                            }
-                        }
-                        "--popup-height" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.popup_height =
-                                    if px == 0.0 { 0.0 } else { px.clamp(200.0, 1200.0) };
-                            }
-                        }
-                        "--text-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.text_color = c;
-                            }
-                        }
-                        "--muted-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.muted_color = c;
-                            }
-                        }
-                        "--headword-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.headword_color = c;
-                            }
-                        }
-                        "--headword-size" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.headword_size = px.clamp(12.0, 48.0);
-                                overrides.headword_size = true;
-                            }
-                        }
-                        "--headword-font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.headword_font_family = ff;
-                                overrides.headword_font_family = true;
-                            }
-                        }
-                        "--reading-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.reading_color = c;
-                            }
-                        }
-                        "--reading-size" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.reading_size = px.clamp(8.0, 28.0);
-                                overrides.reading_size = true;
-                            }
-                        }
-                        "--reading-font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.reading_font_family = ff;
-                                overrides.reading_font_family = true;
-                            }
-                        }
-                        "--conj-font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.conj_font_family = ff;
-                                overrides.conj_font_family = true;
-                            }
-                        }
-                        "--conj-font-size" => {
-                            if let Some(px) = parse_css_length_px(&val, 11.0) {
-                                theme.conj_font_size = px.clamp(8.0, 24.0);
-                                overrides.conj_font_size = true;
-                            }
-                        }
-                        "--tag-font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.tag_font_family = ff;
-                                overrides.tag_font_family = true;
-                            }
-                        }
-                        "--tag-font-size" => {
-                            if let Some(px) = parse_css_length_px(&val, 11.0) {
-                                theme.tag_font_size = px.clamp(8.0, 22.0);
-                                overrides.tag_font_size = true;
-                            }
-                        }
-                        "--kanji-font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.kanji_font_family = ff;
-                                overrides.kanji_font_family = true;
-                            }
-                        }
-                        "--kanji-font-size" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.headword_size) {
-                                theme.kanji_font_size = px.clamp(16.0, 96.0);
-                                overrides.kanji_font_size = true;
-                            }
-                        }
-                        "--font-family" => {
-                            let ff = clean_css_font_family(&val);
-                            if !ff.is_empty() {
-                                theme.font_family = ff;
-                                overrides.font_family = true;
-                            }
-                        }
-                        "--glossary-font-size" => {
-                            if let Some(px) = parse_css_length_px(&val, 14.5) {
-                                theme.glossary_font_size = px.clamp(9.0, 32.0);
-                                overrides.glossary_font_size = true;
-                            }
-                        }
-                        "--link-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.link_color = c;
-                            }
-                        }
-                        "--divider-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.divider_color = c;
-                                theme.term_divider_color = c;
-                            }
-                        }
-                        "--term-divider-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.term_divider_color = c;
-                            }
-                        }
-                        "--freq-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.freq_bg = c;
-                            }
-                        }
-                        "--freq-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.freq_color = c;
-                            }
-                        }
-                        "--freq-font-size" => {
-                            if let Some(px) = parse_css_length_px(&val, 10.0) {
-                                theme.freq_font_size = px.clamp(7.0, 18.0);
-                            }
-                        }
-                        "--pitch-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.pitch_color = c;
-                            }
-                        }
-                        "--pitch-dict-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.pitch_dict_bg = c;
-                            }
-                        }
-                        "--dict-badge-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.dict_badge_bg = c;
-                            }
-                        }
-                        "--dict-badge-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.dict_badge_color = c;
-                            }
-                        }
-                        "--anki-tag-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.anki_tag_bg = c;
-                            }
-                        }
-                        "--anki-tag-border" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.anki_tag_border = c;
-                            }
-                        }
-                        "--anki-tag-color" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.anki_tag_color = c;
-                            }
-                        }
-                        "--definition-columns" => {
-                            if let Ok(cols) = val.trim().parse::<i32>() {
-                                theme.definition_columns = cols.clamp(1, 2);
-                            }
-                        }
-                        "--definition-columns-min-width" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.definition_columns_min_width = px.clamp(320.0, 1400.0);
-                            }
-                        }
-                        "--definition-gap" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.definition_gap = px.clamp(0.0, 32.0);
-                            }
-                        }
-                        "--collapsible-definition-line-count" => {
-                            if let Some(lines) = parse_css_collapsible_lines(&val) {
-                                theme.collapsible_definition_line_count = lines;
-                            }
-                        }
-                        "--card-bg" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.card_bg = c;
-                            }
-                        }
-                        "--card-border" => {
-                            if let Some(c) = parse_css_theme_color(&val) {
-                                theme.card_border = c;
-                            }
-                        }
-                        "--card-border-width" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.card_border_width = px.clamp(0.0, 8.0);
-                            }
-                        }
-                        "--card-radius" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.card_radius = px.clamp(0.0, 24.0);
-                            }
-                        }
-                        "--card-padding" => {
-                            if let Some(px) = parse_css_length_px(&val, theme.glossary_font_size) {
-                                theme.card_padding = px.clamp(0.0, 32.0);
-                            }
-                        }
-                        "--dict-color-opacity" => {
-                            if let Some(op) = parse_css_unit_float(&val) {
-                                theme.dict_color_opacity = op;
-                            }
-                        }
-                        "--derivations-compact" => {
-                            theme.compact_derivations = matches!(
-                                val.trim().to_ascii_lowercase().as_str(),
-                                "true" | "1" | "yes"
-                            );
-                        }
-                        "--pitch-heiban-color" => {
-                            theme.pitch_heiban_color = parse_css_theme_color(&val);
-                        }
-                        "--pitch-atamadaka-color" => {
-                            theme.pitch_atamadaka_color = parse_css_theme_color(&val);
-                        }
-                        "--pitch-nakadaka-color" => {
-                            theme.pitch_nakadaka_color = parse_css_theme_color(&val);
-                        }
-                        "--pitch-odaka-color" => {
-                            theme.pitch_odaka_color = parse_css_theme_color(&val);
-                        }
-                        "--pitch-kifuku-color" => {
-                            theme.pitch_kifuku_color = parse_css_theme_color(&val);
-                        }
-                        _ => {}
-                    }
-                }
+            if classify_root_theme_selector(raw_sel).is_some() {
                 continue;
             }
+            let Some(sel) = strip_matching_theme_prefix(raw_sel, active_theme) else {
+                continue;
+            };
+            let lower = sel.to_ascii_lowercase();
 
             // 2. Outer container selectors (`.popup`, `.yomitan-popup`, `iframe.yomitan-popup`, `body`)
             if matches!(
@@ -2020,22 +2202,35 @@ fn apply_theme_rules(
     }
 }
 
-fn collect_root_vars(rules: &[(String, Vec<(String, String)>)], vars: &mut HashMap<String, String>) {
+fn collect_root_vars(
+    rules: &[(String, Vec<(String, String)>)],
+    active_theme: CssTheme,
+    vars: &mut HashMap<String, String>,
+) {
+    // Pass 1: unconditional root/container custom properties
     for (selector_list, decls) in rules {
-        let applies_to_root = selector_list.split(',').any(|sel| {
-            matches!(
-                sel.trim().to_ascii_lowercase().as_str(),
-                ":root"
-                    | "html"
-                    | "body"
-                    | ".popup"
-                    | ".yomitan-popup"
-                    | "iframe.yomitan-popup"
-                    | ":root[data-theme=\"dark\"]"
-                    | ":root[data-theme='dark']"
-            )
+        let applies_unconditional = selector_list.split(',').any(|sel| {
+            let trimmed = sel.trim();
+            classify_root_theme_selector(trimmed) == Some(None)
+                || matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "body" | ".popup" | ".yomitan-popup" | "iframe.yomitan-popup"
+                )
         });
-        if applies_to_root {
+        if applies_unconditional {
+            for (prop, val) in decls {
+                if prop.starts_with("--") {
+                    vars.insert(prop.clone(), val.clone());
+                }
+            }
+        }
+    }
+    // Pass 2: active-theme `:root[data-theme="dark"|"light"]` custom properties override bare `:root`
+    for (selector_list, decls) in rules {
+        let applies_for_theme = selector_list
+            .split(',')
+            .any(|sel| classify_root_theme_selector(sel) == Some(Some(active_theme)));
+        if applies_for_theme {
             for (prop, val) in decls {
                 if prop.starts_with("--") {
                     vars.insert(prop.clone(), val.clone());
@@ -2045,16 +2240,17 @@ fn collect_root_vars(rules: &[(String, Vec<(String, String)>)], vars: &mut HashM
     }
 }
 
-fn parse_popup_css_theme_full(
+fn parse_popup_css_theme_full_with_theme(
     inner_css: &str,
     outer_css: &str,
+    active_theme: CssTheme,
 ) -> (
     PopupCssTheme,
     PopupCssExplicitOverrides,
     HashMap<String, String>,
     Vec<(String, Vec<(String, String)>)>,
 ) {
-    let mut theme = PopupCssTheme::default();
+    let mut theme = PopupCssTheme::default_for_theme(active_theme);
     let mut overrides = PopupCssExplicitOverrides::default();
     let mut vars: HashMap<String, String> = HashMap::new();
 
@@ -2066,46 +2262,103 @@ fn parse_popup_css_theme_full(
     let mut outer_rules = Vec::new();
     parse_css_rules_flattened(&outer_stripped, "", &mut outer_rules, 0);
 
-    collect_root_vars(&inner_rules, &mut vars);
-    collect_root_vars(&outer_rules, &mut vars);
+    collect_root_vars(&inner_rules, active_theme, &mut vars);
+    collect_root_vars(&outer_rules, active_theme, &mut vars);
 
-    apply_theme_rules(&inner_rules, &vars, &mut theme, &mut overrides, false);
-    apply_theme_rules(&outer_rules, &vars, &mut theme, &mut overrides, true);
+    apply_theme_rules(
+        &inner_rules,
+        &vars,
+        active_theme,
+        &mut theme,
+        &mut overrides,
+        false,
+    );
+    apply_theme_rules(
+        &outer_rules,
+        &vars,
+        active_theme,
+        &mut theme,
+        &mut overrides,
+        true,
+    );
 
     (theme, overrides, vars, inner_rules)
 }
 
 pub fn parse_popup_css_theme(css: &str) -> PopupCssTheme {
-    parse_popup_css_theme_full(css, "").0
+    parse_popup_css_theme_full_with_theme(css, "", CssTheme::Dark).0
+}
+
+#[allow(dead_code)]
+pub fn parse_popup_css_theme_with_theme(css: &str, active_theme: CssTheme) -> PopupCssTheme {
+    parse_popup_css_theme_full_with_theme(css, "", active_theme).0
+}
+
+#[allow(dead_code)]
+pub fn parse_popup_css_theme_for_mode(css: &str, is_light_theme: bool) -> PopupCssTheme {
+    let theme = if is_light_theme {
+        CssTheme::Light
+    } else {
+        CssTheme::Dark
+    };
+    parse_popup_css_theme_full_with_theme(css, "", theme).0
 }
 
 pub fn parse_split_popup_css_theme(inner_css: &str, outer_css: &str) -> PopupCssTheme {
-    parse_popup_css_theme_full(inner_css, outer_css).0
+    parse_popup_css_theme_full_with_theme(inner_css, outer_css, CssTheme::Dark).0
+}
+
+#[allow(dead_code)]
+pub fn parse_split_popup_css_theme_with_theme(
+    inner_css: &str,
+    outer_css: &str,
+    active_theme: CssTheme,
+) -> PopupCssTheme {
+    parse_popup_css_theme_full_with_theme(inner_css, outer_css, active_theme).0
 }
 
 fn preprocess_user_glossary_css(
     inner_rules: &[(String, Vec<(String, String)>)],
     vars: &HashMap<String, String>,
+    active_theme: CssTheme,
 ) -> String {
     let mut out = String::new();
     for (selector_list, decls) in inner_rules {
-        // Normalize Yomitan dictionary container selectors onto our virtual `<memento-dict>` wrapper
-        let norm_sel = selector_list
-            .replace("li.definition-item[data-dictionary", "[data-dictionary")
-            .replace(".definition-item[data-dictionary", "[data-dictionary")
-            .replace("li[data-dictionary", "[data-dictionary")
-            .replace("LI[data-dictionary", "[data-dictionary")
-            .replace("div[data-dictionary", "[data-dictionary")
-            .replace("DIV[data-dictionary", "[data-dictionary");
-        if norm_sel.trim().is_empty() {
-            continue;
-        }
-        let mut decl_str = String::new();
-        for (prop, raw_val) in decls {
-            if prop.starts_with("--") {
+        let mut active_selectors: Vec<String> = Vec::new();
+        let mut is_root_only = true;
+        for raw_sel in selector_list.split(',') {
+            let trimmed = raw_sel.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            let val = resolve_css_var_refs(raw_val, vars, 0);
+            if let Some(required_theme) = selector_theme_restriction(trimmed) {
+                if required_theme != active_theme {
+                    continue;
+                }
+            }
+            if classify_root_theme_selector(trimmed).is_none() {
+                is_root_only = false;
+            }
+            // Normalize Yomitan dictionary container selectors onto our virtual `<memento-dict>` wrapper
+            let norm = trimmed
+                .replace("li.definition-item[data-dictionary", "[data-dictionary")
+                .replace(".definition-item[data-dictionary", "[data-dictionary")
+                .replace("li[data-dictionary", "[data-dictionary")
+                .replace("LI[data-dictionary", "[data-dictionary")
+                .replace("div[data-dictionary", "[data-dictionary")
+                .replace("DIV[data-dictionary", "[data-dictionary");
+            active_selectors.push(norm);
+        }
+        if active_selectors.is_empty() || is_root_only {
+            continue;
+        }
+        let norm_sel = active_selectors.join(", ");
+        let mut decl_str = String::new();
+        for (prop, raw_val) in decls {
+            // Preserve element-scoped custom properties (e.g. `[data-dictionary="..."] { --accent: ... }`)
+            // so per-dictionary custom properties cascade cleanly inside `memento_definition`
+            // without leaking across dictionaries.
+            let val = resolve_css_var_refs_for_glossary(raw_val, vars, 0);
             decl_str.push_str(prop);
             decl_str.push_str(": ");
             decl_str.push_str(&val);
@@ -2221,6 +2474,7 @@ pub(super) fn apply_popup_css_theme_to_bridge(app: &MementoApp, theme: &PopupCss
 
 #[derive(Default)]
 pub(super) struct StylesheetCache {
+    active_theme: CssTheme,
     user_css_path: PathBuf,
     user_outer_css_path: PathBuf,
     user_css_sig: Option<(Option<SystemTime>, u64)>,
@@ -2232,18 +2486,52 @@ pub(super) struct StylesheetCache {
     user_css_overrides: PopupCssExplicitOverrides,
     pub(super) user_css_revision: u64,
     user_only_sheet: Option<Arc<ParsedStylesheet>>,
-    entries: HashMap<PathBuf, (Option<SystemTime>, u64, Arc<ParsedStylesheet>)>,
+    entries: HashMap<(PathBuf, CssTheme), (Option<SystemTime>, u64, Arc<ParsedStylesheet>)>,
 }
 
 impl StylesheetCache {
     pub(super) fn new(config_dir: &Path) -> Self {
+        Self::new_with_theme(config_dir, CssTheme::Dark)
+    }
+
+    pub(super) fn new_with_theme(config_dir: &Path, active_theme: CssTheme) -> Self {
         let mut cache = Self {
+            active_theme,
             user_css_path: config_dir.join(CUSTOM_POPUP_CSS_FILENAME),
             user_outer_css_path: config_dir.join(CUSTOM_POPUP_OUTER_CSS_FILENAME),
+            user_css_theme: PopupCssTheme::default_for_theme(active_theme),
             ..Self::default()
         };
         cache.force_reload_user_css();
         cache
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn active_theme(&self) -> CssTheme {
+        self.active_theme
+    }
+
+    /// Updates the active color theme (`Dark` / `Light`), re-evaluates `:root[data-theme="..."]`
+    /// rules, bumps `user_css_revision`, and invalidates cached dictionary stylesheets when changed.
+    #[allow(dead_code)]
+    pub(super) fn set_theme(&mut self, theme: CssTheme) -> bool {
+        if self.active_theme == theme {
+            return false;
+        }
+        self.active_theme = theme;
+        self.rebuild_user_css_state();
+        self.user_css_revision = self.user_css_revision.wrapping_add(1).max(1);
+        self.entries.clear();
+        true
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn set_light_theme(&mut self, is_light: bool) -> bool {
+        self.set_theme(if is_light {
+            CssTheme::Light
+        } else {
+            CssTheme::Dark
+        })
     }
 
     pub(super) fn theme(&self) -> &PopupCssTheme {
@@ -2292,6 +2580,28 @@ impl StylesheetCache {
         self.apply_reloaded_user_css(inner_sig, outer_sig)
     }
 
+    fn rebuild_user_css_state(&mut self) {
+        if self.user_css_raw.trim().is_empty() && self.user_outer_css_raw.trim().is_empty() {
+            self.user_css_theme = PopupCssTheme::default_for_theme(self.active_theme);
+            self.user_css_overrides = PopupCssExplicitOverrides::default();
+            self.user_css_glossary_preprocessed.clear();
+            self.user_only_sheet = None;
+        } else {
+            let (theme, overrides, vars, inner_rules) = parse_popup_css_theme_full_with_theme(
+                &self.user_css_raw,
+                &self.user_outer_css_raw,
+                self.active_theme,
+            );
+            let preprocessed =
+                preprocess_user_glossary_css(&inner_rules, &vars, self.active_theme);
+            self.user_css_theme = theme;
+            self.user_css_overrides = overrides;
+            self.user_only_sheet = (!preprocessed.trim().is_empty())
+                .then(|| parse_dictionary_css_str(&preprocessed));
+            self.user_css_glossary_preprocessed = preprocessed;
+        }
+    }
+
     fn apply_reloaded_user_css(
         &mut self,
         inner_sig: Option<(Option<SystemTime>, u64)>,
@@ -2318,21 +2628,7 @@ impl StylesheetCache {
         }
         self.user_css_raw = inner_raw;
         self.user_outer_css_raw = outer_raw;
-        if self.user_css_raw.trim().is_empty() && self.user_outer_css_raw.trim().is_empty() {
-            self.user_css_theme = PopupCssTheme::default();
-            self.user_css_overrides = PopupCssExplicitOverrides::default();
-            self.user_css_glossary_preprocessed.clear();
-            self.user_only_sheet = None;
-        } else {
-            let (theme, overrides, vars, inner_rules) =
-                parse_popup_css_theme_full(&self.user_css_raw, &self.user_outer_css_raw);
-            let preprocessed = preprocess_user_glossary_css(&inner_rules, &vars);
-            self.user_css_theme = theme;
-            self.user_css_overrides = overrides;
-            self.user_only_sheet = (!preprocessed.trim().is_empty())
-                .then(|| parse_dictionary_css_str(&preprocessed));
-            self.user_css_glossary_preprocessed = preprocessed;
-        }
+        self.rebuild_user_css_state();
         self.user_css_revision = self.user_css_revision.wrapping_add(1).max(1);
         self.entries.clear();
         true
@@ -2344,32 +2640,66 @@ impl StylesheetCache {
         dic_id: i64,
         dict_name: &str,
     ) -> Option<Arc<ParsedStylesheet>> {
+        self.get_for_dictionary_with_theme(dict_resource_dirs, dic_id, dict_name, self.active_theme)
+    }
+
+    pub(super) fn get_for_dictionary_with_theme(
+        &mut self,
+        dict_resource_dirs: &[PathBuf],
+        dic_id: i64,
+        dict_name: &str,
+        theme: CssTheme,
+    ) -> Option<Arc<ParsedStylesheet>> {
+        let user_css_for_theme: String;
+        let (user_preprocessed, user_only): (&str, Option<Arc<ParsedStylesheet>>) =
+            if theme == self.active_theme {
+                (
+                    self.user_css_glossary_preprocessed.as_str(),
+                    self.user_only_sheet.clone(),
+                )
+            } else if self.user_css_raw.trim().is_empty()
+                && self.user_outer_css_raw.trim().is_empty()
+            {
+                ("", None)
+            } else {
+                let (_, _, vars, inner_rules) = parse_popup_css_theme_full_with_theme(
+                    &self.user_css_raw,
+                    &self.user_outer_css_raw,
+                    theme,
+                );
+                user_css_for_theme = preprocess_user_glossary_css(&inner_rules, &vars, theme);
+                let only = (!user_css_for_theme.trim().is_empty())
+                    .then(|| parse_dictionary_css_str(&user_css_for_theme));
+                (user_css_for_theme.as_str(), only)
+            };
+
         let style_path = dict_resource_dirs.iter().find_map(|dir| {
             memento_dict::databasemanager::resolve_dictionary_style_path(dir, dic_id, dict_name)
         });
         let Some(style_path) = style_path else {
-            return self.user_only_sheet.clone();
+            return user_only;
         };
         let mtime = std::fs::metadata(&style_path)
             .ok()
             .and_then(|m| m.modified().ok());
-        if let Some((cached_mtime, cached_user_rev, sheet)) = self.entries.get(&style_path) {
+        let cache_key = (style_path.clone(), theme);
+        if let Some((cached_mtime, cached_user_rev, sheet)) = self.entries.get(&cache_key) {
             if *cached_mtime == mtime && *cached_user_rev == self.user_css_revision {
                 return Some(sheet.clone());
             }
         }
         let dict_css = match std::fs::read_to_string(&style_path) {
             Ok(s) => s,
-            Err(_) => return self.user_only_sheet.clone(),
+            Err(_) => return user_only,
         };
-        let combined = if self.user_css_glossary_preprocessed.trim().is_empty() {
+        let combined = if user_preprocessed.trim().is_empty() {
             dict_css
         } else {
-            format!("{dict_css}\n{}", self.user_css_glossary_preprocessed)
+            format!("{dict_css}\n{user_preprocessed}")
         };
         let parsed = parse_dictionary_css_str(&combined);
         self.entries
-            .insert(style_path, (mtime, self.user_css_revision, parsed.clone()));
+            .insert(cache_key, (mtime, self.user_css_revision, parsed.clone()));
         Some(parsed)
     }
 }
@@ -2716,5 +3046,109 @@ mod tests {
             "hidden <rt> should suppress ruby box tooltip hit zone, got {:?}",
             doc.hit_zones.len()
         );
+    }
+
+    #[test]
+    fn root_data_theme_dark_and_light_select_distinct_vars_and_compact_glossaries() {
+        let css = r#"
+            :root[data-theme="light"] {
+                --bg: #fafafa;
+                --fg: #111111;
+                --compact-glossaries: true;
+            }
+            :root[data-theme="dark"] {
+                --bg: #101216;
+                --fg: #eef2f6;
+            }
+            :root {
+                --bg: #333333;
+                --fg: #cccccc;
+                --background-color: var(--bg);
+                --text-color: var(--fg);
+            }
+        "#;
+
+        let dark = parse_popup_css_theme_with_theme(css, CssTheme::Dark);
+        assert_eq!(dark.css_theme, CssTheme::Dark);
+        assert!(!dark.is_light_theme());
+        assert_eq!(dark.popup_bg, [0x10, 0x12, 0x16, 0xFF]);
+        assert_eq!(dark.text_color, [0xEE, 0xF2, 0xF6, 0xFF]);
+        assert!(!dark.compact_glossaries);
+        assert_eq!(dark.render_cache_key(), (CssTheme::Dark, false));
+
+        let light = parse_popup_css_theme_for_mode(css, true);
+        assert_eq!(light.css_theme, CssTheme::Light);
+        assert!(light.is_light_theme());
+        assert_eq!(light.popup_bg, [0xFA, 0xFA, 0xFA, 0xFF]);
+        assert_eq!(light.text_color, [0x11, 0x11, 0x11, 0xFF]);
+        assert!(light.compact_glossaries);
+        assert_eq!(light.render_cache_key(), (CssTheme::Light, true));
+    }
+
+    #[test]
+    fn stylesheet_cache_scopes_per_dict_custom_vars_and_invalidates_on_theme_toggle() {
+        let cfg_dir = tempfile::TempDir::new().unwrap();
+        let res_dir = tempfile::TempDir::new().unwrap();
+
+        // Dict 1 defines `--accent` in dark & light themes; Dict 2 defines its OWN `--accent`
+        // (or omits it) so Dict 1's variables must NEVER leak into Dict 2 (#1907).
+        let dict1_dir = res_dir.path().join("dict-1");
+        let dict2_dir = res_dir.path().join("dict-2");
+        std::fs::create_dir_all(&dict1_dir).unwrap();
+        std::fs::create_dir_all(&dict2_dir).unwrap();
+        std::fs::write(
+            dict1_dir.join("styles.css"),
+            r#"
+            :root[data-theme="dark"] { --accent: #ff0000; }
+            :root[data-theme="light"] { --accent: #0000ff; }
+            span[data-sc-k="hl"] { color: var(--accent); }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dict2_dir.join("styles.css"),
+            r#"
+            :root { --accent: #00aa00; }
+            span[data-sc-k="hl"] { color: var(--accent); }
+            "#,
+        )
+        .unwrap();
+
+        let res_dirs = vec![res_dir.path().to_path_buf()];
+        let mut cache = StylesheetCache::new_with_theme(cfg_dir.path(), CssTheme::Dark);
+        let rev_dark = cache.user_css_revision();
+        let sheet1_dark = cache
+            .get_for_dictionary(&res_dirs, 1, "DictOne")
+            .expect("dict1 sheet");
+        let sheet2_dark = cache
+            .get_for_dictionary(&res_dirs, 2, "DictTwo")
+            .expect("dict2 sheet");
+        assert_eq!(
+            sheet1_dark.root_variable("--accent", CssTheme::Dark),
+            Some("#ff0000")
+        );
+        assert_eq!(
+            sheet2_dark.root_variable("--accent", CssTheme::Dark),
+            Some("#00aa00")
+        );
+        assert_ne!(
+            sheet1_dark.root_variable("--accent", CssTheme::Dark),
+            sheet2_dark.root_variable("--accent", CssTheme::Dark),
+            "per-dict custom properties must not leak across dictionaries"
+        );
+
+        // Toggling theme must bump revision and return a freshly resolved theme/stylesheet
+        assert!(cache.set_light_theme(true));
+        assert_eq!(cache.active_theme(), CssTheme::Light);
+        assert!(cache.user_css_revision() > rev_dark);
+        let sheet1_light = cache
+            .get_for_dictionary(&res_dirs, 1, "DictOne")
+            .expect("dict1 light sheet");
+        assert_eq!(
+            sheet1_light.root_variable("--accent", CssTheme::Light),
+            Some("#0000ff")
+        );
+        // No-op when setting same theme
+        assert!(!cache.set_theme(CssTheme::Light));
     }
 }

@@ -11,8 +11,8 @@ use memento_definition::{
     self as mdef,
     element::{BOTTOM, LEFT, RIGHT, TOP},
     split_ruby_content_value, structured_content_text_value, Color as DefColor,
-    Context as DefContext, ElementLayout, LayoutDirection, LegacyGlossaryStyle, ParsedStylesheet,
-    Renderer as DefRenderer, ScreenMetrics, SiblingState,
+    Context as DefContext, CssTheme, ElementLayout, LayoutDirection, LegacyGlossaryStyle,
+    ParsedStylesheet, Renderer as DefRenderer, ScreenMetrics, SiblingState,
 };
 use parley::{
     Alignment, AlignmentOptions, FontFamily, FontStyle, FontWeight, InlineBox, LineHeight,
@@ -120,28 +120,49 @@ pub fn strict_char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> 
     if doc.selectable_chars.is_empty() {
         return None;
     }
-    let mut best: Option<(usize, f32)> = None;
+    let mut best: Option<(usize, bool, f32)> = None;
     for (idx, cell) in doc.selectable_chars.iter().enumerate() {
         if cell.ch == '\n' || cell.w <= 0.0 || cell.h <= 0.0 {
             continue;
         }
-        let pad_x = 1.5f32;
+        let is_line_end = doc
+            .selectable_chars
+            .get(idx + 1)
+            .is_none_or(|next| next.ch == '\n' || next.line_id != cell.line_id);
+        let pad_left = 1.5f32;
+        // Slightly widen the right hit-edge of the final visible character on a line so
+        // scanning the last word of a glossary line without trailing punctuation (#2232)
+        // resolves cleanly while blank margins still return `None`.
+        let pad_right = if is_line_end {
+            (cell.w * 0.25).clamp(2.0, 4.5)
+        } else {
+            1.5f32
+        };
         let pad_y = 1.5f32;
-        if x < cell.x - pad_x
-            || x > cell.x + cell.w + pad_x
+        if x < cell.x - pad_left
+            || x > cell.x + cell.w + pad_right
             || y < cell.y - pad_y
             || y > cell.y + cell.h + pad_y
         {
             continue;
         }
+        let strictly_inside =
+            x >= cell.x && x <= cell.x + cell.w && y >= cell.y && y <= cell.y + cell.h;
         let cx = cell.x + cell.w * 0.5;
         let cy = cell.y + cell.h * 0.5;
         let dist = (x - cx).hypot(y - cy);
-        if best.is_none_or(|(_, best_dist)| dist < best_dist) {
-            best = Some((idx, dist));
+        let is_better = match best {
+            None => true,
+            Some((_, best_inside, best_dist)) => {
+                (strictly_inside && !best_inside)
+                    || (strictly_inside == best_inside && dist < best_dist)
+            }
+        };
+        if is_better {
+            best = Some((idx, strictly_inside, dist));
         }
     }
-    best.map(|(idx, _)| idx)
+    best.map(|(idx, _, _)| idx)
 }
 
 /// Extract a contiguous Japanese scan substring (up to `max_chars`) starting at `start_idx`
@@ -168,16 +189,20 @@ pub fn extract_glossary_scan_substring(
     while i < chars.len() && indices.len() < limit {
         let cell = &chars[i];
         if cell.ch == '\n' {
-            // Bridge a single soft visual wrap within the same paragraph when the next
-            // visible character continues the Japanese run without a paragraph gap.
-            if let Some(next_cell) = chars.get(i + 1) {
-                let vertical_step = next_cell.y - prev_cell.y;
-                if is_japanese_scan_continue_char(next_cell.ch)
-                    && vertical_step >= 0.0
-                    && vertical_step <= prev_cell.h.max(14.0) * 1.65
-                {
-                    i += 1;
-                    continue;
+            // Bridge a single soft visual wrap (`cell.h > 0.0`) within the same paragraph
+            // when the next visible character continues the Japanese run without a paragraph gap.
+            // Hard line/paragraph breaks emit `h == 0.0` so the final word of a line without
+            // trailing punctuation terminates cleanly (#2232).
+            if cell.h > 0.0 {
+                if let Some(next_cell) = chars.get(i + 1) {
+                    let vertical_step = next_cell.y - prev_cell.y;
+                    if is_japanese_scan_continue_char(next_cell.ch)
+                        && vertical_step >= 0.0
+                        && vertical_step <= prev_cell.h.max(14.0) * 1.65
+                    {
+                        i += 1;
+                        continue;
+                    }
                 }
             }
             break;
@@ -536,6 +561,8 @@ struct GlossaryBuilder<'a> {
     dic_id: i64,
     dict_name: &'a str,
     default_link_color: [u8; 4],
+    is_light_theme: bool,
+    compact_glossaries: bool,
     render_scale: f32,
     had_hidden_elements: bool,
 }
@@ -543,13 +570,18 @@ struct GlossaryBuilder<'a> {
 impl<'a> GlossaryBuilder<'a> {
     fn box_frame_from_state(&self, state: &mdef::ElementRenderState) -> BoxFrameIR {
         let mut borders = [None; 4];
+        let default_border_rgba = if self.is_light_theme {
+            [148, 163, 184, 220]
+        } else {
+            [100, 116, 139, 200]
+        };
         for side in 0..4 {
             let b = &state.box_style.borders[side];
             if !b.style.eq_ignore_ascii_case("none")
                 && !b.style.is_empty()
                 && b.width_pixels > 0.05
             {
-                let rgba = parse_def_rgba(&b.color, [100, 116, 139, 200]);
+                let rgba = parse_def_rgba(&b.color, default_border_rgba);
                 borders[side] = Some(((b.width_pixels as f32).clamp(1.0, 6.0), rgba));
             }
         }
@@ -894,13 +926,22 @@ impl<'a> GlossaryBuilder<'a> {
                         *p = 5.0;
                     }
                 }
+                let default_table_border = if self.is_light_theme {
+                    [203, 213, 225, 220]
+                } else {
+                    [82, 97, 107, 180]
+                };
                 for b in &mut frame.borders {
                     if b.is_none() {
-                        *b = Some((1.0, [82, 97, 107, 180]));
+                        *b = Some((1.0, default_table_border));
                     }
                 }
                 if tag == "th" && frame.bg_color.is_none() {
-                    frame.bg_color = Some([43, 50, 56, 220]);
+                    frame.bg_color = Some(if self.is_light_theme {
+                        [238, 242, 246, 235]
+                    } else {
+                        [43, 50, 56, 220]
+                    });
                 }
 
                 let col_span = node
@@ -1301,7 +1342,11 @@ impl<'a> GlossaryBuilder<'a> {
                         if is_details && frame.padding == [0.0; 4] {
                             frame.padding = [4.0, 6.0, 4.0, 6.0];
                             if frame.bg_color.is_none() {
-                                frame.bg_color = Some([34, 40, 46, 180]);
+                                frame.bg_color = Some(if self.is_light_theme {
+                                    [241, 245, 249, 230]
+                                } else {
+                                    [34, 40, 46, 180]
+                                });
                             }
                         }
 
@@ -1418,6 +1463,24 @@ impl<'a> GlossaryBuilder<'a> {
                                 elem_style.font_px,
                             )
                         });
+                        // Yomitan-aligned compact glossaries: flatten simple inline `<ul>`/`<ol>`
+                        // lists into a single inline ` | `-separated flow instead of stacked bullets.
+                        if self.compact_glossaries
+                            && (tag == "ul" || tag == "ol")
+                            && !child_blocks.is_empty()
+                        {
+                            if let Some(compact_atoms) =
+                                try_flatten_compact_list_blocks(&child_blocks, &elem_style)
+                            {
+                                blocks_out.push(BlockIR::Paragraph {
+                                    atoms: compact_atoms,
+                                    frame,
+                                    marker: None,
+                                    summary_detail_id: None,
+                                });
+                                return;
+                            }
+                        }
                         if child_blocks.len() == 1 && frame_is_trivial(&frame) && marker.is_none() {
                             blocks_out.extend(child_blocks);
                         } else if !child_blocks.is_empty() {
@@ -1482,6 +1545,88 @@ fn frame_is_trivial(f: &BoxFrameIR) -> bool {
         && f.borders.iter().all(Option::is_none)
 }
 
+fn frame_has_visual_box(f: &BoxFrameIR) -> bool {
+    f.bg_color.is_some() || f.borders.iter().any(Option::is_some)
+}
+
+/// Flatten simple inline `<li>` children of a `<ul>`/`<ol>` into a single inline
+/// ` | `-separated atom stream for Yomitan-aligned `compact_glossaries` layout.
+/// Returns `None` if any child contains tables, `<details>`, nested block boxes, or
+/// explicit multi-line breaks so complex structured glossaries preserve block layout.
+fn try_flatten_compact_list_blocks(
+    blocks: &[BlockIR],
+    sep_style: &InlineStyleIR,
+) -> Option<Vec<InlineAtom>> {
+    let mut item_atom_slices: Vec<&[InlineAtom]> = Vec::with_capacity(blocks.len());
+    for blk in blocks {
+        let atoms: &[InlineAtom] = match blk {
+            BlockIR::Paragraph {
+                atoms,
+                frame,
+                summary_detail_id,
+                ..
+            } if !frame_has_visual_box(frame) && summary_detail_id.is_none() => atoms.as_slice(),
+            BlockIR::Container {
+                blocks: inner,
+                frame,
+                ..
+            } if !frame_has_visual_box(frame) && inner.len() == 1 => match &inner[0] {
+                BlockIR::Paragraph {
+                    atoms,
+                    frame: inner_frame,
+                    summary_detail_id,
+                    ..
+                } if !frame_has_visual_box(inner_frame) && summary_detail_id.is_none() => {
+                    atoms.as_slice()
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if atoms.iter().any(|a| {
+            matches!(
+                a,
+                InlineAtom::LineBreak | InlineAtom::DetailsToggle { .. }
+            )
+        }) {
+            return None;
+        }
+        if !atoms.is_empty() {
+            item_atom_slices.push(atoms);
+        }
+    }
+    if item_atom_slices.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (idx, atoms) in item_atom_slices.into_iter().enumerate() {
+        if idx > 0 {
+            out.push(InlineAtom::Text {
+                text: " | ".to_owned(),
+                style: sep_style.clone(),
+                selectable: true,
+            });
+        }
+        out.extend(atoms.iter().cloned());
+    }
+    Some(out)
+}
+
+fn push_legacy_text_atoms(text: &str, style: &InlineStyleIR, out: &mut Vec<InlineAtom>) {
+    for (li, line) in text.split('\n').enumerate() {
+        if li > 0 {
+            out.push(InlineAtom::LineBreak);
+        }
+        if !line.is_empty() {
+            out.push(InlineAtom::Text {
+                text: line.to_owned(),
+                style: style.clone(),
+                selectable: true,
+            });
+        }
+    }
+}
+
 pub(super) struct PositionedGlossaryImage {
     pub(super) phys_x: f32,
     pub(super) phys_y: f32,
@@ -1492,6 +1637,9 @@ pub(super) struct PositionedGlossaryImage {
 
 pub(super) struct PaintCollector {
     pub(super) render_scale: f32,
+    pub(super) default_text_color: [u8; 4],
+    pub(super) ruby_color: [u8; 4],
+    pub(super) compact_glossaries: bool,
     pub(super) rects: Vec<(f32, f32, f32, f32, [u8; 4])>,
     pub(super) images: Vec<PositionedGlossaryImage>,
     pub(super) mask_glyphs: Vec<PositionedMaskGlyph>,
@@ -1509,8 +1657,25 @@ impl Default for PaintCollector {
 
 impl PaintCollector {
     fn new(render_scale: f32) -> Self {
+        Self::with_style(
+            render_scale,
+            [241, 245, 249, 255],
+            [196, 181, 253, 255],
+            false,
+        )
+    }
+
+    fn with_style(
+        render_scale: f32,
+        default_text_color: [u8; 4],
+        ruby_color: [u8; 4],
+        compact_glossaries: bool,
+    ) -> Self {
         Self {
             render_scale: render_scale.clamp(1.0, 3.0),
+            default_text_color,
+            ruby_color,
+            compact_glossaries,
             rects: Vec::new(),
             images: Vec::new(),
             mask_glyphs: Vec::new(),
@@ -1519,6 +1684,15 @@ impl PaintCollector {
             line_bounds: Vec::new(),
             next_line_id: 0,
         }
+    }
+
+    fn spawn_child(&self) -> Self {
+        Self::with_style(
+            self.render_scale,
+            self.default_text_color,
+            self.ruby_color,
+            self.compact_glossaries,
+        )
     }
 
     fn push_frame(&mut self, x: f32, y: f32, w: f32, h: f32, frame: &BoxFrameIR) {
@@ -2016,11 +2190,12 @@ fn layout_and_collect_block(
                 content_w = (content_w - mw).max(16.0);
             }
 
+            let child_gap = if collector.compact_glossaries { 1.0 } else { 2.0 };
             let mut cur_y = content_y;
             let mut max_child_w = 0.0f32;
             for (idx, child) in blocks.iter().enumerate() {
                 if idx > 0 {
-                    cur_y += 2.0;
+                    cur_y += child_gap;
                 }
                 let (cw, ch) = layout_and_collect_block(
                     engine,
@@ -2039,7 +2214,7 @@ fn layout_and_collect_block(
             let box_h = border_t + frame.padding[TOP] + inner_h + frame.padding[BOTTOM] + border_b;
 
             if !measure_only && !frame_is_trivial(frame) {
-                let mut frame_collector = PaintCollector::new(collector.render_scale);
+                let mut frame_collector = collector.spawn_child();
                 frame_collector.push_frame(outer_x, outer_y, box_w, box_h, frame);
                 collector
                     .rects
@@ -2192,7 +2367,7 @@ fn layout_inline_atoms(
                     ruby_px,
                     style.weight,
                     false,
-                    [196, 181, 253, 255],
+                    collector.ruby_color,
                 );
                 let bw = base_l
                     .lines()
@@ -2270,7 +2445,7 @@ fn layout_inline_atoms(
     )));
     builder.push_default(StyleProperty::FontSize(14.5));
     builder.push_default(StyleProperty::LineHeight(LineHeight::MetricsRelative(1.18)));
-    builder.push_default(StyleProperty::Brush([241, 245, 249, 255]));
+    builder.push_default(StyleProperty::Brush(collector.default_text_color));
 
     for span in &spans {
         let ff = span.style.font_family.trim();
@@ -2338,11 +2513,15 @@ fn layout_inline_atoms(
         }
     }
 
-    for line in layout.lines() {
+    let total_lines = layout.len();
+    for (line_idx, line) in layout.lines().enumerate() {
+        let line_text_range = line.text_range();
         let line_id = collector.next_line_id;
         collector.next_line_id += 1;
         let line_top = origin_y + line.metrics().min_coord;
-        let line_h = line.metrics().line_height.max(14.0);
+        let line_h = (line.metrics().max_coord - line.metrics().min_coord)
+            .max(line.metrics().line_height)
+            .max(14.0);
         collector.line_bounds.push((line_top, line_top + line_h));
         let baseline = origin_y + line.metrics().baseline;
         let mut prev_run_key: Option<(usize, usize, u64, u32)> = None;
@@ -2508,18 +2687,27 @@ fn layout_inline_atoms(
                         }
 
                         if let Some(slice) = full_text.get(range.clone()) {
-                            if !slice.is_empty() && !slice.chars().all(|c| c == '\n' || c == '\r') {
+                            let visible_chars: Vec<char> = slice
+                                .chars()
+                                .filter(|&c| c != '\n' && c != '\r')
+                                .collect();
+                            if !visible_chars.is_empty() {
                                 let selectable = span_meta.is_none_or(|m| m.selectable);
                                 if selectable {
-                                    let char_count = slice.chars().count();
-                                    let per_w = adv / (char_count.max(1) as f32);
-                                    for (ci, ch) in slice.chars().enumerate() {
+                                    let char_count = visible_chars.len();
+                                    let effective_adv = if adv > 0.0 {
+                                        adv
+                                    } else {
+                                        font_size * 0.45 * (char_count as f32)
+                                    };
+                                    let per_w = (effective_adv / (char_count as f32)).max(2.0);
+                                    for (ci, ch) in visible_chars.into_iter().enumerate() {
                                         let norm_ch = if ch == '\u{00A0}' { ' ' } else { ch };
                                         collector.selectable_chars.push(GlossaryCharCell {
                                             ch: norm_ch,
                                             x: x_cursor + per_w * ci as f32,
                                             y: line_top,
-                                            w: per_w.max(2.0),
+                                            w: per_w,
                                             h: line_h,
                                             line_id,
                                         });
@@ -2609,12 +2797,20 @@ fn layout_inline_atoms(
         if !collector.selectable_chars.is_empty()
             && collector.selectable_chars.last().is_some_and(|c| c.ch != '\n')
         {
+            let line_slice = full_text.get(line_text_range.clone()).unwrap_or("");
+            let trailing_hard_break = line_slice.ends_with('\n')
+                || line_slice.ends_with('\r')
+                || full_text
+                    .as_bytes()
+                    .get(line_text_range.end)
+                    .is_some_and(|&b| b == b'\n' || b == b'\r');
+            let is_soft_wrap = (line_idx + 1 < total_lines) && !trailing_hard_break;
             collector.selectable_chars.push(GlossaryCharCell {
                 ch: '\n',
                 x: origin_x + avail_w,
                 y: line_top,
                 w: 0.0,
-                h: line_h,
+                h: if is_soft_wrap { line_h } else { 0.0 },
                 line_id,
             });
         }
@@ -2703,7 +2899,7 @@ fn layout_table_block(
     } else {
         Vec::with_capacity(placed.len())
     };
-    let mut dummy_collector = PaintCollector::new(collector.render_scale);
+    let mut dummy_collector = collector.spawn_child();
 
     for p in &placed {
         let cx = outer_x + col_offsets[p.col];
@@ -2716,7 +2912,7 @@ fn layout_table_block(
         if measure_only {
             for (idx, blk) in p.cell.blocks.iter().enumerate() {
                 if idx > 0 {
-                    ch_sum += 2.0;
+                    ch_sum += if collector.compact_glossaries { 1.0 } else { 2.0 };
                 }
                 let (_, bh) = layout_and_collect_block(
                     engine,
@@ -2731,10 +2927,10 @@ fn layout_table_block(
                 ch_sum += bh;
             }
         } else {
-            let mut cell_collector = PaintCollector::new(collector.render_scale);
+            let mut cell_collector = collector.spawn_child();
             for (idx, blk) in p.cell.blocks.iter().enumerate() {
                 if idx > 0 {
-                    ch_sum += 2.0;
+                    ch_sum += if collector.compact_glossaries { 1.0 } else { 2.0 };
                 }
                 let (_, bh) = layout_and_collect_block(
                     engine,
@@ -2812,6 +3008,78 @@ pub fn render_structured_glossary_entry_in_dirs(
     avail_width_px: f32,
     selected: bool,
 ) -> Option<RenderedGlossaryDoc> {
+    render_structured_glossary_entry_in_dirs_with_theme(
+        raw_glossary,
+        fallback_glossary,
+        stylesheet,
+        detail_states,
+        legacy_style,
+        dict_resource_dirs,
+        dic_id,
+        dict_name,
+        avail_width_px,
+        selected,
+        false,
+    )
+}
+
+/// Theme-aware variant of [`render_structured_glossary_entry_in_dirs`].
+/// When `is_light_theme` is `true`, uses light popup defaults and passes `CssTheme::Light`
+/// into `memento-definition` stylesheet / `:root[data-theme="light"]` variable resolution.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn render_structured_glossary_entry_in_dirs_with_theme(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+    is_light_theme: bool,
+) -> Option<RenderedGlossaryDoc> {
+    let css_theme = if is_light_theme {
+        CssTheme::Light
+    } else {
+        CssTheme::Dark
+    };
+    render_structured_glossary_entry_with_css_theme(
+        raw_glossary,
+        fallback_glossary,
+        stylesheet,
+        detail_states,
+        legacy_style,
+        dict_resource_dirs,
+        dic_id,
+        dict_name,
+        avail_width_px,
+        selected,
+        css_theme,
+        false,
+    )
+}
+
+/// Build and rasterize a structured-content glossary entry with an explicit [`CssTheme`]
+/// (`Dark` or `Light`) and Yomitan-aligned `compact_glossaries` flag.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn render_structured_glossary_entry_with_css_theme(
+    raw_glossary: &str,
+    fallback_glossary: &str,
+    stylesheet: Option<Arc<ParsedStylesheet>>,
+    detail_states: &HashMap<String, bool>,
+    legacy_style: LegacyGlossaryStyle,
+    dict_resource_dirs: &[PathBuf],
+    dic_id: i64,
+    dict_name: &str,
+    avail_width_px: f32,
+    selected: bool,
+    css_theme: CssTheme,
+    compact_glossaries: bool,
+) -> Option<RenderedGlossaryDoc> {
+    let mut theme = PopupCssTheme::default_for_theme(css_theme);
+    theme.compact_glossaries = compact_glossaries;
     render_structured_glossary_entry_with_theme(
         raw_glossary,
         fallback_glossary,
@@ -2823,7 +3091,7 @@ pub fn render_structured_glossary_entry_in_dirs(
         dict_name,
         avail_width_px,
         selected,
-        &PopupCssTheme::default(),
+        &theme,
     )
 }
 
@@ -2957,6 +3225,7 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
 
     let renderer = DefRenderer::new();
     let contains_structured = renderer.contains_structured_content_value(entries);
+    let is_light_theme = theme.is_light_theme();
     let mut ctx = DefContext {
         screen: Some(ScreenMetrics {
             available_width: avail_w as i32,
@@ -2968,6 +3237,8 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
         text_color: text_color_css,
         glossary_text_color: gloss_text_css,
         glossary_background_color: bg_color_css.clone(),
+        theme: theme.css_theme,
+        cached_css_theme: theme.css_theme,
         background_color: bg_color_css.clone(),
         painted_background_color: bg_color_css,
         needs_element_child_count: stylesheet
@@ -2979,9 +3250,9 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
         ..DefContext::default()
     };
 
-    // Virtual dictionary container so Yomitan `[data-dictionary="..."]` / `[data-dictionary^="..."]`
-    // and `.gloss-item` rules match without interfering with bare tag selectors (`div`, `li`) in
-    // dictionary `styles.css`.
+    // Virtual dictionary container so Yomitan `[data-dictionary="..."]` / `[data-dictionary^="..."]`,
+    // `[data-theme="dark"|"light"]`, `[data-compact-glossaries="true"]`, and `.gloss-item` rules
+    // match without interfering with bare tag selectors (`div`, `li`) in dictionary `styles.css`.
     let mut dict_root = mdef::StructuredElement::new();
     dict_root.tag = "memento-dict".to_owned();
     dict_root.classes.insert("gloss-item".to_owned());
@@ -2989,6 +3260,15 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
     dict_root
         .attributes
         .insert("data-dictionary".to_owned(), dict_name.to_owned());
+    dict_root.attributes.insert(
+        "data-theme".to_owned(),
+        theme.css_theme.as_data_theme().to_owned(),
+    );
+    if theme.compact_glossaries {
+        dict_root
+            .attributes
+            .insert("data-compact-glossaries".to_owned(), "true".to_owned());
+    }
     ctx.selector_elements.push(dict_root);
     ctx.elements.push(0);
 
@@ -3055,49 +3335,66 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
             dic_id,
             dict_name,
             default_link_color: theme.link_color,
+            is_light_theme,
+            compact_glossaries: theme.compact_glossaries,
             render_scale: scale,
             had_hidden_elements: root_hidden,
         };
 
         let mut top_blocks: Vec<BlockIR> = Vec::new();
-        let use_bullets = legacy_style == LegacyGlossaryStyle::Bullet && !contains_structured;
+        let use_pipe_inline = legacy_style == LegacyGlossaryStyle::Pipe
+            || (theme.compact_glossaries && !contains_structured);
+        let use_bullets = !use_pipe_inline
+            && legacy_style == LegacyGlossaryStyle::Bullet
+            && !contains_structured;
+        let mut pending_pipe_atoms: Vec<InlineAtom> = Vec::new();
+
+        let flush_pending_pipe =
+            |pending: &mut Vec<InlineAtom>, blocks_out: &mut Vec<BlockIR>| {
+                if !pending.is_empty() {
+                    blocks_out.push(BlockIR::Paragraph {
+                        atoms: std::mem::take(pending),
+                        frame: BoxFrameIR::default(),
+                        marker: None,
+                        summary_detail_id: None,
+                    });
+                }
+            };
 
         if !root_hidden {
-            for (idx, entry) in entries.iter().enumerate() {
+            for entry in entries {
                 match entry {
                     JsonValue::String(text) => {
-                        let mut atoms = Vec::new();
-                        for (li, line) in text.split('\n').enumerate() {
-                            if li > 0 {
-                                atoms.push(InlineAtom::LineBreak);
+                        if use_pipe_inline {
+                            if !text.is_empty() {
+                                if !pending_pipe_atoms.is_empty() {
+                                    pending_pipe_atoms.push(InlineAtom::Text {
+                                        text: " | ".to_owned(),
+                                        style: root_inline.clone(),
+                                        selectable: true,
+                                    });
+                                }
+                                push_legacy_text_atoms(text, &root_inline, &mut pending_pipe_atoms);
                             }
-                            atoms.push(InlineAtom::Text {
-                                text: line.to_owned(),
-                                style: root_inline.clone(),
-                                selectable: true,
-                            });
+                        } else {
+                            let mut atoms = Vec::new();
+                            push_legacy_text_atoms(text, &root_inline, &mut atoms);
+                            if !atoms.is_empty() {
+                                top_blocks.push(BlockIR::Paragraph {
+                                    atoms,
+                                    frame: BoxFrameIR::default(),
+                                    marker: use_bullets.then(|| {
+                                        ("•".to_owned(), base_text_color, root_inline.font_px)
+                                    }),
+                                    summary_detail_id: None,
+                                });
+                            }
                         }
-                        if !use_bullets
-                            && idx + 1 < entries.len()
-                            && legacy_style == LegacyGlossaryStyle::Pipe
-                        {
-                            atoms.push(InlineAtom::Text {
-                                text: " | ".to_owned(),
-                                style: root_inline.clone(),
-                                selectable: true,
-                            });
-                        }
-                        top_blocks.push(BlockIR::Paragraph {
-                            atoms,
-                            frame: BoxFrameIR::default(),
-                            marker: use_bullets
-                                .then(|| ("•".to_owned(), base_text_color, root_inline.font_px)),
-                            summary_detail_id: None,
-                        });
                     }
                     JsonValue::Object(_) => {
                         match entry.get("type").and_then(JsonValue::as_str).unwrap_or("") {
                             "structured-content" => {
+                                flush_pending_pipe(&mut pending_pipe_atoms, &mut top_blocks);
                                 if let Some(content) = entry.get("content") {
                                     let blocks =
                                         builder.build_children_blocks(content, &root_inline);
@@ -3105,6 +3402,7 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
                                 }
                             }
                             "image" => {
+                                flush_pending_pipe(&mut pending_pipe_atoms, &mut top_blocks);
                                 if let Some(atom) = builder.resolve_image_atom(entry, &root_inline)
                                 {
                                     let mut atoms = vec![atom];
@@ -3132,18 +3430,37 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
                                 let txt =
                                     entry.get("text").and_then(JsonValue::as_str).unwrap_or("");
                                 if !txt.is_empty() {
-                                    top_blocks.push(BlockIR::Paragraph {
-                                        atoms: vec![InlineAtom::Text {
-                                            text: txt.to_owned(),
-                                            style: root_inline.clone(),
-                                            selectable: true,
-                                        }],
-                                        frame: BoxFrameIR::default(),
-                                        marker: use_bullets.then(|| {
-                                            ("•".to_owned(), base_text_color, root_inline.font_px)
-                                        }),
-                                        summary_detail_id: None,
-                                    });
+                                    if use_pipe_inline {
+                                        if !pending_pipe_atoms.is_empty() {
+                                            pending_pipe_atoms.push(InlineAtom::Text {
+                                                text: " | ".to_owned(),
+                                                style: root_inline.clone(),
+                                                selectable: true,
+                                            });
+                                        }
+                                        push_legacy_text_atoms(
+                                            txt,
+                                            &root_inline,
+                                            &mut pending_pipe_atoms,
+                                        );
+                                    } else {
+                                        let mut atoms = Vec::new();
+                                        push_legacy_text_atoms(txt, &root_inline, &mut atoms);
+                                        if !atoms.is_empty() {
+                                            top_blocks.push(BlockIR::Paragraph {
+                                                atoms,
+                                                frame: BoxFrameIR::default(),
+                                                marker: use_bullets.then(|| {
+                                                    (
+                                                        "•".to_owned(),
+                                                        base_text_color,
+                                                        root_inline.font_px,
+                                                    )
+                                                }),
+                                                summary_detail_id: None,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -3152,6 +3469,7 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
                     _ => {}
                 }
             }
+            flush_pending_pipe(&mut pending_pipe_atoms, &mut top_blocks);
         }
         (top_blocks, builder.had_hidden_elements)
     };
@@ -3172,12 +3490,23 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
         return None;
     }
 
-    let mut collector = PaintCollector::new(scale);
+    let ruby_color = if is_light_theme {
+        [91, 33, 182, 255]
+    } else {
+        [196, 181, 253, 255]
+    };
+    let mut collector = PaintCollector::with_style(
+        scale,
+        base_text_color,
+        ruby_color,
+        theme.compact_glossaries,
+    );
     let mut layout_cache = LayoutMeasureCache::default();
+    let top_block_gap = if theme.compact_glossaries { 2.0 } else { 4.0 };
     let mut cur_y = 2.0f32;
     for (idx, blk) in top_blocks.iter().enumerate() {
         if idx > 0 {
-            cur_y += 4.0;
+            cur_y += top_block_gap;
         }
         let (_, bh) = layout_and_collect_block(
             engine,
@@ -3332,4 +3661,224 @@ pub fn render_structured_glossary_entry(
         avail_width_px,
         selected,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pipe_style_and_text_objects_join_inline_and_split_newlines() {
+        let raw_strings = r#"["first meaning", "second meaning", "third meaning"]"#;
+        let doc = render_structured_glossary_entry_in_dirs(
+            raw_strings,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Pipe,
+            &[],
+            1,
+            "JMdict",
+            480.0,
+            true,
+        )
+        .expect("pipe legacy glossary should render");
+        assert_eq!(doc.plain_text, "first meaning | second meaning | third meaning");
+        assert!(
+            !doc.plain_text.ends_with('|') && !doc.plain_text.ends_with("| "),
+            "pipe glossary must not end with trailing pipe"
+        );
+        assert_eq!(
+            doc.line_bottoms.len(),
+            1,
+            "short Pipe entries must join inline on one line instead of separate paragraphs"
+        );
+
+        let raw_text_objs =
+            r#"[{"type":"text","text":"alpha\nbeta"},{"type":"text","text":"gamma"}]"#;
+        let doc_text = render_structured_glossary_entry_in_dirs(
+            raw_text_objs,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Pipe,
+            &[],
+            1,
+            "JMdict",
+            480.0,
+            true,
+        )
+        .expect("legacy text objects should render");
+        assert_eq!(doc_text.plain_text, "alpha\nbeta | gamma");
+        assert_eq!(
+            doc_text.line_bottoms.len(),
+            2,
+            "embedded '\\n' in legacy text object must split into 2 lines while Pipe joins second object inline"
+        );
+    }
+
+    #[test]
+    fn compact_glossaries_flattens_inline_ul_lists_and_respects_light_theme() {
+        let raw_ul = r#"[{
+            "type": "structured-content",
+            "content": {
+                "tag": "ul",
+                "content": [
+                    {"tag": "li", "content": "one"},
+                    {"tag": "li", "content": "two"},
+                    {"tag": "li", "content": "three"}
+                ]
+            }
+        }]"#;
+        let normal = render_structured_glossary_entry_with_css_theme(
+            raw_ul,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "JMdict",
+            480.0,
+            true,
+            CssTheme::Dark,
+            false,
+        )
+        .expect("normal ul should render");
+        let compact = render_structured_glossary_entry_with_css_theme(
+            raw_ul,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "JMdict",
+            480.0,
+            true,
+            CssTheme::Light,
+            true,
+        )
+        .expect("compact light ul should render");
+
+        assert_eq!(compact.plain_text, "one | two | three");
+        assert!(
+            compact.height_px < normal.height_px,
+            "compact glossary height ({}) should be smaller than stacked ul height ({})",
+            compact.height_px,
+            normal.height_px
+        );
+
+        // Verify dark vs light `:root[data-theme="..."]` CSS custom property resolution
+        // produces genuinely different rendered text colors.
+        let sheet = Arc::new(mdef::parse_stylesheet(
+            r#"
+            :root[data-theme="dark"] { --accent: #ff0000; }
+            :root[data-theme="light"] { --accent: #0000ff; }
+            span { color: var(--accent); }
+            "#,
+        ));
+        let raw_var = r#"[{"type":"structured-content","content":{"tag":"span","content":"色"}}]"#;
+        let dark_doc = render_structured_glossary_entry_in_dirs_with_theme(
+            raw_var,
+            "",
+            Some(sheet.clone()),
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "ThemeDict",
+            200.0,
+            true,
+            false,
+        )
+        .expect("dark themed doc");
+        let light_doc = render_structured_glossary_entry_in_dirs_with_theme(
+            raw_var,
+            "",
+            Some(sheet),
+            &HashMap::new(),
+            LegacyGlossaryStyle::Bullet,
+            &[],
+            1,
+            "ThemeDict",
+            200.0,
+            true,
+            true,
+        )
+        .expect("light themed doc");
+        let dark_buf = dark_doc.image.to_rgba8().unwrap();
+        let light_buf = light_doc.image.to_rgba8().unwrap();
+        let dark_red_sum: u64 = dark_buf.as_slice().iter().map(|p| u64::from(p.r)).sum();
+        let dark_blue_sum: u64 = dark_buf.as_slice().iter().map(|p| u64::from(p.b)).sum();
+        let light_red_sum: u64 = light_buf.as_slice().iter().map(|p| u64::from(p.r)).sum();
+        let light_blue_sum: u64 = light_buf.as_slice().iter().map(|p| u64::from(p.b)).sum();
+        assert!(
+            dark_red_sum > dark_blue_sum * 2,
+            "dark theme should resolve --accent to red (R={dark_red_sum}, B={dark_blue_sum})"
+        );
+        assert!(
+            light_blue_sum > light_red_sum * 2,
+            "light theme should resolve --accent to blue (R={light_red_sum}, B={light_blue_sum})"
+        );
+    }
+
+    #[test]
+    fn last_word_without_trailing_punctuation_scans_cleanly_without_bleeding_across_hard_breaks() {
+        // Two separate lines without trailing punctuation (#2232)
+        let raw = r#"["食べる", "飲む"]"#;
+        let doc = render_structured_glossary_entry_in_dirs(
+            raw,
+            "",
+            None,
+            &HashMap::new(),
+            LegacyGlossaryStyle::LineBreak,
+            &[],
+            1,
+            "JMdict",
+            360.0,
+            true,
+        )
+        .expect("two-line doc should render");
+
+        let ta_idx = doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == '食')
+            .expect("must contain 食");
+        let ru_idx = doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == 'る')
+            .expect("must contain る");
+        let ru_cell = &doc.selectable_chars[ru_idx];
+
+        // Hovering the right edge of the last character on line 1 (without trailing punctuation)
+        // must still hit 'る', while far blank margin must still return None.
+        assert_eq!(
+            strict_char_index_at_point(&doc, ru_cell.x + ru_cell.w + 1.8, ru_cell.y + ru_cell.h * 0.5),
+            Some(ru_idx)
+        );
+        assert_eq!(
+            strict_char_index_at_point(&doc, ru_cell.x + ru_cell.w + 40.0, ru_cell.y + ru_cell.h * 0.5),
+            None
+        );
+
+        // Scanning starting at '食' on line 1 must stop at the hard paragraph break and NOT
+        // bleed into '飲む' on line 2.
+        let (sub, idxs) = extract_glossary_scan_substring(&doc.selectable_chars, ta_idx, 24)
+            .expect("must extract line 1 word");
+        assert_eq!(sub, "食べる");
+        assert_eq!(idxs.len(), 3);
+
+        // Scanning the very last char of the entire doc ('む', no trailing punctuation) must succeed.
+        let mu_idx = doc
+            .selectable_chars
+            .iter()
+            .position(|c| c.ch == 'む')
+            .expect("must contain む");
+        let (last_sub, _) = extract_glossary_scan_substring(&doc.selectable_chars, mu_idx, 24)
+            .expect("final char without trailing punctuation must scan");
+        assert_eq!(last_sub, "む");
+    }
 }

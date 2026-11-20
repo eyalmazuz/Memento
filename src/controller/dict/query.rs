@@ -7,7 +7,9 @@ use memento_dict::deconjugationquerygenerator;
 use memento_dict::exactquerygenerator;
 use memento_dict::mecabquerygenerator;
 use memento_dict::normalize;
-use memento_dict::searchcontroller::{self, CandidateSearchQuery, QuerySource, TagSortItem};
+use memento_dict::searchcontroller::{
+    self, CandidateSearchQuery, QuerySource, TagSortItem, TextReplacementOptions,
+};
 use memento_dict::sqlite_db;
 use memento_util::mecab::MecabLookupToken;
 
@@ -141,8 +143,9 @@ pub fn format_cloze_for_term(sentence: &str, term: &str) -> Option<ClozeSentence
     ))
 }
 
-/// Sorts search hits in-place: exact matches first, longest prefix matches, breaking ties by score,
-/// applying the permutation with zero `SearchHit` clones.
+/// Sorts search hits in-place: exact matches first, longest prefix matches,
+/// `expression == cloze_body` ahead of reading-only matches, accumulated group score,
+/// and individual score, applying the permutation with zero `SearchHit` clones.
 pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
     if hits.len() <= 1 {
         return;
@@ -151,7 +154,14 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
     let norm_query = normalize_reading(trimmed);
     let u16_query: Vec<u16> = trimmed.encode_utf16().collect();
 
-    let mut indexed: Vec<(usize, bool, usize, i64)> = hits
+    let mut group_scores: HashMap<(&str, &str, bool), i64> = HashMap::with_capacity(hits.len());
+    for h in hits.iter() {
+        let key = (h.expression.as_str(), h.reading.as_str(), h.is_kanji);
+        let entry = group_scores.entry(key).or_insert(0);
+        *entry = entry.saturating_add(h.score);
+    }
+
+    let mut indexed: Vec<(usize, bool, bool, usize, bool, i64, i64)> = hits
         .iter()
         .enumerate()
         .map(|(i, h)| {
@@ -162,34 +172,53 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
                 || (!norm_reading.is_empty() && norm_reading == norm_query);
 
             let u16_expr: Vec<u16> = h.expression.encode_utf16().collect();
-            let prefix_len = if u16_query.starts_with(&u16_expr) {
-                u16_expr.len()
+            let (prefix_len, expr_equals_cloze) = if u16_query.starts_with(&u16_expr) {
+                (u16_expr.len(), true)
             } else if u16_expr.starts_with(&u16_query) {
-                u16_query.len()
+                (u16_query.len(), h.expression == trimmed)
             } else {
                 let u16_read: Vec<u16> = h.reading.encode_utf16().collect();
                 if u16_query.starts_with(&u16_read) {
-                    u16_read.len()
+                    (u16_read.len(), false)
                 } else if u16_read.starts_with(&u16_query) {
-                    u16_query.len()
+                    (u16_query.len(), false)
                 } else {
-                    0
+                    (0, h.expression == trimmed)
                 }
             };
 
-            (i, is_exact, prefix_len, h.score)
+            let group_score = group_scores
+                .get(&(h.expression.as_str(), h.reading.as_str(), h.is_kanji))
+                .copied()
+                .unwrap_or(h.score);
+
+            (
+                i,
+                h.is_kanji,
+                is_exact,
+                prefix_len,
+                expr_equals_cloze,
+                group_score,
+                h.score,
+            )
         })
         .collect();
 
     indexed.sort_by(|a, b| {
-        b.1.cmp(&a.1)
+        a.1.cmp(&b.1)
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| b.4.cmp(&a.4))
+            .then_with(|| b.5.cmp(&a.5))
+            .then_with(|| b.6.cmp(&a.6))
             .then_with(|| a.0.cmp(&b.0))
     });
 
     // Apply permutation in-place via cycle decomposition (zero SearchHit clones).
-    let mut perm: Vec<usize> = indexed.into_iter().map(|(orig_idx, _, _, _)| orig_idx).collect();
+    let mut perm: Vec<usize> = indexed
+        .into_iter()
+        .map(|(orig_idx, ..)| orig_idx)
+        .collect();
     for i in 0..perm.len() {
         let mut cur = i;
         while perm[cur] != i {
@@ -267,6 +296,7 @@ fn slice_mecab_lookup_prefix(trimmed: &str) -> &str {
     &trimmed[..end_byte]
 }
 
+#[allow(dead_code)]
 pub(super) fn build_lookup_queries(
     trimmed: &str,
     exact_enabled: bool,
@@ -274,49 +304,74 @@ pub(super) fn build_lookup_queries(
     mecab_enabled: bool,
     mecab_tokenizer: MecabTokenizerFn,
 ) -> Vec<LookupQuery> {
+    build_lookup_queries_with_replacements(
+        trimmed,
+        exact_enabled,
+        deconj_enabled,
+        mecab_enabled,
+        mecab_tokenizer,
+        &TextReplacementOptions::default(),
+    )
+}
+
+pub(super) fn build_lookup_queries_with_replacements(
+    trimmed: &str,
+    exact_enabled: bool,
+    deconj_enabled: bool,
+    mecab_enabled: bool,
+    mecab_tokenizer: MecabTokenizerFn,
+    text_replacements: &TextReplacementOptions,
+) -> Vec<LookupQuery> {
     let mut raw_lookups: Vec<LookupQuery> = Vec::new();
     let mut seq = 0usize;
+    let full_orig_u16_len = trimmed.encode_utf16().count();
+
+    let has_active_replacements = text_replacements
+        .rules
+        .iter()
+        .any(|r| r.enabled && !r.pattern.is_empty());
+    let seeds: Vec<(String, bool)> = if has_active_replacements {
+        searchcontroller::apply_text_replacements(trimmed, text_replacements)
+            .into_iter()
+            .map(|s| {
+                let is_orig = s == trimmed;
+                (s, is_orig)
+            })
+            .collect()
+    } else {
+        vec![(trimmed.to_owned(), true)]
+    };
+
+    if seeds.is_empty() {
+        return raw_lookups;
+    }
 
     if exact_enabled || deconj_enabled {
-        let mut prefixes: Vec<(usize, usize, usize)> = Vec::new();
-        let mut char_count = 0usize;
-        let mut u16_count = 0usize;
-        for (byte_idx, ch) in trimmed.char_indices() {
-            char_count += 1;
-            u16_count += ch.len_utf16();
-            prefixes.push((byte_idx + ch.len_utf8(), char_count, u16_count));
-        }
-
-        for &(byte_end, chars_len, orig_u16_len) in prefixes.iter().rev() {
-            let prefix = &trimmed[..byte_end];
-            if prefix.trim().is_empty() {
-                continue;
+        for (seed, is_original) in &seeds {
+            let mut prefixes: Vec<(usize, usize, usize)> = Vec::new();
+            let mut char_count = 0usize;
+            let mut u16_count = 0usize;
+            for (byte_idx, ch) in seed.char_indices() {
+                char_count += 1;
+                u16_count += ch.len_utf16();
+                prefixes.push((byte_idx + ch.len_utf8(), char_count, u16_count));
             }
 
-            if exact_enabled {
-                for variant in normalize::expand_query_variants(prefix) {
-                    let deconj_u16 = if mecab_enabled {
-                        variant.encode_utf16().collect()
-                    } else {
-                        Vec::new()
-                    };
-                    raw_lookups.push(LookupQuery {
-                        key: variant,
-                        deconj_u16,
-                        surface_len: orig_u16_len,
-                        rule_mask: 0,
-                        source: QuerySource::Exact,
-                        derivation: String::new(),
-                        derivation_descriptions: Vec::new(),
-                        rule_derivations: Vec::new(),
-                        seq,
-                    });
-                    seq += 1;
+            for &(byte_end, chars_len, seed_u16_len) in prefixes.iter().rev() {
+                let prefix = &seed[..byte_end];
+                if prefix.trim().is_empty() {
+                    continue;
                 }
+                let orig_u16_len = if *is_original {
+                    seed_u16_len
+                } else if byte_end == seed.len() {
+                    full_orig_u16_len
+                } else {
+                    seed_u16_len.min(full_orig_u16_len)
+                };
 
-                if prefix.chars().any(is_ascii_regex_ws) {
-                    let no_ws: String = prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
-                    for variant in normalize::expand_query_variants(&no_ws) {
+                if exact_enabled {
+                    for variant in normalize::expand_query_variants(prefix) {
                         let deconj_u16 = if mecab_enabled {
                             variant.encode_utf16().collect()
                         } else {
@@ -335,52 +390,109 @@ pub(super) fn build_lookup_queries(
                         });
                         seq += 1;
                     }
-                }
-            }
 
-            if deconj_enabled && (chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == trimmed.len())
-            {
-                let mut deconj_inputs: Vec<String> = Vec::new();
-                let mut push_deconj_in = |s: String| {
-                    if !s.is_empty() && !deconj_inputs.contains(&s) {
-                        deconj_inputs.push(s);
-                    }
-                };
-                let nfkc = normalize::normalize_nfkc(prefix);
-                push_deconj_in(prefix.to_owned());
-                push_deconj_in(nfkc.clone());
-                push_deconj_in(normalize::kata_to_hira_str(&nfkc));
-                for iter_var in normalize::expand_iteration_marks(&nfkc) {
-                    push_deconj_in(iter_var.clone());
-                    if iter_var.contains('ー') {
-                        for pv in normalize::expand_prolonged_vowels(&iter_var) {
-                            push_deconj_in(pv);
-                        }
-                    }
-                }
-
-                for deconj_input in deconj_inputs {
-                    let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
-                    for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
-                        let base = String::from_utf16_lossy(&dq.deconj);
-                        for base_variant in normalize::expand_query_variants(&base) {
+                    if prefix.chars().any(is_ascii_regex_ws) {
+                        let no_ws: String =
+                            prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
+                        for variant in normalize::expand_query_variants(&no_ws) {
                             let deconj_u16 = if mecab_enabled {
-                                base_variant.encode_utf16().collect()
+                                variant.encode_utf16().collect()
                             } else {
                                 Vec::new()
                             };
                             raw_lookups.push(LookupQuery {
-                                key: base_variant,
+                                key: variant,
                                 deconj_u16,
                                 surface_len: orig_u16_len,
-                                rule_mask: dq.rule_mask,
-                                source: QuerySource::Deconj,
-                                derivation: dq.derivation.clone(),
-                                derivation_descriptions: dq.derivation_descriptions.clone(),
-                                rule_derivations: dq.rule_derivations.clone(),
+                                rule_mask: 0,
+                                source: QuerySource::Exact,
+                                derivation: String::new(),
+                                derivation_descriptions: Vec::new(),
+                                rule_derivations: Vec::new(),
                                 seq,
                             });
                             seq += 1;
+                        }
+                    }
+                }
+
+                if deconj_enabled && (chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == seed.len())
+                {
+                    let mut deconj_inputs: Vec<String> = Vec::new();
+                    let push_deconj_in = |inputs: &mut Vec<String>, s: String| {
+                        if !s.is_empty() && !inputs.contains(&s) {
+                            inputs.push(s);
+                        }
+                    };
+                    let nfkc = normalize::normalize_nfkc(prefix);
+                    push_deconj_in(&mut deconj_inputs, prefix.to_owned());
+                    push_deconj_in(&mut deconj_inputs, nfkc.clone());
+                    push_deconj_in(&mut deconj_inputs, normalize::kata_to_hira_str(&nfkc));
+
+                    // Wire Wave 1 Japanese text preprocessors into deconjugation input generation:
+                    // radical normalization, kyūjitai -> shinjitai standardization, emphatic
+                    // sequence collapsing (preserving Yomitan #1411 guard), alphanumeric width
+                    // variants, and romaji -> hiragana conversion.
+                    let rad = normalize::normalize_radical_characters(&nfkc);
+                    if rad != nfkc {
+                        push_deconj_in(&mut deconj_inputs, rad.clone());
+                    }
+                    let std_kanji = normalize::standardize_kanji(&rad);
+                    if std_kanji != rad {
+                        push_deconj_in(&mut deconj_inputs, std_kanji.clone());
+                    }
+                    if nfkc.chars().any(|c| c.is_ascii_alphabetic()) {
+                        let romaji_hira = normalize::alphabetic_to_hiragana(&nfkc);
+                        if romaji_hira != nfkc {
+                            push_deconj_in(&mut deconj_inputs, romaji_hira);
+                        }
+                    }
+                    for width_var in normalize::alphanumeric_width_variants(&nfkc) {
+                        if width_var != nfkc {
+                            push_deconj_in(&mut deconj_inputs, width_var);
+                        }
+                    }
+                    let pre_emph_len = deconj_inputs.len();
+                    for idx in 0..pre_emph_len {
+                        let base_in = deconj_inputs[idx].clone();
+                        if base_in.chars().any(|c| matches!(c, 'っ' | 'ッ' | 'ー')) {
+                            for emph in normalize::collapse_emphatic_sequences_variants(&base_in) {
+                                push_deconj_in(&mut deconj_inputs, emph.text);
+                            }
+                        }
+                    }
+                    for iter_var in normalize::expand_iteration_marks(&std_kanji) {
+                        push_deconj_in(&mut deconj_inputs, iter_var.clone());
+                        if iter_var.contains('ー') {
+                            for pv in normalize::expand_prolonged_vowels(&iter_var) {
+                                push_deconj_in(&mut deconj_inputs, pv);
+                            }
+                        }
+                    }
+
+                    for deconj_input in deconj_inputs {
+                        let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
+                        for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
+                            let base = String::from_utf16_lossy(&dq.deconj);
+                            for base_variant in normalize::expand_query_variants(&base) {
+                                let deconj_u16 = if mecab_enabled {
+                                    base_variant.encode_utf16().collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                raw_lookups.push(LookupQuery {
+                                    key: base_variant,
+                                    deconj_u16,
+                                    surface_len: orig_u16_len,
+                                    rule_mask: dq.rule_mask,
+                                    source: QuerySource::Deconj,
+                                    derivation: dq.derivation.clone(),
+                                    derivation_descriptions: dq.derivation_descriptions.clone(),
+                                    rule_derivations: dq.rule_derivations.clone(),
+                                    seq,
+                                });
+                                seq += 1;
+                            }
                         }
                     }
                 }
@@ -389,88 +501,97 @@ pub(super) fn build_lookup_queries(
     }
 
     if mecab_enabled {
-        let mecab_prefix = slice_mecab_lookup_prefix(trimmed);
-        if let Ok(tokens) = (mecab_tokenizer)(mecab_prefix) {
-            if !tokens.is_empty() {
-                let spans: Vec<mecabquerygenerator::TokenSpan<'_>> = tokens
-                    .iter()
-                    .map(|t| mecabquerygenerator::TokenSpan {
-                        surface: t.surface.as_str(),
-                        surface_clean: t.surface_clean.as_str(),
-                        lemma: t.lemma.as_str(),
-                        alt_lemma: t.alt_lemma.as_deref(),
-                        pos: t.pos.as_str(),
-                        conj_type: t.conj_type.as_str(),
-                    })
-                    .collect();
+        let mut distinct_mecab_fallbacks: Vec<LookupQuery> = Vec::new();
+        let mut ran_mecab = false;
+        for (seed, is_original) in &seeds {
+            let mecab_prefix = slice_mecab_lookup_prefix(seed);
+            if let Ok(tokens) = (mecab_tokenizer)(mecab_prefix) {
+                if !tokens.is_empty() {
+                    ran_mecab = true;
+                    let spans: Vec<mecabquerygenerator::TokenSpan<'_>> = tokens
+                        .iter()
+                        .map(|t| mecabquerygenerator::TokenSpan {
+                            surface: t.surface.as_str(),
+                            surface_clean: t.surface_clean.as_str(),
+                            lemma: t.lemma.as_str(),
+                            alt_lemma: t.alt_lemma.as_deref(),
+                            pos: t.pos.as_str(),
+                            conj_type: t.conj_type.as_str(),
+                        })
+                        .collect();
 
-                let mut distinct_mecab_fallbacks: Vec<LookupQuery> = Vec::new();
-                for cand in mecabquerygenerator::generate_candidates_from_tokens(&spans) {
-                    for variant in normalize::expand_query_variants(&cand.deconj) {
-                        let deconj_u16: Vec<u16> = variant.encode_utf16().collect();
-                        let covered_by_deconj = raw_lookups.iter().any(|d| {
-                            d.source == QuerySource::Deconj
-                                && d.key == variant
-                                && d.surface_len >= cand.surface_u16_len
-                                && cand.rule_mask != 0
-                                && (d.rule_mask & cand.rule_mask) == cand.rule_mask
-                        });
-                        let lq = LookupQuery {
-                            key: variant.clone(),
-                            deconj_u16: deconj_u16.clone(),
-                            surface_len: cand.surface_u16_len,
-                            rule_mask: cand.rule_mask,
-                            source: QuerySource::Mecab,
-                            derivation: String::new(),
-                            derivation_descriptions: Vec::new(),
-                            rule_derivations: Vec::new(),
-                            seq,
+                    for cand in mecabquerygenerator::generate_candidates_from_tokens(&spans) {
+                        let surface_u16 = if *is_original {
+                            cand.surface_u16_len
+                        } else {
+                            cand.surface_u16_len.min(full_orig_u16_len)
                         };
-                        if !covered_by_deconj
-                            && ((cand.span_tokens >= 2 && cand.rule_mask == 0)
-                                || cand.rule_mask != 0)
-                        {
-                            distinct_mecab_fallbacks.push(LookupQuery {
-                                key: variant,
-                                deconj_u16,
-                                surface_len: cand.surface_u16_len,
+                        for variant in normalize::expand_query_variants(&cand.deconj) {
+                            let deconj_u16: Vec<u16> = variant.encode_utf16().collect();
+                            let covered_by_deconj = raw_lookups.iter().any(|d| {
+                                d.source == QuerySource::Deconj
+                                    && d.key == variant
+                                    && d.surface_len >= surface_u16
+                                    && cand.rule_mask != 0
+                                    && (d.rule_mask & cand.rule_mask) == cand.rule_mask
+                            });
+                            let lq = LookupQuery {
+                                key: variant.clone(),
+                                deconj_u16: deconj_u16.clone(),
+                                surface_len: surface_u16,
                                 rule_mask: cand.rule_mask,
                                 source: QuerySource::Mecab,
                                 derivation: String::new(),
                                 derivation_descriptions: Vec::new(),
                                 rule_derivations: Vec::new(),
                                 seq,
-                            });
+                            };
+                            if !covered_by_deconj
+                                && ((cand.span_tokens >= 2 && cand.rule_mask == 0)
+                                    || cand.rule_mask != 0)
+                            {
+                                distinct_mecab_fallbacks.push(LookupQuery {
+                                    key: variant,
+                                    deconj_u16,
+                                    surface_len: surface_u16,
+                                    rule_mask: cand.rule_mask,
+                                    source: QuerySource::Mecab,
+                                    derivation: String::new(),
+                                    derivation_descriptions: Vec::new(),
+                                    rule_derivations: Vec::new(),
+                                    seq,
+                                });
+                            }
+                            raw_lookups.push(lq);
+                            seq += 1;
                         }
-                        raw_lookups.push(lq);
-                        seq += 1;
                     }
                 }
-
-                let descriptors: Vec<CandidateSearchQuery<'_>> = raw_lookups
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, lq)| CandidateSearchQuery {
-                        original_index: idx,
-                        deconj: lq.deconj_u16.as_slice(),
-                        surface_len: lq.surface_len as u64,
-                        rule_mask: lq.rule_mask,
-                        source: lq.source,
-                    })
-                    .collect();
-                let surviving = searchcontroller::sort_and_filter_queries(descriptors, true);
-                let mut filtered: Vec<LookupQuery> =
-                    Vec::with_capacity(surviving.len() + distinct_mecab_fallbacks.len());
-                let mut opts: Vec<Option<LookupQuery>> =
-                    raw_lookups.into_iter().map(Some).collect();
-                for idx in surviving {
-                    if let Some(lq) = opts.get_mut(idx).and_then(Option::take) {
-                        filtered.push(lq);
-                    }
-                }
-                filtered.extend(distinct_mecab_fallbacks);
-                raw_lookups = filtered;
             }
+        }
+        if ran_mecab {
+            let descriptors: Vec<CandidateSearchQuery<'_>> = raw_lookups
+                .iter()
+                .enumerate()
+                .map(|(idx, lq)| CandidateSearchQuery {
+                    original_index: idx,
+                    deconj: lq.deconj_u16.as_slice(),
+                    surface_len: lq.surface_len as u64,
+                    rule_mask: lq.rule_mask,
+                    source: lq.source,
+                })
+                .collect();
+            let surviving = searchcontroller::sort_and_filter_queries(descriptors, true);
+            let mut filtered: Vec<LookupQuery> =
+                Vec::with_capacity(surviving.len() + distinct_mecab_fallbacks.len());
+            let mut opts: Vec<Option<LookupQuery>> = raw_lookups.into_iter().map(Some).collect();
+            for idx in surviving {
+                if let Some(lq) = opts.get_mut(idx).and_then(Option::take) {
+                    filtered.push(lq);
+                }
+            }
+            filtered.extend(distinct_mecab_fallbacks);
+            raw_lookups = filtered;
         }
     }
 
@@ -485,6 +606,125 @@ pub(super) fn build_lookup_queries(
     let mut seen_lookups: HashSet<(String, u8)> = HashSet::with_capacity(raw_lookups.len());
     raw_lookups.retain(|lookup| seen_lookups.insert((lookup.key.clone(), lookup.rule_mask)));
     raw_lookups
+}
+
+/// Wildcard glob matcher (`*`/`＊` = zero or more chars, `?`/`？` = single char) with
+/// ASCII case-insensitivity and katakana-to-hiragana fallback for in-memory dictionaries.
+pub(super) fn wildcard_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    fn glob_chars(pat: &[char], text: &[char]) -> bool {
+        let (mut pi, mut ti) = (0usize, 0usize);
+        let mut star_pi: Option<usize> = None;
+        let mut star_ti = 0usize;
+        while ti < text.len() {
+            if pi < pat.len() && matches!(pat[pi], '*' | '＊') {
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            } else if pi < pat.len()
+                && (matches!(pat[pi], '?' | '？')
+                    || pat[pi] == text[ti]
+                    || (pat[pi].is_ascii()
+                        && text[ti].is_ascii()
+                        && pat[pi].eq_ignore_ascii_case(&text[ti])))
+            {
+                pi += 1;
+                ti += 1;
+            } else if let Some(sp) = star_pi {
+                star_ti += 1;
+                ti = star_ti;
+                pi = sp + 1;
+            } else {
+                return false;
+            }
+        }
+        while pi < pat.len() && matches!(pat[pi], '*' | '＊') {
+            pi += 1;
+        }
+        pi == pat.len()
+    }
+
+    if candidate.is_empty() {
+        return false;
+    }
+    let pat_chars: Vec<char> = pattern.chars().collect();
+    let cand_chars: Vec<char> = candidate.chars().collect();
+    if glob_chars(&pat_chars, &cand_chars) {
+        return true;
+    }
+    let norm_pat: Vec<char> = normalize::kata_to_hira_str(pattern).chars().collect();
+    let norm_cand: Vec<char> = normalize::kata_to_hira_str(candidate).chars().collect();
+    glob_chars(&norm_pat, &norm_cand)
+}
+
+/// Executes a bounded wildcard SQLite query (`*`/`?`/`＊`/`？`) via Wave 1's
+/// `memento_dict::sqlite_db::search_terms_wildcard`.
+pub(super) fn database_wildcard_candidates(
+    database: &ReadOnlyDictionaryDb,
+    snapshot: &DictionaryMetadataSnapshot,
+    query: &str,
+    full_u16_len: usize,
+    limit: usize,
+) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
+    let batch_rows = database
+        .with_conn(|conn| sqlite_db::search_terms_wildcard(conn, query, limit))
+        .map_err(DictControllerError::Sqlite)?;
+    if batch_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::with_capacity(batch_rows.len());
+    let mut seen_rows: HashSet<(i64, i64)> = HashSet::with_capacity(batch_rows.len());
+    for row in batch_rows {
+        let Some(dictionary_name) = snapshot.names.get(&row.dic_id) else {
+            continue;
+        };
+        if !seen_rows.insert((row.dic_id, row.rowid)) {
+            continue;
+        }
+        let Some((cleaned_raw, parsed_val)) = clean_raw_glossary(&row.glossary) else {
+            continue;
+        };
+        let (glossary, example_ja, example_en) = match parsed_val.as_deref() {
+            Some(value) => parse_glossary_entry_value(value),
+            None => (
+                strip_glossary_markup(&cleaned_raw),
+                String::new(),
+                String::new(),
+            ),
+        };
+        if let Some(ref arc_val) = parsed_val {
+            cache_parsed_glossary(&cleaned_raw, Arc::clone(arc_val));
+        }
+        let formatted_tags =
+            format_dictionary_tags(&snapshot.tags, row.dic_id, &row.def_tags, &row.term_tags);
+        results.push(DatabaseCandidate {
+            hit: SearchHit {
+                expression: row.expression,
+                reading: row.reading,
+                glossary,
+                tags: formatted_tags,
+                score: row.score,
+                is_kanji: false,
+                notes: String::new(),
+                example_ja,
+                example_en,
+                dict_name: dictionary_name.clone(),
+                rich_glossary: Vec::new(),
+                derivation: String::new(),
+                derivation_descriptions: Vec::new(),
+                dictionary_id: row.dic_id,
+                rules: row.rules,
+                raw_glossary: cleaned_raw,
+                term_tags: row.term_tags,
+                def_tags: row.def_tags,
+            },
+            parsed_glossary: parsed_val,
+            is_exact: true,
+            prefix_len: full_u16_len,
+            dic_id: row.dic_id,
+        });
+    }
+    Ok(results)
 }
 
 pub(super) fn database_search_candidates(
