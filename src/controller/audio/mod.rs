@@ -10,7 +10,8 @@ mod worker;
 
 pub(crate) use sources::sanitize_anki_filename;
 pub use sources::{
-    ascii_safe_audio_filename, enumerate_word_audio_sources, fetch_word_audio, resolve_word_audio,
+    ascii_safe_audio_filename, download_timeout_config, download_timeout_ms,
+    enumerate_word_audio_sources, fetch_word_audio, resolve_word_audio, set_download_timeout_ms,
 };
 pub use worker::AudioController;
 
@@ -18,9 +19,11 @@ pub use worker::AudioController;
 mod tests {
     use super::super::config::AudioSourceEntry;
     use super::sources::{
-        classify_url, enumerate_word_audio_sources, expand_source_url, fetch_word_audio,
-        fetch_word_audio_with_client, first_audio_candidate, md5_hex, parse_json_audio_entries,
-        parse_json_audio_sources, resolve_word_audio, Md5Hasher, SourceLocation,
+        classify_url, download_timeout_config, download_timeout_ms, enumerate_word_audio_sources,
+        expand_source_url, fetch_word_audio, fetch_word_audio_with_client,
+        fetch_word_audio_with_client_and_timeout, first_audio_candidate, md5_hex,
+        parse_json_audio_entries, parse_json_audio_sources, resolve_word_audio,
+        set_download_timeout_ms, Md5Hasher, SourceLocation,
     };
     use super::worker::{AudioController, AudioWorker, PlaybackBackend};
     use memento_net::http::{HttpClient, HttpClientConfig};
@@ -1010,5 +1013,139 @@ mod tests {
         for p in paths {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn download_timeout_uses_bounded_config_and_enforces_per_request_timeout() {
+        // Default is 8_000 ms; bounds clamp strictly to 1_000..=30_000 ms.
+        set_download_timeout_ms(memento_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+        assert_eq!(download_timeout_ms(), 8_000);
+        assert_eq!(download_timeout_config().timeout(), Duration::from_secs(8));
+
+        set_download_timeout_ms(250);
+        assert_eq!(download_timeout_ms(), 1_000);
+        set_download_timeout_ms(12_500);
+        assert_eq!(download_timeout_ms(), 12_500);
+        set_download_timeout_ms(120_000);
+        assert_eq!(download_timeout_ms(), 30_000);
+        // Restore default so other tests see the 8 s default.
+        set_download_timeout_ms(memento_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+
+        // Verify `send_with_request_timeout` overrides a long-timeout client cleanly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 1024];
+                let _ = stream.read(&mut req);
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: audio/mpeg\r\n\r\nID3slow",
+                );
+            }
+        });
+        let slow_client = HttpClient::new(HttpClientConfig {
+            timeout: Some(Duration::from_secs(30)),
+            connect_timeout: Some(Duration::from_secs(5)),
+            ..HttpClientConfig::default()
+        });
+        let sources = vec![source(
+            "SlowServer",
+            &format!("http://{addr}/slow.mp3"),
+            AudioSourceType::AudioSourceTypeFile,
+            "",
+        )];
+        let started = Instant::now();
+        let err = fetch_word_audio_with_client_and_timeout(
+            &slow_client,
+            "猫",
+            "ねこ",
+            &sources,
+            Some(Duration::from_millis(200)),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "per-request timeout override must abort quickly, took {elapsed:?} (err: {err})"
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn worker_and_controller_clear_cache_force_fresh_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = Arc::clone(&hits);
+        let server = std::thread::spawn(move || {
+            for seq in 1..=3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                server_hits.fetch_add(1, Ordering::AcqRel);
+                let body = format!("ID3payload-v{seq}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let url = format!("http://{addr}/word.mp3");
+        let sources = vec![source(
+            "LocalHttp",
+            &url,
+            AudioSourceType::AudioSourceTypeFile,
+            "",
+        )];
+
+        // 1. Direct `AudioWorker::clear_cache()` clears the LRU cache cleanly.
+        let mock = MockPlayback::new();
+        let played = Arc::clone(&mock.played);
+        let generation = Arc::new(AtomicU64::new(1));
+        let mut worker = AudioWorker::with_backend(mock, fast_http_client(), generation);
+        worker.play_word(1, "猫", "ねこ", &sources).unwrap();
+        assert_eq!(worker.cache_len(), 1);
+        assert_eq!(hits.load(Ordering::Acquire), 1);
+
+        // Cache hit: no second HTTP request.
+        worker.play_word(1, "猫", "ねこ", &sources).unwrap();
+        assert_eq!(hits.load(Ordering::Acquire), 1);
+
+        // Clear cache -> next playback fetches v2 from server.
+        worker.clear_cache();
+        assert_eq!(worker.cache_len(), 0);
+        worker.play_word(1, "猫", "ねこ", &sources).unwrap();
+        assert_eq!(hits.load(Ordering::Acquire), 2);
+        assert_eq!(worker.cache_len(), 1);
+        {
+            let log = played.lock().unwrap();
+            assert_eq!(log[0].1.as_slice(), b"ID3payload-v1");
+            assert_eq!(log[2].1.as_slice(), b"ID3payload-v2");
+        }
+        drop(worker);
+
+        // 2. `AudioController::clear_cache()` dispatches cleanly to the worker thread.
+        let ctrl_mock = MockPlayback::new();
+        let ctrl_played = Arc::clone(&ctrl_mock.played);
+        let controller = AudioController::with_backend(ctrl_mock, fast_http_config()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        controller
+            .play_word("猫", "ねこ", sources.clone(), move |r| {
+                let _ = tx.send(r);
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(hits.load(Ordering::Acquire), 3);
+        controller.clear_cache();
+        // Calling clear_cache again is safe and never hangs on drop.
+        drop(controller);
+        assert_eq!(
+            ctrl_played.lock().unwrap()[0].1.as_slice(),
+            b"ID3payload-v3"
+        );
+        server.join().unwrap();
     }
 }

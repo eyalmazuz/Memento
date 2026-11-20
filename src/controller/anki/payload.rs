@@ -390,8 +390,11 @@ pub fn default_note_fields(ctx: &NoteFieldsContext) -> HashMap<String, String> {
     let glossary_out = format_context_glossary_selected(ctx, None, TermGlossaryVariants::FULL);
 
     let mut fields = HashMap::new();
-    fields.insert("Expression".to_string(), ctx.expression.clone());
-    fields.insert("Reading".to_string(), ctx.reading.clone());
+    fields.insert(
+        "Expression".to_string(),
+        ctx.effective_expression().to_string(),
+    );
+    fields.insert("Reading".to_string(), ctx.effective_reading().to_string());
     fields.insert("Glossary".to_string(), glossary_out.glossary);
     fields.insert("Sentence".to_string(), cloze_str);
     fields.insert("ClozePrefix".to_string(), ctx.cloze_prefix.clone());

@@ -1,11 +1,38 @@
 //! Glossary HTML rendering (with selective variant building) and scoped dictionary CSS.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use memento_anki::note::{
     format_kanji_glossary, format_term_glossary_selected, KanjiDefEntry, TermGlossaryDef,
     TermGlossaryVariant, TermGlossaryVariants,
 };
 
 use super::context::{GlossaryDefinition, NoteFieldsContext};
+
+const MAX_SCOPED_CSS_CACHE_ENTRIES: usize = 256;
+
+#[derive(Clone, Debug)]
+struct CachedScopedCss {
+    dict_name: String,
+    raw_len: usize,
+    scoped: String,
+}
+
+static SCOPED_CSS_CACHE: OnceLock<Mutex<HashMap<(i64, u64), CachedScopedCss>>> = OnceLock::new();
+
+fn scoped_css_cache() -> &'static Mutex<HashMap<(i64, u64), CachedScopedCss>> {
+    SCOPED_CSS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 /// Rendered glossary output in full, brief, and compact styles.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -302,6 +329,61 @@ pub fn scope_dictionary_css(css: &str, dict_name: &str) -> String {
         safe.push_str(tail);
     }
     safe
+}
+
+/// Scopes a dictionary's `styles.css` with a process-wide bounded cache keyed by
+/// `(dict_id, raw_css_hash)` to avoid repeated scoping latency on Anki note adds
+/// (Yomitan `#2512`).
+pub fn scope_dictionary_css_cached(dict_id: i64, css: &str, dict_name: &str) -> String {
+    if css.trim().is_empty() {
+        return String::new();
+    }
+    let raw_hash = fnv1a_64(css.as_bytes());
+    let key = (dict_id, raw_hash);
+    {
+        let cache = scoped_css_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get(&key) {
+            if entry.dict_name == dict_name && entry.raw_len == css.len() {
+                return entry.scoped.clone();
+            }
+        }
+    }
+    let scoped = scope_dictionary_css(css, dict_name);
+    {
+        let mut cache = scoped_css_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= MAX_SCOPED_CSS_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CachedScopedCss {
+                dict_name: dict_name.to_owned(),
+                raw_len: css.len(),
+                scoped: scoped.clone(),
+            },
+        );
+    }
+    scoped
+}
+
+/// Clears the cached scoped dictionary CSS entries.
+pub fn clear_scoped_css_cache() {
+    let mut cache = scoped_css_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clear();
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_css_cache_len() -> usize {
+    scoped_css_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
 }
 
 fn definition_html(definition: &GlossaryDefinition) -> String {

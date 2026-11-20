@@ -1,6 +1,7 @@
 //! Anki duplicate inspection queries, browse query formatting, and batched `findNotes` RPCs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use memento_net::anki::{AnkiAction, AnkiClient};
 
@@ -14,6 +15,117 @@ use super::payload::{AnkiDuplicatePolicy, NoteBuildError, NotePayload};
 
 /// Maximum `findNotes` sub-actions packed into a single AnkiConnect `multi` RPC.
 const FIND_NOTES_MULTI_BATCH_SIZE: usize = 64;
+
+/// Maximum cached `(endpoint_url, model)` entries for `modelFieldNames`.
+const MAX_MODEL_FIELD_CACHE_ENTRIES: usize = 128;
+
+static MODEL_FIELD_NAMES_CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<String>>>> =
+    OnceLock::new();
+
+fn model_field_names_cache() -> &'static Mutex<HashMap<(String, String), Vec<String>>> {
+    MODEL_FIELD_NAMES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns cached `modelFieldNames` for `(endpoint_url, model)` without issuing an RPC.
+pub fn lookup_cached_model_field_names(endpoint_url: &str, model: &str) -> Option<Vec<String>> {
+    if model.trim().is_empty() {
+        return None;
+    }
+    let cache = model_field_names_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .get(&(endpoint_url.to_owned(), model.to_owned()))
+        .cloned()
+}
+
+/// Queries and caches `AnkiClient::model_field_names(model)` per `(endpoint, model)`.
+pub fn cached_model_field_names(
+    client: &AnkiClient,
+    model: &str,
+) -> Result<Vec<String>, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("modelName cannot be empty".to_owned());
+    }
+    let key = (client.endpoint_url(), trimmed.to_owned());
+    {
+        let cache = model_field_names_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(fields) = cache.get(&key) {
+            return Ok(fields.clone());
+        }
+    }
+    let fields = client
+        .model_field_names(trimmed)
+        .map_err(|error| error.to_string())?;
+    if !fields.is_empty() {
+        let mut cache = model_field_names_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= MAX_MODEL_FIELD_CACHE_ENTRIES && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, fields.clone());
+    }
+    Ok(fields)
+}
+
+/// Clears all cached `modelFieldNames` entries (e.g. when Anki profile settings change).
+pub fn invalidate_model_field_names_cache() {
+    let mut cache = model_field_names_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clear();
+}
+
+/// Resolves the exact first/sort field name of `profile.model` via cached
+/// `AnkiClient::model_field_names`, falling back to `select_primary_key_field`
+/// only when `modelFieldNames` fails or returns an empty list.
+pub fn resolve_model_first_field(
+    client: &AnkiClient,
+    profile: &AnkiNoteConfig,
+) -> Option<String> {
+    if let Ok(fields) = cached_model_field_names(client, &profile.model) {
+        if let Some(first) = fields.into_iter().find(|f| !f.trim().is_empty()) {
+            return Some(first);
+        }
+    }
+    select_primary_key_field(&profile.field_templates)
+}
+
+/// Lookup descriptor for batched Anki duplicate checking, optionally flipping a term
+/// to export its kana reading as `{expression}` (`readingAsExpression`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryAnkiLookup {
+    pub expression: String,
+    pub reading: String,
+    pub reading_as_expression: bool,
+}
+
+impl EntryAnkiLookup {
+    pub fn new(expression: impl Into<String>, reading: impl Into<String>) -> Self {
+        Self {
+            expression: expression.into(),
+            reading: reading.into(),
+            reading_as_expression: false,
+        }
+    }
+
+    pub fn with_reading_as_expression(mut self, reading_as_expression: bool) -> Self {
+        self.reading_as_expression = reading_as_expression;
+        self
+    }
+}
+
+/// Result of checking whether a term can be added in kanji (`expression`) and/or
+/// kana (`reading`, i.e. `reading_as_expression = true`) form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermAddableStatus {
+    pub expression: bool,
+    pub reading: bool,
+}
 
 /// Per-entry Anki duplicate and existing card tag status (#340, #346).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -113,14 +225,122 @@ pub(crate) fn select_primary_key_field(
     sorted.first().map(|(name, _)| (*name).clone())
 }
 
+fn format_field_clause(field_name: &str, field_val: &str) -> String {
+    let escaped_val = escape_anki_search_term(field_val);
+    if field_name
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == ':')
+    {
+        format!(
+            "\"{}\":\"{escaped_val}\"",
+            escape_anki_search_term(field_name)
+        )
+    } else {
+        format!("{field_name}:\"{escaped_val}\"")
+    }
+}
+
 /// Builds the Anki search query used by `findNotes` for `(expression, reading)` under `profile`.
 pub fn build_entry_find_query(
     profile: &AnkiNoteConfig,
     expression: &str,
     reading: &str,
 ) -> Result<String, String> {
-    let (_, query) = build_entry_probe_and_query(profile, expression, reading)?;
+    build_entry_find_query_with_options(profile, expression, reading, false)
+}
+
+/// Builds the Anki search query used by `findNotes` for `(expression, reading)` under `profile`,
+/// optionally treating `reading` as `{expression}` (`reading_as_expression = true`).
+pub fn build_entry_find_query_with_options(
+    profile: &AnkiNoteConfig,
+    expression: &str,
+    reading: &str,
+    reading_as_expression: bool,
+) -> Result<String, String> {
+    let (_, query) = build_entry_probe_and_query(profile, expression, reading, reading_as_expression)?;
     Ok(query)
+}
+
+/// Builds a `guiBrowse` duplicate query using the exact first/sort field `first_field`
+/// (from `modelFieldNames`), adding `OR <first_field>:"<reading>"` whenever
+/// `!reading.is_empty() && reading != expression` and the rendered reading value differs.
+pub fn build_duplicate_browse_query_with_field(
+    profile: &AnkiNoteConfig,
+    first_field: &str,
+    expression: &str,
+    reading: &str,
+) -> Result<String, String> {
+    let mut meta = ProbeProfileMeta::from_profile(profile)?;
+    if !first_field.trim().is_empty() {
+        meta.key_field = Some(first_field.to_owned());
+    }
+    let key_field = meta.key_field.as_deref();
+    let render_key_value = |reading_as_expression: bool| -> String {
+        let mut ctx = NoteFieldsContext::new(expression, reading, "");
+        ctx.clipboard = Some(String::new());
+        ctx.reading_as_expression = reading_as_expression;
+        if meta.has_character {
+            ctx.is_kanji = true;
+            ctx.character = expression.to_owned();
+        }
+        let fields = map_note_fields(&profile.field_templates, &ctx);
+        key_field
+            .and_then(|k| fields.get(k))
+            .filter(|v| !v.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| ctx.effective_expression().to_owned())
+    };
+
+    let expr_val = render_key_value(false);
+    let expr_clause = match key_field {
+        Some(field_name) => format_field_clause(field_name, &expr_val),
+        None => format!("\"{}\"", escape_anki_search_term(&expr_val)),
+    };
+
+    let mut combined_clause = expr_clause;
+    let mut has_or = false;
+    if !meta.has_character && !reading.is_empty() && reading != expression {
+        let read_val = render_key_value(true);
+        if !read_val.trim().is_empty() && read_val != expr_val {
+            let read_clause = match key_field {
+                Some(field_name) => format_field_clause(field_name, &read_val),
+                None => format!("\"{}\"", escape_anki_search_term(&read_val)),
+            };
+            combined_clause = format!("{combined_clause} OR {read_clause}");
+            has_or = true;
+        }
+    }
+
+    let query = match meta.policy {
+        AnkiDuplicatePolicy::None => combined_clause,
+        AnkiDuplicatePolicy::DifferentDeck | AnkiDuplicatePolicy::SameDeck => {
+            if has_or {
+                format!(
+                    "deck:\"{}\" ({combined_clause})",
+                    escape_anki_search_term(&profile.deck)
+                )
+            } else {
+                format!(
+                    "deck:\"{}\" {combined_clause}",
+                    escape_anki_search_term(&profile.deck)
+                )
+            }
+        }
+    };
+    Ok(query)
+}
+
+/// Queries and caches `AnkiClient::model_field_names(profile.model)` per `(endpoint, model)`
+/// to determine the exact first/sort field for `guiBrowse` duplicate queries, supporting
+/// `OR reading` when `expression != reading`.
+pub fn build_duplicate_browse_query(
+    client: &AnkiClient,
+    profile: &AnkiNoteConfig,
+    expression: &str,
+    reading: &str,
+) -> Result<String, String> {
+    let first_field = resolve_model_first_field(client, profile).unwrap_or_default();
+    build_duplicate_browse_query_with_field(profile, &first_field, expression, reading)
 }
 
 pub(crate) struct ProbeProfileMeta {
@@ -131,6 +351,13 @@ pub(crate) struct ProbeProfileMeta {
 
 impl ProbeProfileMeta {
     pub(crate) fn from_profile(profile: &AnkiNoteConfig) -> Result<Self, String> {
+        Self::from_profile_with_key_field(profile, None)
+    }
+
+    pub(crate) fn from_profile_with_key_field(
+        profile: &AnkiNoteConfig,
+        exact_first_field: Option<String>,
+    ) -> Result<Self, String> {
         if profile.deck.trim().is_empty() {
             return Err("deckName cannot be empty".to_owned());
         }
@@ -142,7 +369,9 @@ impl ProbeProfileMeta {
         }
         let policy = AnkiDuplicatePolicy::try_from(profile.duplicate_policy)
             .map_err(|error| error.to_string())?;
-        let key_field = select_primary_key_field(&profile.field_templates);
+        let key_field = exact_first_field
+            .filter(|f| !f.trim().is_empty())
+            .or_else(|| select_primary_key_field(&profile.field_templates));
         let has_character =
             templates_reference_marker(profile.field_templates.values(), "character");
         Ok(Self {
@@ -153,24 +382,27 @@ impl ProbeProfileMeta {
     }
 }
 
-pub(crate) fn build_entry_probe_and_query_with_meta(
+pub(crate) fn build_entry_probe_and_query_with_options(
     profile: &AnkiNoteConfig,
     meta: &ProbeProfileMeta,
     expression: &str,
     reading: &str,
+    reading_as_expression: bool,
 ) -> (serde_json::Value, String) {
     let mut ctx = NoteFieldsContext::new(expression, reading, "");
     ctx.clipboard = Some(String::new());
+    ctx.reading_as_expression = reading_as_expression;
     if meta.has_character {
         ctx.is_kanji = true;
         ctx.character = expression.to_owned();
     }
 
+    let effective_expr = ctx.effective_expression().to_owned();
     let mut fields = map_note_fields(&profile.field_templates, &ctx);
     if fields.values().all(|v| v.trim().is_empty()) {
         if let Some(ref k) = meta.key_field {
-            if !expression.trim().is_empty() {
-                fields.insert(k.clone(), expression.to_owned());
+            if !effective_expr.trim().is_empty() {
+                fields.insert(k.clone(), effective_expr.clone());
             }
         }
     }
@@ -181,20 +413,9 @@ pub(crate) fn build_entry_probe_and_query_with_meta(
             .filter(|v| !v.trim().is_empty())
             .map(|v| (k, v))
     }) {
-        let escaped_val = escape_anki_search_term(field_val);
-        if field_name
-            .chars()
-            .any(|c| c.is_whitespace() || c == '"' || c == ':')
-        {
-            format!(
-                "\"{}\":\"{escaped_val}\"",
-                escape_anki_search_term(field_name)
-            )
-        } else {
-            format!("{field_name}:\"{escaped_val}\"")
-        }
+        format_field_clause(field_name, field_val)
     } else {
-        format!("\"{}\"", escape_anki_search_term(expression))
+        format!("\"{}\"", escape_anki_search_term(&effective_expr))
     };
 
     let find_query = match meta.policy {
@@ -224,10 +445,15 @@ fn build_entry_probe_and_query(
     profile: &AnkiNoteConfig,
     expression: &str,
     reading: &str,
+    reading_as_expression: bool,
 ) -> Result<(serde_json::Value, String), String> {
     let meta = ProbeProfileMeta::from_profile(profile)?;
-    Ok(build_entry_probe_and_query_with_meta(
-        profile, &meta, expression, reading,
+    Ok(build_entry_probe_and_query_with_options(
+        profile,
+        &meta,
+        expression,
+        reading,
+        reading_as_expression,
     ))
 }
 
@@ -264,6 +490,15 @@ fn parse_find_notes_subresult(value: &serde_json::Value) -> Result<Vec<i64>, Str
         .ok_or_else(|| "AnkiConnect multi findNotes item is not an array".to_owned())?;
     let mut ids = Vec::with_capacity(items.len());
     for item in items {
+        // Filter out non-positive or null note IDs cleanly (Yomitan PR #2510).
+        if item.is_null()
+            || item.as_i64().is_some_and(|n| n <= 0)
+            || item
+                .as_f64()
+                .is_some_and(|n| n.is_finite() && n.fract() == 0.0 && n <= 0.0)
+        {
+            continue;
+        }
         let id = parse_positive_note_id(item)
             .ok_or_else(|| "AnkiConnect findNotes returned an invalid note ID".to_owned())?;
         ids.push(id);
@@ -275,6 +510,8 @@ fn parse_find_notes_subresult(value: &serde_json::Value) -> Result<Vec<i64>, Str
 ///
 /// Uses a direct `findNotes` RPC when only 1 query is needed and batches multiple
 /// queries via AnkiConnect `multi` (`AnkiAction::Multi`) to avoid O(N) HTTP roundtrips.
+/// Every sub-action is built via [`AnkiClient::build_multi_action`] so `"key": api_key`
+/// is included whenever `use_api_key` is enabled (Yomitan PR #2421).
 pub(crate) fn batch_find_note_ids(
     client: &AnkiClient,
     queries: &[String],
@@ -301,18 +538,13 @@ pub(crate) fn batch_find_note_ids(
         let actions: Vec<serde_json::Value> = chunk
             .iter()
             .map(|query| {
-                serde_json::json!({
-                    "action": AnkiAction::FindNotes.as_wire(),
-                    "params": { "query": query },
-                })
+                client.build_multi_action(
+                    AnkiAction::FindNotes,
+                    Some(serde_json::json!({ "query": query })),
+                )
             })
             .collect();
-        let reply = client
-            .request(
-                AnkiAction::Multi,
-                Some(serde_json::json!({ "actions": actions })),
-            )
-            .map_err(|error| error.to_string())?;
+        let reply = client.multi(actions).map_err(|error| error.to_string())?;
         let entries = reply
             .as_array()
             .ok_or_else(|| "AnkiConnect multi response result is not an array".to_owned())?;

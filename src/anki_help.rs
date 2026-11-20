@@ -135,7 +135,7 @@ fn description(name: &str) -> &'static str {
         "cloze-prefix" => "The text before {cloze-body}.",
         "cloze-suffix" => "The text after {cloze-body}.",
         "context" => "Text of all selected lines in the primary subtitle list.",
-        "context-2" => "Text of all selected lines in the secondary subtitle list.",
+        "context-2" => "Text of secondary subtitle lines whose timestamps overlap the selected primary context (falls back to {subtitle-2} if none overlap).",
         "expression" => "The expression in kanji. Kana if there is no kanji or explicitly requested.",
         "frequencies" => "Bulleted list of frequency tags.",
         "frequency-average-occurrence" => "The average of frequency data for the expression. Defaults to 0 occurrences when frequency data is not available.",
@@ -430,6 +430,12 @@ mod tests {
         assert_eq!(
             width_total, 2,
             "argument search must match screenshot & screenshot-video"
+        );
+
+        let ctx2_desc = description("context-2").to_ascii_lowercase();
+        assert!(
+            ctx2_desc.contains("overlap") && ctx2_desc.contains("secondary"),
+            "context-2 help must accurately describe time-overlapping secondary subtitle lines: {ctx2_desc}"
         );
     }
 }

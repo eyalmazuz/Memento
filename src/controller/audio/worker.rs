@@ -40,6 +40,11 @@ struct AudioRequest {
     completion: Completion,
 }
 
+enum WorkerCommand {
+    Play(AudioRequest),
+    ClearCache,
+}
+
 pub(super) trait PlaybackBackend {
     fn play_file(&mut self, path: &Path) -> Result<(), String>;
 }
@@ -51,7 +56,7 @@ impl PlaybackBackend for AudioInstance {
 }
 
 struct ChannelState {
-    sender: Option<Sender<AudioRequest>>,
+    sender: Option<Sender<WorkerCommand>>,
     init_error: Option<String>,
 }
 
@@ -175,8 +180,10 @@ impl AudioController {
                             state.sender = None;
                         }
                         if !worker_shutdown.load(Ordering::Acquire) {
-                            while let Ok(request) = receiver.recv() {
-                                (request.completion)(Err(error.clone()));
+                            while let Ok(command) = receiver.recv() {
+                                if let WorkerCommand::Play(request) = command {
+                                    (request.completion)(Err(error.clone()));
+                                }
                             }
                         }
                     }
@@ -223,19 +230,37 @@ impl AudioController {
         };
         let generation = self.inner.latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
         sender
-            .send(AudioRequest {
+            .send(WorkerCommand::Play(AudioRequest {
                 generation,
                 expression: expression.into(),
                 reading: reading.into(),
                 sources,
                 completion: Box::new(callback),
-            })
+            }))
             .map_err(|_| {
                 state
                     .init_error
                     .clone()
                     .unwrap_or_else(|| "audio worker is unavailable".to_owned())
             })
+    }
+
+    /// Clears the worker's 10-entry LRU pronunciation audio cache cleanly (e.g.
+    /// whenever Audio Sources are changed in Settings).
+    pub fn clear_cache(&self) {
+        let state = self
+            .inner
+            .channel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = state.sender.as_ref() {
+            let _ = sender.send(WorkerCommand::ClearCache);
+        }
+    }
+
+    /// Updates the bounded pronunciation audio download timeout (`1_000..=30_000` ms).
+    pub fn set_download_timeout_ms(&self, timeout_ms: u64) {
+        super::sources::set_download_timeout_ms(timeout_ms);
     }
 }
 
@@ -308,23 +333,48 @@ impl<P: PlaybackBackend> AudioWorker<P> {
         )
     }
 
+    /// Clears the 10-entry LRU pronunciation audio cache cleanly (keeping any
+    /// currently playing `active_file` alive until playback switches).
+    pub(super) fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
     fn is_superseded(&self, generation: u64) -> bool {
         self.shutdown.load(Ordering::Acquire)
             || self.latest_generation.load(Ordering::Acquire) != generation
     }
 
-    fn run(&mut self, receiver: Receiver<AudioRequest>) {
-        while let Ok(mut request) = receiver.recv() {
+    fn run(&mut self, receiver: Receiver<WorkerCommand>) {
+        while let Ok(command) = receiver.recv() {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
+            let mut request = match command {
+                WorkerCommand::ClearCache => {
+                    self.clear_cache();
+                    continue;
+                }
+                WorkerCommand::Play(req) => req,
+            };
             // Coalesce bursts of rapid play clicks so only the latest request runs.
             while let Ok(newer) = receiver.try_recv() {
                 if self.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                (request.completion)(Ok(()));
-                request = newer;
+                match newer {
+                    WorkerCommand::ClearCache => {
+                        self.clear_cache();
+                    }
+                    WorkerCommand::Play(next_req) => {
+                        (request.completion)(Ok(()));
+                        request = next_req;
+                    }
+                }
             }
             if self.shutdown.load(Ordering::Acquire) {
                 break;

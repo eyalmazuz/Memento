@@ -160,11 +160,16 @@ fn parse_glossary_dict_filter(marker: &Marker) -> GlossaryDictFilter {
 }
 
 pub(crate) fn template_references_any_marker(template: &str, marker_names: &[&str]) -> bool {
-    for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
-        for marker in &token.markers {
-            let name = String::from_utf16_lossy(&marker.name);
-            if marker_names.iter().any(|expected| *expected == name) {
-                return true;
+    for (segment, is_literal_cloze_opener) in split_anki_cloze_openers(template) {
+        if is_literal_cloze_opener {
+            continue;
+        }
+        for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+            for marker in &token.markers {
+                let name = String::from_utf16_lossy(&marker.name);
+                if marker_names.iter().any(|expected| *expected == name) {
+                    return true;
+                }
             }
         }
     }
@@ -307,12 +312,20 @@ fn filter_and_replace_newlines<'a>(
     }
 }
 
+fn format_selection_cow(ctx: &NoteFieldsContext) -> Cow<'static, str> {
+    if ctx.selections.is_empty() && ctx.selection.is_empty() {
+        Cow::Borrowed("")
+    } else {
+        Cow::Owned(ctx.formatted_selection())
+    }
+}
+
 impl<'a> CommonTextFields<'a> {
     pub(crate) fn raw(ctx: &'a NoteFieldsContext, clipboard: &'a str) -> Self {
         Self {
             sentence: Cow::Borrowed(&ctx.sentence),
             context: Cow::Borrowed(&ctx.context),
-            selection: Cow::Borrowed(&ctx.selection),
+            selection: format_selection_cow(ctx),
             secondary_subtitle: Cow::Borrowed(&ctx.secondary_subtitle),
             secondary_context: Cow::Borrowed(&ctx.secondary_context),
             title: Cow::Borrowed(&ctx.title),
@@ -346,7 +359,7 @@ impl<'a> CommonTextFields<'a> {
                 replace_with,
                 newline_replacer,
             ),
-            selection: replace_newlines_cow(&ctx.selection, newline_replacer),
+            selection: format_selection_cow(ctx),
             secondary_subtitle: replace_newlines_cow(&ctx.secondary_subtitle, newline_replacer),
             secondary_context: replace_newlines_cow(&ctx.secondary_context, newline_replacer),
             title: replace_newlines_cow(&ctx.title, newline_replacer),
@@ -402,32 +415,37 @@ impl RenderedTemplateData {
         let mut has_media_marker = false;
 
         for template in field_templates.values() {
-            for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
-                for marker in &token.markers {
-                    let name = String::from_utf16_lossy(&marker.name);
-                    match name.as_str() {
-                        "glossary" | "glossary-brief" | "glossary-compact" => {
-                            if let Some(variant) = glossary_variant_for_marker(&name) {
-                                match parse_glossary_dict_filter(marker) {
-                                    GlossaryDictFilter::Unfiltered => {
-                                        set_variant_flag(&mut unfiltered_variants, variant);
+            for (segment, is_literal_cloze_opener) in split_anki_cloze_openers(template) {
+                if is_literal_cloze_opener {
+                    continue;
+                }
+                for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+                    for marker in &token.markers {
+                        let name = String::from_utf16_lossy(&marker.name);
+                        match name.as_str() {
+                            "glossary" | "glossary-brief" | "glossary-compact" => {
+                                if let Some(variant) = glossary_variant_for_marker(&name) {
+                                    match parse_glossary_dict_filter(marker) {
+                                        GlossaryDictFilter::Unfiltered => {
+                                            set_variant_flag(&mut unfiltered_variants, variant);
+                                        }
+                                        GlossaryDictFilter::ById(id) => {
+                                            let entry = filtered_variants
+                                                .entry(id)
+                                                .or_insert(TermGlossaryVariants::NONE);
+                                            set_variant_flag(entry, variant);
+                                        }
+                                        GlossaryDictFilter::Invalid => {}
                                     }
-                                    GlossaryDictFilter::ById(id) => {
-                                        let entry = filtered_variants
-                                            .entry(id)
-                                            .or_insert(TermGlossaryVariants::NONE);
-                                        set_variant_flag(entry, variant);
-                                    }
-                                    GlossaryDictFilter::Invalid => {}
                                 }
                             }
+                            "tags" => need_tags_full = true,
+                            "tags-brief" => need_tags_brief = true,
+                            "part-of-speech" => need_pos = true,
+                            "clipboard" => need_clipboard = true,
+                            other if is_media_marker(other) => has_media_marker = true,
+                            _ => {}
                         }
-                        "tags" => need_tags_full = true,
-                        "tags-brief" => need_tags_brief = true,
-                        "part-of-speech" => need_pos = true,
-                        "clipboard" => need_clipboard = true,
-                        other if is_media_marker(other) => has_media_marker = true,
-                        _ => {}
                     }
                 }
             }
@@ -507,19 +525,11 @@ fn resolve_frequency_scalar<'a>(name: &str, ctx: &'a NoteFieldsContext) -> Optio
         }),
         "frequency-harmonic-occurrence" => Some(if !ctx.frequency_harmonic_occurrence.is_empty() {
             ctx.frequency_harmonic_occurrence.as_str()
-        } else if !ctx.frequency_harmonic_rank.is_empty()
-            && ctx.frequency_harmonic_rank != "9999999"
-        {
-            ctx.frequency_harmonic_rank.as_str()
         } else {
             "0"
         }),
         "frequency-average-occurrence" => Some(if !ctx.frequency_average_occurrence.is_empty() {
             ctx.frequency_average_occurrence.as_str()
-        } else if !ctx.frequency_average_rank.is_empty()
-            && ctx.frequency_average_rank != "9999999"
-        {
-            ctx.frequency_average_rank.as_str()
         } else {
             "0"
         }),
@@ -617,13 +627,13 @@ fn evaluate_specific_marker_named(
     }
 
     let text_opt = match name {
-        "expression" => Some(ctx.expression.as_str()),
-        "reading" => Some(ctx.reading.as_str()),
+        "expression" => Some(ctx.effective_expression()),
+        "reading" => Some(ctx.effective_reading()),
         "tags" => Some(rendered.tags_full.as_str()),
         "tags-brief" => Some(rendered.tags_brief.as_str()),
         "part-of-speech" => Some(rendered.part_of_speech.as_str()),
-        "furigana" => Some(ctx.furigana.as_str()),
-        "furigana-plain" => Some(ctx.furigana_plain.as_str()),
+        "furigana" => Some(ctx.effective_furigana()),
+        "furigana-plain" => Some(ctx.effective_furigana_plain()),
         "pitch" | "pitch-accents" | "pitch-accent" => Some(ctx.pitch.as_str()),
         "pitch-graphs" | "pitch-graph" | "pitch-accent-graphs" => Some(ctx.pitch_graphs.as_str()),
         "pitch-positions" | "pitch-position" | "pitch-accent-positions" => {
@@ -691,6 +701,42 @@ pub fn map_note_fields(
     map_note_fields_with_data(field_templates, ctx, &text_fields, &rendered)
 }
 
+/// Splits a template around literal Anki cloze deletion openers (`{{c1::`, `{{c2::`, …)
+/// so `{.*?}` tokenization inside `memento_anki::note::substitute_markers` preserves the
+/// `{{cN::` prefix verbatim while still substituting any known Memento markers inside it
+/// (e.g. `{{c1::{cloze-body}}}` -> `{{c1::食べる}}`, while `{{c1::literal}}` stays verbatim).
+fn split_anki_cloze_openers(template: &str) -> Vec<(&str, bool)> {
+    if !template.contains("{{c") {
+        return vec![(template, false)];
+    }
+    let bytes = template.as_bytes();
+    let mut parts = Vec::new();
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i + 5 <= bytes.len() {
+        if &bytes[i..i + 3] == b"{{c" {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 3 && j + 2 <= bytes.len() && &bytes[j..j + 2] == b"::" {
+                if i > cursor {
+                    parts.push((&template[cursor..i], false));
+                }
+                parts.push((&template[i..j + 2], true));
+                cursor = j + 2;
+                i = cursor;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if cursor < template.len() {
+        parts.push((&template[cursor..], false));
+    }
+    parts
+}
+
 pub(crate) fn map_note_fields_with_data(
     field_templates: &HashMap<String, String>,
     ctx: &NoteFieldsContext,
@@ -699,21 +745,29 @@ pub(crate) fn map_note_fields_with_data(
 ) -> HashMap<String, String> {
     let mut result = HashMap::with_capacity(field_templates.len());
     for (field_name, template) in field_templates {
-        let input: Vec<u16> = template.encode_utf16().collect();
-        let output = substitute_markers(
-            &input,
-            |marker| {
-                let name = String::from_utf16_lossy(&marker.name);
-                common_marker_value(&name, text_fields)
-                    .map(marker_result)
-                    .unwrap_or_default()
-            },
-            |marker| {
-                let name = String::from_utf16_lossy(&marker.name);
-                evaluate_specific_marker_named(field_name, &name, marker, ctx, rendered)
-            },
-        );
-        result.insert(field_name.clone(), String::from_utf16_lossy(&output));
+        let mut rendered_field = String::with_capacity(template.len());
+        for (segment, is_literal_cloze_opener) in split_anki_cloze_openers(template) {
+            if is_literal_cloze_opener {
+                rendered_field.push_str(segment);
+                continue;
+            }
+            let input: Vec<u16> = segment.encode_utf16().collect();
+            let output = substitute_markers(
+                &input,
+                |marker| {
+                    let name = String::from_utf16_lossy(&marker.name);
+                    common_marker_value(&name, text_fields)
+                        .map(marker_result)
+                        .unwrap_or_default()
+                },
+                |marker| {
+                    let name = String::from_utf16_lossy(&marker.name);
+                    evaluate_specific_marker_named(field_name, &name, marker, ctx, rendered)
+                },
+            );
+            rendered_field.push_str(&String::from_utf16_lossy(&output));
+        }
+        result.insert(field_name.clone(), rendered_field);
     }
     result
 }
@@ -740,11 +794,10 @@ pub(crate) fn validate_template_markers(
                 }
                 continue;
             }
+            // Leave unknown `{...}` tokens (including Anki cloze `{{c1::...}}` and
+            // literal braces/CSS) verbatim instead of failing note creation.
             if !is_known_marker(&name) {
-                return Err(NoteBuildError::MissingMarkerData {
-                    field: field.to_owned(),
-                    marker: name,
-                });
+                continue;
             }
             let eval = evaluate_specific_marker_named(field, &name, marker, ctx, rendered);
             if eval.media || !eval.text.is_empty() {
@@ -784,32 +837,37 @@ pub(crate) fn referenced_dictionary_media_files_with_data(
     sorted_fields.sort_by_key(|(name, _)| *name);
 
     for (field, template) in sorted_fields {
-        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
-            for marker in &token.markers {
-                let name = String::from_utf16_lossy(&marker.name);
-                if let Some(value) = common_marker_value(&name, &text_fields) {
-                    if !value.is_empty() {
-                        break;
+        for (segment, is_literal_cloze_opener) in split_anki_cloze_openers(template) {
+            if is_literal_cloze_opener {
+                continue;
+            }
+            for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+                for marker in &token.markers {
+                    let name = String::from_utf16_lossy(&marker.name);
+                    if let Some(value) = common_marker_value(&name, &text_fields) {
+                        if !value.is_empty() {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                if glossary_variant_for_marker(&name).is_some() {
-                    let filter = parse_glossary_dict_filter(marker);
-                    for def in ctx.glossary_definitions.iter().filter(|def| match filter {
-                        GlossaryDictFilter::Unfiltered => true,
-                        GlossaryDictFilter::ById(id) => def.dictionary_id == id,
-                        GlossaryDictFilter::Invalid => false,
-                    }) {
-                        for media in &def.media_files {
-                            if seen_filenames.insert(media.filename.clone()) {
-                                files.push(media.clone());
+                    if glossary_variant_for_marker(&name).is_some() {
+                        let filter = parse_glossary_dict_filter(marker);
+                        for def in ctx.glossary_definitions.iter().filter(|def| match filter {
+                            GlossaryDictFilter::Unfiltered => true,
+                            GlossaryDictFilter::ById(id) => def.dictionary_id == id,
+                            GlossaryDictFilter::Invalid => false,
+                        }) {
+                            for media in &def.media_files {
+                                if seen_filenames.insert(media.filename.clone()) {
+                                    files.push(media.clone());
+                                }
                             }
                         }
                     }
-                }
-                let eval = evaluate_specific_marker_named(field, &name, marker, ctx, rendered);
-                if eval.media || !eval.text.is_empty() {
-                    break;
+                    let eval = evaluate_specific_marker_named(field, &name, marker, ctx, rendered);
+                    if eval.media || !eval.text.is_empty() {
+                        break;
+                    }
                 }
             }
         }

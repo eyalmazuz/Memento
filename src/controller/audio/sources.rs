@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -14,27 +15,52 @@ use memento_audio::audioplayer::{
     detect_audio_extension, validate_audio_bytes, validate_audio_content_type,
     MAX_AUDIO_PAYLOAD_BYTES,
 };
+use memento_audio::{AudioDownloadConfig, DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS};
 use memento_net::http::{HttpClient, HttpClientConfig, Request, Response, Url as HttpUrl};
 use memento_setting::enums::AudioSourceType;
 use url::Url;
 
 use super::super::config::AudioSourceEntry;
 
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_JSON_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const AUDIO_USER_AGENT: &str = "Memento";
 
+static AUDIO_DOWNLOAD_TIMEOUT_MS: AtomicU64 = AtomicU64::new(DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
 static SHARED_HTTP_CLIENT: OnceLock<HttpClient> = OnceLock::new();
+
+/// Updates the bounded pronunciation audio download timeout (`audio/download-timeout-ms`),
+/// clamped to `1_000..=30_000` ms via [`AudioDownloadConfig`] (Yomitan `#1876`).
+pub fn set_download_timeout_ms(timeout_ms: u64) {
+    let clamped = AudioDownloadConfig::with_timeout_ms(timeout_ms);
+    AUDIO_DOWNLOAD_TIMEOUT_MS.store(clamped.timeout().as_millis() as u64, Ordering::Release);
+}
+
+/// Returns the active bounded pronunciation audio download timeout configuration (default 8 s).
+pub fn download_timeout_config() -> AudioDownloadConfig {
+    AudioDownloadConfig::with_timeout_ms(AUDIO_DOWNLOAD_TIMEOUT_MS.load(Ordering::Acquire))
+}
+
+/// Returns the active bounded pronunciation audio download timeout in milliseconds.
+pub fn download_timeout_ms() -> u64 {
+    download_timeout_config().timeout().as_millis() as u64
+}
 
 pub(super) fn shared_audio_http_client() -> &'static HttpClient {
     SHARED_HTTP_CLIENT.get_or_init(|| {
+        let cfg = AudioDownloadConfig::default();
         HttpClient::new(HttpClientConfig {
-            timeout: Some(NETWORK_TIMEOUT),
-            connect_timeout: Some(CONNECT_TIMEOUT),
+            timeout: Some(cfg.timeout()),
+            connect_timeout: Some(cfg.connect_timeout()),
             ..HttpClientConfig::default()
         })
     })
+}
+
+fn default_timeout_for_client(http: &HttpClient) -> Option<Duration> {
+    SHARED_HTTP_CLIENT
+        .get()
+        .is_some_and(|shared| std::ptr::eq(http, shared))
+        .then(|| download_timeout_config().timeout())
 }
 
 /// Incremental RFC 1321 MD5 hasher for streaming audio downloads without
@@ -242,17 +268,20 @@ pub fn ascii_safe_audio_filename(
     ascii_safe_audio_filename_with_ext(source_name, reading, expression, payload_md5_hex, ".mp3")
 }
 
-pub(super) fn http_get(
+pub(super) fn http_get_with_timeout(
     http: &HttpClient,
     url: &str,
     description: &str,
+    timeout: Option<Duration>,
 ) -> Result<Response, String> {
     let parsed = HttpUrl::parse(url)
         .map_err(|error| format!("invalid {description} URL {url:?}: {error}"))?;
     let request = Request::get(parsed).header("User-Agent", AUDIO_USER_AGENT);
-    let response = http
-        .send(&request)
-        .map_err(|error| format!("could not request {description} from {url:?}: {error}"))?;
+    let response = match timeout.or_else(|| default_timeout_for_client(http)) {
+        Some(req_timeout) => http.send_with_request_timeout(&request, req_timeout),
+        None => http.send(&request),
+    }
+    .map_err(|error| format!("could not request {description} from {url:?}: {error}"))?;
     if !(200..300).contains(&response.status()) {
         return Err(format!(
             "{description} request to {url:?} returned HTTP {} {}",
@@ -263,9 +292,18 @@ pub(super) fn http_get(
     Ok(response)
 }
 
+pub(super) fn http_get(
+    http: &HttpClient,
+    url: &str,
+    description: &str,
+) -> Result<Response, String> {
+    http_get_with_timeout(http, url, description, None)
+}
+
 fn read_json_source_body(
     http: &HttpClient,
     source_url: &str,
+    timeout: Option<Duration>,
 ) -> Result<(Vec<u8>, Option<Url>), String> {
     match classify_url(source_url)? {
         SourceLocation::File(path) => {
@@ -279,7 +317,7 @@ fn read_json_source_body(
         }
         SourceLocation::Http(url) => {
             let base = Url::parse(&url).ok();
-            let mut response = http_get(http, &url, "audio source JSON")?;
+            let mut response = http_get_with_timeout(http, &url, "audio source JSON", timeout)?;
             let body = response
                 .read_all(MAX_JSON_SOURCE_BYTES)
                 .map_err(|error| format!("could not read audio source JSON response: {error}"))?;
@@ -294,6 +332,16 @@ pub(super) fn expand_audio_source_candidates(
     expression: &str,
     reading: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    expand_audio_source_candidates_with_timeout(http, source, expression, reading, None)
+}
+
+fn expand_audio_source_candidates_with_timeout(
+    http: &HttpClient,
+    source: &AudioSourceEntry,
+    expression: &str,
+    reading: &str,
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, String)>, String> {
     let source_url = expand_source_url(&source.url, expression, reading)?;
     if source_url.trim().is_empty() {
         return Ok(Vec::new());
@@ -307,7 +355,7 @@ pub(super) fn expand_audio_source_candidates(
     match kind {
         AudioSourceType::AudioSourceTypeFile => Ok(vec![(source.name.clone(), source_url)]),
         AudioSourceType::AudioSourceTypeJson => {
-            let (body, base_http_url) = read_json_source_body(http, &source_url)?;
+            let (body, base_http_url) = read_json_source_body(http, &source_url, timeout)?;
             let entries = parse_json_audio_entries(&body)?;
             let resolved = entries
                 .into_iter()
@@ -383,7 +431,11 @@ pub fn enumerate_word_audio_sources(
     available
 }
 
-fn fetch_audio_payload(http: &HttpClient, url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+fn fetch_audio_payload(
+    http: &HttpClient,
+    url: &str,
+    timeout: Option<Duration>,
+) -> Result<(Vec<u8>, Option<String>), String> {
     match classify_url(url)? {
         SourceLocation::File(path) => {
             let meta = fs::metadata(&path).map_err(|error| {
@@ -404,7 +456,7 @@ fn fetch_audio_payload(http: &HttpClient, url: &str) -> Result<(Vec<u8>, Option<
             Ok((bytes, None))
         }
         SourceLocation::Http(url) => {
-            let mut response = http_get(http, &url, "word audio")?;
+            let mut response = http_get_with_timeout(http, &url, "word audio", timeout)?;
             let content_type = response.header("content-type").map(str::to_owned);
             validate_audio_content_type(content_type.as_deref())?;
             if let Some(len) = response.content_length() {
@@ -435,7 +487,13 @@ pub fn fetch_word_audio(
     reading: &str,
     sources: &[AudioSourceEntry],
 ) -> Result<(Vec<u8>, String), String> {
-    fetch_word_audio_with_client(shared_audio_http_client(), expression, reading, sources)
+    fetch_word_audio_with_client_and_timeout(
+        shared_audio_http_client(),
+        expression,
+        reading,
+        sources,
+        Some(download_timeout_config().timeout()),
+    )
 }
 
 pub(super) fn fetch_word_audio_with_client(
@@ -444,10 +502,22 @@ pub(super) fn fetch_word_audio_with_client(
     reading: &str,
     sources: &[AudioSourceEntry],
 ) -> Result<(Vec<u8>, String), String> {
+    fetch_word_audio_with_client_and_timeout(http, expression, reading, sources, None)
+}
+
+pub(super) fn fetch_word_audio_with_client_and_timeout(
+    http: &HttpClient,
+    expression: &str,
+    reading: &str,
+    sources: &[AudioSourceEntry],
+    timeout: Option<Duration>,
+) -> Result<(Vec<u8>, String), String> {
     let mut last_error: Option<String> = None;
 
     for source in sources {
-        let candidates = match expand_audio_source_candidates(http, source, expression, reading) {
+        let candidates = match expand_audio_source_candidates_with_timeout(
+            http, source, expression, reading, timeout,
+        ) {
             Ok(candidates) => candidates,
             Err(error) => {
                 last_error = Some(error);
@@ -456,7 +526,7 @@ pub(super) fn fetch_word_audio_with_client(
         };
 
         for (candidate_name, candidate_url) in candidates {
-            let (bytes, content_type) = match fetch_audio_payload(http, &candidate_url) {
+            let (bytes, content_type) = match fetch_audio_payload(http, &candidate_url, timeout) {
                 Ok(payload) => payload,
                 Err(error) => {
                     last_error = Some(error);

@@ -85,6 +85,10 @@ pub struct NoteFieldsContext {
     pub sentence: String,
     pub context: String,
     pub selection: String,
+    /// Multi-definition glossary selections (`#262`, Yomitan `#2248`), formatted as
+    /// `<ul><li>...</li></ul>` when 2+ non-empty entries are present. Takes precedence
+    /// over `selection` when non-empty.
+    pub selections: Vec<String>,
     pub secondary_subtitle: String,
     pub secondary_context: String,
     pub clipboard: Option<String>,
@@ -119,6 +123,9 @@ pub struct NoteFieldsContext {
     /// Part-of-speech summary for `{part-of-speech}`.
     pub part_of_speech: String,
     pub is_kanji: bool,
+    /// When `true`, exports the kana reading as `{expression}` and adapts `{reading}`,
+    /// `{furigana}`, and `{furigana-plain}` accordingly (matching C++ `kanjiKanaButton`).
+    pub reading_as_expression: bool,
     pub cloze_index: usize,
     /// Optional `search/remove-regex` pattern applied to subtitle/context/cloze text when building notes.
     pub subtitle_filter_regex: Option<String>,
@@ -134,6 +141,8 @@ pub struct NoteFieldsContext {
     pub audio_attachments: Vec<serde_json::Value>,
     pub picture_attachments: Vec<serde_json::Value>,
     pub video_attachments: Vec<serde_json::Value>,
+    /// Non-fatal warnings collected when optional media capture fails or no video is loaded.
+    pub media_warnings: Vec<String>,
     /// `(field_name, marker_name)` pairs that succeeded during `prepare_note_media`.
     pub(crate) resolved_media_markers: Vec<(String, String)>,
 }
@@ -157,6 +166,7 @@ impl NoteFieldsContext {
             context: sentence.clone(),
             // Keep `{selection}` empty unless actual popup glossary text is selected (#262).
             selection: String::new(),
+            selections: Vec::new(),
             secondary_subtitle: String::new(),
             secondary_context: String::new(),
             clipboard: None,
@@ -189,6 +199,7 @@ impl NoteFieldsContext {
             tag_entries: Vec::new(),
             part_of_speech: String::new(),
             is_kanji: false,
+            reading_as_expression: false,
             cloze_index: 1,
             subtitle_filter_regex: None,
             replace_lines: false,
@@ -198,8 +209,66 @@ impl NoteFieldsContext {
             audio_attachments: Vec::new(),
             picture_attachments: Vec::new(),
             video_attachments: Vec::new(),
+            media_warnings: Vec::new(),
             resolved_media_markers: Vec::new(),
         }
+    }
+
+    /// Returns the effective `{expression}` value, substituting `reading` when
+    /// `reading_as_expression` is enabled and `reading` is non-empty.
+    pub fn effective_expression(&self) -> &str {
+        if self.reading_as_expression && !self.reading.is_empty() {
+            self.reading.as_str()
+        } else {
+            self.expression.as_str()
+        }
+    }
+
+    /// Returns the effective `{reading}` value, matching C++ `notebuilder.cpp::getReading`
+    /// when `reading_as_expression` is enabled.
+    pub fn effective_reading(&self) -> &str {
+        if self.reading_as_expression {
+            self.effective_expression()
+        } else {
+            self.reading.as_str()
+        }
+    }
+
+    /// Returns the effective `{furigana}` value (plain kana when `reading_as_expression`
+    /// is enabled, matching C++ `notebuilder.cpp::getFurigana`).
+    pub fn effective_furigana(&self) -> &str {
+        if self.reading_as_expression {
+            self.effective_expression()
+        } else {
+            self.furigana.as_str()
+        }
+    }
+
+    /// Returns the effective `{furigana-plain}` value (plain kana when
+    /// `reading_as_expression` is enabled, matching C++ `notebuilder.cpp::getFuriganaPlain`).
+    pub fn effective_furigana_plain(&self) -> &str {
+        if self.reading_as_expression {
+            self.effective_expression()
+        } else {
+            self.furigana_plain.as_str()
+        }
+    }
+
+    /// Formats `{selection}` from `self.selections` (or single `self.selection` for
+    /// backwards compatibility) via `memento_anki::note::format_selection`, rendering
+    /// multi-definition selections as `<ul><li>...</li></ul>` without double `<br>`.
+    pub fn formatted_selection(&self) -> String {
+        if !self.selections.is_empty() {
+            let refs: Vec<&str> = self.selections.iter().map(String::as_str).collect();
+            let formatted = memento_anki::note::format_selection(&refs);
+            if !formatted.is_empty() {
+                return formatted;
+            }
+        }
+        if !self.selection.is_empty() {
+            return memento_anki::note::format_selection(&[self.selection.as_str()]);
+        }
+        String::new()
     }
 
     /// Applies `search/remove-regex` and `search/replace-lines` to subtitle text fields
@@ -270,6 +339,27 @@ impl NoteFieldsContext {
 
     pub fn with_selected_rowids(mut self, rowids: Vec<(i64, i64)>) -> Self {
         self.selected_rowids = rowids;
+        self
+    }
+
+    pub fn with_selection(mut self, selection: impl Into<String>) -> Self {
+        let s = selection.into();
+        if !s.is_empty() {
+            self.selections.push(s.clone());
+            if self.selection.is_empty() {
+                self.selection = s;
+            }
+        }
+        self
+    }
+
+    pub fn with_selections(mut self, selections: Vec<String>) -> Self {
+        self.selections = selections;
+        self
+    }
+
+    pub fn with_reading_as_expression(mut self, enabled: bool) -> Self {
+        self.reading_as_expression = enabled;
         self
     }
 }

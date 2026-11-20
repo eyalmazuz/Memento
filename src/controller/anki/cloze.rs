@@ -70,9 +70,24 @@ pub fn split_cloze_around<'a>(
         while offset > 0 && !text.is_char_boundary(offset) {
             offset -= 1;
         }
-        text.get(offset..)
-            .and_then(|tail| tail.find(target).map(|rel| offset + rel))
-            .or_else(|| text.get(..offset).and_then(|head| head.rfind(target)))
+        let mut enclosing: Option<usize> = None;
+        let mut first_after: Option<usize> = None;
+        let mut last_before: Option<usize> = None;
+        for (pos, _) in text.match_indices(target) {
+            let end = pos.saturating_add(target.len());
+            if pos <= offset && offset < end {
+                enclosing = Some(pos);
+                break;
+            }
+            if pos >= offset {
+                if first_after.is_none() {
+                    first_after = Some(pos);
+                }
+            } else {
+                last_before = Some(pos);
+            }
+        }
+        enclosing.or(first_after).or(last_before)
     } else {
         text.find(target)
     };

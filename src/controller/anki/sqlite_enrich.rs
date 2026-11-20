@@ -7,23 +7,22 @@ use std::path::{Path, PathBuf};
 
 use memento_anki::glossary::build_glossary;
 use memento_anki::note::{
-    build_frequencies_html, find_stroke_count, format_kanji_readings, format_pitch,
-    format_pitch_categories, format_pitch_graphs, format_pitch_positions, frequency_stats,
-    is_kifuku_applicable, FrequencyEntry, PitchCategoryInput, PitchEntry, PitchGraphEntry,
-    StrokeCountStat,
+    build_frequencies_html, find_stroke_count, format_kanji_readings, format_pitch_categories_ex,
+    format_pitch_ex, format_pitch_graphs_ex, format_pitch_positions_ex, frequency_average,
+    frequency_harmonic, is_kifuku_applicable, parse_frequency_value, FrequencyEntry, PitchEntryEx,
+    PitchSpec, StrokeCountStat,
 };
-use memento_dict::databasemanager;
+use memento_dict::databasemanager::{self, PitchPosition};
 use memento_dict::searchcontroller::{self, TagSortItem};
-use memento_dict::sqlite_db::{self, rusqlite::types::ValueRef};
+use memento_dict::sqlite_db::{self, rusqlite::types::ValueRef, FrequencyMode};
 use memento_dict::yomidbbuilder;
 use memento_net::anki::{to_qjson, MediaFilePayload};
-use memento_util::imageutils::generate_pitch_graph;
 
 use crate::controller::audio::sanitize_anki_filename;
 use crate::controller::dict::{shared_readonly_db, DictTag};
 
 use super::context::{encode_base64, GlossaryDefinition, NoteFieldsContext, NoteTag};
-use super::css_glossary::scope_dictionary_css;
+use super::css_glossary::scope_dictionary_css_cached;
 
 #[inline]
 fn dict_sort_key(dictionary_order: &HashMap<i64, i64>, dic_id: i64) -> (i64, i64) {
@@ -64,7 +63,11 @@ fn resolve_dictionary_resources(
                 let style_path = by_id.join("styles.css");
                 if let Ok(css) = fs::read_to_string(&style_path) {
                     let canon = fs::canonicalize(&by_id).ok();
-                    return (Some(by_id), canon, scope_dictionary_css(&css, dict_name));
+                    return (
+                        Some(by_id),
+                        canon,
+                        scope_dictionary_css_cached(dic_id, &css, dict_name),
+                    );
                 }
             }
         }
@@ -76,7 +79,11 @@ fn resolve_dictionary_resources(
                 let style_path = by_name.join("styles.css");
                 if let Ok(css) = fs::read_to_string(&style_path) {
                     let canon = fs::canonicalize(&by_name).ok();
-                    return (Some(by_name), canon, scope_dictionary_css(&css, dict_name));
+                    return (
+                        Some(by_name),
+                        canon,
+                        scope_dictionary_css_cached(dic_id, &css, dict_name),
+                    );
                 }
             }
         }
@@ -138,19 +145,91 @@ fn resolve_sorted_tags(
     }
 }
 
-fn apply_frequency_rows(
+struct ModeFreqEntry {
+    dic_id: i64,
+    dictionary_title: String,
+    display: String,
+    numeric: Option<f64>,
+    frequency_mode: FrequencyMode,
+}
+
+fn push_unique_str(out: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+        out.push(trimmed.to_owned());
+    }
+}
+
+fn collect_pos_leaf_labels(node: &serde_json::Value, out: &mut Vec<String>) {
+    match node {
+        serde_json::Value::String(text) => push_unique_str(out, text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_pos_leaf_labels(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(content) = map.get("content") {
+                collect_pos_leaf_labels(content, out);
+            } else if let Some(code) = map
+                .get("data")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str)
+            {
+                push_unique_str(out, code);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extracts part-of-speech labels embedded inside Jitendex/Yomitan `structured-content`
+/// glossary trees (`data.content == "part-of-speech-info"` or `"part-of-speech"`, `#988`).
+fn extract_structured_pos_tags(node: &serde_json::Value, out: &mut Vec<String>) {
+    match node {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                extract_structured_pos_tags(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let is_pos_node = map
+                .get("data")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|data| data.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "part-of-speech-info" | "part-of-speech"));
+            if is_pos_node {
+                if let Some(content) = map.get("content") {
+                    collect_pos_leaf_labels(content, out);
+                } else if let Some(code) = map
+                    .get("data")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|data| data.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    push_unique_str(out, code);
+                }
+                return;
+            }
+            if let Some(content) = map.get("content") {
+                extract_structured_pos_tags(content, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_frequency_entries_with_mode(
     ctx: &mut NoteFieldsContext,
-    titles: &HashMap<i64, String>,
     dictionary_order: &HashMap<i64, i64>,
-    mut frequency_rows: Vec<sqlite_db::FreqRow>,
+    mut frequency_rows: Vec<ModeFreqEntry>,
 ) {
     frequency_rows.sort_by_key(|row| dict_sort_key(dictionary_order, row.dic_id));
     ctx.frequency_entries = frequency_rows
         .iter()
-        .filter_map(|row| {
-            let dict = titles.get(&row.dic_id)?;
-            Some((dict.clone(), String::from_utf16_lossy(&row.frequency)))
-        })
+        .map(|row| (row.dictionary_title.clone(), row.display.clone()))
         .collect();
 
     let dict_u16: Vec<Vec<u16>> = ctx
@@ -172,17 +251,44 @@ fn apply_frequency_rows(
         })
         .collect();
     ctx.frequencies = String::from_utf16_lossy(&build_frequencies_html(&entries, false, false));
-    let (_, harmonic, average) = frequency_stats(&entries);
-    ctx.frequency_harmonic_rank = harmonic
+
+    let mut seen_rank_dics: HashSet<i64> = HashSet::new();
+    let mut seen_occ_dics: HashSet<i64> = HashSet::new();
+    let mut rank_numbers: Vec<f64> = Vec::new();
+    let mut occ_numbers: Vec<f64> = Vec::new();
+
+    for (row, display_u16) in frequency_rows.iter().zip(&freq_u16) {
+        let Some(val) = row
+            .numeric
+            .or_else(|| parse_frequency_value(display_u16))
+            .filter(|&v| v.is_finite() && v > 0.0)
+        else {
+            continue;
+        };
+        match row.frequency_mode {
+            FrequencyMode::RankBased => {
+                if seen_rank_dics.insert(row.dic_id) {
+                    rank_numbers.push(val);
+                }
+            }
+            FrequencyMode::OccurrenceBased => {
+                if seen_occ_dics.insert(row.dic_id) {
+                    occ_numbers.push(val);
+                }
+            }
+        }
+    }
+
+    ctx.frequency_harmonic_rank = frequency_harmonic(&rank_numbers)
         .map(|v| v.to_string())
         .unwrap_or_else(|| "9999999".to_owned());
-    ctx.frequency_average_rank = average
+    ctx.frequency_average_rank = frequency_average(&rank_numbers)
         .map(|v| v.to_string())
         .unwrap_or_else(|| "9999999".to_owned());
-    ctx.frequency_harmonic_occurrence = harmonic
+    ctx.frequency_harmonic_occurrence = frequency_harmonic(&occ_numbers)
         .map(|v| v.to_string())
         .unwrap_or_else(|| "0".to_owned());
-    ctx.frequency_average_occurrence = average
+    ctx.frequency_average_occurrence = frequency_average(&occ_numbers)
         .map(|v| v.to_string())
         .unwrap_or_else(|| "0".to_owned());
 }
@@ -332,7 +438,6 @@ pub fn populate_note_context_from_sqlite_ordered(
             ctx.expression.clone()
         };
         ctx.character = target_char.clone();
-        let char_u16: Vec<u16> = target_char.encode_utf16().collect();
 
         let (mut kanji_rows, freq_rows) = db.with_conn(|conn| {
             const KANJI_SQL: &str =
@@ -364,11 +469,10 @@ pub fn populate_note_context_from_sqlite_ordered(
                 });
             }
 
-            let mut freq_rows = Vec::new();
-            let freq_opt = sqlite_db::get_kanji_frequencies_conn(conn, &char_u16, &mut freq_rows)
-                .ok()
-                .map(|()| freq_rows);
-            Ok::<_, String>((out, freq_opt))
+            let freq_modes = sqlite_db::query_dictionary_frequency_modes_conn(conn)
+                .unwrap_or_default();
+            let raw_freqs = sqlite_db::query_kanji_meta_freq_utf8_conn(conn, &target_char).ok();
+            Ok::<_, String>((out, raw_freqs.map(|rows| (rows, freq_modes))))
         })?;
 
         kanji_rows.sort_by_key(|row| (dict_sort_key(dictionary_order, row.dic_id), row.rowid));
@@ -479,8 +583,33 @@ pub fn populate_note_context_from_sqlite_ordered(
             ctx.tags = ctx.tag_entries.iter().map(|t| t.name.clone()).collect();
         }
 
-        if let Some(freq_rows) = freq_rows {
-            apply_frequency_rows(ctx, titles, dictionary_order, freq_rows);
+        if let Some((raw_freqs, freq_modes)) = freq_rows {
+            let mode_entries: Vec<ModeFreqEntry> = raw_freqs
+                .into_iter()
+                .filter(|row| !meta.disabled.contains(&row.dic_id))
+                .filter_map(|row| {
+                    let dictionary_title = titles.get(&row.dic_id)?.clone();
+                    let frequency_mode = freq_modes
+                        .get(&row.dic_id)
+                        .copied()
+                        .unwrap_or(FrequencyMode::RankBased);
+                    let parsed = sqlite_db::parse_freq_blob_with_mode_utf8(
+                        row.blob_type,
+                        &row.data,
+                        &target_char,
+                        "",
+                        frequency_mode,
+                    );
+                    parsed.matched.then_some(ModeFreqEntry {
+                        dic_id: row.dic_id,
+                        dictionary_title,
+                        display: parsed.display,
+                        numeric: parsed.numeric,
+                        frequency_mode,
+                    })
+                })
+                .collect();
+            apply_frequency_entries_with_mode(ctx, dictionary_order, mode_entries);
         }
         return Ok(());
     }
@@ -595,6 +724,9 @@ pub fn populate_note_context_from_sqlite_ordered(
             if item.0.category == "partOfSpeech" && !pos_tags.contains(&item.0.name) {
                 pos_tags.push(item.0.name.clone());
             }
+        }
+        for item in &filtered_items {
+            extract_structured_pos_tags(item, &mut pos_tags);
         }
 
         let (res_dir_opt, canon_base, scoped_css): &(Option<PathBuf>, Option<PathBuf>, String) =
@@ -726,26 +858,29 @@ pub fn populate_note_context_from_sqlite_ordered(
         }
     }
 
-    // Reuse cached `term_meta_bank` rows from the shared read-only DB (both freq & pitch).
-    let raw_meta_rows = db.term_meta_rows_for(&ctx.expression);
-    let freq_rows: Vec<sqlite_db::FreqRow> = raw_meta_rows
-        .iter()
-        .filter(|row| row.mode == "freq" && !meta.disabled.contains(&row.dic_id))
-        .filter_map(|row| {
-            let parsed = sqlite_db::parse_freq_blob_utf8(
-                row.blob_type,
-                &row.data,
-                &ctx.expression,
-                &ctx.reading,
-            );
-            parsed.matched.then(|| sqlite_db::FreqRow {
-                dic_id: row.dic_id,
-                frequency: parsed.display.encode_utf16().collect(),
-            })
+    // Query term frequencies paired with each dictionary's `frequencyMode` (`rank-based` vs
+    // `occurrence-based`, Yomitan PR #2373/#2329) so `*-rank` and `*-occurrence` never mix.
+    let term_freqs_with_mode = db
+        .with_conn(|conn| {
+            sqlite_db::query_term_frequencies_with_mode_conn(conn, &ctx.expression, &ctx.reading)
+        })
+        .map_err(|e| e.to_string())?;
+    let freq_entries_with_mode: Vec<ModeFreqEntry> = term_freqs_with_mode
+        .into_iter()
+        .filter(|row| !meta.disabled.contains(&row.dic_id))
+        .map(|row| ModeFreqEntry {
+            dic_id: row.dic_id,
+            dictionary_title: row.dictionary_title,
+            display: row.parsed.display,
+            numeric: row.parsed.numeric,
+            frequency_mode: row.frequency_mode,
         })
         .collect();
-    apply_frequency_rows(ctx, titles, dictionary_order, freq_rows);
+    apply_frequency_entries_with_mode(ctx, dictionary_order, freq_entries_with_mode);
 
+    // Reuse cached `term_meta_bank` rows from the shared read-only DB for pitch accent export,
+    // preserving exact `H`/`L` string patterns (`PitchEntryDetail.pattern`, Yomitan PR #2055).
+    let raw_meta_rows = db.term_meta_rows_for(&ctx.expression);
     let expr_u16: Vec<u16> = ctx.expression.encode_utf16().collect();
     let read_u16: Vec<u16> = ctx.reading.encode_utf16().collect();
     let mut pitch_rows: Vec<sqlite_db::PitchRow> = raw_meta_rows
@@ -768,80 +903,68 @@ pub fn populate_note_context_from_sqlite_ordered(
         .collect();
 
     pitch_rows.sort_by_key(|row| dict_sort_key(dictionary_order, row.dic_id));
-    let pitches_owned: Vec<(Vec<u16>, Vec<u8>, Vec<Vec<u16>>)> = pitch_rows
+
+    enum OwnedPitchSpec {
+        Downstep(u8),
+        Pattern(String),
+    }
+
+    impl OwnedPitchSpec {
+        fn as_spec(&self) -> PitchSpec<'_> {
+            match self {
+                Self::Downstep(pos) => PitchSpec::Downstep(*pos),
+                Self::Pattern(pat) => PitchSpec::Pattern(pat.as_str()),
+            }
+        }
+    }
+
+    let pitches_owned: Vec<(Vec<u16>, Vec<OwnedPitchSpec>, Vec<Vec<u16>>)> = pitch_rows
         .iter()
         .filter_map(|row| {
-            let positions: Vec<u8> = row
-                .positions
-                .iter()
-                .filter_map(|p| u8::try_from(*p).ok())
-                .collect();
-            (!positions.is_empty() && !row.mora.is_empty()).then(|| {
+            let specs: Vec<OwnedPitchSpec> = if !row.entries.is_empty() {
+                row.entries
+                    .iter()
+                    .filter_map(|detail| match detail.pitch_position()? {
+                        PitchPosition::Pattern(pat) => Some(OwnedPitchSpec::Pattern(pat)),
+                        PitchPosition::Downstep(pos) => {
+                            u8::try_from(pos).ok().map(OwnedPitchSpec::Downstep)
+                        }
+                    })
+                    .collect()
+            } else {
+                row.positions
+                    .iter()
+                    .filter_map(|p| u8::try_from(*p).ok().map(OwnedPitchSpec::Downstep))
+                    .collect()
+            };
+            (!specs.is_empty() && !row.mora.is_empty()).then(|| {
                 let dict_u16 = titles
                     .get(&row.dic_id)
                     .map(|s| s.encode_utf16().collect())
                     .unwrap_or_default();
-                (dict_u16, positions, row.mora.clone())
+                (dict_u16, specs, row.mora.clone())
             })
         })
         .collect();
 
+    let specs_borrowed: Vec<Vec<PitchSpec<'_>>> = pitches_owned
+        .iter()
+        .map(|(_, specs, _)| specs.iter().map(OwnedPitchSpec::as_spec).collect())
+        .collect();
     let mora_refs: Vec<Vec<&[u16]>> = pitches_owned
         .iter()
         .map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect())
         .collect();
-    let pitch_entries: Vec<PitchEntry<'_>> = pitches_owned
+    let pitch_entries: Vec<PitchEntryEx<'_>> = pitches_owned
         .iter()
         .enumerate()
-        .map(|(idx, (name, positions, _))| PitchEntry {
+        .map(|(idx, (name, _, _))| PitchEntryEx {
             dictionary_name: name,
-            positions,
+            specs: &specs_borrowed[idx],
             mora: &mora_refs[idx],
         })
         .collect();
 
-    let fill_u16: Vec<u16> = "rgba(0,0,0,0)".encode_utf16().collect();
-    let stroke_u16: Vec<u16> = "currentColor".encode_utf16().collect();
-    let svgs_owned: Vec<Vec<Vec<u16>>> = pitches_owned
-        .iter()
-        .map(|(_, positions, mora)| {
-            let mora_len = i32::try_from(mora.len()).unwrap_or(0);
-            positions
-                .iter()
-                .filter_map(|&pos| {
-                    generate_pitch_graph(
-                        mora_len,
-                        pos,
-                        &fill_u16,
-                        &stroke_u16,
-                        |n| Some(n.to_string().encode_utf16().collect()),
-                        |_| None,
-                    )
-                })
-                .collect()
-        })
-        .collect();
-    let svg_refs: Vec<Vec<&[u16]>> = svgs_owned
-        .iter()
-        .map(|svgs| svgs.iter().map(Vec::as_slice).collect())
-        .collect();
-    let graph_entries: Vec<PitchGraphEntry<'_>> = pitches_owned
-        .iter()
-        .enumerate()
-        .map(|(idx, (name, positions, _))| PitchGraphEntry {
-            dictionary_name: name,
-            positions_count: positions.len(),
-            svg_graphs: &svg_refs[idx],
-        })
-        .collect();
-
-    let category_inputs: Vec<PitchCategoryInput<'_>> = pitches_owned
-        .iter()
-        .map(|(_, positions, mora)| PitchCategoryInput {
-            mora_len: mora.len(),
-            positions,
-        })
-        .collect();
     let rule_u16: Vec<Vec<u16>> = if !all_rules.is_empty() {
         all_rules
             .iter()
@@ -853,11 +976,13 @@ pub fn populate_note_context_from_sqlite_ordered(
     let rule_refs: Vec<&[u16]> = rule_u16.iter().map(Vec::as_slice).collect();
     let can_be_kifuku = is_kifuku_applicable(&rule_refs);
 
-    ctx.pitch = String::from_utf16_lossy(&format_pitch(&pitch_entries));
-    ctx.pitch_positions = String::from_utf16_lossy(&format_pitch_positions(&pitch_entries));
-    ctx.pitch_graphs = String::from_utf16_lossy(&format_pitch_graphs(&graph_entries));
-    ctx.pitch_categories =
-        String::from_utf16_lossy(&format_pitch_categories(&category_inputs, can_be_kifuku));
+    ctx.pitch = String::from_utf16_lossy(&format_pitch_ex(&pitch_entries));
+    ctx.pitch_positions = String::from_utf16_lossy(&format_pitch_positions_ex(&pitch_entries));
+    ctx.pitch_graphs = String::from_utf16_lossy(&format_pitch_graphs_ex(&pitch_entries));
+    ctx.pitch_categories = String::from_utf16_lossy(&format_pitch_categories_ex(
+        &pitch_entries,
+        can_be_kifuku,
+    ));
 
     Ok(())
 }

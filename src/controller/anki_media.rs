@@ -1,6 +1,9 @@
 //! Capture the media requested by configured Anki field markers.
 
+use std::io::{Read, Write};
 use std::ops::Deref;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
@@ -84,6 +87,174 @@ fn resize_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -
     (nw, nh)
 }
 
+const LOSSY_WEBP_QUALITY: u8 = 80;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebpLossyBackend {
+    Cwebp,
+    Ffmpeg,
+    LosslessFallback,
+}
+
+static WEBP_LOSSY_BACKEND: OnceLock<WebpLossyBackend> = OnceLock::new();
+
+fn configure_background_command(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd;
+}
+
+fn detect_webp_lossy_backend() -> WebpLossyBackend {
+    *WEBP_LOSSY_BACKEND.get_or_init(|| {
+        let mut cwebp = Command::new("cwebp");
+        cwebp
+            .arg("-version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_background_command(&mut cwebp);
+        if cwebp.status().is_ok_and(|status| status.success()) {
+            return WebpLossyBackend::Cwebp;
+        }
+
+        let mut ffmpeg = Command::new("ffmpeg");
+        ffmpeg
+            .args(["-hide_banner", "-loglevel", "error", "-encoders"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_background_command(&mut ffmpeg);
+        if let Ok(output) = ffmpeg.output() {
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("libwebp")
+            {
+                return WebpLossyBackend::Ffmpeg;
+            }
+        }
+
+        WebpLossyBackend::LosslessFallback
+    })
+}
+
+fn is_valid_webp(bytes: &[u8]) -> bool {
+    bytes.len() >= 16 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+}
+
+fn pipe_command_io(mut cmd: Command, write_stdin: impl FnOnce(&mut dyn Write) -> std::io::Result<()> + Send) -> Result<Vec<u8>, String> {
+    configure_background_command(&mut cmd);
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to spawn WebP encoder: {error}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "WebP encoder stdin unavailable".to_owned())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "WebP encoder stdout unavailable".to_owned())?;
+
+    let (write_res, read_res) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let res = write_stdin(&mut stdin);
+            drop(stdin);
+            res
+        });
+        let mut encoded = Vec::new();
+        let read_res = stdout.read_to_end(&mut encoded).map(|_| encoded);
+        let write_res = writer
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("WebP writer panicked")));
+        (write_res, read_res)
+    });
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed waiting for WebP encoder: {error}"))?;
+    let encoded = read_res.map_err(|error| format!("failed reading WebP encoder output: {error}"))?;
+    write_res.map_err(|error| format!("failed writing WebP encoder input: {error}"))?;
+
+    if !status.success() {
+        return Err(format!("WebP encoder exited with status {status}"));
+    }
+    if !is_valid_webp(&encoded) {
+        return Err("WebP encoder produced invalid RIFF/WEBP data".to_owned());
+    }
+    Ok(encoded)
+}
+
+fn encode_webp_via_cwebp(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new("cwebp");
+    cmd.args(["-quiet", "-q", &quality.to_string(), "-o", "-", "--", "-"]);
+    let header = format!(
+        "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
+    );
+    pipe_command_io(cmd, |stdin| {
+        stdin.write_all(header.as_bytes())?;
+        stdin.write_all(raw)
+    })
+}
+
+fn encode_webp_via_ffmpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        &format!("{width}x{height}"),
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libwebp",
+        "-quality",
+        &quality.to_string(),
+        "-lossless",
+        "0",
+        "-f",
+        "image2pipe",
+        "pipe:1",
+    ]);
+    pipe_command_io(cmd, |stdin| stdin.write_all(raw))
+}
+
+fn encode_webp_lossless(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    WebPEncoder::new_lossless(&mut output)
+        .encode(raw, width, height, ExtendedColorType::Rgba8)
+        .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
+    Ok(output)
+}
+
+fn encode_webp_rgba_with_backend(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    backend: WebpLossyBackend,
+) -> Result<Vec<u8>, String> {
+    match backend {
+        WebpLossyBackend::Cwebp => encode_webp_via_cwebp(raw, width, height, LOSSY_WEBP_QUALITY)
+            .or_else(|_| encode_webp_lossless(raw, width, height)),
+        WebpLossyBackend::Ffmpeg => encode_webp_via_ffmpeg(raw, width, height, LOSSY_WEBP_QUALITY)
+            .or_else(|_| encode_webp_lossless(raw, width, height)),
+        WebpLossyBackend::LosslessFallback => encode_webp_lossless(raw, width, height),
+    }
+}
+
 fn encode_rgba_buffer<C>(
     image: &ImageBuffer<Rgba<u8>, C>,
     format: i32,
@@ -92,30 +263,31 @@ where
     C: Deref<Target = [u8]>,
 {
     let raw: &[u8] = Deref::deref(image.as_raw());
-    let mut output = Vec::new();
-    let (result, extension) = match format {
-        1 => (
-            PngEncoder::new(&mut output).write_image(
+    match format {
+        1 => {
+            let mut output = Vec::new();
+            PngEncoder::new(&mut output)
+                .write_image(raw, image.width(), image.height(), ExtendedColorType::Rgba8)
+                .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
+            Ok((output, ".png"))
+        }
+        2 => {
+            let output = encode_webp_rgba_with_backend(
                 raw,
                 image.width(),
                 image.height(),
-                ExtendedColorType::Rgba8,
-            ),
-            ".png",
-        ),
-        2 => (
-            WebPEncoder::new_lossless(&mut output).encode(
-                raw,
-                image.width(),
-                image.height(),
-                ExtendedColorType::Rgba8,
-            ),
-            ".webp",
-        ),
-        _ => (JpegEncoder::new(&mut output).encode_image(image), ".jpg"),
-    };
-    result.map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
-    Ok((output, extension))
+                detect_webp_lossy_backend(),
+            )?;
+            Ok((output, ".webp"))
+        }
+        _ => {
+            let mut output = Vec::new();
+            JpegEncoder::new(&mut output)
+                .encode_image(image)
+                .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
+            Ok((output, ".jpg"))
+        }
+    }
 }
 
 fn encode_picture(
@@ -372,11 +544,18 @@ fn execute_media_task(
 /// clip extraction) run concurrently via `std::thread::scope`, while `{a | b}`
 /// alternatives are resolved sequentially so primary successes short-circuit
 /// fallbacks and results merge deterministically into `ctx`.
+///
+/// Failures in optional media (`{audio}`, `{audio-media}`, `{audio-context}`,
+/// `{video}`, `{screenshot}`, `{screenshot-video}`) are non-fatal: failed
+/// attachments are omitted cleanly and human-readable warnings are recorded in
+/// `ctx.media_warnings` so card creation still succeeds.
 pub fn prepare_note_media(
     profile: &AnkiNoteConfig,
     ctx: &mut NoteFieldsContext,
     input: NoteMediaInput,
 ) -> Result<(), String> {
+    ctx.media_warnings.clear();
+    ctx.resolved_media_markers.clear();
     let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
 
     let mut sorted_fields: Vec<(&String, Vec<_>)> = profile
@@ -476,6 +655,7 @@ pub fn prepare_note_media(
     for (field, tokens) in &sorted_fields {
         for token in tokens {
             let mut token_media_error: Option<String> = None;
+            let mut token_failed_marker: Option<String> = None;
             let mut token_handled_fallback = false;
             let mut token_succeeded = false;
 
@@ -500,6 +680,7 @@ pub fn prepare_note_media(
                 let name = String::from_utf16_lossy(&marker.name);
                 let Some(task_key) = parse_media_task_key(&name, marker, profile) else {
                     token_media_error = Some(invalid_media_marker_error(&name, field));
+                    token_failed_marker = Some(name);
                     token_handled_fallback = false;
                     continue;
                 };
@@ -553,6 +734,7 @@ pub fn prepare_note_media(
                     }
                     Some(Err(error)) => {
                         token_media_error = Some(error.clone());
+                        token_failed_marker = Some(name);
                         token_handled_fallback = false;
                     }
                     None => {}
@@ -561,7 +743,15 @@ pub fn prepare_note_media(
 
             if !token_succeeded && !token_handled_fallback {
                 if let Some(error) = token_media_error {
-                    return Err(error);
+                    let warning = match token_failed_marker {
+                        Some(marker) => {
+                            format!("Skipped {{{marker}}} for field {field:?}: {error}")
+                        }
+                        None => format!("Skipped media for field {field:?}: {error}"),
+                    };
+                    if !ctx.media_warnings.contains(&warning) {
+                        ctx.media_warnings.push(warning);
+                    }
                 }
             }
         }
@@ -617,6 +807,18 @@ pub fn prepare_note_media(
     }
 
     Ok(())
+}
+
+/// Convenience wrapper around [`prepare_note_media`] returning any non-fatal media
+/// warnings recorded on `ctx.media_warnings` so callers can surface a non-blocking
+/// warning toast alongside a successful Anki note creation.
+pub fn prepare_note_media_with_warnings(
+    profile: &AnkiNoteConfig,
+    ctx: &mut NoteFieldsContext,
+    input: NoteMediaInput,
+) -> Result<Vec<String>, String> {
+    prepare_note_media(profile, ctx, input)?;
+    Ok(ctx.media_warnings.clone())
 }
 
 #[cfg(test)]
@@ -1109,7 +1311,74 @@ mod tests {
     }
 
     #[test]
-    fn empty_text_before_failed_media_returns_error_while_empty_text_after_handles_fallback() {
+    fn lossy_webp_produces_valid_riff_webp_and_shrinks_textured_screenshots() {
+        let width = 128u32;
+        let height = 128u32;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(width * height) {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = (state >> 24) as u8;
+            let g = (state >> 16) as u8;
+            let b = (state >> 8) as u8;
+            pixels.extend_from_slice(&[r, g, b, 255]);
+        }
+        let frame = RawFrame {
+            width,
+            height,
+            pixels,
+        };
+        let params = ScreenshotParams {
+            max_width: -1,
+            max_height: -1,
+            keep_aspect_ratio: true,
+        };
+
+        let (webp_bytes, ext) = encode_picture(&frame, params, 2).unwrap();
+        assert_eq!(ext, ".webp");
+        assert!(is_valid_webp(&webp_bytes), "missing RIFF/WEBP header");
+        let decoded = image::load_from_memory_with_format(&webp_bytes, ImageFormat::WebP).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+
+        let lossless_bytes = encode_webp_lossless(&frame.pixels, width, height).unwrap();
+        assert!(is_valid_webp(&lossless_bytes));
+        let decoded_lossless =
+            image::load_from_memory_with_format(&lossless_bytes, ImageFormat::WebP).unwrap();
+        assert_eq!(
+            (decoded_lossless.width(), decoded_lossless.height()),
+            (width, height)
+        );
+
+        // When an external lossy WebP encoder (`cwebp` or `ffmpeg` with `libwebp`) is
+        // available on PATH, the output must be lossy (VP8) and dramatically smaller
+        // than lossless WebP on textured frames.
+        if detect_webp_lossy_backend() != WebpLossyBackend::LosslessFallback {
+            assert_eq!(
+                &webp_bytes[12..16],
+                b"VP8 ",
+                "expected lossy VP8 chunk when external encoder is available"
+            );
+            assert!(
+                webp_bytes.len() < lossless_bytes.len(),
+                "expected lossy WebP ({} bytes) < lossless WebP ({} bytes)",
+                webp_bytes.len(),
+                lossless_bytes.len()
+            );
+        }
+
+        // Lossless fallback backend must also return valid WebP.
+        let fallback_bytes = encode_webp_rgba_with_backend(
+            &frame.pixels,
+            width,
+            height,
+            WebpLossyBackend::LosslessFallback,
+        )
+        .unwrap();
+        assert!(is_valid_webp(&fallback_bytes));
+    }
+
+    #[test]
+    fn failed_optional_media_records_non_fatal_warnings_and_preserves_note_creation() {
         let make_profile = |template: &str| AnkiNoteConfig {
             enabled: true,
             endpoint: memento_net::anki::AnkiEndpoint::default(),
@@ -1140,48 +1409,87 @@ mod tests {
             audio_sources: Vec::new(),
         };
 
-        // 1. `{selection | audio}` with empty `selection` and failing `audio` MUST return error.
+        // 1. `{selection | audio}` with empty `selection` and failing `audio` succeeds non-fatally
+        //    with a warning and omits the failed attachment cleanly.
+        let profile1 = make_profile("{selection | audio}");
         let mut ctx1 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
-        let err1 = prepare_note_media(
-            &make_profile("{selection | audio}"),
-            &mut ctx1,
-            empty_input(),
-        )
-        .expect_err("{selection | audio} must fail when selection is empty and audio fails");
-        assert!(err1.contains("word audio"), "unexpected error: {err1}");
+        let warnings1 = prepare_note_media_with_warnings(&profile1, &mut ctx1, empty_input())
+            .expect("failed optional word audio must not abort card creation");
+        assert!(ctx1.audio_attachments.is_empty());
+        assert_eq!(warnings1.len(), 1);
+        assert!(warnings1[0].contains("word audio"), "unexpected warning: {warnings1:?}");
+        let payload1 = build_note_payload_from_profile(&profile1, &ctx1).unwrap();
+        assert_eq!(payload1.fields["Expression"], "食べる");
+        assert_eq!(payload1.fields["Field"], "");
 
-        // 2. `{context-2 | screenshot}` with empty `context-2` and failing `screenshot` MUST return error.
+        // 2. `{context-2 | screenshot}` with no video loaded succeeds non-fatally with warning.
+        let profile2 = make_profile("{context-2 | screenshot}");
         let mut ctx2 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
-        let err2 = prepare_note_media(
-            &make_profile("{context-2 | screenshot}"),
-            &mut ctx2,
-            empty_input(),
-        )
-        .expect_err(
-            "{context-2 | screenshot} must fail when context-2 is empty and screenshot fails",
-        );
-        assert!(err2.contains("screenshot"), "unexpected error: {err2}");
+        let warnings2 = prepare_note_media_with_warnings(&profile2, &mut ctx2, empty_input())
+            .expect("missing screenshot must not abort card creation");
+        assert!(ctx2.picture_attachments.is_empty());
+        assert_eq!(warnings2.len(), 1);
+        assert!(warnings2[0].contains("screenshot"), "unexpected warning: {warnings2:?}");
+        let payload2 = build_note_payload_from_profile(&profile2, &ctx2).unwrap();
+        assert_eq!(payload2.fields["Field"], "");
 
-        // 3. `{audio | selection}` with failing `audio` followed by empty `selection` handles fallback cleanly.
+        // 3. `{audio | selection}` with failing `audio` followed by empty `selection` handles
+        //    fallback silently with zero warnings.
+        let profile3 = make_profile("{audio | selection}");
         let mut ctx3 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
-        prepare_note_media(
-            &make_profile("{audio | selection}"),
-            &mut ctx3,
-            empty_input(),
-        )
-        .expect("{audio | selection} should fall back to empty selection after audio failure");
-        let payload3 =
-            build_note_payload_from_profile(&make_profile("{audio | selection}"), &ctx3).unwrap();
+        let warnings3 = prepare_note_media_with_warnings(&profile3, &mut ctx3, empty_input())
+            .expect("{audio | selection} should fall back to empty selection after audio failure");
+        assert!(warnings3.is_empty(), "explicit text fallback should not warn: {warnings3:?}");
+        let payload3 = build_note_payload_from_profile(&profile3, &ctx3).unwrap();
         assert_eq!(payload3.fields["Field"], "");
 
-        // 4. `{audio | selection | screenshot}` where final media fallback also fails MUST return error.
+        // 4. `{audio | selection | screenshot}` where trailing screenshot fails succeeds with warning.
+        let profile4 = make_profile("{audio | selection | screenshot}");
         let mut ctx4 = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
-        let err4 = prepare_note_media(
-            &make_profile("{audio | selection | screenshot}"),
-            &mut ctx4,
-            empty_input(),
-        )
-        .expect_err("trailing failed screenshot after empty selection must return error");
-        assert!(err4.contains("screenshot"), "unexpected error: {err4}");
+        let warnings4 = prepare_note_media_with_warnings(&profile4, &mut ctx4, empty_input())
+            .expect("trailing failed screenshot must not abort card creation");
+        assert_eq!(warnings4.len(), 1);
+        assert!(warnings4[0].contains("screenshot"), "unexpected warning: {warnings4:?}");
+
+        // 5. Manual Search (no video loaded) with all media markers `{audio}`, `{audio-media}`,
+        //    `{video}`, `{screenshot}`, `{screenshot-video}` still builds a valid note payload
+        //    with all failed attachments omitted and warnings collected.
+        let manual_profile = AnkiNoteConfig {
+            enabled: true,
+            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            deck: "Japanese".into(),
+            model: "FullMedia".into(),
+            field_templates: std::collections::HashMap::from([
+                ("Expression".into(), "{expression}".into()),
+                ("WordAudio".into(), "{audio}".into()),
+                ("SentenceAudio".into(), "{audio-media}".into()),
+                ("Video".into(), "{video}".into()),
+                ("Pic".into(), "{screenshot}".into()),
+                ("PicClean".into(), "{screenshot-video}".into()),
+            ]),
+            tags: Vec::new(),
+            duplicate_policy: 1,
+            screenshot_type: 0,
+            audio_pad_start: 0.0,
+            audio_pad_end: 0.0,
+            audio_normalize: false,
+            audio_db: -20.0,
+            newline_replacer: "<br>".into(),
+        };
+        let mut manual_ctx = NoteFieldsContext::new("辞書", "じしょ", "");
+        let manual_warnings =
+            prepare_note_media_with_warnings(&manual_profile, &mut manual_ctx, empty_input())
+                .expect("manual search with no video/audio must still succeed");
+        assert_eq!(manual_warnings.len(), 5, "warnings: {manual_warnings:?}");
+        assert!(manual_ctx.audio_attachments.is_empty());
+        assert!(manual_ctx.picture_attachments.is_empty());
+        assert!(manual_ctx.video_attachments.is_empty());
+        let manual_payload = build_note_payload_from_profile(&manual_profile, &manual_ctx).unwrap();
+        assert_eq!(manual_payload.fields["Expression"], "辞書");
+        assert_eq!(manual_payload.fields["WordAudio"], "");
+        assert_eq!(manual_payload.fields["SentenceAudio"], "");
+        assert_eq!(manual_payload.fields["Video"], "");
+        assert_eq!(manual_payload.fields["Pic"], "");
+        assert_eq!(manual_payload.fields["PicClean"], "");
     }
 }
