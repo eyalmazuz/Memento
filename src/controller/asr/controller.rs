@@ -95,6 +95,7 @@ mod imp {
                         control.restart_position = Some(clamped_pos);
                         control.paused_on_errors = false;
                         control.done = false;
+                        control.completed_duration = 0.0;
                         if outside_window {
                             if let Some(abort) = &control.current_abort {
                                 abort.store(true, Ordering::Release);
@@ -149,6 +150,7 @@ mod imp {
                     control.suspended_at_position = None;
                     control.paused_on_errors = false;
                     control.done = false;
+                    control.completed_duration = 0.0;
                     control.restart_position = Some(initial_position);
                     if let Some(abort) = &control.current_abort {
                         abort.store(true, Ordering::Release);
@@ -185,6 +187,7 @@ mod imp {
                     parked_no_audio: false,
                     paused_on_errors: false,
                     done: false,
+                    completed_duration: 0.0,
                     reset_cues: false,
                     emit_snapshot: false,
                     media_path: media.path.clone(),
@@ -275,9 +278,11 @@ mod imp {
             if control.suspended || control.parked_no_audio {
                 return;
             }
+            let duration_grew =
+                control.done && control.duration > control.completed_duration + SUBTITLE_TIME_DELTA;
             if control.paused_on_errors
-                || control.done
-                || is_outside_window(control.current_window, clamped_pos)
+                || duration_grew
+                || (!control.done && is_outside_window(control.current_window, clamped_pos))
             {
                 trigger_seek_restart(&mut control, &self.shared.wake, clamped_pos);
             }
@@ -285,7 +290,7 @@ mod imp {
 
         /// Update playback position and automatically reprioritize when playback jumps
         /// beyond 2.5s outside the currently active transcription window (or while
-        /// parked on errors / completion).
+        /// parked on errors / progressive-stream duration growth).
         pub fn update_position(&mut self, position: f64, duration: f64, paused: bool) {
             if !position.is_finite() || !duration.is_finite() || duration <= 0.0 {
                 return;
@@ -316,9 +321,11 @@ mod imp {
             if control.suspended || control.parked_no_audio || !jumped {
                 return;
             }
+            let duration_grew =
+                control.done && control.duration > control.completed_duration + SUBTITLE_TIME_DELTA;
             if control.paused_on_errors
-                || control.done
-                || is_outside_window(control.current_window, clamped_pos)
+                || duration_grew
+                || (!control.done && is_outside_window(control.current_window, clamped_pos))
             {
                 trigger_seek_restart(&mut control, &self.shared.wake, clamped_pos);
             }
@@ -349,6 +356,7 @@ mod imp {
             control.reset_cues = true;
             control.paused_on_errors = false;
             control.done = false;
+            control.completed_duration = 0.0;
             if let Some(abort) = &control.current_abort {
                 abort.store(true, Ordering::Release);
             }
@@ -498,6 +506,7 @@ mod imp {
         control.restart_position = Some(position);
         control.paused_on_errors = false;
         control.done = false;
+        control.completed_duration = 0.0;
         if let Some(abort) = &control.current_abort {
             abort.store(true, Ordering::Release);
         }
@@ -1168,6 +1177,19 @@ mod imp {
                 thread::sleep(Duration::from_millis(5));
             }
             assert!(completed, "worker did not reach Done state");
+
+            // Seeking inside an already-completed file with unchanged duration must NOT
+            // wake the worker or re-emit `AsrEvent::Completed` (toast spam on seek).
+            controller.notify_seek(10.0, 25.0);
+            controller.update_position(20.0, 25.0, false);
+            thread::sleep(Duration::from_millis(40));
+            let stray_events = controller.poll();
+            assert!(
+                !stray_events
+                    .iter()
+                    .any(|ev| matches!(ev, AsrEvent::Completed { .. } | AsrEvent::Started { .. })),
+                "same-duration seek after completion must not re-trigger Started/Completed: {stray_events:?}"
+            );
 
             // Duration grows (e.g. progressive stream) and user seeks to 40.0.
             controller.notify_seek(40.0, 80.0);

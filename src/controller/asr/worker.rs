@@ -43,6 +43,7 @@ pub(super) struct Control {
     pub(super) parked_no_audio: bool,
     pub(super) paused_on_errors: bool,
     pub(super) done: bool,
+    pub(super) completed_duration: f64,
     pub(super) reset_cues: bool,
     pub(super) emit_snapshot: bool,
     pub(super) media_path: String,
@@ -388,6 +389,7 @@ pub(super) fn run_session_loop<P: WindowProcessor>(
                     cue_count: cues.cues.len(),
                 });
                 control.done = true;
+                control.completed_duration = duration;
                 let mut control = wait_while_idle(
                     &shared,
                     control,
@@ -403,6 +405,7 @@ pub(super) fn run_session_loop<P: WindowProcessor>(
                     processor,
                 );
                 control.done = false;
+                control.completed_duration = 0.0;
                 continue;
             }
             WindowPlan::Advance {

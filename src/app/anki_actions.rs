@@ -30,7 +30,7 @@ pub(crate) const AUDIO_STATUS_AVAILABLE: i32 = 1;
 pub(crate) const AUDIO_STATUS_FAILED: i32 = 2;
 pub(crate) const AUDIO_STATUS_CHECKING: i32 = 3;
 const MAX_CACHED_AUDIO_TERMS: usize = 64;
-const WARNING_TOAST_DURATION: Duration = Duration::from_secs(4);
+const WARNING_TOAST_DURATION: Duration = Duration::from_secs(2);
 
 static STATUS_TOAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -277,7 +277,7 @@ pub(crate) fn invalidate_audio_caches_for_config_change(timeout_ms: u64) {
 }
 
 /// Displays a non-blocking warning toast on `MementoApp` for non-fatal Anki media warnings
-/// and auto-clears it cleanly after ~4 seconds (C3.2).
+/// and auto-clears it cleanly after ~2 seconds (C3.2).
 pub(crate) fn show_warning_toast(app: &MementoApp, warnings: &[String]) {
     let mut unique = Vec::new();
     for warning in warnings {

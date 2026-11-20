@@ -79,6 +79,9 @@ fn update_subtitle_bounds_properties(app: &MementoApp, player: &MpvInstance) {
     }
 }
 
+/// Auto-clear threshold in 200 ms housekeeping ticks (`7` ≈ 1.4–1.6 s + 150 ms fade).
+const STATUS_MESSAGE_CLEAR_TICKS: usize = 7;
+
 pub(crate) struct SyncLoopHandles {
     pub(crate) housekeeping_timer: slint::Timer,
     pub(crate) _dispatch_guard: UiDispatchGuard,
@@ -929,7 +932,7 @@ pub(crate) fn install_sync_loop(
                     status_message_ticks = 0;
                 } else {
                     status_message_ticks += 1;
-                    if status_message_ticks >= 20 {
+                    if status_message_ticks >= STATUS_MESSAGE_CLEAR_TICKS {
                         app.set_status_message("".into());
                         last_observed_status = "".into();
                         status_message_ticks = 0;

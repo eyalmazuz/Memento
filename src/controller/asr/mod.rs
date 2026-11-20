@@ -348,10 +348,16 @@ mod tests {
 
         let mut custom = Config::default_empty();
         custom
-            .set_at(whisper::GROUP, whisper::THREADS, Value::Int(7))
+            .set_value(
+                &memento_config::Key::Whisper(memento_config::WhisperField::Threads),
+                Value::Int(7),
+            )
             .unwrap();
         custom
-            .set_at(onnx::GROUP, onnx::THREADS, Value::Int(3))
+            .set_value(
+                &memento_config::Key::Onnx(memento_config::OnnxField::Threads),
+                Value::Int(3),
+            )
             .unwrap();
         let settings = AsrSettings::from_config("/unused", &custom).unwrap();
         assert_eq!(settings.whisper.threads, 7);
