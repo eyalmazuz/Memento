@@ -14,7 +14,7 @@ use self::escape::{append_escaped, ascii_to_u16};
 use self::media::add_image;
 use self::structured::add_structured_content;
 
-pub use self::escape::format_g;
+pub use self::escape::{append_escaped_str, escape_html_str, escape_html_u16, format_g};
 pub use self::structured::{
     is_supported_structured_tag, structured_data_attribute_name, MAX_STRUCTURED_CONTENT_DEPTH,
 };

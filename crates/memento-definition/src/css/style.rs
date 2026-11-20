@@ -68,6 +68,23 @@ impl Renderer {
         let mut deferred_white_space: Option<&str> = None;
         let mut deferred_margin_sides: [Option<&Value>; 4] = [None; 4];
 
+        // Apply any inline custom properties (`--*`) to the active element first
+        // so sibling properties in the same `style` object resolve against them.
+        if let Some(&elem_idx) = ctx.elements.last() {
+            if let Some(element) = ctx.selector_elements.get_mut(elem_idx as usize) {
+                for (key, value) in map {
+                    if key.starts_with("--") {
+                        if let Some(s) = value.as_str() {
+                            let val = trimmed(s);
+                            if !val.is_empty() {
+                                element.custom_properties.insert(key.clone(), val.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (key, value) in map {
             match key.as_str() {
                 "fontSize" => {

@@ -884,3 +884,346 @@ fn supported_tags_match_the_cpp_qset() {
         assert!(!renderer.is_supported_structured_tag(tag), "{tag}");
     }
 }
+
+/* --- Scoped :root custom properties, element vars & Light/Dark theme -------- */
+
+#[test]
+fn scoped_root_custom_properties_nested_vars_fallbacks_and_cycles() {
+    use crate::css::parse_stylesheet;
+    use crate::element::CssTheme;
+    use std::sync::Arc;
+
+    let renderer = Renderer::new();
+    let sheet = Arc::new(parse_stylesheet(
+        r#"
+        :root {
+            --primary: #38bdf8;
+            --border-spec: 1px solid var(--primary);
+            --double-primary: var(--primary) var(--primary);
+            --half-size: calc(16px / var(--divisor, 2));
+            --divisor: 4;
+            --self-cycle: var(--self-cycle);
+            --cycle-a: var(--cycle-b);
+            --cycle-b: var(--cycle-a);
+            --MixedCase: #abcdef;
+        }
+        "#,
+    ));
+    assert!(
+        sheet.diagnostics.is_empty(),
+        "expected no diagnostics for :root custom vars, got {:?}",
+        sheet.diagnostics
+    );
+
+    let mut ctx = Context {
+        dictionary_styles: Some(sheet),
+        ..Context::default()
+    };
+    assert_eq!(ctx.theme, CssTheme::Dark);
+
+    // Direct and nested custom var resolution + valid diamond expansion.
+    assert_eq!(renderer.resolve_css_value("var(--primary)", &mut ctx), "#38bdf8");
+    assert_eq!(
+        renderer.resolve_css_value("var(--border-spec)", &mut ctx),
+        "1px solid #38bdf8"
+    );
+    assert_eq!(
+        renderer.resolve_css_value("var(--double-primary)", &mut ctx),
+        "#38bdf8 #38bdf8"
+    );
+    assert_eq!(renderer.resolve_css_value("var(--half-size)", &mut ctx), "4px");
+    assert_eq!(renderer.resolve_css_value("var(--MixedCase)", &mut ctx), "#abcdef");
+
+    // Undefined var uses fallback; defined var ignores fallback.
+    assert_eq!(
+        renderer.resolve_css_value("var(--missing, var(--primary))", &mut ctx),
+        "#38bdf8"
+    );
+    assert_eq!(
+        renderer.resolve_css_value("var(--primary, #000000)", &mut ctx),
+        "#38bdf8"
+    );
+
+    // Direct and mutual cycles terminate safely and trigger outer fallback if provided.
+    assert_eq!(renderer.resolve_css_value("var(--self-cycle)", &mut ctx), "");
+    assert_eq!(
+        renderer.resolve_css_value("var(--self-cycle, #123456)", &mut ctx),
+        "#123456"
+    );
+    assert_eq!(renderer.resolve_css_value("var(--cycle-a)", &mut ctx), "");
+    assert_eq!(
+        renderer.resolve_css_value("var(--cycle-a, #654321)", &mut ctx),
+        "#654321"
+    );
+}
+
+#[test]
+fn theme_switching_resolves_root_data_theme_and_builtin_palette() {
+    use crate::css::parse_stylesheet;
+    use crate::element::{CssTheme, StructuredElement};
+    use std::sync::Arc;
+
+    let renderer = Renderer::new();
+    // Place :root[data-theme="..."] BEFORE bare :root to verify higher specificity wins.
+    let sheet = Arc::new(parse_stylesheet(
+        r#"
+        :root[data-theme="light"] {
+            --accent: #0284c7;
+            --surface: #f8fafc;
+        }
+        :root[data-theme="dark"] {
+            --accent: #7dd3fc;
+        }
+        :root {
+            --accent: #999999;
+            --surface: #1e293b;
+            --text-alias: var(--text-color);
+            --bg-alias: var(--background-color);
+        }
+        :root[data-theme="light"] span {
+            font-weight: bold;
+        }
+        :root[data-theme="dark"] span {
+            font-style: italic;
+        }
+        span {
+            color: var(--accent);
+            background-color: var(--surface);
+        }
+        "#,
+    ));
+    assert!(sheet.diagnostics.is_empty(), "{:?}", sheet.diagnostics);
+
+    // Default theme is Dark.
+    let mut ctx = Context::with_theme(CssTheme::Dark);
+    ctx.dictionary_styles = Some(Arc::clone(&sheet));
+    assert_eq!(
+        renderer.resolve_css_value("var(--text-color)", &mut ctx),
+        CssTheme::Dark.default_text_color()
+    );
+    assert_eq!(
+        renderer.resolve_css_value("var(--fg)", &mut ctx),
+        CssTheme::Dark.default_text_color()
+    );
+    assert_eq!(
+        renderer.resolve_css_value("var(--background-color)", &mut ctx),
+        CssTheme::Dark.default_background_color()
+    );
+    assert_eq!(
+        renderer.resolve_css_value("var(--canvas)", &mut ctx),
+        CssTheme::Dark.default_background_color()
+    );
+    assert_eq!(renderer.resolve_css_value("var(--accent)", &mut ctx), "#7dd3fc");
+    assert_eq!(renderer.resolve_css_value("var(--surface)", &mut ctx), "#1e293b");
+    assert_eq!(
+        renderer.resolve_css_value("var(--text-alias)", &mut ctx),
+        CssTheme::Dark.default_text_color()
+    );
+
+    // Explicit theme parameter switches both custom vars and built-in palette without mutating ctx.
+    assert_eq!(
+        renderer.resolve_css_value_with_theme("var(--accent)", &mut ctx, CssTheme::Light),
+        "#0284c7"
+    );
+    assert_eq!(
+        renderer.resolve_css_value_with_theme("var(--surface)", &mut ctx, CssTheme::Light),
+        "#f8fafc"
+    );
+    assert_eq!(
+        renderer.resolve_css_value_with_theme("var(--text-color)", &mut ctx, CssTheme::Light),
+        CssTheme::Light.default_text_color()
+    );
+    assert_eq!(
+        renderer.resolve_css_value_with_theme("var(--background-color)", &mut ctx, CssTheme::Light),
+        CssTheme::Light.default_background_color()
+    );
+
+    // Selector matching under Dark vs Light theme.
+    let mut span = StructuredElement::new();
+    span.tag = "span".to_owned();
+    ctx.selector_elements.push(span);
+    ctx.elements.push(0);
+
+    let mut dark_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut dark_decls, None, None);
+    assert_eq!(dark_decls.get("color").map(String::as_str), Some("#7dd3fc"));
+    assert_eq!(
+        dark_decls.get("background-color").map(String::as_str),
+        Some("#1e293b")
+    );
+    assert_eq!(dark_decls.get("font-style").map(String::as_str), Some("italic"));
+    assert!(!dark_decls.contains_key("font-weight"));
+
+    // Switch context to Light theme (must invalidate cache and switch matched rules + vars).
+    ctx.set_theme(CssTheme::Light);
+    let mut light_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut light_decls, None, None);
+    assert_eq!(light_decls.get("color").map(String::as_str), Some("#0284c7"));
+    assert_eq!(
+        light_decls.get("background-color").map(String::as_str),
+        Some("#f8fafc")
+    );
+    assert_eq!(light_decls.get("font-weight").map(String::as_str), Some("bold"));
+    assert!(!light_decls.contains_key("font-style"));
+    assert_eq!(
+        renderer.resolve_css_value("var(--bg-alias)", &mut ctx),
+        CssTheme::Light.default_background_color()
+    );
+}
+
+#[test]
+fn element_scoped_custom_properties_inherit_and_do_not_leak_to_siblings() {
+    use crate::css::parse_stylesheet;
+    use crate::element::StructuredElement;
+    use std::sync::Arc;
+
+    let renderer = Renderer::new();
+    let sheet = Arc::new(parse_stylesheet(
+        r#"
+        :root { --tone: #aaaaaa; }
+        div.card {
+            color: var(--tone);
+            --tone: #10b981;
+        }
+        span.inner { color: var(--tone); }
+        span.override { --tone: #f43f5e; color: var(--tone); }
+        "#,
+    ));
+
+    let mut ctx = Context {
+        dictionary_styles: Some(sheet),
+        ..Context::default()
+    };
+
+    // Push div.card (declares --tone after color: var(--tone)).
+    let mut div = StructuredElement::new();
+    div.tag = "div".to_owned();
+    div.classes.insert("card".to_owned());
+    ctx.selector_elements.push(div);
+    ctx.elements.push(0);
+
+    let mut div_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut div_decls, None, None);
+    assert_eq!(div_decls.get("color").map(String::as_str), Some("#10b981"));
+    assert!(!div_decls.contains_key("--tone"));
+
+    // Child span.inner inherits div.card's --tone.
+    let mut inner = StructuredElement::new();
+    inner.tag = "span".to_owned();
+    inner.classes.insert("inner".to_owned());
+    ctx.selector_elements.push(inner);
+    ctx.elements.push(1);
+    let mut inner_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut inner_decls, None, None);
+    assert_eq!(inner_decls.get("color").map(String::as_str), Some("#10b981"));
+    ctx.elements.pop();
+
+    // Child span.override overrides --tone locally.
+    let mut over = StructuredElement::new();
+    over.tag = "span".to_owned();
+    over.classes.insert("override".to_owned());
+    ctx.selector_elements.push(over);
+    ctx.elements.push(2);
+    let mut over_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut over_decls, None, None);
+    assert_eq!(over_decls.get("color").map(String::as_str), Some("#f43f5e"));
+    ctx.elements.pop();
+
+    // Pop div.card: a sibling span.inner outside div.card sees :root's --tone again.
+    ctx.elements.pop();
+    let mut outside = StructuredElement::new();
+    outside.tag = "span".to_owned();
+    outside.classes.insert("inner".to_owned());
+    ctx.selector_elements.push(outside);
+    ctx.elements.push(3);
+    let mut outside_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut outside_decls, None, None);
+    assert_eq!(outside_decls.get("color").map(String::as_str), Some("#aaaaaa"));
+}
+
+#[test]
+fn root_custom_properties_are_strictly_isolated_across_dictionaries() {
+    use crate::css::parse_stylesheet;
+    use std::sync::Arc;
+
+    let renderer = Renderer::new();
+    let dict_a = Arc::new(parse_stylesheet(
+        r#"
+        :root { --dict-accent: #ff0000; --shared-name: #111111; }
+        :root[data-theme="light"] { --dict-accent: #aa0000; }
+        "#,
+    ));
+    let dict_b = Arc::new(parse_stylesheet(
+        r#"
+        :root { --shared-name: #222222; }
+        "#,
+    ));
+
+    // Separate contexts never leak across dictionaries.
+    let mut ctx_a = Context {
+        dictionary_styles: Some(Arc::clone(&dict_a)),
+        ..Context::default()
+    };
+    let mut ctx_b = Context {
+        dictionary_styles: Some(Arc::clone(&dict_b)),
+        ..Context::default()
+    };
+
+    assert_eq!(renderer.resolve_css_value("var(--dict-accent)", &mut ctx_a), "#ff0000");
+    assert_eq!(renderer.resolve_css_value("var(--shared-name)", &mut ctx_a), "#111111");
+
+    assert_eq!(renderer.resolve_css_value("var(--dict-accent)", &mut ctx_b), "");
+    assert_eq!(
+        renderer.resolve_css_value("var(--dict-accent, #00ff00)", &mut ctx_b),
+        "#00ff00"
+    );
+    assert_eq!(renderer.resolve_css_value("var(--shared-name)", &mut ctx_b), "#222222");
+
+    // Reusing the same Context after swapping stylesheets also invalidates cache cleanly.
+    ctx_a.dictionary_styles = Some(dict_b);
+    assert_eq!(
+        renderer.resolve_css_value("var(--dict-accent, #00ff00)", &mut ctx_a),
+        "#00ff00"
+    );
+    assert_eq!(renderer.resolve_css_value("var(--shared-name)", &mut ctx_a), "#222222");
+}
+
+#[test]
+fn nested_root_theme_blocks_and_color_mix_with_custom_vars() {
+    use crate::css::parse_stylesheet;
+    use crate::element::{CssTheme, StructuredElement};
+    use std::sync::Arc;
+
+    let renderer = Renderer::new();
+    let sheet = Arc::new(parse_stylesheet(
+        r#"
+        :root {
+            --base: #ff0000;
+            --mix-with: #0000ff;
+            &[data-theme="light"] {
+                --base: #00ff00;
+            }
+            span {
+                color: color-mix(in srgb, var(--base) 50%, var(--mix-with));
+            }
+        }
+        "#,
+    ));
+    assert!(sheet.diagnostics.is_empty(), "{:?}", sheet.diagnostics);
+
+    let mut ctx = Context::with_theme(CssTheme::Dark);
+    ctx.dictionary_styles = Some(sheet);
+    let mut span = StructuredElement::new();
+    span.tag = "span".to_owned();
+    ctx.selector_elements.push(span);
+    ctx.elements.push(0);
+
+    let mut dark_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut dark_decls, None, None);
+    assert_eq!(dark_decls.get("color").map(String::as_str), Some("#ff800080"));
+
+    ctx.set_theme(CssTheme::Light);
+    let mut light_decls = CssDeclarations::new();
+    renderer.add_matching_css_rules(&mut ctx, &mut light_decls, None, None);
+    assert_eq!(light_decls.get("color").map(String::as_str), Some("#ff008080"));
+}

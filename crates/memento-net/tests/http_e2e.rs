@@ -402,6 +402,27 @@ fn stalled_server_fires_the_read_timeout()
 }
 
 #[test]
+fn per_request_timeout_override_bounds_stalled_download()
+{
+    let server = TestServer::start();
+    server.spawn(|_, _| Action::Stall);
+    let config = HttpClientConfig {
+        timeout: Some(Duration::from_secs(30)),
+        ..HttpClientConfig::default()
+    };
+    let url = server.url("/slow-override");
+    let result = client_with_config(config).send_with_request_timeout(
+        &Request::get(Url::parse(&url).unwrap()),
+        Duration::from_millis(200),
+    );
+    let error = result.expect_err("per-request timeout override must fire");
+    assert!(
+        error.is_timeout(),
+        "expected a timeout classification, got {error:?}"
+    );
+}
+
+#[test]
 fn oversized_header_is_rejected_as_a_protocol_error()
 {
     let server = TestServer::start();

@@ -136,9 +136,70 @@ impl Default for AnkiEndpoint
 
 impl AnkiEndpoint
 {
-    fn api_key_sent(&self) -> Option<&str>
+    /// Returns the API key sent in AnkiConnect requests when `use_api_key` is
+    /// enabled (`Some("")` when enabled with `api_key: None`), or `None` when
+    /// API key authentication is disabled.
+    pub fn api_key_sent(&self) -> Option<&str>
     {
         self.use_api_key.then(|| self.api_key.as_deref().unwrap_or(""))
+    }
+}
+
+/// Builds a single sub-action JSON object for AnkiConnect's `"multi"` action.
+///
+/// Includes `"key": api_key` whenever `api_key` is `Some(...)` (Yomitan PR #2421)
+/// so AnkiConnect servers with an API key configured accept every sub-action
+/// dispatched inside `multi`.
+pub fn build_multi_action(
+    action: AnkiAction,
+    params: Option<Value>,
+    api_key: Option<&str>,
+) -> Value
+{
+    let mut obj = serde_json::Map::with_capacity(3);
+    obj.insert("action".to_owned(), Value::String(action.as_wire().to_owned()));
+    if let Some(key) = api_key
+    {
+        obj.insert("key".to_owned(), Value::String(key.to_owned()));
+    }
+    if let Some(params) = params
+    {
+        obj.insert("params".to_owned(), params);
+    }
+    Value::Object(obj)
+}
+
+/// Ensures every sub-action object inside a `multi` request's `params.actions`
+/// array includes `"key": api_key` (recursing into nested `multi` sub-actions).
+fn inject_api_key_into_multi_params(params: &mut Value, api_key: &str)
+{
+    let Some(actions) = params
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("actions"))
+        .and_then(Value::as_array_mut)
+    else
+    {
+        return;
+    };
+    for sub_action in actions
+    {
+        if let Some(sub_obj) = sub_action.as_object_mut()
+        {
+            sub_obj
+                .entry("key".to_owned())
+                .or_insert_with(|| Value::String(api_key.to_owned()));
+            let is_nested_multi = sub_obj
+                .get("action")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == AnkiAction::Multi.as_wire());
+            if is_nested_multi
+            {
+                if let Some(nested_params) = sub_obj.get_mut("params")
+                {
+                    inject_api_key_into_multi_params(nested_params, api_key);
+                }
+            }
+        }
     }
 }
 
@@ -355,6 +416,27 @@ impl AnkiClient
         &self.endpoint
     }
 
+    /// Returns the API key sent on requests when `use_api_key` is enabled, or `None`.
+    pub fn api_key(&self) -> Option<&str>
+    {
+        self.endpoint.api_key_sent()
+    }
+
+    /// Builds a sub-action JSON object for AnkiConnect `"multi"`, automatically
+    /// including `"key"` when this client's endpoint uses an API key.
+    pub fn build_multi_action(&self, action: AnkiAction, params: Option<Value>) -> Value
+    {
+        build_multi_action(action, params, self.endpoint.api_key_sent())
+    }
+
+    /// Sends an AnkiConnect `"multi"` request containing `actions`, ensuring
+    /// every sub-action includes `"key"` when `use_api_key` is enabled.
+    pub fn multi(&self, actions: Vec<Value>) -> AnkiResult<Value>
+    {
+        let params = json!({ "actions": actions });
+        self.request(AnkiAction::Multi, Some(params))
+    }
+
     /// Composes the AnkiConnect endpoint URL from `hostname` and `port`,
     /// wrapping bare IPv6 literals in `[...]`, preserving explicit schemes,
     /// explicit ports in `hostname`, and paths/queries cleanly.
@@ -363,12 +445,20 @@ impl AnkiClient
         compose_endpoint_url(&self.endpoint.hostname, self.endpoint.port)
     }
 
-    fn endpoint_request(&self, action: AnkiAction, params: Option<Value>) -> AnkiResult<Request>
+    fn endpoint_request(&self, action: AnkiAction, mut params: Option<Value>) -> AnkiResult<Request>
     {
+        let api_key = self.endpoint.api_key_sent();
+        if action == AnkiAction::Multi
+        {
+            if let (Some(key), Some(params_val)) = (api_key, params.as_mut())
+            {
+                inject_api_key_into_multi_params(params_val, key);
+            }
+        }
         let request = AnkiRequest {
             action: action.as_wire().to_owned(),
             version: MIN_ANKICONNECT_VERSION,
-            key: self.endpoint.api_key_sent().map(str::to_owned),
+            key: api_key.map(str::to_owned),
             params,
         };
         // `Url::parse` canonicalizes a pathless URL to `/`, while preserving
@@ -484,6 +574,12 @@ impl AnkiClient
             .ok_or(AnkiError::Typed(TypedReplyStatus::ElementTypeMismatch))
     }
 
+    /// Calls AnkiConnect `modelFieldNames` with `{ "modelName": model_name }`.
+    pub fn model_field_names(&self, model_name: &str) -> AnkiResult<Vec<String>>
+    {
+        self.field_names(model_name)
+    }
+
     /// `canAddNotes` with `{ "notes": [...] }` params (reuses
     /// `interpret_can_add_notes`-adjacent bool list shape).
     pub fn can_add_notes(&self, notes: &[Value]) -> AnkiResult<Vec<bool>>
@@ -581,13 +677,13 @@ impl AnkiClient
         let actions: Vec<Value> = files
             .iter()
             .map(|file| {
-                json!({
-                    "action": AnkiAction::StoreMediaFile.as_wire(),
-                    "params": {
+                self.build_multi_action(
+                    AnkiAction::StoreMediaFile,
+                    Some(json!({
                         "data": file.data_base64,
                         "filename": file.filename,
-                    },
-                })
+                    })),
+                )
             })
             .collect();
         let params = json!({ "actions": actions });
@@ -1216,6 +1312,138 @@ mod tests {
             ..AnkiEndpoint::default()
         });
         assert_eq!(client.store_media_files(&[]).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn build_multi_action_with_and_without_api_key()
+    {
+        use super::{build_multi_action, AnkiAction};
+
+        let without_key = build_multi_action(
+            AnkiAction::FindNotes,
+            Some(json!({ "query": "deck:\"Default\"" })),
+            None,
+        );
+        assert_eq!(
+            without_key,
+            json!({
+                "action": "findNotes",
+                "params": { "query": "deck:\"Default\"" }
+            })
+        );
+        assert!(without_key.get("key").is_none());
+
+        let with_key = build_multi_action(
+            AnkiAction::FindNotes,
+            Some(json!({ "query": "deck:\"Default\"" })),
+            Some("my-secret-key"),
+        );
+        assert_eq!(
+            with_key,
+            json!({
+                "action": "findNotes",
+                "key": "my-secret-key",
+                "params": { "query": "deck:\"Default\"" }
+            })
+        );
+
+        let bare_with_empty_key = build_multi_action(AnkiAction::DeckNames, None, Some(""));
+        assert_eq!(
+            bare_with_empty_key,
+            json!({
+                "action": "deckNames",
+                "key": ""
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_request_injects_api_key_into_all_multi_sub_actions_including_nested()
+    {
+        use super::{AnkiAction, AnkiClient};
+
+        let client_with_key = AnkiClient::new(AnkiEndpoint {
+            api_key: Some("tok-123".to_owned()),
+            use_api_key: true,
+            ..AnkiEndpoint::default()
+        });
+        assert_eq!(client_with_key.api_key(), Some("tok-123"));
+
+        let req = client_with_key
+            .endpoint_request(
+                AnkiAction::Multi,
+                Some(json!({
+                    "actions": [
+                        { "action": "findNotes", "params": { "query": "a" } },
+                        {
+                            "action": "multi",
+                            "params": {
+                                "actions": [
+                                    { "action": "deckNames" }
+                                ]
+                            }
+                        }
+                    ]
+                })),
+            )
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "action": "multi",
+                "version": 6,
+                "key": "tok-123",
+                "params": {
+                    "actions": [
+                        { "action": "findNotes", "key": "tok-123", "params": { "query": "a" } },
+                        {
+                            "action": "multi",
+                            "key": "tok-123",
+                            "params": {
+                                "actions": [
+                                    { "action": "deckNames", "key": "tok-123" }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            })
+        );
+
+        let client_without_key = AnkiClient::new(AnkiEndpoint {
+            api_key: Some("ignored-when-disabled".to_owned()),
+            use_api_key: false,
+            ..AnkiEndpoint::default()
+        });
+        assert_eq!(client_without_key.api_key(), None);
+        let req_no_key = client_without_key
+            .endpoint_request(
+                AnkiAction::Multi,
+                Some(json!({
+                    "actions": [
+                        client_without_key.build_multi_action(
+                            AnkiAction::FindNotes,
+                            Some(json!({ "query": "a" })),
+                        )
+                    ]
+                })),
+            )
+            .unwrap();
+        let body_no_key: serde_json::Value =
+            serde_json::from_slice(req_no_key.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body_no_key,
+            json!({
+                "action": "multi",
+                "version": 6,
+                "params": {
+                    "actions": [
+                        { "action": "findNotes", "params": { "query": "a" } }
+                    ]
+                }
+            })
+        );
     }
 
 }

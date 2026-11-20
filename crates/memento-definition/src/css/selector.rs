@@ -26,13 +26,49 @@ use serde_json::Value;
 
 use crate::element::{
     Context, CssAttributeOperator, CssCombinator, CssDeclarations, CssPseudoClass,
-    CssPseudoElement, CssRule, CssSelectorPart, ParsedStylesheet, StructuredElement,
+    CssPseudoElement, CssRule, CssSelectorPart, CssTheme, ParsedStylesheet, StructuredElement,
 };
 use crate::helpers::{css_font_size_to_pixels, format_pixel_size};
-use crate::qstring::{is_qchar_upper, to_lower, to_lower_char};
+use crate::qstring::{find_ascii_ci_span, is_qchar_upper, to_lower, to_lower_char};
 
+use super::parser::is_root_selector_part;
 use super::scanners;
 use super::Renderer;
+
+fn root_selector_part_matches(part: &CssSelectorPart, theme: CssTheme) -> bool {
+    if !part.tag.is_empty() && part.tag != "html" {
+        return false;
+    }
+    if !part.class_names.is_empty() {
+        return false;
+    }
+    let active_theme = theme.as_data_theme();
+    for attribute in &part.attributes {
+        if !attribute.name.eq_ignore_ascii_case("data-theme") {
+            return false;
+        }
+        match attribute.op {
+            CssAttributeOperator::Exists => {}
+            CssAttributeOperator::Equals => {
+                if !active_theme.eq_ignore_ascii_case(&attribute.value) {
+                    return false;
+                }
+            }
+            CssAttributeOperator::StartsWith => {
+                if !active_theme.starts_with(&attribute.value) {
+                    return false;
+                }
+            }
+        }
+    }
+    for pseudo in &part.pseudo_classes {
+        let matched = matches!(pseudo.pseudo_type, CssPseudoClass::Root);
+        if if pseudo.negated { matched } else { !matched } {
+            return false;
+        }
+    }
+    true
+}
 
 impl Renderer {
     /// Apply matching stylesheet rules to a declaration map
@@ -65,10 +101,14 @@ impl Renderer {
         /* Cloned from the Arc up front so `ctx` stays freely mutable below. */
         let stylesheet: Arc<ParsedStylesheet> = ctx.dictionary_styles.clone().unwrap();
 
+        let current_elem_idx = (*ctx.elements.last().unwrap()) as usize;
         let candidate_indexes: &[usize] = {
-            let element = &ctx.selector_elements[(*ctx.elements.last().unwrap()) as usize];
+            let element = &ctx.selector_elements[current_elem_idx];
             scanners::candidate_rule_indexes_for(&stylesheet, &element.tag, element.child_index)
         };
+
+        let mut matched_rules: Vec<usize> = Vec::new();
+        let mut matched_pseudo_rules: Vec<usize> = Vec::new();
 
         for &index in candidate_indexes {
             let rule = &stylesheet.rules[index];
@@ -76,23 +116,57 @@ impl Renderer {
                 continue;
             }
             if rule.pseudo_element != CssPseudoElement::None {
-                let content: Option<&mut String> =
-                    if rule.pseudo_element == CssPseudoElement::After {
-                        after_content.as_mut().map(|s| &mut **s)
-                    } else {
-                        before_content.as_mut().map(|s| &mut **s)
-                    };
-                if let Some(content) = content {
-                    for declaration in &rule.declarations {
-                        if declaration.property == "content" {
+                matched_pseudo_rules.push(index);
+            } else {
+                matched_rules.push(index);
+            }
+        }
+
+        // First pass: apply scoped custom property (`--*`) declarations from all
+        // matching rules in specificity/source order so regular declarations on
+        // this element (and its descendants) resolve against them.
+        for &index in &matched_rules {
+            let rule = &stylesheet.rules[index];
+            for declaration in &rule.declarations {
+                if declaration.property.starts_with("--") {
+                    ctx.selector_elements[current_elem_idx]
+                        .custom_properties
+                        .insert(declaration.property.clone(), declaration.value.clone());
+                }
+            }
+        }
+
+        for &index in &matched_pseudo_rules {
+            let rule = &stylesheet.rules[index];
+            let content: Option<&mut String> =
+                if rule.pseudo_element == CssPseudoElement::After {
+                    after_content.as_mut().map(|s| &mut **s)
+                } else {
+                    before_content.as_mut().map(|s| &mut **s)
+                };
+            if let Some(content) = content {
+                for declaration in &rule.declarations {
+                    if declaration.property == "content" {
+                        if find_ascii_ci_span(&declaration.value, "var(", 0).is_some() {
+                            let resolved = self.resolve_css_variables(&declaration.value, ctx);
+                            if !resolved.is_empty() {
+                                *content = crate::helpers::unquote_css_string(&resolved)
+                                    .unwrap_or(resolved);
+                            }
+                        } else {
                             content.clone_from(&declaration.value);
                         }
                     }
                 }
-                continue;
             }
+        }
 
+        for &index in &matched_rules {
+            let rule = &stylesheet.rules[index];
             for declaration in &rule.declarations {
+                if declaration.property.starts_with("--") {
+                    continue;
+                }
                 let value = self.resolve_css_value_cow(&declaration.value, ctx);
                 if value.is_empty() {
                     continue;
@@ -160,8 +234,16 @@ impl Renderer {
         }
 
         let previous_sibling = element.previous_sibling;
+        let prev_is_root = part_index == 1 && is_root_selector_part(&rule.selector[0]);
         match rule.selector[part_index as usize].combinator {
             CssCombinator::Child => {
+                if prev_is_root {
+                    let at_root = stack_index == 0
+                        || (stack_index == 1
+                            && ctx.selector_elements[ctx.elements[0] as usize].tag
+                                == "memento-dict");
+                    return at_root && root_selector_part_matches(&rule.selector[0], ctx.theme);
+                }
                 if stack_index <= 0 {
                     return false;
                 }
@@ -199,6 +281,9 @@ impl Renderer {
             }
 
             CssCombinator::Descendant => {
+                if prev_is_root {
+                    return root_selector_part_matches(&rule.selector[0], ctx.theme);
+                }
                 let mut i = stack_index - 1;
                 while i >= 0 {
                     if self.css_rule_matches_at(
@@ -253,21 +338,30 @@ impl Renderer {
                 }
             }
         }
-        if !part.pseudo_classes.is_empty() && element.child_index <= 0 {
-            return false;
-        }
         for pseudo in &part.pseudo_classes {
             let matched = match pseudo.pseudo_type {
-                CssPseudoClass::FirstChild => element.child_index == 1,
+                CssPseudoClass::FirstChild => {
+                    if element.child_index <= 0 {
+                        return false;
+                    }
+                    element.child_index == 1
+                }
 
                 CssPseudoClass::LastChild => {
-                    if element.child_count <= 0 {
+                    if element.child_index <= 0 || element.child_count <= 0 {
                         return false;
                     }
                     element.child_index == element.child_count
                 }
 
-                CssPseudoClass::NthChild => element.child_index == pseudo.child_index as i64,
+                CssPseudoClass::NthChild => {
+                    if element.child_index <= 0 {
+                        return false;
+                    }
+                    element.child_index == pseudo.child_index as i64
+                }
+
+                CssPseudoClass::Root => false,
             };
 
             if if pseudo.negated { matched } else { !matched } {

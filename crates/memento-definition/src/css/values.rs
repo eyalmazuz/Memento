@@ -22,9 +22,10 @@
 //! top-level token / argument splitting.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::color::Color;
-use crate::element::Context;
+use crate::element::{Context, CssTheme};
 use crate::helpers::format_pixel_size;
 use crate::qstring::{
     c_double, contains_ascii_ci, find_ascii_ci_span, is_qchar_space, starts_with_ascii_ci,
@@ -40,6 +41,91 @@ const MAX_VARIABLE_REPLACEMENTS: usize = 32;
 const MAX_VARIABLE_DEPTH: usize = 32;
 const MAX_CALC_REPLACEMENTS: usize = 16;
 const UNSPECIFIED_PERCENTAGE: f64 = -1.0;
+
+enum VarResolve {
+    Ok(String),
+    InvalidOrCycle,
+    BudgetExceeded,
+}
+
+fn stylesheet_ptr(ctx: &Context) -> usize {
+    ctx.dictionary_styles
+        .as_ref()
+        .map_or(0, |sheet| Arc::as_ptr(sheet) as usize)
+}
+
+fn has_element_custom_properties(ctx: &Context) -> bool {
+    ctx.elements.iter().any(|&idx| {
+        ctx.selector_elements
+            .get(idx as usize)
+            .is_some_and(|el| !el.custom_properties.is_empty())
+    })
+}
+
+fn resolve_builtin_palette_color<'a>(
+    ctx_color: &'a str,
+    ctx_theme: CssTheme,
+    active_theme: CssTheme,
+    explicit_theme: bool,
+    theme_default: fn(CssTheme) -> &'static str,
+) -> Option<&'a str> {
+    if !ctx_color.is_empty() {
+        if explicit_theme
+            && active_theme != ctx_theme
+            && ctx_color.eq_ignore_ascii_case(theme_default(ctx_theme))
+        {
+            return Some(theme_default(active_theme));
+        }
+        return Some(ctx_color);
+    }
+    if explicit_theme || active_theme == CssTheme::Light {
+        return Some(theme_default(active_theme));
+    }
+    None
+}
+
+fn lookup_scoped_custom_property<'a>(
+    raw_name: &str,
+    lower_name: &str,
+    ctx: &'a Context,
+    theme: CssTheme,
+) -> Option<(&'a str, &'a str)> {
+    // 1. Element-scoped custom properties (innermost element -> outermost ancestor).
+    for &idx in ctx.elements.iter().rev() {
+        if let Some(el) = ctx.selector_elements.get(idx as usize) {
+            if let Some((k, val)) = el.custom_properties.get_key_value(raw_name) {
+                return Some((k.as_str(), val.as_str()));
+            }
+            if raw_name != lower_name {
+                if let Some((k, val)) = el.custom_properties.get_key_value(lower_name) {
+                    return Some((k.as_str(), val.as_str()));
+                }
+            }
+        }
+    }
+    // 2. Per-dictionary `:root` / `:root[data-theme="..."]` custom properties.
+    ctx.dictionary_styles.as_deref().and_then(|sheet| {
+        let theme_map = match theme {
+            CssTheme::Dark => &sheet.dark_root_variables,
+            CssTheme::Light => &sheet.light_root_variables,
+        };
+        if let Some((k, v)) = theme_map.get_key_value(raw_name) {
+            return Some((k.as_str(), v.as_str()));
+        }
+        if let Some((k, v)) = sheet.root_variables.get_key_value(raw_name) {
+            return Some((k.as_str(), v.as_str()));
+        }
+        if raw_name != lower_name {
+            if let Some((k, v)) = theme_map.get_key_value(lower_name) {
+                return Some((k.as_str(), v.as_str()));
+            }
+            if let Some((k, v)) = sheet.root_variables.get_key_value(lower_name) {
+                return Some((k.as_str(), v.as_str()));
+            }
+        }
+        None
+    })
+}
 
 /// Split a CSS value into whitespace-delimited top-level tokens
 /// (`splitCssTokens`, L38-90).
@@ -105,22 +191,36 @@ impl Renderer {
             return Cow::Borrowed(trimmed(value));
         }
 
-        /* PORT-NOTE: the cache is keyed by the raw (untrimmed) source value. */
-        if let Some(cached) = ctx.resolved_css_values.get(value) {
-            return Cow::Owned(cached.clone());
+        let current_sheet_ptr = stylesheet_ptr(ctx);
+        if ctx.cached_css_theme != ctx.theme || ctx.cached_stylesheet_ptr != current_sheet_ptr {
+            ctx.resolved_css_values.clear();
+            ctx.cached_css_theme = ctx.theme;
+            ctx.cached_stylesheet_ptr = current_sheet_ptr;
+        }
+
+        let use_cache = !has_element_custom_properties(ctx);
+        if use_cache {
+            /* PORT-NOTE: the cache is keyed by the raw (untrimmed) source value. */
+            if let Some(cached) = ctx.resolved_css_values.get(value) {
+                return Cow::Owned(cached.clone());
+            }
         }
 
         let mut resolved = self.resolve_css_variables(trimmed(value), ctx);
         if resolved.is_empty() {
-            ctx.resolved_css_values
-                .insert(value.to_string(), String::new());
+            if use_cache {
+                ctx.resolved_css_values
+                    .insert(value.to_string(), String::new());
+            }
             return Cow::Borrowed("");
         }
 
         resolved = self.resolve_css_calculations(&resolved);
         if resolved.is_empty() {
-            ctx.resolved_css_values
-                .insert(value.to_string(), String::new());
+            if use_cache {
+                ctx.resolved_css_values
+                    .insert(value.to_string(), String::new());
+            }
             return Cow::Borrowed("");
         }
 
@@ -129,48 +229,119 @@ impl Renderer {
         } else if contains_ascii_ci(&resolved, "gradient(") {
             resolved = self.css_gradient_fallback(&resolved);
         }
-        ctx.resolved_css_values
-            .insert(value.to_string(), resolved.clone());
+        if use_cache {
+            ctx.resolved_css_values
+                .insert(value.to_string(), resolved.clone());
+        }
         Cow::Owned(resolved)
     }
 
     /// Resolve browser CSS values to values supported by Qt rich text
-    /// (`resolveCssValue`, L468-502).
+    /// (`resolveCssValue`, L468-502). Uses `ctx.theme` (defaulting to
+    /// [`CssTheme::Dark`]).
     pub fn resolve_css_value(&self, value: &str, ctx: &mut Context) -> String {
         self.resolve_css_value_cow(value, ctx).into_owned()
     }
 
+    /// Resolve browser CSS values under an explicit [`CssTheme`] (`Dark` or
+    /// `Light`) without mutating `ctx.theme` or polluting `ctx.resolved_css_values`.
+    pub fn resolve_css_value_with_theme(
+        &self,
+        value: &str,
+        ctx: &mut Context,
+        theme: CssTheme,
+    ) -> String {
+        if !value.contains('(') {
+            return trimmed(value).to_owned();
+        }
+        let mut resolved = self.resolve_css_variables_with_theme(trimmed(value), ctx, theme);
+        if resolved.is_empty() {
+            return String::new();
+        }
+        resolved = self.resolve_css_calculations(&resolved);
+        if resolved.is_empty() {
+            return String::new();
+        }
+        if starts_with_ascii_ci(&resolved, "color-mix(") {
+            resolved = self.resolve_color_mix(&resolved);
+        } else if contains_ascii_ci(&resolved, "gradient(") {
+            resolved = self.css_gradient_fallback(&resolved);
+        }
+        resolved
+    }
+
     /// Resolve CSS variable references in a declaration value
     /// (`resolveCssVariables`, L504-602) with a shared total-substitution
-    /// budget and explicit recursion depth cap.
+    /// budget, explicit recursion depth cap, and cycle detection.
     pub fn resolve_css_variables(&self, value: &str, ctx: &Context) -> String {
         // Match the original 32-iteration loop semantics: up to 31 substitutions
         // succeed (32nd pass sees no remaining `var(`), while 32+ abort with "".
         let mut remaining_budget = MAX_VARIABLE_REPLACEMENTS - 1;
-        self.resolve_css_variables_inner(value, ctx, &mut remaining_budget, 0)
+        let mut active_vars = Vec::new();
+        match self.resolve_css_variables_inner(
+            value,
+            ctx,
+            ctx.theme,
+            false,
+            &mut remaining_budget,
+            0,
+            &mut active_vars,
+        ) {
+            VarResolve::Ok(resolved) => resolved,
+            VarResolve::InvalidOrCycle | VarResolve::BudgetExceeded => String::new(),
+        }
     }
 
+    /// Resolve CSS variable references under an explicit [`CssTheme`] (`Dark`
+    /// or `Light`), applying built-in theme palette defaults when `ctx` does
+    /// not provide an explicit override color.
+    pub fn resolve_css_variables_with_theme(
+        &self,
+        value: &str,
+        ctx: &Context,
+        theme: CssTheme,
+    ) -> String {
+        let mut remaining_budget = MAX_VARIABLE_REPLACEMENTS - 1;
+        let mut active_vars = Vec::new();
+        match self.resolve_css_variables_inner(
+            value,
+            ctx,
+            theme,
+            true,
+            &mut remaining_budget,
+            0,
+            &mut active_vars,
+        ) {
+            VarResolve::Ok(resolved) => resolved,
+            VarResolve::InvalidOrCycle | VarResolve::BudgetExceeded => String::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn resolve_css_variables_inner(
         &self,
         value: &str,
         ctx: &Context,
+        theme: CssTheme,
+        explicit_theme: bool,
         remaining_budget: &mut usize,
         depth: usize,
-    ) -> String {
+        active_vars: &mut Vec<String>,
+    ) -> VarResolve {
         if depth > MAX_VARIABLE_DEPTH {
-            return String::new();
+            return VarResolve::BudgetExceeded;
         }
         if !value.contains('(') {
-            return value.to_string();
+            return VarResolve::Ok(value.to_string());
         }
 
         let mut value = String::from(value);
         loop {
             let Some((start, prefix_end)) = find_ascii_ci_span(&value, "var(", 0) else {
-                return value;
+                return VarResolve::Ok(value);
             };
             if *remaining_budget == 0 {
-                return String::new();
+                return VarResolve::BudgetExceeded;
             }
             *remaining_budget -= 1;
 
@@ -206,47 +377,100 @@ impl Renderer {
                 }
             }
             let Some(end) = end else {
-                return String::new();
+                return VarResolve::InvalidOrCycle;
             };
 
             let arguments = self.split_css_arguments(&value[prefix_end..end]);
             if arguments.is_empty() {
-                return String::new();
+                return VarResolve::InvalidOrCycle;
             }
 
-            let name = to_lower(trimmed(&arguments[0]));
+            let raw_name = trimmed(&arguments[0]);
+            let lower_name = to_lower(raw_name);
             let fallback = if arguments.len() > 1 {
                 arguments[1..].join(",")
             } else {
                 String::new()
             };
 
-            let replacement = if name == "--text-color" || name == "--fg" {
-                if ctx.glossary_text_color.is_empty() {
-                    fallback
+            // Try scoped custom properties first (element scope -> dictionary :root scope).
+            let resolved_replacement =
+                if let Some((matched_key, custom_val)) =
+                    lookup_scoped_custom_property(raw_name, &lower_name, ctx, theme)
+                {
+                    if active_vars.iter().any(|active| active == matched_key) {
+                        VarResolve::InvalidOrCycle
+                    } else {
+                        active_vars.push(matched_key.to_owned());
+                        let res = self.resolve_css_variables_inner(
+                            custom_val,
+                            ctx,
+                            theme,
+                            explicit_theme,
+                            remaining_budget,
+                            depth + 1,
+                            active_vars,
+                        );
+                        active_vars.pop();
+                        res
+                    }
+                } else if lower_name == "--text-color" || lower_name == "--fg" {
+                    let builtin = resolve_builtin_palette_color(
+                        &ctx.glossary_text_color,
+                        ctx.theme,
+                        theme,
+                        explicit_theme,
+                        CssTheme::default_text_color,
+                    );
+                    if let Some(color) = builtin {
+                        VarResolve::Ok(color.to_owned())
+                    } else {
+                        VarResolve::InvalidOrCycle
+                    }
+                } else if lower_name == "--font-size-no-units" {
+                    VarResolve::Ok(format_pixel_size(ctx.root_font_pixel_size))
+                } else if lower_name == "--background-color" || lower_name == "--canvas" {
+                    let builtin = resolve_builtin_palette_color(
+                        &ctx.glossary_background_color,
+                        ctx.theme,
+                        theme,
+                        explicit_theme,
+                        CssTheme::default_background_color,
+                    );
+                    if let Some(color) = builtin {
+                        VarResolve::Ok(color.to_owned())
+                    } else {
+                        VarResolve::InvalidOrCycle
+                    }
                 } else {
-                    ctx.glossary_text_color.clone()
+                    VarResolve::InvalidOrCycle
+                };
+
+            let replacement = match resolved_replacement {
+                VarResolve::Ok(val) if !val.is_empty() => val,
+                VarResolve::BudgetExceeded => return VarResolve::BudgetExceeded,
+                VarResolve::Ok(_) | VarResolve::InvalidOrCycle => {
+                    if fallback.is_empty() {
+                        return VarResolve::InvalidOrCycle;
+                    }
+                    match self.resolve_css_variables_inner(
+                        &fallback,
+                        ctx,
+                        theme,
+                        explicit_theme,
+                        remaining_budget,
+                        depth + 1,
+                        active_vars,
+                    ) {
+                        VarResolve::Ok(val) if !val.is_empty() => val,
+                        VarResolve::BudgetExceeded => return VarResolve::BudgetExceeded,
+                        VarResolve::Ok(_) | VarResolve::InvalidOrCycle => {
+                            return VarResolve::InvalidOrCycle;
+                        }
+                    }
                 }
-            } else if name == "--font-size-no-units" {
-                format_pixel_size(ctx.root_font_pixel_size)
-            } else if name == "--background-color" || name == "--canvas" {
-                if ctx.glossary_background_color.is_empty() {
-                    fallback
-                } else {
-                    ctx.glossary_background_color.clone()
-                }
-            } else {
-                fallback
             };
 
-            if replacement.is_empty() {
-                return String::new();
-            }
-            let replacement =
-                self.resolve_css_variables_inner(&replacement, ctx, remaining_budget, depth + 1);
-            if replacement.is_empty() {
-                return String::new();
-            }
             value.replace_range(start..end + 1, &replacement);
         }
     }

@@ -44,8 +44,9 @@ pub use css::{parse_stylesheet, split_css_tokens, Renderer};
 pub use element::{
     BorderSide, BoxStyle, Context, CssAttributeOperator, CssAttributeSelector, CssCombinator,
     CssDeclaration, CssDeclarations, CssPseudoClass, CssPseudoClassSelector, CssPseudoElement,
-    CssRule, CssSelectorPart, ElementLayout, ElementRenderState, LayoutDirection, MarginFlow,
-    ParsedStylesheet, ScreenMetrics, SiblingState, StructuredElement, StructuredList, WidthPolicy,
+    CssRule, CssSelectorPart, CssTheme, ElementLayout, ElementRenderState, LayoutDirection,
+    MarginFlow, ParsedStylesheet, ScreenMetrics, SiblingState, StructuredElement, StructuredList,
+    WidthPolicy,
 };
 pub use layout::{
     css_box_side_value, css_font_size_to_pixels_with_font, default_list_marker, font_pixel_size,

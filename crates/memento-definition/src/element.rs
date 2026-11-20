@@ -43,6 +43,54 @@ pub struct ScreenMetrics {
     pub logical_dpi: f64,
 }
 
+/// Active color theme for CSS custom property resolution and
+/// `:root[data-theme="..."]` matching. Defaults to [`CssTheme::Dark`] so
+/// existing callers preserve dark-theme behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum CssTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl CssTheme {
+    /// Returns the CSS `data-theme` attribute value (`"dark"` or `"light"`).
+    pub const fn as_data_theme(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    /// Parses a `data-theme` attribute value (`"dark"` / `"light"`, ASCII case-insensitive).
+    pub fn from_data_theme(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("dark") {
+            Some(Self::Dark)
+        } else if trimmed.eq_ignore_ascii_case("light") {
+            Some(Self::Light)
+        } else {
+            None
+        }
+    }
+
+    /// Default built-in `--text-color` / `--fg` color for this theme.
+    pub const fn default_text_color(self) -> &'static str {
+        match self {
+            Self::Dark => "#f8fafc",
+            Self::Light => "#1c2024",
+        }
+    }
+
+    /// Default built-in `--background-color` / `--canvas` color for this theme.
+    pub const fn default_background_color(self) -> &'static str {
+        match self {
+            Self::Dark => "#1c2024",
+            Self::Light => "#ffffff",
+        }
+    }
+}
+
 /// Structured content element used for CSS selector matching
 /// (structuredrichtext_p.h L155-174).
 ///
@@ -59,6 +107,10 @@ pub struct StructuredElement {
 
     /// Generated classes used by stylesheet selectors.
     pub classes: HashSet<String>,
+
+    /// Scoped CSS custom properties (`--*`) declared on this element and
+    /// inherited by its descendants.
+    pub custom_properties: HashMap<String, String>,
 
     /// Index of the previous element sibling in selectorElements, or -1
     /// (qsizetype semantics preserved with i64).
@@ -215,6 +267,11 @@ pub struct Context {
 
     /// Global glossary background color used by palette CSS variables.
     pub glossary_background_color: String,
+
+    /// Active popup color theme (`Dark` by default) used for `:root[data-theme="..."]`
+    /// matching and built-in theme palette defaults.
+    pub theme: CssTheme,
+
     /// Background painted by the glossary canvas.
     pub background_color: String,
 
@@ -253,6 +310,13 @@ pub struct Context {
     /// CSS values resolved during this render, keyed by source value.
     pub resolved_css_values: HashMap<String, String>,
 
+    /// Theme under which `resolved_css_values` entries were populated.
+    pub(crate) cached_css_theme: CssTheme,
+
+    /// Raw pointer identity of the `ParsedStylesheet` under which
+    /// `resolved_css_values` entries were populated.
+    pub(crate) cached_stylesheet_ptr: usize,
+
     /// Inherited href of the current structured anchor.
     pub link_href: String,
 
@@ -281,11 +345,14 @@ impl Default for Context {
             background_color: String::new(),
             painted_background_color: String::new(),
             glossary_background_color: String::new(),
+            theme: CssTheme::Dark,
             dictionary_styles: None,
             selector_elements: Vec::new(),
             elements: Vec::new(),
             siblings: Vec::new(),
             resolved_css_values: HashMap::new(),
+            cached_css_theme: CssTheme::Dark,
+            cached_stylesheet_ptr: 0,
             lists: Vec::new(),
             details: Vec::new(),
             needs_element_child_count: false,
@@ -297,6 +364,49 @@ impl Default for Context {
             suppress_link_decoration: false,
             detail_states: HashMap::new(),
             next_detail_id: 0,
+        }
+    }
+}
+
+impl Context {
+    /// Creates a new rendering context initialized for `theme`, populating
+    /// built-in glossary text and background palette colors.
+    pub fn with_theme(theme: CssTheme) -> Self {
+        let fg = theme.default_text_color().to_owned();
+        let bg = theme.default_background_color().to_owned();
+        Self {
+            text_color: fg.clone(),
+            glossary_text_color: fg,
+            glossary_background_color: bg.clone(),
+            background_color: bg.clone(),
+            painted_background_color: bg,
+            theme,
+            cached_css_theme: theme,
+            ..Self::default()
+        }
+    }
+
+    /// Switches the active theme on this context, clearing any cached resolved
+    /// CSS values and updating built-in palette colors unless custom overrides
+    /// were explicitly set.
+    pub fn set_theme(&mut self, theme: CssTheme) {
+        let previous = self.theme;
+        self.theme = theme;
+        self.resolved_css_values.clear();
+        self.cached_css_theme = theme;
+        if self.glossary_text_color.is_empty()
+            || self
+                .glossary_text_color
+                .eq_ignore_ascii_case(previous.default_text_color())
+        {
+            self.glossary_text_color = theme.default_text_color().to_owned();
+        }
+        if self.glossary_background_color.is_empty()
+            || self
+                .glossary_background_color
+                .eq_ignore_ascii_case(previous.default_background_color())
+        {
+            self.glossary_background_color = theme.default_background_color().to_owned();
         }
     }
 }
@@ -433,6 +543,7 @@ pub enum CssPseudoClass {
     FirstChild,
     LastChild,
     NthChild,
+    Root,
 }
 
 /// A single CSS attribute selector (dictionarystyles.h L86-96).
@@ -542,11 +653,59 @@ pub struct ParsedStylesheet {
     /// Tags whose selector parts use :last-child().
     pub element_child_count_tags: HashSet<String>,
 
+    /// Unconditional `:root` custom properties (`--*`) scoped to this stylesheet.
+    pub root_variables: HashMap<String, String>,
+
+    /// Dark-theme `:root[data-theme="dark"]` custom properties (`--*`) scoped to
+    /// this stylesheet.
+    pub dark_root_variables: HashMap<String, String>,
+
+    /// Light-theme `:root[data-theme="light"]` custom properties (`--*`) scoped
+    /// to this stylesheet.
+    pub light_root_variables: HashMap<String, String>,
+
     /// CSS compatibility limitations recorded while parsing.
     pub diagnostics: Vec<String>,
 }
 
 impl ParsedStylesheet {
+    /// Looks up a stylesheet-scoped `:root` custom property for `theme`,
+    /// preferring `:root[data-theme="<theme>"]` over bare `:root`.
+    pub fn root_variable(&self, name: &str, theme: CssTheme) -> Option<&str> {
+        let theme_map = match theme {
+            CssTheme::Dark => &self.dark_root_variables,
+            CssTheme::Light => &self.light_root_variables,
+        };
+        if let Some(val) = theme_map.get(name) {
+            return Some(val.as_str());
+        }
+        if let Some(val) = self.root_variables.get(name) {
+            return Some(val.as_str());
+        }
+        let lower = crate::qstring::to_lower(name);
+        if lower != name {
+            if let Some(val) = theme_map.get(&lower) {
+                return Some(val.as_str());
+            }
+            if let Some(val) = self.root_variables.get(&lower) {
+                return Some(val.as_str());
+            }
+        }
+        None
+    }
+
+    /// Returns the merged `:root` custom property table effective for `theme`.
+    pub fn effective_root_variables(&self, theme: CssTheme) -> HashMap<String, String> {
+        let mut merged = self.root_variables.clone();
+        let theme_map = match theme {
+            CssTheme::Dark => &self.dark_root_variables,
+            CssTheme::Light => &self.light_root_variables,
+        };
+        for (key, value) in theme_map {
+            merged.insert(key.clone(), value.clone());
+        }
+        merged
+    }
     /// Ordered CSS rule candidates for an element tag
     /// (dictionarystyles.cpp L71-79).
     pub fn candidate_rule_indexes(&self, tag: &str) -> &[usize] {

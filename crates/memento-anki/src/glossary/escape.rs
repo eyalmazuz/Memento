@@ -77,6 +77,40 @@ pub(crate) fn append_escaped(input: &[u16], output: &mut Vec<u16>, newlines_as_b
     }
 }
 
+/// Appends HTML-escaped UTF-8 text (`<`, `>`, `&`, `"` -> `&lt;`, `&gt;`,
+/// `&amp;`, `&quot;`) into `output`.
+pub fn append_escaped_str(input: &str, output: &mut String) {
+    let mut start = 0;
+    for (idx, ch) in input.char_indices() {
+        let replacement = match ch {
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '&' => "&amp;",
+            '"' => "&quot;",
+            _ => continue,
+        };
+        output.push_str(&input[start..idx]);
+        output.push_str(replacement);
+        start = idx + ch.len_utf8();
+    }
+    output.push_str(&input[start..]);
+}
+
+/// Escapes `<`, `>`, `&`, and `"` in a UTF-8 string into HTML entities
+/// (Yomitan PR #2492 / #2394).
+pub fn escape_html_str(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    append_escaped_str(input, &mut out);
+    out
+}
+
+/// Escapes `<`, `>`, `&`, and `"` in a UTF-16 slice into HTML entities.
+pub fn escape_html_u16(input: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(input.len());
+    append_escaped(input, &mut out, false);
+    out
+}
+
 /// Sanitizes a single CSS property value emitted inside a double-quoted HTML
 /// `style="..."` attribute: strips ASCII control chars and `;`/`{`/`}`
 /// declaration/block delimiters, converts `"` to `'`, and HTML-escapes `<`,

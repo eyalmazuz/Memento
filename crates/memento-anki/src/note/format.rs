@@ -3,8 +3,10 @@
 use std::collections::BTreeSet;
 
 use crate::glossary::escape::{
-    append_escaped, append_escaped_style_block, ascii_to_u16, push_ascii,
+    append_escaped, append_escaped_str, append_escaped_style_block, ascii_to_u16, escape_html_str,
+    push_ascii,
 };
+use crate::strings::qt_is_space;
 
 /// Borrowed furigana pair (surface and optional reading).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,7 +297,10 @@ pub fn format_term_glossary_selected(
             push_ascii(&mut glossary_compact, "</span></li>");
         }
 
-        if def.has_styles && dictionaries_with_styles.insert(def.dict_id) {
+        if def.has_styles
+            && def.stylesheet.iter().any(|&u| !qt_is_space(u))
+            && dictionaries_with_styles.insert(def.dict_id)
+        {
             shared_style.clear();
             push_ascii(&mut shared_style, "<style>");
             append_escaped_style_block(def.stylesheet, &mut shared_style);
@@ -327,4 +332,95 @@ pub fn format_term_glossary_selected(
         glossary_brief,
         glossary_compact,
     }
+}
+
+/// Normalizes a single glossary selection string into safe HTML:
+/// - Normalizes `\r\n` and standalone `\r` line endings into `\n`.
+/// - Drops leading/trailing/consecutive empty or whitespace-only lines so no
+///   double `<br><br>` or trailing `<br>` is ever emitted (Yomitan `#2248`).
+/// - HTML-escapes `<`, `>`, `&`, and `"` in each surviving line (Yomitan PR
+///   `#2492` / `#2394`) and joins lines with a single `<br>`.
+fn format_single_selection_item(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    let mut emitted_line = false;
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if emitted_line {
+            out.push_str("<br>");
+        }
+        append_escaped_str(line.trim_end(), &mut out);
+        emitted_line = true;
+    }
+    emitted_line.then_some(out)
+}
+
+/// Formats one or more selected glossary definitions for the `{selection}`
+/// marker (`#262`, Yomitan `#2248`):
+/// - Blank/whitespace-only entries are ignored.
+/// - A single surviving selection is emitted cleanly without a `<ul>` wrapper.
+/// - Two or more selections are combined into `<ul><li>...</li></ul>`.
+/// - Line endings (`\r\n`, `\r`, consecutive blank lines, trailing newlines)
+///   are normalized so NO double `<br><br>` is produced, and HTML special
+///   characters (`<`, `>`, `&`, `"`) are escaped.
+pub fn format_selection(selections: &[&str]) -> String {
+    let items: Vec<String> = selections
+        .iter()
+        .filter_map(|raw| format_single_selection_item(raw))
+        .collect();
+    match items.len() {
+        0 => String::new(),
+        1 => items.into_iter().next().unwrap(),
+        _ => {
+            let cap: usize = 9 + items.iter().map(|s| s.len() + 9).sum::<usize>();
+            let mut out = String::with_capacity(cap);
+            out.push_str("<ul>");
+            for item in items {
+                out.push_str("<li>");
+                out.push_str(&item);
+                out.push_str("</li>");
+            }
+            out.push_str("</ul>");
+            out
+        }
+    }
+}
+
+/// UTF-16 convenience wrapper around [`format_selection`].
+pub fn format_selection_u16(selections: &[&[u16]]) -> Vec<u16> {
+    let owned: Vec<String> = selections
+        .iter()
+        .map(|units| String::from_utf16_lossy(units))
+        .collect();
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    format_selection(&refs).encode_utf16().collect()
+}
+
+/// HTML-escapes `<`, `>`, `&`, and `"` across `(cloze-prefix, cloze-body,
+/// cloze-suffix)` (Yomitan PR #2492 / #2394).
+pub fn format_cloze_parts_escaped(
+    prefix: &str,
+    body: &str,
+    suffix: &str,
+) -> (String, String, String) {
+    (
+        escape_html_str(prefix),
+        escape_html_str(body),
+        escape_html_str(suffix),
+    )
+}
+
+/// Formats an HTML-escaped Anki cloze deletion:
+/// `escaped(prefix) + {{c{index}::escaped(body)}} + escaped(suffix)`.
+/// Defaults `index == 0` to `1`.
+pub fn format_cloze_escaped(prefix: &str, body: &str, suffix: &str, index: usize) -> String {
+    let idx = if index == 0 { 1 } else { index };
+    let (p, b, s) = format_cloze_parts_escaped(prefix, body, suffix);
+    format!("{p}{{{{c{idx}::{b}}}}}{s}")
 }

@@ -35,7 +35,7 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 
 use crate::element::{
     CssAttributeOperator, CssAttributeSelector, CssCombinator, CssDeclaration, CssPseudoClass,
-    CssPseudoClassSelector, CssPseudoElement, CssRule, CssSelectorPart, ParsedStylesheet,
+    CssPseudoClassSelector, CssPseudoElement, CssRule, CssSelectorPart, CssTheme, ParsedStylesheet,
 };
 use crate::helpers::unquote_css_string;
 use crate::qstring::{
@@ -294,6 +294,70 @@ fn expand_nested_css_selectors(
     combined
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootVariableScope {
+    Unconditional,
+    Theme(CssTheme),
+}
+
+/// True when `part` targets the virtual document root (`:root`,
+/// `:root[data-theme="..."]`, `html[data-theme="..."]`, or bare
+/// `[data-theme="..."]`).
+pub(crate) fn is_root_selector_part(part: &CssSelectorPart) -> bool {
+    if part
+        .pseudo_classes
+        .iter()
+        .any(|p| p.pseudo_type == CssPseudoClass::Root && !p.negated)
+    {
+        return true;
+    }
+    part.class_names.is_empty()
+        && part.pseudo_classes.is_empty()
+        && (part.tag.is_empty() || part.tag == "html")
+        && part
+            .attributes
+            .iter()
+            .any(|attr| attr.name.eq_ignore_ascii_case("data-theme"))
+}
+
+fn is_root_target_rule(rule: &CssRule) -> bool {
+    rule.selector
+        .last()
+        .is_some_and(is_root_selector_part)
+}
+
+fn root_variable_scope_for_rule(rule: &CssRule) -> Option<RootVariableScope> {
+    if rule.selector.len() != 1 || rule.pseudo_element != CssPseudoElement::None {
+        return None;
+    }
+    let part = &rule.selector[0];
+    if !is_root_selector_part(part) {
+        return None;
+    }
+    if !part.class_names.is_empty() || (!part.tag.is_empty() && part.tag != "html") {
+        return None;
+    }
+    if part
+        .pseudo_classes
+        .iter()
+        .any(|p| p.pseudo_type != CssPseudoClass::Root || p.negated)
+    {
+        return None;
+    }
+    if part.attributes.is_empty() {
+        return Some(RootVariableScope::Unconditional);
+    }
+    if part.attributes.len() == 1 {
+        let attr = &part.attributes[0];
+        if attr.name.eq_ignore_ascii_case("data-theme")
+            && attr.op == CssAttributeOperator::Equals
+        {
+            return CssTheme::from_data_theme(&attr.value).map(RootVariableScope::Theme);
+        }
+    }
+    None
+}
+
 fn exact_target_nth_child_index(rule: &CssRule) -> i64 {
     rule.selector
         .last()
@@ -471,6 +535,22 @@ pub fn parse_stylesheet(css: &str) -> ParsedStylesheet {
     let mut target_tags = HashSet::new();
     let mut nth_indexes = Vec::with_capacity(parsed.rules.len());
     for (idx, rule) in parsed.rules.iter().enumerate() {
+        if let Some(scope) = root_variable_scope_for_rule(rule) {
+            let target_map = match scope {
+                RootVariableScope::Unconditional => &mut parsed.root_variables,
+                RootVariableScope::Theme(CssTheme::Dark) => &mut parsed.dark_root_variables,
+                RootVariableScope::Theme(CssTheme::Light) => &mut parsed.light_root_variables,
+            };
+            for decl in &rule.declarations {
+                if decl.property.starts_with("--") {
+                    target_map.insert(decl.property.clone(), decl.value.clone());
+                }
+            }
+        }
+        if is_root_target_rule(rule) {
+            nth_indexes.push(0);
+            continue;
+        }
         for part in &rule.selector {
             for pseudo in &part.pseudo_classes {
                 if pseudo.pseudo_type == CssPseudoClass::LastChild {
@@ -494,6 +574,9 @@ pub fn parse_stylesheet(css: &str) -> ParsedStylesheet {
             .iter()
             .enumerate()
             .filter(|(_, rule)| {
+                if is_root_target_rule(rule) {
+                    return false;
+                }
                 let target = &rule.selector.last().expect("parsed rule has a selector").tag;
                 target.is_empty() || *target == tag
             })
@@ -588,6 +671,8 @@ fn push_pseudo_class(part: &mut CssSelectorPart, raw: &str, negated: bool) -> bo
         pseudo.pseudo_type = CssPseudoClass::FirstChild;
     } else if raw == ":last-child" {
         pseudo.pseudo_type = CssPseudoClass::LastChild;
+    } else if raw.eq_ignore_ascii_case(":root") {
+        pseudo.pseudo_type = CssPseudoClass::Root;
     } else if let Some(inner) = raw
         .strip_prefix(":nth-child(")
         .and_then(|s| s.strip_suffix(')'))
@@ -905,7 +990,12 @@ fn flush_declaration(
     let trimmed_name = trimmed(property);
     let trimmed_val = trimmed(value);
     if !trimmed_name.is_empty() && !trimmed_val.is_empty() {
-        let name = to_lower(trimmed_name);
+        let is_custom_prop = trimmed_name.starts_with("--");
+        let name = if is_custom_prop {
+            trimmed_name.to_owned()
+        } else {
+            to_lower(trimmed_name)
+        };
         let cleaned_val = if let Some(without_imp) = strip_suffix_ascii_ci(trimmed_val, "!important")
         {
             diagnostics.push(format!(
@@ -917,7 +1007,9 @@ fn flush_declaration(
         };
 
         if !cleaned_val.is_empty() {
-            let css_value = if let Some(unquoted) = unquote_css_string(cleaned_val) {
+            let css_value = if is_custom_prop {
+                cleaned_val.to_owned()
+            } else if let Some(unquoted) = unquote_css_string(cleaned_val) {
                 if name == "content" || !unquoted.contains('"') {
                     unquoted
                 } else {

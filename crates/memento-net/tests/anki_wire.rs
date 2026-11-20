@@ -777,3 +777,164 @@ fn forbidden_action_body_stays_outside_the_verb_set()
     assert_eq!(StoreMediaFile.as_wire(), "storeMediaFile");
     assert_eq!(Multi.as_wire(), "multi");
 }
+
+#[test]
+fn multi_store_media_file_includes_api_key_in_every_sub_action()
+{
+    let server = TestServer::start();
+    server.spawn(move |_, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "action": "multi",
+                "version": 6,
+                "key": "secret-key",
+                "params": {
+                    "actions": [
+                        {
+                            "action": "storeMediaFile",
+                            "key": "secret-key",
+                            "params": { "data": "aGVsbG8=", "filename": "audio/x.mp3" }
+                        },
+                        {
+                            "action": "storeMediaFile",
+                            "key": "secret-key",
+                            "params": { "data": "aGVsbG8y", "filename": "audio/y.mp3" }
+                        }
+                    ]
+                }
+            })
+        );
+        Action::Respond(reply_of(json!(["_x.mp3", "_y.mp3"])))
+    });
+
+    let client = AnkiClient::new(AnkiEndpoint {
+        api_key: Some("secret-key".to_owned()),
+        use_api_key: true,
+        ..endpoint_for(&server)
+    });
+    let files = vec![
+        MediaFilePayload {
+            filename: "audio/x.mp3".to_owned(),
+            data_base64: "aGVsbG8=".to_owned(),
+        },
+        MediaFilePayload {
+            filename: "audio/y.mp3".to_owned(),
+            data_base64: "aGVsbG8y".to_owned(),
+        },
+    ];
+    assert_eq!(
+        client.store_media_files(&files).unwrap(),
+        vec!["_x.mp3", "_y.mp3"]
+    );
+}
+
+#[test]
+fn multi_helper_and_raw_multi_request_propagate_api_key_to_sub_actions()
+{
+    use memento_net::anki::{build_multi_action, AnkiAction};
+
+    let server = TestServer::start();
+    server.spawn(move |index, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        match index
+        {
+            0 => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "multi",
+                        "version": 6,
+                        "key": "k42",
+                        "params": {
+                            "actions": [
+                                {
+                                    "action": "findNotes",
+                                    "key": "k42",
+                                    "params": { "query": "Expression:\"食べる\"" }
+                                },
+                                {
+                                    "action": "findNotes",
+                                    "key": "k42",
+                                    "params": { "query": "Expression:\"飲む\"" }
+                                }
+                            ]
+                        }
+                    })
+                );
+                Action::Respond(reply_of(json!([[101], [202]])))
+            }
+            _ => {
+                assert_eq!(
+                    body,
+                    json!({
+                        "action": "multi",
+                        "version": 6,
+                        "params": {
+                            "actions": [
+                                {
+                                    "action": "findNotes",
+                                    "params": { "query": "Expression:\"食べる\"" }
+                                }
+                            ]
+                        }
+                    })
+                );
+                Action::Respond(reply_of(json!([[101]])))
+            }
+        }
+    });
+
+    let authed = AnkiClient::new(AnkiEndpoint {
+        api_key: Some("k42".to_owned()),
+        use_api_key: true,
+        ..endpoint_for(&server)
+    });
+    let actions = vec![
+        authed.build_multi_action(
+            AnkiAction::FindNotes,
+            Some(json!({ "query": "Expression:\"食べる\"" })),
+        ),
+        // Even a sub-action built without key gets apiKey injected by `AnkiClient`.
+        json!({
+            "action": "findNotes",
+            "params": { "query": "Expression:\"飲む\"" }
+        }),
+    ];
+    let res = authed.multi(actions).unwrap();
+    assert_eq!(res, json!([[101], [202]]));
+
+    let unauthed = AnkiClient::new(endpoint_for(&server));
+    let no_key_actions = vec![build_multi_action(
+        AnkiAction::FindNotes,
+        Some(json!({ "query": "Expression:\"食べる\"" })),
+        unauthed.api_key(),
+    )];
+    let res_unauthed = unauthed.multi(no_key_actions).unwrap();
+    assert_eq!(res_unauthed, json!([[101]]));
+}
+
+#[test]
+fn model_field_names_calls_ankiconnect_model_field_names()
+{
+    let server = TestServer::start();
+    server.spawn(move |_, request: CapturedRequest| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "action": "modelFieldNames",
+                "version": 6,
+                "params": { "modelName": "Lapis" }
+            })
+        );
+        Action::Respond(reply_of(json!(["Expression", "ExpressionReading", "Glossary"])))
+    });
+
+    let client = AnkiClient::new(endpoint_for(&server));
+    assert_eq!(
+        client.model_field_names("Lapis").unwrap(),
+        vec!["Expression", "ExpressionReading", "Glossary"]
+    );
+}

@@ -138,6 +138,17 @@ impl HttpClient
         self.send_with_timeout(request, None)
     }
 
+    /// Sends a request using an explicit per-request timeout override instead
+    /// of the client's default transfer timeout.
+    pub fn send_with_request_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> HttpResult<Response>
+    {
+        self.send_with_timeout(request, Some(Some(timeout)))
+    }
+
     pub(crate) fn send_with_timeout(
         &self,
         request: &Request,
