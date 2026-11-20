@@ -1811,9 +1811,9 @@ fn refresh_active_rows_clears_previous_highlights_even_when_previous_slice_is_st
     use slint::{Model, VecModel};
 
     let model = VecModel::from(vec![
-        SubEntry { id: 1, start: 91.0, end: 94.0, text: "ニア殿".into(), selected: false, is_active: true, search_match: false },
-        SubEntry { id: 2, start: 95.0, end: 97.5, text: "よくぞお越しくださいました!".into(), selected: false, is_active: false, search_match: false },
-        SubEntry { id: 3, start: 98.0, end: 99.5, text: "そういうのやめて".into(), selected: false, is_active: false, search_match: false },
+        SubEntry { id: 1, start: 91.0, end: 94.0, timestamp: format_time(91.0).into(), text: "ニア殿".into(), selected: false, is_active: true, search_match: false },
+        SubEntry { id: 2, start: 95.0, end: 97.5, timestamp: format_time(95.0).into(), text: "よくぞお越しくださいました!".into(), selected: false, is_active: false, search_match: false },
+        SubEntry { id: 3, start: 98.0, end: 99.5, timestamp: format_time(98.0).into(), text: "そういうのやめて".into(), selected: false, is_active: false, search_match: false },
     ]);
 
     // Simulate update_active_cue mutating SubtitleController::active_indices to [1] before

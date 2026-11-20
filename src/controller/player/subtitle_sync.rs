@@ -10,6 +10,8 @@ use memento_dict::normalize::{
 use memento_player::{subtitle_to_media_time, ASR_STREAM_URI};
 use slint::{Model as _, VecModel};
 
+use super::format_time;
+use crate::app::subtitle_drawer::sync_sub_entries_model;
 use crate::controller::subtitles::{
     ExternalSubtitleLoad, SubtitleController, SubtitleTrackInfo, ASR_TRACK_ID,
 };
@@ -223,6 +225,19 @@ fn normalize_search_str(s: &str, ignore_whitespace: bool) -> String {
     }
 }
 
+fn utf16_equals_str(u16s: &[u16], s: &str) -> bool {
+    let mut u16_iter = std::char::decode_utf16(u16s.iter().copied())
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER));
+    let mut str_iter = s.chars();
+    loop {
+        match (u16_iter.next(), str_iter.next()) {
+            (Some(a), Some(b)) if a == b => continue,
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Refresh the primary subtitle list model applying `sub-speed` and `sub-delay`
 /// to displayed timestamps (H3.7) and omitting rows stripped completely empty
 /// by `search/remove-regex` so blank 24px rows never appear (M1).
@@ -261,6 +276,54 @@ pub fn refresh_subtitle_list_with_timing(
         let mut active_cursor = SortedIndexCursor::new(active);
         let mut selected_cursor = SortedIndexCursor::new(selected);
 
+        // Fast path: when no regex filter is active and existing rows already have
+        // identical count, IDs, and display text, patch only changed flags/timings
+        // in-place with zero Vec/UTF-16 allocations and zero `model.set_vec` reset.
+        let can_patch_directly = compiled_regex.is_none()
+            && model.row_count() == entries.len()
+            && entries.iter().enumerate().all(|(index, cue)| {
+                model.row_data(index).is_some_and(|old| {
+                    old.id == (index + 1) as i32 && utf16_equals_str(&cue.text, old.text.as_str())
+                })
+            });
+        if can_patch_directly {
+            for (index, cue) in entries.iter().enumerate() {
+                let start = subtitle_to_media_time(cue.start, sub_speed, sub_delay) as f32;
+                let end = subtitle_to_media_time(cue.end, sub_speed, sub_delay) as f32;
+                let is_selected = selected_cursor.contains_monotonic(index);
+                let is_active = active_cursor.contains_monotonic(index);
+                let search_match = match_cursor.contains_monotonic(index);
+                if let Some(mut old) = model.row_data(index) {
+                    let start_changed = old.start.to_bits() != start.to_bits();
+                    let end_changed = old.end.to_bits() != end.to_bits();
+                    let new_timestamp = if start_changed || old.timestamp.is_empty() {
+                        let formatted = format_time(start as f64);
+                        (old.timestamp.as_str() != formatted).then(|| formatted.into())
+                    } else {
+                        None
+                    };
+                    if old.selected != is_selected
+                        || old.is_active != is_active
+                        || old.search_match != search_match
+                        || start_changed
+                        || end_changed
+                        || new_timestamp.is_some()
+                    {
+                        old.start = start;
+                        old.end = end;
+                        if let Some(ts) = new_timestamp {
+                            old.timestamp = ts;
+                        }
+                        old.selected = is_selected;
+                        old.is_active = is_active;
+                        old.search_match = search_match;
+                        model.set_row_data(index, old);
+                    }
+                }
+            }
+            return None;
+        }
+
         let mut rows = Vec::with_capacity(entries.len());
         let mut kept_entries: Option<Vec<usize>> = None;
         for (index, cue) in entries.iter().enumerate() {
@@ -291,13 +354,14 @@ pub fn refresh_subtitle_list_with_timing(
                 id: (index + 1) as i32,
                 start,
                 end,
+                timestamp: format_time(start as f64).into(),
                 text: display.into_owned().into(),
                 selected: selected_cursor.contains_monotonic(index),
                 is_active: active_cursor.contains_monotonic(index),
                 search_match,
             });
         }
-        model.set_vec(rows);
+        sync_sub_entries_model(model, rows);
         kept_entries
     });
 
@@ -329,6 +393,54 @@ pub fn refresh_secondary_subtitle_list_with_timing(
         };
 
         let mut active_cursor = SortedIndexCursor::new(active);
+
+        let can_patch_directly = compiled_regex.is_none()
+            && model.row_count() == entries.len()
+            && entries.iter().enumerate().all(|(index, cue)| {
+                model.row_data(index).is_some_and(|old| {
+                    old.id == (index + 1) as i32 && utf16_equals_str(&cue.text, old.text.as_str())
+                })
+            });
+        if can_patch_directly {
+            for (index, cue) in entries.iter().enumerate() {
+                let start =
+                    subtitle_to_media_time(cue.start, sub_speed, secondary_sub_delay) as f32;
+                let end = subtitle_to_media_time(cue.end, sub_speed, secondary_sub_delay) as f32;
+                let is_active = active_cursor.contains_monotonic(index);
+                if let Some(mut old) = model.row_data(index) {
+                    let search_match = !q_norm.is_empty()
+                        && normalize_search_str(old.text.as_str(), ignore_whitespace)
+                            .contains(&q_norm);
+                    let start_changed = old.start.to_bits() != start.to_bits();
+                    let end_changed = old.end.to_bits() != end.to_bits();
+                    let new_timestamp = if start_changed || old.timestamp.is_empty() {
+                        let formatted = format_time(start as f64);
+                        (old.timestamp.as_str() != formatted).then(|| formatted.into())
+                    } else {
+                        None
+                    };
+                    if old.selected
+                        || old.is_active != is_active
+                        || old.search_match != search_match
+                        || start_changed
+                        || end_changed
+                        || new_timestamp.is_some()
+                    {
+                        old.start = start;
+                        old.end = end;
+                        if let Some(ts) = new_timestamp {
+                            old.timestamp = ts;
+                        }
+                        old.selected = false;
+                        old.is_active = is_active;
+                        old.search_match = search_match;
+                        model.set_row_data(index, old);
+                    }
+                }
+            }
+            return None;
+        }
+
         let mut rows = Vec::with_capacity(entries.len());
         let mut kept_entries: Option<Vec<usize>> = None;
         for (index, cue) in entries.iter().enumerate() {
@@ -352,13 +464,14 @@ pub fn refresh_secondary_subtitle_list_with_timing(
                 id: (index + 1) as i32,
                 start,
                 end,
+                timestamp: format_time(start as f64).into(),
                 text: display.into_owned().into(),
                 selected: false,
                 is_active: active_cursor.contains_monotonic(index),
                 search_match,
             });
         }
-        model.set_vec(rows);
+        sync_sub_entries_model(model, rows);
         kept_entries
     });
 
@@ -745,5 +858,154 @@ mod tests {
         assert_eq!(sec_model.row_data(0).unwrap().id, 2);
         assert_eq!(sec_model.row_data(0).unwrap().text.as_str(), "Hello");
         assert!((sec_model.row_data(0).unwrap().start - 3.5).abs() < 1e-4);
+        assert_eq!(sec_model.row_data(0).unwrap().timestamp.as_str(), "00:03");
+    }
+
+    #[test]
+    fn subtitle_list_patches_in_place_for_search_active_selected_and_sub_delay() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let mut subs = SubtitleController::new();
+        subs.ensure_track(1);
+        subs.set_primary_sid(1);
+        subs.load_cues(vec![
+            create_cue("Alpha line", 5.0, 8.0),
+            create_cue("Beta line", 65.0, 70.0),
+            create_cue("Gamma line", 3605.0, 3610.0),
+        ]);
+
+        let model = VecModel::<SubEntry>::default();
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 0.0);
+        assert_eq!(model.row_count(), 3);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "00:05");
+        assert_eq!(model.row_data(1).unwrap().timestamp.as_str(), "01:05");
+        assert_eq!(model.row_data(2).unwrap().timestamp.as_str(), "01:00:05");
+
+        // Keep original SharedString allocations alive so their heap addresses cannot be reused.
+        let orig_texts: Vec<slint::SharedString> = (0..3)
+            .map(|i| model.row_data(i).unwrap().text)
+            .collect();
+        let orig_timestamps: Vec<slint::SharedString> = (0..3)
+            .map(|i| model.row_data(i).unwrap().timestamp)
+            .collect();
+
+        // 1. Changing search query patches only matching row(s) in-place.
+        app.set_subtitle_search_query("Beta".into());
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 0.0);
+        assert!(!model.row_data(0).unwrap().search_match);
+        assert!(model.row_data(1).unwrap().search_match);
+        assert!(!model.row_data(2).unwrap().search_match);
+        for i in 0..3 {
+            assert_eq!(
+                model.row_data(i).unwrap().text.as_ptr(),
+                orig_texts[i].as_ptr(),
+                "search query refresh must patch in-place without set_vec reset (row {i})"
+            );
+            assert_eq!(
+                model.row_data(i).unwrap().timestamp.as_ptr(),
+                orig_timestamps[i].as_ptr(),
+                "unchanged timestamp SharedString must be preserved (row {i})"
+            );
+        }
+
+        // 2. Changing active row patches only active row(s) in-place.
+        subs.update_position(66.0);
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 0.0);
+        assert!(!model.row_data(0).unwrap().is_active);
+        assert!(model.row_data(1).unwrap().is_active);
+        assert!(!model.row_data(2).unwrap().is_active);
+        for i in 0..3 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), orig_texts[i].as_ptr());
+            assert_eq!(
+                model.row_data(i).unwrap().timestamp.as_ptr(),
+                orig_timestamps[i].as_ptr()
+            );
+        }
+
+        // 3. Changing selected row patches only selected row(s) in-place.
+        subs.toggle_select(2);
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 0.0);
+        assert!(!model.row_data(0).unwrap().selected);
+        assert!(!model.row_data(1).unwrap().selected);
+        assert!(model.row_data(2).unwrap().selected);
+        for i in 0..3 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), orig_texts[i].as_ptr());
+            assert_eq!(
+                model.row_data(i).unwrap().timestamp.as_ptr(),
+                orig_timestamps[i].as_ptr()
+            );
+        }
+
+        // 4. Changing sub-delay updates start/end/timestamp in-place without replacing row text.
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 55.0);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "01:00");
+        assert_eq!(model.row_data(1).unwrap().timestamp.as_str(), "02:00");
+        assert_eq!(model.row_data(2).unwrap().timestamp.as_str(), "01:01:00");
+        for i in 0..3 {
+            assert_eq!(
+                model.row_data(i).unwrap().text.as_ptr(),
+                orig_texts[i].as_ptr(),
+                "sub-delay refresh must patch timestamps in-place without set_vec reset (row {i})"
+            );
+        }
+
+        // Negative delay clamps cleanly to 00:00 in-place.
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, -10.0);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "00:00");
+        assert_eq!(model.row_data(1).unwrap().timestamp.as_str(), "00:55");
+        assert_eq!(model.row_data(2).unwrap().timestamp.as_str(), "59:55");
+        for i in 0..3 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), orig_texts[i].as_ptr());
+        }
+
+        // 5. Even with remove-regex active (going through `sync_sub_entries_model`),
+        //    delay/search updates still patch in-place!
+        subs.load_cues(vec![
+            create_cue("(SE)", 1.0, 2.0),
+            create_cue("(SFX) First", 10.0, 12.0),
+            create_cue("Second", 20.0, 22.0),
+        ]);
+        app.set_search_remove_regex(r"\([^)]*\)".into());
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 0.0);
+        assert_eq!(model.row_count(), 2);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "00:10");
+        let regex_texts: Vec<slint::SharedString> = (0..2)
+            .map(|i| model.row_data(i).unwrap().text)
+            .collect();
+        refresh_subtitle_list_with_timing(&app, &model, &subs, 1.0, 5.0);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "00:15");
+        assert_eq!(model.row_data(1).unwrap().timestamp.as_str(), "00:25");
+        for i in 0..2 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), regex_texts[i].as_ptr());
+        }
+
+        // 6. Secondary list also patches in-place on delay & search changes.
+        app.set_search_remove_regex("".into());
+        app.set_subtitle_search_query("".into());
+        subs.ensure_track(2);
+        subs.set_secondary_sid(2);
+        subs.set_track_cues(
+            2,
+            vec![
+                create_cue("Sec Alpha", 10.0, 12.0),
+                create_cue("Sec Beta", 70.0, 72.0),
+            ],
+        );
+        let sec_model = VecModel::<SubEntry>::default();
+        refresh_secondary_subtitle_list_with_timing(&app, &sec_model, &subs, 1.0, 0.0);
+        assert_eq!(sec_model.row_data(0).unwrap().timestamp.as_str(), "00:10");
+        assert_eq!(sec_model.row_data(1).unwrap().timestamp.as_str(), "01:10");
+        let sec_texts: Vec<slint::SharedString> = (0..2)
+            .map(|i| sec_model.row_data(i).unwrap().text)
+            .collect();
+        app.set_subtitle_search_query("Beta".into());
+        refresh_secondary_subtitle_list_with_timing(&app, &sec_model, &subs, 1.0, 5.0);
+        assert!(!sec_model.row_data(0).unwrap().search_match);
+        assert!(sec_model.row_data(1).unwrap().search_match);
+        assert_eq!(sec_model.row_data(0).unwrap().timestamp.as_str(), "00:15");
+        assert_eq!(sec_model.row_data(1).unwrap().timestamp.as_str(), "01:15");
+        for i in 0..2 {
+            assert_eq!(sec_model.row_data(i).unwrap().text.as_ptr(), sec_texts[i].as_ptr());
+        }
     }
 }

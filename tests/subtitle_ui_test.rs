@@ -1231,14 +1231,18 @@ mod ui_dialogs_settings_and_modifier_tests {
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.set_sub_drawer_open(true);
         let rows: Vec<SubEntry> = (0..25)
-            .map(|i| SubEntry {
-                id: i,
-                start: (i * 2) as f32,
-                end: (i * 2 + 1) as f32,
-                text: format!("短い字幕行 #{i}").into(),
-                selected: false,
-                is_active: i == 3,
-                search_match: false,
+            .map(|i| {
+                let start = (i * 2) as f32;
+                SubEntry {
+                    id: i,
+                    start,
+                    end: (i * 2 + 1) as f32,
+                    timestamp: memento_app::controller::player::format_time(start as f64).into(),
+                    text: format!("短い字幕行 #{i}").into(),
+                    selected: false,
+                    is_active: i == 3,
+                    search_match: false,
+                }
             })
             .collect();
         app.set_subtitle_entries(Rc::new(VecModel::from(rows)).into());
@@ -1270,6 +1274,52 @@ mod ui_dialogs_settings_and_modifier_tests {
                 "adjacent subtitle drawer rows must not overlap ({pair:?})"
             );
         }
+
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn subtitle_drawer_timestamps_render_from_sub_entry_without_rust_callback() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
+        app.set_sub_drawer_open(true);
+        app.set_sub_list_show_timestamps(true);
+
+        let callback_calls = Rc::new(std::cell::Cell::new(0usize));
+        let callback_sink = callback_calls.clone();
+        app.on_format_timestamp(move |_| {
+            callback_sink.set(callback_sink.get() + 1);
+            "CALLBACK".into()
+        });
+
+        let rows: Vec<SubEntry> = (0..25)
+            .map(|i| {
+                let start = (i * 15) as f32;
+                SubEntry {
+                    id: i + 1,
+                    start,
+                    end: start + 2.0,
+                    timestamp: memento_app::controller::player::format_time(start as f64).into(),
+                    text: format!("字幕行 #{i}").into(),
+                    selected: false,
+                    is_active: i == 0,
+                    search_match: false,
+                }
+            })
+            .collect();
+        app.set_subtitle_entries(Rc::new(VecModel::from(rows)).into());
+        app.show().unwrap();
+
+        let rendered_rows = ElementQuery::from_root(&app)
+            .match_id("SubtitleDrawerPanel::sub-cue-row")
+            .find_all();
+        assert!(rendered_rows.len() >= 18);
+        assert_eq!(
+            callback_calls.get(),
+            0,
+            "rendering subtitle drawer timestamps must read pre-formatted SubEntry.timestamp without invoking format-timestamp callback"
+        );
 
         app.hide().unwrap();
     }

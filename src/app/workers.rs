@@ -3,7 +3,9 @@
 //! and bounded graceful shutdown.
 
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +21,7 @@ use crate::app::preferences::{
 };
 use crate::app::subtitle_io::parse_external_subtitles;
 use crate::controller::config::ConfigController;
-use crate::controller::dict::{self, DictController, SearchHit};
+use crate::controller::dict::{self, DictController, SearchHit, TermFrequency, TermPitchGraph};
 use crate::controller::subtitles::{self, ExternalSubtitleLoad};
 use crate::ui::{self, dictionary_result_rows, set_dictionary_rows, MementoApp, PopupBridge};
 use memento_config::Value;
@@ -199,10 +201,121 @@ pub(crate) enum ThumbRequest {
 /// Idle timeout after which the thumbnail preview `libmpv` instance is dropped
 /// to reclaim 50–150 MB of RAM (lazily recreated on the next timeline hover).
 const THUMB_IDLE_TIMEOUT: Duration = Duration::from_secs(40);
+const THUMB_FRAME_CACHE_CAPACITY: usize = 32;
+const LOOKUP_RESULT_CACHE_CAPACITY: usize = 32;
 const MAX_THUMB_WIDTH: u32 = 208;
 const MAX_THUMB_HEIGHT: u32 = 117;
 const DEFAULT_THUMB_WIDTH: u32 = 192;
 const DEFAULT_THUMB_HEIGHT: u32 = 108;
+
+/// Fast-decode, low-RAM `libmpv` options for the timeline hover thumbnail worker.
+pub(crate) fn thumb_mpv_cli_options() -> Vec<memento_player::CliOption> {
+    [
+        ("config", "no"),
+        ("aid", "no"),
+        ("sid", "no"),
+        ("secondary-sid", "no"),
+        ("osc", "no"),
+        ("pause", "yes"),
+        ("ytdl", "no"),
+        ("terminal", "no"),
+        ("hwdec", "no"),
+        ("hr-seek", "no"),
+        ("load-scripts", "no"),
+        ("vd-lavc-fast", "yes"),
+        ("vd-lavc-skiploopfilter", "all"),
+        ("vd-lavc-threads", "2"),
+        ("sws-fast", "yes"),
+        ("demuxer-max-bytes", "4MiB"),
+        ("demuxer-max-back-bytes", "1MiB"),
+        ("demuxer-readahead-secs", "1"),
+    ]
+    .into_iter()
+    .map(|(name, value)| memento_player::CliOption {
+        name: name.into(),
+        value: value.into(),
+    })
+    .collect()
+}
+
+/// Quantize a timeline hover timestamp (seconds) to the nearest non-negative
+/// integer second (`NaN`, non-finite, or negative inputs clamp to `0`).
+pub(crate) fn quantize_thumb_time_sec(time_sec: f64) -> i64 {
+    if !time_sec.is_finite() || time_sec <= 0.0 {
+        return 0;
+    }
+    time_sec.max(0.0).round() as i64
+}
+
+pub(crate) type CachedThumbFrame = (u32, u32, SharedPixelBuffer<Rgba8Pixel>);
+
+/// Bounded LRU cache of decoded timeline preview frames (~2–3 MiB at capacity 32).
+pub(crate) struct ThumbFrameCache {
+    capacity: usize,
+    entries: VecDeque<((String, i64), CachedThumbFrame)>,
+}
+
+impl Default for ThumbFrameCache {
+    fn default() -> Self {
+        Self::new(THUMB_FRAME_CACHE_CAPACITY)
+    }
+}
+
+impl ThumbFrameCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn get(&mut self, path: &str, quantized_sec: i64) -> Option<CachedThumbFrame> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|((p, s), _)| *s == quantized_sec && p == path)?;
+        if pos + 1 < self.entries.len() {
+            if let Some(entry) = self.entries.remove(pos) {
+                self.entries.push_back(entry);
+            }
+        }
+        self.entries.back().map(|(_, frame)| frame.clone())
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        path: String,
+        quantized_sec: i64,
+        frame: CachedThumbFrame,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|((p, s), _)| *s == quantized_sec && p == &path)
+        {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(((path, quantized_sec), frame));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 pub(crate) fn resolve_thumbnail_media_path(path: &str) -> Option<PathBuf> {
     let trimmed = path.trim();
@@ -270,6 +383,7 @@ impl LookupWorkerRequest {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct WordLookupResult {
     pub(crate) hits: Vec<SearchHit>,
     pub(crate) error: Option<String>,
@@ -280,6 +394,137 @@ pub(crate) struct WordLookupResult {
     pub(crate) pitch: String,
     pub(crate) freq: String,
     pub(crate) jpdb: String,
+}
+
+pub(crate) type TermMetadataGraphs = Vec<(String, String, Vec<TermPitchGraph>, Vec<TermFrequency>)>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LookupCacheKey {
+    pub(crate) query: String,
+    pub(crate) order_hash: u64,
+    pub(crate) options_hash: u64,
+}
+
+pub(crate) fn hash_lookup_order(order: &[i64]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    order.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub(crate) fn hash_lookup_options(
+    exact_enabled: bool,
+    deconj_enabled: bool,
+    mecab_enabled: bool,
+    remove_regex: &str,
+    replace_lines: bool,
+    replace_with: &str,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    exact_enabled.hash(&mut hasher);
+    deconj_enabled.hash(&mut hasher);
+    mecab_enabled.hash(&mut hasher);
+    remove_regex.hash(&mut hasher);
+    replace_lines.hash(&mut hasher);
+    replace_with.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl LookupCacheKey {
+    pub(crate) fn from_request(request: &WordLookupRequest) -> Self {
+        Self {
+            query: request.query.clone(),
+            order_hash: hash_lookup_order(&request.order),
+            options_hash: hash_lookup_options(
+                request.exact_enabled,
+                request.deconj_enabled,
+                request.mecab_enabled,
+                &request.remove_regex,
+                request.replace_lines,
+                &request.replace_with,
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedWordLookup {
+    pub(crate) result: WordLookupResult,
+    pub(crate) pitch: String,
+    pub(crate) freq: String,
+    pub(crate) jpdb: String,
+    pub(crate) graphs: TermMetadataGraphs,
+}
+
+/// Bounded LRU cache of recent word lookup hits + resolved term metadata inside
+/// `lookup_worker` so re-hovering recently scanned words skips SQLite completely.
+pub(crate) struct LookupResultCache {
+    capacity: usize,
+    database_signature: Option<dict::DbFileFingerprint>,
+    entries: VecDeque<(LookupCacheKey, CachedWordLookup)>,
+}
+
+impl Default for LookupResultCache {
+    fn default() -> Self {
+        Self::new(LOOKUP_RESULT_CACHE_CAPACITY)
+    }
+}
+
+impl LookupResultCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            database_signature: None,
+            entries: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Synchronize against the current dictionary database fingerprint, clearing
+    /// all cached entries whenever the DB changes. Returns `true` if invalidated.
+    pub(crate) fn sync_database_signature(&mut self, signature: dict::DbFileFingerprint) -> bool {
+        if self.database_signature.as_ref() != Some(&signature) {
+            self.clear();
+            self.database_signature = Some(signature);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn get(&mut self, key: &LookupCacheKey) -> Option<CachedWordLookup> {
+        let pos = self.entries.iter().position(|(k, _)| k == key)?;
+        if pos + 1 < self.entries.len() {
+            if let Some(entry) = self.entries.remove(pos) {
+                self.entries.push_back(entry);
+            }
+        }
+        self.entries.back().map(|(_, value)| value.clone())
+    }
+
+    pub(crate) fn insert(&mut self, key: LookupCacheKey, value: CachedWordLookup) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|(k, _)| k == &key) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, value));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 pub(crate) enum MkvExtractRequest {
@@ -406,23 +651,30 @@ impl WorkerPool {
         let mut handles = Vec::with_capacity(5);
 
         // 1. Timeline hover thumbnail preview worker (Condvar-driven, zero sleep-polling,
-        //    with 40s idle teardown to reclaim 50–150 MB of libmpv/FFmpeg memory).
+        //    quantized 32-frame LRU cache, and 40s idle teardown to reclaim libmpv RAM).
         let (thumb_raw_tx, thumb_rx) = std::sync::mpsc::channel::<ThumbRequest>();
         let thumb_tx = ChannelSlot::new(thumb_raw_tx);
         let thumb_worker_app = app.as_weak();
         let thumb_handle = std::thread::spawn(move || {
             let mut thumb_mpv: Option<ThumbMpvState> = None;
             let mut loaded_path = String::new();
+            let mut thumb_cache = ThumbFrameCache::default();
+            let mut last_served: Option<(String, i64)> = None;
             loop {
-                let mut req = if thumb_mpv.is_some() {
+                let mut req = if thumb_mpv.is_some() || !thumb_cache.is_empty() {
                     match thumb_rx.recv_timeout(THUMB_IDLE_TIMEOUT) {
                         Ok(req) => req,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let had_cached = !thumb_cache.is_empty();
+                            thumb_cache.clear();
+                            last_served = None;
+                            loaded_path.clear();
                             if let Some(state) = thumb_mpv.take() {
                                 drop(state);
                                 crate::app::trim_os_heap();
+                            } else if had_cached {
+                                crate::app::trim_os_heap();
                             }
-                            loaded_path.clear();
                             continue;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -438,11 +690,16 @@ impl WorkerPool {
                 }
                 match req {
                     ThumbRequest::Unload => {
+                        let had_cached = !thumb_cache.is_empty();
+                        thumb_cache.clear();
+                        last_served = None;
+                        loaded_path.clear();
                         if let Some(state) = thumb_mpv.take() {
                             drop(state);
                             crate::app::trim_os_heap();
+                        } else if had_cached {
+                            crate::app::trim_os_heap();
                         }
-                        loaded_path.clear();
                         continue;
                     }
                     ThumbRequest::Seek { path, time_sec } => {
@@ -450,53 +707,34 @@ impl WorkerPool {
                             continue;
                         };
                         let resolved_str = resolved_path.to_string_lossy().into_owned();
+                        let quantized_sec = quantize_thumb_time_sec(time_sec);
+
+                        if !loaded_path.is_empty() && loaded_path != resolved_str {
+                            thumb_cache.clear();
+                            last_served = None;
+                        }
+
+                        if last_served
+                            .as_ref()
+                            .is_some_and(|(p, s)| *s == quantized_sec && p == &resolved_str)
+                        {
+                            continue;
+                        }
+
+                        if let Some((thumb_w, thumb_h, buffer)) =
+                            thumb_cache.get(&resolved_str, quantized_sec)
+                        {
+                            last_served = Some((resolved_str, quantized_sec));
+                            let _ = thumb_worker_app.upgrade_in_event_loop(move |app| {
+                                app.set_preview_box_width(thumb_w as f32);
+                                app.set_preview_box_height(thumb_h as f32);
+                                app.set_thumbnail_frame(slint::Image::from_rgba8(buffer));
+                            });
+                            continue;
+                        }
+
                         if thumb_mpv.is_none() {
-                            let opts = [
-                                memento_player::CliOption {
-                                    name: "config".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "aid".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "sid".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "secondary-sid".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "osc".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "pause".into(),
-                                    value: "yes".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "ytdl".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "terminal".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "hwdec".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "hr-seek".into(),
-                                    value: "no".into(),
-                                },
-                                memento_player::CliOption {
-                                    name: "load-scripts".into(),
-                                    value: "no".into(),
-                                },
-                            ];
+                            let opts = thumb_mpv_cli_options();
                             if let Ok(inst) = MpvInstance::new_with_options(None, &opts) {
                                 let wake_signal = Arc::new((Mutex::new(false), Condvar::new()));
                                 let wake_clone = wake_signal.clone();
@@ -522,7 +760,7 @@ impl WorkerPool {
                             if state.inst.load_file(&resolved_str).is_err() {
                                 continue;
                             }
-                            loaded_path = resolved_str;
+                            loaded_path = resolved_str.clone();
                             wait_for_render_update(
                                 &state.inst,
                                 &state.wake_signal,
@@ -532,7 +770,7 @@ impl WorkerPool {
                         }
                         let _ = state.inst.command(&[
                             "seek",
-                            &format!("{:.3}", time_sec.max(0.0)),
+                            &format!("{:.3}", quantized_sec as f64),
                             "absolute+keyframes",
                         ]);
                         wait_for_render_update(
@@ -551,6 +789,12 @@ impl WorkerPool {
                         }
                         .is_ok()
                         {
+                            thumb_cache.insert(
+                                resolved_str.clone(),
+                                quantized_sec,
+                                (thumb_w, thumb_h, buffer.clone()),
+                            );
+                            last_served = Some((resolved_str, quantized_sec));
                             let _ = thumb_worker_app.upgrade_in_event_loop(move |app| {
                                 app.set_preview_box_width(thumb_w as f32);
                                 app.set_preview_box_height(thumb_h as f32);
@@ -563,7 +807,7 @@ impl WorkerPool {
         });
         handles.push(("thumb_worker", thumb_handle));
 
-        // 2. Dictionary & kanji lookup worker (off-UI-thread SQLite queries).
+        // 2. Dictionary & kanji lookup worker (off-UI-thread SQLite queries + 32-entry re-hover LRU).
         let (lookup_raw_tx, lookup_rx) = std::sync::mpsc::channel::<LookupWorkerRequest>();
         let lookup_tx = ChannelSlot::new(lookup_raw_tx);
         let worker_epoch = lookup_epoch.clone();
@@ -575,6 +819,8 @@ impl WorkerPool {
                 eprintln!("Dictionary lookup unavailable: {error}");
                 DictController::new()
             });
+            let mut lookup_cache = LookupResultCache::default();
+            lookup_cache.sync_database_signature(database_signature);
             while let Ok(mut request) = lookup_rx.recv() {
                 while let Ok(newer) = lookup_rx.try_recv() {
                     request = newer;
@@ -589,9 +835,46 @@ impl WorkerPool {
                         DictController::new()
                     });
                     database_signature = signature;
+                    lookup_cache.sync_database_signature(signature);
                 }
                 match request {
                     LookupWorkerRequest::Word(request) => {
+                        let cache_key = LookupCacheKey::from_request(&request);
+                        if let Some(cached) = lookup_cache.get(&cache_key) {
+                            if request.generation != worker_epoch.load(Ordering::Acquire) {
+                                continue;
+                            }
+                            let cached_result = WordLookupResult {
+                                pitch: cached.pitch,
+                                freq: cached.freq,
+                                jpdb: cached.jpdb,
+                                ..cached.result
+                            };
+                            let graphs = cached.graphs;
+                            let generation = request.generation;
+                            let query = request.query;
+                            let source_subtitle = request.source_subtitle;
+                            let excluded = request.excluded;
+                            let event_epoch = worker_epoch.clone();
+                            let _ = worker_app.upgrade_in_event_loop(move |app| {
+                                if generation == event_epoch.load(Ordering::Acquire)
+                                    && app.get_active_sub_text().as_str() == source_subtitle
+                                {
+                                    display_word_lookup(&app, cached_result, &query, &excluded);
+                                    for (expression, reading, graph_rows, frequencies) in graphs {
+                                        set_popup_term_metadata(
+                                            &app,
+                                            &expression,
+                                            &reading,
+                                            graph_rows,
+                                            frequencies,
+                                        );
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+
                         dictionary.set_order(&request.order);
                         dictionary.set_exact_enabled(request.exact_enabled);
                         dictionary.set_deconj_enabled(request.deconj_enabled);
@@ -638,6 +921,8 @@ impl WorkerPool {
                             freq: String::new(),
                             jpdb: String::new(),
                         };
+                        let should_cache = result.error.is_none() && result.database_open;
+                        let cached_result_base = should_cache.then(|| result.clone());
                         if request.generation != worker_epoch.load(Ordering::Acquire) {
                             continue;
                         }
@@ -660,17 +945,32 @@ impl WorkerPool {
                             let (pitch, freq, jpdb) =
                                 dictionary.get_term_meta(&meta_headword, &meta_reading);
                             let mut graphs = Vec::with_capacity(pitch_terms.len());
+                            let mut metadata_complete = true;
                             for (expression, reading) in pitch_terms {
                                 if generation != worker_epoch.load(Ordering::Acquire) {
+                                    metadata_complete = false;
                                     break;
                                 }
-                                let term_graphs =
-                                    dictionary.get_pitch_graphs(&expression, &reading);
-                                let frequencies = dictionary.get_frequencies(&expression, &reading);
+                                let (term_graphs, frequencies) = dictionary
+                                    .get_pitch_graphs_and_frequencies(&expression, &reading);
                                 graphs.push((expression, reading, term_graphs, frequencies));
                             }
-                            if generation != worker_epoch.load(Ordering::Acquire) {
+                            if !metadata_complete
+                                || generation != worker_epoch.load(Ordering::Acquire)
+                            {
                                 continue;
+                            }
+                            if let Some(base) = cached_result_base {
+                                lookup_cache.insert(
+                                    cache_key,
+                                    CachedWordLookup {
+                                        result: base,
+                                        pitch: pitch.clone(),
+                                        freq: freq.clone(),
+                                        jpdb: jpdb.clone(),
+                                        graphs: graphs.clone(),
+                                    },
+                                );
                             }
                             let event_epoch = worker_epoch.clone();
                             let _ = worker_app.upgrade_in_event_loop(move |app| {
@@ -691,6 +991,19 @@ impl WorkerPool {
                                     }
                                 }
                             });
+                        } else if meta_headword.is_empty() {
+                            if let Some(base) = cached_result_base {
+                                lookup_cache.insert(
+                                    cache_key,
+                                    CachedWordLookup {
+                                        result: base,
+                                        pitch: String::new(),
+                                        freq: String::new(),
+                                        jpdb: String::new(),
+                                        graphs: Vec::new(),
+                                    },
+                                );
+                            }
                         }
                     }
                     LookupWorkerRequest::Kanji(request) => {
@@ -1212,5 +1525,183 @@ mod tests {
         assert_eq!(resolve_thumbnail_media_path(""), None);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn thumb_mpv_cli_options_contains_fast_decode_and_low_ram_flags() {
+        let opts = thumb_mpv_cli_options();
+        let has_opt = |name: &str, value: &str| {
+            opts.iter()
+                .any(|opt| opt.name == name && opt.value == value)
+        };
+        for (name, value) in [
+            ("config", "no"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("secondary-sid", "no"),
+            ("osc", "no"),
+            ("pause", "yes"),
+            ("ytdl", "no"),
+            ("terminal", "no"),
+            ("hwdec", "no"),
+            ("hr-seek", "no"),
+            ("load-scripts", "no"),
+            ("vd-lavc-fast", "yes"),
+            ("vd-lavc-skiploopfilter", "all"),
+            ("vd-lavc-threads", "2"),
+            ("sws-fast", "yes"),
+            ("demuxer-max-bytes", "4MiB"),
+            ("demuxer-max-back-bytes", "1MiB"),
+            ("demuxer-readahead-secs", "1"),
+        ] {
+            assert!(
+                has_opt(name, value),
+                "thumb_mpv_cli_options missing {name}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_thumb_time_sec_rounds_and_clamps_invalid_values() {
+        assert_eq!(quantize_thumb_time_sec(f64::NAN), 0);
+        assert_eq!(quantize_thumb_time_sec(f64::NEG_INFINITY), 0);
+        assert_eq!(quantize_thumb_time_sec(f64::INFINITY), 0);
+        assert_eq!(quantize_thumb_time_sec(-12.7), 0);
+        assert_eq!(quantize_thumb_time_sec(-0.0), 0);
+        assert_eq!(quantize_thumb_time_sec(0.0), 0);
+        assert_eq!(quantize_thumb_time_sec(0.49), 0);
+        assert_eq!(quantize_thumb_time_sec(0.5), 1);
+        assert_eq!(quantize_thumb_time_sec(42.4), 42);
+        assert_eq!(quantize_thumb_time_sec(42.6), 43);
+    }
+
+    #[test]
+    fn thumb_frame_cache_supports_hit_lru_promotion_eviction_at_32_and_clear() {
+        let make_frame = |tag: u8| {
+            let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(4, 2);
+            buf.make_mut_bytes().fill(tag);
+            (4u32, 2u32, buf)
+        };
+
+        let mut cache = ThumbFrameCache::default();
+        assert!(cache.is_empty());
+
+        for sec in 0..32i64 {
+            cache.insert("/ep01.mkv".into(), sec, make_frame(sec as u8));
+        }
+        assert_eq!(cache.len(), 32);
+
+        // Hit on sec 0 promotes it to MRU so sec 1 becomes LRU.
+        let (w, h, buf0) = cache.get("/ep01.mkv", 0).expect("sec 0 must hit");
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(buf0.as_bytes()[0], 0);
+
+        // Inserting a 33rd frame evicts sec 1 (LRU), NOT promoted sec 0!
+        cache.insert("/ep01.mkv".into(), 32, make_frame(32));
+        assert_eq!(cache.len(), 32);
+        assert!(cache.get("/ep01.mkv", 1).is_none(), "LRU sec 1 must be evicted");
+        assert!(cache.get("/ep01.mkv", 0).is_some(), "promoted sec 0 must survive");
+        assert!(cache.get("/ep01.mkv", 32).is_some(), "new sec 32 must hit");
+        assert!(
+            cache.get("/ep02.mkv", 0).is_none(),
+            "different resolved path must miss"
+        );
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(cache.get("/ep01.mkv", 0).is_none());
+    }
+
+    #[test]
+    fn lookup_result_cache_handles_hits_lru_eviction_option_misses_and_db_invalidation() {
+        let make_request = |query: &str, order: Vec<i64>, exact: bool, regex: &str| WordLookupRequest {
+            generation: 1,
+            query: query.into(),
+            order,
+            source_subtitle: "sub".into(),
+            excluded: Vec::new(),
+            exact_enabled: exact,
+            deconj_enabled: true,
+            mecab_enabled: true,
+            remove_regex: regex.into(),
+            replace_lines: false,
+            replace_with: String::new(),
+        };
+        let make_cached = |word: &str| CachedWordLookup {
+            result: WordLookupResult {
+                hits: vec![SearchHit::new(word, "よみ", "meaning", "", 10, false)],
+                error: None,
+                database_open: true,
+                matched_units: word.encode_utf16().count(),
+                headword: word.into(),
+                reading: "よみ".into(),
+                pitch: String::new(),
+                freq: String::new(),
+                jpdb: String::new(),
+            },
+            pitch: "[0]".into(),
+            freq: "#120".into(),
+            jpdb: "JPDB 45".into(),
+            graphs: vec![(
+                word.into(),
+                "よみ".into(),
+                vec![TermPitchGraph {
+                    dictionary: "Kanjium".into(),
+                    mora: vec!["よ".into(), "み".into()],
+                    position: 0,
+                }],
+                vec![TermFrequency {
+                    dictionary: "JPDB".into(),
+                    value: "45".into(),
+                }],
+            )],
+        };
+
+        let mut cache = LookupResultCache::default();
+        let sig_v1: dict::DbFileFingerprint = (Some((1024, None)), None);
+        let sig_v2: dict::DbFileFingerprint = (Some((2048, None)), None);
+        assert!(cache.sync_database_signature(sig_v1));
+        assert!(!cache.sync_database_signature(sig_v1));
+
+        // Fill cache to capacity 32.
+        let mut keys = Vec::new();
+        for i in 0..32usize {
+            let req = make_request(&format!("word-{i}"), vec![1, 2], true, "");
+            let key = LookupCacheKey::from_request(&req);
+            cache.insert(key.clone(), make_cached(&format!("word-{i}")));
+            keys.push(key);
+        }
+        assert_eq!(cache.len(), 32);
+
+        // Hit on keys[0] promotes it to MRU so keys[1] becomes LRU.
+        let hit0 = cache.get(&keys[0]).expect("keys[0] must hit");
+        assert_eq!(hit0.result.headword, "word-0");
+        assert_eq!(hit0.pitch, "[0]");
+        assert_eq!(hit0.graphs.len(), 1);
+
+        // Insert 33rd entry -> evicts keys[1], preserves promoted keys[0].
+        let key32 = LookupCacheKey::from_request(&make_request("word-32", vec![1, 2], true, ""));
+        cache.insert(key32.clone(), make_cached("word-32"));
+        assert_eq!(cache.len(), 32);
+        assert!(cache.get(&keys[1]).is_none(), "LRU keys[1] must be evicted");
+        assert!(cache.get(&keys[0]).is_some(), "promoted keys[0] must survive");
+        assert!(cache.get(&key32).is_some(), "newly inserted key32 must hit");
+
+        // Different dictionary order or search options MUST miss!
+        let diff_order =
+            LookupCacheKey::from_request(&make_request("word-0", vec![2, 1], true, ""));
+        let diff_exact =
+            LookupCacheKey::from_request(&make_request("word-0", vec![1, 2], false, ""));
+        let diff_regex =
+            LookupCacheKey::from_request(&make_request("word-0", vec![1, 2], true, r"\(.*\)"));
+        assert!(cache.get(&diff_order).is_none(), "different dictionary order must miss");
+        assert!(cache.get(&diff_exact).is_none(), "different matcher option must miss");
+        assert!(cache.get(&diff_regex).is_none(), "different remove_regex must miss");
+
+        // Changing DB file fingerprint clears every cached entry!
+        assert!(cache.sync_database_signature(sig_v2));
+        assert!(cache.is_empty());
+        assert!(cache.get(&keys[0]).is_none());
+        assert!(cache.get(&key32).is_none());
     }
 }

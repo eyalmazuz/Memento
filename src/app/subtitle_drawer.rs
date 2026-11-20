@@ -11,7 +11,7 @@ use slint::{ComponentHandle, Model as _, VecModel};
 use crate::app::clipboard::copy_text_to_clipboard;
 use crate::controller::dict;
 use crate::controller::player::{
-    refresh_subtitle_list_with_timing as base_refresh_subtitle_list_with_timing,
+    format_time, refresh_subtitle_list_with_timing as base_refresh_subtitle_list_with_timing,
     refresh_subtitle_marks,
 };
 use crate::controller::subtitles::SubtitleController;
@@ -364,6 +364,69 @@ pub(crate) fn slice_lookup_from_char(text: &str, char_idx: i32) -> Option<String
     (!candidate.is_empty()).then(|| candidate.to_owned())
 }
 
+/// Outcome of reconciling a `VecModel<SubEntry>` against a freshly computed row list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubEntriesSyncOutcome {
+    /// `true` when row count, IDs, or display text differed and `model.set_vec` was called.
+    pub(crate) did_reset: bool,
+    /// Number of rows patched in-place via `model.set_row_data` (`0` when `did_reset` is `true`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) patched_rows: usize,
+}
+
+/// Reconcile `model` with `rows`, patching ONLY rows whose `selected`, `is_active`,
+/// `search_match`, `start`, `end`, or `timestamp` changed whenever row count, IDs,
+/// and display text match — avoiding `model.set_vec` so Slint `ListView` preserves
+/// visible delegates on 1,000+ line episodes.
+pub(crate) fn sync_sub_entries_model(
+    model: &VecModel<SubEntry>,
+    rows: Vec<SubEntry>,
+) -> SubEntriesSyncOutcome {
+    let same_structure = model.row_count() == rows.len()
+        && rows.iter().enumerate().all(|(i, new_row)| {
+            model
+                .row_data(i)
+                .is_some_and(|old| old.id == new_row.id && old.text == new_row.text)
+        });
+
+    if same_structure {
+        let mut patched_rows = 0usize;
+        for (i, new_row) in rows.into_iter().enumerate() {
+            if let Some(mut old) = model.row_data(i) {
+                let ts_changed = old.timestamp != new_row.timestamp;
+                if old.selected != new_row.selected
+                    || old.is_active != new_row.is_active
+                    || old.search_match != new_row.search_match
+                    || old.start.to_bits() != new_row.start.to_bits()
+                    || old.end.to_bits() != new_row.end.to_bits()
+                    || ts_changed
+                {
+                    old.start = new_row.start;
+                    old.end = new_row.end;
+                    if ts_changed {
+                        old.timestamp = new_row.timestamp;
+                    }
+                    old.selected = new_row.selected;
+                    old.is_active = new_row.is_active;
+                    old.search_match = new_row.search_match;
+                    model.set_row_data(i, old);
+                    patched_rows += 1;
+                }
+            }
+        }
+        SubEntriesSyncOutcome {
+            did_reset: false,
+            patched_rows,
+        }
+    } else {
+        model.set_vec(rows);
+        SubEntriesSyncOutcome {
+            did_reset: true,
+            patched_rows: 0,
+        }
+    }
+}
+
 pub fn refresh_subtitle_list_with_timing(
     app: &MementoApp,
     model: &VecModel<SubEntry>,
@@ -480,13 +543,14 @@ pub fn refresh_secondary_subtitle_list_with_timing(
                 id: (index + 1) as i32,
                 start,
                 end,
+                timestamp: format_time(start as f64).into(),
                 text: display.into_owned().into(),
                 selected: selected_set.contains(&index),
                 is_active: active_set.contains(&index),
                 search_match: is_match,
             });
         }
-        model.set_vec(rows);
+        let outcome = sync_sub_entries_model(model, rows);
         DRAWER_CACHES.with(|slot| {
             let mut caches = slot.borrow_mut();
             caches.last_secondary_model = Some(SecondaryModelState {
@@ -499,7 +563,9 @@ pub fn refresh_secondary_subtitle_list_with_timing(
                 first_cue_sig,
                 last_cue_sig,
             });
-            caches.secondary_revision = caches.secondary_revision.wrapping_add(1);
+            if outcome.did_reset {
+                caches.secondary_revision = caches.secondary_revision.wrapping_add(1);
+            }
         });
     }
 
@@ -1759,5 +1825,131 @@ mod tests {
         assert_eq!(looked_up.borrow().as_str(), "字幕");
         assert_eq!(app.get_active_sub_text().as_str(), "別の字幕");
         assert_eq!(subtitles.borrow().selected_indices(), &[1]);
+    }
+
+    #[test]
+    fn sync_sub_entries_model_and_secondary_drawer_patch_in_place_without_reset() {
+        i_slint_backend_testing::init_no_event_loop();
+        let make_row = |id: i32, start: f32, text: &str, selected: bool, is_active: bool, search_match: bool| SubEntry {
+            id,
+            start,
+            end: start + 2.0,
+            timestamp: format_time(start as f64).into(),
+            text: text.into(),
+            selected,
+            is_active,
+            search_match,
+        };
+
+        let model = VecModel::<SubEntry>::default();
+        let initial = vec![
+            make_row(1, 5.0, "Line one", false, false, false),
+            make_row(2, 65.0, "Line two", false, false, false),
+            make_row(3, 125.0, "Line three", false, false, false),
+        ];
+        // Initial population requires set_vec reset.
+        let out = sync_sub_entries_model(&model, initial.clone());
+        assert!(out.did_reset);
+        assert_eq!(out.patched_rows, 0);
+
+        // Hold existing SharedString allocations alive so addresses cannot be reused.
+        let orig_texts: Vec<slint::SharedString> =
+            (0..3).map(|i| model.row_data(i).unwrap().text).collect();
+        let orig_ts: Vec<slint::SharedString> = (0..3)
+            .map(|i| model.row_data(i).unwrap().timestamp)
+            .collect();
+
+        // Identical rows -> zero resets, zero row notifications.
+        let out = sync_sub_entries_model(&model, initial);
+        assert!(!out.did_reset);
+        assert_eq!(out.patched_rows, 0);
+
+        // Single flag change -> patches ONLY row 1 in-place.
+        let out = sync_sub_entries_model(
+            &model,
+            vec![
+                make_row(1, 5.0, "Line one", false, false, false),
+                make_row(2, 65.0, "Line two", true, true, true),
+                make_row(3, 125.0, "Line three", false, false, false),
+            ],
+        );
+        assert!(!out.did_reset);
+        assert_eq!(out.patched_rows, 1);
+        assert!(model.row_data(1).unwrap().selected);
+        assert!(model.row_data(1).unwrap().is_active);
+        assert!(model.row_data(1).unwrap().search_match);
+        for i in 0..3 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), orig_texts[i].as_ptr());
+            assert_eq!(model.row_data(i).unwrap().timestamp.as_ptr(), orig_ts[i].as_ptr());
+        }
+
+        // Delay shift changes start/end/timestamp in-place on all 3 rows without replacing text.
+        let out = sync_sub_entries_model(
+            &model,
+            vec![
+                make_row(1, 15.0, "Line one", false, false, false),
+                make_row(2, 75.0, "Line two", true, true, true),
+                make_row(3, 135.0, "Line three", false, false, false),
+            ],
+        );
+        assert!(!out.did_reset);
+        assert_eq!(out.patched_rows, 3);
+        assert_eq!(model.row_data(0).unwrap().timestamp.as_str(), "00:15");
+        assert_eq!(model.row_data(1).unwrap().timestamp.as_str(), "01:15");
+        assert_eq!(model.row_data(2).unwrap().timestamp.as_str(), "02:15");
+        for i in 0..3 {
+            assert_eq!(model.row_data(i).unwrap().text.as_ptr(), orig_texts[i].as_ptr());
+        }
+
+        // Structural change (display text changed) triggers set_vec reset.
+        let out = sync_sub_entries_model(
+            &model,
+            vec![
+                make_row(1, 15.0, "Line one edited", false, false, false),
+                make_row(2, 75.0, "Line two", true, true, true),
+                make_row(3, 135.0, "Line three", false, false, false),
+            ],
+        );
+        assert!(out.did_reset);
+        assert_eq!(model.row_data(0).unwrap().text.as_str(), "Line one edited");
+
+        // Structural change (row count changed) triggers set_vec reset.
+        let out = sync_sub_entries_model(
+            &model,
+            vec![make_row(1, 15.0, "Line one edited", false, false, false)],
+        );
+        assert!(out.did_reset);
+        assert_eq!(model.row_count(), 1);
+
+        // Verify `refresh_secondary_subtitle_list_with_timing` patches secondary-sub-delay in-place!
+        let app = MementoApp::new().unwrap();
+        let mut subs = SubtitleController::new();
+        subs.ensure_track(2);
+        subs.set_secondary_sid(2);
+        subs.set_track_cues(
+            2,
+            vec![
+                create_cue("Sec first", 10.0, 12.0),
+                create_cue("Sec second", 70.0, 72.0),
+            ],
+        );
+        let sec_model = VecModel::<SubEntry>::default();
+        refresh_secondary_subtitle_list_with_timing(&app, &sec_model, &subs, 1.0, 0.0);
+        assert_eq!(sec_model.row_data(0).unwrap().timestamp.as_str(), "00:10");
+        assert_eq!(sec_model.row_data(1).unwrap().timestamp.as_str(), "01:10");
+        let sec_texts: Vec<slint::SharedString> = (0..2)
+            .map(|i| sec_model.row_data(i).unwrap().text)
+            .collect();
+
+        refresh_secondary_subtitle_list_with_timing(&app, &sec_model, &subs, 1.0, 5.0);
+        assert_eq!(sec_model.row_data(0).unwrap().timestamp.as_str(), "00:15");
+        assert_eq!(sec_model.row_data(1).unwrap().timestamp.as_str(), "01:15");
+        for i in 0..2 {
+            assert_eq!(
+                sec_model.row_data(i).unwrap().text.as_ptr(),
+                sec_texts[i].as_ptr(),
+                "secondary sub-delay update must patch in-place without set_vec reset (row {i})"
+            );
+        }
     }
 }

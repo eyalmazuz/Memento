@@ -306,7 +306,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                             font-weight: 600;
                             color: entry.selected ? MementoPalette.success-text : root.text-color;
                             opacity: entry.selected ? 1.0 : 0.72;
-                            text: root.format-timestamp(entry.start);
+                            text: entry.timestamp;
                         }
 
                         // Wrapped Multi-Line Cue Text
