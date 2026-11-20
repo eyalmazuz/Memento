@@ -96,6 +96,48 @@ pub enum SearchMethod {
     SearchMethodModifier = 1,
 }
 
+/// Pure-Rust UI color theme preference (`interface/theme`, `#357`).
+///
+/// Stored on disk as lowercase strings (`"system"`, `"dark"`, `"light"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn from_str_lossy(value: &str) -> Self {
+        Self::try_from(value).unwrap_or(Self::System)
+    }
+}
+
+impl TryFrom<&str> for ThemeMode {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("system") {
+            Ok(Self::System)
+        } else if trimmed.eq_ignore_ascii_case("dark") {
+            Ok(Self::Dark)
+        } else if trimmed.eq_ignore_ascii_case("light") {
+            Ok(Self::Light)
+        } else {
+            Err(())
+        }
+    }
+}
+
 /// `Q_ENUM_NS` numeric round trip: swallows the invalid values that a plain
 /// `as` cast would happily preserve. `Q_ENUM_NS` itself only does the
 /// name/registration side, which stays in C++.
@@ -294,5 +336,18 @@ mod tests {
         assert_eq!(Modifier::try_from(4), Err(4));
         assert_eq!(SearchMethod::try_from(1), Ok(SearchMethod::SearchMethodModifier));
         assert_eq!(SearchMethod::try_from(2), Err(2));
+    }
+
+    #[test]
+    fn theme_mode_round_trips_strings_case_insensitively() {
+        assert_eq!(ThemeMode::default(), ThemeMode::System);
+        assert_eq!(ThemeMode::System.as_str(), "system");
+        assert_eq!(ThemeMode::Dark.as_str(), "dark");
+        assert_eq!(ThemeMode::Light.as_str(), "light");
+        assert_eq!(ThemeMode::try_from("system"), Ok(ThemeMode::System));
+        assert_eq!(ThemeMode::try_from("DARK"), Ok(ThemeMode::Dark));
+        assert_eq!(ThemeMode::try_from(" Light "), Ok(ThemeMode::Light));
+        assert_eq!(ThemeMode::try_from("sepia"), Err(()));
+        assert_eq!(ThemeMode::from_str_lossy("unknown"), ThemeMode::System);
     }
 }

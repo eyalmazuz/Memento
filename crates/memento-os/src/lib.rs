@@ -21,14 +21,21 @@
 //! Cross-platform OS integration for Memento:
 //! - Session-bus screensaver inhibition (`org.freedesktop.ScreenSaver` on Linux/Unix,
 //!   `IOPMAssertionCreateWithName` on macOS, `SetThreadExecutionState` on Windows).
-//! - Non-blocking XDG Desktop Portal `org.freedesktop.portal.FileChooser.OpenFile`
-//!   file dialogs with multi-file playlist & subtitle filter support and background
-//!   `zenity`/`kdialog` fallback.
+//! - Native cross-platform file & folder pickers:
+//!   - Linux/Unix: Non-blocking XDG Desktop Portal `org.freedesktop.portal.FileChooser.OpenFile`
+//!     with multi-file playlist, subtitle filters, and `directory: true` folder support, plus
+//!     `zenity`/`kdialog` fallback.
+//!   - Windows: Native Win32 COM `IFileOpenDialog` (multi-file, folder picking, filters, STA-safe).
+//!   - macOS: Native AppKit `NSOpenPanel` (strictly main-thread-safe via main-thread dispatch /
+//!     GCD main queue).
+//! - Cross-platform system color scheme detection & live theme change watching.
+//! - macOS `.app` bundle `PATH` augmentation for Finder launches.
 //! - `file://` URI and `text/uri-list` drag-and-drop path decoding.
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::process::Command;
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::sync::{
@@ -36,8 +43,15 @@ use std::sync::{
     mpsc, Arc, OnceLock,
 };
 
+mod native_dialogs;
+pub mod theme;
 pub mod windows_fullscreen;
 
+pub use theme::{
+    detect_system_color_scheme, parse_gsettings_color_scheme, parse_gtk_theme_color_scheme,
+    parse_macos_apple_interface_style, parse_portal_color_scheme,
+    parse_windows_apps_use_light_theme, spawn_color_scheme_watcher, SystemColorScheme,
+};
 pub use windows_fullscreen::{
     capture_win32_window_snapshot, compute_windows_borderless_fullscreen_rect,
     enter_windows_borderless_fullscreen, exit_windows_borderless_fullscreen, query_window_monitor,
@@ -465,11 +479,20 @@ impl Drop for Screensaver {
 
 // ── File Dialog & Drag-and-Drop URI Utilities ───────────────────────────────
 
+/// Subtitle glob patterns supported across native file pickers (includes
+/// `.ass`, `.ssa`, `.srt`, `.vtt`, `.sub`, `.idx`, `.sup`, `.lrc`, `.mks`,
+/// `.ttml`, `.smi`, `.rt`, fixing C++ PR #356).
+pub const SUBTITLE_FILE_PATTERNS: &[&str] = &[
+    "*.ass", "*.ssa", "*.srt", "*.vtt", "*.sub", "*.idx", "*.sup", "*.lrc", "*.mks", "*.ttml",
+    "*.smi", "*.rt", "*.pgs", "*.scc", "*.utf-8", "*.utf", "*.utf8",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileDialogKind {
     MediaAndSubtitles,
     SubtitlesOnly,
     ArchiveZip,
+    Folder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,57 +537,74 @@ impl FileDialogOptions {
         }
     }
 
+    pub fn folder(initial_dir: Option<PathBuf>) -> Self {
+        Self::folder_with_title("Select Folder", initial_dir)
+    }
+
+    pub fn folder_with_title(title: impl Into<String>, initial_dir: Option<PathBuf>) -> Self {
+        Self {
+            title: title.into(),
+            kind: FileDialogKind::Folder,
+            multiple: false,
+            initial_dir,
+        }
+    }
+
+    pub const fn is_folder(&self) -> bool {
+        matches!(self.kind, FileDialogKind::Folder)
+    }
+
     pub fn filters(&self) -> Vec<FileDialogFilter> {
         match self.kind {
-            FileDialogKind::MediaAndSubtitles => vec![
-                FileDialogFilter {
-                    label: "Media & Subtitle Files".to_owned(),
-                    patterns: [
-                        "*.mkv", "*.mp4", "*.webm", "*.avi", "*.mov", "*.m4v", "*.mpg", "*.mpeg",
-                        "*.ts", "*.m2ts", "*.vob", "*.ogv", "*.ogg", "*.mp3", "*.flac", "*.wav",
-                        "*.m4a", "*.aac", "*.opus", "*.srt", "*.ass", "*.ssa", "*.vtt", "*.sub",
-                        "*.idx", "*.sup", "*.lrc", "*.mks", "*.pgs",
-                    ]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                },
-                FileDialogFilter {
-                    label: "Video Files".to_owned(),
-                    patterns: [
-                        "*.webm", "*.mkv", "*.vob", "*.ogv", "*.ogg", "*.avi", "*.mov", "*.qt",
-                        "*.mp4", "*.m4p", "*.m4v", "*.mpg", "*.mp2", "*.mpeg", "*.mpe", "*.mpv",
-                        "*.ts", "*.m2ts",
-                    ]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                },
-                FileDialogFilter {
-                    label: "Subtitle Files".to_owned(),
-                    patterns: [
-                        "*.ass", "*.ssa", "*.srt", "*.vtt", "*.sub", "*.idx", "*.sup", "*.lrc",
-                        "*.mks", "*.pgs", "*.rt", "*.scc", "*.smi", "*.utf-8", "*.utf", "*.utf8",
-                    ]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-                },
-                FileDialogFilter {
-                    label: "All Files".to_owned(),
-                    patterns: vec!["*".to_owned()],
-                },
-            ],
+            FileDialogKind::MediaAndSubtitles => {
+                let mut combined_patterns: Vec<String> = [
+                    "*.mkv", "*.mp4", "*.webm", "*.avi", "*.mov", "*.m4v", "*.mpg", "*.mpeg",
+                    "*.ts", "*.m2ts", "*.vob", "*.ogv", "*.ogg", "*.mp3", "*.flac", "*.wav",
+                    "*.m4a", "*.aac", "*.opus",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+                combined_patterns.extend(SUBTITLE_FILE_PATTERNS.iter().copied().map(str::to_owned));
+
+                vec![
+                    FileDialogFilter {
+                        label: "Media & Subtitle Files".to_owned(),
+                        patterns: combined_patterns,
+                    },
+                    FileDialogFilter {
+                        label: "Video Files".to_owned(),
+                        patterns: [
+                            "*.webm", "*.mkv", "*.vob", "*.ogv", "*.ogg", "*.avi", "*.mov", "*.qt",
+                            "*.mp4", "*.m4p", "*.m4v", "*.mpg", "*.mp2", "*.mpeg", "*.mpe",
+                            "*.mpv", "*.ts", "*.m2ts",
+                        ]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    },
+                    FileDialogFilter {
+                        label: "Subtitle Files".to_owned(),
+                        patterns: SUBTITLE_FILE_PATTERNS
+                            .iter()
+                            .copied()
+                            .map(str::to_owned)
+                            .collect(),
+                    },
+                    FileDialogFilter {
+                        label: "All Files".to_owned(),
+                        patterns: vec!["*".to_owned()],
+                    },
+                ]
+            }
             FileDialogKind::SubtitlesOnly => vec![
                 FileDialogFilter {
                     label: "Subtitle Files".to_owned(),
-                    patterns: [
-                        "*.ass", "*.ssa", "*.srt", "*.vtt", "*.sub", "*.idx", "*.sup", "*.lrc",
-                        "*.mks", "*.pgs", "*.rt", "*.scc", "*.smi", "*.utf-8", "*.utf", "*.utf8",
-                    ]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                    patterns: SUBTITLE_FILE_PATTERNS
+                        .iter()
+                        .copied()
+                        .map(str::to_owned)
+                        .collect(),
                 },
                 FileDialogFilter {
                     label: "All Files".to_owned(),
@@ -581,6 +621,7 @@ impl FileDialogOptions {
                     patterns: vec!["*".to_owned()],
                 },
             ],
+            FileDialogKind::Folder => Vec::new(),
         }
     }
 }
@@ -762,7 +803,45 @@ fn extract_portal_uris(results: &HashMap<String, OwnedValue>) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Attempt to open a file dialog via `org.freedesktop.portal.FileChooser.OpenFile`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn build_portal_open_file_opts<'a>(
+    options: &'a FileDialogOptions,
+    handle_token: &'a str,
+) -> HashMap<&'a str, Value<'a>> {
+    let mut portal_opts: HashMap<&str, Value<'_>> = HashMap::new();
+    portal_opts.insert("handle_token", Value::from(handle_token));
+    portal_opts.insert("multiple", Value::from(options.multiple));
+    portal_opts.insert("modal", Value::from(true));
+
+    if options.is_folder() {
+        portal_opts.insert("directory", Value::from(true));
+    } else {
+        let filters: Vec<(String, Vec<(u32, String)>)> = options
+            .filters()
+            .into_iter()
+            .map(|f| {
+                let rules = f.patterns.into_iter().map(|pat| (0u32, pat)).collect();
+                (f.label, rules)
+            })
+            .collect();
+        if let Some(first_filter) = filters.first().cloned() {
+            portal_opts.insert("current_filter", Value::from(first_filter));
+        }
+        if !filters.is_empty() {
+            portal_opts.insert("filters", Value::from(filters));
+        }
+    }
+
+    if let Some(dir) = options.initial_dir.as_deref().and_then(Path::to_str) {
+        let mut dir_bytes = dir.as_bytes().to_vec();
+        dir_bytes.push(0);
+        portal_opts.insert("current_folder", Value::from(dir_bytes));
+    }
+
+    portal_opts
+}
+
+/// Attempt to open a file or folder dialog via `org.freedesktop.portal.FileChooser.OpenFile`.
 /// Returns `Ok(paths)` if the portal handled the dialog (empty if cancelled),
 /// or `Err(...)` if the portal service is unavailable so the caller can fall back.
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -813,29 +892,7 @@ pub fn open_files_via_portal(options: &FileDialogOptions) -> Result<Vec<PathBuf>
     )
     .map_err(|e| format!("Could not create portal FileChooser proxy: {e}"))?;
 
-    let mut portal_opts: HashMap<&str, Value<'_>> = HashMap::new();
-    portal_opts.insert("handle_token", Value::from(handle_token.as_str()));
-    portal_opts.insert("multiple", Value::from(options.multiple));
-    portal_opts.insert("modal", Value::from(true));
-
-    let filters: Vec<(String, Vec<(u32, String)>)> = options
-        .filters()
-        .into_iter()
-        .map(|f| {
-            let rules = f.patterns.into_iter().map(|pat| (0u32, pat)).collect();
-            (f.label, rules)
-        })
-        .collect();
-    if let Some(first_filter) = filters.first().cloned() {
-        portal_opts.insert("current_filter", Value::from(first_filter));
-    }
-    portal_opts.insert("filters", Value::from(filters));
-
-    if let Some(dir) = options.initial_dir.as_deref().and_then(Path::to_str) {
-        let mut dir_bytes = dir.as_bytes().to_vec();
-        dir_bytes.push(0);
-        portal_opts.insert("current_folder", Value::from(dir_bytes));
-    }
+    let portal_opts = build_portal_open_file_opts(options, &handle_token);
 
     let returned_handle: OwnedObjectPath = chooser
         .call("OpenFile", &("", options.title.as_str(), portal_opts))
@@ -871,6 +928,7 @@ pub fn open_files_via_portal(_options: &FileDialogOptions) -> Result<Vec<PathBuf
     Err("XDG Desktop Portal is only supported on Linux/Unix".to_owned())
 }
 
+#[cfg_attr(not(any(all(unix, not(target_os = "macos")), test)), allow(dead_code))]
 fn parse_newline_separated_paths(stdout: &[u8]) -> Vec<PathBuf> {
     stdout
         .split(|&b| b == b'\n')
@@ -891,21 +949,60 @@ fn parse_newline_separated_paths(stdout: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg_attr(not(any(all(unix, not(target_os = "macos")), test)), allow(dead_code))]
+fn build_zenity_args(options: &FileDialogOptions) -> Vec<String> {
+    let mut zenity_args = vec![
+        "--file-selection".to_owned(),
+        format!("--title={}", options.title),
+    ];
+    if options.is_folder() {
+        zenity_args.push("--directory".to_owned());
+    }
+    if options.multiple {
+        zenity_args.push("--multiple".to_owned());
+        zenity_args.push("--separator=\n".to_owned());
+    }
+    if let Some(dir) = options.initial_dir.as_deref() {
+        let mut path_str = dir.to_string_lossy().into_owned();
+        if !path_str.ends_with('/') {
+            path_str.push('/');
+        }
+        zenity_args.push(format!("--filename={path_str}"));
+    }
+    if !options.is_folder() {
+        for filter in options.filters() {
+            zenity_args.push(format!(
+                "--file-filter={} | {}",
+                filter.label,
+                filter.patterns.join(" ")
+            ));
+        }
+    }
+    zenity_args
+}
+
+#[cfg_attr(not(any(all(unix, not(target_os = "macos")), test)), allow(dead_code))]
 fn build_kdialog_args(options: &FileDialogOptions) -> Vec<String> {
     let mut kdialog_args = vec!["--title".to_owned(), options.title.clone()];
+    let start_dir = options
+        .initial_dir
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or(".")
+        .to_owned();
+
+    if options.is_folder() {
+        kdialog_args.push("--getexistingdirectory".to_owned());
+        kdialog_args.push(start_dir);
+        return kdialog_args;
+    }
+
     if options.multiple {
         kdialog_args.push("--multiple".to_owned());
         kdialog_args.push("--separate-output".to_owned());
     }
     kdialog_args.push("--getopenfilename".to_owned());
-    kdialog_args.push(
-        options
-            .initial_dir
-            .as_deref()
-            .and_then(Path::to_str)
-            .unwrap_or(".")
-            .to_owned(),
-    );
+    kdialog_args.push(start_dir);
     let filters = options.filters();
     if !filters.is_empty() {
         let filter_arg = filters
@@ -918,30 +1015,9 @@ fn build_kdialog_args(options: &FileDialogOptions) -> Vec<String> {
     kdialog_args
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn open_files_cli_fallback(options: &FileDialogOptions) -> Vec<PathBuf> {
-    let mut zenity_args = vec![
-        "--file-selection".to_owned(),
-        format!("--title={}", options.title),
-    ];
-    if options.multiple {
-        zenity_args.push("--multiple".to_owned());
-        zenity_args.push("--separator=\n".to_owned());
-    }
-    if let Some(dir) = options.initial_dir.as_deref() {
-        let mut path_str = dir.to_string_lossy().into_owned();
-        if !path_str.ends_with('/') {
-            path_str.push('/');
-        }
-        zenity_args.push(format!("--filename={path_str}"));
-    }
-    for filter in options.filters() {
-        zenity_args.push(format!(
-            "--file-filter={} | {}",
-            filter.label,
-            filter.patterns.join(" ")
-        ));
-    }
-
+    let zenity_args = build_zenity_args(options);
     if let Ok(output) = Command::new("zenity").args(&zenity_args).output() {
         if output.status.success() {
             return parse_newline_separated_paths(&output.stdout);
@@ -958,30 +1034,232 @@ fn open_files_cli_fallback(options: &FileDialogOptions) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// Blocking file chooser (intended to be called from [`open_files_async`] worker thread).
-/// Uses XDG Desktop Portal `org.freedesktop.portal.FileChooser.OpenFile` first,
-/// falling back to `zenity`/`kdialog` only if the portal is unavailable.
+/// Returns `true` on platforms where the native file dialog backend must execute
+/// on the UI/main thread (`true` on macOS AppKit `NSOpenPanel`, `false` on
+/// Linux/Windows).
+pub const fn requires_main_thread_file_dialog() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Blocking cross-platform file or folder chooser:
+/// - **Linux/Unix**: XDG Desktop Portal `org.freedesktop.portal.FileChooser.OpenFile`
+///   first (with `directory: true` for folders), falling back to `zenity`/`kdialog`.
+/// - **Windows**: Native Win32 COM `IFileOpenDialog` (STA-safe, supports multi-file,
+///   folder picking via `FOS_PICKFOLDERS`, filters, and initial directory).
+/// - **macOS**: Native AppKit `NSOpenPanel` (guaranteed main-thread execution;
+///   synchronously hops to the main GCD queue if called from a worker thread).
 pub fn open_files_blocking(options: &FileDialogOptions) -> Vec<PathBuf> {
-    match open_files_via_portal(options) {
-        Ok(paths) => paths,
-        Err(_) => open_files_cli_fallback(options),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match open_files_via_portal(options) {
+            Ok(paths) => paths,
+            Err(_) => open_files_cli_fallback(options),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        native_dialogs::open_files_windows(options)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        native_dialogs::open_files_macos_blocking(options)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = options;
+        Vec::new()
     }
 }
 
-/// Spawn a non-blocking background file chooser dialog and invoke `callback`
-/// with the selected file paths (if any).
+/// Blocking single-folder picker convenience wrapper around [`open_files_blocking`].
+pub fn open_folder_blocking(initial_dir: Option<PathBuf>) -> Option<PathBuf> {
+    open_files_blocking(&FileDialogOptions::folder(initial_dir))
+        .into_iter()
+        .next()
+}
+
+/// Spawn a non-blocking file or folder chooser dialog and invoke `callback`
+/// with the selected paths (if any).
+///
+/// - **Linux/Windows**: Runs on a dedicated `"memento-file-dialog"` worker thread.
+/// - **macOS**: Dispatches onto the main GCD queue (`dispatch_async_f`) so
+///   AppKit `NSOpenPanel` NEVER runs on a worker thread.
 pub fn open_files_async(
     options: FileDialogOptions,
     callback: impl FnOnce(Vec<PathBuf>) + Send + 'static,
 ) {
-    let _ = std::thread::Builder::new()
-        .name("memento-file-dialog".to_owned())
-        .spawn(move || {
-            let paths = open_files_blocking(&options);
+    #[cfg(target_os = "macos")]
+    {
+        native_dialogs::open_files_macos_async(options, callback);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = std::thread::Builder::new()
+            .name("memento-file-dialog".to_owned())
+            .spawn(move || {
+                let paths = open_files_blocking(&options);
+                if !paths.is_empty() {
+                    callback(paths);
+                }
+            });
+    }
+}
+
+/// Spawn a non-blocking folder picker dialog and invoke `callback` with the
+/// selected directory path (if any).
+pub fn open_folder_async(
+    initial_dir: Option<PathBuf>,
+    callback: impl FnOnce(PathBuf) + Send + 'static,
+) {
+    open_files_async(FileDialogOptions::folder(initial_dir), move |paths| {
+        if let Some(dir) = paths.into_iter().next() {
+            callback(dir);
+        }
+    });
+}
+
+fn dispatch_file_dialog_with_policy<D, R, C>(
+    run_on_main_thread: bool,
+    options: FileDialogOptions,
+    dispatch_to_main: D,
+    runner: R,
+    callback: C,
+) where
+    D: FnOnce(Box<dyn FnOnce() + Send>),
+    R: FnOnce(&FileDialogOptions) -> Vec<PathBuf> + Send + 'static,
+    C: FnOnce(Vec<PathBuf>) + Send + 'static,
+{
+    if run_on_main_thread {
+        dispatch_to_main(Box::new(move || {
+            let paths = runner(&options);
             if !paths.is_empty() {
                 callback(paths);
             }
-        });
+        }));
+    } else {
+        let _ = dispatch_to_main;
+        let _ = std::thread::Builder::new()
+            .name("memento-file-dialog".to_owned())
+            .spawn(move || {
+                let paths = runner(&options);
+                if !paths.is_empty() {
+                    callback(paths);
+                }
+            });
+    }
+}
+
+/// Main-thread-safe async file/folder chooser entry point designed for UI
+/// event loops (e.g. passing `|task| { let _ = slint::invoke_from_event_loop(task); }`).
+///
+/// - **macOS**: Invokes `dispatch_to_main` so `NSOpenPanel` runs on the UI/main
+///   thread and NEVER on a worker thread.
+/// - **Linux/Windows**: Runs on a background worker thread so the UI event loop
+///   stays responsive without blocking on modal dialogs.
+pub fn open_files_on_main_thread(
+    options: FileDialogOptions,
+    dispatch_to_main: impl FnOnce(Box<dyn FnOnce() + Send>),
+    callback: impl FnOnce(Vec<PathBuf>) + Send + 'static,
+) {
+    dispatch_file_dialog_with_policy(
+        requires_main_thread_file_dialog(),
+        options,
+        dispatch_to_main,
+        open_files_blocking,
+        callback,
+    );
+}
+
+/// Main-thread-safe async folder picker entry point (counterpart to
+/// [`open_files_on_main_thread`]).
+pub fn open_folder_on_main_thread(
+    initial_dir: Option<PathBuf>,
+    dispatch_to_main: impl FnOnce(Box<dyn FnOnce() + Send>),
+    callback: impl FnOnce(PathBuf) + Send + 'static,
+) {
+    open_files_on_main_thread(
+        FileDialogOptions::folder(initial_dir),
+        dispatch_to_main,
+        move |paths| {
+            if let Some(dir) = paths.into_iter().next() {
+                callback(dir);
+            }
+        },
+    );
+}
+
+// ── macOS `.app` Bundle `PATH` Augmentation ─────────────────────────────────
+
+fn normalize_unix_path_entry(entry: &str) -> &str {
+    if entry == "/" {
+        "/"
+    } else {
+        entry.trim_end_matches('/')
+    }
+}
+
+/// Compute an augmented colon-separated `PATH` string by appending any entries
+/// in `extras` that are not already present in `current`.
+///
+/// Returns `None` when `current` already contains every non-empty entry in
+/// `extras` (so callers can skip mutating the process environment).
+pub fn build_augmented_path(current: &str, extras: &[&str]) -> Option<String> {
+    let mut existing: Vec<&str> = current
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(normalize_unix_path_entry)
+        .collect();
+
+    let mut to_append: Vec<&str> = Vec::new();
+    for &extra in extras {
+        let trimmed = extra.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_unix_path_entry(trimmed);
+        if normalized.is_empty() || existing.contains(&normalized) {
+            continue;
+        }
+        existing.push(normalized);
+        to_append.push(trimmed);
+    }
+
+    if to_append.is_empty() {
+        return None;
+    }
+
+    let trimmed_current = current.trim_end_matches(':');
+    if trimmed_current.is_empty() {
+        Some(to_append.join(":"))
+    } else {
+        Some(format!("{trimmed_current}:{}", to_append.join(":")))
+    }
+}
+
+/// When running on macOS, append `/opt/homebrew/bin`, `/usr/local/bin`, and
+/// `$HOME/.local/bin` to `PATH` if missing so `.app` bundles launched from
+/// Finder can discover `yt-dlp`, `mecab`, `ffmpeg`, and mpv Lua script tools
+/// (fixes Memento `#141`).
+///
+/// Call early during process startup before spawning background worker threads.
+/// No-op on non-macOS targets.
+pub fn augment_macos_bundle_path() {
+    #[cfg(target_os = "macos")]
+    {
+        let current = std::env::var("PATH").unwrap_or_default();
+        let home_local_bin = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| format!("{}/.local/bin", h.trim_end_matches('/')));
+
+        let mut extras: Vec<&str> = vec!["/opt/homebrew/bin", "/usr/local/bin"];
+        if let Some(local_bin) = home_local_bin.as_deref() {
+            extras.push(local_bin);
+        }
+        if let Some(augmented) = build_augmented_path(&current, &extras) {
+            std::env::set_var("PATH", augmented);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1189,5 +1467,195 @@ mod tests {
         let restored = restore_win32_normal_window_style(maximized_style);
         assert_eq!(restored & WIN32_WS_MAXIMIZE, 0);
         assert_eq!(restored, 0x10CF_0000u32);
+    }
+
+    #[test]
+    fn subtitle_filters_include_all_pr356_extensions_in_media_and_subtitles() {
+        let required = [
+            "*.ass", "*.ssa", "*.srt", "*.vtt", "*.sub", "*.idx", "*.sup", "*.lrc", "*.mks",
+            "*.ttml", "*.smi", "*.rt",
+        ];
+
+        let media = FileDialogOptions::media_and_subtitles(None);
+        let media_filters = media.filters();
+        for pat in required {
+            assert!(
+                media_filters[0].patterns.iter().any(|p| p == pat),
+                "Media & Subtitle Files missing `{pat}`"
+            );
+            assert!(
+                media_filters[2].patterns.iter().any(|p| p == pat),
+                "Subtitle Files (under MediaAndSubtitles) missing `{pat}`"
+            );
+        }
+
+        let subs = FileDialogOptions::subtitles_only(None);
+        let sub_filters = subs.filters();
+        for pat in required {
+            assert!(
+                sub_filters[0].patterns.iter().any(|p| p == pat),
+                "Subtitle Files (SubtitlesOnly) missing `{pat}`"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_dialog_options_configure_zenity_kdialog_and_portal_for_directories() {
+        use super::build_zenity_args;
+
+        let folder = FileDialogOptions::folder(Some(PathBuf::from("/media/anime")));
+        assert!(folder.is_folder());
+        assert_eq!(folder.kind, FileDialogKind::Folder);
+        assert!(!folder.multiple);
+        assert!(folder.filters().is_empty());
+
+        let z_args = build_zenity_args(&folder);
+        assert!(z_args.iter().any(|a| a == "--file-selection"));
+        assert!(z_args.iter().any(|a| a == "--directory"));
+        assert!(z_args.iter().any(|a| a == "--filename=/media/anime/"));
+        assert!(!z_args.iter().any(|a| a.starts_with("--file-filter=")));
+
+        let k_args = build_kdialog_args(&folder);
+        assert_eq!(
+            k_args,
+            vec![
+                "--title",
+                "Select Folder",
+                "--getexistingdirectory",
+                "/media/anime",
+            ]
+        );
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use super::build_portal_open_file_opts;
+            use zbus::zvariant::Value;
+
+            let folder_opts = build_portal_open_file_opts(&folder, "tok_folder");
+            assert_eq!(folder_opts.get("directory"), Some(&Value::from(true)));
+            assert!(!folder_opts.contains_key("filters"));
+            assert!(!folder_opts.contains_key("current_filter"));
+            assert!(folder_opts.contains_key("current_folder"));
+
+            let file = FileDialogOptions::subtitles_only(Some(PathBuf::from("/tmp")));
+            let file_opts = build_portal_open_file_opts(&file, "tok_file");
+            assert!(!file_opts.contains_key("directory"));
+            assert!(file_opts.contains_key("filters"));
+            assert!(file_opts.contains_key("current_filter"));
+        }
+    }
+
+    #[test]
+    fn main_thread_dialog_dispatch_policy_respects_macos_and_worker_modes() {
+        use super::dispatch_file_dialog_with_policy;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        };
+
+        // macOS policy (`run_on_main_thread = true`): must invoke `dispatch_to_main`
+        // directly without spawning a worker thread.
+        let caller_tid = std::thread::current().id();
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatched_flag = Arc::clone(&dispatched);
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_out = Arc::clone(&received);
+
+        dispatch_file_dialog_with_policy(
+            true,
+            FileDialogOptions::folder(None),
+            move |task| {
+                dispatched_flag.store(true, Ordering::SeqCst);
+                assert_eq!(std::thread::current().id(), caller_tid);
+                task();
+            },
+            move |opts| {
+                assert!(opts.is_folder());
+                assert_eq!(std::thread::current().id(), caller_tid);
+                vec![PathBuf::from("/Users/test/Videos")]
+            },
+            move |paths| {
+                *received_out.lock().unwrap() = paths;
+            },
+        );
+        assert!(dispatched.load(Ordering::SeqCst));
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![PathBuf::from("/Users/test/Videos")]
+        );
+
+        // Cancelled (empty result) does not invoke callback.
+        let called_on_cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = Arc::clone(&called_on_cancel);
+        dispatch_file_dialog_with_policy(
+            true,
+            FileDialogOptions::folder(None),
+            |task| task(),
+            |_| Vec::new(),
+            move |_| {
+                cancel_flag.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(!called_on_cancel.load(Ordering::SeqCst));
+
+        // Linux/Windows policy (`run_on_main_thread = false`): runs on a background
+        // worker thread and never invokes `dispatch_to_main`.
+        let main_called = Arc::new(AtomicBool::new(false));
+        let main_called_flag = Arc::clone(&main_called);
+        let (tx, rx) = mpsc::channel();
+        dispatch_file_dialog_with_policy(
+            false,
+            FileDialogOptions::media_and_subtitles(None),
+            move |_task| {
+                main_called_flag.store(true, Ordering::SeqCst);
+            },
+            move |_| {
+                assert_ne!(std::thread::current().id(), caller_tid);
+                vec![PathBuf::from("/tmp/ep1.mkv")]
+            },
+            move |paths| {
+                let _ = tx.send(paths);
+            },
+        );
+        let worker_paths = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(!main_called.load(Ordering::SeqCst));
+        assert_eq!(worker_paths, vec![PathBuf::from("/tmp/ep1.mkv")]);
+    }
+
+    #[test]
+    fn build_augmented_path_appends_missing_macos_bundle_dirs_without_duplicates() {
+        use super::build_augmented_path;
+
+        let extras = ["/opt/homebrew/bin", "/usr/local/bin", "/Users/dev/.local/bin"];
+
+        // Typical minimal Finder `.app` PATH on macOS.
+        assert_eq!(
+            build_augmented_path("/usr/bin:/bin:/usr/sbin:/sbin", &extras),
+            Some(
+                "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/Users/dev/.local/bin"
+                    .to_owned()
+            )
+        );
+
+        // Existing entries (including trailing-slash form) are not duplicated.
+        assert_eq!(
+            build_augmented_path("/usr/bin:/opt/homebrew/bin/:/bin", &extras),
+            Some("/usr/bin:/opt/homebrew/bin/:/bin:/usr/local/bin:/Users/dev/.local/bin".to_owned())
+        );
+
+        // Already complete PATH returns None.
+        assert_eq!(
+            build_augmented_path(
+                "/opt/homebrew/bin:/usr/local/bin:/Users/dev/.local/bin:/usr/bin",
+                &extras
+            ),
+            None
+        );
+
+        // Empty PATH builds a clean colon-separated string without a leading colon.
+        assert_eq!(
+            build_augmented_path("", &["/opt/homebrew/bin", "", "/opt/homebrew/bin", "/usr/local/bin"]),
+            Some("/opt/homebrew/bin:/usr/local/bin".to_owned())
+        );
     }
 }

@@ -142,6 +142,17 @@ pub mod audio_source {
     pub const MD5_DEFAULT: &str = "7e2c2f954ef6051373ba916f000168dc";
 }
 
+pub mod audio {
+    /// General audio settings group (`[audio]`).
+    pub const GROUP: &str = "audio";
+
+    /// Per-source network timeout in milliseconds when downloading external
+    /// dictionary audio (Yomitan `#1876`).
+    pub const DOWNLOAD_TIMEOUT_MS: &str = "download-timeout-ms";
+    /// Default external dictionary audio download timeout (8000 ms).
+    pub const DOWNLOAD_TIMEOUT_MS_DEFAULT: i32 = 8000;
+}
+
 pub mod application {
     use crate::enums::Language;
 
@@ -343,6 +354,24 @@ pub mod search {
     pub const MAX_RECURSION_DEPTH: &str = "max-recursion-depth";
     /// Default maximum depth of recursive child popups.
     pub const MAX_RECURSION_DEPTH_DEFAULT: i32 = 4;
+
+    /// Pure-Rust extension: optional toggle for automatically resuming playback
+    /// when the cursor leaves a subtitle after `hover-pause` paused it.
+    pub const HOVER_PAUSE_RESUME: &str = "hover-pause-resume";
+    /// Default auto-resume behavior after hover-pause.
+    pub const HOVER_PAUSE_RESUME_DEFAULT: bool = true;
+
+    /// Pure-Rust extension: JSON-serialized list of custom regex text
+    /// replacement rules applied prior to dictionary lookup (H6.5).
+    pub const TEXT_REPLACEMENTS: &str = "text-replacements";
+    /// Default empty JSON rule list for custom text replacements.
+    pub const TEXT_REPLACEMENTS_DEFAULT: &str = "[]";
+
+    /// Pure-Rust extension: whether to also search the original unmodified
+    /// text alongside text-replacement variants (H6.5).
+    pub const TEXT_REPLACEMENTS_SEARCH_ORIGINAL: &str = "text-replacements-search-original";
+    /// Default: keep searching original text alongside replaced text.
+    pub const TEXT_REPLACEMENTS_SEARCH_ORIGINAL_DEFAULT: bool = true;
 }
 
 pub mod interface {
@@ -355,6 +384,25 @@ pub mod interface {
     pub const SYSTEM_ICONS: &str = "system-icons";
     /// keys.h:267
     pub const SYSTEM_ICONS_DEFAULT: bool = true;
+
+    /// Pure-Rust extension: application color theme mode (`"system"`, `"dark"`,
+    /// or `"light"`, `#357`).
+    pub const THEME: &str = "theme";
+    pub const THEME_SYSTEM: &str = "system";
+    pub const THEME_DARK: &str = "dark";
+    pub const THEME_LIGHT: &str = "light";
+    /// Default application color theme mode (`"system"`).
+    pub const THEME_DEFAULT: &str = THEME_SYSTEM;
+
+    /// Pure-Rust extension: compact glossary presentation mode (`#220`).
+    pub const COMPACT_GLOSSARIES: &str = "compact-glossaries";
+    /// Default compact glossary setting (`false`).
+    pub const COMPACT_GLOSSARIES_DEFAULT: bool = false;
+
+    /// Pure-Rust extension: compact tag badge presentation mode (`#220`).
+    pub const COMPACT_TAGS: &str = "compact-tags";
+    /// Default compact tag badge setting (`true`).
+    pub const COMPACT_TAGS_DEFAULT: bool = true;
 
     /// `Keys::Interface::Subtitle` (keys.h:269-297).
     pub mod subtitle {
@@ -891,6 +939,15 @@ mod tests {
         assert_eq!(search::SHOW_ANKI_GLOSSARY_CHECKBOX_DEFAULT, true);
         assert_eq!(search::MAX_RECURSION_DEPTH, "max-recursion-depth");
         assert_eq!(search::MAX_RECURSION_DEPTH_DEFAULT, 4);
+        assert_eq!(search::HOVER_PAUSE_RESUME, "hover-pause-resume");
+        assert_eq!(search::HOVER_PAUSE_RESUME_DEFAULT, true);
+        assert_eq!(search::TEXT_REPLACEMENTS, "text-replacements");
+        assert_eq!(search::TEXT_REPLACEMENTS_DEFAULT, "[]");
+        assert_eq!(
+            search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL,
+            "text-replacements-search-original"
+        );
+        assert_eq!(search::TEXT_REPLACEMENTS_SEARCH_ORIGINAL_DEFAULT, true);
     }
 
     // keys.h:262-297, 299-306 — Interface top level + Subtitle.
@@ -899,12 +956,28 @@ mod tests {
         assert_eq!(interface::GROUP, "interface");
         assert_eq!(interface::SYSTEM_ICONS, "system-icons");
         assert_eq!(interface::SYSTEM_ICONS_DEFAULT, true);
+        assert_eq!(interface::THEME, "theme");
+        assert_eq!(interface::THEME_SYSTEM, "system");
+        assert_eq!(interface::THEME_DARK, "dark");
+        assert_eq!(interface::THEME_LIGHT, "light");
+        assert_eq!(interface::THEME_DEFAULT, "system");
+        assert_eq!(interface::COMPACT_GLOSSARIES, "compact-glossaries");
+        assert_eq!(interface::COMPACT_GLOSSARIES_DEFAULT, false);
+        assert_eq!(interface::COMPACT_TAGS, "compact-tags");
+        assert_eq!(interface::COMPACT_TAGS_DEFAULT, true);
         assert_eq!(interface::POPUP_WIDTH, "sub-popup-width");
         assert_eq!(interface::POPUP_WIDTH_DEFAULT, 500);
         assert_eq!(interface::POPUP_HEIGHT, "sub-popup-height");
         assert_eq!(interface::POPUP_HEIGHT_DEFAULT, 400);
         assert_eq!(interface::SEARCH_WINDOW, "search-window");
         assert_eq!(interface::SEARCH_WINDOW_DEFAULT, false);
+    }
+
+    #[test]
+    fn audio_constants() {
+        assert_eq!(audio::GROUP, "audio");
+        assert_eq!(audio::DOWNLOAD_TIMEOUT_MS, "download-timeout-ms");
+        assert_eq!(audio::DOWNLOAD_TIMEOUT_MS_DEFAULT, 8000);
     }
 
     // keys.h:269-297 — Interface::Subtitle (QFont default at line 272

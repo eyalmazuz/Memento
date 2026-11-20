@@ -24,8 +24,355 @@
 use std::borrow::Cow;
 use std::ffi::{c_char, c_void, CStr};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
+
+/// Returns `true` when `path` contains whitespace or non-ASCII characters that
+/// require Win32 8.3 short-path conversion (`GetShortPathNameW`) before passing
+/// raw option bytes into `libmecab`'s ANSI `mecab_new2`.
+pub fn path_needs_windows_short_name(path: &str) -> bool {
+    path.chars().any(|c| !c.is_ascii() || c.is_ascii_whitespace())
+}
+
+fn quote_mecab_arg_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let needs_quotes = bytes.iter().any(|&b| b == b' ' || b == b'\t');
+    let already_quoted = bytes.len() >= 2 && bytes.first() == Some(&b'"') && bytes.last() == Some(&b'"');
+    if !needs_quotes || already_quoted {
+        return Cow::Borrowed(bytes);
+    }
+    let mut quoted = Vec::with_capacity(bytes.len() + 2);
+    quoted.push(b'"');
+    for &b in bytes {
+        if b == b'"' {
+            quoted.push(b'\\');
+        }
+        quoted.push(b);
+    }
+    quoted.push(b'"');
+    Cow::Owned(quoted)
+}
+
+/// Format raw `libmecab` tagger initialization option bytes for a discovered
+/// dictionary directory (`dicdir`) and optional resource file (`dicrc`).
+///
+/// - Empty `dicdir_bytes` returns an empty vector so `libmecab` falls back to
+///   its system default `mecabrc`.
+/// - On Windows (`is_windows == true`), delegates to
+///   [`crate::quickutils::format_mecab_tagger_arg`] when both `dicdir` and
+///   `dicrc` are provided (preserving raw ANSI / 8.3 short-path bytes without
+///   UTF-8 re-encoding) and quotes arguments if spaces remain (e.g., when 8.3
+///   short name generation is disabled on a volume).
+pub fn format_dicdir_tagger_arg(
+    is_windows: bool,
+    dicdir_bytes: &[u8],
+    dicrc_bytes: &[u8],
+) -> Vec<u8> {
+    if dicdir_bytes.is_empty() {
+        return crate::quickutils::format_mecab_tagger_arg(false, false, b"", b"");
+    }
+
+    let dicdir_arg = quote_mecab_arg_bytes(dicdir_bytes);
+    let dicrc_arg = quote_mecab_arg_bytes(dicrc_bytes);
+
+    if is_windows {
+        if !dicrc_arg.is_empty() {
+            return crate::quickutils::format_mecab_tagger_arg(true, false, &dicdir_arg, &dicrc_arg);
+        }
+        let mut arg = Vec::with_capacity(4 + dicdir_arg.len());
+        arg.extend_from_slice(b" -d ");
+        arg.extend_from_slice(&dicdir_arg);
+        return arg;
+    }
+
+    let mut arg = Vec::with_capacity(7 + dicdir_arg.len() + dicrc_arg.len());
+    arg.extend_from_slice(b"-d ");
+    arg.extend_from_slice(&dicdir_arg);
+    if !dicrc_arg.is_empty() {
+        arg.extend_from_slice(b" -r ");
+        arg.extend_from_slice(&dicrc_arg);
+    }
+    arg
+}
+
+/// Returns `true` if `dir` is an existing directory containing a MeCab
+/// dictionary (`dicrc` or `sys.dic`).
+pub fn is_valid_mecab_dicdir(dir: &Path) -> bool {
+    dir.is_dir() && (dir.join("dicrc").is_file() || dir.join("sys.dic").is_file())
+}
+
+/// Resolve the `dicrc` resource file inside `dicdir`, if present.
+pub fn resolve_mecab_dicrc(dicdir: &Path) -> Option<PathBuf> {
+    let dicrc = dicdir.join("dicrc");
+    dicrc.is_file().then_some(dicrc)
+}
+
+/// Build the ordered list of explicit override MeCab dictionary candidates
+/// (`MECAB_DICDIR` env var and executable-adjacent / macOS `.app` bundled paths).
+pub fn mecab_dicdir_override_candidates(
+    env_dicdir: Option<&Path>,
+    exe_dir: Option<&Path>,
+    target_os: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(env_dir) = env_dicdir {
+        if !env_dir.as_os_str().is_empty() {
+            candidates.push(env_dir.to_path_buf());
+        }
+    }
+    if let Some(exe_dir) = exe_dir {
+        candidates.push(exe_dir.join("ipadic"));
+        candidates.push(exe_dir.join("unidic"));
+        candidates.push(exe_dir.join("dic"));
+        candidates.push(exe_dir.join("share").join("mecab").join("dic").join("ipadic"));
+        candidates.push(exe_dir.join("share").join("mecab").join("dic").join("unidic"));
+
+        if target_os == "macos" {
+            if let Some(contents_dir) = exe_dir.parent() {
+                let resources = contents_dir.join("Resources");
+                candidates.push(resources.join("ipadic"));
+                candidates.push(resources.join("unidic"));
+                candidates.push(resources.join("dic"));
+                candidates.push(
+                    resources
+                        .join("share")
+                        .join("mecab")
+                        .join("dic")
+                        .join("ipadic"),
+                );
+                candidates.push(
+                    resources
+                        .join("share")
+                        .join("mecab")
+                        .join("dic")
+                        .join("unidic"),
+                );
+            }
+        }
+    }
+    candidates
+}
+
+/// Build the ordered list of platform-standard system MeCab dictionary
+/// locations (macOS Homebrew, standard Linux paths, Windows Program Files).
+pub fn mecab_dicdir_system_candidates(target_os: &str) -> Vec<PathBuf> {
+    match target_os {
+        "macos" => vec![
+            PathBuf::from("/opt/homebrew/lib/mecab/dic/ipadic"),
+            PathBuf::from("/opt/homebrew/lib/mecab/dic/unidic"),
+            PathBuf::from("/usr/local/lib/mecab/dic/ipadic"),
+            PathBuf::from("/usr/local/lib/mecab/dic/unidic"),
+        ],
+        "windows" => vec![
+            PathBuf::from(r"C:\Program Files\MeCab\dic\ipadic"),
+            PathBuf::from(r"C:\Program Files (x86)\MeCab\dic\ipadic"),
+        ],
+        _ => vec![
+            PathBuf::from("/var/lib/mecab/dic/debian"),
+            PathBuf::from("/usr/lib/x86_64-linux-gnu/mecab/dic/unidic"),
+            PathBuf::from("/usr/lib/x86_64-linux-gnu/mecab/dic/ipadic"),
+            PathBuf::from("/usr/lib/aarch64-linux-gnu/mecab/dic/unidic"),
+            PathBuf::from("/usr/lib/aarch64-linux-gnu/mecab/dic/ipadic"),
+            PathBuf::from("/usr/lib/mecab/dic/unidic"),
+            PathBuf::from("/usr/lib/mecab/dic/ipadic"),
+            PathBuf::from("/usr/share/mecab/dic/unidic"),
+            PathBuf::from("/usr/share/mecab/dic/ipadic"),
+            PathBuf::from("/usr/local/lib/mecab/dic/unidic"),
+            PathBuf::from("/usr/local/lib/mecab/dic/ipadic"),
+        ],
+    }
+}
+
+/// Probe `override_candidates` first and then `system_candidates`, returning
+/// the first directory passing [`is_valid_mecab_dicdir`].
+pub fn discover_mecab_dicdir_in(
+    override_candidates: &[PathBuf],
+    system_candidates: &[PathBuf],
+) -> Option<PathBuf> {
+    override_candidates
+        .iter()
+        .chain(system_candidates.iter())
+        .find(|dir| is_valid_mecab_dicdir(dir))
+        .cloned()
+}
+
+/// Discover an explicit MeCab dictionary override (`MECAB_DICDIR` or
+/// executable-adjacent bundled dictionary).
+pub fn discover_mecab_override_dicdir() -> Option<PathBuf> {
+    let env_dicdir = std::env::var_os("MECAB_DICDIR").map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let overrides = mecab_dicdir_override_candidates(
+        env_dicdir.as_deref(),
+        exe_dir.as_deref(),
+        std::env::consts::OS,
+    );
+    overrides.into_iter().find(|dir| is_valid_mecab_dicdir(dir))
+}
+
+/// Automatically discover a MeCab dictionary directory by probing `MECAB_DICDIR`,
+/// executable-adjacent bundled directories, macOS Homebrew paths, and standard
+/// OS paths.
+pub fn discover_mecab_dicdir() -> Option<PathBuf> {
+    let env_dicdir = std::env::var_os("MECAB_DICDIR").map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let overrides = mecab_dicdir_override_candidates(
+        env_dicdir.as_deref(),
+        exe_dir.as_deref(),
+        std::env::consts::OS,
+    );
+    let system = mecab_dicdir_system_candidates(std::env::consts::OS);
+    discover_mecab_dicdir_in(&overrides, &system)
+}
+
+#[cfg(target_os = "windows")]
+mod win_mecab_ffi {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use super::path_needs_windows_short_name;
+
+    const CP_ACP: u32 = 0;
+    const CP_UTF8: u32 = 65001;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(
+            lpsz_long_path: *const u16,
+            lpsz_short_path: *mut u16,
+            cch_buffer: u32,
+        ) -> u32;
+        fn WideCharToMultiByte(
+            code_page: u32,
+            dw_flags: u32,
+            lp_wide_char_str: *const u16,
+            cch_wide_char: i32,
+            lp_multi_byte_str: *mut u8,
+            cb_multi_byte: i32,
+            lp_default_char: *const u8,
+            lp_used_default_char: *mut i32,
+        ) -> i32;
+    }
+
+    fn short_path_wide(wide_nul: &[u16]) -> Option<Vec<u16>> {
+        let needed = unsafe { GetShortPathNameW(wide_nul.as_ptr(), std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written =
+            unsafe { GetShortPathNameW(wide_nul.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if written > 0 && (written as usize) < buf.len() {
+            buf.truncate(written as usize);
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    fn wide_to_codepage(wide: &[u16], code_page: u32) -> Option<Vec<u8>> {
+        if wide.is_empty() {
+            return Some(Vec::new());
+        }
+        let check_default = code_page != CP_UTF8;
+        let mut used_default: i32 = 0;
+        let needed = unsafe {
+            let used_ptr = if check_default {
+                &mut used_default as *mut i32
+            } else {
+                std::ptr::null_mut()
+            };
+            WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                used_ptr,
+            )
+        };
+        if needed <= 0 || (check_default && used_default != 0) {
+            return None;
+        }
+        let mut out = vec![0u8; needed as usize];
+        used_default = 0;
+        let written = unsafe {
+            let used_ptr = if check_default {
+                &mut used_default as *mut i32
+            } else {
+                std::ptr::null_mut()
+            };
+            WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                wide.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+                std::ptr::null(),
+                used_ptr,
+            )
+        };
+        if written <= 0 || (check_default && used_default != 0) {
+            return None;
+        }
+        out.truncate(written as usize);
+        Some(out)
+    }
+
+    /// Convert a Windows path to raw bytes suitable for `libmecab`'s ANSI
+    /// `mecab_new2`: converts paths with spaces or non-ASCII characters via
+    /// `GetShortPathNameW` (8.3 short path) and encodes UTF-16 to `CP_ACP`
+    /// (falling back to UTF-8 if lossy under the active ANSI code page).
+    pub(super) fn path_to_windows_mecab_bytes(path: &Path) -> Vec<u8> {
+        let wide_nul: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let short_owned = if path_needs_windows_short_name(&path.to_string_lossy()) {
+            short_path_wide(&wide_nul)
+        } else {
+            None
+        };
+        let effective_wide: &[u16] = match short_owned.as_deref() {
+            Some(short) => short,
+            None => &wide_nul[..wide_nul.len().saturating_sub(1)],
+        };
+        wide_to_codepage(effective_wide, CP_ACP)
+            .or_else(|| wide_to_codepage(effective_wide, CP_UTF8))
+            .unwrap_or_else(|| String::from_utf16_lossy(effective_wide).into_bytes())
+    }
+}
+
+fn path_to_mecab_arg_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(target_os = "windows")]
+    {
+        win_mecab_ffi::path_to_windows_mecab_bytes(path)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn build_mecab_tagger_arg_for_dicdir(is_windows: bool, dicdir: &Path) -> Vec<u8> {
+    let dicdir_bytes = path_to_mecab_arg_bytes(dicdir);
+    let dicrc_bytes = resolve_mecab_dicrc(dicdir)
+        .map(|dicrc| path_to_mecab_arg_bytes(&dicrc))
+        .unwrap_or_default();
+    format_dicdir_tagger_arg(is_windows, &dicdir_bytes, &dicrc_bytes)
+}
 
 type MecabNew2Fn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type MecabSparseToStr2Fn =
@@ -76,50 +423,119 @@ pub struct LibMecabTagger {
 unsafe impl Send for LibMecabTagger {}
 
 impl LibMecabTagger {
-    /// Load `libmecab` from standard platform library names with default options.
+    /// Load `libmecab` from standard platform library names, automatically
+    /// probing `MECAB_DICDIR`, executable-adjacent bundled dictionaries,
+    /// system default `mecabrc`, and platform-standard paths (Homebrew / Linux /
+    /// Windows), converting Windows `dicdir` paths containing spaces or
+    /// non-ASCII characters via `GetShortPathNameW`.
     pub fn new() -> Result<Self, String> {
-        let default_arg = crate::quickutils::format_mecab_tagger_arg(false, false, b"", b"");
-        Self::new_with_config(None, &default_arg)
+        let is_windows = cfg!(target_os = "windows");
+
+        // 1. Explicit overrides (`MECAB_DICDIR` or executable-adjacent bundled dictionary).
+        if let Some(override_dir) = discover_mecab_override_dicdir() {
+            let arg = build_mecab_tagger_arg_for_dicdir(is_windows, &override_dir);
+            if let Ok(tagger) = Self::new_with_config(None, &arg) {
+                return Ok(tagger);
+            }
+        }
+
+        // 2. On Unix/macOS, prefer system default `mecabrc` when no explicit override
+        //    is configured so custom `/etc/mecabrc` setups (e.g. UniDic) are respected.
+        let mut default_err: Option<String> = None;
+        if !is_windows {
+            let default_arg = crate::quickutils::format_mecab_tagger_arg(false, false, b"", b"");
+            match Self::new_with_config(None, &default_arg) {
+                Ok(tagger) => return Ok(tagger),
+                Err(err) => default_err = Some(err),
+            }
+        }
+
+        // 3. Probe platform-standard dictionary directories (Homebrew, Linux, Windows).
+        let mut last_err = default_err;
+        for candidate_dir in mecab_dicdir_system_candidates(std::env::consts::OS) {
+            if !is_valid_mecab_dicdir(&candidate_dir) {
+                continue;
+            }
+            let arg = build_mecab_tagger_arg_for_dicdir(is_windows, &candidate_dir);
+            match Self::new_with_config(None, &arg) {
+                Ok(tagger) => return Ok(tagger),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        // 4. Final fallback to bare system default `mecabrc` on Windows (or return
+        //    the recorded error on Unix where step 2 already attempted it).
+        if is_windows {
+            let default_arg = crate::quickutils::format_mecab_tagger_arg(false, false, b"", b"");
+            Self::new_with_config(None, &default_arg)
+        } else {
+            Err(last_err.unwrap_or_else(|| "Failed to initialize libmecab".to_owned()))
+        }
     }
 
     /// Load `libmecab` from an optional explicit library path and raw tagger argument bytes
     /// (such as those produced by [`crate::quickutils::format_mecab_tagger_arg`]).
     pub fn new_with_config(lib_path: Option<&str>, tagger_arg: &[u8]) -> Result<Self, String> {
-        let mut candidates: Vec<&str> = Vec::new();
+        let mut candidates: Vec<String> = Vec::new();
         if let Some(custom) = lib_path {
             if !custom.is_empty() {
-                candidates.push(custom);
+                candidates.push(custom.to_owned());
             }
         }
         #[cfg(target_os = "macos")]
         {
-            candidates.extend_from_slice(&[
-                "libmecab.dylib",
-                "libmecab.2.dylib",
-                "/opt/homebrew/lib/libmecab.dylib",
-                "/usr/local/lib/libmecab.dylib",
-            ]);
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(contents) = exe.parent().and_then(Path::parent) {
+                    candidates.push(
+                        contents
+                            .join("Frameworks")
+                            .join("libmecab.dylib")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            candidates.extend(
+                [
+                    "libmecab.dylib",
+                    "libmecab.2.dylib",
+                    "/opt/homebrew/lib/libmecab.dylib",
+                    "/usr/local/lib/libmecab.dylib",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
         }
         #[cfg(target_os = "windows")]
         {
-            candidates.extend_from_slice(&["libmecab.dll", "mecab.dll"]);
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    candidates.push(exe_dir.join("libmecab.dll").to_string_lossy().into_owned());
+                    candidates.push(exe_dir.join("mecab.dll").to_string_lossy().into_owned());
+                }
+            }
+            candidates.extend(["libmecab.dll", "mecab.dll"].into_iter().map(str::to_owned));
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            candidates.extend_from_slice(&[
-                "libmecab.so.2",
-                "libmecab.so",
-                "/usr/lib/libmecab.so.2",
-                "/usr/lib/libmecab.so",
-                "/usr/lib/x86_64-linux-gnu/libmecab.so.2",
-                "/usr/local/lib/libmecab.so.2",
-                "/usr/local/lib/libmecab.so",
-            ]);
+            candidates.extend(
+                [
+                    "libmecab.so.2",
+                    "libmecab.so",
+                    "/usr/lib/libmecab.so.2",
+                    "/usr/lib/libmecab.so",
+                    "/usr/lib/x86_64-linux-gnu/libmecab.so.2",
+                    "/usr/local/lib/libmecab.so.2",
+                    "/usr/local/lib/libmecab.so",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
         }
 
         let mut last_err = String::from("no libmecab candidate paths configured");
         let mut loaded_lib = None;
-        for candidate in candidates {
+        for candidate in &candidates {
             match unsafe { libloading::Library::new(candidate) } {
                 Ok(lib) => {
                     loaded_lib = Some(lib);
@@ -330,8 +746,20 @@ pub struct PipedMecabDaemon {
 }
 
 impl PipedMecabDaemon {
-    /// Spawn a persistent piped `mecab` daemon with default arguments.
+    /// Spawn a persistent piped `mecab` daemon, automatically honoring an
+    /// explicit `MECAB_DICDIR` or executable-adjacent bundled dictionary override
+    /// when present and falling back to system default `mecabrc` otherwise.
     pub fn new() -> Result<Self, String> {
+        if let Some(override_dir) = discover_mecab_override_dicdir() {
+            let mut args = vec!["-d".to_owned(), override_dir.to_string_lossy().into_owned()];
+            if let Some(dicrc) = resolve_mecab_dicrc(&override_dir) {
+                args.push("-r".to_owned());
+                args.push(dicrc.to_string_lossy().into_owned());
+            }
+            if let Ok(daemon) = Self::with_args(args) {
+                return Ok(daemon);
+            }
+        }
         Self::with_args(Vec::new())
     }
 
@@ -992,5 +1420,152 @@ mod tests {
         assert_eq!(tokens[0].surface_clean, "食");
         assert_eq!(tokens[1].surface, "\0べる");
         assert_eq!(tokens[1].surface_clean, "べる");
+    }
+
+    #[test]
+    fn windows_short_path_detection_and_tagger_arg_formatting() {
+        assert!(!path_needs_windows_short_name(r"C:\Memento\ipadic"));
+        assert!(!path_needs_windows_short_name(r"C:\PROGRA~1\ipadic"));
+        assert!(path_needs_windows_short_name(r"C:\Program Files\Memento\ipadic"));
+        assert!(path_needs_windows_short_name(r"C:\Users\太郎\Memento\ipadic"));
+        assert!(path_needs_windows_short_name("C:/Users/José/dic"));
+
+        // Windows 8.3 short paths (including raw ANSI code-page bytes) pass through verbatim.
+        assert_eq!(
+            format_dicdir_tagger_arg(true, b"C:\\PROGRA~1\\ipadic", b"C:\\PROGRA~1\\ipadic\\dicrc"),
+            b" -d C:\\PROGRA~1\\ipadic -r C:\\PROGRA~1\\ipadic\\dicrc"
+        );
+        assert_eq!(
+            format_dicdir_tagger_arg(true, b"C:\\\x8e\x96\\ipadic", b"C:\\\x8e\x96\\ipadic\\dicrc"),
+            b" -d C:\\\x8e\x96\\ipadic -r C:\\\x8e\x96\\ipadic\\dicrc"
+        );
+        // Windows path with remaining spaces (e.g. 8.3 disabled on NTFS volume) is quoted safely.
+        assert_eq!(
+            format_dicdir_tagger_arg(
+                true,
+                b"D:\\My Folder\\ipadic",
+                b"D:\\My Folder\\ipadic\\dicrc"
+            ),
+            b" -d \"D:\\My Folder\\ipadic\" -r \"D:\\My Folder\\ipadic\\dicrc\""
+        );
+        // Windows dicdir without dicrc emits only `-d`.
+        assert_eq!(
+            format_dicdir_tagger_arg(true, b"C:\\PROGRA~1\\ipadic", b""),
+            b" -d C:\\PROGRA~1\\ipadic"
+        );
+        // Unix / macOS Homebrew formatting and quoting.
+        assert_eq!(
+            format_dicdir_tagger_arg(
+                false,
+                b"/opt/homebrew/lib/mecab/dic/ipadic",
+                b"/opt/homebrew/lib/mecab/dic/ipadic/dicrc"
+            ),
+            b"-d /opt/homebrew/lib/mecab/dic/ipadic -r /opt/homebrew/lib/mecab/dic/ipadic/dicrc"
+        );
+        assert_eq!(
+            format_dicdir_tagger_arg(
+                false,
+                b"/Applications/My Memento.app/Contents/Resources/ipadic",
+                b"/Applications/My Memento.app/Contents/Resources/ipadic/dicrc"
+            ),
+            b"-d \"/Applications/My Memento.app/Contents/Resources/ipadic\" -r \"/Applications/My Memento.app/Contents/Resources/ipadic/dicrc\""
+        );
+        // Empty dicdir falls back to empty bytes (system default `mecabrc`).
+        assert_eq!(format_dicdir_tagger_arg(true, b"", b""), b"");
+        assert_eq!(format_dicdir_tagger_arg(false, b"", b""), b"");
+    }
+
+    #[test]
+    fn mecab_dicdir_discovery_probes_env_exe_adjacent_homebrew_and_linux_in_order() {
+        // Candidate ordering checks across platforms.
+        let mac_overrides = mecab_dicdir_override_candidates(
+            Some(Path::new("/custom/mecab/dic")),
+            Some(Path::new("/Applications/Memento.app/Contents/MacOS")),
+            "macos",
+        );
+        assert_eq!(mac_overrides[0], PathBuf::from("/custom/mecab/dic"));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/MacOS/ipadic"
+        )));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/MacOS/unidic"
+        )));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/MacOS/dic"
+        )));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/MacOS/share/mecab/dic/ipadic"
+        )));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/Resources/ipadic"
+        )));
+        assert!(mac_overrides.contains(&PathBuf::from(
+            "/Applications/Memento.app/Contents/Resources/unidic"
+        )));
+
+        let mac_system = mecab_dicdir_system_candidates("macos");
+        assert_eq!(
+            mac_system,
+            vec![
+                PathBuf::from("/opt/homebrew/lib/mecab/dic/ipadic"),
+                PathBuf::from("/opt/homebrew/lib/mecab/dic/unidic"),
+                PathBuf::from("/usr/local/lib/mecab/dic/ipadic"),
+                PathBuf::from("/usr/local/lib/mecab/dic/unidic"),
+            ]
+        );
+
+        let linux_system = mecab_dicdir_system_candidates("linux");
+        assert!(linux_system.contains(&PathBuf::from("/var/lib/mecab/dic/debian")));
+        assert!(linux_system.contains(&PathBuf::from("/usr/lib/x86_64-linux-gnu/mecab/dic/ipadic")));
+        assert!(linux_system.contains(&PathBuf::from("/usr/share/mecab/dic/ipadic")));
+
+        // Filesystem-backed probe with a temporary directory tree.
+        let unique = format!(
+            "memento_mecab_probe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(unique);
+        let exe_dir = root.join("bin");
+        let empty_dic = exe_dir.join("ipadic");
+        let valid_share_dic = exe_dir.join("share").join("mecab").join("dic").join("ipadic");
+        let env_dic = root.join("env_unidic");
+        std::fs::create_dir_all(&empty_dic).unwrap();
+        std::fs::create_dir_all(&valid_share_dic).unwrap();
+        std::fs::create_dir_all(&env_dic).unwrap();
+        std::fs::write(valid_share_dic.join("dicrc"), b"; dicrc").unwrap();
+        std::fs::write(env_dic.join("sys.dic"), b"dummy").unwrap();
+
+        // Empty `ipadic/` without `dicrc` or `sys.dic` is skipped in favor of valid `share/mecab/dic/ipadic`.
+        assert!(!is_valid_mecab_dicdir(&empty_dic));
+        assert!(is_valid_mecab_dicdir(&valid_share_dic));
+        assert_eq!(
+            resolve_mecab_dicrc(&valid_share_dic),
+            Some(valid_share_dic.join("dicrc"))
+        );
+
+        let without_env = mecab_dicdir_override_candidates(None, Some(&exe_dir), "linux");
+        assert_eq!(
+            discover_mecab_dicdir_in(&without_env, &[]),
+            Some(valid_share_dic.clone())
+        );
+
+        // `MECAB_DICDIR` takes highest precedence over executable-adjacent paths.
+        let with_env = mecab_dicdir_override_candidates(Some(&env_dic), Some(&exe_dir), "linux");
+        assert_eq!(
+            discover_mecab_dicdir_in(&with_env, &[]),
+            Some(env_dic.clone())
+        );
+
+        // Clean fallback to `None` (system default `mecabrc`) when no candidates exist.
+        assert_eq!(
+            discover_mecab_dicdir_in(&[root.join("missing")], &[root.join("also_missing")]),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

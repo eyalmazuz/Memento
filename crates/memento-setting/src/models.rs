@@ -77,6 +77,9 @@ pub const ONNX_MODELS: &[&str] = &[
     "custom",
 ];
 
+/// Valid UI theme values accepted by `interface/theme` (`#357`).
+pub const THEME_MODES: &[&str] = &["system", "dark", "light"];
+
 /// Maximum capacity for the recent files list.
 /// Matches `MAX_SIZE` in `Settings::recentFilesAdd`.
 pub const RECENT_FILES_MAX_SIZE: usize = 10;
@@ -182,5 +185,10 @@ mod tests {
         // Limit of 0 or 1 leaves no surviving tail.
         assert!(plan_recent_files_add_with_limit(&items, "file0", 1).is_empty());
         assert!(plan_recent_files_add_with_limit(&items, "file0", 0).is_empty());
+    }
+
+    #[test]
+    fn test_theme_modes_registry() {
+        assert_eq!(THEME_MODES, &["system", "dark", "light"]);
     }
 }
