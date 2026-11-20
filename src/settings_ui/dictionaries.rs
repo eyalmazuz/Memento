@@ -267,11 +267,34 @@ pub(crate) fn dictionary_settings_rows(
     .collect()
 }
 
-pub(crate) fn refresh_dictionary_settings(
+pub(crate) type DictListFingerprint = (memento_dict::sqlite_db::DbFileFingerprint, Vec<i64>);
+
+fn current_dict_order(config: &ConfigController) -> Vec<i64> {
+    match config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER) {
+        Some(Value::Ints(order)) => order,
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn dict_list_fingerprint(
+    db_path: &Path,
+    config: &ConfigController,
+) -> DictListFingerprint {
+    (
+        memento_dict::sqlite_db::db_file_fingerprint(db_path),
+        current_dict_order(config),
+    )
+}
+
+pub(crate) fn invalidate_dict_list_fingerprint(cached_sig: &RefCell<Option<DictListFingerprint>>) {
+    *cached_sig.borrow_mut() = None;
+}
+
+fn refresh_dictionary_settings_checked(
     window: &SettingsWindow,
     manager: Option<&DictionaryManager>,
     config: &ConfigController,
-) {
+) -> bool {
     let rows = manager.map_or_else(
         || Ok(Vec::new()),
         |manager| dictionary_settings_rows(manager, config),
@@ -279,9 +302,46 @@ pub(crate) fn refresh_dictionary_settings(
     match rows {
         Ok(rows) => {
             window.set_installed_dictionaries(Rc::new(VecModel::from(rows)).into());
+            true
         }
-        Err(error) => window.set_settings_status(format!("Dictionary list: {error}").into()),
+        Err(error) => {
+            window.set_settings_status(format!("Dictionary list: {error}").into());
+            false
+        }
     }
+}
+
+pub(crate) fn refresh_dictionary_settings(
+    window: &SettingsWindow,
+    manager: Option<&DictionaryManager>,
+    config: &ConfigController,
+) {
+    let _ = refresh_dictionary_settings_checked(window, manager, config);
+}
+
+/// Reloads installed dictionary rows from SQLite into `SettingsWindow` only when
+/// the database `(main, -wal)` file fingerprint or `dictionary/order` differs
+/// from `cached_sig`. Returns `true` when SQLite was queried and `false` when
+/// the synchronous query + `VecModel` rebuild was skipped.
+pub(crate) fn refresh_dictionary_settings_if_changed(
+    window: &SettingsWindow,
+    manager: Option<&DictionaryManager>,
+    config: &ConfigController,
+    db_path: &Path,
+    cached_sig: &RefCell<Option<DictListFingerprint>>,
+) -> bool {
+    let sig = dict_list_fingerprint(db_path, config);
+    if cached_sig.borrow().as_ref() == Some(&sig) {
+        return false;
+    }
+    if refresh_dictionary_settings_checked(window, manager, config) {
+        // Re-sample after SQLite completes because `DictionaryManager` may
+        // create or checkpoint the `-wal` file while opening/querying the DB.
+        *cached_sig.borrow_mut() = Some(dict_list_fingerprint(db_path, config));
+    } else {
+        *cached_sig.borrow_mut() = None;
+    }
+    true
 }
 
 pub(crate) fn save_dictionary_order(
@@ -359,6 +419,29 @@ impl DictionaryBatchCoordinator {
             dropped_non_zip: Rc::new(RefCell::new(Vec::new())),
             burst_flush_scheduled: Rc::new(Cell::new(false)),
         }
+    }
+
+    /// Returns `true` if any drag-and-drop or batch dictionary import work is
+    /// queued, awaiting burst coalescing, or awaiting main-thread completion.
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.queued_archives.borrow().is_empty()
+            || !self.dropped_burst.borrow().is_empty()
+            || self.burst_flush_scheduled.get()
+            || self
+                .pending_mutation
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_queued_archive_for_test(&self, path: PathBuf) {
+        self.queued_archives.borrow_mut().push_back(path);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_queued_archives_for_test(&self) {
+        self.queued_archives.borrow_mut().clear();
     }
 
     pub(crate) fn on_hovered_file(&self, window: &SettingsWindow, path: &Path) {
@@ -599,6 +682,8 @@ fn finish_async_dictionary_mutation(
         None
     };
 
+    invalidate_dict_list_fingerprint(&ctx.dict_list_fingerprint);
+
     let Some(window) = window_weak.upgrade() else {
         return;
     };
@@ -607,7 +692,13 @@ fn finish_async_dictionary_mutation(
 
     match (combined, ctx.dictionary_manager.as_deref()) {
         (Ok(_), Some(mgr)) => {
-            refresh_dictionary_settings(&window, Some(mgr), &ctx.config);
+            refresh_dictionary_settings_if_changed(
+                &window,
+                Some(mgr),
+                &ctx.config,
+                &ctx.dictionary_database_path,
+                &ctx.dict_list_fingerprint,
+            );
             anki::refresh_anki_excluded_dicts(&window, Some(mgr), &ctx.config);
             if let Some(error) = order_error {
                 window.set_settings_status(format!("Could not save dictionary order: {error}").into());
@@ -616,7 +707,13 @@ fn finish_async_dictionary_mutation(
             }
         }
         (Err(error), _) => {
-            refresh_dictionary_settings(&window, ctx.dictionary_manager.as_deref(), &ctx.config);
+            refresh_dictionary_settings_if_changed(
+                &window,
+                ctx.dictionary_manager.as_deref(),
+                &ctx.config,
+                &ctx.dictionary_database_path,
+                &ctx.dict_list_fingerprint,
+            );
             anki::refresh_anki_excluded_dicts(
                 &window,
                 ctx.dictionary_manager.as_deref(),
@@ -709,7 +806,14 @@ fn handle_move_dictionary(
         direction,
     ) {
         Ok(()) => {
-            refresh_dictionary_settings(&window, Some(manager), &ctx.config);
+            invalidate_dict_list_fingerprint(&ctx.dict_list_fingerprint);
+            refresh_dictionary_settings_if_changed(
+                &window,
+                Some(manager),
+                &ctx.config,
+                &ctx.dictionary_database_path,
+                &ctx.dict_list_fingerprint,
+            );
             anki::refresh_anki_excluded_dicts(&window, Some(manager), &ctx.config);
             window.set_settings_status("Dictionary order updated".into());
         }
@@ -1009,8 +1113,16 @@ mod tests {
             help_window: RefCell::new(None),
             anki_auto_fetch_attempted: Cell::new(false),
             anki_auto_fetch_in_flight: Arc::new(AtomicBool::new(false)),
+            custom_css_fingerprint: RefCell::new(None),
+            dict_list_fingerprint: RefCell::new(None),
         });
         let coord = DictionaryBatchCoordinator::new(ctx, Arc::new(Mutex::new(None)));
+
+        assert!(!coord.has_pending_work());
+        coord.push_queued_archive_for_test(PathBuf::from("/tmp/Queued.zip"));
+        assert!(coord.has_pending_work());
+        coord.clear_queued_archives_for_test();
+        assert!(!coord.has_pending_work());
 
         assert!(!win.get_drop_hover_active());
         coord.on_hovered_file(&win, Path::new("/tmp/video.mkv"));
@@ -1025,5 +1137,94 @@ mod tests {
         coord.on_dropped_file(&win, PathBuf::from("/tmp/readme.txt"));
         assert!(!win.get_drop_hover_active());
         assert!(win.get_settings_status().as_str().contains("Skipped non-ZIP"));
+    }
+
+    #[test]
+    fn dictionary_refresh_skips_unchanged_and_rebuilds_on_order_or_db_change() {
+        use slint::Model as _;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        let res_path = dir.path().join("res");
+        let manager = DictionaryManager::new(&db_path, &res_path).unwrap();
+        let cfg = ConfigController::new();
+        let win = SettingsWindow::new().unwrap();
+        let cached_sig: RefCell<Option<DictListFingerprint>> = RefCell::new(None);
+
+        // First call queries SQLite and caches the DB + order fingerprint.
+        assert!(refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
+        assert!(cached_sig.borrow().is_some());
+
+        let before_model = win.get_installed_dictionaries();
+        let before_ptr = before_model
+            .as_any()
+            .downcast_ref::<VecModel<InstalledDictionaryRow>>()
+            .unwrap() as *const _;
+
+        // Second call with unchanged DB & order skips SQLite query and keeps VecModel identity.
+        assert!(!refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
+        let after_skip_model = win.get_installed_dictionaries();
+        let after_skip_ptr = after_skip_model
+            .as_any()
+            .downcast_ref::<VecModel<InstalledDictionaryRow>>()
+            .unwrap() as *const _;
+        assert_eq!(
+            before_ptr, after_skip_ptr,
+            "unchanged fingerprint must skip rebuilding installed_dictionaries VecModel"
+        );
+
+        // Changing dictionary/order invalidates match and refreshes immediately.
+        cfg.edit_setting("dictionary/order", "2,1").unwrap();
+        assert!(refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
+        assert!(!refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
+
+        // Mutating the SQLite WAL file changes DbFileFingerprint -> refreshes immediately.
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = PathBuf::from(wal_os);
+        let prev_wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        std::fs::write(&wal_path, vec![0u8; prev_wal_len as usize + 64]).unwrap();
+        assert!(refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
+
+        // Explicit invalidation (as after import/delete/toggle/reorder) forces refresh.
+        invalidate_dict_list_fingerprint(&cached_sig);
+        assert!(refresh_dictionary_settings_if_changed(
+            &win,
+            Some(&manager),
+            &cfg,
+            &db_path,
+            &cached_sig,
+        ));
     }
 }

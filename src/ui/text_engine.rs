@@ -1497,7 +1497,7 @@ fn subtitle_prewarm_worker() -> &'static Arc<SubtitlePrewarmWorker> {
     })
 }
 
-pub(super) fn cancel_subtitle_token_prewarm() {
+pub(crate) fn cancel_subtitle_token_prewarm() {
     let epoch = SUBTITLE_PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
     if let Some(worker) = SUBTITLE_PREWARM_WORKER.get() {
         if let Ok(mut guard) = worker.slot.lock() {
@@ -1506,6 +1506,11 @@ pub(super) fn cancel_subtitle_token_prewarm() {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn subtitle_token_prewarm_epoch_for_test() -> u64 {
+    SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire)
 }
 
 fn subtitle_prewarm_worker_loop(worker: Arc<SubtitlePrewarmWorker>) {

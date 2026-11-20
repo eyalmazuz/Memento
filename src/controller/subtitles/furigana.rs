@@ -113,6 +113,17 @@ impl FuriganaCache {
         self.move_to_front(slot);
     }
 
+    fn clear_and_shrink(&mut self) -> bool {
+        let had_entries = !self.index.is_empty() || !self.nodes.is_empty();
+        self.index.clear();
+        self.index.shrink_to_fit();
+        self.nodes.clear();
+        self.nodes.shrink_to_fit();
+        self.head = None;
+        self.tail = None;
+        had_entries
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.index.len()
@@ -295,6 +306,42 @@ pub fn prewarm_subtitle_furigana_window(lines: &[String], center: usize, radius:
         batch
     };
     submit_prewarm_job(uncached);
+}
+
+/// Cancel any in-flight or queued furigana prewarm job and clear & shrink the
+/// process-wide furigana LRU cache.
+///
+/// Advances `PREWARM_EPOCH` before clearing the cache so the shared
+/// `memento-furigana-prewarm` background thread stops immediately without
+/// re-invoking MeCab. Returns `true` iff cached entries were freed.
+pub fn clear_furigana_cache_and_cancel_prewarm() -> bool {
+    let epoch = PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some(worker) = PREWARM_WORKER.get() {
+        if let Ok(mut guard) = worker.slot.lock() {
+            if PREWARM_EPOCH.load(Ordering::Acquire) == epoch {
+                *guard = None;
+            }
+        }
+    }
+    let Some(cache) = FURIGANA_CACHE.get() else {
+        return false;
+    };
+    cache
+        .lock()
+        .map(|mut guard| guard.clear_and_shrink())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn insert_cached_furigana_for_test(text: &str, parts: Vec<(String, String)>) {
+    if let Ok(mut guard) = furigana_cache().lock() {
+        guard.insert(text.to_owned(), parts);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prewarm_epoch_for_test() -> u64 {
+    PREWARM_EPOCH.load(Ordering::Acquire)
 }
 
 /// Non-blocking cache lookup for subtitle furigana spans.
@@ -599,7 +646,10 @@ mod furigana_tests {
         cached_subtitle_furigana_parts, collect_window_indices, parse_mecab_furigana,
         prewarm_subtitle_furigana, segment_subtitle_text, subtitle_furigana_parts, FuriganaCache,
     };
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    static FURIGANA_GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn mecab_readings_preserve_spacing_and_inflected_surface() {
@@ -800,7 +850,51 @@ mod furigana_tests {
     }
 
     #[test]
+    fn clear_furigana_cache_and_cancel_prewarm_empties_shrinks_and_bumps_epoch() {
+        // Unit test `FuriganaCache::clear_and_shrink` directly first:
+        let mut local = FuriganaCache::with_capacity(8);
+        assert!(!local.clear_and_shrink());
+        local.insert("猫".into(), vec![("猫".into(), "ねこ".into())]);
+        local.insert("犬".into(), vec![("犬".into(), "いぬ".into())]);
+        assert_eq!(local.len(), 2);
+        assert!(local.clear_and_shrink());
+        assert_eq!(local.len(), 0);
+        assert_eq!(local.nodes.capacity(), 0);
+        assert!(local.head.is_none());
+        assert!(local.tail.is_none());
+        assert!(!local.clear_and_shrink());
+        // Cache remains reusable after clear & shrink.
+        local.insert("鳥".into(), vec![("鳥".into(), "とり".into())]);
+        assert_eq!(local.get("鳥"), Some(vec![("鳥".into(), "とり".into())]));
+
+        // Global cache + prewarm epoch cancellation:
+        let _global_guard = FURIGANA_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = "memento_clear_test_line_a1b2c3";
+        super::insert_cached_furigana_for_test(key, vec![(key.into(), "てすと".into())]);
+        assert!(cached_subtitle_furigana_parts(key).is_some());
+
+        let epoch_before = super::prewarm_epoch_for_test();
+        let freed = super::clear_furigana_cache_and_cancel_prewarm();
+        assert!(freed, "clearing populated cache must report entries freed");
+        assert!(
+            super::prewarm_epoch_for_test() > epoch_before,
+            "clearing cache must advance PREWARM_EPOCH to stop in-flight prewarm"
+        );
+        assert_eq!(cached_subtitle_furigana_parts(key), None);
+
+        // Second clear with empty cache advances epoch but reports `false`.
+        let epoch_after = super::prewarm_epoch_for_test();
+        assert!(!super::clear_furigana_cache_and_cancel_prewarm());
+        assert!(super::prewarm_epoch_for_test() > epoch_after);
+    }
+
+    #[test]
     fn live_mecab_accuracy_and_sub_100us_warm_latency() {
+        let _global_guard = FURIGANA_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert_eq!(
             subtitle_furigana_parts("来ない").unwrap(),
             vec![("来".into(), "こ".into()), ("ない".into(), "".into())]

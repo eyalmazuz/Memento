@@ -3,8 +3,9 @@
 pub mod furigana;
 
 pub use furigana::{
-    cached_subtitle_furigana_parts, prewarm_subtitle_furigana, prewarm_subtitle_furigana_window,
-    segment_subtitle_text, subtitle_furigana_parts,
+    cached_subtitle_furigana_parts, clear_furigana_cache_and_cancel_prewarm,
+    prewarm_subtitle_furigana, prewarm_subtitle_furigana_window, segment_subtitle_text,
+    subtitle_furigana_parts,
 };
 
 use std::cmp::Ordering;

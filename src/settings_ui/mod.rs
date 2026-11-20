@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use memento_config::config::Config;
@@ -46,8 +46,6 @@ use crate::{
 };
 
 pub(crate) use asr_models::clear_asr_for_settings;
-pub(crate) use custom_css::refresh_custom_popup_css;
-pub(crate) use dictionaries::refresh_dictionary_settings;
 
 thread_local! {
     /// Cached OS color scheme so repeated refreshes avoid redundant portal/CLI queries
@@ -347,6 +345,110 @@ fn restore_anki_draft(config: &ConfigController, draft: &AnkiDraft) {
 
 pub(crate) struct SettingsSession {
     pub(crate) window: SettingsWindow,
+    ctx: Rc<SettingsContext>,
+    dict_coordinator: dictionaries::DictionaryBatchCoordinator,
+    visible: Rc<Cell<bool>>,
+    on_hidden: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+}
+
+impl SettingsSession {
+    pub(crate) fn set_visible(&self, visible: bool) {
+        self.visible.set(visible);
+    }
+
+    pub(crate) fn is_visible(&self) -> bool {
+        self.visible.get()
+    }
+
+    pub(crate) fn set_on_hidden(&self, cb: impl Fn() + 'static) {
+        *self.on_hidden.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Returns `true` when any async job or auxiliary window owned by this
+    /// session is active and must defer idle teardown.
+    pub(crate) fn has_active_jobs(&self) -> bool {
+        self.window.get_dictionary_busy()
+            || self.dict_coordinator.has_pending_work()
+            || self.window.get_asr_download_active()
+            || self.window.get_testing_anki_connection()
+            || self.ctx.anki_auto_fetch_in_flight.load(Ordering::Acquire)
+            || self
+                .ctx
+                .help_window
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| w.window().is_visible())
+    }
+
+    /// Refresh only the currently active category on reopen, checking custom
+    /// CSS only on Interface and dictionary rows only on Dictionaries while
+    /// skipping disk/SQLite reads whenever cached fingerprints match.
+    pub(crate) fn refresh_on_reopen(&self) {
+        let category = self.window.get_active_category();
+        refresh_category_settings(&self.window, &self.ctx.config, category);
+        if category == SettingsCategory::Interface.as_i32() {
+            custom_css::refresh_custom_popup_css_if_changed(
+                &self.window,
+                &self.ctx.cache_dir,
+                &self.ctx.custom_css_fingerprint,
+            );
+        } else if category == SettingsCategory::Dictionaries.as_i32() {
+            dictionaries::refresh_dictionary_settings_if_changed(
+                &self.window,
+                self.ctx.dictionary_manager.as_deref(),
+                &self.ctx.config,
+                &self.ctx.dictionary_database_path,
+                &self.ctx.dict_list_fingerprint,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+impl SettingsSession {
+    pub(crate) fn push_queued_dict_import_for_test(&self, path: PathBuf) {
+        self.dict_coordinator.push_queued_archive_for_test(path);
+    }
+
+    pub(crate) fn clear_queued_dict_imports_for_test(&self) {
+        self.dict_coordinator.clear_queued_archives_for_test();
+    }
+
+    pub(crate) fn set_anki_auto_fetch_in_flight_for_test(&self, active: bool) {
+        self.ctx
+            .anki_auto_fetch_in_flight
+            .store(active, Ordering::Release);
+    }
+
+    pub(crate) fn close_help_window_for_test(&self) {
+        if let Some(help) = self.ctx.help_window.borrow().as_ref() {
+            help.invoke_close();
+        }
+    }
+
+    pub(crate) fn help_window_weak_for_test(&self) -> Option<slint::Weak<AnkiHelpWindow>> {
+        self.ctx
+            .help_window
+            .borrow()
+            .as_ref()
+            .map(|w| w.as_weak())
+    }
+}
+
+impl Drop for SettingsSession {
+    fn drop(&mut self) {
+        // Break any Rc cycle between `SettingsContext.help_window` and
+        // `AnkiHelpWindow`'s `on_winit_window_event` theme-sync closure, and
+        // release any hidden help window resources cleanly.
+        if let Ok(mut slot) = self.ctx.help_window.try_borrow_mut() {
+            if let Some(help) = slot.take() {
+                let _ = help.hide();
+            }
+        }
+        if let Ok(mut cb) = self.on_hidden.try_borrow_mut() {
+            *cb = None;
+        }
+    }
 }
 
 pub(crate) struct SettingsContext {
@@ -369,6 +471,8 @@ pub(crate) struct SettingsContext {
     pub(crate) help_window: RefCell<Option<AnkiHelpWindow>>,
     pub(crate) anki_auto_fetch_attempted: Cell<bool>,
     pub(crate) anki_auto_fetch_in_flight: Arc<AtomicBool>,
+    pub(crate) custom_css_fingerprint: RefCell<Option<custom_css::CustomCssFingerprint>>,
+    pub(crate) dict_list_fingerprint: RefCell<Option<dictionaries::DictListFingerprint>>,
 }
 
 impl SettingsContext {
@@ -775,7 +879,12 @@ fn revert_unsaved_drafts(window: &SettingsWindow, ctx: &SettingsContext) {
     }
     // Clear cached OS scheme so next open detects fresh system theme changes.
     CACHED_SYSTEM_SCHEME.with(|slot| slot.set(None));
-    refresh_custom_popup_css(window, &ctx.cache_dir);
+    custom_css::invalidate_custom_css_fingerprint(&ctx.custom_css_fingerprint);
+    custom_css::refresh_custom_popup_css_if_changed(
+        window,
+        &ctx.cache_dir,
+        &ctx.custom_css_fingerprint,
+    );
     refresh_settings(window, &ctx.config);
     sync_theme(window, ctx, None);
     sync_subtitle_preview(window, &ctx.config);
@@ -1144,7 +1253,11 @@ fn apply_single_category(
     }
     if category == SettingsCategory::Interface.as_i32() {
         if let Some(win) = window {
-            custom_css::save_custom_css_on_apply(win, &ctx.cache_dir)?;
+            custom_css::save_custom_css_on_apply(
+                win,
+                &ctx.cache_dir,
+                &ctx.custom_css_fingerprint,
+            )?;
         }
     }
     ctx.config
@@ -1176,8 +1289,15 @@ fn apply_single_category(
             apply_dictionary_order(&ctx.config, &mut ctx.dict_ctrl.borrow_mut());
         }
         if category == SettingsCategory::Dictionaries.as_i32() {
+            dictionaries::invalidate_dict_list_fingerprint(&ctx.dict_list_fingerprint);
             if let Some(win) = window {
-                refresh_dictionary_settings(win, ctx.dictionary_manager.as_deref(), &ctx.config);
+                dictionaries::refresh_dictionary_settings_if_changed(
+                    win,
+                    ctx.dictionary_manager.as_deref(),
+                    &ctx.config,
+                    &ctx.dictionary_database_path,
+                    &ctx.dict_list_fingerprint,
+                );
             }
         }
         if category == SettingsCategory::Interface.as_i32()
@@ -1269,36 +1389,63 @@ pub(crate) fn create_settings_session(
         help_window: RefCell::new(None),
         anki_auto_fetch_attempted: Cell::new(false),
         anki_auto_fetch_in_flight: Arc::new(AtomicBool::new(false)),
+        custom_css_fingerprint: RefCell::new(None),
+        dict_list_fingerprint: RefCell::new(None),
     });
 
     settings.set_ocr_built(cfg!(feature = "ocr"));
     settings.set_ocr_available(ctx.ocr_available);
     settings.set_asr_available(controller::asr::AVAILABLE);
     sync_theme(&settings, &ctx, None);
-    refresh_dictionary_settings(&settings, ctx.dictionary_manager.as_deref(), &ctx.config);
+    dictionaries::refresh_dictionary_settings_if_changed(
+        &settings,
+        ctx.dictionary_manager.as_deref(),
+        &ctx.config,
+        &ctx.dictionary_database_path,
+        &ctx.dict_list_fingerprint,
+    );
     refresh_settings(&settings, &ctx.config);
     sync_subtitle_preview(&settings, &ctx.config);
     sync_text_replacements(&settings, &ctx.config);
     anki::refresh_anki_excluded_dicts(&settings, ctx.dictionary_manager.as_deref(), &ctx.config);
-    refresh_custom_popup_css(&settings, &ctx.cache_dir);
+    custom_css::refresh_custom_popup_css_if_changed(
+        &settings,
+        &ctx.cache_dir,
+        &ctx.custom_css_fingerprint,
+    );
     asr_models::refresh_asr_model_status(&settings, &ctx.config, &ctx.cache_dir);
+
+    let visible = Rc::new(Cell::new(false));
+    let on_hidden: Rc<RefCell<Option<Box<dyn Fn()>>>> = Rc::new(RefCell::new(None));
 
     // Close / Hide handling — revert any unsaved draft edits before hiding (C5.2)
     let close_req_window = settings.as_weak();
     let close_req_ctx = ctx.clone();
+    let close_req_visible = visible.clone();
+    let close_req_on_hidden = on_hidden.clone();
     settings.window().on_close_requested(move || {
         if let Some(win) = close_req_window.upgrade() {
             revert_unsaved_drafts(&win, &close_req_ctx);
             let _ = win.hide();
+            close_req_visible.set(false);
+            if let Some(cb) = close_req_on_hidden.borrow().as_ref() {
+                cb();
+            }
         }
         slint::CloseRequestResponse::HideWindow
     });
     let close_btn_window = settings.as_weak();
     let close_btn_ctx = ctx.clone();
+    let close_btn_visible = visible.clone();
+    let close_btn_on_hidden = on_hidden.clone();
     settings.on_close(move || {
         if let Some(win) = close_btn_window.upgrade() {
             revert_unsaved_drafts(&win, &close_btn_ctx);
             let _ = win.hide();
+            close_btn_visible.set(false);
+            if let Some(cb) = close_btn_on_hidden.borrow().as_ref() {
+                cb();
+            }
         }
     });
 
@@ -1319,13 +1466,19 @@ pub(crate) fn create_settings_session(
                 anki::reset_auto_fetch_attempt(&cat_ctx);
             }
             if category == SettingsCategory::Dictionaries.as_i32() {
-                refresh_dictionary_settings(
+                dictionaries::refresh_dictionary_settings_if_changed(
                     &window,
                     cat_ctx.dictionary_manager.as_deref(),
                     &cat_ctx.config,
+                    &cat_ctx.dictionary_database_path,
+                    &cat_ctx.dict_list_fingerprint,
                 );
             } else if category == SettingsCategory::Interface.as_i32() {
-                refresh_custom_popup_css(&window, &cat_ctx.cache_dir);
+                custom_css::refresh_custom_popup_css_if_changed(
+                    &window,
+                    &cat_ctx.cache_dir,
+                    &cat_ctx.custom_css_fingerprint,
+                );
                 sync_subtitle_preview(&window, &cat_ctx.config);
             } else if category == SettingsCategory::Asr.as_i32() {
                 asr_models::refresh_asr_model_status(&window, &cat_ctx.config, &cat_ctx.cache_dir);
@@ -1453,10 +1606,15 @@ pub(crate) fn create_settings_session(
                     anki::maybe_auto_fetch_decks_and_models(&window, &edited_ctx);
                 }
                 if key == "dictionary/order" {
-                    refresh_dictionary_settings(
+                    dictionaries::invalidate_dict_list_fingerprint(
+                        &edited_ctx.dict_list_fingerprint,
+                    );
+                    dictionaries::refresh_dictionary_settings_if_changed(
                         &window,
                         edited_ctx.dictionary_manager.as_deref(),
                         &edited_ctx.config,
+                        &edited_ctx.dictionary_database_path,
+                        &edited_ctx.dict_list_fingerprint,
                     );
                 }
                 if matches!(
@@ -2013,13 +2171,25 @@ pub(crate) fn create_settings_session(
             }
             if let Some(window) = reset_window.upgrade() {
                 if category == SettingsCategory::Dictionaries.as_i32() {
-                    refresh_dictionary_settings(
+                    dictionaries::invalidate_dict_list_fingerprint(
+                        &reset_ctx.dict_list_fingerprint,
+                    );
+                    dictionaries::refresh_dictionary_settings_if_changed(
                         &window,
                         reset_ctx.dictionary_manager.as_deref(),
                         &reset_ctx.config,
+                        &reset_ctx.dictionary_database_path,
+                        &reset_ctx.dict_list_fingerprint,
                     );
                 } else if category == SettingsCategory::Interface.as_i32() {
-                    refresh_custom_popup_css(&window, &reset_ctx.cache_dir);
+                    custom_css::invalidate_custom_css_fingerprint(
+                        &reset_ctx.custom_css_fingerprint,
+                    );
+                    custom_css::refresh_custom_popup_css_if_changed(
+                        &window,
+                        &reset_ctx.cache_dir,
+                        &reset_ctx.custom_css_fingerprint,
+                    );
                     sync_theme(&window, &reset_ctx, None);
                     sync_subtitle_preview(&window, &reset_ctx.config);
                 } else if category == SettingsCategory::Search.as_i32() {
@@ -2160,6 +2330,7 @@ pub(crate) fn create_settings_session(
     // Delegate domain callbacks to focused submodules
     custom_css::wire(&settings, &ctx);
     let dict_drop = dictionaries::wire(&settings, &ctx);
+    let dict_coordinator = dict_drop.clone();
     asr_models::wire(&settings, &ctx);
     anki::wire(&settings, &ctx);
 
@@ -2207,7 +2378,13 @@ pub(crate) fn create_settings_session(
         anki::maybe_auto_fetch_decks_and_models(&settings, &ctx);
     }
 
-    Ok(SettingsSession { window: settings })
+    Ok(SettingsSession {
+        window: settings,
+        ctx,
+        dict_coordinator,
+        visible,
+        on_hidden,
+    })
 }
 
 #[cfg(test)]
@@ -2774,5 +2951,134 @@ mod tests {
 
         let matched = filtered_settings_groups(&cfg, "recursion", false, false);
         assert!(!matched.is_empty());
+    }
+
+    #[test]
+    fn settings_session_tracks_visibility_on_hidden_hook_all_active_jobs_and_clean_drop() {
+        use slint::ComponentHandle as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Rc::new(ConfigController::new());
+        let (_app, session) = make_headless_session(cfg, dir.path());
+
+        let hidden_hits = Rc::new(Cell::new(0u32));
+        let hits_cb = hidden_hits.clone();
+        session.set_on_hidden(move || {
+            hits_cb.set(hits_cb.get() + 1);
+        });
+
+        assert!(!session.is_visible());
+        assert!(!session.has_active_jobs());
+
+        // Visible -> hidden via `on_close()` triggers `on_hidden` and clears `visible`.
+        session.set_visible(true);
+        assert!(session.is_visible());
+        session.window.invoke_close();
+        assert!(!session.is_visible());
+        assert_eq!(hidden_hits.get(), 1);
+
+        // Visible -> hidden via `WindowEvent::CloseRequested` triggers `on_hidden` too.
+        session.set_visible(true);
+        session.window.show().unwrap();
+        session
+            .window
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::CloseRequested);
+        assert!(!session.is_visible());
+        assert_eq!(hidden_hits.get(), 2);
+
+        // 1. Dictionary busy blocks teardown
+        session.window.set_dictionary_busy(true);
+        assert!(session.has_active_jobs());
+        session.window.set_dictionary_busy(false);
+        assert!(!session.has_active_jobs());
+
+        // 2. Queued drag-and-drop dictionary archive blocks teardown
+        session.push_queued_dict_import_for_test(dir.path().join("JMdict.zip"));
+        assert!(session.has_active_jobs());
+        session.clear_queued_dict_imports_for_test();
+        assert!(!session.has_active_jobs());
+
+        // 3. ASR download active blocks teardown
+        session.window.set_asr_download_active(true);
+        assert!(session.has_active_jobs());
+        session.window.set_asr_download_active(false);
+        assert!(!session.has_active_jobs());
+
+        // 4. Anki auto-fetch in flight blocks teardown
+        session.set_anki_auto_fetch_in_flight_for_test(true);
+        assert!(session.has_active_jobs());
+        session.set_anki_auto_fetch_in_flight_for_test(false);
+        assert!(!session.has_active_jobs());
+
+        // 5. Open AnkiHelpWindow blocks teardown until closed
+        session.window.invoke_anki_help_requested();
+        let help_weak = session
+            .help_window_weak_for_test()
+            .expect("AnkiHelpWindow should be created");
+        assert!(
+            session.has_active_jobs(),
+            "visible AnkiHelpWindow must block idle teardown"
+        );
+        session.close_help_window_for_test();
+        assert!(
+            !session.has_active_jobs(),
+            "closing AnkiHelpWindow must unblock idle teardown"
+        );
+
+        // Dropping `SettingsSession` releases both `SettingsWindow` and `AnkiHelpWindow` (no Rc cycle).
+        let win_weak = session.window.as_weak();
+        drop(session);
+        assert!(
+            win_weak.upgrade().is_none(),
+            "SettingsWindow must drop cleanly without reference cycles"
+        );
+        assert!(
+            help_weak.upgrade().is_none(),
+            "AnkiHelpWindow must drop cleanly when SettingsSession drops"
+        );
+    }
+
+    #[test]
+    fn settings_reopen_and_tab_switch_gate_custom_css_and_dict_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let css_path = dir.path().join(crate::ui::CUSTOM_POPUP_CSS_FILENAME);
+        std::fs::write(&css_path, ".a { color: red; }").unwrap();
+
+        let cfg = Rc::new(ConfigController::new());
+        let (_app, session) = make_headless_session(cfg, dir.path());
+        assert_eq!(session.window.get_custom_popup_css().as_str(), ".a { color: red; }");
+
+        // Reopening on Behavior (non-Interface) must not touch custom CSS.
+        session.window.set_active_category(SettingsCategory::Behavior.as_i32());
+        session.window.set_custom_popup_css("sentinel-behavior".into());
+        std::fs::write(&css_path, ".a { color: green; padding: 4px; }").unwrap();
+        session.refresh_on_reopen();
+        assert_eq!(
+            session.window.get_custom_popup_css().as_str(),
+            "sentinel-behavior",
+            "reopen on non-Interface tab must not read popup.css"
+        );
+
+        // Switching to Interface picks up the external CSS change immediately.
+        session
+            .window
+            .set_active_category(SettingsCategory::Interface.as_i32());
+        session
+            .window
+            .invoke_category_changed(SettingsCategory::Interface.as_i32());
+        assert_eq!(
+            session.window.get_custom_popup_css().as_str(),
+            ".a { color: green; padding: 4px; }"
+        );
+
+        // Subsequent reopen on Interface with unchanged CSS skips disk read + Slint write.
+        session.window.set_custom_popup_css("sentinel-cached".into());
+        session.refresh_on_reopen();
+        assert_eq!(
+            session.window.get_custom_popup_css().as_str(),
+            "sentinel-cached",
+            "unchanged popup.css fingerprint must skip reload on reopen"
+        );
     }
 }

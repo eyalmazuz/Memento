@@ -569,11 +569,25 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             app.set_no_dicts_dialog_open(false);
+            let switched_before_open = if let Ok(guard) = open_dict_session.try_borrow() {
+                if let Some(session) = guard.as_ref() {
+                    let was_different = session.window.get_active_category() != 4;
+                    session.window.set_active_category(4);
+                    was_different
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             app.invoke_open_options();
             if let Ok(guard) = open_dict_session.try_borrow() {
                 if let Some(session) = guard.as_ref() {
-                    session.window.set_active_category(4);
-                    session.window.invoke_category_changed(4);
+                    session.set_visible(true);
+                    if switched_before_open || session.window.get_active_category() != 4 {
+                        session.window.set_active_category(4);
+                        session.window.invoke_category_changed(4);
+                    }
                 }
             }
         });

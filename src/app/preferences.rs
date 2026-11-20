@@ -21,8 +21,7 @@ use crate::controller::dictmanager::DictionaryManager;
 use crate::controller::player::{effective_media_title, LivePlayerCoordinator};
 use crate::controller::subtitles::SubtitleController;
 use crate::settings_ui::{
-    create_settings_session, refresh_category_settings, refresh_custom_popup_css,
-    refresh_dictionary_settings, SettingsSession,
+    create_settings_session, refresh_category_settings, SettingsSession,
 };
 use crate::ui::{self, MementoApp, PopupBridge, SubEntry, SubtitleOverlayBridge};
 use memento_config::{ArgbColor, QtFontSpec, Value};
@@ -31,6 +30,8 @@ use memento_player::MpvInstance;
 use memento_setting::keys as raw;
 
 const MAX_RECENT_TITLES: usize = 64;
+pub(crate) const SETTINGS_IDLE_TEARDOWN_DELAY: Duration = Duration::from_secs(75);
+pub(crate) const SETTINGS_IDLE_RETRY_DELAY: Duration = Duration::from_secs(45);
 const DEFAULT_SUB_LIST_FONT_SIZE: f32 = if cfg!(target_os = "macos") {
     20.0
 } else {
@@ -496,6 +497,28 @@ pub(crate) fn apply_dictionary_order(config: &ConfigController, dictionary: &mut
     }
 }
 
+/// Release MeCab and cached furigana state only when BOTH subtitle furigana and
+/// the MeCab dictionary matcher are disabled. Cancels both background prewarm
+/// queues before unloading MeCab so neither can race to reload `libmecab`, and
+/// trims OS heap pages only if memory was actually freed.
+pub(crate) fn maybe_release_mecab_resources(
+    config: &ConfigController,
+    furigana_visible: bool,
+) -> bool {
+    if furigana_visible || mecab_matcher_enabled(config) {
+        return false;
+    }
+    let cleared_cache = crate::controller::subtitles::clear_furigana_cache_and_cancel_prewarm();
+    crate::ui::cancel_subtitle_token_prewarm();
+    let unloaded_mecab = memento_util::mecab::unload_mecab();
+    if cleared_cache || unloaded_mecab {
+        crate::app::trim_os_heap();
+        true
+    } else {
+        false
+    }
+}
+
 pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
     let is_light_theme = resolve_is_light_theme(config);
     app.set_is_light_theme(is_light_theme);
@@ -546,9 +569,7 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
     );
     app.set_furigana_visible(furigana_visible);
     app.set_furigana_enabled(true);
-    if !furigana_visible && !mecab_matcher_enabled(config) {
-        memento_util::mecab::unload_mecab();
-    }
+    let _ = maybe_release_mecab_resources(config, furigana_visible);
     store_cached_furigana_ratio(setting_number(
         config,
         raw::interface::GROUP,
@@ -796,13 +817,70 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
         .set_nested_max_depth(max_recursion_depth);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsTeardownOutcome {
+    AlreadyDropped,
+    AbortedVisible,
+    DeferredActiveJobs,
+    TornDown,
+}
+
+/// Evaluates whether a hidden `SettingsSession` can be torn down after its idle
+/// grace period. Drops `SettingsSession` and trims OS heap pages only when still
+/// hidden and no async dictionary/ASR/Anki job or `AnkiHelpWindow` is active.
+pub(crate) fn evaluate_idle_settings_teardown(
+    settings_session: &Rc<RefCell<Option<SettingsSession>>>,
+) -> SettingsTeardownOutcome {
+    let decision = {
+        let guard = settings_session.borrow();
+        let Some(session) = guard.as_ref() else {
+            return SettingsTeardownOutcome::AlreadyDropped;
+        };
+        if session.is_visible() {
+            SettingsTeardownOutcome::AbortedVisible
+        } else if session.has_active_jobs() {
+            SettingsTeardownOutcome::DeferredActiveJobs
+        } else {
+            SettingsTeardownOutcome::TornDown
+        }
+    };
+    if decision == SettingsTeardownOutcome::TornDown {
+        *settings_session.borrow_mut() = None;
+        crate::app::trim_os_heap();
+    }
+    decision
+}
+
+fn arm_settings_idle_teardown(
+    timer: &Rc<slint::Timer>,
+    settings_session: &Rc<RefCell<Option<SettingsSession>>>,
+    delay: Duration,
+) {
+    let weak_session = Rc::downgrade(settings_session);
+    let weak_timer = Rc::downgrade(timer);
+    timer.start(slint::TimerMode::SingleShot, delay, move || {
+        let Some(session_slot) = weak_session.upgrade() else {
+            return;
+        };
+        if evaluate_idle_settings_teardown(&session_slot)
+            == SettingsTeardownOutcome::DeferredActiveJobs
+        {
+            if let Some(timer) = weak_timer.upgrade() {
+                arm_settings_idle_teardown(&timer, &session_slot, SETTINGS_IDLE_RETRY_DELAY);
+            }
+        }
+    });
+}
+
 /// Holds debounced single-setting persistence timers for rapid `Ctrl+1/2` and `Alt+1/2`
-/// subtitle scale/offset adjustments, ensuring pending edits are flushed cleanly on shutdown.
+/// subtitle scale/offset adjustments and the Settings idle-teardown timer, ensuring
+/// timers stop cleanly and pending edits flush on shutdown.
 pub(crate) struct DebouncedSubtitlePrefSaver {
     config: Rc<ConfigController>,
     config_dir: PathBuf,
     scale_timer: Rc<slint::Timer>,
     offset_timer: Rc<slint::Timer>,
+    settings_idle_timer: Rc<slint::Timer>,
     pending_scale: Rc<Cell<Option<f32>>>,
     pending_offset: Rc<Cell<Option<f32>>>,
 }
@@ -811,6 +889,7 @@ impl DebouncedSubtitlePrefSaver {
     pub(crate) fn flush(&self) {
         self.scale_timer.stop();
         self.offset_timer.stop();
+        self.settings_idle_timer.stop();
         if let Some(scale) = self.pending_scale.take() {
             if let Err(error) = self.config.persist_single_setting(
                 "interface/sub-scale",
@@ -852,8 +931,10 @@ pub(crate) fn install_settings_and_preference_handlers(
     coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
     settings_session: Rc<RefCell<Option<SettingsSession>>>,
 ) -> DebouncedSubtitlePrefSaver {
-    // ── Open Options (lazy creation without duplicate refresh on first open) ─
+    // ── Open Options (lazy creation, 75 s idle teardown, fingerprint-gated reopen) ─
+    let settings_idle_timer = Rc::new(slint::Timer::default());
     let settings_on_open = settings_session.clone();
+    let open_idle_timer = settings_idle_timer.clone();
     let open_config = config_ctrl.clone();
     let open_dict = dict_ctrl;
     let open_manager = dictionary_manager;
@@ -871,6 +952,9 @@ pub(crate) fn install_settings_and_preference_handlers(
         let Some(app) = open_app.upgrade() else {
             return;
         };
+        // Reopening within the 75 s idle grace window cancels pending teardown immediately.
+        open_idle_timer.stop();
+
         let newly_created = settings_on_open.borrow().is_none();
         if newly_created {
             match create_settings_session(
@@ -889,33 +973,47 @@ pub(crate) fn install_settings_and_preference_handlers(
                 open_settings_mpv.clone(),
                 open_settings_coord.clone(),
             ) {
-                Ok(session) => *settings_on_open.borrow_mut() = Some(session),
+                Ok(session) => {
+                    let hide_session = Rc::downgrade(&settings_on_open);
+                    let hide_timer = Rc::downgrade(&open_idle_timer);
+                    session.set_on_hidden(move || {
+                        if let (Some(slot), Some(timer)) =
+                            (hide_session.upgrade(), hide_timer.upgrade())
+                        {
+                            arm_settings_idle_teardown(
+                                &timer,
+                                &slot,
+                                SETTINGS_IDLE_TEARDOWN_DELAY,
+                            );
+                        }
+                    });
+                    *settings_on_open.borrow_mut() = Some(session);
+                }
                 Err(error) => {
                     app.set_status_message(format!("Could not open preferences: {error}").into());
                     return;
                 }
             }
         }
-        let settings = settings_on_open
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .window
-            .clone_strong();
-        settings.set_showing_audio_help(false);
-        settings.set_connection_popup_open(false);
-        // `create_settings_session` already populates settings, custom CSS, and dictionary rows.
-        // Only refresh on subsequent re-opens so first open never duplicates I/O and UI work.
-        if !newly_created {
-            let category = settings.get_active_category();
-            refresh_category_settings(&settings, &open_config, category);
-            refresh_custom_popup_css(&settings, &open_cache);
-            if category == 4 {
-                refresh_dictionary_settings(&settings, open_manager.as_deref(), &open_config);
+        let settings = {
+            let guard = settings_on_open.borrow();
+            let session = guard.as_ref().unwrap();
+            session.set_visible(true);
+            session.window.set_showing_audio_help(false);
+            session.window.set_connection_popup_open(false);
+            // `create_settings_session` already populates settings, custom CSS, and dictionary rows.
+            // On reopen, refresh only the active category with fingerprint-gated CSS/SQLite checks.
+            if !newly_created {
+                session.refresh_on_reopen();
             }
-        }
+            session.window.clone_strong()
+        };
         if let Err(error) = settings.show() {
+            if let Some(session) = settings_on_open.borrow().as_ref() {
+                session.set_visible(false);
+            }
             app.set_status_message(format!("Could not open preferences: {error}").into());
+            return;
         }
         settings.window().request_redraw();
         app.window().request_redraw();
@@ -1204,6 +1302,7 @@ pub(crate) fn install_settings_and_preference_handlers(
         config_dir,
         scale_timer,
         offset_timer,
+        settings_idle_timer,
         pending_scale,
         pending_offset,
     }
@@ -1624,5 +1723,265 @@ mod tests {
         // Unchanged config does not re-invalidate.
         sync_audio_preferences(&cfg);
         assert_eq!(audio_config_generation(), gen1);
+    }
+
+    #[test]
+    fn settings_idle_teardown_reopen_cancels_active_jobs_block_and_idle_drops_cleanly() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::tempdir().unwrap();
+        let app = MementoApp::new().unwrap();
+        let cfg = Rc::new(ConfigController::new());
+        let dict_ctrl = Rc::new(RefCell::new(DictController::new()));
+        let asr_session = Rc::new(RefCell::new(AsrController::new()));
+        let sub_ctrl = Rc::new(RefCell::new(SubtitleController::new()));
+        let sub_model = Rc::new(VecModel::<SubEntry>::default());
+        let asr_restart = Rc::new(Cell::new(false));
+        let mpv = Rc::new(RefCell::new(None));
+        let coord = Rc::new(RefCell::new(None));
+        let settings_session: Rc<RefCell<Option<SettingsSession>>> = Rc::new(RefCell::new(None));
+
+        let pref_saver = install_settings_and_preference_handlers(
+            &app,
+            cfg,
+            dict_ctrl,
+            None,
+            dir.path().join("dictionaries.sqlite"),
+            dir.path().to_path_buf(),
+            dir.path().join("anki_connect.json"),
+            false,
+            asr_session,
+            sub_ctrl,
+            sub_model,
+            asr_restart,
+            mpv,
+            coord,
+            settings_session.clone(),
+        );
+
+        assert_eq!(SETTINGS_IDLE_TEARDOWN_DELAY, Duration::from_secs(75));
+        assert_eq!(SETTINGS_IDLE_RETRY_DELAY, Duration::from_secs(45));
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::AlreadyDropped
+        );
+
+        // Open Settings -> lazily constructs session, marks visible, timer stopped.
+        app.invoke_open_options();
+        assert!(settings_session.borrow().is_some());
+        assert!(settings_session.borrow().as_ref().unwrap().is_visible());
+        assert!(!pref_saver.settings_idle_timer.running());
+        let first_win_weak = settings_session.borrow().as_ref().unwrap().window.as_weak();
+
+        // Hide Settings -> marks hidden and arms the 75 s single-shot timer.
+        settings_session.borrow().as_ref().unwrap().window.invoke_close();
+        assert!(!settings_session.borrow().as_ref().unwrap().is_visible());
+        assert!(
+            pref_saver.settings_idle_timer.running(),
+            "closing SettingsWindow must arm the 75 s idle teardown timer"
+        );
+
+        // (a) Reopening within the grace window cancels the timer and reuses the same window.
+        app.invoke_open_options();
+        assert!(
+            !pref_saver.settings_idle_timer.running(),
+            "reopening SettingsWindow must cancel pending idle teardown timer"
+        );
+        assert!(settings_session.borrow().as_ref().unwrap().is_visible());
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::AbortedVisible
+        );
+        assert!(first_win_weak.upgrade().is_some());
+
+        // Hide again so teardown checks run against hidden state.
+        settings_session.borrow().as_ref().unwrap().window.invoke_close();
+        assert!(!settings_session.borrow().as_ref().unwrap().is_visible());
+        assert!(pref_saver.settings_idle_timer.running());
+
+        // (b) Active dict / queued drop / ASR / Anki / Help window each block teardown.
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .window
+            .set_dictionary_busy(true);
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::DeferredActiveJobs
+        );
+        assert!(settings_session.borrow().is_some());
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .window
+            .set_dictionary_busy(false);
+
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .push_queued_dict_import_for_test(dir.path().join("queued.zip"));
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::DeferredActiveJobs
+        );
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .clear_queued_dict_imports_for_test();
+
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .window
+            .set_asr_download_active(true);
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::DeferredActiveJobs
+        );
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .window
+            .set_asr_download_active(false);
+
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .set_anki_auto_fetch_in_flight_for_test(true);
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::DeferredActiveJobs
+        );
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .set_anki_auto_fetch_in_flight_for_test(false);
+
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .window
+            .invoke_anki_help_requested();
+        let help_weak = settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .help_window_weak_for_test()
+            .expect("help window created");
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::DeferredActiveJobs
+        );
+        settings_session
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .close_help_window_for_test();
+
+        // (c) Hidden idle session with no active jobs tears down cleanly and drops native handles.
+        assert_eq!(
+            evaluate_idle_settings_teardown(&settings_session),
+            SettingsTeardownOutcome::TornDown
+        );
+        assert!(settings_session.borrow().is_none());
+        assert!(
+            first_win_weak.upgrade().is_none(),
+            "SettingsWindow must be dropped on idle teardown"
+        );
+        assert!(
+            help_weak.upgrade().is_none(),
+            "AnkiHelpWindow must be dropped on idle teardown"
+        );
+
+        // Reopening after teardown cleanly re-creates a fresh session.
+        app.invoke_open_options();
+        assert!(settings_session.borrow().is_some());
+        assert!(settings_session.borrow().as_ref().unwrap().is_visible());
+
+        settings_session.borrow().as_ref().unwrap().window.invoke_close();
+        assert!(pref_saver.settings_idle_timer.running());
+        pref_saver.flush();
+        assert!(!pref_saver.settings_idle_timer.running());
+    }
+
+    #[test]
+    fn mecab_unload_and_prewarm_cancel_only_when_both_furigana_and_matcher_disabled() {
+        use crate::controller::subtitles::furigana::{
+            cached_subtitle_furigana_parts, insert_cached_furigana_for_test, prewarm_epoch_for_test,
+        };
+
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+        let sample_key = "memento_pref_mecab_guard_line_7e6d5c";
+
+        // 1. Furigana enabled + matcher enabled -> keep cache & prewarm untouched.
+        cfg.edit_setting("search/subtitle-furigana", "true")
+            .unwrap();
+        cfg.edit_setting("search/ipadic-matcher", "true").unwrap();
+        insert_cached_furigana_for_test(sample_key, vec![("漢字".into(), "かんじ".into())]);
+        let furigana_epoch_0 = prewarm_epoch_for_test();
+        let token_epoch_0 = crate::ui::subtitle_token_prewarm_epoch_for_test();
+        refresh_player_preferences(&app, &cfg);
+        assert!(cached_subtitle_furigana_parts(sample_key).is_some());
+        assert_eq!(prewarm_epoch_for_test(), furigana_epoch_0);
+        assert_eq!(
+            crate::ui::subtitle_token_prewarm_epoch_for_test(),
+            token_epoch_0
+        );
+
+        // 2. Furigana enabled + matcher disabled -> still keep cache & MeCab.
+        cfg.edit_setting("search/ipadic-matcher", "false").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(cached_subtitle_furigana_parts(sample_key).is_some());
+        assert_eq!(prewarm_epoch_for_test(), furigana_epoch_0);
+        assert_eq!(
+            crate::ui::subtitle_token_prewarm_epoch_for_test(),
+            token_epoch_0
+        );
+
+        // 3. Furigana disabled + matcher enabled -> still keep MeCab & cache.
+        cfg.edit_setting("search/subtitle-furigana", "false")
+            .unwrap();
+        cfg.edit_setting("search/ipadic-matcher", "true").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(cached_subtitle_furigana_parts(sample_key).is_some());
+        assert_eq!(prewarm_epoch_for_test(), furigana_epoch_0);
+        assert_eq!(
+            crate::ui::subtitle_token_prewarm_epoch_for_test(),
+            token_epoch_0
+        );
+
+        // 4. Both disabled -> cancel BOTH prewarm queues, clear furigana cache, unload MeCab.
+        cfg.edit_setting("search/ipadic-matcher", "false").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(
+            prewarm_epoch_for_test() > furigana_epoch_0,
+            "disabling both features must cancel furigana prewarm"
+        );
+        assert!(
+            crate::ui::subtitle_token_prewarm_epoch_for_test() > token_epoch_0,
+            "disabling both features must cancel subtitle token prewarm"
+        );
+        assert_eq!(
+            cached_subtitle_furigana_parts(sample_key),
+            None,
+            "disabling both features must clear the furigana LRU cache"
+        );
+        assert!(
+            !memento_util::mecab::is_mecab_loaded(),
+            "MeCab must be unloaded when both furigana and matcher are disabled"
+        );
+
+        // 5. Repeated call when already unloaded & cache empty reports no memory freed (skips trim).
+        assert!(!maybe_release_mecab_resources(&cfg, false));
     }
 }

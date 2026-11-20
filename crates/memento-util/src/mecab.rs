@@ -918,6 +918,14 @@ enum MecabInit<B = MecabBackend> {
 }
 
 impl<B> MecabInit<B> {
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    fn take_reset(&mut self) -> Self {
+        std::mem::replace(self, Self::Uninitialized)
+    }
+
     fn get_or_init_with<F>(&mut self, init: F) -> Result<&mut B, String>
     where
         F: FnOnce() -> Result<B, String>,
@@ -939,15 +947,30 @@ impl<B> MecabInit<B> {
 static MECAB_INIT_LOCK: Mutex<()> = Mutex::new(());
 static GLOBAL_MECAB: Mutex<MecabInit> = Mutex::new(MecabInit::Uninitialized);
 
-/// Drop the process-wide cached MeCab backend (unloading `libmecab` or
-/// terminating and reaping the piped `mecab` daemon) and reset the cache so a
-/// subsequent parse re-initializes cleanly.
-pub fn unload_mecab() {
-    let mut guard = match GLOBAL_MECAB.lock() {
+/// Returns `true` if the process-wide MeCab backend is currently loaded in
+/// memory without triggering lazy initialization.
+pub fn is_mecab_loaded() -> bool {
+    let guard = match GLOBAL_MECAB.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *guard = MecabInit::Uninitialized;
+    guard.is_ready()
+}
+
+/// Drop the process-wide cached MeCab backend (unloading `libmecab` or
+/// terminating and reaping the piped `mecab` daemon) and reset the cache so a
+/// subsequent parse re-initializes cleanly.
+///
+/// Returns `true` iff a loaded `MecabInit::Ready` backend was actually dropped.
+pub fn unload_mecab() -> bool {
+    let prev = {
+        let mut guard = match GLOBAL_MECAB.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take_reset()
+    };
+    matches!(prev, MecabInit::Ready(_))
 }
 
 fn split_eos_blocks(raw: &str) -> Vec<String> {
@@ -1236,6 +1259,8 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    static GLOBAL_MECAB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn in_process_libmecab_parses_and_drops_cleanly_under_100us() {
         let mut tagger = LibMecabTagger::new().expect("libmecab.so.2 should load on this system");
@@ -1319,6 +1344,9 @@ mod tests {
 
     #[test]
     fn live_unidic_tokenize_for_lookup_nbest_and_sub_millisecond_latency() {
+        let _global_guard = GLOBAL_MECAB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let shite = mecab_tokenize_for_lookup("していました").expect("live mecab should succeed");
         assert!(shite.len() >= 4);
         assert_eq!(shite[0].surface_clean, "し");
@@ -1407,6 +1435,43 @@ mod tests {
             .unwrap();
         assert_eq!(*val, 99);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn is_mecab_loaded_and_unload_mecab_report_ready_drop_accurately() {
+        // State-machine transitions (independent of host MeCab installation):
+        let mut state: MecabInit<u32> = MecabInit::Uninitialized;
+        assert!(!state.is_ready());
+        assert!(!matches!(state.take_reset(), MecabInit::Ready(_)));
+
+        let _ = state.get_or_init_with(|| Err("missing".to_string()));
+        assert!(!state.is_ready());
+        // Resetting Unavailable clears the error cache and reports `false` (no Ready backend dropped).
+        assert!(!matches!(state.take_reset(), MecabInit::Ready(_)));
+        assert!(!state.is_ready());
+
+        assert_eq!(*state.get_or_init_with(|| Ok(7)).unwrap(), 7);
+        assert!(state.is_ready());
+        assert!(matches!(state.take_reset(), MecabInit::Ready(_)));
+        assert!(!state.is_ready());
+        assert!(!matches!(state.take_reset(), MecabInit::Ready(_)));
+
+        // Global lazy state (serialized against live global-tagger benchmark tests):
+        let _global_guard = GLOBAL_MECAB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _ = unload_mecab();
+        assert!(!is_mecab_loaded());
+        assert!(!unload_mecab());
+        assert!(!is_mecab_loaded());
+
+        // When host MeCab is available, verify lazy Ready -> unload -> Uninitialized cycle:
+        if parse_mecab("猫").is_ok() {
+            assert!(is_mecab_loaded());
+            assert!(unload_mecab());
+            assert!(!is_mecab_loaded());
+            assert!(!unload_mecab());
+        }
     }
 
     #[test]
