@@ -12,27 +12,28 @@ Watch anime, dramas, or YouTube videos with instant hover dictionary lookups, pi
 
 ## Features
 
-### Video & Subtitles
-* **Full `libmpv` playback** — supports your own `mpv.conf`, `input.conf`, shaders, scripts, playlists, hardware decoding, drag-and-drop, and streaming URLs via `yt-dlp`.
-* **Crisp vector-stroked subtitles** — smooth per-glyph hover scanning (hover, modifier key, or middle-mouse), top-edge secondary subtitles, and auto-hiding controls/cursor in fullscreen.
-* **Automatic furigana** — fast in-process MeCab tokenization supporting both **IPADic** and **UniDic** dictionaries.
-* **Interactive subtitle drawer** — Primary and Secondary tabs, instant search with match navigation, resizable split view, and multi-row selection for context/cloze mining.
-* **Timeline navigation** — hover thumbnail previews and chapter markers.
+### Video, Themes & Subtitles
+* **Cross-platform `libmpv` playback** — runs on Linux (X11/Wayland/Flatpak), Windows, and macOS with native file/folder dialogs, OS drag-and-drop, Finder/Dock file opening, and full support for your own `mpv.conf`, `input.conf`, shaders, scripts, playlists, hardware decoding, and streaming URLs via `yt-dlp`.
+* **Light, Dark & System themes** — reactive light and dark palettes with automatic OS color-scheme detection (including GNOME/Flatpak via XDG Desktop Portal, Windows Registry, and macOS appearance).
+* **Crisp vector-stroked & native ASS subtitles** — smooth per-glyph hover scanning (hover, modifier key, or middle-mouse), double-click subtitle copy, styled top-edge secondary subtitles, native `libass` rendering, and windowed/fullscreen cursor & OSC auto-hide.
+* **Automatic furigana** — fast, lazy in-process MeCab tokenization supporting both **IPADic** and **UniDic** dictionaries (automatically unloaded when both furigana and MeCab lookup are disabled).
+* **Interactive subtitle drawer** — Primary and Secondary tabs with in-list hover/middle-click dictionary scanning, instant Unicode-aware search with match navigation, `sub-delay`-aware timestamps & seeks, smooth in-place row updates, resizable split view, and multi-row selection for context/cloze mining.
+* **Timeline navigation** — fast, aspect-preserving cached hover thumbnail previews and chapter markers.
 
 ### Yomitan-Style Dictionary Lookup
-* **Rich formatted definitions** — renders Yomitan `structured-content` (tables, ruby text, collapsible `<details>`, local images, monochrome SVGs) with scoped dictionary `styles.css`.
-* **Accurate Japanese lookup** — grammar-aware deconjugation, NFKC/kana normalization, conjugation hover tooltips, and optional MeCab compound/lemma matching.
-* **Deep exploration** — clickable `?query=` cross-links with Back/Forward history, per-kanji lookup view, `かな` reading toggle, glossary text selection (`Ctrl+C`), and a dedicated Dictionary Search panel.
-* **Pitch accent & frequencies** — pitch accent graphs (with nasal and devoice markers), frequency pills (JPDB, BCCWJ, etc.), and category-colored tags.
+* **Rich formatted definitions** — renders Yomitan `structured-content` (tables, ruby text, collapsible `<details>`, local images, theme-tinted monochrome SVGs & rasters) with scoped dictionary `styles.css` (including `:root` custom CSS variables and Light/Dark theme rules), optional **compact glossaries**, **compact tags** deduplication, and click-to-show tag tooltips.
+* **Accurate Japanese lookup** — comprehensive Yomitan-aligned Japanese deconjugation (Godan `-たら`/`-だら`, Kansai-ben, honorifics, slang, historical kana, Zuru verbs, irregulars), Japanese text preprocessors (emphatic sequence collapsing, kyūjitai → shinjitai standardization, WanaKana romaji → hiragana, radical/width normalization, CJK Extensions H & J), custom regex text replacement rules, optional MeCab compound/lemma matching, and an instant re-hover lookup cache.
+* **Deep exploration** — rich interactive Dictionary Search panel with **prefix/wildcard search (`*` / `?`)**, clickable `?query=` cross-links with Back/Forward history, kanji entry footer on multi-character lookups, multi-definition cross-entry glossary selection (`Ctrl+C`), `かな` reading-as-expression toggle, and keyboard navigation (`Ctrl+Up`/`Ctrl+Down`/`Ctrl+D`).
+* **Pitch accent & frequencies** — numeric downsteps and **string-based exact pitch patterns** (`"LHH"`, `"HLL"`, etc.), pitch graphs (with nasal and devoice markers), separated `rank-based` vs `occurrence-based` frequency modes, compact frequency badges (JPDB, BCCWJ, etc.), and category-colored tags.
 
 ### Anki Integration
-* **One-click card presets** — built-in templates for **Lapis**, **Kiku**, **Senren**, **Animecards**, and **JPMN**, or fully custom field mappings via [AnkiConnect](https://ankiweb.net/shared/info/2055492159).
-* **Live card status** — non-blocking duplicate detection, **Browse in Anki** buttons, and existing note tag pills right inside the popup.
-* **Rich media & markers** — stereo `.aac` audio clips, screenshots/video, multi-source word audio, multi-subtitle cloze, `{selection | clipboard | glossary}`, pitch graphs, frequencies, part-of-speech, and Yomitan HTML glossaries.
+* **One-click card presets & smooth setup** — built-in templates for **Lapis**, **Kiku**, **Senren**, **Animecards**, and **JPMN**, or custom field mappings via [AnkiConnect](https://ankiweb.net/shared/info/2055492159) (with API key support including batched `multi` actions, automatic deck/model discovery, marker/argument autocomplete, and an excluded-dictionary checklist).
+* **Live card status & audio controls** — non-blocking duplicate detection (supporting `readingAsExpression`), **Browse in Anki** buttons, existing note tag pills, per-source audio availability indicators, and a right-click audio-source picker on the Add button.
+* **Rich media, streaming & manual context** — `sub-delay`-aware and streaming-script-aware stereo `.aac` audio clips, **manual A/B audio context marking** (`Ctrl+B` / `Cmd+B`) for manual search & OCR lookups in subtitle-less video, lossy WebP/JPEG/PNG screenshots & video clips, multi-definition `{selection | clipboard | glossary}`, multi-subtitle cloze, non-fatal media fallback warnings, pitch graphs, frequencies, part-of-speech, and Yomitan HTML glossaries.
 
 ### Optional Speech Recognition (ASR) & OCR
-* **Real-time ASR subtitles** — transcribe video audio on the fly using **Whisper** (CPU OpenMP/AVX2, Vulkan, or CUDA) or **ONNX Runtime** models. Generated cues feed natively into an in-memory `libmpv` subtitle track, so pause, seek, auto-pause, `sub-seek`, `sub-delay`, and audio track switching keep working seamlessly.
-* **Manga OCR** — press `Ctrl+L` (customizable) to drag a box over hardcoded subtitles or on-screen Japanese text for instant recognition and lookup.
+* **Real-time ASR subtitles** — transcribe video audio on the fly using **Whisper** (CPU OpenMP/AVX2, Vulkan, or CUDA) or **ONNX Runtime** models (with low-peak-RAM arena allocation and 45 s idle model unloading). Generated cues feed natively into an in-memory `libmpv` subtitle track, so pause, seek, auto-pause, `sub-seek`, `sub-delay`, and audio track switching keep working seamlessly.
+* **Manga OCR** — press `Ctrl+L` (customizable) to drag a box over hardcoded subtitles or on-screen Japanese text for instant recognition and lookup (right-click cancels; model automatically unloads after 5 minutes idle to reclaim RAM).
 
 ---
 
@@ -73,6 +74,26 @@ sudo apt install build-essential libclang-dev pkg-config libmpv-dev libass-dev l
 
 </details>
 
+<details>
+<summary><strong>macOS system dependencies</strong></summary>
+
+Install via [Homebrew](https://brew.sh/):
+```bash
+brew install pkgconf mpv libass sqlite mecab mecab-ipadic yt-dlp
+```
+*(Homebrew paths `/opt/homebrew/bin` and `/usr/local/bin` are added automatically when launched from a `.app` bundle.)*
+
+</details>
+
+<details>
+<summary><strong>Windows system dependencies</strong></summary>
+
+* Rust stable MSVC toolchain (`x86_64-pc-windows-msvc`) and LLVM/Clang (for `bindgen`).
+* `libmpv` (`mpv-2.dll` / import library), `libass`, and `sqlite3` development libraries on your build/runtime path.
+* Optional runtime extras: `libmecab.dll` + IPADic/UniDic (placed next to `memento.exe`, via `MECAB_DICDIR`, or standard MeCab install — paths with spaces are handled automatically via 8.3 short paths), `yt-dlp.exe`, and `libmocr.dll` (when built with `--features ocr`).
+
+</details>
+
 ### Optional Build Features
 
 ASR and OCR are opt-in via Cargo feature flags (unbuilt features are automatically hidden in Settings):
@@ -91,6 +112,12 @@ ASR and OCR are opt-in via Cargo feature flags (unbuilt features are automatical
 cargo build --release --features ocr,asr,asr-onnx,whisper-vulkan
 ```
 
+For smaller distribution binaries with fat LTO (slower link time than standard `--release`), use the `release-dist` profile:
+
+```bash
+cargo build --profile release-dist
+```
+
 > Whisper builds require `cmake` and a system toolchain (included in `base-devel` / `build-essential`). GPU backend support is chosen at build time; you can toggle **Use GPU** on or off anytime in Settings.
 >
 > For advanced build overrides, tests, and playback profiling, see [docs/development.md](docs/development.md).
@@ -99,7 +126,7 @@ cargo build --release --features ocr,asr,asr-onnx,whisper-vulkan
 
 ## Recommended Dictionaries
 
-Import `.zip` dictionaries directly in **Settings → Dictionaries** (drag-and-drop or file picker).
+Import one or multiple `.zip` dictionaries at once in **Settings → Dictionaries** (batch drag-and-drop or multi-file picker).
 
 ### Japanese Definitions & Names
 * **[Jitendex](https://jitendex.org/)** *(Recommended English)* — [jitendex-yomitan.zip](https://github.com/stephenmk/stephenmk.github.io/releases/latest/download/jitendex-yomitan.zip)
@@ -136,35 +163,36 @@ Import `.zip` dictionaries directly in **Settings → Dictionaries** (drag-and-d
 ## Feature Setup Notes
 
 ### Speech-to-Text (ASR)
-* **Whisper**: Download models directly from **Settings → ASR**, or drop GGML models (such as `ggml-large-v3-turbo.bin` and optional Silero VAD `ggml-silero-v6.2.0.bin`) into `~/.config/memento/models/`.
-* **ONNX Runtime**: Supports local or downloaded ONNX speech models (e.g., `kitsune-transcribe-t0.6b-ja`) inside `~/.config/memento/models/`.
+* **Whisper**: Download models directly from **Settings → ASR**, or drop GGML models (such as `ggml-large-v3-turbo.bin` and optional Silero VAD `ggml-silero-v6.2.0.bin`) into the `models/` subdirectory of your Memento config directory.
+* **ONNX Runtime**: Supports local or downloaded ONNX speech models (e.g., `kitsune-transcribe-t0.6b-ja`) inside the same `models/` directory.
 
 ### Manga OCR
 * Compile with `--features ocr`.
-* At runtime, install [libmocr](https://github.com/ripose-jp/libmocr) and the Python [`manga-ocr`](https://github.com/kha-white/manga-ocr) package in your Python environment.
-* Press **`Ctrl+L`** (default) to select a screen region on the video for instant OCR + dictionary lookup.
+* At runtime, install [libmocr](https://github.com/ripose-jp/libmocr) and the Python [`manga-ocr`](https://github.com/kha-white/manga-ocr) package in your Python environment (on Windows, place `libmocr.dll` next to `memento.exe`, in `%LOCALAPPDATA%\memento`, or on `PATH`).
+* Press **`Ctrl+L`** (default; **`Cmd+L`** on macOS) to drag a screen region on the video for instant OCR + dictionary lookup (right-click cancels).
 
 ### MeCab (Furigana & Compound Matching)
 * Built in automatically — no Cargo feature flag required, and Memento does not bundle a MeCab dictionary in the repo.
-* Both **IPADic** (smallest/easiest via distro packages) and **UniDic** *(recommended for noticeably more accurate modern readings and compound lookup)* are detected and supported automatically.
+* Both **IPADic** (smallest/easiest via system packages) and **UniDic** *(recommended for noticeably more accurate modern readings and compound lookup)* are detected and supported automatically.
 * **Install MeCab + a dictionary:**
   * **Debian / Ubuntu (IPADic):** `sudo apt install mecab libmecab2 mecab-ipadic-utf8`
   * **Arch Linux:** install `mecab` + `mecab-ipadic` (or `unidic`) from the AUR
-  * **UniDic via Python (any distro):** `pip install unidic && python -m unidic download`
-* **Selecting your dictionary:** Memento loads `libmecab` in-process (falling back to the `mecab` CLI) using whatever `dicdir` is configured in `/etc/mecabrc` (or the `$MECABRC` environment variable). If you install UniDic via Python or have multiple dictionaries installed, set `dicdir = /path/to/unidic/dicdir` in `/etc/mecabrc` (run `python -c "import unidic; print(unidic.DICDIR)"` to find the path).
-* **Enabling furigana:** Turn on **Show furigana over subtitles** in **Settings → Search** (or toggle it from the Subtitle menu / shortcut). Without MeCab installed, subtitles still work normally without furigana.
+  * **macOS (Homebrew):** `brew install mecab mecab-ipadic`
+  * **UniDic via Python (any platform):** `pip install unidic && python -m unidic download`
+* **Selecting your dictionary:** Memento loads `libmecab` in-process (falling back to the `mecab` CLI) and automatically checks `MECAB_DICDIR`, bundled executable-adjacent `ipadic`/`unidic`/`dic` folders, `/etc/mecabrc` (`$MECABRC`), and standard Homebrew/Linux/Windows dictionary paths. If you install UniDic via Python or have multiple dictionaries installed, set `MECAB_DICDIR` or `dicdir = /path/to/unidic/dicdir` in `/etc/mecabrc` (run `python -c "import unidic; print(unidic.DICDIR)"` to find the path).
+* **Enabling furigana:** Turn on **Show furigana over subtitles** in **Settings → Search** (or toggle it from the Subtitle menu / shortcut). MeCab loads lazily on first use and unloads automatically when both furigana and MeCab lookup are disabled.
 
 ---
 
 ## Configuration & Directories
 
-Memento keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its own config folder, separate from your global `mpv` setup.
+Memento keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its own config folder, separate from your global `mpv` setup. On Linux, volatile state (`recent/files`, `dictionary/order`, window panel state) is split into the cache config file so your main `memento.conf` stays clean for dotfile version control.
 
-| Purpose | Environment variable | Default path |
-| --- | --- | --- |
-| Settings, `mpv.conf`, Anki profiles, ASR models | `XDG_CONFIG_HOME` | `~/.config/memento` |
-| Dictionary database & extracted dictionary assets | `XDG_DATA_HOME` | `~/.local/share/memento` |
-| Cache | `XDG_CACHE_HOME` | `~/.cache/memento` |
+| Platform | Config (`memento.conf`, `mpv.conf`, Anki, ASR models) | Data (dictionary DB & assets) | Cache (volatile state / temp) |
+| --- | --- | --- | --- |
+| **Linux** | `$XDG_CONFIG_HOME/memento` (`~/.config/memento`) | `$XDG_DATA_HOME/memento` (`~/.local/share/memento`) | `$XDG_CACHE_HOME/memento` (`~/.cache/memento`) |
+| **macOS** | `~/Library/Application Support/memento` *(falls back to `~/.config/memento` if present)* | `~/Library/Application Support/memento` | `~/Library/Caches/memento` |
+| **Windows** | `%LOCALAPPDATA%\memento` *(falls back to `%APPDATA%\memento` if present)* | `%LOCALAPPDATA%\memento` | `%LOCALAPPDATA%\memento\cache` |
 
 ---
 
