@@ -606,4 +606,215 @@ mod tests {
         assert!(parsed_float.matched);
         assert_eq!(parsed_float.display, "42.5");
     }
+
+    #[test]
+    fn frequency_mode_persists_and_migrates_legacy_v4_databases() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+
+        // 1. Create a legacy v4 database WITHOUT `directory.frequency_mode`.
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            raw.execute_batch(
+                "
+                CREATE TABLE directory (
+                    dic_id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE,
+                    format INTEGER NOT NULL, revision TEXT NOT NULL, sequenced INTEGER NOT NULL
+                );
+                CREATE TABLE dict_disabled (dic_id INTEGER PRIMARY KEY);
+                CREATE TABLE tag_bank (
+                    dic_id INTEGER NOT NULL, name TEXT NOT NULL, category TEXT NOT NULL,
+                    ord INTEGER NOT NULL, notes TEXT NOT NULL, score INTEGER NOT NULL,
+                    PRIMARY KEY(dic_id, name)
+                );
+                CREATE TABLE term_bank (
+                    dic_id INTEGER NOT NULL, expression TEXT NOT NULL, reading TEXT NOT NULL,
+                    def_tags TEXT NOT NULL, rules TEXT NOT NULL, score INTEGER NOT NULL,
+                    glossary TEXT NOT NULL, sequence INTEGER NOT NULL, term_tags TEXT NOT NULL
+                );
+                CREATE TABLE term_meta_bank (
+                    dic_id INTEGER NOT NULL, expression TEXT NOT NULL, mode TEXT NOT NULL,
+                    type INTEGER NOT NULL, data BLOB
+                );
+                CREATE TABLE kanji_bank (
+                    dic_id INTEGER NOT NULL, char TEXT NOT NULL, onyomi TEXT NOT NULL,
+                    kunyomi TEXT NOT NULL, tags TEXT NOT NULL, meanings TEXT NOT NULL, stats TEXT NOT NULL
+                );
+                CREATE TABLE kanji_meta_bank (
+                    dic_id INTEGER NOT NULL, expression TEXT NOT NULL, mode TEXT NOT NULL,
+                    type INTEGER NOT NULL, data BLOB
+                );
+                INSERT INTO directory VALUES (1, 'LegacyRankDict', 3, '1', 0);
+                PRAGMA user_version = 4;
+                ",
+            )
+            .unwrap();
+        }
+
+        // Read-only init on unmigrated v4 DB defaults cleanly to RankBased:
+        {
+            let ro = sqlite_db::open_read_only_connection(&db_path).unwrap();
+            let cache = sqlite_db::init_cache_conn(&ro).unwrap();
+            assert_eq!(cache.dictionaries.len(), 1);
+            assert_eq!(
+                cache.dictionaries[0].frequency_mode,
+                sqlite_db::FrequencyMode::RankBased
+            );
+        }
+
+        // Opening an existing v4 DB read-write automatically runs ALTER TABLE for `frequency_mode`:
+        {
+            let rw = sqlite_db::open_read_write_connection(&db_path).unwrap();
+            let mode: String = rw
+                .query_row(
+                    "SELECT frequency_mode FROM directory WHERE dic_id = 1;",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(mode, "rank-based");
+        }
+
+        // Importing an occurrence-based dictionary automatically migrates v4 -> v5:
+        let occ_zip = root.path().join("occ.zip");
+        build_zip(
+            &occ_zip,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"OccFreq","format":3,"revision":"1","frequencyMode":"occurrence-based"}"#,
+                    None,
+                ),
+                (
+                    "term_meta_bank_1.json",
+                    r#"[["食べる","freq",98765]]"#.as_bytes(),
+                    None,
+                ),
+            ],
+        );
+        let occ_id = process_dictionary(&occ_zip, &db_path, &res_dir).unwrap();
+
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+        let cache = sqlite_db::init_cache_conn(&conn).unwrap();
+        let legacy = cache
+            .dictionaries
+            .iter()
+            .find(|d| d.title == "LegacyRankDict")
+            .unwrap();
+        assert_eq!(legacy.frequency_mode, sqlite_db::FrequencyMode::RankBased);
+        let occ = cache
+            .dictionaries
+            .iter()
+            .find(|d| d.id == occ_id)
+            .unwrap();
+        assert_eq!(occ.frequency_mode, sqlite_db::FrequencyMode::OccurrenceBased);
+
+        let modes = sqlite_db::query_dictionary_frequency_modes_conn(&conn).unwrap();
+        assert_eq!(modes.get(&1), Some(&sqlite_db::FrequencyMode::RankBased));
+        assert_eq!(
+            modes.get(&occ_id),
+            Some(&sqlite_db::FrequencyMode::OccurrenceBased)
+        );
+
+        let freqs =
+            sqlite_db::query_term_frequencies_with_mode_conn(&conn, "食べる", "たべる").unwrap();
+        assert_eq!(freqs.len(), 1);
+        assert_eq!(
+            freqs[0].frequency_mode,
+            sqlite_db::FrequencyMode::OccurrenceBased
+        );
+        assert_eq!(
+            freqs[0].parsed.frequency_mode,
+            sqlite_db::FrequencyMode::OccurrenceBased
+        );
+        assert_eq!(freqs[0].parsed.display, "98765");
+    }
+
+    #[test]
+    fn string_pitch_patterns_and_kanji_bank_pr_2377_nulls_and_5_elem_rows_round_trip() {
+        let root = TempDir::new().unwrap();
+        let res_dir = root.path().join("res");
+        let db_path = root.path().join("dictionaries.sqlite");
+        let zip_path = root.path().join("pitch_and_kanji.zip");
+
+        build_zip(
+            &zip_path,
+            &[
+                (
+                    "index.json",
+                    br#"{"title":"PitchAndKanji","format":3,"revision":"1"}"#,
+                    None,
+                ),
+                (
+                    "term_meta_bank_1.json",
+                    r#"[["雨","pitch",{"reading":"あめ","pitches":[{"position":"LH"},{"position":"HL"},{"position":1}]}]]"#
+                        .as_bytes(),
+                    None,
+                ),
+                (
+                    "kanji_bank_1.json",
+                    r#"[
+                        ["漢", null, null, null, ["China"], null],
+                        ["字", "ジ", null, "jouyou", ["character"]],
+                        ["語", "ゴ", "かた.る", "", null, {}]
+                    ]"#
+                    .as_bytes(),
+                    None,
+                ),
+            ],
+        );
+
+        process_dictionary(&zip_path, &db_path, &res_dir).unwrap();
+        let conn = sqlite_db::open_read_only_connection(&db_path).unwrap();
+
+        // String-based exact pitch patterns round-trip through SQLite intact (H6.1 / PR #2055):
+        let meta = sqlite_db::query_term_meta_batch_conn(&conn, &["雨".to_owned()]).unwrap();
+        assert_eq!(meta.len(), 1);
+        let null_pos = meta[0]
+            .data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(meta[0].data.len());
+        let parsed = crate::databasemanager::parse_pitch_blob_utf8(
+            &meta[0].data[..null_pos],
+            "雨",
+            "あめ",
+        );
+        assert!(parsed.matched);
+        assert_eq!(parsed.entries.len(), 3);
+        assert_eq!(
+            parsed.entries[0].pitch_position(),
+            Some(sqlite_db::PitchPosition::Pattern("LH".to_owned()))
+        );
+        assert_eq!(
+            parsed.entries[1].pitch_position(),
+            Some(sqlite_db::PitchPosition::Pattern("HL".to_owned()))
+        );
+        assert_eq!(
+            parsed.entries[2].pitch_position(),
+            Some(sqlite_db::PitchPosition::Downstep(1))
+        );
+
+        // PR #2377 kanji_bank nullable fields & 5-element rows:
+        let k1 = sqlite_db::query_kanji_utf8_conn(&conn, "漢").unwrap();
+        assert_eq!(k1.len(), 1);
+        assert_eq!(k1[0].onyomi, "");
+        assert_eq!(k1[0].kunyomi, "");
+        assert_eq!(k1[0].tags, "");
+        assert_eq!(k1[0].meanings, vec!["China"]);
+        assert_eq!(k1[0].stats, "{}");
+
+        let k2 = sqlite_db::query_kanji_utf8_conn(&conn, "字").unwrap();
+        assert_eq!(k2.len(), 1);
+        assert_eq!(k2[0].onyomi, "ジ");
+        assert_eq!(k2[0].kunyomi, "");
+        assert_eq!(k2[0].meanings, vec!["character"]);
+        assert_eq!(k2[0].stats, "{}");
+
+        let k3 = sqlite_db::query_kanji_utf8_conn(&conn, "語").unwrap();
+        assert_eq!(k3.len(), 1);
+        assert!(k3[0].meanings.is_empty());
+        assert_eq!(k3[0].stats, "{}");
+    }
 }

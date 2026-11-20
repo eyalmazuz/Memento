@@ -20,17 +20,20 @@ pub unsafe fn sqlite3_close_v2(db: *mut sqlite3) -> std::ffi::c_int {
     unsafe { sqlite3_close_v2(db) }
 }
 
-pub use crate::databasemanager::PitchEntryDetail;
+pub use crate::databasemanager::{PitchEntryDetail, PitchPosition};
 
 pub use self::connection::{
     configure_read_only_connection, configure_read_write_connection, db_file_fingerprint,
-    init_cache_conn, open_read_only_connection, open_read_write_connection,
-    query_data_version_conn, validate_schema_conn, DbFileFingerprint, FileMetaStamp,
+    ensure_frequency_mode_column_conn, init_cache_conn, open_read_only_connection,
+    open_read_write_connection, query_data_version_conn, validate_schema_conn, DbFileFingerprint,
+    FileMetaStamp,
 };
-pub use self::freq::{format_g, parse_freq_blob_utf8, ParsedFreqUtf8};
+pub use self::freq::{format_g, parse_freq_blob_utf8, parse_freq_blob_with_mode_utf8, ParsedFreqUtf8};
 pub use self::queries::{
-    get_kanji_frequencies_conn, query_kanji_meta_freq_utf8_conn, query_kanji_utf8_conn,
-    query_term_details_batch_conn, query_term_meta_batch_conn, query_term_rules_conn,
+    get_kanji_frequencies_conn, query_dictionary_frequency_modes_conn,
+    query_kanji_meta_freq_utf8_conn, query_kanji_utf8_conn, query_term_details_batch_conn,
+    query_term_frequencies_with_mode_conn, query_term_meta_batch_conn, query_term_rules_conn,
+    search_terms_wildcard, search_terms_wildcard_conn, DEFAULT_WILDCARD_LIMIT, MAX_WILDCARD_LIMIT,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,11 +69,52 @@ impl From<rusqlite::Error> for DictError {
     }
 }
 
+/// Yomitan `index.json` `frequencyMode` (PR #2373/#2329): whether numeric frequency values
+/// are corpus ranks (`"rank-based"`, lower = more frequent, default) or raw occurrence counts
+/// (`"occurrence-based"`, higher = more frequent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum FrequencyMode {
+    #[default]
+    RankBased,
+    OccurrenceBased,
+}
+
+impl FrequencyMode {
+    pub const RANK_BASED: &'static str = "rank-based";
+    pub const OCCURRENCE_BASED: &'static str = "occurrence-based";
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RankBased => Self::RANK_BASED,
+            Self::OccurrenceBased => Self::OCCURRENCE_BASED,
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(raw: &str) -> Self {
+        match raw.trim() {
+            "occurrence-based" => Self::OccurrenceBased,
+            _ => Self::RankBased,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictMeta {
     pub id: i64,
     pub title: String,
     pub disabled: bool,
+    pub frequency_mode: FrequencyMode,
+}
+
+/// Frequency query result paired with its dictionary metadata and `frequency_mode`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermFrequencyWithMode {
+    pub dic_id: i64,
+    pub dictionary_title: String,
+    pub frequency_mode: FrequencyMode,
+    pub parsed: ParsedFreqUtf8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -367,5 +411,91 @@ mod tests {
             formatted,
             vec![(1, "420".to_string()), (3, "123.45".to_string())]
         );
+    }
+
+    #[test]
+    fn wildcard_search_handles_ascii_fullwidth_escaping_limits_indexes_and_cjk_ext_j() {
+        let db = create_test_db();
+        db.execute_batch(
+            "
+            CREATE INDEX idx_term_bank_combo ON term_bank(expression, reading);
+            CREATE INDEX idx_term_bank_reading ON term_bank(reading);
+            INSERT INTO directory VALUES (1, 'JMdict', 3, 'rev1', 0);
+            INSERT INTO directory VALUES (2, 'DisabledDict', 3, 'rev1', 0);
+            INSERT INTO dict_disabled VALUES (2);
+            INSERT INTO term_bank VALUES (1, '食べる', 'たべる', '', 'v1', 10, '[\"to eat\"]', 1, '');
+            INSERT INTO term_bank VALUES (1, '食べ物', 'たべもの', '', '', 8, '[\"food\"]', 2, '');
+            INSERT INTO term_bank VALUES (1, '食卓', 'しょくたく', '', '', 5, '[\"dining table\"]', 3, '');
+            INSERT INTO term_bank VALUES (1, '100%果汁', '', '', '', 1, '[\"100% juice\"]', 4, '');
+            INSERT INTO term_bank VALUES (1, '1000円', '', '', '', 1, '[\"1000 yen\"]', 5, '');
+            INSERT INTO term_bank VALUES (1, 'a_bc', '', '', '', 1, '[\"underscore\"]', 6, '');
+            INSERT INTO term_bank VALUES (1, 'axbc', '', '', '', 1, '[\"x\"]', 7, '');
+            INSERT INTO term_bank VALUES (1, '\u{323B0}語', 'extj', '', '', 1, '[\"ext j\"]', 8, '');
+            INSERT INTO term_bank VALUES (2, '食べ放題', 'たべほうだい', '', '', 1, '[\"buffet\"]', 9, '');
+            ",
+        )
+        .unwrap();
+
+        // Prefix wildcard (`*` and fullwidth `＊`), respecting dict_disabled:
+        let hits = search_terms_wildcard(&db, "食べ*", 10).unwrap();
+        let exprs: Vec<&str> = hits.iter().map(|r| r.expression.as_str()).collect();
+        assert_eq!(exprs, vec!["食べる", "食べ物"]);
+
+        // Fullwidth `＊` and leading whitespace trimmed cleanly (PR #2506):
+        let fw_hits = search_terms_wildcard(&db, "  　食べ＊", 10).unwrap();
+        assert_eq!(fw_hits.len(), 2);
+
+        // Single-char wildcard `?` / `？`:
+        let q_hits = search_terms_wildcard(&db, "食？", 10).unwrap();
+        assert_eq!(q_hits.len(), 1);
+        assert_eq!(q_hits[0].expression, "食卓");
+
+        // Reading match & katakana->hiragana reading fallback:
+        let r_hits = search_terms_wildcard(&db, "タベ*", 10).unwrap();
+        assert_eq!(r_hits.len(), 2);
+
+        // SQL LIKE metacharacters (`%`, `_`) are escaped properly:
+        let pct = search_terms_wildcard(&db, "100%*", 10).unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].expression, "100%果汁");
+
+        let under = search_terms_wildcard(&db, "a_b*", 10).unwrap();
+        assert_eq!(under.len(), 1);
+        assert_eq!(under[0].expression, "a_bc");
+
+        // CJK Extension J (4-byte UTF-8) prefix wildcard safety (PR #2522):
+        let ext_j = search_terms_wildcard(&db, "\u{323B0}*", 10).unwrap();
+        assert_eq!(ext_j.len(), 1);
+        assert_eq!(ext_j[0].expression, "\u{323B0}語");
+
+        // Limit capping:
+        let capped = search_terms_wildcard(&db, "*", 2).unwrap();
+        assert_eq!(capped.len(), 2);
+
+        // Verify SQLite uses B-tree index range scan for non-leading Japanese wildcard prefix:
+        let plan: String = db
+            .query_row(
+                "EXPLAIN QUERY PLAN \
+                 SELECT rowid FROM term_bank \
+                 WHERE expression >= '食べ' AND expression < '食ぺ' AND expression LIKE '食べ%' ESCAPE '\\' \
+                 LIMIT 10;",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX idx_term_bank_combo")
+                || plan.contains("USING COVERING INDEX idx_term_bank_combo"),
+            "expected B-tree index usage, got plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn freq_text_parsing_is_safe_with_trailing_4byte_cjk_ext_j_pr_2522() {
+        let blob = "123\u{323B0}".as_bytes();
+        let parsed = parse_freq_blob_utf8(2, blob, "\u{323B0}", "");
+        assert!(parsed.matched);
+        assert_eq!(parsed.numeric, Some(123.0));
+        assert_eq!(parsed.frequency_mode, FrequencyMode::RankBased);
     }
 }

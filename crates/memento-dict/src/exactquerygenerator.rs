@@ -127,6 +127,16 @@ mod tests {
         assert_eq!(res_ext.len(), 2);
         assert_eq!(String::from_utf16(&res_ext[0].deconj).unwrap(), "𠮟る");
         assert_eq!(String::from_utf16(&res_ext[1].deconj).unwrap(), "𠮟");
+
+        // CJK Extension H (U+31350) & Extension J (U+323B0) surrogate pairs (PR #2522):
+        let ext_hj: Vec<u16> = "\u{31350}\u{323B0}".encode_utf16().collect();
+        let res_hj = generate_queries(&ext_hj);
+        assert_eq!(res_hj.len(), 2);
+        assert_eq!(
+            String::from_utf16(&res_hj[0].deconj).unwrap(),
+            "\u{31350}\u{323B0}"
+        );
+        assert_eq!(String::from_utf16(&res_hj[1].deconj).unwrap(), "\u{31350}");
     }
 
     #[test]

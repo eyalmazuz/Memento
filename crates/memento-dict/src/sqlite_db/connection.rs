@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
-use super::{CacheInfo, DictError, DictMeta, TableCounts};
+use super::{CacheInfo, DictError, DictMeta, FrequencyMode, TableCounts};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_CACHE_CAPACITY: usize = 64;
@@ -82,7 +82,41 @@ pub fn open_read_write_connection(path: &Path) -> Result<Connection, DictError> 
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )?;
     configure_read_write_connection(&conn)?;
+    ensure_frequency_mode_column_conn(&conn)?;
     Ok(conn)
+}
+
+/// Checks whether `directory` exists and contains `col_name`.
+pub(super) fn directory_has_column_conn(
+    conn: &Connection,
+    col_name: &str,
+) -> Result<bool, DictError> {
+    let mut stmt = conn.prepare_cached("PRAGMA table_info(directory);")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == col_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Automatically adds `directory.frequency_mode` via `ALTER TABLE` when opening an existing
+/// writable v1–v4 database that predates Yomitan `frequencyMode` support (H4.4).
+pub fn ensure_frequency_mode_column_conn(conn: &Connection) -> Result<(), DictError> {
+    let has_directory: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'directory');",
+        )?
+        .query_row([], |row| row.get::<_, i64>(0))?
+        != 0;
+    if has_directory && !directory_has_column_conn(conn, "frequency_mode")? {
+        conn.execute_batch(
+            "ALTER TABLE directory ADD COLUMN frequency_mode TEXT NOT NULL DEFAULT 'rank-based';",
+        )?;
+    }
+    Ok(())
 }
 
 /// Applies WAL, synchronous, cache_size, mmap_size, temp_store, and busy_timeout PRAGMAs
@@ -141,19 +175,42 @@ pub fn query_data_version_conn(conn: &Connection) -> Result<i64, DictError> {
 pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
     validate_schema_conn(conn)?;
 
-    let mut dict_stmt = conn.prepare_cached(
-        "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) AS disabled FROM directory;",
-    )?;
+    let has_freq_mode = directory_has_column_conn(conn, "frequency_mode")?;
     let mut dictionaries = Vec::new();
-    let dict_rows = dict_stmt.query_map([], |row| {
-        Ok(DictMeta {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            disabled: row.get::<_, i64>(2)? != 0,
-        })
-    })?;
-    for d_res in dict_rows {
-        dictionaries.push(d_res?);
+    if has_freq_mode {
+        let mut dict_stmt = conn.prepare_cached(
+            "SELECT dic_id, title, \
+             EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) AS disabled, \
+             COALESCE(frequency_mode, 'rank-based') \
+             FROM directory;",
+        )?;
+        let dict_rows = dict_stmt.query_map([], |row| {
+            let mode_str: String = row.get(3)?;
+            Ok(DictMeta {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                disabled: row.get::<_, i64>(2)? != 0,
+                frequency_mode: FrequencyMode::from_db_str(&mode_str),
+            })
+        })?;
+        for d_res in dict_rows {
+            dictionaries.push(d_res?);
+        }
+    } else {
+        let mut dict_stmt = conn.prepare_cached(
+            "SELECT dic_id, title, EXISTS (SELECT 1 FROM dict_disabled WHERE dict_disabled.dic_id = directory.dic_id) AS disabled FROM directory;",
+        )?;
+        let dict_rows = dict_stmt.query_map([], |row| {
+            Ok(DictMeta {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                disabled: row.get::<_, i64>(2)? != 0,
+                frequency_mode: FrequencyMode::RankBased,
+            })
+        })?;
+        for d_res in dict_rows {
+            dictionaries.push(d_res?);
+        }
     }
 
     let table_counts = TableCounts {

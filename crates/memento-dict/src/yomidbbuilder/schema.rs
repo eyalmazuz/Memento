@@ -8,12 +8,13 @@ use crate::sqlite_db;
 
 use super::{validate_non_empty_path, YomiError};
 
-pub(super) const CURRENT_SCHEMA_VERSION: i32 = 4;
+pub(super) const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 const CREATE_TABLES_SQL: &str = "
 CREATE TABLE directory (
     dic_id INTEGER PRIMARY KEY, title TEXT NOT NULL UNIQUE,
-    format INTEGER NOT NULL, revision TEXT NOT NULL, sequenced INTEGER NOT NULL
+    format INTEGER NOT NULL, revision TEXT NOT NULL, sequenced INTEGER NOT NULL,
+    frequency_mode TEXT NOT NULL DEFAULT 'rank-based'
 );
 CREATE TRIGGER directory_remove AFTER DELETE ON directory BEGIN
     DELETE FROM dict_disabled WHERE dic_id = old.dic_id;
@@ -111,6 +112,28 @@ UPDATE term_bank SET reading = '' WHERE expression = reading;
 PRAGMA user_version = 4;
 ";
 
+fn directory_has_column(tx: &Transaction<'_>, col_name: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = tx.prepare("PRAGMA table_info(directory);")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == col_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_v4_to_v5(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    if !directory_has_column(tx, "frequency_mode")? {
+        tx.execute_batch(
+            "ALTER TABLE directory ADD COLUMN frequency_mode TEXT NOT NULL DEFAULT 'rank-based';",
+        )?;
+    }
+    tx.pragma_update(None, "user_version", 5)?;
+    Ok(())
+}
+
 pub(super) fn open_writable_db(db_file: &Path) -> Result<Connection, YomiError> {
     validate_non_empty_path(db_file)?;
     sqlite_db::open_read_write_connection(db_file).map_err(|err| match err {
@@ -171,20 +194,28 @@ pub(super) fn prepare_schema(
             }
             tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         }
-        1..=3 => {
+        1..=4 => {
             if version <= 1 {
                 tx.execute_batch(V1_TO_V2)?;
             }
             if version <= 2 {
                 tx.execute_batch(V2_TO_V3)?;
             }
-            tx.execute_batch(V3_TO_V4)?;
+            if version <= 3 {
+                tx.execute_batch(V3_TO_V4)?;
+            }
+            migrate_v4_to_v5(&tx)?;
             tx.execute_batch(DROP_LEGACY_REDUNDANT_INDEXES_SQL)?;
             if !defer_indexes_if_empty {
                 tx.execute_batch(CREATE_INDEXES_SQL)?;
             }
         }
         _ => {
+            if !directory_has_column(&tx, "frequency_mode")? {
+                tx.execute_batch(
+                    "ALTER TABLE directory ADD COLUMN frequency_mode TEXT NOT NULL DEFAULT 'rank-based';",
+                )?;
+            }
             tx.execute_batch(DROP_LEGACY_REDUNDANT_INDEXES_SQL)?;
             if !defer_indexes_if_empty {
                 tx.execute_batch(CREATE_INDEXES_SQL)?;

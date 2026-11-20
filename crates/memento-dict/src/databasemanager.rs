@@ -127,13 +127,120 @@ pub fn json_array_to_utf8_strings(json_bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Yomitan `term_meta_bank_v3` pitch position (PR #2055): either a numeric downstep index
+/// (`0` = heiban, `1..=N` = downstep mora) or an exact high/low pattern string
+/// (`"LHH"`, `"HLL"`, `"LHHL"`, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum PitchPosition {
+    Downstep(u32),
+    Pattern(String),
+}
+
+impl PitchPosition {
+    /// Returns `true` if `s` is a valid non-empty Yomitan pitch pattern string (`^[HLhl]+$`).
+    #[must_use]
+    pub fn is_valid_pattern(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| matches!(b, b'H' | b'L' | b'h' | b'l'))
+    }
+
+    /// Parses a Yomitan `term_meta_bank_v3` `"position"` JSON value (integer downstep or
+    /// exact `"H"`/`"L"` pattern string).
+    #[must_use]
+    pub fn from_json_value(val: &serde_json::Value) -> Option<Self> {
+        if let Some(s) = val.as_str() {
+            return Self::is_valid_pattern(s).then(|| Self::Pattern(s.to_ascii_uppercase()));
+        }
+        let n = val.as_f64()?;
+        if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= f64::from(u32::MAX) {
+            Some(Self::Downstep(n as u32))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn as_downstep(&self) -> Option<u32> {
+        match self {
+            Self::Downstep(pos) => Some(*pos),
+            Self::Pattern(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_pattern(&self) -> Option<&str> {
+        match self {
+            Self::Downstep(_) => None,
+            Self::Pattern(pat) => Some(pat.as_str()),
+        }
+    }
+
+    /// Expands this pitch position into boolean high/low pitch levels (`true` = High, `false` = Low).
+    ///
+    /// For [`PitchPosition::Pattern`], maps each `'H'`/`'L'` character directly.
+    /// For [`PitchPosition::Downstep`], returns `mora_count + 1` levels (including the following
+    /// particle mora) according to standard Tokyo Japanese pitch accent rules.
+    #[must_use]
+    pub fn to_levels(&self, mora_count: usize) -> Vec<bool> {
+        match self {
+            Self::Pattern(pat) => pat.bytes().map(|b| b == b'H' || b == b'h').collect(),
+            Self::Downstep(downstep) => {
+                if mora_count == 0 {
+                    return Vec::new();
+                }
+                let total = mora_count + 1;
+                let mut levels = Vec::with_capacity(total);
+                match *downstep {
+                    0 => {
+                        levels.push(false);
+                        for _ in 1..total {
+                            levels.push(true);
+                        }
+                    }
+                    1 => {
+                        levels.push(true);
+                        for _ in 1..total {
+                            levels.push(false);
+                        }
+                    }
+                    n => {
+                        let drop_after = n as usize;
+                        levels.push(false);
+                        for i in 1..total {
+                            levels.push(i < drop_after);
+                        }
+                    }
+                }
+                levels
+            }
+        }
+    }
+}
+
 /// One pitch pattern inside a Yomitan `pitches` JSON array.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PitchEntryDetail {
     pub position: i32,
+    /// Exact high/low pitch pattern string (`"LHH"`, `"HLL"`, `"LHHL"`, etc.) from Yomitan
+    /// `term_meta_bank_v3` (PR #2055), or `None` for integer downstep entries.
+    pub pattern: Option<String>,
     pub nasal: Vec<usize>,
     pub devoice: Vec<usize>,
     pub tags: Vec<String>,
+}
+
+impl PitchEntryDetail {
+    /// Returns the typed [`PitchPosition`] (`Pattern` when an exact string pattern was present,
+    /// otherwise `Downstep` for non-negative integer positions).
+    #[must_use]
+    pub fn pitch_position(&self) -> Option<PitchPosition> {
+        if let Some(ref pat) = self.pattern {
+            Some(PitchPosition::Pattern(pat.clone()))
+        } else {
+            u32::try_from(self.position)
+                .ok()
+                .map(PitchPosition::Downstep)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -197,8 +304,12 @@ fn parse_pitch_entries(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<
             let Some(o) = val.as_object() else {
                 return PitchEntryDetail::default();
             };
-            let position = o
-                .get("position")
+            let pos_val = o.get("position");
+            let pattern = pos_val
+                .and_then(|p| p.as_str())
+                .filter(|s| PitchPosition::is_valid_pattern(s))
+                .map(str::to_ascii_uppercase);
+            let position = pos_val
                 .and_then(|p| p.as_f64())
                 .filter(|&position| {
                     position.fract() == 0.0
@@ -212,6 +323,7 @@ fn parse_pitch_entries(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<
             let tags = parse_pitch_tags(o.get("tags"));
             PitchEntryDetail {
                 position,
+                pattern,
                 nasal,
                 devoice,
                 tags,
@@ -539,6 +651,49 @@ mod tests {
         let data = parse_pitch_blob(blob.as_bytes(), &to_u16("亜"), &to_u16("あ"));
         assert!(data.matched);
         assert_eq!(data.positions, [0, 0, 0, 0, 2, i32::MIN, 0, 0]);
+        assert!(data.entries.iter().all(|e| e.pattern.is_none()));
+    }
+
+    #[test]
+    fn pitch_positions_parse_string_exact_patterns_pr_2055() {
+        let blob = r#"{"reading":"たべる","pitches":[{"position":"LHH"},{"position":"HLL"},{"position":"lhhl","tags":["kansai"]},{"position":2},{"position":"invalid"}]}"#;
+        let parsed = parse_pitch_blob_utf8(blob.as_bytes(), "食べる", "たべる");
+        assert!(parsed.matched);
+        assert_eq!(parsed.mora, vec!["た", "べ", "る"]);
+        assert_eq!(parsed.entries.len(), 5);
+
+        assert_eq!(parsed.entries[0].pattern.as_deref(), Some("LHH"));
+        assert_eq!(
+            parsed.entries[0].pitch_position(),
+            Some(PitchPosition::Pattern("LHH".to_owned()))
+        );
+        assert_eq!(
+            parsed.entries[0].pitch_position().unwrap().to_levels(3),
+            vec![false, true, true]
+        );
+
+        assert_eq!(parsed.entries[1].pattern.as_deref(), Some("HLL"));
+        assert_eq!(
+            parsed.entries[1].pitch_position(),
+            Some(PitchPosition::Pattern("HLL".to_owned()))
+        );
+
+        assert_eq!(parsed.entries[2].pattern.as_deref(), Some("LHHL"));
+        assert_eq!(parsed.entries[2].tags, vec!["kansai".to_owned()]);
+
+        assert_eq!(parsed.entries[3].pattern, None);
+        assert_eq!(parsed.entries[3].position, 2);
+        assert_eq!(
+            parsed.entries[3].pitch_position(),
+            Some(PitchPosition::Downstep(2))
+        );
+        assert_eq!(
+            parsed.entries[3].pitch_position().unwrap().to_levels(3),
+            vec![false, true, false, false]
+        );
+
+        assert_eq!(parsed.entries[4].pattern, None);
+        assert_eq!(parsed.entries[4].position, 0);
     }
 
     #[test]

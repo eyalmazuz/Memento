@@ -126,6 +126,15 @@ pub(super) fn add_index<R: Read + Seek>(
             YomiError::MalformedIndex("'sequenced' must be a boolean".to_owned())
         })?,
     };
+    let frequency_mode = match obj.get("frequencyMode") {
+        None | Some(Value::Null) => crate::sqlite_db::FrequencyMode::RANK_BASED,
+        Some(Value::String(mode)) => crate::sqlite_db::FrequencyMode::from_db_str(mode).as_str(),
+        Some(_) => {
+            return Err(YomiError::MalformedIndex(
+                "'frequencyMode' must be a string or null".to_owned(),
+            ));
+        }
+    };
 
     let replaced_dic_id: Option<i64> = tx
         .query_row(
@@ -136,8 +145,8 @@ pub(super) fn add_index<R: Read + Seek>(
         .optional()?;
 
     tx.execute(
-        "INSERT OR REPLACE INTO directory (title, format, revision, sequenced) VALUES (?1, ?2, ?3, ?4);",
-        params![title, format, revision, i64::from(sequenced)],
+        "INSERT OR REPLACE INTO directory (title, format, revision, sequenced, frequency_mode) VALUES (?1, ?2, ?3, ?4, ?5);",
+        params![title, format, revision, i64::from(sequenced), frequency_mode],
     )?;
     let dic_id = tx.last_insert_rowid();
     if dic_id <= 0 {
@@ -304,30 +313,39 @@ fn insert_row(
             ])?;
         }
         Bank::Kanji => {
-            if row.len() != 6 {
+            // Yomitan PR #2377: tolerate 5-element rows (omitted stats) and null/missing
+            // optional fields (`onyomi`, `kunyomi`, `tags`, `meanings`, `stats`).
+            if !(5..=6).contains(&row.len()) {
                 return Err(YomiError::MalformedBank {
                     bank: bank_label,
-                    detail: format!("expected 6 elements, got {}", row.len()),
+                    detail: format!("expected 5 or 6 elements, got {}", row.len()),
                 });
             }
             let character = parse_raw_str(&row[0], 0, bank_label)?;
-            let onyomi = parse_raw_str(&row[1], 1, bank_label)?;
-            let kunyomi = parse_raw_str(&row[2], 2, bank_label)?;
-            let tags = parse_raw_str(&row[3], 3, bank_label)?;
-            let meanings = row[4].get().trim();
-            if !meanings.starts_with('[') {
+            let onyomi = parse_raw_nullable_str(&row[1], 1, "onyomi", bank_label)?;
+            let kunyomi = parse_raw_nullable_str(&row[2], 2, "kunyomi", bank_label)?;
+            let tags = parse_raw_nullable_str(&row[3], 3, "tags", bank_label)?;
+            let raw_meanings = row[4].get().trim();
+            let meanings = if raw_meanings == "null" {
+                "[]"
+            } else if raw_meanings.starts_with('[') {
+                raw_meanings
+            } else {
                 return Err(YomiError::MalformedBank {
                     bank: bank_label,
-                    detail: "element 4 (meanings) must be an array".to_owned(),
+                    detail: "element 4 (meanings) must be an array or null".to_owned(),
                 });
-            }
-            let stats = row[5].get().trim();
-            if !stats.starts_with('{') {
-                return Err(YomiError::MalformedBank {
-                    bank: bank_label,
-                    detail: "element 5 (stats) must be an object".to_owned(),
-                });
-            }
+            };
+            let stats = match row.get(5).map(|v| v.get().trim()) {
+                None | Some("null") => "{}",
+                Some(s) if s.starts_with('{') => s,
+                Some(_) => {
+                    return Err(YomiError::MalformedBank {
+                        bank: bank_label,
+                        detail: "element 5 (stats) must be an object or null".to_owned(),
+                    });
+                }
+            };
             stmt.execute(params![
                 dic_id, character, onyomi, kunyomi, tags, meanings, stats,
             ])?;

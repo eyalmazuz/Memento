@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Rule-based Japanese deconjugation, ported from `src/dict/deconjugator.cpp`
-//! with Yomitan rule parity, short-causative sub-conditions, indexed rule lookup,
-//! recursion depth bounds, and grammar descriptions.
+//! with complete Yomitan Japanese transform parity, short-causative sub-conditions,
+//! indexed rule lookup, recursion depth and candidate bounds (#2153), and grammar descriptions.
 
 mod rules;
 
@@ -13,8 +13,13 @@ use std::sync::OnceLock;
 use self::rules::{Rule, SilentRule, RULES, SILENT_RULES, SUB_CAUS_LONG, SUB_NONE};
 
 const MAX_DEPTH: usize = 12;
+/// Maximum deconjugation candidates emitted for a single prefix (Yomitan #2153 safeguard).
+const MAX_RESULTS_PER_PREFIX: usize = 64;
+/// Maximum total deconjugation candidates emitted across all prefixes in sentence mode (#2153).
+const MAX_TOTAL_RESULTS: usize = 256;
 
-/// `WordForm` values and order match the C++ enum (including its unused members).
+/// `WordForm` values and order match the C++ enum (0..=42) plus additive Yomitan transform
+/// variants (43+).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum WordForm {
@@ -61,6 +66,24 @@ pub enum WordForm {
     Noun = 40,
     Any = 41,
     None = 42,
+    ZuruVerb = 43,
+    Ya = 44,
+    Cha = 45,
+    NBakari = 46,
+    NTosuru = 47,
+    Mu = 48,
+    Mai = 49,
+    Fu = 50,
+    Ge = 51,
+    Garu = 52,
+    Yagaru = 53,
+    Yashinai = 54,
+    TeOku = 55,
+    VolitionalSlang = 56,
+    NSlang = 57,
+    ImperativeNegativeSlang = 58,
+    KansaiBenNegative = 59,
+    KansaiBenAdverbial = 60,
 }
 
 /// An ordered UTF-8 deconjugation candidate; alternative derivations are retained while exact
@@ -74,13 +97,14 @@ pub struct ConjugationInfo {
     pub derivation_display: String,
 }
 
-/// The untranslated source text used by C++ `Deconjugator::tr`.
+/// The untranslated English source label for a conjugation step.
 pub fn word_form_label(form: WordForm) -> &'static str {
     match form {
         WordForm::GodanVerb => "godan verb",
         WordForm::IchidanVerb => "ichidan verb",
         WordForm::SuruVerb => "suru verb",
         WordForm::KuruVerb => "kuru verb",
+        WordForm::ZuruVerb => "zuru verb",
         WordForm::Adjective => "adjective",
         WordForm::Negative => "negative",
         WordForm::Past => "past",
@@ -116,6 +140,23 @@ pub fn word_form_label(form: WordForm) -> &'static str {
         WordForm::Continuous => "progressive or perfect",
         WordForm::Adverbial => "adv",
         WordForm::Noun => "noun",
+        WordForm::Ya => "-ya",
+        WordForm::Cha => "-cha",
+        WordForm::NBakari => "-n bakari",
+        WordForm::NTosuru => "-n to suru",
+        WordForm::Mu => "-mu",
+        WordForm::Mai => "-mai",
+        WordForm::Fu => "-fu",
+        WordForm::Ge => "-ge",
+        WordForm::Garu => "-garu",
+        WordForm::Yagaru => "-yagaru",
+        WordForm::Yashinai => "-yashinai",
+        WordForm::TeOku => "-te oku",
+        WordForm::VolitionalSlang => "volitional slang",
+        WordForm::NSlang => "-n slang",
+        WordForm::ImperativeNegativeSlang => "imperative negative slang",
+        WordForm::KansaiBenNegative => "Kansai-ben negative",
+        WordForm::KansaiBenAdverbial => "Kansai-ben -ku",
         WordForm::IrregularVerb | WordForm::Conditional | WordForm::Any | WordForm::None => {
             "unknown"
         }
@@ -129,6 +170,7 @@ pub fn word_form_description(form: WordForm) -> &'static str {
         WordForm::IchidanVerb => "One-row (-iru/-eru) verb",
         WordForm::SuruVerb => "Action verb conjugated with suru (to do)",
         WordForm::KuruVerb => "Irregular verb kuru (to come)",
+        WordForm::ZuruVerb => "Alternative literary -zuru verb (vz)",
         WordForm::IrregularVerb => "Irregular verb conjugation",
         WordForm::Adjective => "True i-adjective (-i)",
         WordForm::Negative => "Negates the verb or adjective (-nai/-masen)",
@@ -159,7 +201,7 @@ pub fn word_form_description(form: WordForm) -> &'static str {
         WordForm::Nasai => "Polite/firm command form (-nasai)",
         WordForm::Sugiru => "Indicates excess ('too much', -sugiru)",
         WordForm::Sou => "Indicates appearance or likelihood ('looks like', -sou)",
-        WordForm::E => "Colloquial vowel contraction (-ai/-oi to -ee)",
+        WordForm::E => "Colloquial vowel contraction (-ai/-oi to -ee, -ui to -ii)",
         WordForm::Ba => "Provisional conditional ('if', -eba/-kereba)",
         WordForm::Ki => "Classical attributive i-adjective form (-ki)",
         WordForm::Toku => "Colloquial contraction of -te oku ('do in advance')",
@@ -170,6 +212,27 @@ pub fn word_form_description(form: WordForm) -> &'static str {
         WordForm::Continuous => "Ongoing action or resultant state (-te iru / -teru / -toru)",
         WordForm::Adverbial => "Adverbial form modifying a predicate (-ku)",
         WordForm::Noun => "Nominalized degree or quality noun (-sa)",
+        WordForm::Ya => "Colloquial contraction of -ba conditional (-kerya / -kya / -rya)",
+        WordForm::Cha => "Colloquial contraction of -te wa / -de wa (-cha / -ja)",
+        WordForm::NBakari => "Literary 'as if about to / on the verge of' (-n bakari)",
+        WordForm::NTosuru => "Literary 'about to / trying to' (-n to suru)",
+        WordForm::Mu => "Archaic/literary volitional form (-mu)",
+        WordForm::Mai => "Negative volitional / conjecture ('will probably not', -mai)",
+        WordForm::Fu => "Historical kana -fu verb ending (modern -u)",
+        WordForm::Ge => "Indicates outward appearance or feeling (-ge)",
+        WordForm::Garu => "Shows outward signs of feeling or wanting (-garu)",
+        WordForm::Yagaru => "Derogatory/contemptuous auxiliary verb (-yagaru)",
+        WordForm::Yashinai => "Emphatic negative ('not at all', -yashinai / -yashimasen)",
+        WordForm::TeOku => "Do in advance or leave in a resultant state (-te oku / -de oku)",
+        WordForm::VolitionalSlang => "Casual volitional contraction (-okka / -yokka / -kokka)",
+        WordForm::NSlang => "Colloquial /r/ -> /n/ assimilation (-nnai / -rannai / -nnasai)",
+        WordForm::ImperativeNegativeSlang => {
+            "Colloquial negative command (-nna, contraction of -runa)"
+        }
+        WordForm::KansaiBenNegative => "Kansai-ben negative form (-hen / -hin / seehen)",
+        WordForm::KansaiBenAdverbial => {
+            "Kansai-ben u-onbin i-adjective adverbial form (-ou / -yuu / -uu)"
+        }
         WordForm::Any | WordForm::None => "",
     }
 }
@@ -300,22 +363,16 @@ fn is_terminal(form: WordForm) -> bool {
             | WordForm::IchidanVerb
             | WordForm::SuruVerb
             | WordForm::KuruVerb
+            | WordForm::ZuruVerb
             | WordForm::Adjective
     )
 }
 
-/// Guards the empty-suffix rule (`る <- ""`) so it only fires on kana or kanji stems,
-/// never on ASCII, digits, whitespace, or Japanese punctuation/symbols.
+/// Guards the empty-suffix rule (`る <- ""`) so it only fires on kana or CJK ideograph stems
+/// (including CJK Extensions H & J), never on ASCII, digits, whitespace, or Japanese punctuation.
 fn is_valid_empty_suffix_stem_end(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{3041}'..='\u{3096}'
-            | '\u{30A1}'..='\u{30FA}'
-            | '\u{3400}'..='\u{4DBF}'
-            | '\u{4E00}'..='\u{9FFF}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{20000}'..='\u{323AF}'
-    )
+    matches!(ch, '\u{3041}'..='\u{3096}' | '\u{30A1}'..='\u{30FA}')
+        || crate::normalize::is_cjk_ideograph(ch)
 }
 
 fn format_derivation(derivations: &[WordForm]) -> String {
@@ -370,11 +427,12 @@ fn deconjugate_recursive(
     derivations: &[WordForm],
     caus_sub: u8,
     depth: usize,
+    max_results: usize,
     results: &mut Vec<ConjugationInfo>,
     seen: &mut HashSet<(String, Vec<WordForm>)>,
     index: &RuleIndex,
 ) {
-    if depth >= MAX_DEPTH || word.is_empty() {
+    if depth >= MAX_DEPTH || word.is_empty() || results.len() >= max_results {
         return;
     }
     let current_type = derivations.first().copied().unwrap_or(WordForm::Any);
@@ -382,6 +440,9 @@ fn deconjugate_recursive(
     let allow_empty_suffix = last_char.is_some_and(is_valid_empty_suffix_stem_end);
 
     index.for_each_matching_rule(current_type, last_char, allow_empty_suffix, |rule| {
+        if results.len() >= max_results {
+            return;
+        }
         if rule.conjugated_type == WordForm::Causative {
             let active = if current_type == WordForm::Any {
                 SUB_CAUS_LONG
@@ -421,13 +482,16 @@ fn deconjugate_recursive(
                 base,
                 derivations: chain,
             });
-            if depth + 1 >= MAX_DEPTH {
+            if depth + 1 >= MAX_DEPTH || results.len() >= max_results {
                 return;
             }
             // Emit the terminal result first, then re-enter the original parent
             // with the silent rule's base type (not the terminal child).
             if let Some(silent_rules) = index.silent_by_form.get(&rule.base_type) {
                 for &silent_rule in silent_rules {
+                    if results.len() >= max_results {
+                        break;
+                    }
                     if rule.base_type == WordForm::GodanVerb
                         && (rule.v5_out & silent_rule.required_v5_sub) == 0
                     {
@@ -447,6 +511,7 @@ fn deconjugate_recursive(
                             &derived_chain,
                             silent_rule.caus_sub,
                             depth + 1,
+                            max_results,
                             results,
                             seen,
                             index,
@@ -465,6 +530,7 @@ fn deconjugate_recursive(
                 &chain,
                 next_caus,
                 depth + 1,
+                max_results,
                 results,
                 seen,
                 index,
@@ -486,14 +552,37 @@ fn deconjugate_prefix_str(
     index: &RuleIndex,
 ) {
     seen.clear();
-    if conjugated.chars().any(is_regex_whitespace_char) {
-        let word: String = conjugated
+    let trimmed = conjugated.trim_start();
+    if trimmed.is_empty() || results.len() >= MAX_TOTAL_RESULTS {
+        return;
+    }
+    let max_results = (results.len() + MAX_RESULTS_PER_PREFIX).min(MAX_TOTAL_RESULTS);
+    if trimmed.chars().any(is_regex_whitespace_char) {
+        let word: String = trimmed
             .chars()
             .filter(|&c| !is_regex_whitespace_char(c))
             .collect();
-        deconjugate_recursive(&word, &[], SUB_CAUS_LONG, 0, results, seen, index);
+        deconjugate_recursive(
+            &word,
+            &[],
+            SUB_CAUS_LONG,
+            0,
+            max_results,
+            results,
+            seen,
+            index,
+        );
     } else {
-        deconjugate_recursive(conjugated, &[], SUB_CAUS_LONG, 0, results, seen, index);
+        deconjugate_recursive(
+            trimmed,
+            &[],
+            SUB_CAUS_LONG,
+            0,
+            max_results,
+            results,
+            seen,
+            index,
+        );
     }
 }
 
@@ -505,8 +594,8 @@ pub fn deconjugate_str(query: &str, sentence_mode: bool) -> Vec<ConjugationInfo>
     let mut seen: HashSet<(String, Vec<WordForm>)> = HashSet::new();
 
     if sentence_mode {
-        let mut conjugated = query.to_owned();
-        while !conjugated.is_empty() {
+        let mut conjugated = query.trim_start().to_owned();
+        while !conjugated.is_empty() && results.len() < MAX_TOTAL_RESULTS {
             deconjugate_prefix_str(&conjugated, &mut results, &mut seen, index);
             conjugated.pop();
             while conjugated.chars().next_back().is_some_and(is_regex_whitespace_char) {
@@ -530,6 +619,10 @@ mod tests {
             .collect()
     }
 
+    fn has_base(input: &str, expected_base: &str, expected_form: WordForm) -> bool {
+        bases_for(input).contains(&(expected_base.to_owned(), expected_form))
+    }
+
     #[test]
     fn fixes_gu_chau_chimau_and_blocks_unvoiced_false_match() {
         let chau = bases_for("泳いじゃう");
@@ -549,22 +642,247 @@ mod tests {
 
     #[test]
     fn fixes_tou_kou_chimau_voiced_doru_and_kana_iku_geminates() {
-        assert!(bases_for("問うちまう").contains(&("問う".into(), WordForm::GodanVerb)));
-        assert!(bases_for("請うちまう").contains(&("請う".into(), WordForm::GodanVerb)));
-        assert!(bases_for("読んどる").contains(&("読む".into(), WordForm::GodanVerb)));
-        assert!(bases_for("読んどった").contains(&("読む".into(), WordForm::GodanVerb)));
-        assert!(bases_for("いっとく").contains(&("いく".into(), WordForm::GodanVerb)));
-        assert!(bases_for("いったり").contains(&("いく".into(), WordForm::GodanVerb)));
-        assert!(bases_for("いっちゃう").contains(&("いく".into(), WordForm::GodanVerb)));
-        assert!(bases_for("いっちまう").contains(&("いく".into(), WordForm::GodanVerb)));
+        assert!(has_base("問うちまう", "問う", WordForm::GodanVerb));
+        assert!(has_base("請うちまう", "請う", WordForm::GodanVerb));
+        assert!(has_base("読んどる", "読む", WordForm::GodanVerb));
+        assert!(has_base("読んどった", "読む", WordForm::GodanVerb));
+        assert!(has_base("いっとく", "いく", WordForm::GodanVerb));
+        assert!(has_base("いったり", "いく", WordForm::GodanVerb));
+        assert!(has_base("いっちゃう", "いく", WordForm::GodanVerb));
+        assert!(has_base("いっちまう", "いく", WordForm::GodanVerb));
+    }
+
+    #[test]
+    fn critical_c4_godan_and_all_verb_tara_dara_deconjugation() {
+        // Every Godan euphonic -たら/-だら class from C4 spec:
+        assert!(has_base("行ったら", "行く", WordForm::GodanVerb));
+        assert!(has_base("いったら", "いく", WordForm::GodanVerb));
+        assert!(has_base("飲んだら", "飲む", WordForm::GodanVerb));
+        assert!(has_base("書いたら", "書く", WordForm::GodanVerb));
+        assert!(has_base("泳いだら", "泳ぐ", WordForm::GodanVerb));
+        assert!(has_base("買ったら", "買う", WordForm::GodanVerb));
+        assert!(has_base("待ったら", "待つ", WordForm::GodanVerb));
+        assert!(has_base("取ったら", "取る", WordForm::GodanVerb));
+        assert!(has_base("話したら", "話す", WordForm::GodanVerb));
+        assert!(has_base("死んだら", "死ぬ", WordForm::GodanVerb));
+        assert!(has_base("遊んだら", "遊ぶ", WordForm::GodanVerb));
+        // Ichidan, Kuru, Suru, Zuru, Polite, Negative-tara:
+        assert!(has_base("食べたら", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("来たら", "来る", WordForm::KuruVerb));
+        assert!(has_base("きたら", "くる", WordForm::KuruVerb));
+        assert!(has_base("したら", "する", WordForm::SuruVerb));
+        assert!(has_base("論じたら", "論ずる", WordForm::ZuruVerb));
+        assert!(has_base("食べましたら", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べなかったら", "食べる", WordForm::IchidanVerb));
+        // Ungrammatical masu-stem `*書きたら` must NOT deconjugate to `書く`:
+        assert!(!has_base("書きたら", "書く", WordForm::GodanVerb));
+    }
+
+    #[test]
+    fn h6_4_ya_cha_nbakari_ntosuru_mu_mai_rules() {
+        // -ゃ (-ば contraction)
+        assert!(has_base("高けりゃ", "高い", WordForm::Adjective));
+        assert!(has_base("高きゃ", "高い", WordForm::Adjective));
+        assert!(has_base("食べなけりゃ", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("行きゃ", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べりゃ", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("くりゃ", "くる", WordForm::KuruVerb));
+        assert!(has_base("すりゃ", "する", WordForm::SuruVerb));
+        assert!(has_base("行かにゃ", "行く", WordForm::GodanVerb));
+        // -ちゃ / -じゃ (-ては / -では contraction)
+        assert!(has_base("食べちゃ", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("行っちゃ", "行く", WordForm::GodanVerb));
+        assert!(has_base("飲んじゃ", "飲む", WordForm::GodanVerb));
+        assert!(has_base("泳いじゃ", "泳ぐ", WordForm::GodanVerb));
+        assert!(!has_base("泳いちゃ", "泳ぐ", WordForm::GodanVerb));
+        assert!(has_base("食べなくちゃ", "食べる", WordForm::IchidanVerb));
+        // -んばかり
+        assert!(has_base("言わんばかり", "言う", WordForm::GodanVerb));
+        assert!(has_base("溢れんばかり", "溢れる", WordForm::IchidanVerb));
+        assert!(has_base("破裂せんばかり", "破裂する", WordForm::SuruVerb));
+        // -んとする (including conjugated `んとした` / `んとしている`)
+        assert!(has_base("言わんとする", "言う", WordForm::GodanVerb));
+        assert!(has_base("沈まんとした", "沈む", WordForm::GodanVerb));
+        assert!(has_base("消えんとしている", "消える", WordForm::IchidanVerb));
+        // -む (archaic volitional)
+        assert!(has_base("行かむ", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べむ", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("せむ", "する", WordForm::SuruVerb));
+        // -まい (negative volitional)
+        assert!(has_base("行くまい", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べるまい", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べまい", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("するまい", "する", WordForm::SuruVerb));
+        assert!(has_base("すまい", "する", WordForm::SuruVerb));
+        assert!(has_base("行きますまい", "行く", WordForm::GodanVerb));
+    }
+
+    #[test]
+    fn h6_4_historical_kana_ge_garu_yagaru_yashinai_sugiru_teoku() {
+        // -ふ & Historical Kana Orthography (Yomitan PR #2474 / #2501)
+        assert!(has_base("思ふ", "思う", WordForm::GodanVerb));
+        assert!(has_base("言ふ", "言う", WordForm::GodanVerb));
+        assert!(has_base("思ひます", "思う", WordForm::GodanVerb));
+        assert!(has_base("言ひました", "言う", WordForm::GodanVerb));
+        assert!(has_base("思はない", "思う", WordForm::GodanVerb));
+        assert!(has_base("思へば", "思う", WordForm::GodanVerb));
+        assert!(has_base("食べさう", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("高さう", "高い", WordForm::Adjective));
+        assert!(has_base("食べやう", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("行きませう", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べてゐる", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べてゐた", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("飲んでゐる", "飲む", WordForm::GodanVerb));
+        assert!(has_base("食べてしまふ", "食べる", WordForm::IchidanVerb));
+        // -げ, -がる, -やがる (PR #2333), -やしない/-やしません (PR #2500)
+        assert!(has_base("悲しげ", "悲しい", WordForm::Adjective));
+        assert!(has_base("寒がる", "寒い", WordForm::Adjective));
+        assert!(has_base("寒がった", "寒い", WordForm::Adjective));
+        assert!(has_base("食べたがる", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べたがっていた", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べやがる", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("逃げやがった", "逃げる", WordForm::IchidanVerb));
+        assert!(has_base("飲んでやがった", "飲む", WordForm::GodanVerb));
+        assert!(has_base("食べやしない", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("行きやしません", "行く", WordForm::GodanVerb));
+        assert!(has_base("行きやしませんでした", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べやしなかった", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("分かりゃしない", "分かる", WordForm::GodanVerb));
+        // -過ぎる (kanji form) & full -ておく / -でおく
+        assert!(has_base("食べ過ぎる", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べ過ぎた", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("高過ぎる", "高い", WordForm::Adjective));
+        assert!(has_base("食べておく", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("買っておいた", "買う", WordForm::GodanVerb));
+        assert!(has_base("飲んでおきます", "飲む", WordForm::GodanVerb));
+        assert!(has_base("書いて置く", "書く", WordForm::GodanVerb));
+    }
+
+    #[test]
+    fn h6_4_slang_kansai_honorific_irregulars_zuru_and_adj_e() {
+        // Volitional slang, n-slang, imperative negative slang
+        assert!(has_base("食べよっか", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("買おっか", "買う", WordForm::GodanVerb));
+        assert!(has_base("行こっか", "行く", WordForm::GodanVerb));
+        assert!(has_base("こっか", "くる", WordForm::KuruVerb));
+        assert!(has_base("帰んなさい", "帰る", WordForm::GodanVerb));
+        assert!(has_base("食べらんない", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べらんなかった", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("わかんない", "わかる", WordForm::GodanVerb));
+        assert!(has_base("わかんなきゃ", "わかる", WordForm::GodanVerb));
+        assert!(has_base("わかんなかった", "わかる", WordForm::GodanVerb));
+        assert!(has_base("食べてん", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("見んな", "見る", WordForm::IchidanVerb));
+        assert!(has_base("すんな", "する", WordForm::SuruVerb));
+        assert!(has_base("来んな", "来る", WordForm::KuruVerb));
+        assert!(has_base("触んな", "触る", WordForm::GodanVerb));
+
+        // All 8 Kansai-ben groups
+        assert!(has_base("行かへん", "行く", WordForm::GodanVerb));
+        assert!(has_base("食べへん", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べひん", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("せえへん", "する", WordForm::SuruVerb));
+        assert!(has_base("行かへんかった", "行く", WordForm::GodanVerb));
+        assert!(has_base("せえへんかった", "する", WordForm::SuruVerb));
+        assert!(has_base("食べひんかったら", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べられへん", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("書けへん", "書く", WordForm::GodanVerb));
+        assert!(has_base("見いひん", "見る", WordForm::IchidanVerb));
+        assert!(has_base("寝えへん", "寝る", WordForm::IchidanVerb));
+        assert!(has_base("こおへん", "くる", WordForm::KuruVerb));
+        assert!(has_base("きいひん", "くる", WordForm::KuruVerb));
+        assert!(has_base("忘れてもうた", "忘れる", WordForm::IchidanVerb));
+        assert!(has_base("こうて", "かう", WordForm::GodanVerb));
+        assert!(has_base("こうてる", "かう", WordForm::GodanVerb));
+        assert!(has_base("おうた", "あう", WordForm::GodanVerb));
+        assert!(has_base("ゆうたら", "いう", WordForm::GodanVerb));
+        assert!(has_base("ゆうたり", "いう", WordForm::GodanVerb));
+        assert!(has_base("買うて", "買う", WordForm::GodanVerb));
+        assert!(has_base("よう", "よい", WordForm::Adjective));
+        assert!(has_base("しゅうて", "しい", WordForm::Adjective));
+        assert!(has_base("嬉しゅうて", "嬉しい", WordForm::Adjective));
+        assert!(has_base("おいしゅうて", "おいしい", WordForm::Adjective));
+        assert!(has_base("たこうない", "たかい", WordForm::Adjective));
+        assert!(has_base("たこうなかった", "たかい", WordForm::Adjective));
+        assert!(has_base("こうない", "こい", WordForm::Adjective));
+        assert!(has_base("食べとうない", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("食べていらっしゃいます", "食べる", WordForm::IchidanVerb));
+
+        // Special honorific -ます verbs (PR #2324)
+        assert!(has_base("いらっしゃいます", "いらっしゃる", WordForm::GodanVerb));
+        assert!(has_base("いらっしゃいませ", "いらっしゃる", WordForm::GodanVerb));
+        assert!(has_base("ございます", "ござる", WordForm::GodanVerb));
+        assert!(has_base("ございました", "ござる", WordForm::GodanVerb));
+        assert!(has_base("なさいます", "なさる", WordForm::GodanVerb));
+        assert!(has_base("くださいます", "くださる", WordForm::GodanVerb));
+        assert!(has_base("下さいます", "下さる", WordForm::GodanVerb));
+        assert!(has_base("おっしゃいます", "おっしゃる", WordForm::GodanVerb));
+        assert!(has_base("仰います", "仰る", WordForm::GodanVerb));
+
+        // Missing irregular -て/-た/-たら/-たり verbs
+        assert!(has_base("逝った", "逝く", WordForm::GodanVerb));
+        assert!(has_base("逝って", "逝く", WordForm::GodanVerb));
+        assert!(has_base("逝ったら", "逝く", WordForm::GodanVerb));
+        assert!(has_base("往った", "往く", WordForm::GodanVerb));
+        assert!(has_base("乞うて", "乞う", WordForm::GodanVerb));
+        assert!(has_base("恋うた", "恋う", WordForm::GodanVerb));
+        assert!(has_base("訪うたら", "訪う", WordForm::GodanVerb));
+        assert!(has_base("宣うた", "宣う", WordForm::GodanVerb));
+        assert!(has_base("のたまうて", "のたまう", WordForm::GodanVerb));
+        assert!(has_base("曰うた", "曰う", WordForm::GodanVerb));
+        assert!(has_base("給うて", "給う", WordForm::GodanVerb));
+        assert!(has_base("たまうた", "たまう", WordForm::GodanVerb));
+        assert!(has_base("賜うたら", "賜う", WordForm::GodanVerb));
+        assert!(has_base("揺蕩うて", "揺蕩う", WordForm::GodanVerb));
+        assert!(has_base("たゆたうたり", "たゆたう", WordForm::GodanVerb));
+
+        // Zuru verbs (vz)
+        assert!(has_base("論じた", "論ずる", WordForm::ZuruVerb));
+        assert!(has_base("論じて", "論ずる", WordForm::ZuruVerb));
+        assert!(has_base("論ずれば", "論ずる", WordForm::ZuruVerb));
+        assert!(has_base("論ぜず", "論ずる", WordForm::ZuruVerb));
+        assert!(has_base("信ぜられる", "信ずる", WordForm::ZuruVerb));
+        assert!(has_base("生じます", "生ずる", WordForm::ZuruVerb));
+        assert!(has_base("論ぜよ", "論ずる", WordForm::ZuruVerb));
+
+        // Full 42-rule i-adjective -え / -い slang table
+        assert!(has_base("すげえ", "すごい", WordForm::Adjective));
+        assert!(has_base("すげぇ", "すごい", WordForm::Adjective));
+        assert!(has_base("すげー", "すごい", WordForm::Adjective));
+        assert!(has_base("うぜえ", "うざい", WordForm::Adjective));
+        assert!(has_base("だりい", "だるい", WordForm::Adjective));
+        assert!(has_base("さみい", "さむい", WordForm::Adjective));
+        assert!(has_base("うめえ", "うまい", WordForm::Adjective));
+        assert!(has_base("やべえ", "やばい", WordForm::Adjective));
+        assert!(has_base("たけえ", "たかい", WordForm::Adjective));
+        assert!(has_base("おもしれえ", "おもしろい", WordForm::Adjective));
+        assert!(has_base("つええ", "つよい", WordForm::Adjective));
+        assert!(has_base("あちい", "あつい", WordForm::Adjective));
+        assert!(has_base("わりい", "わるい", WordForm::Adjective));
+        assert!(has_base("かっこよかった", "かっこいい", WordForm::Adjective));
+    }
+
+    #[test]
+    fn yomitan_1411_matta_nda_never_deconjugates_to_false_negative_matan() {
+        let collapsed = crate::normalize::collapse_emphatic_sequences("待ったんだ", true);
+        let hits = deconjugate_str(&collapsed.text, true);
+        assert!(hits
+            .iter()
+            .any(|i| i.base == "待つ" && i.derivations.contains(&WordForm::Past)));
+        assert!(
+            !hits
+                .iter()
+                .any(|i| i.base == "待つ" && i.derivations.contains(&WordForm::ColloquialNegative)),
+            "Yomitan #1411 regression: 待ったんだ must never produce colloquial negative 待たん"
+        );
     }
 
     #[test]
     fn enforces_yomitan_sasu_passive_subconditions() {
-        assert!(bases_for("食べさせられた").contains(&("食べる".into(), WordForm::IchidanVerb)));
-        assert!(bases_for("書かされた").contains(&("書く".into(), WordForm::GodanVerb)));
-        assert!(bases_for("読まされた").contains(&("読む".into(), WordForm::GodanVerb)));
-        assert!(bases_for("食べさした").contains(&("食べる".into(), WordForm::IchidanVerb)));
+        assert!(has_base("食べさせられた", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("書かされた", "書く", WordForm::GodanVerb));
+        assert!(has_base("読まされた", "読む", WordForm::GodanVerb));
+        assert!(has_base("食べさした", "食べる", WordForm::IchidanVerb));
 
         assert!(!bases_for("食べされる").iter().any(|(b, _)| b == "食べる"));
         assert!(!bases_for("食べされた").iter().any(|(b, _)| b == "食べる"));
@@ -585,7 +903,26 @@ mod tests {
         assert!(bases_for("。").is_empty());
         assert!(bases_for("hello").is_empty());
         assert!(bases_for("123").is_empty());
-        assert!(bases_for("食べ").contains(&("食べる".into(), WordForm::IchidanVerb)));
+        assert!(has_base("食べ", "食べる", WordForm::IchidanVerb));
+        // CJK Extension J stem works cleanly (PR #2504 / #2522):
+        let ext_j_stem = "\u{323B0}";
+        assert!(has_base(ext_j_stem, "\u{323B0}る", WordForm::IchidanVerb));
+    }
+
+    #[test]
+    fn pr_2506_leading_whitespace_is_trimmed_and_2153_candidate_explosion_is_capped() {
+        // PR #2506: ASCII and fullwidth leading whitespace trimmed cleanly
+        assert!(has_base("  \t食べた", "食べる", WordForm::IchidanVerb));
+        assert!(has_base("　食べた", "食べる", WordForm::IchidanVerb));
+        assert!(deconjugate_str("　行ったら", true)
+            .iter()
+            .any(|i| i.base == "行く" && i.derivations.contains(&WordForm::Tara)));
+
+        // #2153: high-frequency hiragana query stays fast and bounded
+        let started = std::time::Instant::now();
+        let nagara = deconjugate_str("ながらながらながらながら", true);
+        assert!(nagara.len() <= MAX_TOTAL_RESULTS);
+        assert!(started.elapsed().as_millis() < 200);
     }
 
     #[test]

@@ -1,7 +1,16 @@
-//! Pure search controller sorting, deduplication, cloze slicing, and model move planning.
+//! Pure search controller sorting, deduplication, cloze slicing, model move planning,
+//! custom text replacement patterns (H6.5), wildcard detection/escaping (H6.2), and
+//! candidate explosion capping (#2153).
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+
+use regex::RegexBuilder;
+use serde::{Deserialize, Serialize};
+
+/// Default hard cap on deduplicated search query candidates to prevent candidate explosion
+/// on high-frequency hiragana inputs (Yomitan #2153).
+pub const MAX_CANDIDATE_QUERIES: usize = 256;
 
 /// Source origin of a search query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -52,7 +61,7 @@ pub fn sort_queries(queries: &mut [CandidateSearchQuery]) {
 
 /// Filter candidate queries:
 /// 1. If mecab_enabled: removes Mecab queries if any Deconj query has the same deconj string.
-/// 2. Deduplicates consecutive queries with identical (deconj, rule_mask), keeping the first.
+/// 2. Deduplicates queries with identical `(deconj, rule_mask)`, keeping the first occurrence.
 /// 3. Removes queries with empty deconj.
 pub fn filter_duplicates(queries: &mut Vec<CandidateSearchQuery>, mecab_enabled: bool) {
     if mecab_enabled
@@ -68,10 +77,28 @@ pub fn filter_duplicates(queries: &mut Vec<CandidateSearchQuery>, mecab_enabled:
         queries.retain(|q| !(q.source == QuerySource::Mecab && deconj_set.contains(q.deconj)));
     }
 
-    // std::unique in C++ keeps the first element of each consecutive group with equal key.
-    queries.dedup_by(|a, b| a.deconj == b.deconj && a.rule_mask == b.rule_mask);
+    let mut seen: HashSet<(&[u16], u8)> = HashSet::with_capacity(queries.len());
+    queries.retain(|q| !q.deconj.is_empty() && seen.insert((q.deconj, q.rule_mask)));
+}
 
-    queries.retain(|q| !q.deconj.is_empty());
+/// Deduplicates and caps candidate queries to at most `max_candidates` (preserving
+/// longest `surface_len` candidates first when capping) so high-frequency hiragana queries
+/// cannot explode search latency (Yomitan #2153).
+pub fn cap_and_dedup_queries(
+    queries: &mut Vec<CandidateSearchQuery>,
+    mecab_enabled: bool,
+    max_candidates: usize,
+) {
+    filter_duplicates(queries, mecab_enabled);
+    if queries.len() > max_candidates {
+        queries.sort_by(|a, b| {
+            b.surface_len
+                .cmp(&a.surface_len)
+                .then_with(|| a.source.to_u8().cmp(&b.source.to_u8()))
+                .then_with(|| a.original_index.cmp(&b.original_index))
+        });
+        queries.truncate(max_candidates);
+    }
 }
 
 /// Sort and deduplicate queries, returning the surviving original indices in sorted order.
@@ -82,6 +109,196 @@ pub fn sort_and_filter_queries(
     sort_queries(&mut queries);
     filter_duplicates(&mut queries, mecab_enabled);
     queries.into_iter().map(|q| q.original_index).collect()
+}
+
+/// A single Yomitan-compatible custom regex text replacement rule (H6.5).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextReplacementRule {
+    pub pattern: String,
+    pub replacement: String,
+    pub ignore_case: bool,
+    pub enabled: bool,
+}
+
+/// Ordered set of custom text replacement rules with Yomitan's `search_original` toggle (H6.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextReplacementOptions {
+    pub rules: Vec<TextReplacementRule>,
+    pub search_original: bool,
+}
+
+impl Default for TextReplacementOptions {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            search_original: true,
+        }
+    }
+}
+
+/// Applies ordered enabled regex replacements from `options` to `text`.
+///
+/// - Invalid or empty regex patterns are gracefully skipped.
+/// - Rules are chained sequentially so rule `i+1` operates on the output of rule `i`.
+/// - When `options.search_original` is `true`, both the original string and the transformed
+///   string (if changed and non-empty) are returned, deduplicated.
+/// - When `options.search_original` is `false`, only the transformed string is returned
+///   (or empty `Vec` if the transformed string is empty).
+#[must_use]
+pub fn apply_text_replacements(text: &str, options: &TextReplacementOptions) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut current = text.to_owned();
+    for rule in &options.rules {
+        if !rule.enabled || rule.pattern.is_empty() {
+            continue;
+        }
+        let Ok(re) = RegexBuilder::new(&rule.pattern)
+            .case_insensitive(rule.ignore_case)
+            .build()
+        else {
+            continue;
+        };
+        if let std::borrow::Cow::Owned(replaced) = re.replace_all(&current, rule.replacement.as_str())
+        {
+            current = replaced;
+        }
+    }
+
+    let mut out = Vec::with_capacity(2);
+    if options.search_original {
+        out.push(text.to_owned());
+        if !current.is_empty() && current != text {
+            out.push(current);
+        }
+    } else if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Returns `true` if `query` contains any ASCII or fullwidth wildcard character
+/// (`*`, `?`, `＊`, `？`) for Yomitan-compatible wildcard search (H6.2).
+#[must_use]
+pub fn has_wildcard_chars(query: &str) -> bool {
+    query
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '＊' | '？'))
+}
+
+/// Returns the literal UTF-8 prefix before the first wildcard character (`*`, `?`, `＊`, `？`),
+/// or the entire string if no wildcard character is present.
+#[must_use]
+pub fn wildcard_literal_prefix(query: &str) -> &str {
+    match query.find(['*', '?', '＊', '？']) {
+        Some(idx) => &query[..idx],
+        None => query,
+    }
+}
+
+/// Converts a user wildcard query (`*`/`＊` = zero or more chars, `?`/`？` = single char)
+/// into a SQL `LIKE ... ESCAPE '\'` pattern, safely escaping literal `\`, `%`, and `_`
+/// and collapsing consecutive `%` wildcards.
+#[must_use]
+pub fn wildcard_to_like_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 4);
+    let mut prev_percent = false;
+    for ch in query.chars() {
+        match ch {
+            '*' | '＊' => {
+                if !prev_percent {
+                    pattern.push('%');
+                    prev_percent = true;
+                }
+            }
+            '?' | '？' => {
+                pattern.push('_');
+                prev_percent = false;
+            }
+            '\\' | '%' | '_' => {
+                pattern.push('\\');
+                pattern.push(ch);
+                prev_percent = false;
+            }
+            other => {
+                pattern.push(other);
+                prev_percent = false;
+            }
+        }
+    }
+    pattern
+}
+
+/// Stateful search controller helper managing custom text replacement options,
+/// wildcard query detection, leading-whitespace trimming (PR #2506), and bounded
+/// candidate generation (#2153).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchController {
+    replacement_options: TextReplacementOptions,
+}
+
+impl SearchController {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_text_replacements(replacement_options: TextReplacementOptions) -> Self {
+        Self {
+            replacement_options,
+        }
+    }
+
+    #[must_use]
+    pub fn text_replacement_options(&self) -> &TextReplacementOptions {
+        &self.replacement_options
+    }
+
+    pub fn set_text_replacement_options(&mut self, options: TextReplacementOptions) {
+        self.replacement_options = options;
+    }
+
+    /// Applies configured custom text replacement patterns to `text`.
+    #[must_use]
+    pub fn apply_text_replacements(&self, text: &str) -> Vec<String> {
+        apply_text_replacements(text, &self.replacement_options)
+    }
+
+    /// Detects whether a manual search query should use wildcard search (`*`, `?`, `＊`, `？`).
+    #[must_use]
+    pub fn is_wildcard_query(&self, query: &str) -> bool {
+        has_wildcard_chars(query)
+    }
+
+    /// Trims leading whitespace (PR #2506), applies configured custom text replacements,
+    /// expands Yomitan normalization variants, deduplicates, and caps at [`MAX_CANDIDATE_QUERIES`].
+    #[must_use]
+    pub fn prepare_query_candidates(&self, raw_query: &str) -> Vec<String> {
+        let trimmed = crate::normalize::trim_leading_whitespace(raw_query);
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let seeds = self.apply_text_replacements(trimmed);
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for seed in seeds {
+            if out.len() >= MAX_CANDIDATE_QUERIES {
+                break;
+            }
+            for variant in crate::normalize::expand_query_variants(&seed) {
+                if out.len() >= MAX_CANDIDATE_QUERIES {
+                    break;
+                }
+                if seen.insert(variant.clone()) {
+                    out.push(variant);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Cloze span offsets and lengths matching QString::left/mid/right.
@@ -428,5 +645,126 @@ mod tests {
         assert_eq!(plan_move(1, 5, 5), None);
         assert_eq!(plan_move(1, 3, 5), Some(4)); // to > from => to + 1
         assert_eq!(plan_move(3, 1, 5), Some(1)); // to <= from => to
+    }
+
+    #[test]
+    fn custom_text_replacement_patterns_respect_order_flags_and_search_original() {
+        let opts = TextReplacementOptions {
+            rules: vec![
+                TextReplacementRule {
+                    pattern: r"\[[^\]]*\]".to_owned(),
+                    replacement: String::new(),
+                    ignore_case: false,
+                    enabled: true,
+                },
+                TextReplacementRule {
+                    pattern: "disabled".to_owned(),
+                    replacement: "NOPE".to_owned(),
+                    ignore_case: true,
+                    enabled: false,
+                },
+                TextReplacementRule {
+                    pattern: "[invalid".to_owned(),
+                    replacement: "NOPE".to_owned(),
+                    ignore_case: false,
+                    enabled: true,
+                },
+                TextReplacementRule {
+                    pattern: "abc".to_owned(),
+                    replacement: "食べる".to_owned(),
+                    ignore_case: true,
+                    enabled: true,
+                },
+            ],
+            search_original: true,
+        };
+
+        let with_orig = apply_text_replacements("[note]ABC", &opts);
+        assert_eq!(with_orig, vec!["[note]ABC".to_owned(), "食べる".to_owned()]);
+
+        let opts_no_orig = TextReplacementOptions {
+            search_original: false,
+            ..opts.clone()
+        };
+        let replaced_only = apply_text_replacements("[note]ABC", &opts_no_orig);
+        assert_eq!(replaced_only, vec!["食べる".to_owned()]);
+
+        // Chained rules: rule 2 sees output of rule 1
+        let chained = TextReplacementOptions {
+            rules: vec![
+                TextReplacementRule {
+                    pattern: "foo".to_owned(),
+                    replacement: "bar".to_owned(),
+                    ignore_case: false,
+                    enabled: true,
+                },
+                TextReplacementRule {
+                    pattern: "bar".to_owned(),
+                    replacement: "baz".to_owned(),
+                    ignore_case: false,
+                    enabled: true,
+                },
+            ],
+            search_original: false,
+        };
+        assert_eq!(
+            apply_text_replacements("foo", &chained),
+            vec!["baz".to_owned()]
+        );
+
+        let controller = SearchController::with_text_replacements(opts_no_orig);
+        let candidates = controller.prepare_query_candidates("  　[note]ABC");
+        assert!(candidates.contains(&"食べる".to_owned()));
+        assert!(!candidates.iter().any(|c| c.starts_with(char::is_whitespace)));
+    }
+
+    #[test]
+    fn wildcard_detection_prefix_and_like_escaping_are_utf8_safe() {
+        assert!(has_wildcard_chars("食べ*"));
+        assert!(has_wildcard_chars("食べ？"));
+        assert!(has_wildcard_chars("＊べる"));
+        assert!(has_wildcard_chars("た?る"));
+        assert!(!has_wildcard_chars("食べる"));
+
+        assert_eq!(wildcard_literal_prefix("食べ*"), "食べ");
+        assert_eq!(wildcard_literal_prefix("＊べる"), "");
+        assert_eq!(wildcard_literal_prefix("食べる"), "食べる");
+        assert_eq!(wildcard_literal_prefix("\u{323B0}\u{31350}＊"), "\u{323B0}\u{31350}");
+
+        // Escapes SQL LIKE metacharacters (%, _, \) and converts */＊->% and ?/？->_
+        assert_eq!(wildcard_to_like_pattern("100%_a\\b*？**"), r"100\%\_a\\b%_%");
+        assert_eq!(wildcard_to_like_pattern("食＊べ？"), "食%べ_");
+    }
+
+    #[test]
+    fn cap_and_dedup_queries_bounds_candidate_explosion_2153() {
+        let keys: Vec<Vec<u16>> = (0..400u16)
+            .map(|i| vec![0x3042 + (i % 60), 0x3042 + (i / 60)])
+            .collect();
+        let mut queries: Vec<CandidateSearchQuery<'_>> = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, k)| CandidateSearchQuery {
+                original_index: idx,
+                deconj: k.as_slice(),
+                surface_len: (idx % 10 + 1) as u64,
+                rule_mask: 1,
+                source: QuerySource::Deconj,
+            })
+            .collect();
+        // Inject non-consecutive duplicate of index 0
+        queries.push(CandidateSearchQuery {
+            original_index: 999,
+            deconj: keys[0].as_slice(),
+            surface_len: 1,
+            rule_mask: 1,
+            source: QuerySource::Deconj,
+        });
+
+        cap_and_dedup_queries(&mut queries, false, 64);
+        assert_eq!(queries.len(), 64);
+        assert!(!queries.iter().any(|q| q.original_index == 999));
+        // Longest surface_len candidates are prioritized when capping
+        assert_eq!(queries[0].surface_len, 10);
     }
 }

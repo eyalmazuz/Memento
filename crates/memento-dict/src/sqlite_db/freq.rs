@@ -1,6 +1,9 @@
 //! Frequency blob decoding and C-locale `%g` float formatting.
 
-/// Parsed UTF-8 frequency value with homograph reading match info and raw numeric value.
+use super::FrequencyMode;
+
+/// Parsed UTF-8 frequency value with homograph reading match info, raw numeric value,
+/// and dictionary `frequency_mode` (Yomitan PR #2373/#2329).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedFreqUtf8 {
     pub matched: bool,
@@ -8,6 +11,7 @@ pub struct ParsedFreqUtf8 {
     pub has_reading_key: bool,
     pub display: String,
     pub numeric: Option<f64>,
+    pub frequency_mode: FrequencyMode,
 }
 
 fn parse_numeric_from_freq_text(text: &str) -> Option<f64> {
@@ -62,13 +66,32 @@ fn parse_numeric_from_freq_text(text: &str) -> Option<f64> {
 }
 
 /// Parses a `term_meta_bank` / `kanji_meta_bank` `freq` blob in UTF-8 with strict homograph
-/// reading matching and exact numeric extraction.
+/// reading matching and exact numeric extraction (defaulting `frequency_mode` to `RankBased`).
 #[must_use]
 pub fn parse_freq_blob_utf8(
     blob_type: i32,
     blob: &[u8],
     expression: &str,
     caller_reading: &str,
+) -> ParsedFreqUtf8 {
+    parse_freq_blob_with_mode_utf8(
+        blob_type,
+        blob,
+        expression,
+        caller_reading,
+        FrequencyMode::RankBased,
+    )
+}
+
+/// Parses a `term_meta_bank` / `kanji_meta_bank` `freq` blob in UTF-8 and tags the result with
+/// the owning dictionary's [`FrequencyMode`] (`rank-based` vs `occurrence-based`).
+#[must_use]
+pub fn parse_freq_blob_with_mode_utf8(
+    blob_type: i32,
+    blob: &[u8],
+    expression: &str,
+    caller_reading: &str,
+    frequency_mode: FrequencyMode,
 ) -> ParsedFreqUtf8 {
     match blob_type {
         1 => {
@@ -83,15 +106,22 @@ pub fn parse_freq_blob_utf8(
                         has_reading_key: false,
                         display: val.to_string(),
                         numeric: (val > 0).then_some(val as f64),
+                        frequency_mode,
                     };
                 }
             }
-            ParsedFreqUtf8::default()
+            ParsedFreqUtf8 {
+                frequency_mode,
+                ..ParsedFreqUtf8::default()
+            }
         }
         2 => {
             let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
             let Ok(s) = std::str::from_utf8(&blob[..null_pos]) else {
-                return ParsedFreqUtf8::default();
+                return ParsedFreqUtf8 {
+                    frequency_mode,
+                    ..ParsedFreqUtf8::default()
+                };
             };
             ParsedFreqUtf8 {
                 matched: true,
@@ -99,6 +129,7 @@ pub fn parse_freq_blob_utf8(
                 has_reading_key: false,
                 display: s.to_owned(),
                 numeric: parse_numeric_from_freq_text(s).filter(|&v| v > 0.0),
+                frequency_mode,
             }
         }
         3 => {
@@ -113,16 +144,23 @@ pub fn parse_freq_blob_utf8(
                         has_reading_key: false,
                         display: format_g(val, 6),
                         numeric: (val > 0.0).then_some(val),
+                        frequency_mode,
                     };
                 }
             }
-            ParsedFreqUtf8::default()
+            ParsedFreqUtf8 {
+                frequency_mode,
+                ..ParsedFreqUtf8::default()
+            }
         }
         4 => {
             let null_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
             let slice = &blob[..null_pos];
             let Ok(serde_json::Value::Object(obj)) = serde_json::from_slice(slice) else {
-                return ParsedFreqUtf8::default();
+                return ParsedFreqUtf8 {
+                    frequency_mode,
+                    ..ParsedFreqUtf8::default()
+                };
             };
 
             let meta_reading = obj.get("reading").and_then(|v| v.as_str());
@@ -136,6 +174,7 @@ pub fn parse_freq_blob_utf8(
             if !matched {
                 return ParsedFreqUtf8 {
                     has_reading_key,
+                    frequency_mode,
                     ..ParsedFreqUtf8::default()
                 };
             }
@@ -162,6 +201,7 @@ pub fn parse_freq_blob_utf8(
                     } else {
                         return ParsedFreqUtf8 {
                             has_reading_key,
+                            frequency_mode,
                             ..ParsedFreqUtf8::default()
                         };
                     }
@@ -188,9 +228,13 @@ pub fn parse_freq_blob_utf8(
                 has_reading_key,
                 display,
                 numeric,
+                frequency_mode,
             }
         }
-        _ => ParsedFreqUtf8::default(),
+        _ => ParsedFreqUtf8 {
+            frequency_mode,
+            ..ParsedFreqUtf8::default()
+        },
     }
 }
 

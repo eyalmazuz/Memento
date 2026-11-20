@@ -56,7 +56,7 @@ fn rule_for_info(info: &ConjugationInfo) -> u8 {
         Some(WordForm::KuruVerb) => RULE_VK,
         Some(WordForm::SuruVerb) => RULE_VS,
         Some(WordForm::Adjective) => RULE_ADJ_I,
-        Some(WordForm::IrregularVerb) => RULE_VZ,
+        Some(WordForm::ZuruVerb | WordForm::IrregularVerb) => RULE_VZ,
         _ => RULE_EMPTY,
     }
 }
@@ -208,5 +208,17 @@ mod tests {
         assert!(!rule_matches_entry(RULE_V1, 0));
         assert!(!rule_matches_entry(RULE_V1, RULE_V5));
         assert!(rule_matches_entry(RULE_V1 | RULE_V5, RULE_V5));
+    }
+
+    #[test]
+    fn zuru_verb_maps_to_rule_vz() {
+        let queries = generate_queries_single_str("論ずれば");
+        let target: Vec<u16> = "論ずる".encode_utf16().collect();
+        let found = queries
+            .iter()
+            .find(|q| q.deconj == target)
+            .expect("should deconjugate 論ずれば to 論ずる");
+        assert_ne!(found.rule_mask & RULE_VZ, 0);
+        assert!(rule_matches_entry(found.rule_mask, parse_rule_mask("vz")));
     }
 }
