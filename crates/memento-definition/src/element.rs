@@ -311,11 +311,13 @@ pub struct Context {
     pub resolved_css_values: HashMap<String, String>,
 
     /// Theme under which `resolved_css_values` entries were populated.
-    pub(crate) cached_css_theme: CssTheme,
+    #[doc(hidden)]
+    pub cached_css_theme: CssTheme,
 
     /// Raw pointer identity of the `ParsedStylesheet` under which
     /// `resolved_css_values` entries were populated.
-    pub(crate) cached_stylesheet_ptr: usize,
+    #[doc(hidden)]
+    pub cached_stylesheet_ptr: usize,
 
     /// Inherited href of the current structured anchor.
     pub link_href: String,
