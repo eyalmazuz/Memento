@@ -1,9 +1,16 @@
+import { Palette } from "std-widgets.slint";
 import { MementoPalette } from "palette.slint";
 import { ActionButton } from "components/buttons.slint";
-import { SettingsWindow } from "settings.slint";
+import {
+    SettingsWindow,
+    AnkiExcludedDictRow,
+    AnkiAutocompleteItem,
+    TextReplacementRow,
+} from "settings.slint";
 import { AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection } from "anki_help.slint";
 import {
-    PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
+    PitchMora, PitchGraph, RichPitchEntry, PopupFrequency, PopupFrequencyLine,
+    CompactFrequencyItem, CompactFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult,
     PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
     PopupLayout, YomitanPopup, NestedYomitanPopup, DictionarySearchPanel, PopupBridge,
@@ -16,12 +23,17 @@ import { SubEntry, PlayerTrack, ChapterMark } from "player/types.slint";
 import { PlayerOscBar } from "player/osc_bar.slint";
 import { TopMenuBar, MenuDropdown } from "player/menu_bar.slint";
 import { SubtitleDrawerPanel } from "player/subtitle_drawer.slint";
-import { AboutModal, OpenUrlModal } from "player/modals.slint";
+import { AboutModal, NoDictionariesModal, OpenUrlModal } from "player/modals.slint";
 
-export { MementoPalette, SettingsWindow, AnkiHelpWindow, HelpArgument, HelpMarker, HelpSection }
+export {
+    MementoPalette, SettingsWindow, AnkiHelpWindow,
+    HelpArgument, HelpMarker, HelpSection,
+    AnkiExcludedDictRow, AnkiAutocompleteItem, TextReplacementRow,
+}
 export { SubEntry, PlayerTrack, ChapterMark }
 export {
-    PitchMora, PitchGraph, PopupFrequency, PopupFrequencyLine,
+    PitchMora, PitchGraph, RichPitchEntry, PopupFrequency, PopupFrequencyLine,
+    CompactFrequencyItem, CompactFrequencyLine,
     PopupGlossaryBlock, PopupAudioSource, DictResult, PopupLayout,
     PopupDictStyle, PopupFreqStyle, DefinitionGridRow,
     PopupBridge,
@@ -40,6 +52,12 @@ export component MementoApp inherits Window {
     preferred-height: 720px;
     background: #000000;
 
+    in-out property <bool> is-light-theme <=> MementoPalette.light-mode;
+    in-out property <bool> drop-hover-active: false;
+    in-out property <string> drop-hover-label: "Drop media or subtitle files to open";
+    in-out property <string> status-toast-text: "";
+    in-out property <bool> status-toast-is-warning: false;
+    in-out property <string> audio-context-hud-text: "";
     in-out property <string> media-title: "";
     in-out property <bool> is-playing: false;
     in-out property <float> position: 0.0;
@@ -52,6 +70,8 @@ export component MementoApp inherits Window {
     in-out property <image> video-frame;
     in-out property <image> thumbnail-frame;
     in-out property <bool> preview-thumbnails-enabled: true;
+    in-out property <length> preview-box-width: 192px;
+    in-out property <length> preview-box-height: 108px;
     in-out property <string> hover-chapter-title: "";
     in-out property <[float]> chapters: [];
     in-out property <[ChapterMark]> chapter-marks: [];
@@ -75,6 +95,7 @@ export component MementoApp inherits Window {
     in-out property <length> sidebar-width: 360px;
     in-out property <float> sidebar-split-ratio: 0.45;
     in-out property <bool> is-fullscreen: false;
+    in-out property <bool> osc-enabled: true;
     in-out property <bool> osc-visible: true;
     in-out property <int> osc-visibility-mode: 0; // 0: Auto, 1: Hidden, 2: Visible
     in-out property <int> osc-duration-ms: 700;
@@ -124,18 +145,29 @@ export component MementoApp inherits Window {
     in-out property <bool> hover-pause-enabled: false;
     in-out property <[string]> recent-files: [];
     in-out property <[string]> recent-file-labels: [];
+    in-out property <[PlayerTrack]> video-tracks: [];
     in-out property <[PlayerTrack]> audio-tracks: [];
     in-out property <[PlayerTrack]> subtitle-tracks: [];
+    in-out property <int> video-id: 0;
     in-out property <int> audio-id: 0;
     in-out property <int> primary-sid: 0;
     in-out property <int> secondary-sid: 0;
+    in-out property <bool> has-secondary-subtitles: root.secondary-sid > 0 || root.secondary-subtitle-entries.length > 0;
+    in-out property <bool> can-increase-sub-size: root.subtitle-scale < 0.995;
+    in-out property <bool> can-decrease-sub-size: root.subtitle-scale > 0.006;
+    in-out property <bool> can-move-sub-up: root.subtitle-offset < 0.995;
+    in-out property <bool> can-move-sub-down: root.subtitle-offset > 0.001;
     in-out property <[string]> anki-profiles: [];
     in-out property <string> anki-profile: "";
     in-out property <bool> anki-enabled: false;
     in-out property <bool> show-anki-checkbox: true;
+    in-out property <bool> compact-glossaries <=> PopupBridge.compact-glossaries;
+    in-out property <bool> compact-tags <=> PopupBridge.compact-tags;
     in-out property <string> app-version: "";
+    in-out property <string> app-version-display: "";
     in-out property <string> key-open-file: "Ctrl+O";
     in-out property <string> key-open-url: "Ctrl+U";
+    in-out property <string> key-quit: "Ctrl+Q";
     in-out property <string> key-show-search: "Ctrl+R";
     in-out property <string> key-show-sub-list: "Ctrl+E";
     in-out property <string> key-start-ocr: "Ctrl+L";
@@ -167,6 +199,7 @@ export component MementoApp inherits Window {
     in-out property <[DictResult]> popup-results: [];
     in-out property <int> popup-loaded-count: 0;
     in-out property <int> popup-focused-index: 0;
+    in-out property <length> popup-target-scroll-y: 0px;
     in-out property <length> popup-configured-width: 480px;
     in-out property <length> popup-configured-height: 440px;
     out property <bool> popup-needs-more: yomi-card.needs-more;
@@ -182,6 +215,7 @@ export component MementoApp inherits Window {
     in-out property <bool> subtitle-drawer-user-scrolling <=> sub-drawer.user-scrolling;
     out property <length> subtitle-drawer-viewport-y: sub-drawer.viewport-y;
     in-out property <[PopupAudioSource]> popup-audio-sources: [];
+    in-out property <[int]> popup-audio-source-statuses <=> PopupBridge.audio-source-statuses;
     in-out property <bool> popup-audio-sources-loading: false;
     in-out property <int> popup-selected-audio-source: -1;
     in-out property <string> anki-added-note-id: "";
@@ -189,6 +223,7 @@ export component MementoApp inherits Window {
     in-out property <bool> about-open: false;
     in-out property <bool> url-dialog-open: false;
     in-out property <string> url-dialog-text: "";
+    in-out property <bool> no-dicts-dialog-open: false;
     in-out property <bool> update-dialog-open: false;
     in-out property <bool> update-dialog-opt-in: false;
     in-out property <string> update-dialog-title: "";
@@ -246,6 +281,7 @@ export component MementoApp inherits Window {
     callback quit-app();
     callback file-dropped(string);
     callback files-dropped([string]);
+    callback select-video-track(int);
     callback select-audio-track(int);
     callback select-subtitle-track(int);
     callback select-secondary-subtitle-track(int);
@@ -260,9 +296,14 @@ export component MementoApp inherits Window {
     callback toggle-subtitles();
     callback add-subtitle();
     callback adjust-sub-delay(float);
+    callback copy-subtitle-text(string);
+    callback clear-audio-context();
     callback start-ocr();
+    callback ocr-cancelled();
     callback ocr-region(float, float, float, float);
     callback open-config();
+    callback open-dict-settings();
+    callback dismiss-no-dicts-dialog();
     callback check-updates();
     callback update-opt-in-responded(bool);
     callback update-dialog-dismissed();
@@ -274,6 +315,8 @@ export component MementoApp inherits Window {
     callback video-wheel(float, float, float, float);
     callback osc-activity();
     callback select-row(int, bool);
+    callback subtitle-row-clicked-mod(int, int, bool, bool);
+    callback subtitle-row-lookup(int, int, int, length, length);
     callback select-subtitle-range(int, int, bool);
     callback mark-subtitle-row(int);
     callback search-subtitles(string);
@@ -295,9 +338,12 @@ export component MementoApp inherits Window {
     callback hover-word(string, int, bool, bool, bool, bool);
     callback toggle-definition-selection(int);
     callback toggle-term-collapse(int);
+    callback toggle-reading-as-expression(int);
     callback load-more-definition-results(bool);
     callback navigate-popup(int);
+    callback popup-viewport-scrolled(length);
     callback add-anki-note(int);
+    callback add-to-anki-with-audio(int, int);
     callback browse-anki-note(string);
     callback reset-definition-scroll();
     callback open-options();
@@ -332,6 +378,21 @@ export component MementoApp inherits Window {
         sub-drawer.focus-search();
     }
 
+    init => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
+
+    changed is-light-theme => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
+
+    changed ocr-mode => {
+        if root.ocr-mode {
+            menu-bar.open-menu = -1;
+            root.dismiss-definition();
+        }
+    }
+
     navigate-popup(direction) => {
         if direction > 0 {
             let count = root.popup-results.length;
@@ -341,16 +402,17 @@ export component MementoApp inherits Window {
             root.load-more-definition-results(true);
         } else {
             root.popup-focused-index = max(0, root.popup-focused-index - 1);
-            yomi-card.reset-scroll();
         }
     }
 
     reset-definition-scroll => {
         root.popup-focused-index = 0;
+        root.popup-target-scroll-y = 0px;
         yomi-card.reset-scroll();
     }
     pure callback format-timestamp(float) -> string;
 
+    private property <bool> suppress-next-mouse-up: false;
     property <bool> subtitle-hover-latched: false;
     property <bool> split-v-hovered: false;
     property <bool> non-subtitle-hovered:
@@ -364,13 +426,15 @@ export component MementoApp inherits Window {
         || root.menu-open
         || root.about-open
         || root.url-dialog-open
+        || root.no-dicts-dialog-open
         || root.update-dialog-open
         || root.ocr-mode;
     property <bool> ass-overlay-visible:
-        SubtitleOverlayBridge.ass-native-active
-        && (root.subtitle-cursor-show-enabled
-            ? root.primary-cursor-reveal
-            : root.subtitles-visible);
+        !root.ocr-mode
+        && SubtitleOverlayBridge.ass-native-active
+        && root.subtitles-visible
+        && !(root.hide-memento-while-playing && root.is-playing)
+        && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
     property <bool> primary-cursor-reveal:
         root.subtitle-cursor-show-enabled
         && (root.cursor-in-bottom-sub-zone
@@ -428,6 +492,11 @@ export component MementoApp inherits Window {
             f-scope.focus();
         }
     }
+    changed no-dicts-dialog-open => {
+        if !root.no-dicts-dialog-open {
+            f-scope.focus();
+        }
+    }
     changed sub-drawer-open => {
         if !root.sub-drawer-open {
             f-scope.focus();
@@ -468,6 +537,42 @@ export component MementoApp inherits Window {
     changed secondary-sid => {
         if root.secondary-sid == 0 && root.secondary-subtitle-entries.length == 0 && root.subtitle-drawer-tab == 1 {
             root.subtitle-drawer-tab = 0;
+        }
+    }
+
+    // ── Shared 500ms Hover Tooltip Timer (tags / derivations / action buttons) ──
+    property <int> popup-tooltip-timer-seq: PopupBridge.pending-tooltip-seq;
+    changed popup-tooltip-timer-seq => {
+        if PopupBridge.pending-tooltip-text != "" {
+            if PopupBridge.tooltip-hover-delay-ms > 0 {
+                popup-tooltip-timer.restart();
+            } else {
+                popup-tooltip-timer.running = false;
+                PopupBridge.show-tooltip(
+                    PopupBridge.pending-tooltip-text,
+                    PopupBridge.pending-tooltip-x,
+                    PopupBridge.pending-tooltip-y,
+                );
+                PopupBridge.pending-tooltip-text = "";
+            }
+        } else {
+            popup-tooltip-timer.running = false;
+        }
+    }
+
+    popup-tooltip-timer := Timer {
+        interval: max(1, PopupBridge.tooltip-hover-delay-ms) * 1ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if PopupBridge.pending-tooltip-text != "" {
+                PopupBridge.show-tooltip(
+                    PopupBridge.pending-tooltip-text,
+                    PopupBridge.pending-tooltip-x,
+                    PopupBridge.pending-tooltip-y,
+                );
+                PopupBridge.pending-tooltip-text = "";
+            }
         }
     }
 
@@ -554,7 +659,7 @@ export component MementoApp inherits Window {
             if (event.modifiers.control && !event.modifiers.shift && !event.modifiers.alt && !event.modifiers.meta
                 && (event.text == "d" || event.text == "D")) {
                 if (root.dict-open && root.anki-enabled && root.dict-results.length > 0) {
-                    root.add-anki-note(0);
+                    root.add-anki-note(max(0, root.popup-focused-index));
                 } else {
                     root.dict-search-open = !root.dict-search-open;
                 }
@@ -584,7 +689,8 @@ export component MementoApp inherits Window {
             }
             if (event.text == Key.Escape) {
                 if (menu-bar.open-menu >= 0) { menu-bar.open-menu = -1; return accept; }
-                if (root.ocr-mode) { root.ocr-mode = false; return accept; }
+                if (root.ocr-mode) { root.ocr-mode = false; root.ocr-cancelled(); return accept; }
+                if (root.no-dicts-dialog-open) { root.no-dicts-dialog-open = false; root.dismiss-no-dicts-dialog(); return accept; }
                 if (root.update-dialog-open) {
                     if (root.update-dialog-opt-in) {
                         root.update-opt-in-responded(false);
@@ -628,12 +734,12 @@ export component MementoApp inherits Window {
             padding-bottom: root.window-bottom-margin;
             spacing: 0;
 
-            // Top Native Menu Bar
+            // Top Native Menu Bar (hidden whenever OCR mode is active)
             menu-bar := TopMenuBar {
-                property <bool> target-visible: root.osc-visible || self.open-menu >= 0;
+                property <bool> target-visible: !root.ocr-mode && (root.osc-visible || self.open-menu >= 0);
                 opacity: self.target-visible ? 1.0 : 0.0;
                 animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
-                visible: self.target-visible || self.opacity > 0.01;
+                visible: !root.ocr-mode && (self.target-visible || self.opacity > 0.01);
                 activity => { root.osc-activity(); }
                 interacted => { root.dismiss-definition(); }
             }
@@ -663,10 +769,8 @@ export component MementoApp inherits Window {
                     video-motion := TouchArea {
                         width: 100%;
                         height: 100%;
-                        mouse-cursor: (root.cursor-hidden
-                            || (!root.osc-mpv-cursor && root.is-fullscreen && !root.osc-visible && !root.osc-hovered && !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open))
-                            ? none
-                            : default;
+                        // Windowed & fullscreen cursor auto-hide controlled uniformly by `root.cursor-hidden` (H3.4)
+                        mouse-cursor: root.cursor-hidden ? none : default;
                         changed has-hover => {
                             if !self.has-hover {
                                 root.cursor-in-top-sub-zone = false;
@@ -681,8 +785,8 @@ export component MementoApp inherits Window {
                                 root.cursor-hidden = false;
                                 if video-area.height > 0px {
                                     let y-ratio = self.mouse-y / video-area.height;
-                                    root.cursor-in-top-sub-zone = y-ratio >= 0.0 && y-ratio <= 0.20;
-                                    root.cursor-in-bottom-sub-zone = y-ratio >= 0.80 && y-ratio <= 1.0;
+                                    root.cursor-in-top-sub-zone = y-ratio >= 0.0 && y-ratio <= 0.25;
+                                    root.cursor-in-bottom-sub-zone = y-ratio >= 0.75 && y-ratio <= 1.0;
                                 } else {
                                     root.cursor-in-top-sub-zone = false;
                                     root.cursor-in-bottom-sub-zone = false;
@@ -699,28 +803,48 @@ export component MementoApp inherits Window {
                                     : event.button == PointerEventButton.middle ? 4
                                     : event.button == PointerEventButton.back ? 8
                                     : event.button == PointerEventButton.forward ? 16 : 0;
-                                let had-popup = root.dict-open;
                                 if event.kind == PointerEventKind.down {
+                                    let had-popup = root.dict-open;
                                     root.dismiss-definition();
-                                }
-                                if !had-popup && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open && btn > 0 {
-                                    root.video-pointer-button(
-                                        self.mouse-x / 1px,
-                                        self.mouse-y / 1px,
-                                        btn,
-                                        event.kind == PointerEventKind.down,
-                                        event.modifiers.control,
-                                        event.modifiers.shift,
-                                        event.modifiers.alt,
-                                        event.modifiers.meta
-                                    );
+                                    if had-popup {
+                                        // Suppress matching pointer-up so dismissing popup never emits an orphan keyup MOUSE_BTN0 to mpv (H3.2)
+                                        root.suppress-next-mouse-up = true;
+                                    } else if !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
+                                        root.suppress-next-mouse-up = false;
+                                        root.video-pointer-button(
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px,
+                                            btn,
+                                            true,
+                                            event.modifiers.control,
+                                            event.modifiers.shift,
+                                            event.modifiers.alt,
+                                            event.modifiers.meta
+                                        );
+                                    }
+                                } else {
+                                    if root.suppress-next-mouse-up {
+                                        root.suppress-next-mouse-up = false;
+                                    } else if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
+                                        root.video-pointer-button(
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px,
+                                            btn,
+                                            false,
+                                            event.modifiers.control,
+                                            event.modifiers.shift,
+                                            event.modifiers.alt,
+                                            event.modifiers.meta
+                                        );
+                                    }
                                 }
                             } else if event.kind == PointerEventKind.cancel {
+                                root.suppress-next-mouse-up = false;
                                 root.video-pointer-button(0.0, 0.0, 0, false, false, false, false, false);
                             }
                         }
                         scroll-event(event) => {
-                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.update-dialog-open {
+                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open {
                                 root.video-wheel(
                                     self.mouse-x / 1px,
                                     self.mouse-y / 1px,
@@ -731,10 +855,16 @@ export component MementoApp inherits Window {
                             }
                             reject
                         }
-                        double-clicked => { root.toggle-fullscreen(); }
+                        double-clicked => {
+                            // Only toggle fullscreen locally when Memento's built-in OSC is active;
+                            // when custom OSC is enabled (`osc-enabled == false`), mpv handles MBTN_LEFT_DBL via forwarded MOUSE_BTN0 (H3.2).
+                            if root.osc-enabled {
+                                root.toggle-fullscreen();
+                            }
+                        }
                     }
 
-                    // Branded Empty / Placeholder State
+                    // Branded Empty / Placeholder State (sits over #000000 canvas, uses OSC light foreground tokens)
                     if root.duration <= 0.0 : VerticalLayout {
                         alignment: center;
                         spacing: 14px;
@@ -752,13 +882,13 @@ export component MementoApp inherits Window {
                             text: "Memento";
                             font-size: 26px;
                             font-weight: 700;
-                            color: MementoPalette.text;
+                            color: MementoPalette.osc-text;
                             horizontal-alignment: center;
                         }
                         Text {
                             text: "Open a video file (Ctrl+O) or drag and drop media to start";
                             font-size: 13.5px;
-                            color: MementoPalette.text-secondary;
+                            color: MementoPalette.osc-text-secondary;
                             horizontal-alignment: center;
                         }
                         HorizontalLayout {
@@ -864,15 +994,15 @@ export component MementoApp inherits Window {
                                 width: max(ruby.width, ruby-txt.preferred-width + 6px);
                                 height: ruby-txt.preferred-height + 2px;
                                 border-radius: 3px;
-                                background: MementoPalette.scrim;
+                                background: MementoPalette.video-scrim;
                                 ruby-txt := Text {
                                     x: (parent.width - self.preferred-width) / 2;
                                     y: 1px;
                                     text: ruby.text;
                                     font-size: ruby.font-size;
                                     font-weight: 700;
-                                    font-family: "Noto Sans CJK JP";
-                                    color: MementoPalette.text;
+                                    font-family: SubtitleOverlayBridge.sub-font-family;
+                                    color: MementoPalette.osc-text;
                                     wrap: no-wrap;
                                 }
                             }
@@ -890,6 +1020,11 @@ export component MementoApp inherits Window {
                                     (hb.x + self.mouse-x) / 1px,
                                     (hb.y + self.mouse-y) / 1px
                                 );
+                            }
+                            double-clicked => {
+                                if root.active-sub-text != "" {
+                                    root.copy-subtitle-text(root.active-sub-text);
+                                }
                             }
                             pointer-event(event) => {
                                 let vx = (hb.x + self.mouse-x) / 1px;
@@ -936,50 +1071,85 @@ export component MementoApp inherits Window {
                     }
 
                     // Secondary Subtitles cleanly positioned at the top edge of the video viewport
+                    // Styled with user's `sub-*` font, size, color, stroke, bold/italic, and background (H3.7)
                     secondary-subtitle-box := Rectangle {
-                        visible: root.secondary-sub-text != ""
-                            && (root.secondary-subtitle-cursor-show-enabled
-                                ? root.secondary-cursor-reveal
-                                : (root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing)));
+                        property <length> stroke-w: clamp(SubtitleOverlayBridge.sub-stroke-width, 0.0, 4.0) * 1px;
+                        property <length> stroke-d: self.stroke-w * 0.707;
+                        property <int> sub-weight: SubtitleOverlayBridge.sub-font-bold ? 700 : 400;
+                        property <length> sub-size: video-area.height * root.subtitle-scale;
+                        visible: !root.ocr-mode
+                            && root.secondary-sub-text != ""
+                            && root.subtitles-visible
+                            && !(root.hide-memento-while-playing && root.is-playing)
+                            && (!root.secondary-subtitle-cursor-show-enabled || root.secondary-cursor-reveal);
                         x: (parent.width - self.width) / 2;
                         y: 12px;
                         width: min(parent.width - 40px, secondary-subtitle-text.preferred-width + 32px);
                         height: secondary-subtitle-text.preferred-height + 16px;
-                        background: #00000099;
+                        background: SubtitleOverlayBridge.rich-enabled
+                            ? SubtitleOverlayBridge.subtitle-bg-color
+                            : SubtitleOverlayBridge.sub-bg-color;
                         border-radius: 4px;
+
+                        // 8-direction outline stroke when `sub-stroke-width > 0`
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px - parent.stroke-w; y: 8px; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px + parent.stroke-w; y: 8px; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px; y: 8px - parent.stroke-w; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px; y: 8px + parent.stroke-w; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px - parent.stroke-d; y: 8px - parent.stroke-d; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px + parent.stroke-d; y: 8px - parent.stroke-d; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px - parent.stroke-d; y: 8px + parent.stroke-d; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+                        if SubtitleOverlayBridge.sub-stroke-width > 0.0 : Text { x: 16px + parent.stroke-d; y: 8px + parent.stroke-d; width: secondary-subtitle-text.width; text: root.secondary-sub-text; font-family: SubtitleOverlayBridge.sub-font-family; font-size: parent.sub-size; font-weight: parent.sub-weight; font-italic: SubtitleOverlayBridge.sub-font-italic; color: SubtitleOverlayBridge.sub-stroke-color; horizontal-alignment: center; wrap: word-wrap; }
+
                         secondary-subtitle-text := Text {
                             x: 16px;
                             y: 8px;
                             width: min(video-area.width - 72px, self.preferred-width);
                             text: root.secondary-sub-text;
-                            font-size: video-area.height * root.subtitle-scale;
-                            font-weight: 700;
-                            color: white;
+                            font-family: SubtitleOverlayBridge.sub-font-family;
+                            font-size: parent.sub-size;
+                            font-weight: parent.sub-weight;
+                            font-italic: SubtitleOverlayBridge.sub-font-italic;
+                            color: SubtitleOverlayBridge.sub-text-color;
                             horizontal-alignment: center;
                             wrap: word-wrap;
                         }
                         secondary-hover-area := TouchArea {
                             width: 100%;
                             height: 100%;
+                            double-clicked => {
+                                if root.secondary-sub-text != "" {
+                                    root.copy-subtitle-text(root.secondary-sub-text);
+                                }
+                            }
                         }
                     }
 
                     // Clickable primary subtitle tokens supply the search suffix at each token.
                     subtitle-box := Rectangle {
-                        visible: !SubtitleOverlayBridge.ass-native-active
+                        visible: !root.ocr-mode
+                            && !SubtitleOverlayBridge.ass-native-active
                             && root.active-sub-text != ""
-                            && (root.subtitle-cursor-show-enabled
-                                ? root.primary-cursor-reveal
-                                : (root.subtitles-visible && !(root.hide-memento-while-playing && root.is-playing)));
+                            && root.subtitles-visible
+                            && !(root.hide-memento-while-playing && root.is-playing)
+                            && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
                         x: (parent.width - self.width) / 2;
-                        y: max(10px, parent.height - self.height - max(62px, parent.height * root.subtitle-offset));
+                        // Allow subtitles all the way down to 4px bottom margin (removed 62px clamp — H3.7)
+                        y: max(4px, parent.height - self.height - max(4px, parent.height * root.subtitle-offset));
                         width: min(parent.width - 40px, subtitle-lines-layout.preferred-width + 32px);
                         height: subtitle-lines-layout.preferred-height + 16px;
-                        background: SubtitleOverlayBridge.rich-enabled ? SubtitleOverlayBridge.subtitle-bg-color : #00000099;
+                        background: SubtitleOverlayBridge.rich-enabled
+                            ? SubtitleOverlayBridge.subtitle-bg-color
+                            : SubtitleOverlayBridge.sub-bg-color;
                         border-radius: 4px;
                         subtitle-hover-area := TouchArea {
                             width: 100%;
                             height: 100%;
+                            double-clicked => {
+                                if root.active-sub-text != "" {
+                                    root.copy-subtitle-text(root.active-sub-text);
+                                }
+                            }
                         }
                         subtitle-lines-layout := VerticalLayout {
                             x: (parent.width - self.width) / 2;
@@ -1014,6 +1184,11 @@ export component MementoApp inherits Window {
                                         root.selected-token-index = word.index;
                                         root.hover-word("", word.index, false, false, false, false);
                                         root.lookup-word(word.query);
+                                    }
+                                    double-clicked => {
+                                        if root.active-sub-text != "" {
+                                            root.copy-subtitle-text(root.active-sub-text);
+                                        }
                                     }
                                 }
                             }
@@ -1058,6 +1233,8 @@ export component MementoApp inherits Window {
                         is-open: root.dict-open;
                         anki-enabled: root.anki-enabled;
                         show-anki-checkbox: root.show-anki-checkbox;
+                        compact-glossaries: root.compact-glossaries;
+                        compact-tags: root.compact-tags;
                         added-note-id: root.anki-added-note-id;
                         added-result-index: root.anki-added-result-index;
                         headword: root.dict-query;
@@ -1066,18 +1243,27 @@ export component MementoApp inherits Window {
                         freq-rank: root.dict-freq-rank;
                         jpdb-rank: root.dict-jpdb-rank;
                         results: root.popup-results;
+                        focused-index: root.popup-focused-index;
+                        target-scroll-y <=> root.popup-target-scroll-y;
                         has-more-results: root.popup-loaded-count < root.dict-results.length;
                         audio-sources: root.popup-audio-sources;
+                        audio-source-statuses: root.popup-audio-source-statuses;
                         audio-sources-loading: root.popup-audio-sources-loading;
                         selected-audio-source: root.popup-selected-audio-source;
                         close-requested => { root.dismiss-definition(); }
                         add-anki-note(idx) => { root.add-anki-note(idx); }
+                        add-to-anki-with-audio(idx, src-idx) => { root.add-to-anki-with-audio(idx, src-idx); }
                         browse-anki-note(id) => { root.browse-anki-note(id); }
                         play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
                         request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
                         kanji-info(word) => { root.lookup-kanji(word); }
                         toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
                         toggle-term-collapse(idx) => { root.toggle-term-collapse(idx); }
+                        toggle-reading-as-expression(idx) => {
+                            root.toggle-reading-as-expression(idx);
+                            PopupBridge.toggle-reading-as-expression(idx);
+                        }
+                        viewport-scrolled(sy) => { root.popup-viewport-scrolled(sy); }
                         load-more-results(force) => { root.load-more-definition-results(force); }
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
@@ -1094,9 +1280,12 @@ export component MementoApp inherits Window {
                         configured-height: root.popup-configured-height;
                         anki-enabled: root.anki-enabled;
                         show-anki-checkbox: root.show-anki-checkbox;
+                        compact-glossaries: root.compact-glossaries;
+                        compact-tags: root.compact-tags;
                         added-note-id: root.anki-added-note-id;
                         added-result-index: root.anki-added-result-index;
                         audio-sources: root.popup-audio-sources;
+                        audio-source-statuses: root.popup-audio-source-statuses;
                         audio-sources-loading: root.popup-audio-sources-loading;
                         selected-audio-source: root.popup-selected-audio-source;
                         browse-anki-note(id) => { root.browse-anki-note(id); }
@@ -1105,6 +1294,143 @@ export component MementoApp inherits Window {
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
                         close-parent-requested => { root.dismiss-definition(); }
+                    }
+
+                    // Manual A/B Audio Context HUD Pill (#136 — H5.2)
+                    if root.audio-context-hud-text != "" && !root.ocr-mode : Rectangle {
+                        x: max(12px, parent.width - self.width - 14px);
+                        y: 12px;
+                        width: min(parent.width - 28px, audio-ctx-row.preferred-width + 16px);
+                        height: 28px;
+                        border-radius: 14px;
+                        background: MementoPalette.osc-bg;
+                        border-width: 1px;
+                        border-color: MementoPalette.cyan-accent;
+                        drop-shadow-blur: 12px;
+                        drop-shadow-color: MementoPalette.osc-shadow;
+
+                        audio-ctx-row := HorizontalLayout {
+                            x: 10px;
+                            y: 0px;
+                            height: parent.height;
+                            spacing: 7px;
+                            alignment: start;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 7px;
+                                    height: 7px;
+                                    border-radius: 3.5px;
+                                    background: MementoPalette.cyan-accent;
+                                }
+                            }
+
+                            Text {
+                                text: root.audio-context-hud-text;
+                                color: MementoPalette.osc-text;
+                                font-size: 11.5px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: clear-ctx-touch.has-hover ? MementoPalette.osc-btn-hover : transparent;
+                                    Text {
+                                        text: "×";
+                                        color: clear-ctx-touch.has-hover ? MementoPalette.osc-text : MementoPalette.osc-text-secondary;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    clear-ctx-touch := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.clear-audio-context(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Non-Blocking Status / Warning Toast Pill (C3.2 — non-fatal Anki media warnings & feedback)
+                    nonblocking-status-toast := Rectangle {
+                        property <bool> active: root.status-toast-text != "";
+                        opacity: self.active ? 1.0 : 0.0;
+                        animate opacity { duration: 150ms; }
+                        visible: self.active || self.opacity > 0.01;
+                        width: min(max(180px, nb-toast-row.preferred-width + 24px), parent.width - 48px);
+                        height: max(34px, nb-toast-lbl.preferred-height + 14px);
+                        x: (parent.width - self.width) / 2;
+                        y: parent.height - (root.status-message != "" ? 156px : 112px);
+                        background: root.status-toast-is-warning
+                            ? MementoPalette.warning-bg
+                            : MementoPalette.surface-elevated;
+                        border-radius: 17px;
+                        border-width: 1px;
+                        border-color: root.status-toast-is-warning
+                            ? MementoPalette.warning-border
+                            : MementoPalette.cyan-accent;
+                        drop-shadow-blur: 14px;
+                        drop-shadow-color: MementoPalette.shadow;
+
+                        nb-toast-row := HorizontalLayout {
+                            x: 12px;
+                            y: 0px;
+                            width: parent.width - 24px;
+                            height: parent.height;
+                            spacing: 8px;
+                            alignment: center;
+
+                            if root.status-toast-is-warning : Text {
+                                text: "⚠";
+                                color: MementoPalette.warning-text;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+
+                            nb-toast-lbl := Text {
+                                horizontal-stretch: 1;
+                                text: root.status-toast-text;
+                                color: root.status-toast-is-warning
+                                    ? MementoPalette.warning-text
+                                    : MementoPalette.text;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: dismiss-nb-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                                    Text {
+                                        text: "×";
+                                        color: root.status-toast-is-warning
+                                            ? MementoPalette.warning-text
+                                            : MementoPalette.text-secondary;
+                                        font-size: 13px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    dismiss-nb-touch := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.status-toast-text = ""; }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Status Toast (content-fit pill centered over video-area with opacity fade)
@@ -1138,9 +1464,9 @@ export component MementoApp inherits Window {
                         }
                     }
 
-                    // Bottom OSC Bar (Floating, 50px)
+                    // Bottom OSC Bar (Floating, 50px — hidden when custom OSC active or during OCR mode)
                     osc := PlayerOscBar {
-                        property <bool> target-visible: root.osc-visible && !root.ocr-mode;
+                        property <bool> target-visible: root.osc-enabled && root.osc-visible && !root.ocr-mode;
                         opacity: self.target-visible ? 1.0 : 0.0;
                         animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
                         visible: self.target-visible || self.opacity > 0.01;
@@ -1160,6 +1486,8 @@ export component MementoApp inherits Window {
                         ocr-enabled: root.ocr-enabled;
                         chapters: root.chapters;
                         chapter-marks: root.chapter-marks;
+                        preview-box-width: root.preview-box-width;
+                        preview-box-height: root.preview-box-height;
                         toggle-play => { root.toggle-play(); }
                         seek(val) => { root.seek-to(val); }
                         subtitle-seek(dir) => { root.sub-seek(dir); }
@@ -1177,35 +1505,42 @@ export component MementoApp inherits Window {
                         interacted => { root.dismiss-definition(); }
                     }
 
-                    // Timeline Hover Preview Card (Thumbnail + Chapter Label + Timestamp)
-                    if root.osc-visible && !root.ocr-mode && osc.timeline-hovered && root.duration > 0.0 : Rectangle {
-                        property <bool> has-thumb: root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0;
-                        width: self.has-thumb ? 212px : max(84px, preview-col.preferred-width + 20px);
-                        height: preview-col.preferred-height + 16px;
+                    // Timeline Hover Preview Card (Dynamic Thumbnail Dimensions + Compact Badge While Dragging — M3)
+                    if root.osc-enabled && root.osc-visible && !root.ocr-mode && osc.timeline-hovered && root.duration > 0.0 : preview-card := Rectangle {
+                        property <bool> has-thumb: !osc.is-dragging && root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0;
+                        property <length> thumb-w: max(100px, osc.preview-box-width);
+                        property <length> thumb-h: max(56px, osc.preview-box-height);
+                        width: self.has-thumb ? (self.thumb-w + 20px) : max(76px, preview-col.preferred-width + 20px);
+                        height: preview-col.preferred-height + (osc.is-dragging ? 10px : 16px);
                         x: max(16px, min(parent.width - self.width - 16px, osc.x + osc.hover-x - self.width / 2));
                         y: max(10px, osc.y - self.height - 8px);
-                        background: MementoPalette.surface-elevated;
+                        background: MementoPalette.osc-bg;
                         border-width: 1px;
-                        border-color: MementoPalette.border-light;
-                        border-radius: 8px;
+                        border-color: osc.is-dragging ? MementoPalette.cyan-accent : MementoPalette.osc-border;
+                        border-radius: osc.is-dragging ? 12px : 8px;
                         drop-shadow-blur: 14px;
-                        drop-shadow-color: MementoPalette.shadow;
+                        drop-shadow-color: MementoPalette.osc-shadow;
 
                         preview-col := VerticalLayout {
                             x: 10px;
-                            y: 8px;
+                            y: osc.is-dragging ? 5px : 8px;
                             width: parent.width - 20px;
                             height: self.preferred-height;
-                            spacing: 4px;
+                            spacing: osc.is-dragging ? 2px : 4px;
                             alignment: center;
 
-                            if root.preview-thumbnails-enabled && root.thumbnail-frame.width > 0 : Image {
-                                width: 192px;
-                                height: 108px;
-                                source: root.thumbnail-frame;
-                                image-fit: contain;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                            if preview-card.has-thumb : Rectangle {
+                                width: preview-card.thumb-w;
+                                height: preview-card.thumb-h;
+                                background: transparent;
+                                Image {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    source: root.thumbnail-frame;
+                                    image-fit: contain;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
 
                             if root.hover-chapter-title != "" : Text {
@@ -1222,47 +1557,88 @@ export component MementoApp inherits Window {
                                 font-family: "monospace";
                                 font-size: 12px;
                                 font-weight: 700;
-                                color: MementoPalette.text;
+                                color: MementoPalette.osc-text;
                                 horizontal-alignment: center;
                             }
                         }
                     }
 
-                    // Drag a rectangle over the current video frame for OCR.
+                    // Drag a rectangle over the current video frame for OCR (Left-drag only; Right-click cancels — H3.6).
                     if root.ocr-mode : Rectangle {
                         width: parent.width;
                         height: parent.height;
+
+                        // Subtle non-blocking cancel hint pill
+                        Rectangle {
+                            x: (parent.width - self.width) / 2;
+                            y: 14px;
+                            width: ocr-hint-lbl.preferred-width + 24px;
+                            height: 28px;
+                            border-radius: 14px;
+                            background: MementoPalette.osc-bg;
+                            border-width: 1px;
+                            border-color: MementoPalette.cyan-accent;
+                            ocr-hint-lbl := Text {
+                                text: "Drag with left button to OCR region · Right-click or Esc to cancel";
+                                color: MementoPalette.osc-text;
+                                font-size: 11.5px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
                         ocr-touch := TouchArea {
+                            property <bool> dragging: false;
+                            property <length> drag-start-x: 0px;
+                            property <length> drag-start-y: 0px;
                             width: parent.width;
                             height: parent.height;
                             mouse-cursor: crosshair;
                             pointer-event(event) => {
-                                if (event.kind == PointerEventKind.up) {
-                                    let min-x = min(self.pressed-x, self.mouse-x);
-                                    let min-y = min(self.pressed-y, self.mouse-y);
-                                    let max-x = max(self.pressed-x, self.mouse-x);
-                                    let max-y = max(self.pressed-y, self.mouse-y);
-                                    let box-w = max-x - min-x;
-                                    let box-h = max-y - min-y;
-                                    if (box-w >= 6px && box-h >= 6px && self.width > 0px && self.height > 0px) {
-                                        root.ocr-region(
-                                            min-x / self.width,
-                                            min-y / self.height,
-                                            box-w / self.width,
-                                            box-h / self.height
-                                        );
+                                if (event.kind == PointerEventKind.down) {
+                                    if (event.button == PointerEventButton.right) {
+                                        self.dragging = false;
+                                        root.ocr-mode = false;
+                                        root.ocr-cancelled();
+                                    } else if (event.button == PointerEventButton.left) {
+                                        self.dragging = true;
+                                        self.drag-start-x = self.mouse-x;
+                                        self.drag-start-y = self.mouse-y;
                                     }
-                                    root.ocr-mode = false;
+                                } else if (event.kind == PointerEventKind.up) {
+                                    if (self.dragging && event.button == PointerEventButton.left) {
+                                        let min-x = min(self.drag-start-x, self.mouse-x);
+                                        let min-y = min(self.drag-start-y, self.mouse-y);
+                                        let max-x = max(self.drag-start-x, self.mouse-x);
+                                        let max-y = max(self.drag-start-y, self.mouse-y);
+                                        let box-w = max-x - min-x;
+                                        let box-h = max-y - min-y;
+                                        self.dragging = false;
+                                        if (box-w >= 6px && box-h >= 6px && self.width > 0px && self.height > 0px) {
+                                            root.ocr-region(
+                                                min-x / self.width,
+                                                min-y / self.height,
+                                                box-w / self.width,
+                                                box-h / self.height
+                                            );
+                                        } else {
+                                            root.ocr-cancelled();
+                                        }
+                                        root.ocr-mode = false;
+                                    }
                                 } else if (event.kind == PointerEventKind.cancel) {
+                                    self.dragging = false;
                                     root.ocr-mode = false;
+                                    root.ocr-cancelled();
                                 }
                             }
                         }
-                        if ocr-touch.pressed : Rectangle {
-                            x: min(ocr-touch.pressed-x, ocr-touch.mouse-x);
-                            y: min(ocr-touch.pressed-y, ocr-touch.mouse-y);
-                            width: max(1px, max(ocr-touch.pressed-x, ocr-touch.mouse-x) - self.x);
-                            height: max(1px, max(ocr-touch.pressed-y, ocr-touch.mouse-y) - self.y);
+                        if ocr-touch.dragging : Rectangle {
+                            x: min(ocr-touch.drag-start-x, ocr-touch.mouse-x);
+                            y: min(ocr-touch.drag-start-y, ocr-touch.mouse-y);
+                            width: max(1px, max(ocr-touch.drag-start-x, ocr-touch.mouse-x) - self.x);
+                            height: max(1px, max(ocr-touch.drag-start-y, ocr-touch.mouse-y) - self.y);
                             background: MementoPalette.accent-subtle;
                             border-width: 2px;
                             border-color: MementoPalette.cyan-accent;
@@ -1292,6 +1668,16 @@ export component MementoApp inherits Window {
                             visible: root.dict-search-open;
                             results: root.dict-results;
                             query <=> root.dict-query;
+                            anki-enabled: root.anki-enabled;
+                            show-anki-checkbox: root.show-anki-checkbox;
+                            added-note-id: root.anki-added-note-id;
+                            added-result-index: root.anki-added-result-index;
+                            audio-sources: root.popup-audio-sources;
+                            audio-source-statuses: root.popup-audio-source-statuses;
+                            audio-sources-loading: root.popup-audio-sources-loading;
+                            selected-audio-source <=> root.popup-selected-audio-source;
+                            compact-glossaries: root.compact-glossaries;
+                            compact-tags: root.compact-tags;
                             search-changed(query) => {
                                 if PopupBridge.rich-enabled {
                                     PopupBridge.panel-search-requested(query);
@@ -1300,6 +1686,17 @@ export component MementoApp inherits Window {
                                 }
                             }
                             lookup(word) => { root.lookup-word(word); }
+                            add-anki-note(idx) => { root.add-anki-note(idx); }
+                            add-to-anki-with-audio(idx, src-idx) => { root.add-to-anki-with-audio(idx, src-idx); }
+                            browse-anki-note(id) => { root.browse-anki-note(id); }
+                            play-audio(word, reading) => { root.play-audio-for-word(word, reading); }
+                            request-audio-sources(word, reading) => { root.popup-audio-sources-requested(word, reading); }
+                            select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
+                            kanji-info(word) => { root.lookup-kanji(word); }
+                            toggle-select-definition(idx) => { root.toggle-definition-selection(idx); }
+                            toggle-term-collapse(idx) => { root.toggle-term-collapse(idx); }
+                            toggle-reading-as-expression(idx) => { root.toggle-reading-as-expression(idx); }
+                            open-rich-link(link) => { root.open-glossary-link(link); }
                             close => { root.dict-search-open = false; f-scope.focus(); }
                         }
 
@@ -1340,6 +1737,7 @@ export component MementoApp inherits Window {
                             entries: root.subtitle-entries;
                             secondary-entries: root.secondary-subtitle-entries;
                             has-secondary: root.secondary-sid > 0;
+                            has-secondary-subtitles: root.has-secondary-subtitles;
                             active-tab <=> root.subtitle-drawer-tab;
                             search-text <=> root.subtitle-search-query;
                             current-match: root.subtitle-search-current-match;
@@ -1363,6 +1761,8 @@ export component MementoApp inherits Window {
                             secondary-font-italic: root.sub-list-secondary-font-italic;
                             format-timestamp(sec) => { root.format-timestamp(sec) }
                             row-clicked(idx, extend-range) => { root.dismiss-definition(); root.select-row(idx, extend-range); f-scope.focus(); }
+                            subtitle-row-clicked-mod(tab, row-idx, ctrl, shift) => { root.dismiss-definition(); root.subtitle-row-clicked-mod(tab, row-idx, ctrl, shift); f-scope.focus(); }
+                            subtitle-row-lookup(tab, row-idx, char-idx, lx, ly) => { root.subtitle-row-lookup(tab, row-idx, char-idx, lx, ly); }
                             range-dragged(first, last, begin) => { root.dismiss-definition(); root.select-subtitle-range(first, last, begin); }
                             row-activated(idx, sec) => { root.dismiss-definition(); root.mark-subtitle-row(idx); root.seek-to(sec); f-scope.focus(); }
                             search-changed(q) => { root.dismiss-definition(); root.search-subtitles(q); }
@@ -1442,11 +1842,13 @@ export component MementoApp inherits Window {
         menu-drop := MenuDropdown {
             menu-index: menu-bar.open-menu;
             max-dropdown-height: max(160px, root.height - 48px);
+            video-tracks: root.video-tracks;
             audio-tracks: root.audio-tracks;
             subtitle-tracks: root.subtitle-tracks;
             recent-files: root.recent-files;
             recent-file-labels: root.recent-file-labels;
             anki-profiles: root.anki-profiles;
+            video-id: root.video-id;
             audio-id: root.audio-id;
             primary-sid: root.primary-sid;
             secondary-sid: root.secondary-sid;
@@ -1460,8 +1862,15 @@ export component MementoApp inherits Window {
             auto-pause: root.auto-pause;
             subtitles-visible: root.subtitles-visible;
             furigana-visible: root.furigana-visible;
+            dict-search-open: root.dict-search-open;
+            sub-drawer-open: root.sub-drawer-open;
+            can-increase-sub-size: root.can-increase-sub-size;
+            can-decrease-sub-size: root.can-decrease-sub-size;
+            can-move-sub-up: root.can-move-sub-up;
+            can-move-sub-down: root.can-move-sub-down;
             key-open-file: root.key-open-file;
             key-open-url: root.key-open-url;
+            key-quit: root.key-quit;
             key-show-search: root.key-show-search;
             key-show-sub-list: root.key-show-sub-list;
             key-start-ocr: root.key-start-ocr;
@@ -1474,8 +1883,10 @@ export component MementoApp inherits Window {
             key-sub-move-down: root.key-sub-move-down;
             open-file => { root.open-file(); }
             open-url => { root.open-url(); }
+            quit-app => { root.quit-app(); }
             open-recent(path) => { root.open-recent(path); }
             clear-recent => { root.clear-recent(); }
+            select-video-track(id) => { root.select-video-track(id); }
             select-audio-track(id) => { root.select-audio-track(id); }
             select-subtitle-track(id) => { root.select-subtitle-track(id); }
             select-secondary-subtitle-track(id) => { root.select-secondary-subtitle-track(id); }
@@ -1517,14 +1928,29 @@ export component MementoApp inherits Window {
             }
         }
 
-        // About Memento Modal (standardized onto ModalDialog)
+        // About Memento Modal (standardized onto ModalDialog, supports git hash in app-version-display)
         if root.about-open : AboutModal {
             app-version: root.app-version;
+            app-version-display: root.app-version-display;
             dismissed => {
                 root.about-open = false;
                 f-scope.focus();
             }
             open-link(url) => { root.open-external-link(url); }
+        }
+
+        // "No Dictionaries Installed" Startup Prompt Modal (M3)
+        if root.no-dicts-dialog-open : NoDictionariesModal {
+            dismissed => {
+                root.no-dicts-dialog-open = false;
+                root.dismiss-no-dicts-dialog();
+                f-scope.focus();
+            }
+            primary-clicked => {
+                root.no-dicts-dialog-open = false;
+                root.open-dict-settings();
+                f-scope.focus();
+            }
         }
 
         // Update Check & First-Launch Auto-Update Opt-In Modal
@@ -1689,6 +2115,39 @@ export component MementoApp inherits Window {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Subtle OS Drag-and-Drop Overlay (C2)
+        if root.drop-hover-active : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: MementoPalette.accent-subtle;
+            border-width: 3px;
+            border-color: MementoPalette.cyan-accent;
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(parent.width - 64px, main-drop-lbl.preferred-width + 44px);
+                height: 54px;
+                border-radius: 12px;
+                background: MementoPalette.surface-elevated;
+                border-width: 1.5px;
+                border-color: MementoPalette.cyan-accent;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: MementoPalette.shadow;
+
+                main-drop-lbl := Text {
+                    text: root.drop-hover-label != ""
+                        ? root.drop-hover-label
+                        : "Drop media or subtitle files to open";
+                    color: MementoPalette.text;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

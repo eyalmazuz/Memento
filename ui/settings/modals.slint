@@ -1,6 +1,6 @@
 import { LineEdit } from "std-widgets.slint";
 import { MementoPalette } from "../palette.slint";
-import { MementoSlider } from "../components/controls.slint";
+import { MementoCheckBox, MementoSlider } from "../components/controls.slint";
 import { ModalDialog } from "../components/modal.slint";
 
 component CheckerboardBackdrop inherits Rectangle {
@@ -322,5 +322,86 @@ export component ConfirmDeleteModal inherits ModalDialog {
         color: MementoPalette.text-secondary;
         font-size: 13px;
         wrap: word-wrap;
+    }
+}
+
+export component ProfileModal inherits ModalDialog {
+    in property <bool> is-rename: false;
+    in property <string> kind-label: "Anki";
+    in-out property <string> profile-name: "";
+    in-out property <bool> copy-current-profile: true;
+    in property <string> profile-name-error: "";
+    callback name-changed(string);
+    callback submitted(string, bool);
+
+    public function focus-input() {
+        name-edit.focus();
+        name-edit.select-all();
+    }
+
+    private property <bool> can-submit: root.profile-name != "" && root.profile-name-error == "";
+
+    title: root.is-rename
+        ? ("Rename " + root.kind-label + " Profile")
+        : ("Add " + root.kind-label + " Profile");
+    dialog-width: 420px;
+    cancel-text: "Cancel";
+    primary-text: root.is-rename ? "Rename" : "Add Profile";
+    primary-enabled: root.can-submit;
+    primary-clicked => {
+        if root.can-submit {
+            root.submitted(root.profile-name, root.copy-current-profile);
+        }
+    }
+
+    VerticalLayout {
+        spacing: 10px;
+
+        Text {
+            text: root.is-rename
+                ? "Enter a new name for the active profile:"
+                : "Enter a name for the new profile:";
+            color: MementoPalette.text-secondary;
+            font-size: 12.5px;
+            wrap: word-wrap;
+        }
+
+        name-edit := LineEdit {
+            text <=> root.profile-name;
+            placeholder-text: "Profile name…";
+            init => {
+                self.focus();
+                self.select-all();
+            }
+            edited(val) => { root.name-changed(val); }
+            accepted(val) => {
+                if root.can-submit {
+                    root.submitted(val, root.copy-current-profile);
+                }
+            }
+        }
+
+        if root.profile-name-error != "" : Rectangle {
+            height: err-lbl.preferred-height + 12px;
+            border-radius: 6px;
+            background: MementoPalette.danger-bg;
+            border-width: 1px;
+            border-color: MementoPalette.danger;
+            err-lbl := Text {
+                x: 10px;
+                y: 6px;
+                width: parent.width - 20px;
+                text: "⚠ " + root.profile-name-error;
+                color: MementoPalette.danger-text;
+                font-size: 12px;
+                font-weight: 600;
+                wrap: word-wrap;
+            }
+        }
+
+        if !root.is-rename : MementoCheckBox {
+            label: "Copy current profile";
+            checked <=> root.copy-current-profile;
+        }
     }
 }

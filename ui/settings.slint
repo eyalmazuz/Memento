@@ -1,21 +1,40 @@
-import { ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
 import { MementoPalette } from "palette.slint";
 import { ActionButton, IconButton } from "components/buttons.slint";
 import { MementoSwitch } from "components/controls.slint";
-import { SettingsField, SettingsGroup, InstalledDictionaryRow, AsrModelStatusRow } from "settings/types.slint";
+import {
+    AnkiAutocompleteItem,
+    AnkiExcludedDictRow,
+    AsrModelStatusRow,
+    InstalledDictionaryRow,
+    SettingsField,
+    SettingsGroup,
+    TextReplacementRow,
+} from "settings/types.slint";
+import { SubtitlePreviewCard } from "settings/controls.slint";
 import { SettingsSection } from "settings/section.slint";
 import { SettingsSidebar } from "settings/sidebar.slint";
 import { DictionariesPanel } from "settings/dictionaries.slint";
 import { AsrModelsPanel } from "settings/asr.slint";
 import { CustomPopupCssPanel } from "settings/custom_css.slint";
+import { TextReplacementsPanel } from "settings/text_replacements.slint";
 import {
     AnkiConnectionModal,
     AudioHelpModal,
     ColorPickerModal,
     ConfirmDeleteModal,
+    ProfileModal,
 } from "settings/modals.slint";
 
-export { SettingsField, SettingsGroup, InstalledDictionaryRow, AsrModelStatusRow }
+export {
+    SettingsField,
+    SettingsGroup,
+    InstalledDictionaryRow,
+    AsrModelStatusRow,
+    AnkiExcludedDictRow,
+    AnkiAutocompleteItem,
+    TextReplacementRow,
+}
 
 // Apply/Reset/Defaults operate on the selected category.
 // The owner refreshes settings-groups after reset/default/profile/list/category actions.
@@ -28,6 +47,8 @@ export component SettingsWindow inherits Window {
     background: MementoPalette.window-bg;
     default-font-family: "Noto Sans, sans-serif";
 
+    in-out property <bool> is-light-theme <=> MementoPalette.light-mode;
+    in-out property <bool> drop-hover-active: false;
     in-out property <int> active-category: 0;
     in property <[SettingsGroup]> settings-groups;
     in property <[InstalledDictionaryRow]> installed-dictionaries;
@@ -45,6 +66,10 @@ export component SettingsWindow inherits Window {
     in-out property <[string]> available-anki-models: [];
     in-out property <bool> adding-entry: false;
     in-out property <string> new-entry-name: "";
+    in-out property <bool> profile-modal-open: false;
+    in-out property <bool> profile-modal-is-rename: false;
+    in-out property <bool> copy-current-profile: true;
+    in-out property <string> profile-name-error: "";
     in-out property <bool> showing-advanced: false;
     in-out property <bool> showing-audio-help: false;
     in-out property <bool> connection-popup-open: false;
@@ -94,11 +119,35 @@ export component SettingsWindow inherits Window {
     in-out property <string> custom-popup-outer-css: "";
     in property <string> custom-popup-outer-css-path: "";
 
+    // Live Subtitle Style Preview state (Interface category)
+    in-out property <string> preview-sub-font-family: "Noto Sans CJK JP";
+    in-out property <length> preview-sub-font-size: 24px;
+    in-out property <bool> preview-sub-font-bold: false;
+    in-out property <bool> preview-sub-font-italic: false;
+    in-out property <color> preview-sub-text-color: #FFFFFF;
+    in-out property <color> preview-sub-bg-color: #00000080;
+    in-out property <color> preview-sub-stroke-color: #000000;
+    in-out property <float> preview-sub-stroke-width: 1.5;
+    in-out property <float> preview-sub-furigana-ratio: 0.45;
+    in-out property <bool> preview-sub-show-furigana: true;
+
+    // Anki excluded glossary dictionary checklist (`ex-glos`) & marker autocomplete
+    in property <[AnkiExcludedDictRow]> anki-excluded-dicts: [];
+    in property <[AnkiAutocompleteItem]> anki-autocomplete-items: [];
+    in-out property <bool> anki-autocomplete-open: false;
+    in-out property <string> anki-autocomplete-field-key: "";
+    in-out property <int> anki-autocomplete-selected: 0;
+
+    // Custom Text Replacements rule editor state (Search category)
+    in property <[TextReplacementRow]> text-replacement-rows: [];
+    in-out property <bool> text-replacements-search-original: true;
+
     callback close();
     callback anki-help-requested();
     callback category-changed(int);
     callback settings-search-changed(string);
     callback setting-edited(string, string);
+    callback browse-folder-setting(string);
     callback color-hex-committed(string, string);
     callback color-picker-hex-edited(string);
     callback open-color-picker-requested(string, string);
@@ -107,6 +156,18 @@ export component SettingsWindow inherits Window {
     callback color-edited(string, int, int, int, int);
     callback keybind-captured(string, string, bool, bool, bool, bool);
     callback apply-anki-preset(string);
+    callback anki-excluded-dict-toggled(string, bool);
+    callback anki-field-autocomplete-query(string, string, int);
+    callback anki-field-autocomplete-accepted(string, string);
+    callback anki-field-autocomplete-dismissed();
+    callback profile-name-edited(int, string, bool);
+    callback add-profile-with-options(int, string, bool) -> bool;
+    callback rename-profile(int, string, string);
+    callback add-text-replacement-rule();
+    callback remove-text-replacement-rule(int);
+    callback move-text-replacement-rule(int, int);
+    callback update-text-replacement-rule(int, string, string, bool, bool);
+    callback text-replacements-search-original-changed(bool);
     callback apply-settings(int);
     callback reset-settings(int);
     callback defaults-settings(int);
@@ -133,8 +194,17 @@ export component SettingsWindow inherits Window {
 
     private property <bool> searching: root.settings-search-query != "";
 
+    init => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
+
+    changed is-light-theme => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
+
     changed active-category => {
         body-scroll.viewport-y = 0px;
+        root.anki-autocomplete-open = false;
     }
 
     changed settings-search-query => {
@@ -180,8 +250,14 @@ export component SettingsWindow inherits Window {
                 return accept;
             }
             if event.text == Key.Escape {
-                if root.confirm-delete-open {
+                if root.anki-autocomplete-open {
+                    root.anki-autocomplete-open = false;
+                    root.anki-field-autocomplete-dismissed();
+                } else if root.confirm-delete-open {
                     root.confirm-delete-open = false;
+                } else if root.profile-modal-open {
+                    root.profile-modal-open = false;
+                    root.profile-name-error = "";
                 } else if root.color-picker-open {
                     root.color-picker-open = false;
                 } else if root.showing-audio-help {
@@ -393,7 +469,7 @@ export component SettingsWindow inherits Window {
                                     }
                                 }
 
-                                // Profile actions: [+ Add] LEFT of destructive [Delete]
+                                // Profile actions: [+ Add] [Rename] LEFT of destructive [Delete]
                                 if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : VerticalLayout {
                                     alignment: center;
                                     IconButton {
@@ -403,7 +479,27 @@ export component SettingsWindow inherits Window {
                                         tooltip-below: true;
                                         clicked => {
                                             root.new-entry-name = "";
-                                            root.adding-entry = true;
+                                            root.profile-name-error = "";
+                                            root.copy-current-profile = true;
+                                            root.profile-modal-is-rename = false;
+                                            root.profile-modal-open = true;
+                                        }
+                                    }
+                                }
+                                if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : VerticalLayout {
+                                    alignment: center;
+                                    ActionButton {
+                                        text: "Rename";
+                                        compact: true;
+                                        ghost: true;
+                                        tooltip: root.active-category == 0 ? "Rename Anki profile" : "Rename keybind profile";
+                                        clicked => {
+                                            root.new-entry-name = root.active-category == 0
+                                                ? root.current-anki-profile
+                                                : root.current-keybind-profile;
+                                            root.profile-name-error = "";
+                                            root.profile-modal-is-rename = true;
+                                            root.profile-modal-open = true;
                                         }
                                     }
                                 }
@@ -412,10 +508,11 @@ export component SettingsWindow inherits Window {
                                     IconButton {
                                         icon: @image-url("icons/delete.svg");
                                         danger: true;
-                                        enabled: root.active-category == 0
-                                            ? root.anki-profile-list.length > 1
-                                            : root.current-keybind-profile != "Default";
-                                        tooltip: root.active-category == 0 ? "Delete current profile" : "Delete keybind profile";
+                                        // Allow deleting even the last/Default profile (resets cleanly to "Default")
+                                        enabled: true;
+                                        tooltip: root.active-category == 0
+                                            ? (root.anki-profile-list.length <= 1 ? "Reset Default profile" : "Delete current profile")
+                                            : (root.current-keybind-profile == "Default" ? "Reset Default profile" : "Delete keybind profile");
                                         tooltip-below: true;
                                         tooltip-align-right: true;
                                         clicked => {
@@ -423,15 +520,19 @@ export component SettingsWindow inherits Window {
                                                 root.open-confirm-entry-delete(
                                                     0,
                                                     root.current-anki-profile,
-                                                    "Delete Anki Profile?",
-                                                    "Delete Anki profile \"" + root.current-anki-profile + "\" and its note field mappings? Click Apply afterward to persist.",
+                                                    root.anki-profile-list.length <= 1 ? "Reset Default Anki Profile?" : "Delete Anki Profile?",
+                                                    root.anki-profile-list.length <= 1
+                                                        ? "Reset \"" + root.current-anki-profile + "\" back to factory defaults as \"Default\"? Click Apply afterward to persist."
+                                                        : "Delete Anki profile \"" + root.current-anki-profile + "\" and its note field mappings? Click Apply afterward to persist.",
                                                 );
                                             } else {
                                                 root.open-confirm-entry-delete(
                                                     6,
                                                     root.current-keybind-profile,
-                                                    "Delete Keybind Profile?",
-                                                    "Delete keybind profile \"" + root.current-keybind-profile + "\" and all of its shortcut bindings?",
+                                                    root.current-keybind-profile == "Default" ? "Reset Default Keybind Profile?" : "Delete Keybind Profile?",
+                                                    root.current-keybind-profile == "Default"
+                                                        ? "Reset the \"Default\" keybind profile back to factory default shortcuts?"
+                                                        : "Delete keybind profile \"" + root.current-keybind-profile + "\" and all of its shortcut bindings?",
                                                 );
                                             }
                                         }
@@ -508,6 +609,20 @@ export component SettingsWindow inherits Window {
                             }
                         }
 
+                        // ── Live Subtitle Style Preview Card (Interface category) ─
+                        if !root.searching && root.active-category == 5 : SubtitlePreviewCard {
+                            sub-font-family: root.preview-sub-font-family;
+                            sub-font-size: root.preview-sub-font-size;
+                            sub-font-bold: root.preview-sub-font-bold;
+                            sub-font-italic: root.preview-sub-font-italic;
+                            sub-text-color: root.preview-sub-text-color;
+                            sub-bg-color: root.preview-sub-bg-color;
+                            sub-stroke-color: root.preview-sub-stroke-color;
+                            sub-stroke-width: root.preview-sub-stroke-width;
+                            sub-furigana-ratio: root.preview-sub-furigana-ratio;
+                            show-furigana <=> root.preview-sub-show-furigana;
+                        }
+
                         for group[g-idx] in root.settings-groups : VerticalLayout {
                             if group.category != 4 &&
                                 (root.searching || group.category != 0 || group.title != "Advanced" || root.showing-advanced) : SettingsSection {
@@ -515,12 +630,18 @@ export component SettingsWindow inherits Window {
                                 anki-decks: root.available-anki-decks;
                                 anki-models: root.available-anki-models;
                                 font-families: root.font-families;
+                                anki-excluded-dicts: root.anki-excluded-dicts;
+                                anki-autocomplete-items: root.anki-autocomplete-items;
+                                anki-autocomplete-open: root.anki-autocomplete-open;
+                                anki-autocomplete-field-key: root.anki-autocomplete-field-key;
+                                anki-autocomplete-selected <=> root.anki-autocomplete-selected;
                                 keybind-conflict-count: root.keybind-conflict-count;
                                 testing-anki: root.testing-anki-connection;
                                 can-move-up: g-idx > 0;
                                 can-move-down: g-idx < root.settings-groups.length - 1;
                                 show-advanced: root.showing-advanced;
                                 edited(key, value) => { root.setting-edited(key, value); }
+                                browse-folder-setting(key) => { root.browse-folder-setting(key); }
                                 color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                                 font-edited(key, family, size, bold, italic) => {
                                     root.font-edited(key, family, size, bold, italic);
@@ -533,6 +654,20 @@ export component SettingsWindow inherits Window {
                                 }
                                 keybind-captured(key, text, ctrl, alt, shift, meta) => {
                                     root.keybind-captured(key, text, ctrl, alt, shift, meta);
+                                }
+                                anki-excluded-dict-toggled(name, excluded) => {
+                                    root.anki-excluded-dict-toggled(name, excluded);
+                                }
+                                anki-field-autocomplete-query(key, text, pos) => {
+                                    root.anki-field-autocomplete-query(key, text, pos);
+                                }
+                                anki-field-autocomplete-accepted(key, insert-text) => {
+                                    root.anki-autocomplete-open = false;
+                                    root.anki-field-autocomplete-accepted(key, insert-text);
+                                }
+                                anki-field-autocomplete-dismissed => {
+                                    root.anki-autocomplete-open = false;
+                                    root.anki-field-autocomplete-dismissed();
                                 }
                                 apply-anki-preset(preset) => { root.apply-anki-preset(preset); }
                                 advanced-changed(value) => { root.showing-advanced = value; }
@@ -547,6 +682,21 @@ export component SettingsWindow inherits Window {
                                 }
                                 test-anki-connection => { root.test-anki-connection(); }
                                 load-anki-fields(section) => { root.load-anki-fields(section); }
+                            }
+                        }
+
+                        // ── Custom Text Replacements Editor (Search category) ─
+                        if !root.searching && root.active-category == 9 : TextReplacementsPanel {
+                            rows: root.text-replacement-rows;
+                            search-original <=> root.text-replacements-search-original;
+                            add-rule => { root.add-text-replacement-rule(); }
+                            remove-rule(idx) => { root.remove-text-replacement-rule(idx); }
+                            move-rule(idx, delta) => { root.move-text-replacement-rule(idx, delta); }
+                            update-rule(idx, pat, repl, icase, en) => {
+                                root.update-text-replacement-rule(idx, pat, repl, icase, en);
+                            }
+                            search-original-changed(val) => {
+                                root.text-replacements-search-original-changed(val);
                             }
                         }
 
@@ -579,6 +729,7 @@ export component SettingsWindow inherits Window {
                             installed-dictionaries: root.installed-dictionaries;
                             dictionary-busy: root.dictionary-busy;
                             dictionary-progress-text: root.dictionary-progress-text;
+                            drop-hover-active: root.drop-hover-active;
                             add-dictionary-archive => { root.add-dictionary-archive(); }
                             dictionary-enabled-changed(id, enabled) => { root.dictionary-enabled-changed(id, enabled); }
                             move-dictionary-up(id) => { root.move-dictionary-up(id); }
@@ -708,6 +859,68 @@ export component SettingsWindow inherits Window {
                     root.delete-dictionary(root.confirm-delete-dict-id);
                 } else {
                     root.remove-entry(root.confirm-delete-category, root.confirm-delete-id);
+                }
+            }
+        }
+
+        if root.profile-modal-open : ProfileModal {
+            is-rename: root.profile-modal-is-rename;
+            kind-label: root.active-category == 0 ? "Anki" : "Keybind";
+            profile-name <=> root.new-entry-name;
+            copy-current-profile <=> root.copy-current-profile;
+            profile-name-error: root.profile-name-error;
+            name-changed(val) => {
+                root.profile-name-edited(root.active-category, val, root.profile-modal-is-rename);
+            }
+            dismissed => {
+                root.profile-modal-open = false;
+                root.profile-name-error = "";
+                root.new-entry-name = "";
+            }
+            submitted(name, copy-cur) => {
+                if name != "" && root.profile-name-error == "" {
+                    root.profile-modal-open = false;
+                    if root.profile-modal-is-rename {
+                        let old-name = root.active-category == 0
+                            ? root.current-anki-profile
+                            : root.current-keybind-profile;
+                        root.rename-profile(root.active-category, old-name, name);
+                    } else if !root.add-profile-with-options(root.active-category, name, copy-cur) {
+                        root.add-entry(root.active-category, name);
+                    }
+                    root.new-entry-name = "";
+                    root.profile-name-error = "";
+                }
+            }
+        }
+
+        // Subtle OS Drag-and-Drop Overlay for Yomitan .zip dictionary imports (C2)
+        if root.drop-hover-active : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: MementoPalette.accent-subtle;
+            border-width: 3px;
+            border-color: MementoPalette.cyan-accent;
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(parent.width - 64px, drop-lbl.preferred-width + 44px);
+                height: 54px;
+                border-radius: 12px;
+                background: MementoPalette.surface-elevated;
+                border-width: 1.5px;
+                border-color: MementoPalette.cyan-accent;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: MementoPalette.shadow;
+
+                drop-lbl := Text {
+                    text: "Drop Yomitan .zip dictionary archive to import";
+                    color: MementoPalette.text;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

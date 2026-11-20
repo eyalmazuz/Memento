@@ -1,8 +1,8 @@
-import { ComboBox, LineEdit } from "std-widgets.slint";
+import { ComboBox, LineEdit, ScrollView, TextEdit } from "std-widgets.slint";
 import { MementoPalette } from "../palette.slint";
 import { ActionButton, ToggleChip } from "../components/buttons.slint";
-import { MementoSwitch } from "../components/controls.slint";
-import { SettingsField } from "types.slint";
+import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { AnkiAutocompleteItem, SettingsField } from "types.slint";
 
 export component FontPickerControl inherits VerticalLayout {
     in property <SettingsField> field;
@@ -262,6 +262,462 @@ export component ColorSwatchControl inherits HorizontalLayout {
     }
 }
 
+// ── Folder / File Path Browse Control (C1.1) ────────────────────────────────
+export component FolderBrowseControl inherits HorizontalLayout {
+    in property <SettingsField> field;
+    callback edited(string, string);
+    callback browse-folder-setting(string);
+
+    width: 260px;
+    spacing: 6px;
+    alignment: end;
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        LineEdit {
+            width: 176px;
+            enabled: root.field.enabled;
+            text: root.field.value;
+            placeholder-text: "Folder path…";
+            edited(value) => { root.edited(root.field.key, value); }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        ActionButton {
+            text: "Browse…";
+            compact: true;
+            enabled: root.field.enabled;
+            tooltip: "Browse folder";
+            clicked => { root.browse-folder-setting(root.field.key); }
+        }
+    }
+}
+
+// ── Numeric SpinBox-Style Stepper Control (M3) ──────────────────────────────
+export component NumericStepperControl inherits HorizontalLayout {
+    in property <SettingsField> field;
+    in property <float> step: 1.0;
+    in property <float> min-val: 0.0;
+    in property <float> max-val: 99999.0;
+    in property <bool> is-float: false;
+    in property <float> precision-scale: 100.0;
+    callback edited(string, string);
+
+    function step-by(delta: float) {
+        let cur = num-edit.text.to-float();
+        let raw-next = clamp(cur + delta, root.min-val, root.max-val);
+        if root.is-float {
+            let rounded = Math.round(raw-next * root.precision-scale) / root.precision-scale;
+            root.edited(root.field.key, rounded + "");
+        } else {
+            let rounded = Math.round(raw-next);
+            root.edited(root.field.key, rounded + "");
+        }
+    }
+
+    width: 260px;
+    spacing: 6px;
+    alignment: end;
+
+    VerticalLayout {
+        alignment: center;
+        ActionButton {
+            text: "−";
+            compact: true;
+            enabled: root.field.enabled && num-edit.text.to-float() > root.min-val;
+            tooltip: "Decrease";
+            clicked => { root.step-by(-root.step); }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        num-edit := LineEdit {
+            width: 184px;
+            enabled: root.field.enabled;
+            text: root.field.value;
+            edited(value) => { root.edited(root.field.key, value); }
+        }
+    }
+
+    VerticalLayout {
+        alignment: center;
+        ActionButton {
+            text: "+";
+            compact: true;
+            enabled: root.field.enabled && num-edit.text.to-float() < root.max-val;
+            tooltip: "Increase";
+            clicked => { root.step-by(root.step); }
+        }
+    }
+}
+
+// ── Multi-Line Anki Field Editor with Marker & Argument Autocomplete Popup ──
+export component AnkiFieldEditorControl inherits VerticalLayout {
+    in property <SettingsField> field;
+    in property <[AnkiAutocompleteItem]> autocomplete-items: [];
+    in property <bool> autocomplete-open: false;
+    in property <string> autocomplete-field-key: "";
+    in-out property <int> autocomplete-selected: 0;
+    callback edited(string, string);
+    callback autocomplete-query(string, string, int);
+    callback autocomplete-accepted(string, string);
+    callback autocomplete-dismissed();
+
+    private property <bool> popup-active: root.autocomplete-open
+        && root.autocomplete-field-key == root.field.key
+        && root.autocomplete-items.length > 0;
+    private property <string> current-text: root.field.value;
+    private property <string> synced-value: root.field.value;
+
+    width: 310px;
+    spacing: 4px;
+
+    changed synced-value => {
+        root.current-text = root.synced-value;
+    }
+
+    HorizontalLayout {
+        spacing: 5px;
+        alignment: start;
+
+        editor-scope := FocusScope {
+            horizontal-stretch: 1;
+            width: 273px;
+            height: 58px;
+
+            capture-key-pressed(event) => {
+                if root.popup-active {
+                    if event.text == Key.DownArrow {
+                        root.autocomplete-selected = mod(root.autocomplete-selected + 1, root.autocomplete-items.length);
+                        return accept;
+                    }
+                    if event.text == Key.UpArrow {
+                        root.autocomplete-selected = mod(
+                            root.autocomplete-selected - 1 + root.autocomplete-items.length,
+                            root.autocomplete-items.length
+                        );
+                        return accept;
+                    }
+                    if event.text == Key.Return || event.text == Key.Tab {
+                        let pick-idx = clamp(root.autocomplete-selected, 0, root.autocomplete-items.length - 1);
+                        root.autocomplete-accepted(root.field.key, root.autocomplete-items[pick-idx].insert-text);
+                        return accept;
+                    }
+                    if event.text == Key.Escape {
+                        root.autocomplete-dismissed();
+                        return accept;
+                    }
+                }
+                if event.text == "{" || event.text == "|" || event.text == ":" || event.text == "," {
+                    root.autocomplete-query(
+                        root.field.key,
+                        root.current-text + event.text,
+                        root.current-text.character-count + 1
+                    );
+                }
+                reject
+            }
+
+            field-editor := TextEdit {
+                width: parent.width;
+                height: parent.height;
+                enabled: root.field.enabled;
+                text: root.current-text;
+                font-family: "monospace";
+                font-size: 12px;
+                wrap: word-wrap;
+                placeholder-text: "Type {marker} or text…";
+                edited(val) => {
+                    root.current-text = val;
+                    root.edited(root.field.key, val);
+                    root.autocomplete-query(root.field.key, val, val.character-count);
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: start;
+            ActionButton {
+                text: "{…}";
+                compact: true;
+                enabled: root.field.enabled;
+                tooltip: "Insert Anki marker";
+                clicked => {
+                    if root.popup-active {
+                        root.autocomplete-dismissed();
+                    } else {
+                        root.autocomplete-query(root.field.key, root.current-text + "{", root.current-text.character-count + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Cursor-anchored marker & argument autocomplete popup (Up/Down/Enter/Tab/Esc + click)
+    if root.popup-active : Rectangle {
+        property <length> approx-cursor-x: clamp((root.current-text.character-count * 6px), 0px, max(0px, parent.width - 268px));
+        x: min(self.approx-cursor-x, max(0px, parent.width - self.width));
+        width: min(parent.width, 290px);
+        height: min(176px, ac-list-col.preferred-height + 8px);
+        border-radius: 7px;
+        background: MementoPalette.surface-elevated;
+        border-width: 1px;
+        border-color: MementoPalette.cyan-accent;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: MementoPalette.shadow;
+        clip: true;
+
+        ScrollView {
+            x: 4px;
+            y: 4px;
+            width: parent.width - 8px;
+            height: parent.height - 8px;
+
+            ac-list-col := VerticalLayout {
+                width: max(0px, parent.width - 8px);
+                spacing: 2px;
+                alignment: start;
+
+                for item[idx] in root.autocomplete-items : ac-row := Rectangle {
+                    property <bool> selected: idx == root.autocomplete-selected;
+                    width: parent.width;
+                    height: max(26px, ac-row-inner.preferred-height + 6px);
+                    border-radius: 5px;
+                    background: self.selected
+                        ? MementoPalette.accent-muted
+                        : (ac-touch.has-hover ? MementoPalette.hover-bg : transparent);
+                    border-width: self.selected ? 1px : 0px;
+                    border-color: self.selected ? MementoPalette.cyan-accent : transparent;
+
+                    ac-row-inner := HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-top: 3px;
+                        padding-bottom: 3px;
+                        spacing: 6px;
+                        alignment: start;
+
+                        Text {
+                            text: item.label != "" ? item.label : item.insert-text;
+                            font-family: "monospace";
+                            font-size: 11.5px;
+                            font-weight: 700;
+                            color: ac-row.selected ? MementoPalette.cyan-text : MementoPalette.text;
+                            vertical-alignment: center;
+                        }
+
+                        if item.kind != "" : VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                height: 15px;
+                                width: kind-lbl.preferred-width + 8px;
+                                border-radius: 3px;
+                                background: item.kind == "argument" ? MementoPalette.teal-muted : MementoPalette.badge-blue;
+                                kind-lbl := Text {
+                                    text: item.kind;
+                                    font-size: 9px;
+                                    font-weight: 700;
+                                    color: item.kind == "argument" ? MementoPalette.teal-text : MementoPalette.badge-blue-text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        if item.detail != "" : Text {
+                            horizontal-stretch: 1;
+                            text: item.detail;
+                            font-size: 10.5px;
+                            color: MementoPalette.text-muted;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    ac-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.autocomplete-selected = idx;
+                            root.autocomplete-accepted(root.field.key, item.insert-text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Live Subtitle Style Preview Card (Settings → Interface) ─────────────────
+component PreviewRubyWord inherits VerticalLayout {
+    in property <string> base-text;
+    in property <string> ruby-text: "";
+    in property <bool> show-furigana: true;
+    in property <string> font-family: "Noto Sans CJK JP";
+    in property <length> font-size: 24px;
+    in property <bool> font-bold: false;
+    in property <bool> font-italic: false;
+    in property <color> text-color: #FFFFFF;
+    in property <color> stroke-color: #000000;
+    in property <float> stroke-width: 1.5;
+    in property <float> furigana-ratio: 0.45;
+
+    property <length> sw: clamp(root.stroke-width, 0.0, 4.0) * 1px;
+    property <length> sd: self.sw * 0.707;
+    property <length> ruby-sz: max(9px, root.font-size * clamp(root.furigana-ratio, 0.2, 0.9));
+
+    spacing: 1px;
+    alignment: end;
+
+    if root.show-furigana : Text {
+        text: root.ruby-text != "" ? root.ruby-text : " ";
+        font-family: root.font-family;
+        font-size: root.ruby-sz;
+        font-weight: 600;
+        color: root.text-color;
+        opacity: root.ruby-text != "" ? 0.92 : 0.0;
+        horizontal-alignment: center;
+    }
+
+    Rectangle {
+        width: main-glyph.preferred-width;
+        height: main-glyph.preferred-height;
+        background: transparent;
+
+        if root.stroke-width > 0.0 : Text { x: -root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: 0px; y: -root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: 0px; y: root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: -root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: -root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        if root.stroke-width > 0.0 : Text { x: root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+
+        main-glyph := Text {
+            x: 0px;
+            y: 0px;
+            text: root.base-text;
+            font-family: root.font-family;
+            font-size: root.font-size;
+            font-weight: root.font-bold ? 700 : 400;
+            font-italic: root.font-italic;
+            color: root.text-color;
+        }
+    }
+}
+
+export component SubtitlePreviewCard inherits VerticalLayout {
+    in property <string> sub-font-family: "Noto Sans CJK JP";
+    in property <length> sub-font-size: 24px;
+    in property <bool> sub-font-bold: false;
+    in property <bool> sub-font-italic: false;
+    in property <color> sub-text-color: #FFFFFF;
+    in property <color> sub-bg-color: #00000080;
+    in property <color> sub-stroke-color: #000000;
+    in property <float> sub-stroke-width: 1.5;
+    in property <float> sub-furigana-ratio: 0.45;
+    in-out property <bool> show-furigana: true;
+
+    spacing: 8px;
+
+    SectionHeader {
+        title: "Live Subtitle Preview";
+        subtitle: "Reflects font, colors, stroke, and furigana settings";
+
+        ToggleChip {
+            text: "振り仮名";
+            chip-width: 68px;
+            active: root.show-furigana;
+            tooltip: "Toggle furigana preview";
+            clicked => { root.show-furigana = !root.show-furigana; }
+        }
+    }
+
+    Rectangle {
+        height: max(108px, sub-pill.preferred-height + 36px);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: MementoPalette.card-border;
+        background: @linear-gradient(180deg, #16202E 0%, #0D1117 65%, #07090D 100%);
+        clip: true;
+
+        sub-pill := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, words-row.preferred-width + 28px);
+            height: words-row.preferred-height + 16px;
+            border-radius: 5px;
+            background: root.sub-bg-color;
+
+            words-row := HorizontalLayout {
+                x: (parent.width - self.width) / 2;
+                y: 8px;
+                width: self.preferred-width;
+                height: self.preferred-height;
+                spacing: 1px;
+                alignment: center;
+
+                PreviewRubyWord {
+                    base-text: "日本語";
+                    ruby-text: "にほんご";
+                    show-furigana: root.show-furigana;
+                    font-family: root.sub-font-family;
+                    font-size: clamp(root.sub-font-size, 12px, 44px);
+                    font-bold: root.sub-font-bold;
+                    font-italic: root.sub-font-italic;
+                    text-color: root.sub-text-color;
+                    stroke-color: root.sub-stroke-color;
+                    stroke-width: root.sub-stroke-width;
+                    furigana-ratio: root.sub-furigana-ratio;
+                }
+                PreviewRubyWord {
+                    base-text: "の";
+                    ruby-text: "";
+                    show-furigana: root.show-furigana;
+                    font-family: root.sub-font-family;
+                    font-size: clamp(root.sub-font-size, 12px, 44px);
+                    font-bold: root.sub-font-bold;
+                    font-italic: root.sub-font-italic;
+                    text-color: root.sub-text-color;
+                    stroke-color: root.sub-stroke-color;
+                    stroke-width: root.sub-stroke-width;
+                    furigana-ratio: root.sub-furigana-ratio;
+                }
+                PreviewRubyWord {
+                    base-text: "字幕";
+                    ruby-text: "じまく";
+                    show-furigana: root.show-furigana;
+                    font-family: root.sub-font-family;
+                    font-size: clamp(root.sub-font-size, 12px, 44px);
+                    font-bold: root.sub-font-bold;
+                    font-italic: root.sub-font-italic;
+                    text-color: root.sub-text-color;
+                    stroke-color: root.sub-stroke-color;
+                    stroke-width: root.sub-stroke-width;
+                    furigana-ratio: root.sub-furigana-ratio;
+                }
+                PreviewRubyWord {
+                    base-text: "プレビュー";
+                    ruby-text: "";
+                    show-furigana: root.show-furigana;
+                    font-family: root.sub-font-family;
+                    font-size: clamp(root.sub-font-size, 12px, 44px);
+                    font-bold: root.sub-font-bold;
+                    font-italic: root.sub-font-italic;
+                    text-color: root.sub-text-color;
+                    stroke-color: root.sub-stroke-color;
+                    stroke-width: root.sub-stroke-width;
+                    furigana-ratio: root.sub-furigana-ratio;
+                }
+            }
+        }
+    }
+}
+
 export component KeybindCaptureControl inherits VerticalLayout {
     in property <SettingsField> field;
     property <bool> recording: false;
@@ -394,18 +850,72 @@ export component KeybindCaptureControl inherits VerticalLayout {
 
 export component FieldRow inherits Rectangle {
     in property <SettingsField> field;
+    in property <int> group-category: -1;
+    in property <string> group-title: "";
     in property <[string]> anki-decks;
     in property <[string]> anki-models;
     in property <[string]> font-families;
+    in property <[AnkiAutocompleteItem]> anki-autocomplete-items: [];
+    in property <bool> anki-autocomplete-open: false;
+    in property <string> anki-autocomplete-field-key: "";
+    in-out property <int> anki-autocomplete-selected: 0;
+
     property <bool> use-anki-decks: (root.field.key == "anki/profile/term/deck" || root.field.key == "anki/profile/kanji/deck") && root.anki-decks.length > 0;
     property <bool> use-anki-models: (root.field.key == "anki/profile/term/model" || root.field.key == "anki/profile/kanji/model") && root.anki-models.length > 0;
     property <bool> use-combo: root.field.kind == "choice" || (root.field.kind == "text" && (self.use-anki-decks || self.use-anki-models));
+    property <bool> is-browse-field: root.field.kind == "folder" || root.field.kind == "file"
+        || (root.field.kind == "text" && (
+            root.field.key == "behavior/file-open-custom"
+            || root.field.key == "onnx/custom-model"
+            || root.field.key == "whisper/custom-model"
+            || root.field.key == "whisper/vad-model"
+        ));
+    property <bool> is-float-stepper: root.field.kind == "float"
+        || (root.field.kind == "text" && (
+            root.field.key == "interface/sub-scale"
+            || root.field.key == "interface/sub-offset"
+            || root.field.key == "interface/sub-furigana-ratio"
+            || root.field.key == "interface/sub-stroke"
+            || root.field.key == "anki/profile/audio-pad-start"
+            || root.field.key == "anki/profile/audio-pad-end"
+            || root.field.key == "anki/profile/audio-db"
+        ));
+    property <bool> is-int-stepper: root.field.kind == "number" || root.field.kind == "int"
+        || (root.field.kind == "text" && (
+            root.field.key == "interface/sub-line-spacing"
+            || root.field.key == "interface/sub-popup-width"
+            || root.field.key == "interface/sub-popup-height"
+            || root.field.key == "behavior/autofit-percent"
+            || root.field.key == "behavior/osc-duration"
+            || root.field.key == "behavior/osc-fade"
+            || root.field.key == "behavior/osc-min-move"
+            || root.field.key == "search/delay"
+            || root.field.key == "search/max-recursion-depth"
+            || root.field.key == "audio/download-timeout-ms"
+            || root.field.key == "anki/profile/port"
+            || root.field.key == "whisper/threads"
+            || root.field.key == "onnx/threads"
+        ));
+    property <bool> is-numeric-stepper: self.is-float-stepper || self.is-int-stepper;
+    property <bool> is-anki-template-field: root.field.kind == "anki-field"
+        || (root.field.kind == "text"
+            && root.group-category == 0
+            && (root.group-title == "Term Notes" || root.group-title == "Kanji Notes")
+            && root.field.key != "anki/profile/term/deck"
+            && root.field.key != "anki/profile/term/model"
+            && root.field.key != "anki/profile/kanji/deck"
+            && root.field.key != "anki/profile/kanji/model");
+
     callback edited(string, string);
     callback color-hex-committed(string, string);
     callback font-edited(string, string, string, bool, bool);
     callback font-size-typed(string, string, string, bool, bool);
     callback open-color-picker(SettingsField);
     callback keybind-captured(string, string, bool, bool, bool, bool);
+    callback browse-folder-setting(string);
+    callback anki-field-autocomplete-query(string, string, int);
+    callback anki-field-autocomplete-accepted(string, string);
+    callback anki-field-autocomplete-dismissed();
 
     visible: root.field.visible;
     property <length> label-col-width: max(120px, root.width - ctrl-box.preferred-width - 16px);
@@ -481,7 +991,57 @@ export component FieldRow inherits Rectangle {
                     root.keybind-captured(key, text, ctrl, alt, shift, meta);
                 }
             }
-            if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models : LineEdit {
+            if root.is-browse-field : FolderBrowseControl {
+                field: root.field;
+                edited(key, value) => { root.edited(key, value); }
+                browse-folder-setting(key) => { root.browse-folder-setting(key); }
+            }
+            if root.is-numeric-stepper && !root.is-browse-field : NumericStepperControl {
+                field: root.field;
+                is-float: root.is-float-stepper;
+                step: (root.field.key == "interface/sub-scale" || root.field.key == "interface/sub-offset") ? 0.005
+                    : (root.field.key == "interface/sub-furigana-ratio" || root.field.key == "anki/profile/audio-pad-start" || root.field.key == "anki/profile/audio-pad-end") ? 0.05
+                    : root.field.key == "interface/sub-stroke" ? 0.5
+                    : root.field.key == "audio/download-timeout-ms" ? 500.0
+                    : (root.field.key == "behavior/osc-duration" || root.field.key == "behavior/osc-fade") ? 50.0
+                    : root.field.key == "search/delay" ? 25.0
+                    : (root.field.key == "interface/sub-popup-width" || root.field.key == "interface/sub-popup-height") ? 20.0
+                    : root.field.key == "behavior/autofit-percent" ? 5.0
+                    : 1.0;
+                min-val: root.field.key == "interface/sub-scale" ? 0.001
+                    : root.field.key == "interface/sub-line-spacing" ? -100.0
+                    : root.field.key == "anki/profile/audio-db" ? -60.0
+                    : root.field.key == "audio/download-timeout-ms" ? 1000.0
+                    : root.field.key == "behavior/osc-duration" ? 50.0
+                    : (root.field.key == "behavior/autofit-percent" || root.field.key == "anki/profile/port" || root.field.key == "whisper/threads" || root.field.key == "onnx/threads") ? 1.0
+                    : (root.field.key == "interface/sub-popup-width" || root.field.key == "interface/sub-popup-height") ? 100.0
+                    : 0.0;
+                max-val: (root.field.key == "interface/sub-scale" || root.field.key == "interface/sub-offset" || root.field.key == "interface/sub-furigana-ratio") ? 1.0
+                    : root.field.key == "anki/profile/audio-db" ? 0.0
+                    : root.field.key == "audio/download-timeout-ms" ? 30000.0
+                    : root.field.key == "search/max-recursion-depth" ? 10.0
+                    : (root.field.key == "whisper/threads" || root.field.key == "onnx/threads") ? 64.0
+                    : root.field.key == "anki/profile/port" ? 65535.0
+                    : (root.field.key == "behavior/autofit-percent" || root.field.key == "interface/sub-stroke") ? 1000.0
+                    : 99999.0;
+                precision-scale: (root.field.key == "interface/sub-scale" || root.field.key == "interface/sub-offset") ? 1000.0
+                    : (root.field.key == "interface/sub-stroke" || root.field.key == "anki/profile/audio-db") ? 10.0
+                    : 100.0;
+                edited(key, value) => { root.edited(key, value); }
+            }
+            if root.is-anki-template-field : AnkiFieldEditorControl {
+                field: root.field;
+                autocomplete-items: root.anki-autocomplete-items;
+                autocomplete-open: root.anki-autocomplete-open;
+                autocomplete-field-key: root.anki-autocomplete-field-key;
+                autocomplete-selected <=> root.anki-autocomplete-selected;
+                edited(key, value) => { root.edited(key, value); }
+                autocomplete-query(key, text, pos) => { root.anki-field-autocomplete-query(key, text, pos); }
+                autocomplete-accepted(key, insert-text) => { root.anki-field-autocomplete-accepted(key, insert-text); }
+                autocomplete-dismissed => { root.anki-field-autocomplete-dismissed(); }
+            }
+            if root.field.kind == "text" && !root.use-anki-decks && !root.use-anki-models
+                && !root.is-browse-field && !root.is-numeric-stepper && !root.is-anki-template-field : LineEdit {
                 width: 260px;
                 enabled: root.field.enabled;
                 text: root.field.value;

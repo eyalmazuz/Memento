@@ -231,13 +231,15 @@ component DropdownSeparator inherits Rectangle {
 export component MenuDropdown inherits Rectangle {
     in property <int> menu-index: -1;
     in property <length> max-dropdown-height: 460px;
-    in-out property <int> submenu-index: -1; // 0 Recent, 1 Size/Position, 2 Secondary, 3 Primary, 4 Anki profile
+    in-out property <int> submenu-index: -1; // 0 Recent, 1 Size/Position, 2 Secondary, 3 Primary, 4 Anki profile, 5 Video Track
     property <length> submenu-anchor-y: 0px;
+    in property <[PlayerTrack]> video-tracks: [];
     in property <[PlayerTrack]> audio-tracks: [];
     in property <[PlayerTrack]> subtitle-tracks: [];
     in property <[string]> recent-files: [];
     in property <[string]> recent-file-labels: [];
     in property <[string]> anki-profiles: [];
+    in property <int> video-id: 0;
     in property <int> audio-id: 0;
     in property <int> primary-sid: 0;
     in property <int> secondary-sid: 0;
@@ -251,8 +253,15 @@ export component MenuDropdown inherits Rectangle {
     in property <bool> auto-pause: false;
     in property <bool> subtitles-visible: true;
     in property <bool> furigana-visible: false;
+    in property <bool> dict-search-open: false;
+    in property <bool> sub-drawer-open: false;
+    in property <bool> can-increase-sub-size: true;
+    in property <bool> can-decrease-sub-size: true;
+    in property <bool> can-move-sub-up: true;
+    in property <bool> can-move-sub-down: true;
     in property <string> key-open-file: "";
     in property <string> key-open-url: "";
+    in property <string> key-quit: "Ctrl+Q";
     in property <string> key-show-search: "";
     in property <string> key-show-sub-list: "";
     in property <string> key-start-ocr: "";
@@ -266,9 +275,11 @@ export component MenuDropdown inherits Rectangle {
 
     callback open-file();
     callback open-url();
+    callback quit-app();
     callback add-subtitle();
     callback open-recent(string);
     callback clear-recent();
+    callback select-video-track(int);
     callback select-audio-track(int);
     callback select-subtitle-track(int);
     callback select-secondary-subtitle-track(int);
@@ -347,6 +358,20 @@ export component MenuDropdown inherits Rectangle {
                     submenu-active: root.submenu-index == 0;
                     is-disabled: root.recent-files.length == 0;
                     clicked => { root.toggle-submenu(0, self.y); }
+                }
+                DropdownSeparator {}
+                video-track-item := DropdownItem {
+                    text: "Video Track";
+                    has-submenu: true;
+                    submenu-active: root.submenu-index == 5;
+                    is-disabled: root.video-tracks.length == 0;
+                    clicked => { root.toggle-submenu(5, self.y); }
+                }
+                DropdownSeparator {}
+                DropdownItem {
+                    text: "Quit";
+                    shortcut: root.key-quit;
+                    clicked => { root.close-menu(); root.quit-app(); }
                 }
             }
 
@@ -430,16 +455,23 @@ export component MenuDropdown inherits Rectangle {
                 DropdownItem {
                     text: "Show Search";
                     shortcut: root.key-show-search;
+                    checkable: true;
+                    reserve-check-gutter: true;
+                    checked: root.dict-search-open;
                     clicked => { root.toggle-search(); root.close-menu(); }
                 }
                 DropdownItem {
                     text: "Show Subtitle List";
                     shortcut: root.key-show-sub-list;
+                    checkable: true;
+                    reserve-check-gutter: true;
+                    checked: root.sub-drawer-open;
                     clicked => { root.toggle-sub-drawer(); root.close-menu(); }
                 }
                 if root.ocr-enabled : DropdownItem {
                     text: "Start OCR";
                     shortcut: root.key-start-ocr;
+                    reserve-check-gutter: true;
                     clicked => { root.start-ocr(); root.close-menu(); }
                 }
             }
@@ -521,21 +553,25 @@ export component MenuDropdown inherits Rectangle {
                     DropdownItem {
                         text: "Increase Size";
                         shortcut: root.key-sub-increase-size;
+                        is-disabled: !root.can-increase-sub-size;
                         clicked => { root.adjust-subtitle-scale(0.005); root.close-menu(); }
                     }
                     DropdownItem {
                         text: "Decrease Size";
                         shortcut: root.key-sub-decrease-size;
+                        is-disabled: !root.can-decrease-sub-size;
                         clicked => { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
                     }
                     DropdownItem {
                         text: "Move Up";
                         shortcut: root.key-sub-move-up;
+                        is-disabled: !root.can-move-sub-up;
                         clicked => { root.adjust-subtitle-offset(0.005); root.close-menu(); }
                     }
                     DropdownItem {
                         text: "Move Down";
                         shortcut: root.key-sub-move-down;
+                        is-disabled: !root.can-move-sub-down;
                         clicked => { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
                     }
                 }
@@ -597,6 +633,22 @@ export component MenuDropdown inherits Rectangle {
                         checkable: true;
                         checked: profile == root.anki-profile;
                         clicked => { root.select-anki-profile(profile); root.close-menu(); }
+                    }
+                }
+
+                if root.submenu-index == 5 : VerticalLayout {
+                    spacing: 2px;
+                    DropdownItem {
+                        text: "None";
+                        checkable: true;
+                        checked: root.video-id == 0;
+                        clicked => { root.select-video-track(0); root.close-menu(); }
+                    }
+                    for track[index] in root.video-tracks : DropdownItem {
+                        text: track.label;
+                        checkable: true;
+                        checked: track.id == root.video-id;
+                        clicked => { root.select-video-track(track.id); root.close-menu(); }
                     }
                 }
             }

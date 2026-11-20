@@ -20,17 +20,17 @@ component OscIconButton inherits Rectangle {
     border-radius: root.emphasized ? 7px : 6px;
     border-width: 1px;
     background: touch.pressed
-        ? MementoPalette.active-bg
+        ? MementoPalette.osc-btn-pressed
         : (root.active
-            ? MementoPalette.accent-muted
+            ? MementoPalette.osc-btn-active-bg
             : (touch.has-hover
-                ? MementoPalette.hover-bg
-                : (root.emphasized ? MementoPalette.button-bg : transparent)));
+                ? MementoPalette.osc-btn-hover
+                : (root.emphasized ? MementoPalette.osc-btn-bg : transparent)));
     border-color: root.active
         ? MementoPalette.cyan-accent
         : (touch.has-hover
-            ? MementoPalette.border-light
-            : (root.emphasized ? MementoPalette.border : transparent));
+            ? MementoPalette.osc-border
+            : (root.emphasized ? MementoPalette.osc-btn-border : transparent));
 
     animate background { duration: 100ms; }
     animate border-color { duration: 100ms; }
@@ -41,7 +41,7 @@ component OscIconButton inherits Rectangle {
         width: root.icon-size;
         height: root.icon-size;
         source: root.icon;
-        colorize: root.active ? MementoPalette.cyan-text : MementoPalette.icon;
+        colorize: root.active ? MementoPalette.osc-icon-active : MementoPalette.osc-icon;
     }
 
     touch := TouchArea {
@@ -61,12 +61,12 @@ component OscIconButton inherits Rectangle {
         width: tip-lbl.preferred-width + 14px;
         height: 24px;
         border-radius: 5px;
-        background: MementoPalette.tooltip-bg;
+        background: MementoPalette.osc-tooltip-bg;
         border-width: 1px;
-        border-color: MementoPalette.border-light;
+        border-color: MementoPalette.osc-border;
         tip-lbl := Text {
             text: root.tooltip;
-            color: MementoPalette.text;
+            color: MementoPalette.osc-text;
             font-size: 11px;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -89,8 +89,11 @@ export component PlayerOscBar inherits Rectangle {
     in property <bool> ocr-enabled: false;
     in property <[float]> chapters: [];
     in property <[ChapterMark]> chapter-marks: [];
+    in property <length> preview-box-width: 192px;
+    in property <length> preview-box-height: 108px;
 
     property <bool> ocr-btn-hovered: false;
+    out property <bool> is-dragging: slider-touch.pressed;
     out property <bool> timeline-hovered: slider-touch.has-hover || slider-touch.pressed;
     // Stored imperatively from `slider-touch` pointer events (not reactive bindings on
     // `slider-touch.width`), so evaluating the timeline hover preview's `Text` never
@@ -132,9 +135,9 @@ export component PlayerOscBar inherits Rectangle {
     background: MementoPalette.osc-bg;
     border-radius: 10px;
     border-width: 1px;
-    border-color: MementoPalette.border-light;
+    border-color: MementoPalette.osc-border;
     drop-shadow-blur: 16px;
-    drop-shadow-color: MementoPalette.shadow;
+    drop-shadow-color: MementoPalette.osc-shadow;
 
     bar-touch := TouchArea {
         pointer-event(event) => {
@@ -220,7 +223,7 @@ export component PlayerOscBar inherits Rectangle {
                     font-family: "monospace";
                     font-size: 12px;
                     font-weight: 600;
-                    color: MementoPalette.text;
+                    color: MementoPalette.osc-text;
                     horizontal-alignment: right;
                     vertical-alignment: center;
                     min-width: 56px;
@@ -246,7 +249,7 @@ export component PlayerOscBar inherits Rectangle {
                     width: parent.width;
                     height: self.hot ? 7px : 5px;
                     border-radius: self.height / 2;
-                    background: MementoPalette.track-bg;
+                    background: MementoPalette.osc-track-bg;
                     animate height { duration: 100ms; }
 
                     // Cyan Progress Fill
@@ -266,7 +269,7 @@ export component PlayerOscBar inherits Rectangle {
                         y: 0px;
                         width: 2px;
                         height: parent.height;
-                        background: MementoPalette.window-bg;
+                        background: MementoPalette.osc-chapter-tick;
                     }
 
                     // Scrubber Knob with subtle hover/drag scale & accent ring
@@ -342,7 +345,7 @@ export component PlayerOscBar inherits Rectangle {
                     font-family: "monospace";
                     font-size: 12px;
                     font-weight: 600;
-                    color: MementoPalette.text-secondary;
+                    color: MementoPalette.osc-text-secondary;
                     horizontal-alignment: left;
                     vertical-alignment: center;
                     min-width: 56px;
@@ -370,6 +373,7 @@ export component PlayerOscBar inherits Rectangle {
                     maximum: max(100.0, root.volume-max);
                     value: root.is-muted ? 0.0 : root.volume;
                     accent: MementoPalette.cyan-accent;
+                    track-color: MementoPalette.osc-track-bg;
                     changed(val) => {
                         root.interacted();
                         root.activity();
@@ -385,7 +389,7 @@ export component PlayerOscBar inherits Rectangle {
                     text: (root.is-muted ? 0 : round(root.volume)) + "%";
                     font-family: "monospace";
                     font-size: 11px;
-                    color: MementoPalette.text-secondary;
+                    color: MementoPalette.osc-text-secondary;
                     horizontal-alignment: right;
                     vertical-alignment: center;
                     min-width: 34px;

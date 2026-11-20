@@ -32,6 +32,7 @@ export component OpenUrlModal inherits ModalDialog {
 
 export component AboutModal inherits ModalDialog {
     in property <string> app-version: "";
+    in property <string> app-version-display: "";
     callback open-link(string);
 
     title: "";
@@ -65,7 +66,7 @@ export component AboutModal inherits ModalDialog {
                     font-weight: 700;
                 }
                 Text {
-                    text: "Version " + root.app-version;
+                    text: root.app-version-display != "" ? root.app-version-display : ("Version " + root.app-version);
                     color: MementoPalette.text-secondary;
                     font-size: 13px;
                 }
@@ -130,6 +131,31 @@ export component AboutModal inherits ModalDialog {
                     clicked => { root.open-link("https://github.com/ripose-jp/Memento"); }
                 }
             }
+        }
+    }
+}
+
+export component NoDictionariesModal inherits ModalDialog {
+    title: "No Dictionaries Installed";
+    dialog-width: 440px;
+    cancel-text: "Later";
+    primary-text: "Open Dictionary Settings";
+
+    VerticalLayout {
+        spacing: 10px;
+
+        Text {
+            text: "Memento needs at least one Yomitan dictionary (.zip) installed before hovering or searching words can display definitions.";
+            color: MementoPalette.text;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        Text {
+            text: "Open Options → Dictionaries to import Yomitan dictionary archives, or drag and drop .zip dictionary files into the Settings window at any time.";
+            color: MementoPalette.text-secondary;
+            font-size: 12px;
+            wrap: word-wrap;
         }
     }
 }

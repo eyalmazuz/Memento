@@ -58,6 +58,14 @@ export struct AssRubyItem {
 export global SubtitleOverlayBridge {
     in-out property <bool> rich-enabled: false;
     in-out property <color> subtitle-bg-color: #00000000;
+    // User-configured subtitle style properties (shared by primary fallback & secondary subtitles)
+    in-out property <string> sub-font-family: "Noto Sans CJK JP";
+    in-out property <bool> sub-font-bold: true;
+    in-out property <bool> sub-font-italic: false;
+    in-out property <color> sub-text-color: #FFFFFF;
+    in-out property <color> sub-stroke-color: #000000;
+    in-out property <float> sub-stroke-width: 1.5;
+    in-out property <color> sub-bg-color: #00000099;
     in-out property <int> style-revision: 0;
     in-out property <int> highlight-revision: 0;
     in-out property <int> hovered-token-index: -1;
@@ -102,6 +110,7 @@ export component InteractiveSubtitleToken inherits Rectangle {
     in property <bool> selected;
     in property <bool> show-furigana: false;
     callback clicked();
+    callback double-clicked();
     callback hovered(string, bool, bool, bool, bool);
     callback hover-state(bool);
     callback popup-anchor-requested(length);
@@ -178,8 +187,8 @@ export component InteractiveSubtitleToken inherits Rectangle {
         height: self.preferred-height;
         wrap: no-wrap;
         font-size: root.type-size * 0.5;
-        font-family: "Noto Sans CJK JP";
-        color: MementoPalette.icon;
+        font-family: SubtitleOverlayBridge.sub-font-family;
+        color: SubtitleOverlayBridge.sub-text-color;
         x: round((parent.width - self.preferred-width) / 2 / 1px) * 1px;
         y: max(0px, root.ruby-space - self.preferred-height);
     }
@@ -193,9 +202,10 @@ export component InteractiveSubtitleToken inherits Rectangle {
         x: round((parent.width - self.preferred-width) / 2 / 1px) * 1px;
         y: root.ruby-space;
         font-size: root.type-size;
-        font-weight: 700;
-        font-family: "Noto Sans CJK JP";
-        color: MementoPalette.text;
+        font-weight: SubtitleOverlayBridge.sub-font-bold ? 700 : 400;
+        font-italic: SubtitleOverlayBridge.sub-font-italic;
+        font-family: SubtitleOverlayBridge.sub-font-family;
+        color: SubtitleOverlayBridge.sub-text-color;
     }
 
     token-focus := FocusScope {
@@ -247,6 +257,9 @@ export component InteractiveSubtitleToken inherits Rectangle {
             } else {
                 root.clicked();
             }
+        }
+        double-clicked => {
+            root.double-clicked();
         }
         pointer-event(event) => {
             if (SubtitleOverlayBridge.rich-enabled) {

@@ -1,9 +1,13 @@
 // Shared types, layout helpers, and global bridges for the Yomitan dictionary popup and search panel.
 
+import { MementoPalette } from "../palette.slint";
+
 export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
 export struct PitchGraph { dictionary: string, position: int, mora: [PitchMora] }
 export struct PopupFrequency { dictionary: string, value: string }
 export struct PopupFrequencyLine { entries: [PopupFrequency] }
+export struct CompactFrequencyItem { dictionary: string, value: string, omit-dict-name: bool }
+export struct CompactFrequencyLine { entries: [CompactFrequencyItem] }
 export struct PopupGlossaryBlock { text: string, kind: int, href: string }
 export struct PopupAudioSource { name: string, index: int }
 
@@ -64,6 +68,17 @@ export struct RichPitchMora {
 export struct RichPitchGraph {
     dictionary: string,
     position: int,
+    mora: [RichPitchMora],
+    tags: string,
+}
+
+// Extended pitch entry carrying exact string pitch patterns ("LHH", "HLL", etc.) and
+// per-entry dictionary badge hiding without breaking existing RichPitchGraph initializers.
+export struct RichPitchEntry {
+    dictionary: string,
+    position: int,
+    pattern-text: string,
+    hide-dict-name: bool,
     mora: [RichPitchMora],
     tags: string,
 }
@@ -131,6 +146,7 @@ export struct DefinitionGridRow {
 
 export global PopupLayout {
     pure callback frequency-lines([PopupFrequency], float) -> [PopupFrequencyLine];
+    pure callback compact-frequency-lines([CompactFrequencyItem], float) -> [CompactFrequencyLine];
 }
 
 export global PopupBridge {
@@ -141,23 +157,29 @@ export global PopupBridge {
     in-out property <int> rich-revision: 0;
     in-out property <int> selection-revision: 0;
 
+    // Compact layout & pitch display toggles (#220, H6.1, M2)
+    in-out property <bool> compact-glossaries: false;
+    in-out property <bool> compact-tags: true;
+    in-out property <bool> compact-freq-badges: true;
+    in-out property <bool> hide-pitch-dict-name: false;
+
     // Custom Popup Outer CSS properties (~/.config/memento/popup-outer.css)
-    in-out property <color> css-popup-bg: #1C2024;
-    in-out property <color> css-popup-border: #384046;
+    in-out property <color> css-popup-bg: MementoPalette.is-light ? #FFFFFF : #1C2024;
+    in-out property <color> css-popup-border: MementoPalette.is-light ? #CBD5E1 : #384046;
     in-out property <length> css-popup-border-width: 1px;
     in-out property <length> css-popup-radius: 8px;
     in-out property <length> css-popup-padding: 12px;
     in-out property <length> css-popup-shadow-blur: 24px;
-    in-out property <color> css-popup-shadow-color: #000000DD;
+    in-out property <color> css-popup-shadow-color: MementoPalette.is-light ? #0F172A33 : #000000DD;
     in-out property <length> css-popup-width: 0px;
     in-out property <length> css-popup-height: 0px;
 
     // Custom Popup Inner CSS properties (~/.config/memento/popup.css)
-    in-out property <color> css-text-color: #F8FAFC;
-    in-out property <color> css-muted-color: #94A3B8;
-    in-out property <color> css-headword-color: #FFFFFF;
+    in-out property <color> css-text-color: MementoPalette.is-light ? #0F172A : #F8FAFC;
+    in-out property <color> css-muted-color: MementoPalette.is-light ? #64748B : #94A3B8;
+    in-out property <color> css-headword-color: MementoPalette.is-light ? #0F172A : #FFFFFF;
     in-out property <length> css-headword-size: 23px;
-    in-out property <color> css-reading-color: #94A3B8;
+    in-out property <color> css-reading-color: MementoPalette.is-light ? #475569 : #94A3B8;
     in-out property <length> css-reading-size: 12px;
     in-out property <string> css-font-family: "Noto Sans CJK JP";
     in-out property <string> css-headword-font-family: "Noto Sans CJK JP";
@@ -169,19 +191,19 @@ export global PopupBridge {
     in-out property <string> css-kanji-font-family: "Noto Sans CJK JP";
     in-out property <length> css-kanji-font-size: 0px;
     in-out property <length> css-glossary-font-size: 14.5px;
-    in-out property <color> css-link-color: #93C5FD;
-    in-out property <color> css-divider-color: #30373D;
-    in-out property <color> css-term-divider-color: #52616B;
-    in-out property <color> css-freq-bg: #07513E;
-    in-out property <color> css-freq-color: #9CE5C7;
+    in-out property <color> css-link-color: MementoPalette.is-light ? #0284C7 : #93C5FD;
+    in-out property <color> css-divider-color: MementoPalette.is-light ? #E2E8F0 : #30373D;
+    in-out property <color> css-term-divider-color: MementoPalette.is-light ? #CBD5E1 : #52616B;
+    in-out property <color> css-freq-bg: MementoPalette.is-light ? #DCFCE7 : #07513E;
+    in-out property <color> css-freq-color: MementoPalette.is-light ? #065F46 : #9CE5C7;
     in-out property <length> css-freq-font-size: 10px;
-    in-out property <color> css-pitch-color: #B9A1E8;
-    in-out property <color> css-pitch-dict-bg: #6640BE;
+    in-out property <color> css-pitch-color: MementoPalette.is-light ? #6D28D9 : #B9A1E8;
+    in-out property <color> css-pitch-dict-bg: MementoPalette.is-light ? #6D28D9 : #6640BE;
     in-out property <color> css-dict-badge-bg: #6D28D9;
-    in-out property <color> css-dict-badge-color: #EDE9FE;
-    in-out property <color> css-anki-tag-bg: #162B3D;
-    in-out property <color> css-anki-tag-border: #38BDF888;
-    in-out property <color> css-anki-tag-color: #BAE6FD;
+    in-out property <color> css-dict-badge-color: MementoPalette.is-light ? #FFFFFF : #EDE9FE;
+    in-out property <color> css-anki-tag-bg: MementoPalette.is-light ? #E0F2FE : #162B3D;
+    in-out property <color> css-anki-tag-border: MementoPalette.is-light ? #0284C766 : #38BDF888;
+    in-out property <color> css-anki-tag-color: MementoPalette.is-light ? #0369A1 : #BAE6FD;
     in-out property <int> css-definition-columns: 1;
     in-out property <length> css-definition-columns-min-width: 560px;
     in-out property <length> css-definition-gap: 8px;
@@ -202,12 +224,51 @@ export global PopupBridge {
     in-out property <string> tooltip-text: "";
     in-out property <float> tooltip-x: 0.0;
     in-out property <float> tooltip-y: 0.0;
+    in-out property <bool> tooltip-is-ruby: false;
+    in-out property <int> tooltip-hover-delay-ms: 500;
+    // Deferred hover tooltip queue (driven by single top-level Timer in MementoApp)
+    in-out property <string> pending-tooltip-text: "";
+    in-out property <float> pending-tooltip-x: 0.0;
+    in-out property <float> pending-tooltip-y: 0.0;
+    in-out property <int> pending-tooltip-seq: 0;
+    in-out property <bool> tooltip-next-immediate: false;
+
+    public function request-popup-tooltip(text: string, x: float, y: float) {
+        if (self.tooltip-next-immediate || self.tooltip-hover-delay-ms <= 0) {
+            self.tooltip-next-immediate = false;
+            self.pending-tooltip-text = "";
+            self.pending-tooltip-seq += 1;
+            self.show-tooltip(text, x, y);
+        } else {
+            self.pending-tooltip-text = text;
+            self.pending-tooltip-x = x;
+            self.pending-tooltip-y = y;
+            self.pending-tooltip-seq += 1;
+        }
+    }
+
+    public function cancel-pending-tooltip() {
+        self.pending-tooltip-text = "";
+        self.pending-tooltip-seq += 1;
+    }
+
+    // Per-source audio availability status parallel to `popup-audio-sources`
+    // (0 = unknown/default, 1 = available, 2 = failed/unavailable, 3 = checking)
+    in-out property <[int]> audio-source-statuses: [];
 
     // Independent DictionarySearchPanel state
     in-out property <string> panel-query: "";
     in-out property <[DictResult]> panel-results: [];
     in-out property <bool> panel-kana-only: false;
     in-out property <bool> panel-searching: false;
+    in-out property <bool> panel-rich-enabled: false;
+    in-out property <int> panel-revision: 0;
+    in-out property <[bool]> panel-row-anki-duplicates: [];
+    in-out property <[int]> panel-row-anki-note-ids: [];
+    in-out property <[string]> panel-row-anki-browse-queries: [];
+    in-out property <[string]> panel-row-anki-tags: [];
+    in-out property <[bool]> panel-row-anki-addable: [];
+    in-out property <[bool]> panel-row-reading-as-expression: [];
 
     // Background Anki duplicate & show-tag state (#340, #346)
     in-out property <int> popup-revision: 0;
@@ -218,6 +279,8 @@ export global PopupBridge {
     in-out property <[string]> row-anki-note-id-strings: [];
     in-out property <[string]> row-anki-browse-queries: [];
     in-out property <[string]> row-anki-tags: [];
+    in-out property <[bool]> row-anki-addable: [];
+    in-out property <[bool]> row-reading-as-expression: [];
 
     // Recursive nested child popup state (depth 1..=4)
     in-out property <int> nested-depth: 0;
@@ -236,6 +299,8 @@ export global PopupBridge {
     in-out property <[int]> nested-row-anki-note-ids: [];
     in-out property <[string]> nested-row-anki-browse-queries: [];
     in-out property <[string]> nested-row-anki-tags: [];
+    in-out property <[bool]> nested-row-anki-addable: [];
+    in-out property <[bool]> nested-row-reading-as-expression: [];
     in-out property <bool> last-added-was-nested: false;
 
     // Rich query callbacks
@@ -252,6 +317,9 @@ export global PopupBridge {
     pure callback derivation-steps(int, int) -> [RichDerivationStep];
     pure callback derivation-summary(int, int) -> string;
     pure callback rich-pitch-graphs(int, int) -> [RichPitchGraph];
+    pure callback rich-pitch-entries(int, int) -> [RichPitchEntry];
+    pure callback pitch-pattern-text(int, int, int, int) -> string;
+    pure callback row-compact-frequencies(int, int, int) -> [CompactFrequencyItem];
     pure callback devoice-circle-image() -> image;
     pure callback kanji-detail(int, int) -> RichKanjiDetail;
     pure callback render-glossary(int, float, bool, int, int) -> RichGlossaryRender;
@@ -264,15 +332,30 @@ export global PopupBridge {
     pure callback nested-derivation-steps(int, int, int) -> [RichDerivationStep];
     pure callback nested-derivation-summary(int, int, int) -> string;
     pure callback nested-rich-pitch-graphs(int, int, int) -> [RichPitchGraph];
+    pure callback nested-rich-pitch-entries(int, int, int) -> [RichPitchEntry];
     pure callback nested-kanji-detail(int, int, int) -> RichKanjiDetail;
     pure callback nested-render-glossary(int, int, float, bool, int, int) -> RichGlossaryRender;
     pure callback nested-glossary-cursor-is-pointer(int, int, float, float) -> bool;
+
+    // Panel-isolated rich query callbacks (DictionarySearchPanel, scan-depth == -1)
+    pure callback panel-headword-pitch-color(int, int) -> color;
+    pure callback panel-term-tag-pills(int, int) -> [RichTagPill];
+    pure callback panel-def-tag-pills(int, int) -> [RichTagPill];
+    pure callback panel-derivation-steps(int, int) -> [RichDerivationStep];
+    pure callback panel-derivation-summary(int, int) -> string;
+    pure callback panel-rich-pitch-graphs(int, int) -> [RichPitchGraph];
+    pure callback panel-rich-pitch-entries(int, int) -> [RichPitchEntry];
+    pure callback panel-kanji-detail(int, int) -> RichKanjiDetail;
+    pure callback panel-render-glossary(int, float, bool, int, int) -> RichGlossaryRender;
+    pure callback panel-glossary-cursor-is-pointer(int, float, float) -> bool;
 
     // Interactive actions
     callback nav-back();
     callback nav-forward();
     callback lookup-kanji-char(string, string);
     callback toggle-kana-reading-search(string, string);
+    callback toggle-reading-as-expression(int);
+    callback nested-toggle-reading-as-expression(int, int);
     callback activate-glossary-link(string) -> bool;
     callback toggle-glossary-details(int, string);
     callback toggle-definition-expanded(int, int);
@@ -294,6 +377,7 @@ export global PopupBridge {
     callback nested-toggle-select-definition(int, int);
     callback nested-toggle-term-collapse(int, int);
     callback nested-add-anki-note(int);
+    callback nested-add-to-anki-with-audio(int, int);
     callback nested-popup-hover-changed(bool);
     callback nested-body-hover-changed(bool);
     callback lock-nested-popup();
@@ -311,6 +395,13 @@ export global PopupBridge {
     callback panel-search-requested(string);
     callback panel-toggle-kana-only();
     callback panel-lookup-requested(string);
+    callback panel-scan-query(string, int, length, length);
+    callback panel-add-anki-note(int);
+    callback panel-add-to-anki-with-audio(int, int);
+    callback panel-toggle-select-definition(int);
+    callback panel-toggle-term-collapse(int);
+    callback panel-toggle-reading-as-expression(int);
+    callback panel-lookup-kanji-char(string, string);
 }
 
 // Japanese text uses one family; Slint accepts a single name, not a CSS list.

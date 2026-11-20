@@ -1,7 +1,7 @@
 import { MementoPalette } from "../palette.slint";
 import { ActionButton, FilterChip, IconButton } from "../components/buttons.slint";
-import { MementoSwitch, SectionHeader } from "../components/controls.slint";
-import { SettingsField, SettingsGroup } from "types.slint";
+import { MementoCheckBox, MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { AnkiAutocompleteItem, AnkiExcludedDictRow, SettingsField, SettingsGroup } from "types.slint";
 import { FieldRow } from "controls.slint";
 
 export component SettingsSection inherits VerticalLayout {
@@ -9,6 +9,11 @@ export component SettingsSection inherits VerticalLayout {
     in property <[string]> anki-decks;
     in property <[string]> anki-models;
     in property <[string]> font-families;
+    in property <[AnkiExcludedDictRow]> anki-excluded-dicts: [];
+    in property <[AnkiAutocompleteItem]> anki-autocomplete-items: [];
+    in property <bool> anki-autocomplete-open: false;
+    in property <string> anki-autocomplete-field-key: "";
+    in-out property <int> anki-autocomplete-selected: 0;
     in property <int> keybind-conflict-count: 0;
     in property <bool> testing-anki: false;
     in property <bool> can-move-up: true;
@@ -20,6 +25,11 @@ export component SettingsSection inherits VerticalLayout {
     callback font-size-typed(string, string, string, bool, bool);
     callback open-color-picker(SettingsField);
     callback keybind-captured(string, string, bool, bool, bool, bool);
+    callback browse-folder-setting(string);
+    callback anki-excluded-dict-toggled(string, bool);
+    callback anki-field-autocomplete-query(string, string, int);
+    callback anki-field-autocomplete-accepted(string, string);
+    callback anki-field-autocomplete-dismissed();
     callback apply-anki-preset(string);
     callback advanced-changed(bool);
     callback move-entry(string, int);
@@ -98,9 +108,15 @@ export component SettingsSection inherits VerticalLayout {
                 if index > 0 && field.visible : Rectangle { height: 1px; background: MementoPalette.border; }
                 field-row := FieldRow {
                     field: field;
+                    group-category: root.group.category;
+                    group-title: root.group.title;
                     anki-decks: root.anki-decks;
                     anki-models: root.anki-models;
                     font-families: root.font-families;
+                    anki-autocomplete-items: root.anki-autocomplete-items;
+                    anki-autocomplete-open: root.anki-autocomplete-open;
+                    anki-autocomplete-field-key: root.anki-autocomplete-field-key;
+                    anki-autocomplete-selected <=> root.anki-autocomplete-selected;
                     edited(key, value) => { root.edited(key, value); }
                     color-hex-committed(key, value) => { root.color-hex-committed(key, value); }
                     font-edited(key, family, size, bold, italic) => {
@@ -112,6 +128,84 @@ export component SettingsSection inherits VerticalLayout {
                     open-color-picker(f) => { root.open-color-picker(f); }
                     keybind-captured(key, text, ctrl, alt, shift, meta) => {
                         root.keybind-captured(key, text, ctrl, alt, shift, meta);
+                    }
+                    browse-folder-setting(key) => { root.browse-folder-setting(key); }
+                    anki-field-autocomplete-query(key, text, pos) => {
+                        root.anki-field-autocomplete-query(key, text, pos);
+                    }
+                    anki-field-autocomplete-accepted(key, insert-text) => {
+                        root.anki-field-autocomplete-accepted(key, insert-text);
+                    }
+                    anki-field-autocomplete-dismissed => { root.anki-field-autocomplete-dismissed(); }
+                }
+            }
+
+            // Excluded Glossary Dictionaries (`ex-glos`) checklist inside Anki Advanced section
+            if root.group.category == 0 && root.group.title == "Advanced" && root.anki-excluded-dicts.length > 0 : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 1px; background: MementoPalette.border; }
+                VerticalLayout {
+                    padding-top: 11px;
+                    padding-bottom: 11px;
+                    spacing: 8px;
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text {
+                            text: "Excluded Glossary Dictionaries";
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: MementoPalette.text;
+                        }
+                        Text {
+                            text: "Checked dictionaries are excluded from {glossary} exports for this Anki profile";
+                            font-size: 11px;
+                            color: MementoPalette.text-muted;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    Rectangle {
+                        border-radius: 7px;
+                        background: MementoPalette.card-inset;
+                        border-width: 1px;
+                        border-color: MementoPalette.border;
+
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 6px;
+
+                            for item in root.anki-excluded-dicts : HorizontalLayout {
+                                spacing: 8px;
+                                alignment: space-between;
+
+                                MementoCheckBox {
+                                    label: item.name;
+                                    checked: item.excluded;
+                                    toggled(val) => { root.anki-excluded-dict-toggled(item.name, val); }
+                                }
+
+                                if !item.installed : VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        height: 18px;
+                                        width: uninst-lbl.preferred-width + 10px;
+                                        border-radius: 4px;
+                                        background: MementoPalette.warning-bg;
+                                        border-width: 1px;
+                                        border-color: MementoPalette.warning-border;
+                                        uninst-lbl := Text {
+                                            text: "Not installed";
+                                            font-size: 10px;
+                                            font-weight: 600;
+                                            color: MementoPalette.warning-text;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

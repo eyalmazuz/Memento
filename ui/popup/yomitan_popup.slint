@@ -4,6 +4,7 @@ import {
     DictResult,
     PopupAudioSource,
     RichDerivationStep,
+    RichPitchEntry,
     RichPitchGraph,
     DictionaryText,
     PopupBridge,
@@ -28,10 +29,13 @@ component LeadingActionsBox inherits Rectangle {
     in property <DictResult> res;
     in property <length> spacing: 6px;
     in property <bool> show-kana: false;
+    in property <bool> show-reading-as-expr: false;
+    in property <bool> reading-as-expression: false;
     in property <bool> show-browse: false;
     in property <length> btn-size: 28px;
     in property <length> icon-size: 16px;
     callback kana-clicked();
+    callback reading-as-expression-clicked();
     callback kanji-clicked();
     callback audio-clicked();
     callback audio-right-clicked(length);
@@ -51,8 +55,11 @@ component LeadingActionsBox inherits Rectangle {
         btn-size: root.btn-size;
         icon-size: root.icon-size;
         show-kana: root.show-kana;
+        show-reading-as-expr: root.show-reading-as-expr;
+        reading-as-expression: root.reading-as-expression;
         show-browse: root.show-browse;
         kana-clicked => { root.kana-clicked(); }
+        reading-as-expression-clicked => { root.reading-as-expression-clicked(); }
         kanji-clicked => { root.kanji-clicked(); }
         audio-clicked => { root.audio-clicked(); }
         audio-right-clicked(x) => { root.audio-right-clicked(x); }
@@ -74,12 +81,17 @@ export component NestedYomitanPopup inherits Rectangle {
     in property <length> configured-height: 500px;
     in property <bool> anki-enabled: false;
     in property <bool> show-anki-checkbox: true;
+    in property <bool> compact-glossaries: PopupBridge.compact-glossaries;
+    in property <bool> compact-tags: PopupBridge.compact-tags;
     in property <string> added-note-id: "";
     in property <int> added-result-index: -1;
     in property <[PopupAudioSource]> audio-sources;
+    in property <[int]> audio-source-statuses: PopupBridge.audio-source-statuses;
     in property <bool> audio-sources-loading: false;
     in-out property <int> selected-audio-source: -1;
     in-out property <bool> audio-menu-open: false;
+    in-out property <bool> audio-menu-for-anki: false;
+    in-out property <int> audio-menu-anki-row-index: -1;
     in-out property <string> audio-menu-expression: "";
     in-out property <string> audio-menu-reading: "";
     in-out property <length> audio-menu-x: 210px;
@@ -231,12 +243,13 @@ export component NestedYomitanPopup inherits Rectangle {
                         clicked => { PopupBridge.pop-nested-popup(); }
                         changed has-hover => {
                             if self.has-hover {
-                                PopupBridge.show-tooltip(
+                                PopupBridge.request-popup-tooltip(
                                     "Back to previous level (Esc)",
                                     (root.x - root.parent-x + root.card-pad) / 1px,
                                     (root.y - root.parent-y + root.card-pad + 60px) / 1px
                                 );
                             } else {
+                                PopupBridge.cancel-pending-tooltip();
                                 PopupBridge.hide-tooltip();
                             }
                         }
@@ -292,7 +305,7 @@ export component NestedYomitanPopup inherits Rectangle {
                     tooltip: "Close all nested popups";
                     clicked => { PopupBridge.dismiss-all-nested-popups(); }
                     request-tooltip(tip) => {
-                        PopupBridge.show-tooltip(
+                        PopupBridge.request-popup-tooltip(
                             tip,
                             (root.x - root.parent-x + root.width - 170px) / 1px,
                             (root.y - root.parent-y + root.card-pad + 60px) / 1px
@@ -311,7 +324,8 @@ export component NestedYomitanPopup inherits Rectangle {
         nested-definition-list := ScrollView {
             vertical-stretch: 1;
             changed viewport-y => {
-                PopupBridge.hide-tooltip();
+                PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
                 if self.viewport-y < -1px {
                     PopupBridge.lock-nested-popup();
                 }
@@ -360,11 +374,25 @@ export component NestedYomitanPopup inherits Rectangle {
                                 : "";
                         property <bool> nshow-browse-btn: self.nadded-this-row || (root.anki-enabled && self.nrow-is-duplicate);
                         property <bool> nshow-update-btn: root.anki-enabled && self.nrow-is-duplicate && self.nrow-anki-note-id > 0;
+                        property <bool> nrow-term-addable:
+                            (PopupBridge.nested-revision >= 0
+                                && self.nrow-zero-idx >= 0
+                                && self.nrow-zero-idx < PopupBridge.nested-row-anki-addable.length)
+                                ? PopupBridge.nested-row-anki-addable[self.nrow-zero-idx]
+                                : !self.nshow-browse-btn;
+                        property <bool> nrow-reading-as-expr:
+                            (PopupBridge.nested-revision >= 0
+                                && self.nrow-zero-idx >= 0
+                                && self.nrow-zero-idx < PopupBridge.nested-row-reading-as-expression.length)
+                                && PopupBridge.nested-row-reading-as-expression[self.nrow-zero-idx];
                         property <color> nterm-headword-color: PopupBridge.nested-headword-pitch-color(
                             PopupBridge.nested-depth,
                             nres.index,
                             PopupBridge.nested-revision
                         );
+                        property <[RichPitchEntry]> cached-rich-pitch-entries: (!nres.collapsed && nres.term-start)
+                            ? PopupBridge.nested-rich-pitch-entries(PopupBridge.nested-depth, nres.index, PopupBridge.nested-revision)
+                            : [];
                         property <[RichPitchGraph]> cached-rich-pitches: (!nres.collapsed && nres.term-start)
                             ? PopupBridge.nested-rich-pitch-graphs(PopupBridge.nested-depth, nres.index, PopupBridge.nested-revision)
                             : [];
@@ -405,7 +433,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                 spacing: 5px;
                                 min-height: root.action-btn-size + 4px;
                                 property <length> nbuttons-w:
-                                    (!nres.is-kanji && nres.reading != "" && nres.reading != nres.expression ? 39px : 0px)
+                                    (!nres.is-kanji && nres.reading != "" && nres.reading != nres.expression ? (39px + root.action-btn-size + 5px) : 0px)
                                     + (!nres.is-kanji && nres.has-kanji ? (root.action-btn-size + 5px) : 0px)
                                     + (!nres.is-kanji ? (root.action-btn-size + 5px) : 0px)
                                     + (nested-term-segment.nshow-browse-btn || root.anki-enabled ? (root.action-btn-size + 5px) : 0px)
@@ -416,7 +444,8 @@ export component NestedYomitanPopup inherits Rectangle {
                                 TermHeadwordBlock {
                                     res: nres;
                                     nested: true;
-                                    compact: false;
+                                    compact: root.compact-glossaries;
+                                    reading-as-expression: nested-term-segment.nrow-reading-as-expr;
                                     scan-depth: PopupBridge.nested-depth;
                                     bridge-rev: PopupBridge.nested-revision;
                                     avail-width: nterm-header.navail-title-w;
@@ -441,9 +470,15 @@ export component NestedYomitanPopup inherits Rectangle {
                                             btn-size: root.action-btn-size;
                                             icon-size: 15px;
                                             show-kana: !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression;
+                                            show-reading-as-expr: root.anki-enabled && !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression;
+                                            reading-as-expression: nested-term-segment.nrow-reading-as-expr;
                                             show-browse: nested-term-segment.nshow-browse-btn;
                                             kana-clicked => {
                                                 PopupBridge.toggle-kana-reading-search(nres.expression, nres.reading);
+                                            }
+                                            reading-as-expression-clicked => {
+                                                PopupBridge.lock-nested-popup();
+                                                PopupBridge.nested-toggle-reading-as-expression(PopupBridge.nested-depth, nres.index - 1);
                                             }
                                             kanji-clicked => {
                                                 PopupBridge.lock-nested-popup();
@@ -455,9 +490,11 @@ export component NestedYomitanPopup inherits Rectangle {
                                             }
                                             audio-right-clicked(offset-x) => {
                                                 PopupBridge.lock-nested-popup();
+                                                root.audio-menu-for-anki = false;
+                                                root.audio-menu-anki-row-index = -1;
                                                 root.audio-menu-expression = nres.expression;
                                                 root.audio-menu-reading = nres.reading;
-                                                root.audio-menu-x = max(8px, min(root.width - 244px, root.card-pad + nheader-actions.x + nleading-actions.x + offset-x - 190px));
+                                                root.audio-menu-x = max(8px, min(root.width - 260px, root.card-pad + nheader-actions.x + nleading-actions.x + offset-x - 190px));
                                                 root.audio-menu-y = max(36px, min(root.height - 140px, nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px));
                                                 root.audio-menu-open = true;
                                                 root.request-audio-sources(nres.expression, nres.reading);
@@ -469,7 +506,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                                 }
                                             }
                                             request-tooltip(tip, right-offset) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.x - root.parent-x + root.width - right-offset) / 1px,
                                                     (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px) / 1px
@@ -483,12 +520,12 @@ export component NestedYomitanPopup inherits Rectangle {
                                             label: "↻";
                                             label-font-size: 15px;
                                             bg-normal: MementoPalette.warning-bg;
-                                            bg-hover: #644010;
+                                            bg-hover: MementoPalette.warning-hover;
                                             bg-pressed: MementoPalette.warning-bg;
                                             border-normal: MementoPalette.warning-border;
                                             border-hover: MementoPalette.warning;
                                             fg-color: MementoPalette.warning-text;
-                                            fg-hover-color: #FEF3C7;
+                                            fg-hover-color: MementoPalette.warning-text-hover;
                                             tooltip: "Update existing Anki note";
                                             clicked => {
                                                 PopupBridge.lock-nested-popup();
@@ -501,7 +538,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                                 );
                                             }
                                             request-tooltip(tip) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.x - root.parent-x + root.width - 180px) / 1px,
                                                     (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px) / 1px
@@ -515,8 +552,19 @@ export component NestedYomitanPopup inherits Rectangle {
                                                 PopupBridge.lock-nested-popup();
                                                 PopupBridge.nested-add-anki-note(nres.index - 1);
                                             }
+                                            right-clicked(offset-x) => {
+                                                PopupBridge.lock-nested-popup();
+                                                root.audio-menu-for-anki = true;
+                                                root.audio-menu-anki-row-index = nres.index - 1;
+                                                root.audio-menu-expression = nres.expression;
+                                                root.audio-menu-reading = nres.reading;
+                                                root.audio-menu-x = max(8px, min(root.width - 260px, root.width - 256px));
+                                                root.audio-menu-y = max(36px, min(root.height - 140px, nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px));
+                                                root.audio-menu-open = true;
+                                                root.request-audio-sources(nres.expression, nres.reading);
+                                            }
                                             request-tooltip(tip) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.x - root.parent-x + root.width - 120px) / 1px,
                                                     (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px) / 1px
@@ -538,7 +586,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                                 PopupBridge.nested-toggle-term-collapse(PopupBridge.nested-depth, nres.index - 1);
                                             }
                                             request-tooltip(tip) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.x - root.parent-x + root.width - 120px) / 1px,
                                                     (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 38px) / 1px
@@ -553,7 +601,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                 steps: nested-term-segment.cached-deriv-steps;
                                 compact-summary: nested-term-segment.cached-deriv-summary;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         (root.x - root.parent-x + 20px) / 1px,
                                         (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 44px) / 1px
@@ -565,8 +613,9 @@ export component NestedYomitanPopup inherits Rectangle {
                                 res-index: nres.index;
                                 scan-depth: PopupBridge.nested-depth;
                                 bridge-rev: PopupBridge.nested-revision;
+                                compact-tags: root.compact-tags;
                                 request-tooltip(notes) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         notes,
                                         (root.x - root.parent-x + 16px) / 1px,
                                         (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 44px) / 1px
@@ -577,7 +626,7 @@ export component NestedYomitanPopup inherits Rectangle {
                             if !nres.collapsed && nres.term-start && PopupBridge.anki-show-tags && nested-term-segment.nrow-raw-anki-tags != "" : AnkiTagRow {
                                 raw-tags: nested-term-segment.nrow-raw-anki-tags;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         (root.x - root.parent-x + 16px) / 1px,
                                         (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 44px) / 1px
@@ -588,16 +637,22 @@ export component NestedYomitanPopup inherits Rectangle {
                             if !nres.collapsed && nres.term-start && nres.frequencies.length > 0 : FrequencyBadgeList {
                                 width: parent.width;
                                 res: nres;
+                                scan-depth: PopupBridge.nested-depth;
+                                bridge-rev: PopupBridge.nested-revision;
                             }
 
-                            if !nres.collapsed && nres.term-start && nested-term-segment.cached-rich-pitches.length > 0 : PitchGraphList {
+                            if !nres.collapsed && nres.term-start && (nested-term-segment.cached-rich-pitch-entries.length > 0 || nested-term-segment.cached-rich-pitches.length > 0) : PitchGraphList {
                                 width: parent.width;
+                                rich-pitch-entries: nested-term-segment.cached-rich-pitch-entries;
                                 rich-pitches: nested-term-segment.cached-rich-pitches;
                                 fallback-pitches: [];
+                                scan-depth: PopupBridge.nested-depth;
+                                row-index: nres.index;
+                                bridge-rev: PopupBridge.nested-revision;
                                 allow-fallback: false;
                                 compact: true;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         (root.x - root.parent-x + 24px) / 1px,
                                         (root.y - root.parent-y + nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 64px) / 1px
@@ -613,6 +668,10 @@ export component NestedYomitanPopup inherits Rectangle {
                                 bridge-rev: PopupBridge.nested-revision;
                                 is-solo: nres.term-start && nres.term-end;
                                 show-anki-checkbox: root.show-anki-checkbox;
+                                anki-enabled: root.anki-enabled;
+                                term-addable: nested-term-segment.nrow-term-addable;
+                                compact-glossaries: root.compact-glossaries;
+                                compact-tags: root.compact-tags;
                                 tooltip-base-x: round(root.card-pad / 1px) * 1px;
                                 content-base-y: nested-row-wrapper.y + 4px + self.y;
                                 scan-offset-x: root.x - root.parent-x;
@@ -635,6 +694,10 @@ export component NestedYomitanPopup inherits Rectangle {
                                 scan-depth: PopupBridge.nested-depth;
                                 bridge-rev: PopupBridge.nested-revision;
                                 show-anki-checkbox: root.show-anki-checkbox;
+                                anki-enabled: root.anki-enabled;
+                                term-addable: nested-term-segment.nrow-term-addable;
+                                compact-glossaries: root.compact-glossaries;
+                                compact-tags: root.compact-tags;
                                 base-x: root.card-pad;
                                 content-base-y: nested-row-wrapper.y + 4px + self.y;
                                 scan-offset-x: root.x - root.parent-x;
@@ -669,13 +732,24 @@ export component NestedYomitanPopup inherits Rectangle {
         menu-x: root.audio-menu-x;
         menu-y: root.audio-menu-y;
         audio-sources: root.audio-sources;
+        audio-source-statuses: root.audio-source-statuses;
         loading: root.audio-sources-loading;
         selected-source: root.selected-audio-source;
-        dismissed => { root.audio-menu-open = false; }
-        source-picked(idx) => {
-            root.select-audio-source(idx);
+        header-title: root.audio-menu-for-anki ? "Add to Anki with audio" : "";
+        allow-no-audio: root.audio-menu-for-anki;
+        dismissed => {
             root.audio-menu-open = false;
-            root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+            root.audio-menu-for-anki = false;
+        }
+        source-picked(idx) => {
+            root.audio-menu-open = false;
+            if root.audio-menu-for-anki {
+                root.audio-menu-for-anki = false;
+                PopupBridge.nested-add-to-anki-with-audio(root.audio-menu-anki-row-index, idx);
+            } else {
+                root.select-audio-source(idx);
+                root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+            }
         }
     }
 }
@@ -689,11 +763,17 @@ export component YomitanPopup inherits Rectangle {
     in property <string> freq-rank: "";
     in property <string> jpdb-rank: "";
     in property <[DictResult]> results;
+    in property <int> focused-index: 0;
+    in-out property <length> target-scroll-y: 0px;
+    out property <length> current-scroll-y: definition-list.viewport-y;
     in property <bool> has-more-results: false;
     in property <[PopupAudioSource]> audio-sources;
+    in property <[int]> audio-source-statuses: PopupBridge.audio-source-statuses;
     in property <bool> audio-sources-loading: false;
     in-out property <int> selected-audio-source: -1;
     in-out property <bool> audio-menu-open: false;
+    in-out property <bool> audio-menu-for-anki: false;
+    in-out property <int> audio-menu-anki-row-index: -1;
     in-out property <string> audio-menu-expression: "";
     in-out property <string> audio-menu-reading: "";
     in-out property <length> audio-menu-x: 210px;
@@ -701,19 +781,25 @@ export component YomitanPopup inherits Rectangle {
     in property <bool> is-open: false;
     in property <bool> anki-enabled: false;
     in property <bool> show-anki-checkbox: true;
+    in property <bool> compact-glossaries: PopupBridge.compact-glossaries;
+    in property <bool> compact-tags: PopupBridge.compact-tags;
     in property <string> added-note-id: "";
     in property <int> added-result-index: -1;
     in property <bool> render-nested-inline: false;
+    private property <bool> programmatic-scroll: false;
     callback close-requested();
     callback add-anki-note(int);
+    callback add-to-anki-with-audio(int, int);
     callback browse-anki-note(string);
     callback play-audio(string, string);
     callback request-audio-sources(string, string);
     callback kanji-info(string);
     callback toggle-select-definition(int);
     callback toggle-term-collapse(int);
+    callback toggle-reading-as-expression(int);
     callback select-audio-source(int);
     callback open-rich-link(string);
+    callback viewport-scrolled(length);
     callback reset-scroll();
     callback load-more-results(bool);
     out property <bool> needs-more: root.is-open && root.has-more-results
@@ -723,6 +809,24 @@ export component YomitanPopup inherits Rectangle {
         && PopupBridge.css-definition-columns >= 2
         && root.width >= PopupBridge.css-definition-columns-min-width;
     property <int> watched-nested-depth: PopupBridge.nested-depth;
+
+    function scroll-to-row-y(row-y: length, row-h: length) {
+        let view-h = definition-list.height;
+        let content-h = definition-list.viewport-height;
+        if view-h <= 0px || content-h <= view-h {
+            return;
+        }
+        let min-vy = min(0px, view-h - content-h);
+        let cur-top = -definition-list.viewport-y;
+        let cur-bottom = cur-top + view-h;
+        let desired-top = row-y < cur-top
+            ? row-y
+            : (row-y + row-h > cur-bottom ? (row-y + row-h - view-h) : cur-top);
+        let clamped = max(min-vy, min(0px, -desired-top));
+        root.programmatic-scroll = true;
+        definition-list.viewport-y = clamped;
+        root.programmatic-scroll = false;
+    }
 
     visible: root.is-open && root.results.length > 0;
     width: 480px;
@@ -734,6 +838,16 @@ export component YomitanPopup inherits Rectangle {
     drop-shadow-blur: PopupBridge.css-popup-shadow-blur;
     drop-shadow-color: PopupBridge.css-popup-shadow-color;
 
+    changed target-scroll-y => {
+        let view-h = definition-list.height;
+        let content-h = definition-list.viewport-height;
+        let min-vy = content-h > view-h ? (view-h - content-h) : 0px;
+        let clamped = max(min-vy, min(0px, -abs(root.target-scroll-y)));
+        root.programmatic-scroll = true;
+        definition-list.viewport-y = clamped;
+        root.programmatic-scroll = false;
+    }
+
     changed watched-nested-depth => {
         if root.is-open && !glossary-focus.has-focus {
             glossary-focus.focus();
@@ -741,18 +855,26 @@ export component YomitanPopup inherits Rectangle {
     }
     changed is-open => {
         root.audio-menu-open = false;
-        PopupBridge.hide-tooltip();
+        root.audio-menu-for-anki = false;
+        PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
         if root.is-open {
+            root.programmatic-scroll = true;
             definition-list.viewport-y = 0px;
+            root.programmatic-scroll = false;
             definition-list.fill-viewport();
         } else {
             PopupBridge.dismiss-all-nested-popups();
         }
     }
     reset-scroll => {
+        root.programmatic-scroll = true;
         definition-list.viewport-y = 0px;
+        root.programmatic-scroll = false;
         root.audio-menu-open = false;
-        PopupBridge.hide-tooltip();
+        root.audio-menu-for-anki = false;
+        PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
     }
 
     // Keep clicks on the card's padding from reaching the video underneath.
@@ -790,7 +912,7 @@ export component YomitanPopup inherits Rectangle {
                     tooltip: "Back";
                     clicked => { PopupBridge.nav-back(); }
                     request-tooltip(tip) => {
-                        PopupBridge.show-tooltip(
+                        PopupBridge.request-popup-tooltip(
                             tip,
                             (PopupBridge.css-popup-padding) / 1px,
                             (PopupBridge.css-popup-padding + 58px) / 1px
@@ -844,12 +966,13 @@ export component YomitanPopup inherits Rectangle {
                         clicked => { PopupBridge.nav-forward(); }
                         changed has-hover => {
                             if self.has-hover && PopupBridge.can-go-forward {
-                                PopupBridge.show-tooltip(
+                                PopupBridge.request-popup-tooltip(
                                     "Forward",
                                     (PopupBridge.css-popup-padding + 30px) / 1px,
                                     (PopupBridge.css-popup-padding + 58px) / 1px
                                 );
                             } else if !self.has-hover {
+                                PopupBridge.cancel-pending-tooltip();
                                 PopupBridge.hide-tooltip();
                             }
                         }
@@ -876,7 +999,14 @@ export component YomitanPopup inherits Rectangle {
                     root.load-more-results(false);
                 }
             }
-            changed viewport-y => { self.fill-viewport(); PopupBridge.hide-tooltip(); }
+            changed viewport-y => {
+                self.fill-viewport();
+                PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
+                if !root.programmatic-scroll {
+                    root.viewport-scrolled(-self.viewport-y);
+                }
+            }
             changed viewport-height => { self.fill-viewport(); }
             changed height => { self.fill-viewport(); }
             definition-content := VerticalLayout {
@@ -890,10 +1020,17 @@ export component YomitanPopup inherits Rectangle {
                 for res[idx] in root.results : row-wrapper := Rectangle {
                     property <bool> hidden-by-grid: root.use-two-columns && !res.term-start;
                     property <bool> row-hidden: self.hidden-by-grid || (res.collapsed && !res.term-start);
+                    property <bool> is-focused: !self.row-hidden && root.focused-index >= 0 && idx == root.focused-index;
                     width: parent.width - 6px;
                     height: self.row-hidden ? 0px : term-segment.height + ((res.term-end || root.use-two-columns || (res.collapsed && res.term-start)) ? 10px : 0px);
                     visible: !self.row-hidden;
                     background: transparent;
+
+                    changed is-focused => {
+                        if self.is-focused && root.is-open {
+                            root.scroll-to-row-y(self.y, self.height);
+                        }
+                    }
 
                     term-segment := Rectangle {
                         property <int> row-zero-idx: res.index - 1;
@@ -923,9 +1060,23 @@ export component YomitanPopup inherits Rectangle {
                                 : "";
                         property <bool> show-browse-btn: self.added-this-row || (root.anki-enabled && self.row-is-duplicate);
                         property <bool> show-update-btn: root.anki-enabled && self.row-is-duplicate && self.row-anki-note-id > 0;
+                        property <bool> row-term-addable:
+                            (PopupBridge.popup-revision >= 0
+                                && self.row-zero-idx >= 0
+                                && self.row-zero-idx < PopupBridge.row-anki-addable.length)
+                                ? PopupBridge.row-anki-addable[self.row-zero-idx]
+                                : !self.show-browse-btn;
+                        property <bool> row-reading-as-expr:
+                            (PopupBridge.popup-revision >= 0
+                                && self.row-zero-idx >= 0
+                                && self.row-zero-idx < PopupBridge.row-reading-as-expression.length)
+                                && PopupBridge.row-reading-as-expression[self.row-zero-idx];
                         property <color> term-headword-color: PopupBridge.rich-enabled
                             ? PopupBridge.headword-pitch-color(res.index, PopupBridge.rich-revision)
                             : PopupBridge.css-headword-color;
+                        property <[RichPitchEntry]> cached-rich-pitch-entries: (!res.collapsed && res.term-start && PopupBridge.rich-enabled)
+                            ? PopupBridge.rich-pitch-entries(res.index, PopupBridge.rich-revision)
+                            : [];
                         property <[RichPitchGraph]> cached-rich-pitches: (!res.collapsed && res.term-start && PopupBridge.rich-enabled)
                             ? PopupBridge.rich-pitch-graphs(res.index, PopupBridge.rich-revision)
                             : [];
@@ -938,7 +1089,19 @@ export component YomitanPopup inherits Rectangle {
 
                         width: parent.width;
                         height: row-wrapper.row-hidden ? 0px : card-content.preferred-height + 10px;
-                        background: transparent;
+                        border-radius: 5px;
+                        background: (row-wrapper.is-focused && root.results.length > 1) ? MementoPalette.accent-subtle : transparent;
+                        border-width: (row-wrapper.is-focused && root.results.length > 1) ? 1px : 0px;
+                        border-color: (row-wrapper.is-focused && root.results.length > 1) ? MementoPalette.cyan-accent : transparent;
+                        // Left keyboard-focus accent bar (visible on focused term card for Ctrl+Up/Down & Ctrl+D)
+                        if row-wrapper.is-focused && res.term-start && root.results.length > 1 : Rectangle {
+                            x: 0px;
+                            y: 4px;
+                            width: 3px;
+                            height: max(0px, parent.height - 8px);
+                            border-radius: 1.5px;
+                            background: MementoPalette.cyan-accent;
+                        }
                         Rectangle {
                             visible: !row-wrapper.row-hidden && res.term-start && res.index > 1;
                             y: 0px;
@@ -959,7 +1122,7 @@ export component YomitanPopup inherits Rectangle {
                             y: 4px;
                             width: parent.width;
                             height: self.preferred-height;
-                            spacing: 4px;
+                            spacing: root.compact-glossaries ? 2px : 4px;
 
                             if res.term-start : term-header := HorizontalLayout {
                                 width: parent.width;
@@ -967,6 +1130,7 @@ export component YomitanPopup inherits Rectangle {
                                 min-height: 34px;
                                 property <length> buttons-reserved-w:
                                     (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
+                                    + (root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 34px : 0px)
                                     + (!res.is-kanji && res.has-kanji ? 34px : 0px)
                                     + (!res.is-kanji ? 34px : 0px)
                                     + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
@@ -977,7 +1141,8 @@ export component YomitanPopup inherits Rectangle {
                                 term-title := TermHeadwordBlock {
                                     res: res;
                                     nested: false;
-                                    compact: false;
+                                    compact: root.compact-glossaries;
+                                    reading-as-expression: term-segment.row-reading-as-expr;
                                     scan-depth: 0;
                                     bridge-rev: PopupBridge.rich-revision;
                                     avail-width: term-header.avail-title-w;
@@ -1001,9 +1166,14 @@ export component YomitanPopup inherits Rectangle {
                                             btn-size: 28px;
                                             icon-size: 16px;
                                             show-kana: PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression;
+                                            show-reading-as-expr: root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression;
+                                            reading-as-expression: term-segment.row-reading-as-expr;
                                             show-browse: term-segment.show-browse-btn;
                                             kana-clicked => {
                                                 PopupBridge.toggle-kana-reading-search(res.expression, res.reading);
+                                            }
+                                            reading-as-expression-clicked => {
+                                                root.toggle-reading-as-expression(res.index - 1);
                                             }
                                             kanji-clicked => {
                                                 if PopupBridge.rich-enabled {
@@ -1016,9 +1186,11 @@ export component YomitanPopup inherits Rectangle {
                                                 if (!root.audio-menu-open) { root.play-audio(res.expression, res.reading); }
                                             }
                                             audio-right-clicked(offset-x) => {
+                                                root.audio-menu-for-anki = false;
+                                                root.audio-menu-anki-row-index = -1;
                                                 root.audio-menu-expression = res.expression;
                                                 root.audio-menu-reading = res.reading;
-                                                root.audio-menu-x = max(8px, min(root.width - 244px, PopupBridge.css-popup-padding + header-actions.x + leading-actions.x + offset-x - 190px));
+                                                root.audio-menu-x = max(8px, min(root.width - 260px, PopupBridge.css-popup-padding + header-actions.x + leading-actions.x + offset-x - 190px));
                                                 root.audio-menu-y = max(36px, min(root.height - 140px, 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px));
                                                 root.audio-menu-open = true;
                                                 root.request-audio-sources(res.expression, res.reading);
@@ -1029,7 +1201,7 @@ export component YomitanPopup inherits Rectangle {
                                                 }
                                             }
                                             request-tooltip(tip, right-offset) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.width - right-offset) / 1px,
                                                     (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
@@ -1046,13 +1218,13 @@ export component YomitanPopup inherits Rectangle {
                                             border-color: update-anki-touch.has-hover ? MementoPalette.warning : MementoPalette.warning-border;
                                             background: update-anki-touch.pressed
                                                 ? MementoPalette.warning-bg
-                                                : (update-anki-touch.has-hover ? #644010 : MementoPalette.warning-bg);
+                                                : (update-anki-touch.has-hover ? MementoPalette.warning-hover : MementoPalette.warning-bg);
                                             animate background { duration: 100ms; }
                                             animate border-color { duration: 100ms; }
 
                                             DictionaryText {
                                                 text: "↻";
-                                                color: update-anki-touch.has-hover ? #FEF3C7 : MementoPalette.warning-text;
+                                                color: update-anki-touch.has-hover ? MementoPalette.warning-text-hover : MementoPalette.warning-text;
                                                 font-size: 15px;
                                                 font-weight: 700;
                                                 horizontal-alignment: center;
@@ -1075,13 +1247,14 @@ export component YomitanPopup inherits Rectangle {
                                                 }
                                                 changed has-hover => {
                                                     if self.has-hover && PopupBridge.rich-enabled {
-                                                        PopupBridge.show-tooltip(
+                                                        PopupBridge.request-popup-tooltip(
                                                             "Update existing Anki note",
                                                             (root.width - 170px) / 1px,
                                                             (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
                                                         );
                                                     } else if !self.has-hover && PopupBridge.rich-enabled {
-                                                        PopupBridge.hide-tooltip();
+                                                        PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
                                                     }
                                                 }
                                             }
@@ -1090,8 +1263,18 @@ export component YomitanPopup inherits Rectangle {
                                         if root.anki-enabled && !term-segment.show-browse-btn : AnkiAddButton {
                                             btn-size: 28px;
                                             clicked => { root.add-anki-note(res.index - 1); }
+                                            right-clicked(offset-x) => {
+                                                root.audio-menu-for-anki = true;
+                                                root.audio-menu-anki-row-index = res.index - 1;
+                                                root.audio-menu-expression = res.expression;
+                                                root.audio-menu-reading = res.reading;
+                                                root.audio-menu-x = max(8px, min(root.width - 260px, root.width - 256px));
+                                                root.audio-menu-y = max(36px, min(root.height - 140px, 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px));
+                                                root.audio-menu-open = true;
+                                                root.request-audio-sources(res.expression, res.reading);
+                                            }
                                             request-tooltip(tip) => {
-                                                PopupBridge.show-tooltip(
+                                                PopupBridge.request-popup-tooltip(
                                                     tip,
                                                     (root.width - 120px) / 1px,
                                                     (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
@@ -1128,13 +1311,14 @@ export component YomitanPopup inherits Rectangle {
                                                 clicked => { root.toggle-term-collapse(res.index - 1); }
                                                 changed has-hover => {
                                                     if self.has-hover && PopupBridge.rich-enabled {
-                                                        PopupBridge.show-tooltip(
+                                                        PopupBridge.request-popup-tooltip(
                                                             res.collapsed ? "Expand term" : "Collapse term",
                                                             (root.width - 120px) / 1px,
                                                             (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px) / 1px
                                                         );
                                                     } else if !self.has-hover && PopupBridge.rich-enabled {
-                                                        PopupBridge.hide-tooltip();
+                                                        PopupBridge.cancel-pending-tooltip();
+                                PopupBridge.hide-tooltip();
                                                     }
                                                 }
                                             }
@@ -1147,7 +1331,7 @@ export component YomitanPopup inherits Rectangle {
                                 steps: term-segment.cached-deriv-steps;
                                 compact-summary: term-segment.cached-deriv-summary;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         24.0,
                                         (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 48px) / 1px
@@ -1160,8 +1344,9 @@ export component YomitanPopup inherits Rectangle {
                                 res-index: res.index;
                                 scan-depth: 0;
                                 bridge-rev: PopupBridge.rich-revision;
+                                compact-tags: root.compact-tags;
                                 request-tooltip(notes) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         notes,
                                         20.0,
                                         (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 44px) / 1px
@@ -1173,7 +1358,7 @@ export component YomitanPopup inherits Rectangle {
                             if !res.collapsed && res.term-start && PopupBridge.anki-show-tags && term-segment.row-raw-anki-tags != "" : AnkiTagRow {
                                 raw-tags: term-segment.row-raw-anki-tags;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         20.0,
                                         (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 44px) / 1px
@@ -1187,21 +1372,27 @@ export component YomitanPopup inherits Rectangle {
                                     && (root.jpdb-rank != "" || root.freq-rank != "" || root.pitch-accent != ""))) : FrequencyBadgeList {
                                 width: parent.width;
                                 res: res;
+                                scan-depth: 0;
+                                bridge-rev: PopupBridge.rich-revision;
                                 show-legacy-meta: true;
                                 jpdb-rank: root.jpdb-rank;
                                 freq-rank: root.freq-rank;
                                 pitch-accent: root.pitch-accent;
                             }
 
-                            // Pitch accent graphs (single cached rich-pitch-graphs call + fallback)
-                            if !res.collapsed && res.term-start && (term-segment.cached-rich-pitches.length > 0 || res.pitch-graphs.length > 0) : PitchGraphList {
+                            // Pitch accent graphs (single cached rich-pitch-entries/graphs call + fallback)
+                            if !res.collapsed && res.term-start && (term-segment.cached-rich-pitch-entries.length > 0 || term-segment.cached-rich-pitches.length > 0 || res.pitch-graphs.length > 0) : PitchGraphList {
                                 width: parent.width;
+                                rich-pitch-entries: term-segment.cached-rich-pitch-entries;
                                 rich-pitches: term-segment.cached-rich-pitches;
                                 fallback-pitches: res.pitch-graphs;
+                                scan-depth: 0;
+                                row-index: res.index;
+                                bridge-rev: PopupBridge.rich-revision;
                                 allow-fallback: true;
-                                compact: false;
+                                compact: root.compact-glossaries;
                                 request-tooltip(tip) => {
-                                    PopupBridge.show-tooltip(
+                                    PopupBridge.request-popup-tooltip(
                                         tip,
                                         30.0,
                                         (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 64px) / 1px
@@ -1217,6 +1408,10 @@ export component YomitanPopup inherits Rectangle {
                                 bridge-rev: PopupBridge.rich-revision;
                                 is-solo: res.term-start && res.term-end;
                                 show-anki-checkbox: root.show-anki-checkbox;
+                                anki-enabled: root.anki-enabled;
+                                term-addable: term-segment.row-term-addable;
+                                compact-glossaries: root.compact-glossaries;
+                                compact-tags: root.compact-tags;
                                 tooltip-base-x: round(PopupBridge.css-popup-padding / 1px) * 1px;
                                 content-base-y: row-wrapper.y + 4px + self.y;
                                 read-scroll-y => { definition-list.y + definition-list.viewport-y }
@@ -1237,6 +1432,10 @@ export component YomitanPopup inherits Rectangle {
                                 scan-depth: 0;
                                 bridge-rev: PopupBridge.rich-revision;
                                 show-anki-checkbox: root.show-anki-checkbox;
+                                anki-enabled: root.anki-enabled;
+                                term-addable: term-segment.row-term-addable;
+                                compact-glossaries: root.compact-glossaries;
+                                compact-tags: root.compact-tags;
                                 base-x: PopupBridge.css-popup-padding;
                                 content-base-y: row-wrapper.y + 4px + self.y;
                                 read-scroll-y => { definition-list.y + definition-list.viewport-y }
@@ -1267,13 +1466,24 @@ export component YomitanPopup inherits Rectangle {
         menu-x: root.audio-menu-x;
         menu-y: root.audio-menu-y;
         audio-sources: root.audio-sources;
+        audio-source-statuses: root.audio-source-statuses;
         loading: root.audio-sources-loading;
         selected-source: root.selected-audio-source;
-        dismissed => { root.audio-menu-open = false; }
-        source-picked(idx) => {
-            root.select-audio-source(idx);
+        header-title: root.audio-menu-for-anki ? "Add to Anki with audio" : "";
+        allow-no-audio: root.audio-menu-for-anki;
+        dismissed => {
             root.audio-menu-open = false;
-            root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+            root.audio-menu-for-anki = false;
+        }
+        source-picked(idx) => {
+            root.audio-menu-open = false;
+            if root.audio-menu-for-anki {
+                root.audio-menu-for-anki = false;
+                root.add-to-anki-with-audio(root.audio-menu-anki-row-index, idx);
+            } else {
+                root.select-audio-source(idx);
+                root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
+            }
         }
     }
 }

@@ -15,6 +15,10 @@ export component DefinitionEntryBody inherits Rectangle {
     in property <int> bridge-rev: PopupBridge.rich-revision;
     in property <bool> is-solo: false;
     in property <bool> show-anki-checkbox: true;
+    in property <bool> anki-enabled: true;
+    in property <bool> term-addable: true;
+    in property <bool> compact-glossaries: PopupBridge.compact-glossaries;
+    in property <bool> compact-tags: PopupBridge.compact-tags;
     in property <length> tooltip-base-x: 12px;
     // Content-space y inside ScrollView (never reactively bound to viewport-y!)
     in property <length> content-base-y: 0px;
@@ -86,14 +90,14 @@ export component DefinitionEntryBody inherits Rectangle {
         y: root.pad;
         width: parent.width - root.pad * 2;
         height: self.preferred-height;
-        spacing: 4px;
+        spacing: root.compact-glossaries ? 2px : 4px;
 
         // Header row: 24x24px Anki checkbox hit target + vertically centered POS & Dictionary badges
         HorizontalLayout {
-            spacing: 6px;
+            spacing: root.compact-tags ? 4px : 6px;
             alignment: start;
 
-            if root.show-anki-checkbox : VerticalLayout {
+            if root.show-anki-checkbox && root.anki-enabled && root.term-addable : VerticalLayout {
                 alignment: center;
                 Rectangle {
                     width: 24px;
@@ -154,13 +158,15 @@ export component DefinitionEntryBody inherits Rectangle {
             if PopupBridge.rich-enabled : VerticalLayout {
                 alignment: center;
                 HorizontalLayout {
-                    spacing: 4px;
-                    for pill in (root.scan-depth == 0
-                        ? PopupBridge.def-tag-pills(root.res.index, root.bridge-rev)
-                        : PopupBridge.nested-def-tag-pills(root.scan-depth, root.res.index, root.bridge-rev)) : RichTagPillBadge {
+                    spacing: root.compact-tags ? 3px : 4px;
+                    for pill in (root.scan-depth < 0
+                        ? PopupBridge.panel-def-tag-pills(root.res.index, root.bridge-rev)
+                        : (root.scan-depth == 0
+                            ? PopupBridge.def-tag-pills(root.res.index, root.bridge-rev)
+                            : PopupBridge.nested-def-tag-pills(root.scan-depth, root.res.index, root.bridge-rev))) : RichTagPillBadge {
                         pill: pill;
                         request-tooltip(notes) => {
-                            PopupBridge.show-tooltip(
+                            PopupBridge.request-popup-tooltip(
                                 notes,
                                 (root.scan-offset-x + root.tooltip-base-x + 12px) / 1px,
                                 (root.scan-offset-y + root.read-scroll-y() + root.content-base-y + 24px) / 1px
@@ -218,33 +224,43 @@ export component DefinitionEntryBody inherits Rectangle {
         // Glossary body (respects per-dictionary opacity / hover-to-reveal)
         gloss-wrap := VerticalLayout {
             property <RichKanjiDetail> cached-kanji-detail: root.res.is-kanji && PopupBridge.rich-enabled
-                ? (root.scan-depth == 0
-                    ? PopupBridge.kanji-detail(root.res.index, root.bridge-rev)
-                    : PopupBridge.nested-kanji-detail(root.scan-depth, root.res.index, root.bridge-rev))
+                ? (root.scan-depth < 0
+                    ? PopupBridge.panel-kanji-detail(root.res.index, root.bridge-rev)
+                    : (root.scan-depth == 0
+                        ? PopupBridge.kanji-detail(root.res.index, root.bridge-rev)
+                        : PopupBridge.nested-kanji-detail(root.scan-depth, root.res.index, root.bridge-rev)))
                 : { valid: false };
             property <bool> has-rich-kanji: root.res.is-kanji && PopupBridge.rich-enabled && self.cached-kanji-detail.valid;
             property <RichGlossaryRender> cached-rich-doc: !root.res.is-kanji && PopupBridge.rich-enabled
-                ? (root.scan-depth == 0
-                    ? PopupBridge.render-glossary(
+                ? (root.scan-depth < 0
+                    ? PopupBridge.panel-render-glossary(
                         root.res.index,
                         self.width / 1px,
                         root.res.selected,
                         root.bridge-rev,
                         PopupBridge.selection-revision
                     )
-                    : PopupBridge.nested-render-glossary(
-                        root.scan-depth,
-                        root.res.index,
-                        self.width / 1px,
-                        root.res.selected,
-                        root.bridge-rev,
-                        PopupBridge.selection-revision
-                    ))
+                    : (root.scan-depth == 0
+                        ? PopupBridge.render-glossary(
+                            root.res.index,
+                            self.width / 1px,
+                            root.res.selected,
+                            root.bridge-rev,
+                            PopupBridge.selection-revision
+                        )
+                        : PopupBridge.nested-render-glossary(
+                            root.scan-depth,
+                            root.res.index,
+                            self.width / 1px,
+                            root.res.selected,
+                            root.bridge-rev,
+                            PopupBridge.selection-revision
+                        )))
                 : { has-rich: false };
             property <bool> has-rich-glossary: !root.res.is-kanji && PopupBridge.rich-enabled && self.cached-rich-doc.has-rich;
 
             width: parent.width;
-            spacing: 4px;
+            spacing: root.compact-glossaries ? 2px : 4px;
             opacity: root.active-glossary-opacity;
             animate opacity { duration: 120ms; }
 
@@ -359,18 +375,24 @@ export component DefinitionEntryBody inherits Rectangle {
                                     }
                                 } else {
                                     root.focus-glossary();
-                                    root.pointer-over-link = root.scan-depth == 0
-                                        ? PopupBridge.glossary-cursor-is-pointer(
+                                    root.pointer-over-link = root.scan-depth < 0
+                                        ? PopupBridge.panel-glossary-cursor-is-pointer(
                                             root.res.index,
                                             self.mouse-x / 1px,
                                             self.mouse-y / 1px
                                         )
-                                        : PopupBridge.nested-glossary-cursor-is-pointer(
-                                            root.scan-depth,
-                                            root.res.index,
-                                            self.mouse-x / 1px,
-                                            self.mouse-y / 1px
-                                        );
+                                        : (root.scan-depth == 0
+                                            ? PopupBridge.glossary-cursor-is-pointer(
+                                                root.res.index,
+                                                self.mouse-x / 1px,
+                                                self.mouse-y / 1px
+                                            )
+                                            : PopupBridge.nested-glossary-cursor-is-pointer(
+                                                root.scan-depth,
+                                                root.res.index,
+                                                self.mouse-x / 1px,
+                                                self.mouse-y / 1px
+                                            ));
                                     let sy = root.read-scroll-y();
                                     PopupBridge.glossary-scan-hover(
                                         root.scan-depth,
@@ -427,18 +449,24 @@ export component DefinitionEntryBody inherits Rectangle {
                             root.rich-hovered = self.has-hover;
                             if self.has-hover {
                                 root.focus-glossary();
-                                root.pointer-over-link = root.scan-depth == 0
-                                    ? PopupBridge.glossary-cursor-is-pointer(
+                                root.pointer-over-link = root.scan-depth < 0
+                                    ? PopupBridge.panel-glossary-cursor-is-pointer(
                                         root.res.index,
                                         self.mouse-x / 1px,
                                         self.mouse-y / 1px
                                     )
-                                    : PopupBridge.nested-glossary-cursor-is-pointer(
-                                        root.scan-depth,
-                                        root.res.index,
-                                        self.mouse-x / 1px,
-                                        self.mouse-y / 1px
-                                    );
+                                    : (root.scan-depth == 0
+                                        ? PopupBridge.glossary-cursor-is-pointer(
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        )
+                                        : PopupBridge.nested-glossary-cursor-is-pointer(
+                                            root.scan-depth,
+                                            root.res.index,
+                                            self.mouse-x / 1px,
+                                            self.mouse-y / 1px
+                                        ));
                             } else {
                                 root.pointer-over-link = false;
                                 PopupBridge.hide-tooltip();
@@ -514,10 +542,10 @@ export component DefinitionEntryBody inherits Rectangle {
                 && root.res.glossary-blocks.length > 0 : VerticalLayout
             {
                 width: parent.width;
-                spacing: 4px;
+                spacing: root.compact-glossaries ? 2px : 4px;
                 for block in root.res.glossary-blocks : Rectangle {
                     width: parent.width;
-                    height: rich-text.preferred-height + 2px;
+                    height: rich-text.preferred-height + (root.compact-glossaries ? 0px : 2px);
                     rich-text := DictionaryText {
                         width: parent.width;
                         height: self.preferred-height;
@@ -525,7 +553,7 @@ export component DefinitionEntryBody inherits Rectangle {
                         wrap: word-wrap;
                         font-size: block.kind == 1 ? max(11px, PopupBridge.css-glossary-font-size - 1.5px) : PopupBridge.css-glossary-font-size;
                         font-weight: block.kind == 1 ? 700 : 400;
-                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? #D8C9FC : PopupBridge.css-text-color;
+                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? MementoPalette.glossary-heading : PopupBridge.css-text-color;
                     }
                     if block.href != "" : TouchArea {
                         mouse-cursor: pointer;
@@ -613,6 +641,10 @@ export component DefinitionCardGrid inherits VerticalLayout {
     in property <int> scan-depth: 0;
     in property <int> bridge-rev: 0;
     in property <bool> show-anki-checkbox: true;
+    in property <bool> anki-enabled: true;
+    in property <bool> term-addable: true;
+    in property <bool> compact-glossaries: PopupBridge.compact-glossaries;
+    in property <bool> compact-tags: PopupBridge.compact-tags;
     in property <length> base-x: 12px;
     in property <length> content-base-y: 0px;
     in property <length> scan-offset-x: 0px;
@@ -638,6 +670,10 @@ export component DefinitionCardGrid inherits VerticalLayout {
             bridge-rev: root.bridge-rev;
             is-solo: grid-row.is-solo;
             show-anki-checkbox: root.show-anki-checkbox;
+            anki-enabled: root.anki-enabled;
+            term-addable: root.term-addable;
+            compact-glossaries: root.compact-glossaries;
+            compact-tags: root.compact-tags;
             tooltip-base-x: round(root.base-x / 1px) * 1px;
             content-base-y: root.content-base-y + grid-row-box.y;
             scan-offset-x: root.scan-offset-x;
@@ -655,6 +691,10 @@ export component DefinitionCardGrid inherits VerticalLayout {
             bridge-rev: root.bridge-rev;
             is-solo: false;
             show-anki-checkbox: root.show-anki-checkbox;
+            anki-enabled: root.anki-enabled;
+            term-addable: root.term-addable;
+            compact-glossaries: root.compact-glossaries;
+            compact-tags: root.compact-tags;
             tooltip-base-x: round((root.base-x + grid-row-box.col-w + grid-row-box.col-gap) / 1px) * 1px;
             content-base-y: root.content-base-y + grid-row-box.y;
             scan-offset-x: root.scan-offset-x;

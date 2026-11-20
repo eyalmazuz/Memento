@@ -123,6 +123,7 @@ export component MementoSlider inherits Rectangle {
     in property <float> maximum: 100;
     in property <bool> enabled: true;
     in property <color> accent: MementoPalette.cyan-accent;
+    in property <color> track-color: MementoPalette.track-bg;
     callback changed(float);
 
     private property <float> span: max(0.0001, root.maximum - root.minimum);
@@ -148,7 +149,7 @@ export component MementoSlider inherits Rectangle {
         width: max(0px, parent.width - 14px);
         height: 6px;
         border-radius: 3px;
-        background: MementoPalette.track-bg;
+        background: root.track-color;
 
         Rectangle {
             x: 0px;

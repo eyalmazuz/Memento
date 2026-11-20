@@ -11,6 +11,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
     in property <[SubEntry]> entries;
     in property <[SubEntry]> secondary-entries: [];
     in property <bool> has-secondary: false;
+    in property <bool> has-secondary-subtitles: root.has-secondary || root.secondary-entries.length > 0;
     in-out property <int> active-tab: 0; // 0: Primary, 1: Secondary
     in-out property <string> search-text: "";
     in property <int> current-match: 0;
@@ -34,15 +35,19 @@ export component SubtitleDrawerPanel inherits Rectangle {
     in property <bool> secondary-font-italic: false;
     in-out property <bool> user-scrolling: false;
     property <bool> programmatic-scroll: false;
+    private property <bool> prim-tab-hovered: false;
+    private property <bool> sec-tab-hovered: false;
     out property <length> viewport-y: sub-list-view.viewport-y;
     out property <bool> is-hovered:
         drawer-bg-touch.has-hover
-        || prim-tab-touch.has-hover
-        || sec-tab-touch.has-hover
+        || root.prim-tab-hovered
+        || root.sec-tab-hovered
         || time-toggle-touch.has-hover;
 
     pure callback format-timestamp(float) -> string;
     callback row-clicked(int, bool);
+    callback subtitle-row-clicked-mod(int, int, bool, bool);
+    callback subtitle-row-lookup(int, int, int, length, length);
     callback range-dragged(int, int, bool);
     callback row-activated(int, float);
     callback search-changed(string);
@@ -101,12 +106,21 @@ export component SubtitleDrawerPanel inherits Rectangle {
             padding: 10px;
             spacing: 8px;
 
-            // Top 28px header: Primary / Secondary Tabs + Timestamps Toggle Pill + Close IconButton
+            // Top 28px header: Primary / Secondary Tabs (hidden when no secondary subs) + Timestamps Toggle + Close
             HorizontalLayout {
                 height: 28px;
                 spacing: 6px;
 
-                Rectangle {
+                if !root.has-secondary-subtitles : Text {
+                    horizontal-stretch: 1;
+                    text: "Subtitles";
+                    font-size: 13.5px;
+                    font-weight: 700;
+                    color: root.text-color;
+                    vertical-alignment: center;
+                }
+
+                if root.has-secondary-subtitles : Rectangle {
                     horizontal-stretch: 1;
                     height: 28px;
                     border-radius: 6px;
@@ -126,6 +140,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     }
                     prim-tab-touch := TouchArea {
                         mouse-cursor: pointer;
+                        changed has-hover => { root.prim-tab-hovered = self.has-hover; }
                         clicked => {
                             if root.active-tab != 0 {
                                 root.user-scrolling = false;
@@ -136,7 +151,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     }
                 }
 
-                Rectangle {
+                if root.has-secondary-subtitles : Rectangle {
                     horizontal-stretch: 1;
                     height: 28px;
                     border-radius: 6px;
@@ -145,7 +160,6 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         : (sec-tab-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
                     border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
-                    opacity: root.has-secondary || root.secondary-entries.length > 0 ? 1.0 : 0.65;
                     animate background { duration: 100ms; }
                     Text {
                         text: "Secondary";
@@ -157,6 +171,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     }
                     sec-tab-touch := TouchArea {
                         mouse-cursor: pointer;
+                        changed has-hover => { root.sec-tab-hovered = self.has-hover; }
                         clicked => {
                             if root.active-tab != 1 {
                                 root.user-scrolling = false;
@@ -314,6 +329,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         width: 100%;
                         height: 100%;
                         mouse-cursor: pointer;
+                        property <bool> ctrl-held: false;
                         property <bool> extend-range: false;
                         property <bool> dragging-range: false;
                         property <int> drag-end: -1;
@@ -323,27 +339,41 @@ export component SubtitleDrawerPanel inherits Rectangle {
                             return EventResult.reject;
                         }
                         pointer-event(event) => {
+                            let text-left = root.show-timestamps ? 66px : 8px;
+                            let char-px = max(6px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) * 0.78);
+                            let approx-char = max(0, floor(max(0px, self.mouse-x - text-left) / char-px));
+                            let panel-y = clamp(sub-list-view.y + sub-cue-row.y + sub-list-view.viewport-y + self.mouse-y, 0px, root.height);
                             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                                self.ctrl-held = event.modifiers.control || event.modifiers.meta;
                                 self.extend-range = event.modifiers.shift;
                                 self.dragging-range = false;
                                 self.drag-end = idx;
+                            } else if event.kind == PointerEventKind.down && event.button == PointerEventButton.middle {
+                                root.subtitle-row-lookup(root.active-tab, idx, approx-char, self.mouse-x, panel-y);
+                            } else if event.kind == PointerEventKind.move && !self.pressed
+                                && (event.modifiers.shift || event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                                root.subtitle-row-lookup(root.active-tab, idx, approx-char, self.mouse-x, panel-y);
                             }
                         }
                         moved => {
-                            if self.pressed && root.active-tab == 0 {
-                                // TouchArea keeps the pointer grab outside its row.
-                                let end = min(root.entries.length - 1, max(0, idx + floor(self.mouse-y / self.height)));
-                                if end != self.drag-end {
-                                    root.user-scrolling = true;
-                                    root.user-scrolled();
-                                    root.range-dragged(idx, end, !self.dragging-range);
-                                    self.dragging-range = true;
-                                    self.drag-end = end;
+                            if self.pressed {
+                                // TouchArea keeps the pointer grab outside its row (supports both Primary & Secondary tabs).
+                                let row-count = root.active-tab == 1 ? root.secondary-entries.length : root.entries.length;
+                                if row-count > 0 && self.height > 0px {
+                                    let end = min(row-count - 1, max(0, idx + floor(self.mouse-y / self.height)));
+                                    if end != self.drag-end {
+                                        root.user-scrolling = true;
+                                        root.user-scrolled();
+                                        root.range-dragged(idx, end, !self.dragging-range);
+                                        self.dragging-range = true;
+                                        self.drag-end = end;
+                                    }
                                 }
                             }
                         }
                         clicked => {
-                            if !self.dragging-range && root.active-tab == 0 {
+                            if !self.dragging-range {
+                                root.subtitle-row-clicked-mod(root.active-tab, idx, self.ctrl-held, self.extend-range);
                                 root.row-clicked(idx, self.extend-range);
                             }
                         }

@@ -1,23 +1,75 @@
-import { LineEdit, ListView } from "std-widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
 import { MementoPalette } from "../palette.slint";
 import { IconButton, ToggleChip } from "../components/buttons.slint";
-import { DictResult, DictionaryText, PopupBridge } from "types.slint";
+import {
+    DictResult,
+    PopupAudioSource,
+    RichDerivationStep,
+    RichPitchEntry,
+    RichPitchGraph,
+    DictionaryText,
+    PopupBridge,
+} from "types.slint";
+import {
+    AnkiAddButton,
+    AnkiTagRow,
+    AudioSourceMenu,
+    FrequencyBadgeList,
+    PitchGraphList,
+    PopupActionButton,
+    TermDerivationRow,
+    TermHeadwordBlock,
+    TermLeadingActions,
+    TermTagPillRow,
+} from "term_widgets.slint";
+import { DefinitionEntryBody } from "definition_body.slint";
 
-// ── Manual Dictionary Search Panel ──────────────────────────────────────────
+// ── Interactive Manual Dictionary Search Panel ──────────────────────────────
 export component DictionarySearchPanel inherits Rectangle {
     in property <[DictResult]> results;
     in-out property <string> query: "";
+    in property <bool> anki-enabled: false;
+    in property <bool> show-anki-checkbox: true;
+    in property <string> added-note-id: "";
+    in property <int> added-result-index: -1;
+    in property <[PopupAudioSource]> audio-sources: [];
+    in property <[int]> audio-source-statuses: PopupBridge.audio-source-statuses;
+    in property <bool> audio-sources-loading: false;
+    in-out property <int> selected-audio-source: -1;
+    in property <bool> compact-glossaries: PopupBridge.compact-glossaries;
+    in property <bool> compact-tags: PopupBridge.compact-tags;
+
     callback search-changed(string);
     callback lookup(string);
     callback close();
+    callback add-anki-note(int);
+    callback add-to-anki-with-audio(int, int);
+    callback browse-anki-note(string);
+    callback play-audio(string, string);
+    callback request-audio-sources(string, string);
+    callback select-audio-source(int);
+    callback kanji-info(string);
+    callback toggle-select-definition(int);
+    callback toggle-term-collapse(int);
+    callback toggle-reading-as-expression(int);
+    callback open-rich-link(string);
+    callback scan-input(string, int, length, length);
 
     private property <[DictResult]> active-results: PopupBridge.rich-enabled ? PopupBridge.panel-results : root.results;
     private property <string> active-query: PopupBridge.rich-enabled ? PopupBridge.panel-query : root.query;
     private property <bool> is-searching: PopupBridge.rich-enabled && PopupBridge.panel-searching;
+    private property <bool> audio-menu-open: false;
+    private property <bool> audio-menu-for-anki: false;
+    private property <int> audio-menu-anki-row-index: -1;
+    private property <string> audio-menu-expression: "";
+    private property <string> audio-menu-reading: "";
+    private property <length> audio-menu-x: 16px;
+    private property <length> audio-menu-y: 84px;
 
     background: MementoPalette.surface-bg;
     border-width: 1px;
     border-color: MementoPalette.border;
+    clip: true;
 
     VerticalLayout {
         padding: 10px;
@@ -56,6 +108,8 @@ export component DictionarySearchPanel inherits Rectangle {
                     text: "かな";
                     chip-width: 38px;
                     active: PopupBridge.panel-kana-only;
+                    tooltip: "Search kana readings only";
+                    tooltip-below: true;
                     clicked => { PopupBridge.panel-toggle-kana-only(); }
                 }
             }
@@ -67,25 +121,30 @@ export component DictionarySearchPanel inherits Rectangle {
                     icon: @image-url("../icons/close.svg");
                     size: 28px;
                     icon-size: 15px;
+                    tooltip: "Close search";
+                    tooltip-below: true;
+                    tooltip-align-right: true;
                     clicked => { root.close(); }
                 }
             }
         }
 
-        // Search input row with inline clear button
+        // Search input row with wildcard hint (* / ?) and inline clear button
         HorizontalLayout {
             spacing: 4px;
 
             if PopupBridge.rich-enabled : LineEdit {
                 horizontal-stretch: 1;
-                placeholder-text: PopupBridge.panel-kana-only ? "Search by reading (かな)…" : "Search Japanese…";
+                placeholder-text: PopupBridge.panel-kana-only
+                    ? "Search reading (* / ? wildcards)…"
+                    : "Search Japanese (* / ? wildcards)…";
                 text <=> PopupBridge.panel-query;
                 edited(value) => { PopupBridge.panel-search-requested(value); }
             }
 
             if !PopupBridge.rich-enabled : LineEdit {
                 horizontal-stretch: 1;
-                placeholder-text: "Search Japanese…";
+                placeholder-text: "Search Japanese (* / ? wildcards)…";
                 text <=> root.query;
                 edited(value) => { root.search-changed(value); }
             }
@@ -98,6 +157,9 @@ export component DictionarySearchPanel inherits Rectangle {
                     size: 28px;
                     icon-size: 15px;
                     tint: MementoPalette.icon-muted;
+                    tooltip: "Clear search";
+                    tooltip-below: true;
+                    tooltip-align-right: true;
                     clicked => {
                         if PopupBridge.rich-enabled {
                             PopupBridge.panel-query = "";
@@ -106,6 +168,70 @@ export component DictionarySearchPanel inherits Rectangle {
                             root.query = "";
                             root.search-changed("");
                         }
+                    }
+                }
+            }
+        }
+
+        // Interactive scan strip for hover-modifier or middle-click scanning inside the search query
+        if root.active-query != "" : scan-strip := Rectangle {
+            height: 24px;
+            border-radius: 5px;
+            background: scan-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-inset;
+            border-width: 1px;
+            border-color: scan-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border;
+            animate background { duration: 100ms; }
+            animate border-color { duration: 100ms; }
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 6px;
+                alignment: start;
+
+                Text {
+                    text: "Scan:";
+                    font-size: 10.5px;
+                    font-weight: 700;
+                    color: MementoPalette.text-muted;
+                    vertical-alignment: center;
+                }
+
+                scan-query-lbl := DictionaryText {
+                    horizontal-stretch: 1;
+                    text: root.active-query;
+                    font-size: 12px;
+                    color: MementoPalette.text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            scan-touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: pointer;
+                pointer-event(event) => {
+                    let local-text-x = max(0px, self.mouse-x - 42px);
+                    let approx-idx = max(0, floor(local-text-x / 12px));
+                    if event.kind == PointerEventKind.down && event.button == PointerEventButton.middle {
+                        root.scan-input(root.active-query, approx-idx, self.mouse-x, scan-strip.y + self.mouse-y);
+                        if PopupBridge.rich-enabled {
+                            PopupBridge.panel-scan-query(root.active-query, approx-idx, self.mouse-x, scan-strip.y + self.mouse-y);
+                        }
+                    } else if event.kind == PointerEventKind.move
+                        && (event.modifiers.shift || event.modifiers.control || event.modifiers.alt || event.modifiers.meta) {
+                        root.scan-input(root.active-query, approx-idx, self.mouse-x, scan-strip.y + self.mouse-y);
+                        if PopupBridge.rich-enabled {
+                            PopupBridge.panel-scan-query(root.active-query, approx-idx, self.mouse-x, scan-strip.y + self.mouse-y);
+                        }
+                    }
+                }
+                clicked => {
+                    if PopupBridge.rich-enabled {
+                        PopupBridge.panel-lookup-requested(root.active-query);
+                    } else {
+                        root.lookup(root.active-query);
                     }
                 }
             }
@@ -173,8 +299,8 @@ export component DictionarySearchPanel inherits Rectangle {
 
                 DictionaryText {
                     text: root.active-query == ""
-                        ? "Type Japanese, kana, or English to look up terms."
-                        : "Try checking the spelling or toggling かな reading mode.";
+                        ? "Type Japanese, kana, romaji, or use * / ? wildcards to look up terms and kanji."
+                        : "Try checking the spelling, using * / ? wildcards, or toggling かな reading mode.";
                     font-size: 11.5px;
                     color: MementoPalette.text-muted;
                     horizontal-alignment: center;
@@ -183,102 +309,375 @@ export component DictionarySearchPanel inherits Rectangle {
             }
         }
 
-        // Variable-height result cards with subtle hairlines
-        if root.active-results.length > 0 : ListView {
+        // Rich Interactive Term & Kanji Cards (reusing TermWidgets & DefinitionEntryBody)
+        if root.active-results.length > 0 : panel-scroll := ScrollView {
             vertical-stretch: 1;
 
-            for hit[index] in root.active-results : Rectangle {
-                height: min(
-                    156px,
-                    max(
-                        58px,
-                        header-row.preferred-height
-                        + (hit.dict-name != "" ? 16px : 0px)
-                        + gloss-txt.preferred-height
-                        + 24px
-                    )
-                );
-                clip: true;
-                border-radius: 6px;
-                background: result-touch.has-hover ? MementoPalette.list-hover : transparent;
-                animate background { duration: 100ms; }
+            panel-content := VerticalLayout {
+                x: 0px;
+                y: 0px;
+                width: max(0px, panel-scroll.width - 10px);
+                height: self.preferred-height;
+                alignment: start;
+                spacing: 0px;
 
-                // Subtle hairline divider between cards
-                if index > 0 && !result-touch.has-hover : Rectangle {
-                    x: 8px;
-                    y: 0px;
-                    width: parent.width - 16px;
-                    height: 1px;
-                    background: MementoPalette.border;
-                    opacity: 0.7;
-                }
+                for hit[idx] in root.active-results : panel-row := Rectangle {
+                    property <bool> is-kanji-footer-start: hit.is-kanji && hit.term-start && idx > 0 && !root.active-results[idx - 1].is-kanji;
+                    property <bool> row-hidden: hit.collapsed && !hit.term-start;
+                    property <int> row-zero-idx: hit.index > 0 ? (hit.index - 1) : idx;
+                    property <bool> row-is-duplicate:
+                        PopupBridge.rich-enabled
+                        && PopupBridge.panel-revision >= 0
+                        && self.row-zero-idx >= 0
+                        && self.row-zero-idx < PopupBridge.panel-row-anki-duplicates.length
+                        && PopupBridge.panel-row-anki-duplicates[self.row-zero-idx];
+                    property <int> row-anki-note-id:
+                        PopupBridge.rich-enabled
+                        && PopupBridge.panel-revision >= 0
+                        && self.row-zero-idx >= 0
+                        && self.row-zero-idx < PopupBridge.panel-row-anki-note-ids.length
+                            ? PopupBridge.panel-row-anki-note-ids[self.row-zero-idx]
+                            : 0;
+                    property <string> row-browse-query:
+                        (root.added-note-id != "" && root.added-result-index == self.row-zero-idx)
+                            ? root.added-note-id
+                            : ((PopupBridge.rich-enabled
+                                && self.row-zero-idx >= 0
+                                && self.row-zero-idx < PopupBridge.panel-row-anki-browse-queries.length)
+                                    ? PopupBridge.panel-row-anki-browse-queries[self.row-zero-idx]
+                                    : "");
+                    property <string> row-raw-anki-tags:
+                        (PopupBridge.rich-enabled
+                            && PopupBridge.panel-revision >= 0
+                            && self.row-zero-idx >= 0
+                            && self.row-zero-idx < PopupBridge.panel-row-anki-tags.length)
+                            ? PopupBridge.panel-row-anki-tags[self.row-zero-idx]
+                            : "";
+                    property <bool> show-browse-btn: (root.added-note-id != "" && root.added-result-index == self.row-zero-idx)
+                        || (root.anki-enabled && self.row-is-duplicate);
+                    property <bool> row-term-addable:
+                        (PopupBridge.rich-enabled
+                            && PopupBridge.panel-revision >= 0
+                            && self.row-zero-idx >= 0
+                            && self.row-zero-idx < PopupBridge.panel-row-anki-addable.length)
+                            ? PopupBridge.panel-row-anki-addable[self.row-zero-idx]
+                            : !self.show-browse-btn;
+                    property <bool> row-reading-as-expr:
+                        (PopupBridge.rich-enabled
+                            && PopupBridge.panel-revision >= 0
+                            && self.row-zero-idx >= 0
+                            && self.row-zero-idx < PopupBridge.panel-row-reading-as-expression.length)
+                            && PopupBridge.panel-row-reading-as-expression[self.row-zero-idx];
+                    property <color> headword-color: PopupBridge.panel-rich-enabled
+                        ? PopupBridge.panel-headword-pitch-color(hit.index, PopupBridge.panel-revision)
+                        : PopupBridge.css-headword-color;
+                    property <[RichPitchEntry]> cached-pitch-entries: (!hit.collapsed && hit.term-start && PopupBridge.panel-rich-enabled)
+                        ? PopupBridge.panel-rich-pitch-entries(hit.index, PopupBridge.panel-revision)
+                        : [];
+                    property <[RichPitchGraph]> cached-pitches: (!hit.collapsed && hit.term-start && PopupBridge.panel-rich-enabled)
+                        ? PopupBridge.panel-rich-pitch-graphs(hit.index, PopupBridge.panel-revision)
+                        : [];
+                    property <[RichDerivationStep]> cached-deriv-steps: (hit.term-start && !hit.is-kanji && PopupBridge.panel-rich-enabled && !PopupBridge.css-compact-derivations)
+                        ? PopupBridge.panel-derivation-steps(hit.index, PopupBridge.panel-revision)
+                        : [];
+                    property <string> cached-deriv-summary: (hit.term-start && !hit.is-kanji && PopupBridge.panel-rich-enabled && PopupBridge.css-compact-derivations)
+                        ? PopupBridge.panel-derivation-summary(hit.index, PopupBridge.panel-revision)
+                        : "";
 
-                VerticalLayout {
                     width: parent.width;
-                    height: parent.height;
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    padding-top: 7px;
-                    padding-bottom: 8px;
-                    spacing: 3px;
+                    height: self.row-hidden ? 0px : panel-card-col.preferred-height + (hit.term-end || hit.collapsed ? 10px : 4px);
+                    visible: !self.row-hidden;
+                    background: transparent;
 
-                    header-row := HorizontalLayout {
-                        spacing: 8px;
-                        alignment: start;
-
-                        DictionaryText {
-                            text: hit.expression;
-                            font-size: 16px;
-                            font-weight: 700;
-                            color: MementoPalette.text;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-
-                        if hit.reading != "" && hit.reading != hit.expression : DictionaryText {
-                            text: hit.reading;
-                            font-size: 12px;
-                            color: MementoPalette.text-secondary;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
+                    // Term-group divider
+                    if !panel-row.row-hidden && hit.term-start && idx > 0 : Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: parent.width;
+                        height: panel-row.is-kanji-footer-start ? 2px : 1px;
+                        background: panel-row.is-kanji-footer-start ? MementoPalette.cyan-accent : PopupBridge.css-term-divider-color;
                     }
 
-                    dict-lbl := DictionaryText {
-                        height: hit.dict-name != "" ? 16px : 0px;
-                        visible: hit.dict-name != "";
-                        text: hit.dict-name;
-                        font-size: 11px;
-                        font-weight: 600;
-                        color: MementoPalette.teal-text;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
+                    panel-card-col := VerticalLayout {
+                        x: 0px;
+                        y: 4px;
+                        width: parent.width;
+                        height: self.preferred-height;
+                        spacing: root.compact-glossaries ? 2px : 4px;
 
-                    gloss-txt := DictionaryText {
-                        text: hit.glossary;
-                        font-size: 12px;
-                        color: MementoPalette.icon;
-                        wrap: word-wrap;
-                        overflow: elide;
-                        vertical-stretch: 1;
-                        vertical-alignment: top;
+                        // Kanji Footer section badge when kanji entries appear below terms
+                        if panel-row.is-kanji-footer-start : HorizontalLayout {
+                            padding-top: 4px;
+                            padding-bottom: 2px;
+                            spacing: 6px;
+                            alignment: start;
+
+                            Rectangle {
+                                height: 18px;
+                                width: kf-lbl.preferred-width + 12px;
+                                border-radius: 4px;
+                                background: MementoPalette.accent-muted;
+                                border-width: 1px;
+                                border-color: MementoPalette.cyan-accent;
+                                kf-lbl := Text {
+                                    text: "KANJI";
+                                    font-size: 9.5px;
+                                    font-weight: 700;
+                                    color: MementoPalette.cyan-text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Text {
+                                text: "Character Details";
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: MementoPalette.text-muted;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Card Header: Headword + Reading + Actions (かな, 漢/か, 字, Audio, Browse, Add, Collapse)
+                        if hit.term-start || idx == 0 : panel-term-header := HorizontalLayout {
+                            property <length> pbuttons-w:
+                                (root.anki-enabled && !hit.is-kanji && hit.reading != "" && hit.reading != hit.expression ? 30px : 0px)
+                                + (!hit.is-kanji && hit.has-kanji ? 30px : 0px)
+                                + (!hit.is-kanji ? 30px : 0px)
+                                + (panel-row.show-browse-btn || root.anki-enabled ? 30px : 0px)
+                                + 30px;
+                            property <length> pavail-title-w: max(80px, panel-card-col.width - self.pbuttons-w);
+                            width: parent.width;
+                            spacing: 4px;
+                            min-height: 30px;
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                min-width: 0px;
+                                preferred-width: 0px;
+                                height: hw-block.preferred-height;
+                                background: transparent;
+
+                                hw-block := TermHeadwordBlock {
+                                    width: parent.width;
+                                    res: hit;
+                                    nested: false;
+                                    compact: true;
+                                    reading-as-expression: panel-row.row-reading-as-expr;
+                                    scan-depth: -1;
+                                    bridge-rev: PopupBridge.panel-revision;
+                                    avail-width: panel-term-header.pavail-title-w;
+                                    headword-color: panel-row.headword-color;
+                                    kanji-clicked(ch) => {
+                                        if PopupBridge.panel-rich-enabled {
+                                            PopupBridge.panel-lookup-kanji-char(hit.expression, ch);
+                                        } else if PopupBridge.rich-enabled {
+                                            PopupBridge.lookup-kanji-char(hit.expression, ch);
+                                        } else {
+                                            root.kanji-info(ch);
+                                        }
+                                    }
+                                }
+
+                                // Allow clicking non-rich headword to open in popup
+                                if !PopupBridge.rich-enabled : TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.lookup(hit.expression); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                horizontal-stretch: 0;
+                                alignment: center;
+
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    alignment: end;
+
+                                    if !hit.is-kanji || panel-row.show-browse-btn : TermLeadingActions {
+                                        res: hit;
+                                        spacing: 4px;
+                                        btn-size: 26px;
+                                        icon-size: 14px;
+                                        show-kana: false;
+                                        show-reading-as-expr: root.anki-enabled && !hit.is-kanji && hit.reading != "" && hit.reading != hit.expression;
+                                        reading-as-expression: panel-row.row-reading-as-expr;
+                                        show-browse: panel-row.show-browse-btn;
+                                        reading-as-expression-clicked => {
+                                            root.toggle-reading-as-expression(panel-row.row-zero-idx);
+                                            if PopupBridge.panel-rich-enabled {
+                                                PopupBridge.panel-toggle-reading-as-expression(panel-row.row-zero-idx);
+                                            }
+                                        }
+                                        kanji-clicked => {
+                                            if PopupBridge.panel-rich-enabled {
+                                                PopupBridge.panel-lookup-kanji-char(hit.expression, "");
+                                            } else if PopupBridge.rich-enabled {
+                                                PopupBridge.panel-lookup-requested(hit.expression);
+                                            } else {
+                                                root.kanji-info(hit.expression);
+                                            }
+                                        }
+                                        audio-clicked => {
+                                            if !root.audio-menu-open {
+                                                root.play-audio(hit.expression, hit.reading);
+                                            }
+                                        }
+                                        audio-right-clicked(offset-x) => {
+                                            root.audio-menu-for-anki = false;
+                                            root.audio-menu-anki-row-index = -1;
+                                            root.audio-menu-expression = hit.expression;
+                                            root.audio-menu-reading = hit.reading;
+                                            root.audio-menu-x = max(8px, root.width - 260px);
+                                            root.audio-menu-y = max(48px, min(root.height - 140px, panel-scroll.y + panel-scroll.viewport-y + panel-row.y + 34px));
+                                            root.audio-menu-open = true;
+                                            root.request-audio-sources(hit.expression, hit.reading);
+                                        }
+                                        browse-clicked => {
+                                            if panel-row.row-browse-query != "" {
+                                                root.browse-anki-note(panel-row.row-browse-query);
+                                            }
+                                        }
+                                        request-tooltip(tip, right-offset) => {}
+                                    }
+
+                                    if root.anki-enabled && !panel-row.show-browse-btn : AnkiAddButton {
+                                        btn-size: 26px;
+                                        clicked => {
+                                            if PopupBridge.panel-rich-enabled {
+                                                PopupBridge.panel-add-anki-note(panel-row.row-zero-idx);
+                                            } else {
+                                                root.add-anki-note(panel-row.row-zero-idx);
+                                            }
+                                        }
+                                        right-clicked(offset-x) => {
+                                            root.audio-menu-for-anki = true;
+                                            root.audio-menu-anki-row-index = panel-row.row-zero-idx;
+                                            root.audio-menu-expression = hit.expression;
+                                            root.audio-menu-reading = hit.reading;
+                                            root.audio-menu-x = max(8px, root.width - 260px);
+                                            root.audio-menu-y = max(48px, min(root.height - 140px, panel-scroll.y + panel-scroll.viewport-y + panel-row.y + 34px));
+                                            root.audio-menu-open = true;
+                                            root.request-audio-sources(hit.expression, hit.reading);
+                                        }
+                                        request-tooltip(tip) => {}
+                                    }
+
+                                    PopupActionButton {
+                                        btn-width: 26px;
+                                        btn-height: 26px;
+                                        has-icon: true;
+                                        icon: hit.collapsed
+                                            ? @image-url("../icons/arrow-drop-down.svg")
+                                            : @image-url("../icons/arrow-drop-up.svg");
+                                        icon-size: 16px;
+                                        tooltip: hit.collapsed ? "Expand" : "Collapse";
+                                        clicked => {
+                                            if PopupBridge.panel-rich-enabled {
+                                                PopupBridge.panel-toggle-term-collapse(panel-row.row-zero-idx);
+                                            } else {
+                                                root.toggle-term-collapse(panel-row.row-zero-idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if hit.term-start && (panel-row.cached-deriv-steps.length > 0 || panel-row.cached-deriv-summary != "") : TermDerivationRow {
+                            steps: panel-row.cached-deriv-steps;
+                            compact-summary: panel-row.cached-deriv-summary;
+                            request-tooltip(tip) => {}
+                        }
+
+                        if !hit.collapsed && hit.term-start && PopupBridge.panel-rich-enabled && PopupBridge.css-show-term-tags : TermTagPillRow {
+                            res-index: hit.index;
+                            scan-depth: -1;
+                            bridge-rev: PopupBridge.panel-revision;
+                            compact-tags: root.compact-tags;
+                            request-tooltip(notes) => {}
+                        }
+
+                        if !hit.collapsed && hit.term-start && PopupBridge.anki-show-tags && panel-row.row-raw-anki-tags != "" : AnkiTagRow {
+                            raw-tags: panel-row.row-raw-anki-tags;
+                            request-tooltip(tip) => {}
+                        }
+
+                        if !hit.collapsed && (hit.term-start || idx == 0) && hit.frequencies.length > 0 : FrequencyBadgeList {
+                            width: parent.width;
+                            res: hit;
+                            scan-depth: -1;
+                            bridge-rev: PopupBridge.panel-revision;
+                        }
+
+                        if !hit.collapsed && (hit.term-start || idx == 0) && (panel-row.cached-pitch-entries.length > 0 || panel-row.cached-pitches.length > 0 || hit.pitch-graphs.length > 0) : PitchGraphList {
+                            width: parent.width;
+                            rich-pitch-entries: panel-row.cached-pitch-entries;
+                            rich-pitches: panel-row.cached-pitches;
+                            fallback-pitches: hit.pitch-graphs;
+                            scan-depth: -1;
+                            row-index: hit.index;
+                            bridge-rev: PopupBridge.panel-revision;
+                            allow-fallback: true;
+                            compact: true;
+                            request-tooltip(tip) => {}
+                        }
+
+                        if !hit.collapsed : DefinitionEntryBody {
+                            width: parent.width;
+                            res: hit;
+                            scan-depth: -1;
+                            bridge-rev: PopupBridge.panel-revision;
+                            is-solo: hit.term-start && hit.term-end;
+                            show-anki-checkbox: root.show-anki-checkbox;
+                            anki-enabled: root.anki-enabled;
+                            term-addable: panel-row.row-term-addable;
+                            compact-glossaries: root.compact-glossaries;
+                            compact-tags: root.compact-tags;
+                            read-scroll-y => { panel-scroll.y + panel-scroll.viewport-y }
+                            toggle-select-definition(i) => {
+                                if PopupBridge.panel-rich-enabled {
+                                    PopupBridge.panel-toggle-select-definition(i);
+                                } else {
+                                    root.toggle-select-definition(i);
+                                }
+                            }
+                            open-rich-link(href) => { root.open-rich-link(href); }
+                            focus-glossary => {}
+                        }
                     }
                 }
+            }
+        }
+    }
 
-                result-touch := TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    mouse-cursor: pointer;
-                    clicked => {
-                        if PopupBridge.rich-enabled {
-                            PopupBridge.panel-lookup-requested(hit.expression);
-                        } else {
-                            root.lookup(hit.expression);
-                        }
-                    }
+    if root.audio-menu-open : AudioSourceMenu {
+        width: parent.width;
+        height: parent.height;
+        menu-x: root.audio-menu-x;
+        menu-y: root.audio-menu-y;
+        audio-sources: root.audio-sources;
+        audio-source-statuses: root.audio-source-statuses;
+        loading: root.audio-sources-loading;
+        selected-source: root.selected-audio-source;
+        header-title: root.audio-menu-for-anki ? "Add to Anki with audio" : "";
+        allow-no-audio: root.audio-menu-for-anki;
+        dismissed => {
+            root.audio-menu-open = false;
+            root.audio-menu-for-anki = false;
+        }
+        source-picked(idx) => {
+            root.audio-menu-open = false;
+            if root.audio-menu-for-anki {
+                root.audio-menu-for-anki = false;
+                if PopupBridge.panel-rich-enabled {
+                    PopupBridge.panel-add-to-anki-with-audio(root.audio-menu-anki-row-index, idx);
+                } else {
+                    root.add-to-anki-with-audio(root.audio-menu-anki-row-index, idx);
                 }
+            } else {
+                root.select-audio-source(idx);
+                root.play-audio(root.audio-menu-expression, root.audio-menu-reading);
             }
         }
     }

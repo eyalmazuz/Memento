@@ -7,6 +7,7 @@ export component DictionariesPanel inherits VerticalLayout {
     in property <[InstalledDictionaryRow]> installed-dictionaries;
     in property <bool> dictionary-busy: false;
     in property <string> dictionary-progress-text: "";
+    in property <bool> drop-hover-active: false;
     callback add-dictionary-archive();
     callback dictionary-enabled-changed(int, bool);
     callback move-dictionary-up(int);
@@ -74,12 +75,28 @@ export component DictionariesPanel inherits VerticalLayout {
         }
     }
 
+    if root.drop-hover-active : Rectangle {
+        height: 48px;
+        border-radius: 10px;
+        background: MementoPalette.accent-subtle;
+        border-width: 2px;
+        border-color: MementoPalette.cyan-accent;
+        Text {
+            text: "Drop Yomitan .zip dictionary archive(s) here to import";
+            color: MementoPalette.cyan-text;
+            font-size: 13px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
     if root.installed-dictionaries.length == 0 : Rectangle {
         height: 92px;
         border-radius: 10px;
         background: MementoPalette.card-bg;
-        border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-width: root.drop-hover-active ? 2px : 1px;
+        border-color: root.drop-hover-active ? MementoPalette.cyan-accent : MementoPalette.card-border;
         clip: true;
 
         if root.dictionary-busy : Rectangle {

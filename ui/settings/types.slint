@@ -43,3 +43,26 @@ export struct AsrModelStatusRow {
     selected: bool,
     status-text: string,
 }
+
+// Structured checklist row for Anki excluded glossaries (`ex-glos`)
+export struct AnkiExcludedDictRow {
+    name: string,
+    excluded: bool,
+    installed: bool,
+}
+
+// Marker or argument suggestion row for the Anki field autocomplete popup
+export struct AnkiAutocompleteItem {
+    insert-text: string,
+    label: string,
+    detail: string,
+    kind: string, // "marker" or "argument"
+}
+
+// Editable row for Custom Text Replacements (`search/text-replacements`)
+export struct TextReplacementRow {
+    pattern: string,
+    replacement: string,
+    ignore-case: bool,
+    enabled: bool,
+}

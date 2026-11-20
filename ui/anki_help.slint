@@ -1,5 +1,5 @@
 import { MementoPalette } from "palette.slint";
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { LineEdit, Palette, ScrollView } from "std-widgets.slint";
 import { FilterChip, IconButton, TabPill } from "components/buttons.slint";
 import { SectionHeader } from "components/controls.slint";
 
@@ -301,6 +301,7 @@ export component AnkiHelpWindow inherits Window {
     background: MementoPalette.window-bg;
     default-font-family: "Noto Sans, sans-serif";
 
+    in-out property <bool> is-light-theme <=> MementoPalette.light-mode;
     in-out property <int> active-tab: 0; // 0: Overview & Syntax, 1: Term Markers, 2: Kanji Markers
     in-out property <int> active-term-section: -1; // -1: All, 0..N: specific section
     in-out property <int> active-kanji-section: -1;
@@ -317,6 +318,14 @@ export component AnkiHelpWindow inherits Window {
     callback search-changed(string);
     callback copy-marker(string);
     callback close();
+
+    init => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
+
+    changed is-light-theme => {
+        Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
+    }
 
     changed active-tab => {
         help-scroll.viewport-y = 0px;

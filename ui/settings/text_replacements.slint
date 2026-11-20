@@ -1,0 +1,223 @@
+import { LineEdit } from "std-widgets.slint";
+import { MementoPalette } from "../palette.slint";
+import { ActionButton, IconButton, ToggleChip } from "../components/buttons.slint";
+import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { TextReplacementRow } from "types.slint";
+
+// ── Custom Text Replacements Rule Editor (H6.5 — Settings → Search) ─────────
+export component TextReplacementsPanel inherits VerticalLayout {
+    in property <[TextReplacementRow]> rows: [];
+    in-out property <bool> search-original: true;
+    callback add-rule();
+    callback remove-rule(int);
+    callback move-rule(int, int);
+    callback update-rule(int, string, string, bool, bool);
+    callback search-original-changed(bool);
+
+    spacing: 8px;
+
+    SectionHeader {
+        title: "Custom Text Replacements";
+        subtitle: "Regex rules applied before dictionary lookup";
+
+        ActionButton {
+            text: "+ Add Rule";
+            primary: true;
+            compact: true;
+            clicked => { root.add-rule(); }
+        }
+    }
+
+    Rectangle {
+        background: MementoPalette.card-bg;
+        border-width: 1px;
+        border-color: MementoPalette.card-border;
+        border-radius: 10px;
+
+        VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 8px;
+            padding-bottom: 10px;
+            spacing: 8px;
+
+            // Search original toggle
+            HorizontalLayout {
+                min-height: 34px;
+                spacing: 12px;
+                alignment: space-between;
+
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text {
+                        text: "Also search original unmodified text";
+                        font-size: 13px;
+                        font-weight: 500;
+                        color: MementoPalette.text;
+                    }
+                    Text {
+                        text: "Keep original lookup candidates alongside regex-replaced variants";
+                        font-size: 11px;
+                        color: MementoPalette.text-muted;
+                        wrap: word-wrap;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    MementoSwitch {
+                        checked <=> root.search-original;
+                        toggled(val) => { root.search-original-changed(val); }
+                    }
+                }
+            }
+
+            Rectangle { height: 1px; background: MementoPalette.border; }
+
+            if root.rows.length == 0 : Rectangle {
+                height: 54px;
+                border-radius: 7px;
+                background: MementoPalette.card-inset;
+                border-width: 1px;
+                border-color: MementoPalette.border;
+                Text {
+                    text: "No custom text replacement rules yet. Click \"+ Add Rule\" to add a regex transformation.";
+                    color: MementoPalette.text-muted;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            if root.rows.length > 0 : VerticalLayout {
+                spacing: 6px;
+
+                // Column labels
+                HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle { width: 40px; background: transparent; }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Pattern (regex)";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: MementoPalette.text-muted;
+                    }
+                    Rectangle { width: 14px; background: transparent; }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Replacement";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: MementoPalette.text-muted;
+                    }
+                    Rectangle { width: 132px; background: transparent; }
+                }
+
+                for rule[idx] in root.rows : HorizontalLayout {
+                    spacing: 6px;
+                    min-height: 32px;
+
+                    VerticalLayout {
+                        alignment: center;
+                        MementoSwitch {
+                            checked: rule.enabled;
+                            toggled(val) => {
+                                root.update-rule(idx, rule.pattern, rule.replacement, rule.ignore-case, val);
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        LineEdit {
+                            text: rule.pattern;
+                            placeholder-text: "Regex pattern…";
+                            enabled: rule.enabled;
+                            edited(val) => {
+                                root.update-rule(idx, val, rule.replacement, rule.ignore-case, rule.enabled);
+                            }
+                        }
+                    }
+
+                    Text {
+                        width: 14px;
+                        text: "→";
+                        font-size: 13px;
+                        color: MementoPalette.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        LineEdit {
+                            text: rule.replacement;
+                            placeholder-text: "Replacement…";
+                            enabled: rule.enabled;
+                            edited(val) => {
+                                root.update-rule(idx, rule.pattern, val, rule.ignore-case, rule.enabled);
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        ToggleChip {
+                            text: "Aa";
+                            chip-width: 30px;
+                            active: rule.ignore-case;
+                            enabled: rule.enabled;
+                            tooltip: "Case-insensitive regex";
+                            clicked => {
+                                root.update-rule(idx, rule.pattern, rule.replacement, !rule.ignore-case, rule.enabled);
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/arrow-up.svg");
+                            size: 28px;
+                            icon-size: 14px;
+                            enabled: idx > 0;
+                            tooltip: "Move rule up";
+                            clicked => { root.move-rule(idx, -1); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/arrow-down.svg");
+                            size: 28px;
+                            icon-size: 14px;
+                            enabled: idx < root.rows.length - 1;
+                            tooltip: "Move rule down";
+                            clicked => { root.move-rule(idx, 1); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: @image-url("../icons/delete.svg");
+                            size: 28px;
+                            icon-size: 14px;
+                            danger: true;
+                            tooltip: "Remove rule";
+                            tooltip-align-right: true;
+                            clicked => { root.remove-rule(idx); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,87 +1,123 @@
-// Memento Unified Dark Theme Palette
+// Memento Unified Reactive Theme Palette (Dark & Light Modes)
 // Single source of truth for design tokens across Settings, Anki Help, Player, and Popup UI.
 
 export global MementoPalette {
+    // Primary reactive theme switch (false = Dark default, true = Light)
+    in-out property <bool> light-mode: false;
     // Kept exported for compatibility with existing bindings
     in-out property <string> scheme: "dark";
-    out property <bool> dark: scheme == "dark";
+    out property <bool> is-light: light-mode || scheme == "light";
+    out property <bool> dark: !is-light;
 
     // Surface hierarchy (deep -> elevated)
-    out property <color> window-bg:        #111215;
-    out property <color> sidebar-bg:       #14161B;
-    out property <color> card-inset:       #14171D;
-    out property <color> surface-bg:       #17191E;
-    out property <color> card-bg:          #1C1F26;
-    out property <color> surface-elevated: #22262F;
-    out property <color> osc-bg:           #141418EE;
-    out property <color> hover-bg:         #262A34;
-    out property <color> active-bg:        #2E3440;
-    out property <color> scrim:            #000000A8;
-    out property <color> shadow:           #000000CC;
-    out property <color> tooltip-bg:       #0E1015;
+    out property <color> window-bg:        is-light ? #F1F5F9 : #111215;
+    out property <color> sidebar-bg:       is-light ? #E9EEF5 : #14161B;
+    out property <color> card-inset:       is-light ? #F8FAFC : #14171D;
+    out property <color> surface-bg:       is-light ? #F8FAFC : #17191E;
+    out property <color> card-bg:          is-light ? #FFFFFF : #1C1F26;
+    out property <color> surface-elevated: is-light ? #FFFFFF : #22262F;
+    out property <color> input-bg:         is-light ? #FFFFFF : #14171D;
+    out property <color> hover-bg:         is-light ? #E2E8F0 : #262A34;
+    out property <color> active-bg:        is-light ? #CBD5E1 : #2E3440;
+    out property <color> scrim:            is-light ? #0F172A66 : #000000A8;
+    out property <color> shadow:           is-light ? #0F172A2B : #000000CC;
+    out property <color> tooltip-bg:       is-light ? #FFFFFF : #0E1015;
+    out property <color> tooltip-text:     is-light ? #0F172A : #F8FAFC;
 
-    // Interactive control surfaces
-    out property <color> button-bg:        #1F242E;
-    out property <color> button-hover:     #29303D;
-    out property <color> button-pressed:   #323B4B;
-    out property <color> track-bg:         #2B313E;
-    out property <color> checker-dark:     #1A1E24;
-    out property <color> checker-light:    #363E4A;
+    // Interactive control surfaces & scrollbars
+    out property <color> button-bg:        is-light ? #F1F5F9 : #1F242E;
+    out property <color> button-hover:     is-light ? #E2E8F0 : #29303D;
+    out property <color> button-pressed:   is-light ? #CBD5E1 : #323B4B;
+    out property <color> track-bg:         is-light ? #CBD5E1 : #2B313E;
+    out property <color> checker-dark:     is-light ? #CBD5E1 : #1A1E24;
+    out property <color> checker-light:    is-light ? #F1F5F9 : #363E4A;
+    out property <color> scrollbar-track:  is-light ? #E2E8F0 : #17191E;
+    out property <color> scrollbar-thumb:  is-light ? #94A3B8 : #363C4A;
 
     // Typography & SVG icon tinting
-    out property <color> text:             #F8FAFC;
-    out property <color> text-secondary:   #94A3B8;
-    out property <color> text-muted:       #64748B;
-    out property <color> icon:             #E2E8F0;
-    out property <color> icon-muted:       #94A3B8;
+    out property <color> text:             is-light ? #0F172A : #F8FAFC;
+    out property <color> text-secondary:   is-light ? #475569 : #94A3B8;
+    out property <color> text-muted:       is-light ? #64748B : #64748B;
+    out property <color> icon:             is-light ? #334155 : #E2E8F0;
+    out property <color> icon-muted:       is-light ? #64748B : #94A3B8;
 
     // Borders & dividers
-    out property <color> border:           #262A34;
-    out property <color> card-border:      #2A2F3B;
-    out property <color> border-light:     #363C4A;
-    out property <color> focus-ring:       #38A3E5;
+    out property <color> border:           is-light ? #E2E8F0 : #262A34;
+    out property <color> card-border:      is-light ? #CBD5E1 : #2A2F3B;
+    out property <color> border-light:     is-light ? #CBD5E1 : #363C4A;
+    out property <color> focus-ring:       is-light ? #0284C7 : #38A3E5;
 
     // Brand accents
-    out property <color> cyan-accent:        #38A3E5;
-    out property <color> cyan-hover:         #60BAF5;
-    out property <color> cyan-text:          #7DD3FC;
-    out property <color> accent-muted:       #1A2C3D;
-    out property <color> accent-muted-hover: #21384D;
-    out property <color> accent-subtle:      #38A3E526;
+    out property <color> cyan-accent:          is-light ? #0284C7 : #38A3E5;
+    out property <color> cyan-hover:           is-light ? #0369A1 : #60BAF5;
+    out property <color> cyan-text:            is-light ? #0369A1 : #7DD3FC;
+    out property <color> accent-muted:         is-light ? #E0F2FE : #1A2C3D;
+    out property <color> accent-muted-hover:   is-light ? #BAE6FD : #21384D;
+    out property <color> accent-subtle:        is-light ? #0284C71F : #38A3E526;
+    out property <color> accent-border-subtle: is-light ? #0284C755 : #38BDF844;
 
     out property <color> teal-accent:      #0D8269;
-    out property <color> teal-hover:       #109B87;
-    out property <color> teal-pressed:     #0A6B5C;
-    out property <color> teal-border:      #14B8A6;
-    out property <color> teal-muted:       #0D826933;
-    out property <color> teal-text:        #5EEAD4;
+    out property <color> teal-hover:       is-light ? #0F9477 : #109B87;
+    out property <color> teal-pressed:     is-light ? #096954 : #0A6B5C;
+    out property <color> teal-border:      is-light ? #0D9488 : #14B8A6;
+    out property <color> teal-muted:       is-light ? #CCFBF1 : #0D826933;
+    out property <color> teal-text:        is-light ? #0F766E : #5EEAD4;
 
     // Semantic status colors
-    out property <color> success:          #10B981;
-    out property <color> success-bg:       #064E3B;
-    out property <color> success-text:     #6EE7B7;
-    out property <color> warning:          #EAB308;
-    out property <color> warning-bg:       #422006;
-    out property <color> warning-border:   #B45309;
-    out property <color> warning-text:     #FDE68A;
-    out property <color> danger:           #EF4444;
-    out property <color> danger-hover:     #DC2626;
-    out property <color> danger-pressed:   #B91C1C;
-    out property <color> danger-bg:        #450A0A;
-    out property <color> danger-text:      #FCA5A5;
+    out property <color> success:            is-light ? #059669 : #10B981;
+    out property <color> success-bg:         is-light ? #DCFCE7 : #064E3B;
+    out property <color> success-border:     is-light ? #10B98166 : #10B98155;
+    out property <color> success-text:       is-light ? #065F46 : #6EE7B7;
+    out property <color> warning:            is-light ? #D97706 : #EAB308;
+    out property <color> warning-bg:         is-light ? #FEF3C7 : #422006;
+    out property <color> warning-hover:      is-light ? #FDE68A : #644010;
+    out property <color> warning-border:     is-light ? #D97706 : #B45309;
+    out property <color> warning-text:       is-light ? #92400E : #FDE68A;
+    out property <color> warning-text-hover: is-light ? #78350F : #FEF3C7;
+    out property <color> danger:             is-light ? #DC2626 : #EF4444;
+    out property <color> danger-hover:       is-light ? #B91C1C : #DC2626;
+    out property <color> danger-pressed:     is-light ? #991B1B : #B91C1C;
+    out property <color> danger-bg:          is-light ? #FEE2E2 : #450A0A;
+    out property <color> danger-text:        is-light ? #B91C1C : #FCA5A5;
 
-    // Badges & tag colors (Yomitan popup)
-    out property <color> badge-blue:        #1E3A8A;
-    out property <color> badge-blue-text:   #93C5FD;
-    out property <color> badge-green:       #064E3B;
-    out property <color> badge-green-text:  #6EE7B7;
-    out property <color> badge-purple:      #4C1D95;
-    out property <color> badge-purple-text: #C4B5FD;
+    // Badges, pills & tag colors (Yomitan popup)
+    out property <color> badge-blue:         is-light ? #DBEAFE : #1E3A8A;
+    out property <color> badge-blue-text:    is-light ? #1E40AF : #93C5FD;
+    out property <color> badge-green:        is-light ? #DCFCE7 : #064E3B;
+    out property <color> badge-green-text:   is-light ? #065F46 : #6EE7B7;
+    out property <color> badge-purple:       is-light ? #EDE9FE : #4C1D95;
+    out property <color> badge-purple-text:  is-light ? #5B21B6 : #C4B5FD;
+    out property <color> pill-surface:       is-light ? #0F172A0D : #FFFFFF0C;
+    out property <color> pill-surface-hover: is-light ? #0F172A1A : #FFFFFF1E;
+    out property <color> pill-border:        is-light ? #0F172A1A : #FFFFFF16;
+    out property <color> pill-text:          is-light ? #334155 : #CBD5E1;
+    out property <color> pill-text-hover:    is-light ? #0F172A : #F8FAFC;
+    out property <color> pill-arrow:         is-light ? #64748BCC : #94A3B8CC;
+    out property <color> glossary-heading:   is-light ? #6D28D9 : #D8C9FC;
+    out property <color> nasal-ring:         is-light ? #D97706 : #FBBF24;
 
     // Subtitle list hover and selection
-    out property <color> list-hover:     #222630;
-    out property <color> list-selected:  #1E3A8A;
-    out property <color> list-sel-text:  #FFFFFF;
-    out property <color> list-sel-hover: #2563EB;
-    out property <color> active-cue:     #10B981;
+    out property <color> list-hover:     is-light ? #E2E8F0 : #222630;
+    out property <color> list-selected:  is-light ? #DBEAFE : #1E3A8A;
+    out property <color> list-sel-text:  is-light ? #0F172A : #FFFFFF;
+    out property <color> list-sel-hover: is-light ? #BFDBFE : #2563EB;
+    out property <color> active-cue:     is-light ? #059669 : #10B981;
+
+    // Video-overlaid OSC & HUD tokens — ALWAYS dark translucent so controls stay readable over bright video
+    out property <color> osc-bg:             #141418EE;
+    out property <color> osc-border:         #363C4A;
+    out property <color> osc-text:           #F8FAFC;
+    out property <color> osc-text-secondary: #94A3B8;
+    out property <color> osc-icon:           #E2E8F0;
+    out property <color> osc-icon-active:    #7DD3FC;
+    out property <color> osc-btn-bg:         #1F242E;
+    out property <color> osc-btn-hover:      #262A34;
+    out property <color> osc-btn-pressed:    #2E3440;
+    out property <color> osc-btn-active-bg:  #1A2C3D;
+    out property <color> osc-btn-border:     #262A34;
+    out property <color> osc-track-bg:       #2B313E;
+    out property <color> osc-chapter-tick:   #111215;
+    out property <color> osc-tooltip-bg:     #0E1015;
+    out property <color> osc-shadow:         #000000CC;
+    out property <color> video-scrim:        #000000A8;
 }
