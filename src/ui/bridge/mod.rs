@@ -12,15 +12,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model as _, VecModel};
+use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
+use crate::app::anki_actions::{
+    clear_active_glossary_selections, clear_active_row_hit_meta, set_active_row_hit_meta,
+    ActiveRowHitMeta,
+};
 use crate::controller::config::ConfigController;
 use crate::controller::dict::DictController;
 use crate::ui::popup_css::PopupCssTheme;
 use crate::ui::popup_model::{
-    active_rich_bridge_for_app, build_dictionary_result_rows_grouped, clone_last_grouped_hits,
-    dictionary_result_rows, is_kanji_char, popup_pitch_graphs, popup_rows_through,
-    set_dictionary_rows, set_last_grouped_hits, suppress_first_term_ready_guard,
+    active_rich_bridge_for_app, build_dictionary_result_rows_grouped_with_options,
+    clone_last_grouped_hits, dictionary_result_rows_with_options, is_kanji_char,
+    popup_pitch_graphs, popup_rows_through, set_dictionary_rows, set_last_grouped_hits,
+    suppress_first_term_ready_guard,
 };
 use crate::ui::subtitle_layout::{set_active_subtitle_render_style, subtitle_lines_for_app};
 use crate::ui::text_engine::SubtitleRenderStyle;
@@ -29,14 +34,15 @@ use crate::ui::{
 };
 
 use state::{
-    apply_kanji_freq_updates_to_app, apply_popup_css_theme_to_bridge, build_row_extras_for_grouped,
-    execute_nav_lookup, push_history_capped, AnkiPopupCheckRequest, AnkiPopupCheckResponse,
-    DictWorkerRequest, GlossaryPreRenderBatch, GlossaryPreRenderDone, NavLookupRequest,
-    NavLookupResponse, NavQueryKind, NestedScanResponse, PanelSearchRequest, PanelSearchResponse,
-    PopupHistoryEntry, RichUiMutable, SuppressHistoryResetGuard, FRESH_CHECK_THROTTLE,
-    IDLE_DICT_ASSET_CACHE_MAX_BYTES, IDLE_DICT_ASSET_CACHE_MAX_ENTRIES,
-    IDLE_GLOSSARY_CACHE_MAX_BYTES, IDLE_GLOSSARY_CACHE_MAX_ENTRIES,
-    IDLE_PARSED_GLOSSARY_MAX_ENTRIES, IDLE_POPUP_SHRINK_DELAY,
+    apply_kanji_freq_updates_to_app, apply_kanji_freq_updates_to_rows,
+    apply_popup_css_theme_to_bridge, build_row_extras_for_grouped, execute_nav_lookup,
+    push_history_capped, sync_subtitle_overlay_style_to_bridge, AnkiCheckTarget,
+    AnkiPopupCheckRequest, AnkiPopupCheckResponse, DictWorkerRequest, GlossaryPreRenderBatch,
+    GlossaryPreRenderDone, NavLookupRequest, NavLookupResponse, NavQueryKind, NestedScanResponse,
+    PanelSearchRequest, PanelSearchResponse, PopupHistoryEntry, RichUiMutable,
+    SuppressHistoryResetGuard, FRESH_CHECK_THROTTLE, IDLE_DICT_ASSET_CACHE_MAX_BYTES,
+    IDLE_DICT_ASSET_CACHE_MAX_ENTRIES, IDLE_GLOSSARY_CACHE_MAX_BYTES,
+    IDLE_GLOSSARY_CACHE_MAX_ENTRIES, IDLE_PARSED_GLOSSARY_MAX_ENTRIES, IDLE_POPUP_SHRINK_DELAY,
 };
 use subtitle::compute_subtitle_lookup_match_u16;
 
@@ -63,8 +69,10 @@ pub(in crate::ui) struct RichUiBridge {
     anki_res_rx: Arc<Mutex<mpsc::Receiver<AnkiPopupCheckResponse>>>,
     anki_nav_epoch: Arc<AtomicU64>,
     nested_anki_nav_epoch: Arc<AtomicU64>,
+    panel_anki_nav_epoch: Arc<AtomicU64>,
     root_anki_in_flight: Arc<AtomicU64>,
     nested_anki_in_flight: Arc<AtomicU64>,
+    panel_anki_in_flight: Arc<AtomicU64>,
     external_lookup_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     nested_tx: mpsc::Sender<DictWorkerRequest>,
     nested_res_rx: Arc<Mutex<mpsc::Receiver<NestedScanResponse>>>,
@@ -158,6 +166,12 @@ impl RichUiBridge {
                 lvl.glossary_cache.clear();
                 lvl.last_rendered_key.clear();
             }
+            st.panel
+                .glossary_cache
+                .shrink_to(IDLE_GLOSSARY_CACHE_MAX_ENTRIES, IDLE_GLOSSARY_CACHE_MAX_BYTES);
+            st.panel
+                .last_rendered_key
+                .retain(|_, key| st.panel.glossary_cache.contains_key(key));
         }
         crate::ui::dict_assets::shrink_dict_asset_cache(
             IDLE_DICT_ASSET_CACHE_MAX_ENTRIES,
@@ -246,12 +260,127 @@ impl RichUiBridge {
         if resp.gen_id != self.panel_epoch.load(Ordering::Acquire) {
             return false;
         }
+        let (compact_glossaries, compact_tags) = {
+            let st = self.state.borrow();
+            (st.settings.compact_glossaries, st.settings.compact_tags)
+        };
         // Build DictResult rows WITHOUT touching LAST_GROUPED_HITS or app.dict_results!
-        let (rows, _) = build_dictionary_result_rows_grouped(&resp.hits, &resp.excluded);
+        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped_with_options(
+            &resp.hits,
+            &resp.excluded,
+            None,
+            compact_glossaries,
+            compact_tags,
+        );
+        for row in &mut rows {
+            if row.term_start && !row.is_kanji {
+                if let Some((_, _, graphs, freqs)) = resp.term_meta_rows.iter().find(|(e, r, _, _)| {
+                    e == row.expression.as_str() && r == row.reading.as_str()
+                }) {
+                    row.pitch_graphs =
+                        Rc::new(VecModel::from(popup_pitch_graphs(graphs.clone()))).into();
+                    row.frequencies = Rc::new(VecModel::from(
+                        freqs
+                            .iter()
+                            .map(|f| PopupFrequency {
+                                dictionary: f.dictionary.clone().into(),
+                                value: f.value.clone().into(),
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                    .into();
+                }
+            }
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            let state_ref = &mut *st;
+            let (row_extras, kanji_freq_updates) = build_row_extras_for_grouped(
+                &mut state_ref.db_helper,
+                &mut state_ref.dict_ctrl,
+                &rows,
+                &grouped_hits,
+                Some(&resp.term_pitch_details),
+                Some(&resp.kanji_frequencies),
+                compact_tags,
+            );
+            apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
+            let row_count = rows.len();
+            state_ref.panel.rows = rows.clone();
+            state_ref.panel.hits = grouped_hits;
+            state_ref.panel.rich_epoch = state_ref.panel.rich_epoch.wrapping_add(1).max(1);
+            state_ref.panel.row_extras = row_extras;
+            state_ref.panel.glossary_cache.clear();
+            state_ref.panel.last_rendered_key.clear();
+            state_ref.panel.selections.clear();
+            state_ref.panel.active_drag_selection_key = None;
+            state_ref.panel.expanded_cards.clear();
+            state_ref.panel.row_anki_duplicates = vec![false; row_count];
+            state_ref.panel.row_anki_note_ids_i64 = vec![0; row_count];
+            state_ref.panel.row_anki_browse_queries = vec![SharedString::default(); row_count];
+            state_ref.panel.row_anki_tags = vec![SharedString::default(); row_count];
+            state_ref.panel.row_anki_addable = vec![true; row_count];
+            state_ref.panel.row_reading_as_expression = vec![false; row_count];
+            state_ref.panel.term_kanji_statuses.clear();
+            state_ref.panel.term_kana_statuses.clear();
+            state_ref.panel.manual_reading_as_expr.clear();
+        }
+        clear_active_glossary_selections(self.instance_id, Some(-1));
+        self.sync_panel_popup_to_bridge(app, true);
         let pb = app.global::<PopupBridge>();
-        pb.set_panel_results(Rc::new(VecModel::from(rows)).into());
         pb.set_panel_searching(false);
+        self.dispatch_anki_check_for_rows(app, &rows, AnkiCheckTarget::Panel);
         true
+    }
+
+    pub(super) fn rebuild_row_extras_for_compact_tags(&self, app: &MementoApp) {
+        let root_model = app.get_dict_results();
+        let root_rows: Vec<DictResult> = (0..root_model.row_count())
+            .filter_map(|i| root_model.row_data(i))
+            .collect();
+        let mut st_guard = self.state.borrow_mut();
+        let st = &mut *st_guard;
+        let compact_tags = st.settings.compact_tags;
+        st.cached_compact_tags = compact_tags;
+        if !st.current_hits.is_empty() && st.current_hits.len() == root_rows.len() {
+            let hits = st.current_hits.clone();
+            let (extras, _) = build_row_extras_for_grouped(
+                &mut st.db_helper,
+                &mut st.dict_ctrl,
+                &root_rows,
+                &hits,
+                None,
+                None,
+                compact_tags,
+            );
+            st.row_extras = extras;
+        }
+        for lvl in &mut st.nested_stack {
+            if !lvl.hits.is_empty() && lvl.hits.len() == lvl.rows.len() {
+                let (extras, _) = build_row_extras_for_grouped(
+                    &mut st.db_helper,
+                    &mut st.dict_ctrl,
+                    &lvl.rows,
+                    &lvl.hits,
+                    None,
+                    None,
+                    compact_tags,
+                );
+                lvl.row_extras = extras;
+            }
+        }
+        if !st.panel.hits.is_empty() && st.panel.hits.len() == st.panel.rows.len() {
+            let (extras, _) = build_row_extras_for_grouped(
+                &mut st.db_helper,
+                &mut st.dict_ctrl,
+                &st.panel.rows,
+                &st.panel.hits,
+                None,
+                None,
+                compact_tags,
+            );
+            st.panel.row_extras = extras;
+        }
     }
 
     pub(super) fn ensure_fresh_db_and_config(&self, app: &MementoApp, force: bool) {
@@ -260,6 +389,8 @@ impl RichUiBridge {
         let mut reloaded_max_depth: Option<usize> = None;
         let mut truncated_nested = false;
         let mut middle_mouse_update: Option<bool> = None;
+        let mut theme_and_compact_sync: Option<(bool, bool, bool)> = None;
+        let mut compact_tags_changed = false;
         {
             let mut st = self.state.borrow_mut();
             if !force
@@ -275,6 +406,9 @@ impl RichUiBridge {
             let prev_fonts = st.settings.popup_fonts.clone();
             let prev_glossary_style = st.settings.glossary_style;
             let prev_middle_mouse = st.settings.middle_mouse_scan;
+            let prev_is_light = st.settings.is_light_theme;
+            let prev_compact_glossaries = st.settings.compact_glossaries;
+            let prev_compact_tags = st.settings.compact_tags;
 
             let config_dir = st.config_dir.clone();
             let config_reloaded = st.settings.reload_if_changed_on_disk(&config_dir);
@@ -302,10 +436,24 @@ impl RichUiBridge {
                 if st.settings.subtitle_style != prev_sub_style {
                     sub_style_update = Some((true, st.settings.subtitle_style.clone()));
                 }
+                if st.settings.is_light_theme != prev_is_light
+                    || st.settings.compact_glossaries != prev_compact_glossaries
+                    || st.settings.compact_tags != prev_compact_tags
+                {
+                    theme_and_compact_sync = Some((
+                        st.settings.is_light_theme,
+                        st.settings.compact_glossaries,
+                        st.settings.compact_tags,
+                    ));
+                }
+                if st.settings.compact_tags != prev_compact_tags {
+                    compact_tags_changed = true;
+                }
             }
 
             let glossary_visual_changed = css_changed
                 || theme_changed
+                || compact_tags_changed
                 || st.settings.glossary_style != prev_glossary_style
                 || st.settings.popup_fonts != prev_fonts;
             if glossary_visual_changed {
@@ -326,6 +474,15 @@ impl RichUiBridge {
             st.apply_search_config_if_needed();
         }
 
+        if compact_tags_changed {
+            self.rebuild_row_extras_for_compact_tags(app);
+        }
+        if let Some((is_light, compact_gloss, compact_tags)) = theme_and_compact_sync {
+            app.set_is_light_theme(is_light);
+            let pb = app.global::<PopupBridge>();
+            pb.set_compact_glossaries(compact_gloss);
+            pb.set_compact_tags(compact_tags);
+        }
         if let Some(max_d) = reloaded_max_depth {
             app.global::<PopupBridge>()
                 .set_nested_max_depth(max_d as i32);
@@ -345,9 +502,11 @@ impl RichUiBridge {
             if pb.get_nested_depth() > 0 {
                 pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
             }
+            pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
         }
         if let Some((relayout, new_sub_style)) = sub_style_update {
             let bg = new_sub_style.bg_rgba;
+            sync_subtitle_overlay_style_to_bridge(app, &new_sub_style);
             set_active_subtitle_render_style(new_sub_style);
             let sb = app.global::<SubtitleOverlayBridge>();
             sb.set_subtitle_bg_color(slint::Color::from_argb_u8(bg[3], bg[0], bg[1], bg[2]));
@@ -383,20 +542,37 @@ impl RichUiBridge {
         self.nested_anki_nav_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_anki_in_flight.store(0, Ordering::Release);
 
-        let (can_back, can_fwd, crumb, reset_kana, kanji_freq_updates, ass_ctrl, ass_action) = {
+        let (
+            can_back,
+            can_fwd,
+            crumb,
+            reset_kana,
+            kanji_freq_updates,
+            ass_ctrl,
+            ass_action,
+            old_nested_depth,
+            root_hit_meta,
+        ) = {
             let mut st = self.state.borrow_mut();
             if !st.suppress_history_reset {
                 st.back_stack.clear();
                 st.forward_stack.clear();
             }
+            let old_nested_depth = st.nested_stack.len();
             st.rich_epoch = st.rich_epoch.wrapping_add(1);
             st.row_extras.clear();
             st.glossary_cache.clear();
             st.last_rendered_key.clear();
-            st.selection = None;
+            st.selections.clear();
+            st.active_drag_selection_key = None;
             st.root_scan_highlight = None;
             st.root_expanded_cards.clear();
             st.root_row_anki_note_ids_i64.clear();
+            st.root_row_anki_addable = vec![true; rows.len()];
+            st.root_row_reading_as_expression = vec![false; rows.len()];
+            st.root_term_kanji_statuses.clear();
+            st.root_term_kana_statuses.clear();
+            st.root_manual_reading_as_expr.clear();
             st.last_active_glossary_row_idx = 0;
             st.nested_stack.clear();
             st.hovered_glossary_target = None;
@@ -409,9 +585,19 @@ impl RichUiBridge {
 
             let mut kanji_freq_updates = Vec::new();
             let mut ass_action: Option<PendingAssHighlightAction> = None;
+            let mut root_hit_meta = Vec::new();
 
             if matches_hits {
                 st.current_hits = candidate_hits.clone();
+                root_hit_meta = candidate_hits
+                    .iter()
+                    .map(|h| ActiveRowHitMeta {
+                        dictionary_id: h.dictionary_id,
+                        dict_name: h.dict_name.clone(),
+                        raw_glossary: h.raw_glossary.clone(),
+                    })
+                    .collect();
+                let compact_tags = st.settings.compact_tags;
                 let state_ref = &mut *st;
                 let (pre_pitch, pre_kanji) = match precomputed_meta.as_ref() {
                     Some((p, k)) => (Some(p), Some(k)),
@@ -424,6 +610,7 @@ impl RichUiBridge {
                     &candidate_hits,
                     pre_pitch,
                     pre_kanji,
+                    compact_tags,
                 );
                 state_ref.row_extras = extras;
                 kanji_freq_updates = freq_updates;
@@ -475,8 +662,17 @@ impl RichUiBridge {
                 kanji_freq_updates,
                 ass_ctrl,
                 ass_action,
+                old_nested_depth,
+                root_hit_meta,
             )
         };
+
+        clear_active_glossary_selections(self.instance_id, Some(0));
+        set_active_row_hit_meta(self.instance_id, 0, root_hit_meta);
+        for d in 1..=old_nested_depth {
+            clear_active_glossary_selections(self.instance_id, Some(d as i32));
+            clear_active_row_hit_meta(self.instance_id, Some(d as i32));
+        }
 
         apply_kanji_freq_updates_to_app(app, kanji_freq_updates);
 
@@ -494,6 +690,7 @@ impl RichUiBridge {
         }
 
         let pb = app.global::<PopupBridge>();
+        pb.set_selected_glossary_text("".into());
         pb.set_can_go_back(can_back);
         pb.set_can_go_forward(can_fwd);
         pb.set_nav_breadcrumb(crumb.into());
@@ -508,7 +705,28 @@ impl RichUiBridge {
             && !app.get_dict_query().is_empty()
         {
             pb.set_panel_query(app.get_dict_query());
-            pb.set_panel_results(Rc::new(VecModel::from(rows.to_vec())).into());
+            {
+                let mut st = self.state.borrow_mut();
+                st.panel.rows = rows.to_vec();
+                st.panel.hits = st.current_hits.clone();
+                st.panel.row_extras = st.row_extras.clone();
+                st.panel.rich_epoch = st.panel.rich_epoch.wrapping_add(1).max(1);
+                st.panel.glossary_cache.clear();
+                st.panel.last_rendered_key.clear();
+                st.panel.selections.clear();
+                st.panel.active_drag_selection_key = None;
+                st.panel.expanded_cards.clear();
+                st.panel.row_anki_duplicates = vec![false; rows.len()];
+                st.panel.row_anki_note_ids_i64 = vec![0; rows.len()];
+                st.panel.row_anki_browse_queries = vec![SharedString::default(); rows.len()];
+                st.panel.row_anki_tags = vec![SharedString::default(); rows.len()];
+                st.panel.row_anki_addable = vec![true; rows.len()];
+                st.panel.row_reading_as_expression = vec![false; rows.len()];
+                st.panel.term_kanji_statuses.clear();
+                st.panel.term_kana_statuses.clear();
+                st.panel.manual_reading_as_expr.clear();
+            }
+            self.sync_panel_popup_to_bridge(app, true);
         }
         pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
@@ -521,7 +739,7 @@ impl RichUiBridge {
             self.dispatch_glossary_prerender(app, rows);
         }
 
-        self.dispatch_anki_check_for_rows(app, rows, None);
+        self.dispatch_anki_check_for_rows(app, rows, AnkiCheckTarget::Root);
     }
 
     fn snapshot_current_popup(&self, app: &MementoApp) -> Option<PopupHistoryEntry> {
@@ -696,7 +914,17 @@ impl RichUiBridge {
                     pb.set_active_kana_reading("".into());
                 }
 
-                let mut rows = dictionary_result_rows(&resp.hits, &resp.excluded);
+                let (compact_glossaries, compact_tags) = {
+                    let st = self.state.borrow();
+                    (st.settings.compact_glossaries, st.settings.compact_tags)
+                };
+                let mut rows = dictionary_result_rows_with_options(
+                    &resp.hits,
+                    &resp.excluded,
+                    None,
+                    compact_glossaries,
+                    compact_tags,
+                );
                 for row in &mut rows {
                     if row.term_start && !row.is_kanji {
                         if let Some((_, _, graphs, freqs)) = resp
@@ -753,7 +981,17 @@ impl RichUiBridge {
                 pb.set_kana_reading_active(false);
                 pb.set_active_kana_reading("".into());
 
-                let rows = dictionary_result_rows(&resp.hits, &resp.excluded);
+                let (compact_glossaries, compact_tags) = {
+                    let st = self.state.borrow();
+                    (st.settings.compact_glossaries, st.settings.compact_tags)
+                };
+                let rows = dictionary_result_rows_with_options(
+                    &resp.hits,
+                    &resp.excluded,
+                    None,
+                    compact_glossaries,
+                    compact_tags,
+                );
                 app.set_anki_added_note_id("".into());
                 app.set_anki_added_result_index(-1);
                 set_dictionary_rows(app, rows);
@@ -782,12 +1020,18 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         sub_style,
         sub_style_changed,
         glossary_visual_changed,
+        compact_tags_changed,
+        is_light_theme,
+        compact_glossaries,
+        compact_tags,
         popup_theme,
+        panel_rows_for_anki,
     ) = {
         let mut st = bridge.state.borrow_mut();
         let prev_fonts = st.settings.popup_fonts.clone();
         let prev_glossary_style = st.settings.glossary_style;
         let prev_sub_style = st.settings.subtitle_style.clone();
+        let prev_compact_tags = st.settings.compact_tags;
 
         st.settings.apply_controller(config);
         st.last_fresh_check = Some(Instant::now());
@@ -808,10 +1052,12 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
             truncated = true;
         }
 
+        let compact_tags_changed = st.settings.compact_tags != prev_compact_tags;
         let css_changed = st.stylesheets.force_reload_user_css();
         let theme_changed = st.refresh_cached_theme(css_changed);
         let glossary_visual_changed = css_changed
             || theme_changed
+            || compact_tags_changed
             || st.settings.glossary_style != prev_glossary_style
             || st.settings.popup_fonts != prev_fonts;
         if glossary_visual_changed {
@@ -831,6 +1077,7 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         st.apply_search_config_if_needed();
 
         let sub_style_changed = st.settings.subtitle_style != prev_sub_style;
+        let panel_rows = (!st.panel.rows.is_empty()).then(|| st.panel.rows.clone());
         (
             st.settings.middle_mouse_scan,
             max_depth,
@@ -838,11 +1085,23 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
             st.settings.subtitle_style.clone(),
             sub_style_changed,
             glossary_visual_changed,
+            compact_tags_changed,
+            st.settings.is_light_theme,
+            st.settings.compact_glossaries,
+            st.settings.compact_tags,
             st.effective_popup_theme(),
+            panel_rows,
         )
     };
 
+    if compact_tags_changed {
+        bridge.rebuild_row_extras_for_compact_tags(app);
+    }
+
+    app.set_is_light_theme(is_light_theme);
     let pb = app.global::<PopupBridge>();
+    pb.set_compact_glossaries(compact_glossaries);
+    pb.set_compact_tags(compact_tags);
     pb.set_anki_show_tags(config.anki_show_tag());
     pb.set_nested_max_depth(max_recursion_depth as i32);
     if truncated_nested {
@@ -855,13 +1114,19 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
         if pb.get_nested_depth() > 0 {
             pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
         }
+        pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
     }
     if app.get_dict_open() {
         let full = app.get_dict_results();
         let current_rows: Vec<DictResult> = (0..full.row_count())
             .filter_map(|i| full.row_data(i))
             .collect();
-        bridge.dispatch_anki_check_for_rows(app, &current_rows, None);
+        bridge.dispatch_anki_check_for_rows(app, &current_rows, AnkiCheckTarget::Root);
+    }
+    if app.get_dict_search_open() {
+        if let Some(panel_rows) = panel_rows_for_anki {
+            bridge.dispatch_anki_check_for_rows(app, &panel_rows, AnkiCheckTarget::Panel);
+        }
     }
 
     let sb = app.global::<SubtitleOverlayBridge>();
@@ -870,6 +1135,7 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
     sb.set_subtitle_bg_color(slint::Color::from_argb_u8(
         sub_bg[3], sub_bg[0], sub_bg[1], sub_bg[2],
     ));
+    sync_subtitle_overlay_style_to_bridge(app, &sub_style);
     if sub_style_changed {
         set_active_subtitle_render_style(sub_style);
         sb.set_style_revision(sb.get_style_revision().wrapping_add(1));
@@ -940,4 +1206,338 @@ pub fn active_ass_lookup_for_app(
         .and_then(|bridge| bridge.state.borrow().ass_controller.clone())?;
     let lookup = ass_ctrl.try_borrow().ok()?.active_lookup().cloned();
     lookup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::anki_actions::get_active_glossary_selections;
+    use crate::controller::anki::EntryAnkiStatus;
+    use crate::controller::dict::{SearchHit, TermPitchDetail};
+    use crate::ui::popup_css::CUSTOM_POPUP_CSS_FILENAME;
+    use crate::ui::popup_model::{dictionary_result_rows, install_popup_navigation};
+    use crate::ui::PopupLayout;
+    use memento_dict::yomidbbuilder::prepare_db;
+    use memento_setting::keys as raw;
+    use state::{
+        build_rich_pitch_entries_from_details, classify_pitch_category, CachedConfigSettings,
+    };
+
+    fn create_test_dict_db(path: &std::path::Path) {
+        prepare_db(path).unwrap();
+        let conn = memento_dict::sqlite_db::open_read_write_connection(path).unwrap();
+        conn.execute(
+            "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES \
+             (1, 'Jitendex', 3, '1', 1), \
+             (2, 'Daijirin', 3, '1', 1);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO term_bank (dic_id, expression, reading, def_tags, rules, score, glossary, sequence, term_tags) VALUES \
+             (1, '食べる', 'たべる', 'v1 ichidan', 'v1', 100, '[\"to eat food\"]', 1, 'common'), \
+             (2, '食べる', 'たべる', 'v1 ichidan', 'v1', 90, '[\"consume meal\"]', 2, 'common'), \
+             (1, '食べログ', 'たべろぐ', 'n', '', 80, '[\"restaurant review site\"]', 3, ''), \
+             (1, '世界', 'せかい', 'n', '', 70, '[\"the world\"]', 4, '');",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanji_bank (dic_id, char, onyomi, kunyomi, tags, meanings, stats) VALUES \
+             (1, '食', 'ショク', 'た.べる', '', '[\"eat\",\"food\"]', '{}');",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn multi_definition_selection_persists_across_definitions_and_clears_on_escape_and_lookup() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        create_test_dict_db(&db_path);
+
+        let cfg = ConfigController::new();
+        let app = MementoApp::new().unwrap();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+
+        let mut dict = DictController::open(&db_path).unwrap();
+        let hits = dict.search("食べる").to_vec();
+        assert!(hits.len() >= 2);
+        set_dictionary_rows(&app, dictionary_result_rows(&hits, &[]));
+        app.set_dict_open(true);
+
+        let pb = app.global::<PopupBridge>();
+        let bridge_id = pb.get_bridge_instance_id();
+        let rev = pb.get_rich_revision();
+        let sel_rev = pb.get_selection_revision();
+        let r1 = pb.invoke_render_glossary(1, 320.0, true, rev, sel_rev);
+        let r2 = pb.invoke_render_glossary(2, 320.0, true, rev, sel_rev);
+        assert!(r1.has_rich && r2.has_rich);
+
+        // Double-click word in definition 1, then double-click word in definition 2.
+        pb.invoke_glossary_double_clicked(1, 10.0, 10.0);
+        pb.invoke_glossary_double_clicked(2, 10.0, 10.0);
+
+        let active = get_active_glossary_selections(bridge_id, 0);
+        assert_eq!(
+            active.len(),
+            2,
+            "both definitions' selections must persist in order: {active:?}"
+        );
+        assert_eq!(pb.get_selected_glossary_text().as_str(), active.join("\n"));
+
+        // Escape clears all selections cleanly.
+        assert!(pb.invoke_popup_key_pressed("\u{1b}".into(), false, false, false, false));
+        assert!(get_active_glossary_selections(bridge_id, 0).is_empty());
+        assert!(pb.get_selected_glossary_text().is_empty());
+
+        // New lookup also clears selections.
+        pb.invoke_glossary_double_clicked(1, 10.0, 10.0);
+        assert_eq!(get_active_glossary_selections(bridge_id, 0).len(), 1);
+        let world_hits = dict.search("世界").to_vec();
+        set_dictionary_rows(&app, dictionary_result_rows(&world_hits, &[]));
+        assert!(get_active_glossary_selections(bridge_id, 0).is_empty());
+        assert!(pb.get_selected_glossary_text().is_empty());
+    }
+
+    #[test]
+    fn light_dark_theme_switch_propagates_css_theme_and_custom_root_vars() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(CUSTOM_POPUP_CSS_FILENAME),
+            ":root { --bg: #112233; }\n\
+             :root[data-theme=\"light\"] { --bg: #fafbfc; }\n\
+             body { background-color: var(--bg); }\n",
+        )
+        .unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        create_test_dict_db(&db_path);
+
+        let cfg = ConfigController::new();
+        cfg.edit_setting("interface/theme", "dark").unwrap();
+        let app = MementoApp::new().unwrap();
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+
+        let pb = app.global::<PopupBridge>();
+        assert!(!app.get_is_light_theme());
+        assert_eq!(
+            pb.get_css_popup_bg(),
+            slint::Color::from_argb_u8(0xFF, 0x11, 0x22, 0x33)
+        );
+        let rev_before = pb.get_rich_revision();
+
+        cfg.edit_setting("interface/theme", "light").unwrap();
+        refresh_rich_ui_bridges(&app, &cfg);
+
+        assert!(app.get_is_light_theme());
+        assert_eq!(
+            pb.get_css_popup_bg(),
+            slint::Color::from_argb_u8(0xFF, 0xFA, 0xFB, 0xFC)
+        );
+        assert_ne!(pb.get_rich_revision(), rev_before);
+        let bridge = active_rich_bridge_for_app(&app).unwrap();
+        assert!(bridge.state.borrow().effective_popup_theme().is_light_theme());
+    }
+
+    #[test]
+    fn compact_tags_compact_frequencies_and_exact_string_pitch_entries() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        create_test_dict_db(&db_path);
+
+        let cfg = ConfigController::new();
+        cfg.edit_setting("interface/compact-tags", "true").unwrap();
+        let app = MementoApp::new().unwrap();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+
+        let mut dict = DictController::open(&db_path).unwrap();
+        let hits = dict.search("食べる").to_vec();
+        let mut rows = dictionary_result_rows(&hits, &[]);
+        rows[0].frequencies = Rc::new(VecModel::from(vec![
+            PopupFrequency {
+                dictionary: "JPDB".into(),
+                value: "123".into(),
+            },
+            PopupFrequency {
+                dictionary: "JPDB".into(),
+                value: "456㋕".into(),
+            },
+            PopupFrequency {
+                dictionary: "BCCWJ".into(),
+                value: "99".into(),
+            },
+        ]))
+        .into();
+        set_dictionary_rows(&app, rows);
+
+        let pb = app.global::<PopupBridge>();
+        let rev = pb.get_rich_revision();
+
+        // Compact tags deduplicates repeated `v1`/`ichidan` pills on the second sense.
+        let pills_1 = pb.invoke_def_tag_pills(1, rev);
+        let pills_2 = pb.invoke_def_tag_pills(2, rev);
+        assert!(pills_1.row_count() >= 1);
+        assert_eq!(pills_2.row_count(), 0);
+
+        // Compact frequency badges omit repeated consecutive dictionary names.
+        let compact_freqs = pb.invoke_row_compact_frequencies(0, 1, rev);
+        assert_eq!(compact_freqs.row_count(), 3);
+        assert!(!compact_freqs.row_data(0).unwrap().omit_dict_name);
+        assert!(compact_freqs.row_data(1).unwrap().omit_dict_name);
+        assert!(!compact_freqs.row_data(2).unwrap().omit_dict_name);
+
+        let lines = app
+            .global::<PopupLayout>()
+            .invoke_compact_frequency_lines(compact_freqs, 120.0);
+        assert!(lines.row_count() >= 1);
+
+        // Exact string pitch patterns ("LHH", "HLL") & consecutive repeated dictionary hiding.
+        let details = vec![
+            TermPitchDetail {
+                dictionary: "NHKJ".into(),
+                mora: vec!["た".into(), "べ".into(), "る".into()],
+                position: 0,
+                pattern: Some("LHH".into()),
+                nasal: Vec::new(),
+                devoice: Vec::new(),
+                tags: Vec::new(),
+            },
+            TermPitchDetail {
+                dictionary: "NHKJ".into(),
+                mora: vec!["た".into(), "べ".into(), "る".into()],
+                position: 1,
+                pattern: Some("HLL".into()),
+                nasal: Vec::new(),
+                devoice: Vec::new(),
+                tags: Vec::new(),
+            },
+        ];
+        let entries = build_rich_pitch_entries_from_details(&details, true);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].pattern_text.as_str(), "LHH");
+        assert!(!entries[0].hide_dict_name);
+        assert_eq!(entries[1].pattern_text.as_str(), "HLL");
+        assert!(entries[1].hide_dict_name);
+        let graphs = crate::ui::popup_model::rich_pitch_graphs_from_details(&details);
+        assert_eq!(classify_pitch_category(&graphs, &details, "n"), Some("heiban"));
+        assert_eq!(
+            classify_pitch_category(&graphs[1..], &details[1..], "n"),
+            Some("atamadaka")
+        );
+    }
+
+    #[test]
+    fn interactive_panel_wildcards_select_collapse_and_reading_as_expression_toggle() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        create_test_dict_db(&db_path);
+
+        let cfg = ConfigController::new();
+        let app = MementoApp::new().unwrap();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+
+        let pb = app.global::<PopupBridge>();
+        assert!(pb.get_panel_rich_enabled());
+
+        // Wildcard search in panel (`食べ*`) finds both `食べる` and `食べログ`.
+        pb.invoke_panel_search_requested("食べ*".into());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pb.get_panel_searching() && Instant::now() < deadline {
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
+        let panel_rows = pb.get_panel_results();
+        assert!(
+            panel_rows.row_count() >= 2,
+            "wildcard panel search must return matches, got {}",
+            panel_rows.row_count()
+        );
+
+        // Toggle definition selection & term collapse on panel rows.
+        let initial_sel = panel_rows.row_data(0).unwrap().selected;
+        pb.invoke_panel_toggle_select_definition(0);
+        assert_eq!(
+            pb.get_panel_results().row_data(0).unwrap().selected,
+            !initial_sel
+        );
+        assert!(!pb.get_panel_results().row_data(0).unwrap().collapsed);
+        pb.invoke_panel_toggle_term_collapse(0);
+        assert!(pb.get_panel_results().row_data(0).unwrap().collapsed);
+
+        // `readingAsExpression` auto-toggle + manual toggle on root popup.
+        let hit = SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        set_dictionary_rows(&app, dictionary_result_rows(&[hit], &[]));
+        let br = active_rich_bridge_for_app(&app).unwrap();
+        {
+            let mut st = br.state.borrow_mut();
+            st.root_term_kanji_statuses.insert(
+                ("食べる".into(), "たべる".into()),
+                EntryAnkiStatus {
+                    can_add: false,
+                    is_duplicate: true,
+                    note_ids: vec![42],
+                    tags: vec!["mined".into()],
+                    browse_query: "nid:42".into(),
+                },
+            );
+            st.root_term_kana_statuses.insert(
+                ("食べる".into(), "たべる".into()),
+                EntryAnkiStatus {
+                    can_add: true,
+                    is_duplicate: false,
+                    note_ids: Vec::new(),
+                    tags: Vec::new(),
+                    browse_query: String::new(),
+                },
+            );
+        }
+        // Manual toggle enables reading_as_expression -> switches to kana (addable, non-duplicate).
+        pb.invoke_toggle_reading_as_expression(0);
+        assert_eq!(pb.get_row_reading_as_expression().row_data(0), Some(true));
+        assert_eq!(pb.get_row_anki_addable().row_data(0), Some(true));
+        assert_eq!(pb.get_row_anki_duplicates().row_data(0), Some(false));
+        // Second toggle switches back to kanji (duplicate, not addable).
+        pb.invoke_toggle_reading_as_expression(0);
+        assert_eq!(pb.get_row_reading_as_expression().row_data(0), Some(false));
+        assert_eq!(pb.get_row_anki_addable().row_data(0), Some(false));
+        assert_eq!(pb.get_row_anki_duplicates().row_data(0), Some(true));
+    }
+
+    #[test]
+    fn search_kanji_font_cap_relaxed_to_200_and_font_attrs_preserved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ConfigController::new();
+        // 135pt * 96/72 = 180px (exceeds old 96px cap, stays within new 200px cap).
+        cfg.edit_setting(
+            &format!("{}/{}", raw::interface::GROUP, raw::interface::SEARCH_KANJI_FONT),
+            "KanjiStrokeOrders,135,-1,5,50,0,1,1,0,0,letterSpacing=2.0",
+        )
+        .unwrap();
+        let cached = CachedConfigSettings::from_controller(&cfg, dir.path());
+        let kanji_font = cached.popup_fonts.kanji.expect("custom kanji font parsed");
+        assert!((kanji_font.size_px - 180.0).abs() < 1e-3);
+        let attrs = cached
+            .popup_font_attrs
+            .get(raw::interface::SEARCH_KANJI_FONT)
+            .expect("extra font attributes captured");
+        assert!(attrs.underline);
+        assert!(attrs.strikeout);
+        assert!((attrs.letter_spacing - 2.0).abs() < 1e-3);
+    }
 }

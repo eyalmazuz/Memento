@@ -1,20 +1,24 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use memento_definition::CssTheme;
+use memento_dict::searchcontroller::has_wildcard_chars;
 use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
+use crate::controller::anki::EntryAnkiLookup;
 use crate::controller::config::ConfigController;
 use crate::controller::dict::DictController;
 use crate::ui::dict_assets::collect_dictionary_resource_dirs;
 use crate::ui::glossary_render::rasterize_structured_glossary_entry_with_engine;
 use crate::ui::popup_css::{rgba_to_slint_color, StylesheetCache};
 use crate::ui::popup_model::{
-    is_kanji_char, register_active_rich_bridge, split_anki_tags_str, NEXT_BRIDGE_INSTANCE_ID,
+    compact_frequency_badges_from_popup, is_kanji_char, register_active_rich_bridge,
+    split_anki_tags_str, NEXT_BRIDGE_INSTANCE_ID,
 };
 use crate::ui::rich_db::RichDbHelper;
 use crate::ui::subtitle_layout::set_active_subtitle_render_style;
@@ -23,8 +27,9 @@ use crate::ui::text_engine::{
     TextEngine,
 };
 use crate::ui::{
-    DefinitionGridRow, DictResult, MementoApp, PopupBridge, PopupDictStyle, PopupFreqStyle,
-    RichHeadwordChar, RichHeadwordLine, SubtitleOverlayBridge,
+    CompactFrequencyItem, CompactFrequencyLine, DefinitionGridRow, DictResult, MementoApp,
+    PopupBridge, PopupDictStyle, PopupFreqStyle, PopupFrequency, PopupLayout, RichHeadwordChar,
+    RichHeadwordLine, SubtitleOverlayBridge,
 };
 
 use super::anki::{drain_anki_results_for_app, sync_anki_checking_for_app};
@@ -34,11 +39,11 @@ use super::state::{
     apply_popup_css_theme_to_bridge, collect_hits_term_and_kanji_meta,
     copy_to_persistent_clipboard, current_external_lookup_epoch, execute_nav_lookup,
     modifier_matches_setting, push_history_capped, resolve_bare_modifier_event,
-    utf16_units_to_char_count, AnkiPopupCheckRequest, AnkiPopupCheckResponse, CachedConfigSettings,
-    DictSearchConfig, DictWorkerRequest, GlossaryDocLruCache, GlossaryPreRenderBatch,
-    GlossaryPreRenderDone, NavLookupRequest, NavLookupResponse, NestedScanRequest,
-    NestedScanResponse, PanelSearchRequest, PanelSearchResponse, RichUiMutable,
-    SubtitleTokenLayoutCache,
+    sync_subtitle_overlay_style_to_bridge, utf16_units_to_char_count, AnkiCheckTarget,
+    AnkiPopupCheckRequest, AnkiPopupCheckResponse, CachedConfigSettings, DictSearchConfig,
+    DictWorkerRequest, GlossaryDocLruCache, GlossaryPreRenderBatch, GlossaryPreRenderDone,
+    NavLookupRequest, NavLookupResponse, NestedScanRequest, NestedScanResponse, PanelPopupState,
+    PanelSearchRequest, PanelSearchResponse, RichUiMutable, SubtitleTokenLayoutCache,
 };
 use super::{drain_nav_lookup_results_for_app, drain_panel_results_for_app, RichUiBridge};
 
@@ -66,6 +71,9 @@ fn spawn_panel_worker(
                     gen_id: req.gen_id,
                     hits: Vec::new(),
                     excluded: req.excluded,
+                    term_meta_rows: Vec::new(),
+                    term_pitch_details: HashMap::new(),
+                    kanji_frequencies: HashMap::new(),
                 });
                 let _ = worker_app.upgrade_in_event_loop(move |app| {
                     let _ = drain_panel_results_for_app(&app);
@@ -82,20 +90,46 @@ fn spawn_panel_worker(
                 req.search_cfg.apply_to(&mut dict);
                 applied_cfg = Some(req.search_cfg);
             }
-            let search_key = if req.kana_only {
-                crate::controller::dict::normalize_reading(&trimmed)
-            } else {
-                trimmed.clone()
-            };
-            let mut hits = dict.search(&search_key).to_vec();
-            if req.kana_only {
+            let hits = if req.kanji_only {
+                let mut kanji_hits = Vec::new();
+                let mut seen_chars = HashSet::new();
+                for ch in trimmed.chars() {
+                    if is_kanji_char(ch) && seen_chars.insert(ch) {
+                        let s = ch.to_string();
+                        kanji_hits.extend_from_slice(dict.search_kanji(&s));
+                    }
+                }
+                if kanji_hits.is_empty() {
+                    kanji_hits = dict.search_kanji(&trimmed).to_vec();
+                }
+                kanji_hits
+            } else if has_wildcard_chars(&trimmed) {
+                let mut raw = dict.search_manual(&trimmed).to_vec();
+                if req.kana_only {
+                    raw.retain(|h| !h.reading.is_empty() || !h.expression.chars().any(is_kanji_char));
+                }
+                raw
+            } else if req.kana_only {
                 let norm = crate::controller::dict::normalize_reading(&trimmed);
-                hits.retain(|h| {
+                let mut raw = dict.search_manual(&norm).to_vec();
+                raw.retain(|h| {
                     crate::controller::dict::normalize_reading(&h.reading).starts_with(&norm)
                         || crate::controller::dict::normalize_reading(&h.expression)
                             .starts_with(&norm)
                 });
+                raw
+            } else {
+                let mut raw = dict.search_manual(&trimmed).to_vec();
+                if raw.is_empty() && trimmed.chars().count() == 1 {
+                    raw = dict.search_kanji(&trimmed).to_vec();
+                }
+                raw
+            };
+            if req.gen_id != worker_epoch.load(Ordering::Acquire) {
+                continue;
             }
+            let (term_meta_rows, term_pitch_details, kanji_frequencies) =
+                collect_hits_term_and_kanji_meta(&dict, &hits);
             if req.gen_id != worker_epoch.load(Ordering::Acquire) {
                 continue;
             }
@@ -103,6 +137,9 @@ fn spawn_panel_worker(
                 gen_id: req.gen_id,
                 hits,
                 excluded: req.excluded,
+                term_meta_rows,
+                term_pitch_details,
+                kanji_frequencies,
             });
             let _ = worker_app.upgrade_in_event_loop(move |app| {
                 let _ = drain_panel_results_for_app(&app);
@@ -341,8 +378,10 @@ fn spawn_anki_worker(
     anki_res_tx: mpsc::Sender<AnkiPopupCheckResponse>,
     worker_anki_epoch: Arc<AtomicU64>,
     worker_nested_anki_epoch: Arc<AtomicU64>,
+    worker_panel_anki_epoch: Arc<AtomicU64>,
     root_in_flight: Arc<AtomicU64>,
     nested_in_flight: Arc<AtomicU64>,
+    panel_in_flight: Arc<AtomicU64>,
     worker_anki_ext: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     worker_anki_app: slint::Weak<MementoApp>,
 ) {
@@ -350,27 +389,34 @@ fn spawn_anki_worker(
         while let Ok(first_req) = anki_rx.recv() {
             let mut pending_root: Option<AnkiPopupCheckRequest> = None;
             let mut pending_nested: Option<AnkiPopupCheckRequest> = None;
-            if first_req.target_nested_depth.is_some() {
-                pending_nested = Some(first_req);
-            } else {
-                pending_root = Some(first_req);
-            }
-            while let Ok(newer) = anki_rx.try_recv() {
-                if newer.target_nested_depth.is_some() {
-                    pending_nested = Some(newer);
-                } else {
-                    pending_root = Some(newer);
+            let mut pending_panel: Option<AnkiPopupCheckRequest> = None;
+            {
+                let mut accept = |item: AnkiPopupCheckRequest| match item.target {
+                    AnkiCheckTarget::Root => pending_root = Some(item),
+                    AnkiCheckTarget::Nested(_) => pending_nested = Some(item),
+                    AnkiCheckTarget::Panel => pending_panel = Some(item),
+                };
+                accept(first_req);
+                while let Ok(newer) = anki_rx.try_recv() {
+                    accept(newer);
                 }
             }
-            for req in pending_root.into_iter().chain(pending_nested) {
-                let (target_epoch, target_in_flight) = if req.target_nested_depth.is_some() {
-                    (&worker_nested_anki_epoch, &nested_in_flight)
-                } else {
-                    (&worker_anki_epoch, &root_in_flight)
+            for req in pending_root
+                .into_iter()
+                .chain(pending_nested)
+                .chain(pending_panel)
+            {
+                let (target_epoch, target_in_flight, check_ext_epoch) = match req.target {
+                    AnkiCheckTarget::Root => (&worker_anki_epoch, &root_in_flight, true),
+                    AnkiCheckTarget::Nested(_) => {
+                        (&worker_nested_anki_epoch, &nested_in_flight, true)
+                    }
+                    AnkiCheckTarget::Panel => (&worker_panel_anki_epoch, &panel_in_flight, false),
                 };
                 let is_cancelled = || {
                     req.nav_epoch != target_epoch.load(Ordering::Acquire)
-                        || req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext)
+                        || (check_ext_epoch
+                            && req.lookup_epoch != current_external_lookup_epoch(&worker_anki_ext))
                 };
                 let clear_if_cancelled = || -> bool {
                     if !is_cancelled() {
@@ -392,16 +438,42 @@ fn spawn_anki_worker(
                 }
 
                 let mut term_statuses = HashMap::new();
+                let mut term_kana_statuses = HashMap::new();
                 if let Some(mut profile) = req.term_profile.clone() {
                     if profile.endpoint.timeout.is_none() {
                         profile.endpoint.timeout = Some(std::time::Duration::from_secs(3));
                     }
                     let ctrl = crate::controller::anki::AnkiController::new(profile.endpoint());
-                    if let Ok(statuses) =
-                        ctrl.check_entries_anki_status(&profile, &req.term_entries, req.show_tags)
-                    {
-                        for (pair, st) in req.term_entries.iter().cloned().zip(statuses) {
-                            term_statuses.insert(pair, st);
+                    let mut lookups: Vec<EntryAnkiLookup> = Vec::with_capacity(req.term_entries.len() * 2);
+                    for (expr, reading) in &req.term_entries {
+                        lookups.push(EntryAnkiLookup::new(expr.clone(), reading.clone()));
+                    }
+                    let mut kana_map: Vec<(usize, usize)> = Vec::new();
+                    for (entry_idx, (expr, reading)) in req.term_entries.iter().enumerate() {
+                        if !reading.is_empty() && reading != expr {
+                            let lookup_idx = lookups.len();
+                            lookups.push(
+                                EntryAnkiLookup::new(expr.clone(), reading.clone())
+                                    .with_reading_as_expression(true),
+                            );
+                            kana_map.push((entry_idx, lookup_idx));
+                        }
+                    }
+                    if let Ok(statuses) = ctrl.check_entries_anki_status_with_lookups(
+                        &profile,
+                        &lookups,
+                        req.show_tags,
+                    ) {
+                        for (entry_idx, pair) in req.term_entries.iter().enumerate() {
+                            if let Some(st) = statuses.get(entry_idx) {
+                                term_statuses.insert(pair.clone(), st.clone());
+                            }
+                        }
+                        for (entry_idx, lookup_idx) in kana_map {
+                            if let Some(st) = statuses.get(lookup_idx) {
+                                term_kana_statuses
+                                    .insert(req.term_entries[entry_idx].clone(), st.clone());
+                            }
                         }
                     }
                 }
@@ -432,9 +504,10 @@ fn spawn_anki_worker(
                 let _ = anki_res_tx.send(AnkiPopupCheckResponse {
                     nav_epoch: req.nav_epoch,
                     lookup_epoch: req.lookup_epoch,
-                    target_nested_depth: req.target_nested_depth,
+                    target: req.target,
                     show_tags: req.show_tags,
                     term_statuses,
+                    term_kana_statuses,
                     kanji_statuses,
                 });
                 let _ = worker_anki_app.upgrade_in_event_loop(move |app| {
@@ -446,6 +519,44 @@ fn spawn_anki_worker(
 }
 
 fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
+    app.global::<PopupLayout>()
+        .on_compact_frequency_lines(|items, available_width| {
+            let available_width = available_width.max(1.0);
+            let mut lines = Vec::new();
+            let mut entries = Vec::new();
+            let mut line_width = 0.0f32;
+            for item in items.iter() {
+                let label = if item.omit_dict_name || item.dictionary.is_empty() {
+                    item.value.to_string()
+                } else {
+                    format!("{} {}", item.dictionary, item.value)
+                };
+                let width = label
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { 6.0 } else { 10.0 })
+                    .sum::<f32>()
+                    + 10.0;
+                let gap = if entries.is_empty() { 0.0 } else { 4.0 };
+                if !entries.is_empty() && line_width + gap + width > available_width {
+                    lines.push(CompactFrequencyLine {
+                        entries: Rc::new(VecModel::from(std::mem::take(&mut entries))).into(),
+                    });
+                    line_width = 0.0;
+                }
+                if !entries.is_empty() {
+                    line_width += 4.0;
+                }
+                entries.push(item);
+                line_width += width;
+            }
+            if !entries.is_empty() {
+                lines.push(CompactFrequencyLine {
+                    entries: Rc::new(VecModel::from(entries)).into(),
+                });
+            }
+            Rc::new(VecModel::from(lines)).into()
+        });
+
     let pb = app.global::<PopupBridge>();
     pb.on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
 
@@ -646,6 +757,88 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         Rc::new(VecModel::from(graphs)).into()
     });
 
+    let b_pitch_entries = bridge.clone();
+    pb.on_rich_pitch_entries(move |row_idx, _rev| {
+        let st = b_pitch_entries.state.borrow();
+        let entries = st
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.pitch_entries.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(entries)).into()
+    });
+
+    let b_pitch_pat = bridge.clone();
+    pb.on_pitch_pattern_text(move |depth, row_idx, pitch_idx, _rev| {
+        if pitch_idx < 0 {
+            return SharedString::default();
+        }
+        let st = b_pitch_pat.state.borrow();
+        let extras = if depth < 0 {
+            st.panel.row_extras.get(&row_idx)
+        } else if depth == 0 {
+            st.row_extras.get(&row_idx)
+        } else {
+            st.nested_level(depth)
+                .and_then(|lvl| lvl.row_extras.get(&row_idx))
+        };
+        extras
+            .and_then(|e| e.pitch_details.get(pitch_idx as usize))
+            .and_then(|d| d.pattern.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(SharedString::from)
+            .unwrap_or_default()
+    });
+
+    let b_compact_freq = bridge.clone();
+    pb.on_row_compact_frequencies(move |depth, row_idx, _rev| {
+        let Some(app) = b_compact_freq.app_weak.upgrade() else {
+            return Rc::new(VecModel::from(Vec::<CompactFrequencyItem>::new())).into();
+        };
+        let compact_enabled = app.global::<PopupBridge>().get_compact_freq_badges();
+        let raw_freqs: Vec<PopupFrequency> = if depth < 0 {
+            let st = b_compact_freq.state.borrow();
+            st.panel
+                .rows
+                .iter()
+                .find(|r| r.index == row_idx)
+                .map(|r| r.frequencies.iter().collect())
+                .unwrap_or_default()
+        } else if depth == 0 {
+            let full = app.get_dict_results();
+            let zero_idx = row_idx.saturating_sub(1) as usize;
+            full.row_data(zero_idx)
+                .filter(|r| r.index == row_idx)
+                .or_else(|| {
+                    (0..full.row_count())
+                        .filter_map(|i| full.row_data(i))
+                        .find(|r| r.index == row_idx)
+                })
+                .map(|r| r.frequencies.iter().collect())
+                .unwrap_or_default()
+        } else {
+            let st = b_compact_freq.state.borrow();
+            st.nested_level(depth)
+                .and_then(|lvl| lvl.rows.iter().find(|r| r.index == row_idx))
+                .map(|r| r.frequencies.iter().collect())
+                .unwrap_or_default()
+        };
+        let items: Vec<CompactFrequencyItem> = compact_frequency_badges_from_popup(&raw_freqs)
+            .into_iter()
+            .map(|badge| CompactFrequencyItem {
+                omit_dict_name: if compact_enabled {
+                    !badge.show_dictionary
+                } else {
+                    badge.dictionary.is_empty()
+                },
+                dictionary: badge.dictionary.into(),
+                value: badge.value.into(),
+            })
+            .collect();
+        Rc::new(VecModel::from(items)).into()
+    });
+
     pb.on_devoice_circle_image(|| with_shared_text_engine(|e| e.devoice_circle_image()));
 
     let b_kanji_detail = bridge.clone();
@@ -753,6 +946,17 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         Rc::new(VecModel::from(graphs)).into()
     });
 
+    let b_npitch_entries = bridge.clone();
+    pb.on_nested_rich_pitch_entries(move |depth, row_idx, _rev| {
+        let st = b_npitch_entries.state.borrow();
+        let entries = st
+            .nested_level(depth)
+            .and_then(|lvl| lvl.row_extras.get(&row_idx))
+            .map(|e| e.pitch_entries.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(entries)).into()
+    });
+
     let b_nkanji = bridge.clone();
     pb.on_nested_kanji_detail(move |depth, row_idx, _rev| {
         let st = b_nkanji.state.borrow();
@@ -770,6 +974,126 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
     let b_ncursor = bridge.clone();
     pb.on_nested_glossary_cursor_is_pointer(move |depth, row_idx, x, y| {
         let Some(doc) = b_ncursor.latest_cached_doc_at_depth(depth, row_idx) else {
+            return false;
+        };
+        doc.hit_zones.iter().any(|z| {
+            z.action.is_some() && x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h
+        })
+    });
+
+    // Panel-isolated rich query callbacks (DictionarySearchPanel, scan-depth == -1)
+    let b_phw_pitch = bridge.clone();
+    pb.on_panel_headword_pitch_color(move |row_idx, _rev| {
+        let st = b_phw_pitch.state.borrow();
+        let cat = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .and_then(|e| e.pitch_category);
+        rgba_to_slint_color(st.effective_popup_theme().resolve_headword_pitch_color(cat))
+    });
+
+    let b_pterm_pills = bridge.clone();
+    pb.on_panel_term_tag_pills(move |row_idx, _rev| {
+        let st = b_pterm_pills.state.borrow();
+        let pills = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.term_pills.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(pills)).into()
+    });
+
+    let b_pdef_pills = bridge.clone();
+    pb.on_panel_def_tag_pills(move |row_idx, _rev| {
+        let st = b_pdef_pills.state.borrow();
+        let pills = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.def_pills.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(pills)).into()
+    });
+
+    let b_pderiv = bridge.clone();
+    pb.on_panel_derivation_steps(move |row_idx, _rev| {
+        let st = b_pderiv.state.borrow();
+        let steps = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.derivation_steps.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(steps)).into()
+    });
+
+    let b_pderiv_sum = bridge.clone();
+    pb.on_panel_derivation_summary(move |row_idx, _rev| {
+        let st = b_pderiv_sum.state.borrow();
+        let Some(extras) = st.panel.row_extras.get(&row_idx) else {
+            return SharedString::default();
+        };
+        if extras.derivation_steps.is_empty() {
+            return SharedString::default();
+        }
+        let joined: Vec<String> = extras
+            .derivation_steps
+            .iter()
+            .map(|s| {
+                if s.description.is_empty() {
+                    s.label.to_string()
+                } else {
+                    format!("{} ({})", s.label, s.description)
+                }
+            })
+            .collect();
+        format!("« {}", joined.join(" ← ")).into()
+    });
+
+    let b_ppitches = bridge.clone();
+    pb.on_panel_rich_pitch_graphs(move |row_idx, _rev| {
+        let st = b_ppitches.state.borrow();
+        let graphs = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.pitch_graphs.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(graphs)).into()
+    });
+
+    let b_ppitch_entries = bridge.clone();
+    pb.on_panel_rich_pitch_entries(move |row_idx, _rev| {
+        let st = b_ppitch_entries.state.borrow();
+        let entries = st
+            .panel
+            .row_extras
+            .get(&row_idx)
+            .map(|e| e.pitch_entries.clone())
+            .unwrap_or_default();
+        Rc::new(VecModel::from(entries)).into()
+    });
+
+    let b_pkanji = bridge.clone();
+    pb.on_panel_kanji_detail(move |row_idx, _rev| {
+        let st = b_pkanji.state.borrow();
+        st.panel
+            .row_extras
+            .get(&row_idx)
+            .and_then(|e| e.kanji_detail.clone())
+            .unwrap_or_default()
+    });
+
+    let b_prender = bridge.clone();
+    pb.on_panel_render_glossary(move |row_idx, avail_w, selected, _rev, _sel_rev| {
+        b_prender.build_rich_glossary_render(-1, row_idx, avail_w, selected)
+    });
+
+    let b_pcursor = bridge.clone();
+    pb.on_panel_glossary_cursor_is_pointer(move |row_idx, x, y| {
+        let Some(doc) = b_pcursor.latest_cached_doc_at_depth(-1, row_idx) else {
             return false;
         };
         doc.hit_zones.iter().any(|z| {
@@ -839,6 +1163,26 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         b_kana_toggle.navigate_to_term_query(&app, reading.as_str(), Some(reading.as_str()));
     });
 
+    let b_rae = bridge.clone();
+    pb.on_toggle_reading_as_expression(move |row_zero_idx| {
+        if let Some(app) = b_rae.app_weak.upgrade() {
+            b_rae.toggle_reading_as_expression(&app, AnkiCheckTarget::Root, row_zero_idx);
+        }
+    });
+
+    let b_nrae = bridge.clone();
+    pb.on_nested_toggle_reading_as_expression(move |depth, row_zero_idx| {
+        if depth > 0 {
+            if let Some(app) = b_nrae.app_weak.upgrade() {
+                b_nrae.toggle_reading_as_expression(
+                    &app,
+                    AnkiCheckTarget::Nested(depth as usize),
+                    row_zero_idx,
+                );
+            }
+        }
+    });
+
     let b_act_link = bridge.clone();
     pb.on_activate_glossary_link(move |href| {
         let Some(app) = b_act_link.app_weak.upgrade() else {
@@ -862,7 +1206,11 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         };
         {
             let mut st = b_toggle_exp.state.borrow_mut();
-            if depth == 0 {
+            if depth < 0 {
+                if !st.panel.expanded_cards.remove(&row_idx) {
+                    st.panel.expanded_cards.insert(row_idx);
+                }
+            } else if depth == 0 {
                 if !st.root_expanded_cards.remove(&row_idx) {
                     st.root_expanded_cards.insert(row_idx);
                 }
@@ -874,7 +1222,9 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
             }
         }
         let pb = app.global::<PopupBridge>();
-        if depth == 0 {
+        if depth < 0 {
+            pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
+        } else if depth == 0 {
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         } else {
             pb.set_nested_locked(true);
@@ -1037,6 +1387,13 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         }
     });
 
+    let b_nadd_audio = bridge.clone();
+    pb.on_nested_add_to_anki_with_audio(move |row_zero_idx, source_idx| {
+        if let Some(app) = b_nadd_audio.app_weak.upgrade() {
+            b_nadd_audio.add_nested_anki_note_with_audio(&app, row_zero_idx, Some(source_idx));
+        }
+    });
+
     let b_nhover = bridge.clone();
     pb.on_nested_popup_hover_changed(move |hovered| {
         {
@@ -1116,6 +1473,36 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
 
     let b_pkey = bridge.clone();
     pb.on_popup_key_pressed(move |text, control, shift, alt, meta| {
+        let is_escape = text.as_str() == "\u{1b}"
+            || text.as_str() == "Escape"
+            || text
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == char::from(slint::platform::Key::Escape));
+        if is_escape {
+            if let Some(app) = b_pkey.app_weak.upgrade() {
+                let depth = app.global::<PopupBridge>().get_nested_depth();
+                let had_sel = {
+                    let st = b_pkey.state.borrow();
+                    if depth > 0 {
+                        st.nested_level(depth)
+                            .is_some_and(|lvl| !lvl.selections.is_empty())
+                    } else {
+                        !st.selections.is_empty() || !st.panel.selections.is_empty()
+                    }
+                };
+                if had_sel {
+                    if depth > 0 {
+                        b_pkey.clear_glossary_selections_at_depth(&app, depth);
+                    } else {
+                        b_pkey.clear_glossary_selections_at_depth(&app, 0);
+                        b_pkey.clear_glossary_selections_at_depth(&app, -1);
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
         if let Some((c, s, a, m)) =
             resolve_bare_modifier_event(text.as_str(), control, shift, alt, meta)
         {
@@ -1165,7 +1552,8 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         pb.set_panel_query(query.clone());
         let kana_only = pb.get_panel_kana_only();
         let (excluded, search_cfg) = {
-            let st = b_panel_search.state.borrow();
+            let mut st = b_panel_search.state.borrow_mut();
+            st.panel.last_panel_scan.clear();
             (
                 st.settings.excluded_glossaries.clone(),
                 st.settings.dict_search_config(),
@@ -1173,7 +1561,13 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         };
         let gen_id = b_panel_search.panel_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         if query.trim().is_empty() {
-            pb.set_panel_results(Rc::new(VecModel::from(Vec::<DictResult>::new())).into());
+            {
+                let mut st = b_panel_search.state.borrow_mut();
+                st.panel = PanelPopupState::default();
+            }
+            b_panel_search.cancel_panel_anki_check(&app);
+            b_panel_search.clear_glossary_selections_at_depth(&app, -1);
+            b_panel_search.sync_panel_popup_to_bridge(&app, true);
             pb.set_panel_searching(false);
             return;
         }
@@ -1182,6 +1576,7 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
             gen_id,
             query: query.to_string(),
             kana_only,
+            kanji_only: false,
             excluded,
             search_cfg,
         });
@@ -1208,6 +1603,122 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
             return;
         };
         b_panel_lookup.navigate_to_term_query(&app, word.as_str(), None);
+    });
+
+    let b_panel_scan = bridge.clone();
+    pb.on_panel_scan_query(move |query, char_idx, _x, _y| {
+        let Some(app) = b_panel_scan.app_weak.upgrade() else {
+            return;
+        };
+        b_panel_scan.ensure_fresh_db_and_config(&app, false);
+        let start = char_idx.max(0) as usize;
+        let suffix: String = query.chars().skip(start).collect();
+        let trimmed = suffix.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let pb = app.global::<PopupBridge>();
+        let kana_only = pb.get_panel_kana_only();
+        let (excluded, search_cfg) = {
+            let mut st = b_panel_scan.state.borrow_mut();
+            if st.panel.last_panel_scan == trimmed {
+                return;
+            }
+            st.panel.last_panel_scan = trimmed.clone();
+            (
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
+            )
+        };
+        let gen_id = b_panel_scan.panel_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        pb.set_panel_searching(true);
+        let _ = b_panel_scan.panel_tx.send(PanelSearchRequest {
+            gen_id,
+            query: trimmed,
+            kana_only,
+            kanji_only: false,
+            excluded,
+            search_cfg,
+        });
+        b_panel_scan.kick_no_event_loop_pump();
+    });
+
+    let b_panel_add = bridge.clone();
+    pb.on_panel_add_anki_note(move |row_zero_idx| {
+        if let Some(app) = b_panel_add.app_weak.upgrade() {
+            b_panel_add.add_panel_anki_note(&app, row_zero_idx, None);
+        }
+    });
+
+    let b_panel_add_audio = bridge.clone();
+    pb.on_panel_add_to_anki_with_audio(move |row_zero_idx, source_idx| {
+        if let Some(app) = b_panel_add_audio.app_weak.upgrade() {
+            b_panel_add_audio.add_panel_anki_note(&app, row_zero_idx, Some(source_idx));
+        }
+    });
+
+    let b_panel_sel = bridge.clone();
+    pb.on_panel_toggle_select_definition(move |zero_based_idx| {
+        if let Some(app) = b_panel_sel.app_weak.upgrade() {
+            b_panel_sel.toggle_panel_select_definition(&app, zero_based_idx);
+        }
+    });
+
+    let b_panel_coll = bridge.clone();
+    pb.on_panel_toggle_term_collapse(move |term_start_zero_idx| {
+        if let Some(app) = b_panel_coll.app_weak.upgrade() {
+            b_panel_coll.toggle_panel_term_collapse(&app, term_start_zero_idx);
+        }
+    });
+
+    let b_panel_rae = bridge.clone();
+    pb.on_panel_toggle_reading_as_expression(move |row_zero_idx| {
+        if let Some(app) = b_panel_rae.app_weak.upgrade() {
+            b_panel_rae.toggle_reading_as_expression(&app, AnkiCheckTarget::Panel, row_zero_idx);
+        }
+    });
+
+    let b_panel_kanji = bridge.clone();
+    pb.on_panel_lookup_kanji_char(move |headword, ch_str| {
+        let Some(app) = b_panel_kanji.app_weak.upgrade() else {
+            return;
+        };
+        b_panel_kanji.ensure_fresh_db_and_config(&app, false);
+        let target: String = if !ch_str.trim().is_empty() {
+            ch_str.trim().to_owned()
+        } else {
+            let mut chars = String::new();
+            for ch in headword.chars() {
+                if is_kanji_char(ch) && !chars.contains(ch) {
+                    chars.push(ch);
+                }
+            }
+            chars
+        };
+        if target.is_empty() {
+            return;
+        }
+        let pb = app.global::<PopupBridge>();
+        pb.set_panel_query(target.clone().into());
+        let (excluded, search_cfg) = {
+            let mut st = b_panel_kanji.state.borrow_mut();
+            st.panel.last_panel_scan.clear();
+            (
+                st.settings.excluded_glossaries.clone(),
+                st.settings.dict_search_config(),
+            )
+        };
+        let gen_id = b_panel_kanji.panel_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        pb.set_panel_searching(true);
+        let _ = b_panel_kanji.panel_tx.send(PanelSearchRequest {
+            gen_id,
+            query: target,
+            kana_only: false,
+            kanji_only: true,
+            excluded,
+            search_cfg,
+        });
+        b_panel_kanji.kick_no_event_loop_pump();
     });
 }
 
@@ -1610,8 +2121,12 @@ pub fn install_rich_ui_bridges(
     let settings = CachedConfigSettings::from_controller(config, config_dir);
     let middle_mouse_default = settings.middle_mouse_scan;
     let initial_max_recursion_depth = settings.max_recursion_depth;
+    let initial_sub_style = settings.subtitle_style.clone();
     let initial_sub_bg = settings.subtitle_style.bg_rgba;
     let initial_anki_show_tag = settings.anki_show_tag;
+    let initial_is_light = settings.is_light_theme;
+    let initial_compact_glossaries = settings.compact_glossaries;
+    let initial_compact_tags = settings.compact_tags;
     set_active_subtitle_render_style(settings.subtitle_style.clone());
 
     let dict_resource_dirs = collect_dictionary_resource_dirs(config_dir, dictionary_db_path);
@@ -1655,16 +2170,20 @@ pub fn install_rich_ui_bridges(
     let anki_res_rx = Arc::new(Mutex::new(raw_anki_res_rx));
     let anki_nav_epoch = Arc::new(AtomicU64::new(0));
     let nested_anki_nav_epoch = Arc::new(AtomicU64::new(0));
+    let panel_anki_nav_epoch = Arc::new(AtomicU64::new(0));
     let root_anki_in_flight = Arc::new(AtomicU64::new(0));
     let nested_anki_in_flight = Arc::new(AtomicU64::new(0));
+    let panel_anki_in_flight = Arc::new(AtomicU64::new(0));
     let external_lookup_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::new(Mutex::new(None));
     spawn_anki_worker(
         anki_rx,
         anki_res_tx,
         anki_nav_epoch.clone(),
         nested_anki_nav_epoch.clone(),
+        panel_anki_nav_epoch.clone(),
         root_anki_in_flight.clone(),
         nested_anki_in_flight.clone(),
+        panel_anki_in_flight.clone(),
         external_lookup_epoch.clone(),
         app.as_weak(),
     );
@@ -1694,12 +2213,18 @@ pub fn install_rich_ui_bridges(
     app.global::<PopupBridge>()
         .set_bridge_instance_id(instance_id);
 
-    let stylesheets = StylesheetCache::new(config_dir);
-    let initial_popup_theme = Arc::new(
-        stylesheets
-            .theme()
-            .with_interface_font_fallbacks(stylesheets.overrides(), &settings.popup_fonts),
-    );
+    let initial_css_theme = if initial_is_light {
+        CssTheme::Light
+    } else {
+        CssTheme::Dark
+    };
+    let stylesheets = StylesheetCache::new_with_theme(config_dir, initial_css_theme);
+    let mut initial_theme_val = stylesheets
+        .theme()
+        .with_interface_font_fallbacks(stylesheets.overrides(), &settings.popup_fonts);
+    initial_theme_val.compact_glossaries =
+        initial_theme_val.compact_glossaries || initial_compact_glossaries;
+    let initial_popup_theme = Arc::new(initial_theme_val);
     let cached_theme_fonts = settings.popup_fonts.clone();
 
     let bridge = Rc::new(RichUiBridge {
@@ -1717,16 +2242,25 @@ pub fn install_rich_ui_bridges(
             stylesheets,
             cached_theme: initial_popup_theme.clone(),
             cached_theme_fonts,
+            cached_theme_is_light: initial_is_light,
+            cached_compact_glossaries: initial_compact_glossaries,
+            cached_compact_tags: initial_compact_tags,
             last_fresh_check: Some(Instant::now()),
             rich_epoch: 1,
             row_extras: HashMap::new(),
             current_hits: Vec::new(),
             glossary_cache: GlossaryDocLruCache::new_root(),
             last_rendered_key: HashMap::new(),
-            selection: None,
+            selections: BTreeMap::new(),
+            active_drag_selection_key: None,
             root_scan_highlight: None,
             root_expanded_cards: HashSet::new(),
             root_row_anki_note_ids_i64: Vec::new(),
+            root_row_anki_addable: Vec::new(),
+            root_row_reading_as_expression: Vec::new(),
+            root_term_kanji_statuses: HashMap::new(),
+            root_term_kana_statuses: HashMap::new(),
+            root_manual_reading_as_expr: HashMap::new(),
             last_active_glossary_row_idx: 0,
             suppress_history_reset: false,
             back_stack: VecDeque::new(),
@@ -1738,6 +2272,8 @@ pub fn install_rich_ui_bridges(
             nested_scan_timer: slint::Timer::default(),
             nested_dismiss_timer: slint::Timer::default(),
             pending_nested_anki_adds: VecDeque::new(),
+            panel: PanelPopupState::default(),
+            pending_panel_anki_adds: VecDeque::new(),
             hovered_cluster: None,
             hovered_ass_target: None,
             pending_ass_scan: None,
@@ -1759,8 +2295,10 @@ pub fn install_rich_ui_bridges(
         anki_res_rx,
         anki_nav_epoch,
         nested_anki_nav_epoch,
+        panel_anki_nav_epoch,
         root_anki_in_flight,
         nested_anki_in_flight,
+        panel_anki_in_flight,
         external_lookup_epoch,
         nested_tx,
         nested_res_rx,
@@ -1775,8 +2313,12 @@ pub fn install_rich_ui_bridges(
 
     register_active_rich_bridge(bridge.clone());
 
+    app.set_is_light_theme(initial_is_light);
     let pb = app.global::<PopupBridge>();
     pb.set_rich_enabled(true);
+    pb.set_panel_rich_enabled(true);
+    pb.set_compact_glossaries(initial_compact_glossaries);
+    pb.set_compact_tags(initial_compact_tags);
     pb.set_anki_show_tags(initial_anki_show_tag);
     pb.set_nested_max_depth(initial_max_recursion_depth as i32);
     apply_popup_css_theme_to_bridge(app, &initial_popup_theme);
@@ -1790,6 +2332,7 @@ pub fn install_rich_ui_bridges(
         initial_sub_bg[1],
         initial_sub_bg[2],
     ));
+    sync_subtitle_overlay_style_to_bridge(app, &initial_sub_style);
     sb.set_middle_mouse_scan_enabled(middle_mouse_default);
     wire_subtitle_bridge(app, &bridge);
 }

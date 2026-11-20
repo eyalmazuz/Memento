@@ -13,8 +13,9 @@ use crate::ui::subtitle_layout::is_japanese_lookup_char;
 use crate::ui::{DictResult, MementoApp, PopupBridge, RichGlossaryRender};
 
 use super::state::{
-    build_selection_rects_for_cells, GlossaryDocCacheKey, GlossaryPreRenderBatch,
-    GlossaryPreRenderItem, GlossarySelectionState, GLOSSARY_PRERENDER_MAX_ROWS,
+    build_selection_rects_for_cells, row_term_def_key, row_term_def_key_model, GlossaryDocCacheKey,
+    GlossaryPreRenderBatch, GlossaryPreRenderItem, GlossarySelectionState,
+    GLOSSARY_PRERENDER_MAX_ROWS,
 };
 use super::RichUiBridge;
 
@@ -136,6 +137,8 @@ impl RichUiBridge {
                     details_sig,
                     rich_epoch,
                     scale_quarter,
+                    css_theme_light: theme.is_light_theme(),
+                    compact_glossaries: theme.compact_glossaries,
                 };
                 if st.glossary_cache.contains_key(&cache_key) {
                     i += 1;
@@ -246,7 +249,16 @@ impl RichUiBridge {
                 st.last_observed_col_width_px = Some((pw_rounded, use_two_cols, bucket_w));
             }
         }
-        let (hit, parsed_glossary, detail_states, epoch) = if depth == 0 {
+        let (hit, parsed_glossary, detail_states, epoch) = if depth < 0 {
+            let extras = st.panel.row_extras.get(&row_index)?;
+            let hit = extras.hit.as_ref()?.clone();
+            (
+                hit,
+                extras.parsed_glossary.clone(),
+                extras.detail_states.clone(),
+                st.panel.rich_epoch,
+            )
+        } else if depth == 0 {
             let extras = st.row_extras.get(&row_index)?;
             let hit = extras.hit.as_ref()?.clone();
             (
@@ -269,6 +281,7 @@ impl RichUiBridge {
         if hit.is_kanji {
             return None;
         }
+        let theme = st.effective_popup_theme();
         let details_sig = format_details_sig(&detail_states);
         let cache_key = GlossaryDocCacheKey {
             row_index,
@@ -277,8 +290,15 @@ impl RichUiBridge {
             details_sig,
             rich_epoch: epoch,
             scale_quarter,
+            css_theme_light: theme.is_light_theme(),
+            compact_glossaries: theme.compact_glossaries,
         };
-        if depth == 0 {
+        if depth < 0 {
+            if let Some(doc) = st.panel.glossary_cache.get(&cache_key) {
+                st.panel.last_rendered_key.insert(row_index, cache_key);
+                return Some(doc);
+            }
+        } else if depth == 0 {
             if let Some(doc) = st.glossary_cache.get(&cache_key) {
                 st.last_rendered_key.insert(row_index, cache_key);
                 return Some(doc);
@@ -290,7 +310,6 @@ impl RichUiBridge {
             }
         }
         let res_dirs = st.dict_resource_dirs.clone();
-        let theme = st.effective_popup_theme();
         let legacy_style = st.settings.glossary_style;
         let sheet = st
             .stylesheets
@@ -310,7 +329,12 @@ impl RichUiBridge {
             &theme,
             render_scale,
         )?;
-        if depth == 0 {
+        if depth < 0 {
+            st.panel
+                .last_rendered_key
+                .insert(row_index, cache_key.clone());
+            st.panel.glossary_cache.insert(cache_key, doc.clone());
+        } else if depth == 0 {
             st.last_rendered_key.insert(row_index, cache_key.clone());
             st.glossary_cache.insert(cache_key, doc.clone());
         } else if let Some(lvl) = st.nested_level_mut(depth) {
@@ -326,7 +350,13 @@ impl RichUiBridge {
         row_index: i32,
     ) -> Option<RenderedGlossaryDoc> {
         let st = self.state.borrow();
-        let (epoch, last_key, cache) = if depth == 0 {
+        let (epoch, last_key, cache) = if depth < 0 {
+            (
+                st.panel.rich_epoch,
+                &st.panel.last_rendered_key,
+                &st.panel.glossary_cache,
+            )
+        } else if depth == 0 {
             (st.rich_epoch, &st.last_rendered_key, &st.glossary_cache)
         } else {
             let lvl = st.nested_level(depth)?;
@@ -355,15 +385,38 @@ impl RichUiBridge {
         };
         let (sel_rects, scan_rects, collapsible, collapsed_h, total_lines, expanded) = {
             let st = self.state.borrow();
-            let (sel_opt, scan_opt, expanded, dict_name) = if depth == 0 {
+            let (sel_opt, scan_opt, expanded, dict_name) = if depth < 0 {
+                let dname = st
+                    .panel
+                    .row_extras
+                    .get(&row_index)
+                    .and_then(|e| e.hit.as_ref())
+                    .map(|h| h.dict_name.as_str())
+                    .unwrap_or("");
+                let sel = st
+                    .panel
+                    .selections
+                    .values()
+                    .find(|s| s.row_index == row_index && s.anchor_char != s.focus_char);
+                (
+                    sel,
+                    None,
+                    st.panel.expanded_cards.contains(&row_index),
+                    dname,
+                )
+            } else if depth == 0 {
                 let dname = st
                     .row_extras
                     .get(&row_index)
                     .and_then(|e| e.hit.as_ref())
                     .map(|h| h.dict_name.as_str())
                     .unwrap_or("");
+                let sel = st
+                    .selections
+                    .values()
+                    .find(|s| s.row_index == row_index && s.anchor_char != s.focus_char);
                 (
-                    st.selection.as_ref(),
+                    sel,
                     st.root_scan_highlight.as_ref(),
                     st.root_expanded_cards.contains(&row_index),
                     dname,
@@ -375,8 +428,12 @@ impl RichUiBridge {
                     .and_then(|e| e.hit.as_ref())
                     .map(|h| h.dict_name.as_str())
                     .unwrap_or("");
+                let sel = lvl
+                    .selections
+                    .values()
+                    .find(|s| s.row_index == row_index && s.anchor_char != s.focus_char);
                 (
-                    lvl.selection.as_ref(),
+                    sel,
                     lvl.scan_highlight.as_ref(),
                     lvl.expanded_cards.contains(&row_index),
                     dname,
@@ -472,43 +529,85 @@ impl RichUiBridge {
     }
 
     pub(super) fn update_glossary_selection_text_at_depth(&self, app: &MementoApp, depth: i32) {
-        let sel_opt = {
+        let ordered_selections: Vec<GlossarySelectionState> = {
             let st = self.state.borrow();
-            if depth == 0 {
-                st.selection.clone()
+            if depth < 0 {
+                st.panel.selections.values().cloned().collect()
+            } else if depth == 0 {
+                st.selections.values().cloned().collect()
             } else {
-                st.nested_level(depth).and_then(|lvl| lvl.selection.clone())
+                st.nested_level(depth)
+                    .map(|lvl| lvl.selections.values().cloned().collect())
+                    .unwrap_or_default()
             }
         };
-        let text = match sel_opt {
-            Some(sel) if sel.anchor_char != sel.focus_char => {
-                if let Some(doc) = self.latest_cached_doc_at_depth(depth, sel.row_index) {
-                    let lo = sel
-                        .anchor_char
-                        .min(sel.focus_char)
-                        .min(doc.selectable_chars.len());
-                    let hi = sel
-                        .anchor_char
-                        .max(sel.focus_char)
-                        .min(doc.selectable_chars.len());
-                    doc.selectable_chars[lo..hi]
-                        .iter()
-                        .map(|c| c.ch)
-                        .collect::<String>()
-                        .trim_matches(|c: char| {
-                            matches!(c, '\u{2060}'..='\u{206a}' | '\u{fdd0}'..='\u{fdef}' | '\u{fffc}')
-                        })
-                        .trim()
-                        .to_owned()
-                } else {
-                    String::new()
-                }
+        let mut texts = Vec::new();
+        for sel in ordered_selections {
+            if sel.anchor_char == sel.focus_char {
+                continue;
             }
-            _ => String::new(),
-        };
+            let Some(doc) = self.latest_cached_doc_at_depth(depth, sel.row_index) else {
+                continue;
+            };
+            let lo = sel
+                .anchor_char
+                .min(sel.focus_char)
+                .min(doc.selectable_chars.len());
+            let hi = sel
+                .anchor_char
+                .max(sel.focus_char)
+                .min(doc.selectable_chars.len());
+            let trimmed = doc.selectable_chars[lo..hi]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_matches(|c: char| {
+                    matches!(c, '\u{2060}'..='\u{206a}' | '\u{fdd0}'..='\u{fdef}' | '\u{fffc}')
+                })
+                .trim()
+                .to_owned();
+            if !trimmed.is_empty() {
+                texts.push(trimmed);
+            }
+        }
+        crate::app::anki_actions::set_active_glossary_selections(
+            self.instance_id,
+            depth,
+            texts.clone(),
+        );
         let pb = app.global::<PopupBridge>();
-        pb.set_selected_glossary_text(text.into());
+        pb.set_selected_glossary_text(texts.join("\n").into());
         pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
+    }
+
+    pub(super) fn clear_glossary_selections_at_depth(&self, app: &MementoApp, depth: i32) {
+        let had_any = {
+            let mut st = self.state.borrow_mut();
+            if depth < 0 {
+                let had = !st.panel.selections.is_empty();
+                st.panel.selections.clear();
+                st.panel.active_drag_selection_key = None;
+                had
+            } else if depth == 0 {
+                let had = !st.selections.is_empty();
+                st.selections.clear();
+                st.active_drag_selection_key = None;
+                had
+            } else if let Some(lvl) = st.nested_level_mut(depth) {
+                let had = !lvl.selections.is_empty();
+                lvl.selections.clear();
+                lvl.active_drag_selection_key = None;
+                had
+            } else {
+                false
+            }
+        };
+        crate::app::anki_actions::clear_active_glossary_selections(self.instance_id, Some(depth));
+        let pb = app.global::<PopupBridge>();
+        if had_any || !pb.get_selected_glossary_text().is_empty() {
+            pb.set_selected_glossary_text("".into());
+            pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
+        }
     }
 
     pub(super) fn toggle_glossary_details_at_depth(
@@ -520,7 +619,14 @@ impl RichUiBridge {
     ) {
         {
             let mut st = self.state.borrow_mut();
-            if depth == 0 {
+            if depth < 0 {
+                if let Some(extras) = st.panel.row_extras.get_mut(&row_idx) {
+                    let current = extras.detail_states.get(detail_id).copied().unwrap_or(false);
+                    extras.detail_states.insert(detail_id.to_owned(), !current);
+                }
+                st.panel.glossary_cache.retain(|k| k.row_index != row_idx);
+                st.panel.last_rendered_key.remove(&row_idx);
+            } else if depth == 0 {
                 if let Some(extras) = st.row_extras.get_mut(&row_idx) {
                     let current = extras.detail_states.get(detail_id).copied().unwrap_or(false);
                     extras.detail_states.insert(detail_id.to_owned(), !current);
@@ -538,7 +644,9 @@ impl RichUiBridge {
         }
         let pb = app.global::<PopupBridge>();
         pb.set_tooltip_visible(false);
-        if depth == 0 {
+        if depth < 0 {
+            pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
+        } else if depth == 0 {
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
         } else {
             pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
@@ -556,20 +664,35 @@ impl RichUiBridge {
             return Some(r);
         }
         let st = self.state.borrow();
-        let (extras_map, preferred_rows): (_, [Option<i32>; 2]) = if depth == 0 {
+        let (extras_map, preferred_rows): (_, [Option<i32>; 2]) = if depth < 0 {
+            let active_row = st
+                .panel
+                .active_drag_selection_key
+                .and_then(|k| st.panel.selections.get(&k))
+                .or_else(|| st.panel.selections.values().next_back())
+                .map(|s| s.row_index);
+            (&st.panel.row_extras, [active_row, None])
+        } else if depth == 0 {
+            let active_row = st
+                .active_drag_selection_key
+                .and_then(|k| st.selections.get(&k))
+                .or_else(|| st.selections.values().next_back())
+                .map(|s| s.row_index);
             (
                 &st.row_extras,
                 [
                     (st.last_active_glossary_row_idx > 0).then_some(st.last_active_glossary_row_idx),
-                    st.selection.as_ref().map(|s| s.row_index),
+                    active_row,
                 ],
             )
         } else {
             let lvl = st.nested_level(depth)?;
-            (
-                &lvl.row_extras,
-                [lvl.selection.as_ref().map(|s| s.row_index), None],
-            )
+            let active_row = lvl
+                .active_drag_selection_key
+                .and_then(|k| lvl.selections.get(&k))
+                .or_else(|| lvl.selections.values().next_back())
+                .map(|s| s.row_index);
+            (&lvl.row_extras, [active_row, None])
         };
 
         for candidate in preferred_rows.into_iter().flatten() {
@@ -647,7 +770,11 @@ impl RichUiBridge {
             {
                 let q_owned = q.into_owned();
                 if !q_owned.is_empty() {
-                    if depth == 0 {
+                    if depth < 0 {
+                        let pb = app.global::<PopupBridge>();
+                        pb.set_panel_query(q_owned.clone().into());
+                        pb.invoke_panel_search_requested(q_owned.into());
+                    } else if depth == 0 {
                         self.navigate_to_term_query(app, &q_owned, None);
                     } else {
                         self.navigate_nested_query(app, depth, &q_owned);
@@ -711,6 +838,8 @@ impl RichUiBridge {
             return;
         };
         if let Some(ci) = RichUiBridge::char_index_at_point(&doc, x, y) {
+            let root_key = (depth == 0)
+                .then(|| row_term_def_key_model(&app.get_dict_results(), row_idx));
             let sel = GlossarySelectionState {
                 row_index: row_idx,
                 anchor_char: ci,
@@ -720,10 +849,18 @@ impl RichUiBridge {
             };
             {
                 let mut st = self.state.borrow_mut();
-                if depth == 0 {
-                    st.selection = Some(sel);
+                if depth < 0 {
+                    let key = row_term_def_key(&st.panel.rows, row_idx);
+                    st.panel.selections.insert(key, sel);
+                    st.panel.active_drag_selection_key = Some(key);
+                } else if depth == 0 {
+                    let key = root_key.unwrap_or((row_idx.max(0) as usize, 0));
+                    st.selections.insert(key, sel);
+                    st.active_drag_selection_key = Some(key);
                 } else if let Some(lvl) = st.nested_level_mut(depth) {
-                    lvl.selection = Some(sel);
+                    let key = row_term_def_key(&lvl.rows, row_idx);
+                    lvl.selections.insert(key, sel);
+                    lvl.active_drag_selection_key = Some(key);
                 }
             }
             self.update_glossary_selection_text_at_depth(app, depth);
@@ -745,14 +882,20 @@ impl RichUiBridge {
         {
             let mut st = self.state.borrow_mut();
             st.nested_scan_timer.stop();
-            let sel_slot = if depth == 0 {
-                &mut st.selection
+            let sel_opt = if depth < 0 {
+                st.panel
+                    .active_drag_selection_key
+                    .and_then(|k| st.panel.selections.get_mut(&k))
+            } else if depth == 0 {
+                st.active_drag_selection_key
+                    .and_then(|k| st.selections.get_mut(&k))
             } else if let Some(lvl) = st.nested_level_mut(depth) {
-                &mut lvl.selection
+                lvl.active_drag_selection_key
+                    .and_then(|k| lvl.selections.get_mut(&k))
             } else {
-                return;
+                None
             };
-            if let Some(ref mut sel) = sel_slot {
+            if let Some(sel) = sel_opt {
                 if sel.row_index == row_idx {
                     let dist = (x - sel.press_pos.0).hypot(y - sel.press_pos.1);
                     if dist >= 3.0 {
@@ -789,23 +932,42 @@ impl RichUiBridge {
         x: f32,
         y: f32,
     ) {
-        let was_dragging = {
-            let mut st = self.state.borrow_mut();
-            let sel_slot = if depth == 0 {
-                &mut st.selection
+        let (was_dragging, removed_empty) = {
+            let mut st_guard = self.state.borrow_mut();
+            let st = &mut *st_guard;
+            let (selections, active_key) = if depth < 0 {
+                (
+                    &mut st.panel.selections,
+                    &mut st.panel.active_drag_selection_key,
+                )
+            } else if depth == 0 {
+                (&mut st.selections, &mut st.active_drag_selection_key)
             } else if let Some(lvl) = st.nested_level_mut(depth) {
-                &mut lvl.selection
+                (&mut lvl.selections, &mut lvl.active_drag_selection_key)
             } else {
                 return;
             };
-            let dragged = sel_slot
-                .as_ref()
-                .is_some_and(|s| s.dragging && s.anchor_char != s.focus_char);
-            if let Some(ref mut s) = sel_slot {
-                s.dragging = false;
+            let key = active_key.take();
+            if let Some(k) = key {
+                let dragged = selections
+                    .get(&k)
+                    .is_some_and(|s| s.dragging && s.anchor_char != s.focus_char);
+                let mut removed = false;
+                if let Some(s) = selections.get_mut(&k) {
+                    s.dragging = false;
+                    if s.anchor_char == s.focus_char {
+                        selections.remove(&k);
+                        removed = true;
+                    }
+                }
+                (dragged, removed)
+            } else {
+                (false, false)
             }
-            dragged
         };
+        if removed_empty {
+            self.update_glossary_selection_text_at_depth(app, depth);
+        }
         if was_dragging {
             return;
         }
@@ -856,6 +1018,8 @@ impl RichUiBridge {
         while hi < doc.selectable_chars.len() && is_word(doc.selectable_chars[hi].ch) {
             hi += 1;
         }
+        let root_key =
+            (depth == 0).then(|| row_term_def_key_model(&app.get_dict_results(), row_idx));
         let sel = GlossarySelectionState {
             row_index: row_idx,
             anchor_char: lo,
@@ -865,10 +1029,18 @@ impl RichUiBridge {
         };
         {
             let mut st = self.state.borrow_mut();
-            if depth == 0 {
-                st.selection = Some(sel);
+            if depth < 0 {
+                let key = row_term_def_key(&st.panel.rows, row_idx);
+                st.panel.selections.insert(key, sel);
+                st.panel.active_drag_selection_key = None;
+            } else if depth == 0 {
+                let key = root_key.unwrap_or((row_idx.max(0) as usize, 0));
+                st.selections.insert(key, sel);
+                st.active_drag_selection_key = None;
             } else if let Some(lvl) = st.nested_level_mut(depth) {
-                lvl.selection = Some(sel);
+                let key = row_term_def_key(&lvl.rows, row_idx);
+                lvl.selections.insert(key, sel);
+                lvl.active_drag_selection_key = None;
             }
         }
         self.update_glossary_selection_text_at_depth(app, depth);

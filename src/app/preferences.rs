@@ -2,13 +2,16 @@
 //! debounced subtitle scale/offset persistence, and preference refresh hooks.
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use memento_setting::enums::ThemeMode;
 use slint::{ComponentHandle, VecModel};
 
 use crate::controller::asr::AsrController;
@@ -23,10 +26,20 @@ use crate::settings_ui::{
 };
 use crate::ui::{self, MementoApp, PopupBridge, SubEntry, SubtitleOverlayBridge};
 use memento_config::{ArgbColor, QtFontSpec, Value};
+use memento_os::SystemColorScheme;
 use memento_player::MpvInstance;
 use memento_setting::keys as raw;
 
 const MAX_RECENT_TITLES: usize = 64;
+const DEFAULT_SUB_LIST_FONT_SIZE: f32 = if cfg!(target_os = "macos") {
+    20.0
+} else {
+    16.0
+};
+
+static AUDIO_CONFIG_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static LAST_AUDIO_CONFIG_HASH: AtomicU64 = AtomicU64::new(0);
+static AUDIO_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Sentinel value (`NaN` bit pattern) indicating the furigana ratio cache has not been populated yet.
 const FURIGANA_RATIO_UNSET: u32 = u32::MAX;
@@ -177,6 +190,11 @@ pub(crate) fn setting_enabled(
     match config.effective_setting(group, key) {
         Some(Value::Bool(value)) => value,
         Some(Value::Int(value)) => value != 0,
+        Some(Value::Text(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => default,
+        },
         _ => default,
     }
 }
@@ -206,23 +224,215 @@ fn setting_color(
     slint::Color::from_argb_u8(parsed.a, parsed.r, parsed.g, parsed.b)
 }
 
+/// Extended font attributes parsed from Qt `QFont::toString()` CSV strings
+/// (`family,pointSizeF,pixelSize,styleHint,weight,style,underline,strikeOut,fixedPitch,rawMode[,...]`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ParsedFontAttributes {
+    pub(crate) family: String,
+    pub(crate) size: f32,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikeout: bool,
+    pub(crate) letter_spacing: f32,
+}
+
+pub(crate) fn parse_font_attributes(
+    raw_font: &str,
+    default_family: &str,
+    default_size: f32,
+    min_size: f32,
+    max_size: f32,
+) -> ParsedFontAttributes {
+    let trimmed = raw_font.trim();
+    if let Ok(spec) = QtFontSpec::parse(trimmed) {
+        let parts: Vec<&str> = trimmed.split(',').collect();
+        let parse_flag = |idx: usize| -> bool {
+            parts.get(idx).is_some_and(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true")
+            })
+        };
+        let underline = parse_flag(6);
+        let strikeout = parse_flag(7);
+        let mut letter_spacing = 0.0f32;
+        for part in parts.iter().skip(10) {
+            let token = part.trim();
+            if let Some(val) = token
+                .strip_prefix("letterSpacing=")
+                .or_else(|| token.strip_prefix("letter-spacing="))
+            {
+                if let Ok(parsed) = val.trim().parse::<f32>() {
+                    if parsed.is_finite() {
+                        letter_spacing = parsed.clamp(-8.0, 32.0);
+                    }
+                }
+            }
+        }
+        if letter_spacing == 0.0 {
+            if let Some(raw_ls) = parts.get(16).map(|s| s.trim()) {
+                if let Ok(parsed) = raw_ls.parse::<f32>() {
+                    if parsed.is_finite() && parsed.abs() <= 32.0 {
+                        letter_spacing = parsed;
+                    }
+                }
+            }
+        }
+        ParsedFontAttributes {
+            family: spec.family,
+            size: (spec.point_size as f32).clamp(min_size, max_size),
+            bold: spec.bold,
+            italic: spec.italic,
+            underline,
+            strikeout,
+            letter_spacing,
+        }
+    } else {
+        ParsedFontAttributes {
+            family: default_family.to_owned(),
+            size: default_size,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikeout: false,
+            letter_spacing: 0.0,
+        }
+    }
+}
+
 fn setting_font_spec(
     config: &ConfigController,
     group: &str,
     key: &str,
     default_family: &str,
     default_size: f32,
-) -> (String, f32, bool, bool) {
+) -> ParsedFontAttributes {
     let raw_font = setting_text(config, group, key, "");
-    match QtFontSpec::parse(&raw_font) {
-        Ok(spec) => (
-            spec.family,
-            (spec.point_size as f32).clamp(8.0, 72.0),
-            spec.bold,
-            spec.italic,
-        ),
-        Err(_) => (default_family.to_owned(), default_size, false, false),
+    parse_font_attributes(&raw_font, default_family, default_size, 8.0, 72.0)
+}
+
+/// Resolves whether the application UI should use the light theme given a configured
+/// theme mode string (`"light"`, `"dark"`, `"system"`) and detected OS color scheme.
+pub(crate) fn resolve_theme_mode_is_light(mode: ThemeMode, system: SystemColorScheme) -> bool {
+    match mode {
+        ThemeMode::Light => true,
+        ThemeMode::Dark => false,
+        ThemeMode::System => system == SystemColorScheme::Light,
     }
+}
+
+/// Resolves the active light/dark theme boolean from `ConfigController` (`interface/theme`).
+pub(crate) fn resolve_is_light_theme(config: &ConfigController) -> bool {
+    let mode = config.theme_mode();
+    let system = match mode {
+        ThemeMode::System => memento_os::detect_system_color_scheme(),
+        ThemeMode::Light => SystemColorScheme::Light,
+        ThemeMode::Dark => SystemColorScheme::Dark,
+    };
+    resolve_theme_mode_is_light(mode, system)
+}
+
+/// Builds a `dic_id -> priority` map from `ConfigController`'s `dictionary/order` setting.
+pub(crate) fn dictionary_order_map(config: &ConfigController) -> HashMap<i64, i64> {
+    let mut map = HashMap::new();
+    if let Some(Value::Ints(order)) =
+        config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER)
+    {
+        map.reserve(order.len());
+        for (priority, dic_id) in order.into_iter().enumerate() {
+            map.entry(dic_id).or_insert(priority as i64);
+        }
+    }
+    map
+}
+
+/// Computes a deterministic hash covering `audio/sources` and `audio/download-timeout-ms`
+/// so audio playback caches and popup source menus invalidate cleanly whenever settings change.
+pub(crate) fn compute_audio_config_hash(config: &ConfigController) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    config.audio_download_timeout_ms().hash(&mut hasher);
+    let sources = config.audio_source_entries();
+    sources.len().hash(&mut hasher);
+    for src in &sources {
+        src.name.hash(&mut hasher);
+        src.url.hash(&mut hasher);
+        src.kind.hash(&mut hasher);
+        src.md5.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Returns the monotonically increasing audio configuration generation counter.
+pub(crate) fn audio_config_generation() -> u64 {
+    AUDIO_CONFIG_GENERATION.load(Ordering::Acquire)
+}
+
+/// Synchronizes `audio/download-timeout-ms` and `audio/sources` changes from `ConfigController`,
+/// updating the active download timeout and invalidating audio worker & popup caches on change.
+pub(crate) fn sync_audio_preferences(config: &ConfigController) -> bool {
+    let timeout_ms = config.audio_download_timeout_ms();
+    let hash = compute_audio_config_hash(config);
+    crate::controller::audio::set_download_timeout_ms(timeout_ms);
+    let was_initialized = AUDIO_CONFIG_INITIALIZED.swap(true, Ordering::AcqRel);
+    let prev_hash = LAST_AUDIO_CONFIG_HASH.swap(hash, Ordering::AcqRel);
+    if was_initialized && prev_hash != hash {
+        AUDIO_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+        crate::app::anki_actions::invalidate_audio_caches_for_config_change(timeout_ms);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn sync_subtitle_overlay_style_from_config(
+    app: &MementoApp,
+    config: &ConfigController,
+) {
+    let sub_font = setting_font_spec(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::FONT,
+        "Noto Sans CJK JP",
+        24.0,
+    );
+    let text_color = setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::TEXT_COLOR,
+        raw::interface::subtitle::TEXT_COLOR_DEFAULT,
+    );
+    let stroke_color = setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::STROKE_COLOR,
+        raw::interface::subtitle::STROKE_COLOR_DEFAULT,
+    );
+    let bg_color = setting_color(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::BACKGROUND_COLOR,
+        raw::interface::subtitle::BACKGROUND_COLOR_DEFAULT,
+    );
+    let raw_stroke = setting_number(
+        config,
+        raw::interface::GROUP,
+        raw::interface::subtitle::STROKE,
+        raw::interface::subtitle::STROKE_DEFAULT,
+    );
+    let stroke_width = if raw_stroke <= 0.0 {
+        0.0
+    } else {
+        (raw_stroke * 0.1).clamp(0.5, 4.0)
+    };
+    let sb = app.global::<SubtitleOverlayBridge>();
+    sb.set_sub_font_family(sub_font.family.into());
+    sb.set_sub_font_bold(sub_font.bold);
+    sb.set_sub_font_italic(sub_font.italic);
+    sb.set_sub_text_color(text_color);
+    sb.set_sub_stroke_color(stroke_color);
+    sb.set_sub_stroke_width(stroke_width);
+    sb.set_sub_bg_color(bg_color);
+    sb.set_subtitle_bg_color(bg_color);
 }
 
 pub(crate) fn exact_matcher_enabled(config: &ConfigController) -> bool {
@@ -278,6 +488,7 @@ pub(crate) fn apply_dictionary_order(config: &ConfigController, dictionary: &mut
     dictionary.set_mecab_enabled(mecab_matcher_enabled(config));
     let (remove_regex, replace_lines, replace_with) = search_text_filters(config);
     dictionary.set_search_text_filters(&remove_regex, replace_lines, &replace_with);
+    dictionary.set_text_replacements(config.text_replacement_options());
     if let Some(Value::Ints(order)) =
         config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER)
     {
@@ -286,6 +497,19 @@ pub(crate) fn apply_dictionary_order(config: &ConfigController, dictionary: &mut
 }
 
 pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
+    let is_light_theme = resolve_is_light_theme(config);
+    app.set_is_light_theme(is_light_theme);
+    app.set_compact_glossaries(config.compact_glossaries());
+    app.set_compact_tags(config.compact_tags());
+    app.set_osc_enabled(setting_enabled(
+        config,
+        raw::behavior::GROUP,
+        "osc-enabled",
+        true,
+    ));
+    sync_subtitle_overlay_style_from_config(app, config);
+    let _ = sync_audio_preferences(config);
+
     app.set_hide_mpv_subtitles(setting_enabled(
         config,
         raw::search::GROUP,
@@ -455,28 +679,28 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
         raw::interface::subtitle_list::SELECTED_HOVER_COLOR,
         raw::interface::subtitle_list::SELECTED_HOVER_COLOR_DEFAULT,
     ));
-    let (p_fam, p_size, p_bold, p_italic) = setting_font_spec(
+    let primary_font = setting_font_spec(
         config,
         raw::interface::GROUP,
         raw::interface::subtitle_list::PRIMARY_FONT,
         "Noto Sans CJK JP",
-        16.0,
+        DEFAULT_SUB_LIST_FONT_SIZE,
     );
-    app.set_sub_list_primary_font_family(p_fam.into());
-    app.set_sub_list_primary_font_size(p_size);
-    app.set_sub_list_primary_font_bold(p_bold);
-    app.set_sub_list_primary_font_italic(p_italic);
-    let (s_fam, s_size, s_bold, s_italic) = setting_font_spec(
+    app.set_sub_list_primary_font_family(primary_font.family.into());
+    app.set_sub_list_primary_font_size(primary_font.size);
+    app.set_sub_list_primary_font_bold(primary_font.bold);
+    app.set_sub_list_primary_font_italic(primary_font.italic);
+    let secondary_font = setting_font_spec(
         config,
         raw::interface::GROUP,
         raw::interface::subtitle_list::SECONDARY_FONT,
         "Sans Serif",
-        16.0,
+        DEFAULT_SUB_LIST_FONT_SIZE,
     );
-    app.set_sub_list_secondary_font_family(s_fam.into());
-    app.set_sub_list_secondary_font_size(s_size);
-    app.set_sub_list_secondary_font_bold(s_bold);
-    app.set_sub_list_secondary_font_italic(s_italic);
+    app.set_sub_list_secondary_font_family(secondary_font.family.into());
+    app.set_sub_list_secondary_font_size(secondary_font.size);
+    app.set_sub_list_secondary_font_bold(secondary_font.bold);
+    app.set_sub_list_secondary_font_italic(secondary_font.italic);
     app.set_popup_configured_width(
         setting_number(
             config,
@@ -485,7 +709,7 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
             raw::interface::POPUP_WIDTH_DEFAULT as f64,
         )
         .round()
-        .clamp(240.0, 960.0),
+        .clamp(160.0, 4096.0),
     );
     app.set_popup_configured_height(
         setting_number(
@@ -495,7 +719,7 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
             raw::interface::POPUP_HEIGHT_DEFAULT as f64,
         )
         .round()
-        .clamp(180.0, 720.0),
+        .clamp(160.0, 4096.0),
     );
     app.set_subtitle_scale(setting_number(
         config,
@@ -1180,7 +1404,9 @@ mod tests {
                 .unwrap();
         });
         app.show().unwrap();
-        let pos = slint::LogicalPosition::new(1240.0, 54.0);
+        // Drawer right edge = 1280; right pad = 10, Close button = 28, spacing = 6,
+        // Time pill = 58px -> x in [1178, 1236], menu bar 30 + top pad 10 + 14 = y 54.
+        let pos = slint::LogicalPosition::new(1207.0, 54.0);
         app.window().dispatch_event(WindowEvent::PointerPressed {
             position: pos,
             button: PointerEventButton::Left,
@@ -1260,5 +1486,143 @@ mod tests {
 
         assert_eq!(estimate_drawer_row_height("短い字幕", 260.0, 13.0), 24.0);
         assert!(estimate_drawer_row_height("line1\nline2", 260.0, 13.0) > 36.0);
+    }
+
+    #[test]
+    fn theme_compact_osc_subtitle_style_and_relaxed_popup_clamps_sync() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let cfg = ConfigController::new();
+
+        assert!(resolve_theme_mode_is_light(
+            ThemeMode::Light,
+            SystemColorScheme::Dark
+        ));
+        assert!(!resolve_theme_mode_is_light(
+            ThemeMode::Dark,
+            SystemColorScheme::Light
+        ));
+        assert!(resolve_theme_mode_is_light(
+            ThemeMode::System,
+            SystemColorScheme::Light
+        ));
+        assert!(!resolve_theme_mode_is_light(
+            ThemeMode::System,
+            SystemColorScheme::Dark
+        ));
+
+        cfg.edit_setting("interface/theme", "light").unwrap();
+        cfg.edit_setting("interface/compact-glossaries", "true")
+            .unwrap();
+        cfg.edit_setting("interface/compact-tags", "true").unwrap();
+        cfg.edit_setting("interface/sub-popup-width", "1800")
+            .unwrap();
+        cfg.edit_setting("interface/sub-popup-height", "1200")
+            .unwrap();
+        cfg.edit_setting("interface/sub-font", "Noto Serif JP,24,-1,5,75,1,0,0,0,0")
+            .unwrap();
+        cfg.edit_setting("interface/sub-text-color", "#FFEECCAA")
+            .unwrap();
+        cfg.edit_setting("interface/sub-stroke-color", "#FF112233")
+            .unwrap();
+        cfg.edit_setting("interface/sub-bg-color", "#80001122")
+            .unwrap();
+        cfg.edit_setting("interface/sub-stroke", "25.0").unwrap();
+
+        refresh_player_preferences(&app, &cfg);
+
+        assert!(app.get_is_light_theme());
+        assert!(app.get_osc_enabled());
+        let pb = app.global::<PopupBridge>();
+        assert!(pb.get_compact_glossaries());
+        assert!(pb.get_compact_tags());
+        assert_eq!(app.get_popup_configured_width(), 1800.0);
+        assert_eq!(app.get_popup_configured_height(), 1200.0);
+
+        let sub = app.global::<SubtitleOverlayBridge>();
+        assert_eq!(sub.get_sub_font_family().as_str(), "Noto Serif JP");
+        assert!(sub.get_sub_font_bold());
+        assert!(sub.get_sub_font_italic());
+        assert_eq!(
+            sub.get_sub_text_color(),
+            slint::Color::from_argb_u8(0xFF, 0xEE, 0xCC, 0xAA)
+        );
+        assert_eq!(
+            sub.get_sub_stroke_color(),
+            slint::Color::from_argb_u8(0xFF, 0x11, 0x22, 0x33)
+        );
+        assert_eq!(
+            sub.get_sub_bg_color(),
+            slint::Color::from_argb_u8(0x80, 0x00, 0x11, 0x22)
+        );
+        assert!((sub.get_sub_stroke_width() - 2.5).abs() < 1e-4);
+
+        // Relaxed clamps allow 160..=4096 (clamping out-of-bounds values cleanly).
+        cfg.edit_setting("interface/sub-popup-width", "100")
+            .unwrap();
+        cfg.edit_setting("interface/sub-popup-height", "9000")
+            .unwrap();
+        cfg.edit_setting("interface/theme", "dark").unwrap();
+        refresh_player_preferences(&app, &cfg);
+        assert!(!app.get_is_light_theme());
+        assert_eq!(app.get_popup_configured_width(), 160.0);
+        assert_eq!(app.get_popup_configured_height(), 4096.0);
+    }
+
+    #[test]
+    fn apply_dictionary_order_propagates_text_replacements_and_font_attrs_parse() {
+        let cfg = ConfigController::new();
+        let mut dict = DictController::new();
+        let hit = SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
+        dict.add_entries([hit]);
+
+        cfg.edit_setting(
+            "search/text-replacements",
+            r#"[{"pattern":"喰","replacement":"食","ignore_case":false,"enabled":true}]"#,
+        )
+        .unwrap();
+        cfg.edit_setting("search/text-replacements-search-original", "true")
+            .unwrap();
+        apply_dictionary_order(&cfg, &mut dict);
+
+        let hits = dict.search("喰べる");
+        assert_eq!(
+            hits.first().map(|h| h.expression.as_str()),
+            Some("食べる")
+        );
+
+        let attrs = parse_font_attributes(
+            "Noto Sans,16,-1,5,75,1,1,1,0,0,letterSpacing=1.5",
+            "Sans Serif",
+            16.0,
+            8.0,
+            200.0,
+        );
+        assert!(attrs.underline);
+        assert!(attrs.strikeout);
+        assert!((attrs.letter_spacing - 1.5).abs() < 1e-4);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(DEFAULT_SUB_LIST_FONT_SIZE, 20.0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(DEFAULT_SUB_LIST_FONT_SIZE, 16.0);
+    }
+
+    #[test]
+    fn sync_audio_preferences_tracks_timeout_and_source_changes() {
+        let cfg = ConfigController::new();
+        sync_audio_preferences(&cfg);
+        let gen0 = audio_config_generation();
+
+        cfg.edit_setting("audio/download-timeout-ms", "8500")
+            .unwrap();
+        sync_audio_preferences(&cfg);
+        let gen1 = audio_config_generation();
+        assert!(gen1 > gen0);
+        assert_eq!(crate::controller::audio::download_timeout_ms(), 8_500);
+
+        // Unchanged config does not re-invalidate.
+        sync_audio_preferences(&cfg);
+        assert_eq!(audio_config_generation(), gen1);
     }
 }

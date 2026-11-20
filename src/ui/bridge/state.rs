@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -7,9 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use memento_definition::{Color as DefColor, LegacyGlossaryStyle};
+use memento_dict::searchcontroller::TextReplacementOptions;
 use memento_setting::keys as raw;
-use slint::{Model as _, SharedString, VecModel};
+use slint::{ComponentHandle as _, Model as _, SharedString, VecModel};
 
+use crate::app::preferences::{parse_font_attributes, resolve_is_light_theme, ParsedFontAttributes};
+use crate::controller::anki::EntryAnkiStatus;
 use crate::controller::config::ConfigController;
 use crate::controller::dict::{DictController, SearchHit, TermFrequency, TermPitchDetail};
 pub(super) use crate::ui::glossary_render::{
@@ -20,15 +23,15 @@ pub(super) use crate::ui::popup_css::apply_popup_css_theme_to_bridge;
 use crate::ui::popup_css::{
     InterfaceFontFallback, PopupCssTheme, PopupInterfaceFonts, StylesheetCache,
 };
-use crate::ui::popup_model::rich_pitch_graphs_from_details;
+use crate::ui::popup_model::{resolve_pitch_mora_levels, rich_pitch_graphs_from_details};
 use crate::ui::rich_db::RichDbHelper;
 use crate::ui::tags::{
-    extract_inline_structured_tags_from_value, suppress_redundant_tags_with_inline, tag_brush,
+    extract_inline_structured_tags_from_value, suppress_redundant_tags_for_sense, tag_brush,
 };
 use crate::ui::text_engine::SubtitleRenderStyle;
 use crate::ui::{
-    DictResult, MementoApp, PopupFrequency, RichDerivationStep, RichKanjiDetail, RichPitchGraph,
-    RichTagPill, SubtitleLine, SubtitleWord,
+    DictResult, MementoApp, PopupFrequency, RichDerivationStep, RichKanjiDetail, RichPitchEntry,
+    RichPitchGraph, RichPitchMora, RichTagPill, SubtitleLine, SubtitleOverlayBridge, SubtitleWord,
 };
 
 pub(super) const ROOT_GLOSSARY_CACHE_MAX_ENTRIES: usize = 384;
@@ -69,6 +72,8 @@ pub(super) struct RichRowExtras {
     pub(super) def_pills: Vec<RichTagPill>,
     pub(super) derivation_steps: Vec<RichDerivationStep>,
     pub(super) pitch_graphs: Vec<RichPitchGraph>,
+    pub(super) pitch_details: Vec<TermPitchDetail>,
+    pub(super) pitch_entries: Vec<RichPitchEntry>,
     pub(super) pitch_category: Option<&'static str>,
     pub(super) kanji_detail: Option<RichKanjiDetail>,
     pub(super) detail_states: HashMap<String, bool>,
@@ -116,12 +121,23 @@ pub(super) struct PendingNestedAnkiAdd {
     pub(super) expression: String,
     pub(super) reading: String,
     pub(super) is_kanji: bool,
+    pub(super) reading_as_expression: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingPanelAnkiAdd {
+    pub(super) row_index: usize,
+    pub(super) expression: String,
+    pub(super) reading: String,
+    pub(super) is_kanji: bool,
+    pub(super) reading_as_expression: bool,
 }
 
 #[derive(Default)]
 pub(super) struct NestedPopupLevel {
     pub(super) label: String,
     pub(super) rows: Vec<DictResult>,
+    pub(super) hits: Vec<SearchHit>,
     pub(super) headword: String,
     pub(super) reading: String,
     pub(super) anchor_x: f32,
@@ -133,19 +149,50 @@ pub(super) struct NestedPopupLevel {
     pub(super) row_extras: HashMap<i32, RichRowExtras>,
     pub(super) glossary_cache: GlossaryDocLruCache,
     pub(super) last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
-    pub(super) selection: Option<GlossarySelectionState>,
+    pub(super) selections: BTreeMap<(usize, usize), GlossarySelectionState>,
+    pub(super) active_drag_selection_key: Option<(usize, usize)>,
     pub(super) scan_highlight: Option<GlossaryScanHighlight>,
     pub(super) expanded_cards: HashSet<i32>,
     pub(super) row_anki_duplicates: Vec<bool>,
     pub(super) row_anki_note_ids_i64: Vec<i64>,
     pub(super) row_anki_browse_queries: Vec<SharedString>,
     pub(super) row_anki_tags: Vec<SharedString>,
+    pub(super) row_anki_addable: Vec<bool>,
+    pub(super) row_reading_as_expression: Vec<bool>,
+    pub(super) term_kanji_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) term_kana_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) manual_reading_as_expr: HashMap<(String, String), bool>,
+}
+
+/// Independent rich popup state backing `DictionarySearchPanel` (`scan-depth == -1`).
+#[derive(Default)]
+pub(super) struct PanelPopupState {
+    pub(super) rows: Vec<DictResult>,
+    pub(super) hits: Vec<SearchHit>,
+    pub(super) rich_epoch: u64,
+    pub(super) row_extras: HashMap<i32, RichRowExtras>,
+    pub(super) glossary_cache: GlossaryDocLruCache,
+    pub(super) last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
+    pub(super) selections: BTreeMap<(usize, usize), GlossarySelectionState>,
+    pub(super) active_drag_selection_key: Option<(usize, usize)>,
+    pub(super) expanded_cards: HashSet<i32>,
+    pub(super) row_anki_duplicates: Vec<bool>,
+    pub(super) row_anki_note_ids_i64: Vec<i64>,
+    pub(super) row_anki_browse_queries: Vec<SharedString>,
+    pub(super) row_anki_tags: Vec<SharedString>,
+    pub(super) row_anki_addable: Vec<bool>,
+    pub(super) row_reading_as_expression: Vec<bool>,
+    pub(super) term_kanji_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) term_kana_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) manual_reading_as_expr: HashMap<(String, String), bool>,
+    pub(super) last_panel_scan: String,
 }
 
 pub(super) struct PanelSearchRequest {
     pub(super) gen_id: u64,
     pub(super) query: String,
     pub(super) kana_only: bool,
+    pub(super) kanji_only: bool,
     pub(super) excluded: Vec<String>,
     pub(super) search_cfg: DictSearchConfig,
 }
@@ -154,12 +201,27 @@ pub(super) struct PanelSearchResponse {
     pub(super) gen_id: u64,
     pub(super) hits: Vec<SearchHit>,
     pub(super) excluded: Vec<String>,
+    pub(super) term_meta_rows: Vec<(
+        String,
+        String,
+        Vec<crate::controller::dict::TermPitchGraph>,
+        Vec<TermFrequency>,
+    )>,
+    pub(super) term_pitch_details: HashMap<(String, String), Vec<TermPitchDetail>>,
+    pub(super) kanji_frequencies: HashMap<String, Vec<TermFrequency>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AnkiCheckTarget {
+    Root,
+    Nested(usize),
+    Panel,
 }
 
 pub(super) struct AnkiPopupCheckRequest {
     pub(super) nav_epoch: u64,
     pub(super) lookup_epoch: Option<u64>,
-    pub(super) target_nested_depth: Option<usize>,
+    pub(super) target: AnkiCheckTarget,
     pub(super) show_tags: bool,
     pub(super) term_profile: Option<crate::controller::config::AnkiNoteConfig>,
     pub(super) kanji_profile: Option<crate::controller::config::AnkiNoteConfig>,
@@ -170,10 +232,11 @@ pub(super) struct AnkiPopupCheckRequest {
 pub(super) struct AnkiPopupCheckResponse {
     pub(super) nav_epoch: u64,
     pub(super) lookup_epoch: Option<u64>,
-    pub(super) target_nested_depth: Option<usize>,
+    pub(super) target: AnkiCheckTarget,
     pub(super) show_tags: bool,
-    pub(super) term_statuses: HashMap<(String, String), crate::controller::anki::EntryAnkiStatus>,
-    pub(super) kanji_statuses: HashMap<String, crate::controller::anki::EntryAnkiStatus>,
+    pub(super) term_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) term_kana_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) kanji_statuses: HashMap<String, EntryAnkiStatus>,
 }
 
 pub(super) struct NestedScanRequest {
@@ -484,6 +547,7 @@ pub(super) struct DictSearchConfig {
     pub(super) remove_regex: String,
     pub(super) replace_lines: bool,
     pub(super) replace_with: String,
+    pub(super) text_replacements: TextReplacementOptions,
 }
 
 impl DictSearchConfig {
@@ -493,12 +557,18 @@ impl DictSearchConfig {
         dict.set_deconj_enabled(self.deconj_enabled);
         dict.set_mecab_enabled(self.mecab_enabled);
         dict.set_search_text_filters(&self.remove_regex, self.replace_lines, &self.replace_with);
+        dict.set_text_replacements(self.text_replacements.clone());
     }
 }
 
 pub(super) struct CachedConfigSettings {
     pub(super) subtitle_style: SubtitleRenderStyle,
+    pub(super) subtitle_font_attrs: ParsedFontAttributes,
     pub(super) popup_fonts: PopupInterfaceFonts,
+    pub(super) popup_font_attrs: HashMap<&'static str, ParsedFontAttributes>,
+    pub(super) is_light_theme: bool,
+    pub(super) compact_glossaries: bool,
+    pub(super) compact_tags: bool,
     pub(super) search_method: i32,
     pub(super) search_modifier: i32,
     pub(super) search_delay_ms: u64,
@@ -510,6 +580,7 @@ pub(super) struct CachedConfigSettings {
     pub(super) remove_regex: String,
     pub(super) replace_lines: bool,
     pub(super) replace_with: String,
+    pub(super) text_replacements: TextReplacementOptions,
     pub(super) glossary_style: LegacyGlossaryStyle,
     pub(super) dict_order: Vec<i64>,
     pub(super) excluded_glossaries: Vec<String>,
@@ -525,7 +596,12 @@ impl CachedConfigSettings {
     pub(super) fn from_controller(config: &ConfigController, config_dir: &Path) -> Self {
         let mut out = Self {
             subtitle_style: SubtitleRenderStyle::default(),
+            subtitle_font_attrs: ParsedFontAttributes::default(),
             popup_fonts: PopupInterfaceFonts::default(),
+            popup_font_attrs: HashMap::new(),
+            is_light_theme: false,
+            compact_glossaries: raw::interface::COMPACT_GLOSSARIES_DEFAULT,
+            compact_tags: raw::interface::COMPACT_TAGS_DEFAULT,
             search_method: raw::search::METHOD_DEFAULT as i32,
             search_modifier: raw::search::MODIFIER_DEFAULT as i32,
             search_delay_ms: raw::search::DELAY_DEFAULT as u64,
@@ -537,6 +613,7 @@ impl CachedConfigSettings {
             remove_regex: raw::search::REMOVE_REGEX_DEFAULT.to_owned(),
             replace_lines: raw::search::REPLACE_NEWLINES_DEFAULT,
             replace_with: raw::search::REPLACE_NEWLINES_WITH_DEFAULT.to_owned(),
+            text_replacements: TextReplacementOptions::default(),
             glossary_style: LegacyGlossaryStyle::Bullet,
             dict_order: Vec::new(),
             excluded_glossaries: Vec::new(),
@@ -564,11 +641,24 @@ impl CachedConfigSettings {
             remove_regex: self.remove_regex.clone(),
             replace_lines: self.replace_lines,
             replace_with: self.replace_with.clone(),
+            text_replacements: self.text_replacements.clone(),
         }
     }
 
     pub(super) fn apply_controller(&mut self, config: &ConfigController) {
         use memento_config::Value;
+        self.is_light_theme = resolve_is_light_theme(config);
+        self.compact_glossaries = match config
+            .effective_setting(raw::interface::GROUP, raw::interface::COMPACT_GLOSSARIES)
+        {
+            Some(Value::Bool(b)) => b,
+            _ => raw::interface::COMPACT_GLOSSARIES_DEFAULT,
+        };
+        self.compact_tags =
+            match config.effective_setting(raw::interface::GROUP, raw::interface::COMPACT_TAGS) {
+                Some(Value::Bool(b)) => b,
+                _ => raw::interface::COMPACT_TAGS_DEFAULT,
+            };
         if let Some(Value::Text(font_csv)) =
             config.effective_setting(raw::interface::GROUP, raw::interface::subtitle::FONT)
         {
@@ -584,6 +674,8 @@ impl CachedConfigSettings {
             if let Some(i_str) = parts.get(5).map(|s| s.trim()) {
                 self.subtitle_style.italic = i_str == "1" || i_str.eq_ignore_ascii_case("true");
             }
+            self.subtitle_font_attrs =
+                parse_font_attributes(&font_csv, "Noto Sans CJK JP", 24.0, 8.0, 200.0);
         }
         if let Some(Value::Text(c)) =
             config.effective_setting(raw::interface::GROUP, raw::interface::subtitle::TEXT_COLOR)
@@ -639,6 +731,24 @@ impl CachedConfigSettings {
             }
         }
         let stock_config = ConfigController::new();
+        self.popup_font_attrs.clear();
+        for key in [
+            raw::interface::SEARCH_EXPRESSION_FONT,
+            raw::interface::SEARCH_READING_FONT,
+            raw::interface::SEARCH_CONJ_FONT,
+            raw::interface::SEARCH_TAG_FONT,
+            raw::interface::SEARCH_GLOSSARY_FONT,
+            raw::interface::SEARCH_KANJI_FONT,
+        ] {
+            if let Some(Value::Text(raw_csv)) = config.effective_setting(raw::interface::GROUP, key)
+            {
+                let attrs =
+                    parse_font_attributes(&raw_csv, "Noto Sans CJK JP", 14.0, 8.0, 200.0);
+                if attrs.underline || attrs.strikeout || attrs.letter_spacing.abs() > f32::EPSILON {
+                    self.popup_font_attrs.insert(key, attrs);
+                }
+            }
+        }
         self.popup_fonts = PopupInterfaceFonts {
             expression: parse_interface_font_setting(
                 config,
@@ -680,7 +790,7 @@ impl CachedConfigSettings {
                 &stock_config,
                 raw::interface::SEARCH_KANJI_FONT,
                 16.0,
-                96.0,
+                200.0,
             ),
         };
         if let Some(Value::Int(m)) =
@@ -750,6 +860,7 @@ impl CachedConfigSettings {
             Some(Value::Text(s)) => s,
             _ => raw::search::REPLACE_NEWLINES_WITH_DEFAULT.to_owned(),
         };
+        self.text_replacements = config.text_replacement_options();
         if let Some(Value::Int(gs)) =
             config.effective_setting(raw::search::GROUP, raw::search::GLOSSARY_STYLE)
         {
@@ -801,6 +912,8 @@ pub(super) struct GlossaryDocCacheKey {
     pub(super) details_sig: String,
     pub(super) rich_epoch: u64,
     pub(super) scale_quarter: u16,
+    pub(super) css_theme_light: bool,
+    pub(super) compact_glossaries: bool,
 }
 
 struct GlossaryCacheEntry {
@@ -1058,6 +1171,9 @@ pub(super) struct RichUiMutable {
     pub(super) stylesheets: StylesheetCache,
     pub(super) cached_theme: Arc<PopupCssTheme>,
     pub(super) cached_theme_fonts: PopupInterfaceFonts,
+    pub(super) cached_theme_is_light: bool,
+    pub(super) cached_compact_glossaries: bool,
+    pub(super) cached_compact_tags: bool,
     pub(super) last_fresh_check: Option<Instant>,
 
     pub(super) rich_epoch: u64,
@@ -1065,10 +1181,16 @@ pub(super) struct RichUiMutable {
     pub(super) current_hits: Vec<SearchHit>,
     pub(super) glossary_cache: GlossaryDocLruCache,
     pub(super) last_rendered_key: HashMap<i32, GlossaryDocCacheKey>,
-    pub(super) selection: Option<GlossarySelectionState>,
+    pub(super) selections: BTreeMap<(usize, usize), GlossarySelectionState>,
+    pub(super) active_drag_selection_key: Option<(usize, usize)>,
     pub(super) root_scan_highlight: Option<GlossaryScanHighlight>,
     pub(super) root_expanded_cards: HashSet<i32>,
     pub(super) root_row_anki_note_ids_i64: Vec<i64>,
+    pub(super) root_row_anki_addable: Vec<bool>,
+    pub(super) root_row_reading_as_expression: Vec<bool>,
+    pub(super) root_term_kanji_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) root_term_kana_statuses: HashMap<(String, String), EntryAnkiStatus>,
+    pub(super) root_manual_reading_as_expr: HashMap<(String, String), bool>,
     pub(super) last_active_glossary_row_idx: i32,
 
     pub(super) suppress_history_reset: bool,
@@ -1082,6 +1204,9 @@ pub(super) struct RichUiMutable {
     pub(super) nested_scan_timer: slint::Timer,
     pub(super) nested_dismiss_timer: slint::Timer,
     pub(super) pending_nested_anki_adds: VecDeque<PendingNestedAnkiAdd>,
+
+    pub(super) panel: PanelPopupState,
+    pub(super) pending_panel_anki_adds: VecDeque<PendingPanelAnkiAdd>,
 
     pub(super) hovered_cluster: Option<HoveredSubtitleCluster>,
     pub(super) hovered_ass_target: Option<crate::controller::ass::AssHoveredTarget>,
@@ -1106,18 +1231,27 @@ impl RichUiMutable {
         Arc::clone(&self.cached_theme)
     }
 
-    /// Rebuild `cached_theme` when user CSS or interface font fallbacks changed.
-    /// Returns `true` if the effective `PopupCssTheme` changed.
+    /// Rebuild `cached_theme` when user CSS, active light/dark theme, compact glossaries,
+    /// or interface font fallbacks changed. Returns `true` if the effective `PopupCssTheme` changed.
     pub(super) fn refresh_cached_theme(&mut self, css_changed: bool) -> bool {
-        if !css_changed && self.settings.popup_fonts == self.cached_theme_fonts {
+        let theme_mode_changed = self.stylesheets.set_light_theme(self.settings.is_light_theme);
+        if !css_changed
+            && !theme_mode_changed
+            && self.settings.popup_fonts == self.cached_theme_fonts
+            && self.settings.is_light_theme == self.cached_theme_is_light
+            && self.settings.compact_glossaries == self.cached_compact_glossaries
+        {
             return false;
         }
-        let next = self.stylesheets.theme().with_interface_font_fallbacks(
+        let mut next = self.stylesheets.theme().with_interface_font_fallbacks(
             self.stylesheets.overrides(),
             &self.settings.popup_fonts,
         );
+        next.compact_glossaries = next.compact_glossaries || self.settings.compact_glossaries;
         self.cached_theme_fonts = self.settings.popup_fonts.clone();
-        let changed = css_changed || *self.cached_theme != next;
+        self.cached_theme_is_light = self.settings.is_light_theme;
+        self.cached_compact_glossaries = self.settings.compact_glossaries;
+        let changed = css_changed || theme_mode_changed || *self.cached_theme != next;
         self.cached_theme = Arc::new(next);
         changed
     }
@@ -1153,7 +1287,87 @@ impl RichUiMutable {
             lvl.glossary_cache.clear();
             lvl.last_rendered_key.clear();
         }
+        self.panel.rich_epoch = self.panel.rich_epoch.wrapping_add(1);
+        self.panel.glossary_cache.clear();
+        self.panel.last_rendered_key.clear();
     }
+}
+
+pub(super) fn sync_subtitle_overlay_style_to_bridge(
+    app: &MementoApp,
+    style: &SubtitleRenderStyle,
+) {
+    let sub = app.global::<SubtitleOverlayBridge>();
+    sub.set_sub_font_family(style.font_family.clone().into());
+    sub.set_sub_font_bold(style.bold);
+    sub.set_sub_font_italic(style.italic);
+    sub.set_sub_text_color(slint::Color::from_argb_u8(
+        style.text_rgba[3],
+        style.text_rgba[0],
+        style.text_rgba[1],
+        style.text_rgba[2],
+    ));
+    sub.set_sub_stroke_color(slint::Color::from_argb_u8(
+        style.stroke_rgba[3],
+        style.stroke_rgba[0],
+        style.stroke_rgba[1],
+        style.stroke_rgba[2],
+    ));
+    sub.set_sub_bg_color(slint::Color::from_argb_u8(
+        style.bg_rgba[3],
+        style.bg_rgba[0],
+        style.bg_rgba[1],
+        style.bg_rgba[2],
+    ));
+    let stroke_width = if style.stroke_size <= 0.0 {
+        0.0
+    } else {
+        (style.stroke_size * 0.1).clamp(0.5, 4.0)
+    };
+    sub.set_sub_stroke_width(stroke_width);
+}
+
+/// Maps a 1-based `DictResult.index` (`row_index`) to a deterministic `(term_idx, def_idx)`
+/// key in visual reading order so multi-definition persistent `{selection}` stays cleanly
+/// ordered across definitions and terms (#262 / H5.1).
+pub(super) fn row_term_def_key(rows: &[DictResult], row_index: i32) -> (usize, usize) {
+    let mut term_idx = 0usize;
+    let mut def_idx = 0usize;
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 && row.term_start {
+            term_idx += 1;
+            def_idx = 0;
+        } else if idx > 0 {
+            def_idx += 1;
+        }
+        if row.index == row_index {
+            return (term_idx, def_idx);
+        }
+    }
+    (row_index.max(0) as usize, 0)
+}
+
+pub(super) fn row_term_def_key_model(
+    rows: &slint::ModelRc<DictResult>,
+    row_index: i32,
+) -> (usize, usize) {
+    let mut term_idx = 0usize;
+    let mut def_idx = 0usize;
+    for idx in 0..rows.row_count() {
+        let Some(row) = rows.row_data(idx) else {
+            continue;
+        };
+        if idx > 0 && row.term_start {
+            term_idx += 1;
+            def_idx = 0;
+        } else if idx > 0 {
+            def_idx += 1;
+        }
+        if row.index == row_index {
+            return (term_idx, def_idx);
+        }
+    }
+    (row_index.max(0) as usize, 0)
 }
 
 /// RAII guard for `RichUiMutable::suppress_history_reset` so early returns or panics
@@ -1240,15 +1454,70 @@ pub(super) fn parse_interface_font_setting(
     })
 }
 
+/// Converts detailed pitch entries (with 1-based `nasal`/`devoice` mora indices and optional
+/// exact string `H`/`L` patterns like `"LHH"`, `"HLL"`) into Slint `RichPitchEntry` rows.
+pub(super) fn build_rich_pitch_entries_from_details(
+    details: &[TermPitchDetail],
+    hide_repeated_dict: bool,
+) -> Vec<RichPitchEntry> {
+    details
+        .iter()
+        .enumerate()
+        .map(|(entry_idx, detail)| {
+            let len = detail.mora.len();
+            let (mora_highs, particle_high) =
+                resolve_pitch_mora_levels(len, detail.position, detail.pattern.as_deref());
+            let mora: Vec<RichPitchMora> = detail
+                .mora
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let high = mora_highs[index];
+                    let next_high = if index + 1 < len {
+                        mora_highs[index + 1]
+                    } else {
+                        particle_high
+                    };
+                    let one_based = index + 1;
+                    RichPitchMora {
+                        text: text.clone().into(),
+                        high,
+                        rises_after: index + 1 < len && !high && next_high,
+                        falls_after: high && !next_high,
+                        nasal: detail.nasal.contains(&one_based),
+                        devoice: detail.devoice.contains(&one_based),
+                    }
+                })
+                .collect();
+            let hide_dict_name = hide_repeated_dict
+                && entry_idx > 0
+                && !detail.dictionary.is_empty()
+                && details[entry_idx - 1].dictionary == detail.dictionary;
+            let pattern_text = detail
+                .pattern
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .into();
+            RichPitchEntry {
+                dictionary: detail.dictionary.clone().into(),
+                position: detail.position,
+                pattern_text,
+                hide_dict_name,
+                mora: Rc::new(VecModel::from(mora)).into(),
+                tags: detail.tags.join(", ").into(),
+            }
+        })
+        .collect()
+}
+
 pub(super) fn classify_pitch_category(
     pitches: &[RichPitchGraph],
+    details: &[TermPitchDetail],
     group_tags: &str,
 ) -> Option<&'static str> {
     let first = pitches.first()?;
-    let pos = first.position;
-    if pos == 0 {
-        return Some("heiban");
-    }
     let is_kifuku_pos = group_tags.split_whitespace().any(|t| {
         t == "adj-i"
             || t == "v1"
@@ -1260,6 +1529,33 @@ pub(super) fn classify_pitch_category(
             || t.starts_with("v2")
             || t.starts_with("v4")
     });
+    if let Some(detail) = details.first() {
+        if let Some(pat) = detail.pattern.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let len = detail.mora.len().max(1);
+            let (mora_highs, particle_high) =
+                resolve_pitch_mora_levels(len, detail.position, Some(pat));
+            let drop_after = (0..mora_highs.len()).find(|&idx| {
+                let cur = mora_highs[idx];
+                let next = if idx + 1 < mora_highs.len() {
+                    mora_highs[idx + 1]
+                } else {
+                    particle_high
+                };
+                cur && !next
+            });
+            return match drop_after {
+                None => Some("heiban"),
+                Some(_) if is_kifuku_pos => Some("kifuku"),
+                Some(0) => Some("atamadaka"),
+                Some(idx) if idx + 1 >= mora_highs.len() && mora_highs.len() > 1 => Some("odaka"),
+                Some(_) => Some("nakadaka"),
+            };
+        }
+    }
+    let pos = first.position;
+    if pos == 0 {
+        return Some("heiban");
+    }
     if is_kifuku_pos {
         return Some("kifuku");
     }
@@ -1278,6 +1574,7 @@ pub(super) fn classify_pitch_category(
 /// Build per-row rich metadata (`RichRowExtras`) and deferred kanji frequency updates for a
 /// grouped result set. Returns `(extras_map, kanji_freq_updates)` without touching Slint models,
 /// so callers can drop `RefCell` borrows before updating Slint UI state.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_row_extras_for_grouped(
     db_helper: &mut RichDbHelper,
     dict_ctrl: &mut DictController,
@@ -1285,6 +1582,7 @@ pub(super) fn build_row_extras_for_grouped(
     grouped_hits: &[SearchHit],
     precomputed_pitch_details: Option<&HashMap<(String, String), Vec<TermPitchDetail>>>,
     precomputed_kanji_freqs: Option<&HashMap<String, Vec<TermFrequency>>>,
+    compact_tags: bool,
 ) -> (HashMap<i32, RichRowExtras>, Vec<(usize, Vec<TermFrequency>)>) {
     let mut extras_map = HashMap::new();
     let mut kanji_freq_updates = Vec::new();
@@ -1314,6 +1612,7 @@ pub(super) fn build_row_extras_for_grouped(
             Vec::new()
         };
         let rich_pitches = rich_pitch_graphs_from_details(&pitch_details);
+        let rich_pitch_entries = build_rich_pitch_entries_from_details(&pitch_details, true);
         let mut group_pos_tags = String::new();
         for hit in &grouped_hits[group_start..group_end] {
             if !hit.def_tags.is_empty() {
@@ -1325,7 +1624,8 @@ pub(super) fn build_row_extras_for_grouped(
                 group_pos_tags.push_str(&hit.term_tags);
             }
         }
-        let group_pitch_category = classify_pitch_category(&rich_pitches, &group_pos_tags);
+        let group_pitch_category =
+            classify_pitch_category(&rich_pitches, &pitch_details, &group_pos_tags);
         let kanji_freqs: Vec<TermFrequency> = if first_hit.is_kanji {
             if let Some(pre_kf) = precomputed_kanji_freqs {
                 pre_kf
@@ -1339,6 +1639,7 @@ pub(super) fn build_row_extras_for_grouped(
             Vec::new()
         };
 
+        let mut seen_sense_tags: HashSet<String> = HashSet::new();
         for idx in group_start..group_end {
             let hit = &grouped_hits[idx];
             let parsed_glossary = (!hit.is_kanji && !hit.raw_glossary.trim().is_empty())
@@ -1349,8 +1650,13 @@ pub(super) fn build_row_extras_for_grouped(
                 .map(extract_inline_structured_tags_from_value)
                 .unwrap_or_default();
             let raw_def_tags = db_helper.resolve_tag_list(hit.dictionary_id, &hit.def_tags);
-            let (dedup_term, dedup_def) =
-                suppress_redundant_tags_with_inline(&raw_term_tags, &raw_def_tags, &inline_tags);
+            let (dedup_term, dedup_def) = suppress_redundant_tags_for_sense(
+                &raw_term_tags,
+                &raw_def_tags,
+                &inline_tags,
+                &mut seen_sense_tags,
+                compact_tags,
+            );
 
             let term_pills = if idx == group_start {
                 dedup_term
@@ -1410,6 +1716,16 @@ pub(super) fn build_row_extras_for_grouped(
                     derivation_steps,
                     pitch_graphs: if idx == group_start {
                         rich_pitches.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    pitch_details: if idx == group_start {
+                        pitch_details.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    pitch_entries: if idx == group_start {
+                        rich_pitch_entries.clone()
                     } else {
                         Vec::new()
                     },

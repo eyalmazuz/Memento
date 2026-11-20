@@ -1,22 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 use slint::{ComponentHandle, SharedString, VecModel};
 
+use crate::app::anki_actions::{
+    clear_active_glossary_selections, clear_active_row_hit_meta, set_active_row_hit_meta,
+    ActiveRowHitMeta, AnkiAddTarget, ScopedAnkiAddOverride,
+};
 use crate::ui::glossary_render::{extract_glossary_scan_substring, strict_char_index_at_point};
 use crate::ui::popup_model::{
-    active_rich_bridge_for_app, build_dictionary_result_rows_grouped, is_kanji_char,
+    active_rich_bridge_for_app, build_dictionary_result_rows_grouped_with_options, is_kanji_char,
     popup_pitch_graphs,
 };
 use crate::ui::{DictResult, MementoApp, PopupBridge, PopupFrequency};
 
 use super::state::{
     apply_kanji_freq_updates_to_rows, build_row_extras_for_grouped, encode_note_id_i32,
-    execute_nav_lookup, modifier_matches_setting, DictWorkerRequest, GlossaryDocLruCache,
-    GlossaryScanHighlight, HoveredGlossaryTarget, NavLookupRequest, NavLookupResponse,
-    NavQueryKind, NestedPopupLevel, NestedScanRequest, NestedScanResponse, PendingNestedAnkiAdd,
-    GLOSSARY_SCAN_MAX_CHARS, MAX_PENDING_NESTED_ANKI_ADDS, NESTED_DISMISS_GRACE_MS,
+    execute_nav_lookup, modifier_matches_setting, AnkiCheckTarget, DictWorkerRequest,
+    GlossaryDocLruCache, GlossaryScanHighlight, HoveredGlossaryTarget, NavLookupRequest,
+    NavLookupResponse, NavQueryKind, NestedPopupLevel, NestedScanRequest, NestedScanResponse,
+    PendingNestedAnkiAdd, PendingPanelAnkiAdd, GLOSSARY_SCAN_MAX_CHARS,
+    MAX_PENDING_NESTED_ANKI_ADDS, NESTED_DISMISS_GRACE_MS,
 };
 use super::RichUiBridge;
 
@@ -60,6 +65,9 @@ impl RichUiBridge {
             note_ids,
             queries,
             tags,
+            addable,
+            reading_as_expr,
+            hit_meta,
         ) = {
             let mut st = self.state.borrow_mut();
             if nav_changed {
@@ -81,6 +89,15 @@ impl RichUiBridge {
                     .copied()
                     .map(encode_note_id_i32)
                     .collect();
+                let hit_meta: Vec<ActiveRowHitMeta> = top
+                    .hits
+                    .iter()
+                    .map(|h| ActiveRowHitMeta {
+                        dictionary_id: h.dictionary_id,
+                        dict_name: h.dict_name.clone(),
+                        raw_glossary: h.raw_glossary.clone(),
+                    })
+                    .collect();
                 (
                     depth,
                     max_depth,
@@ -95,6 +112,9 @@ impl RichUiBridge {
                     note_ids,
                     top.row_anki_browse_queries.clone(),
                     top.row_anki_tags.clone(),
+                    top.row_anki_addable.clone(),
+                    top.row_reading_as_expression.clone(),
+                    hit_meta,
                 )
             } else {
                 (
@@ -111,9 +131,15 @@ impl RichUiBridge {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                 )
             }
         };
+        if depth > 0 {
+            set_active_row_hit_meta(self.instance_id, depth as i32, hit_meta);
+        }
         let pb = app.global::<PopupBridge>();
         pb.set_nested_depth(depth as i32);
         pb.set_nested_max_depth(max_depth as i32);
@@ -128,6 +154,8 @@ impl RichUiBridge {
         pb.set_nested_row_anki_note_ids(Rc::new(VecModel::from(note_ids)).into());
         pb.set_nested_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
         pb.set_nested_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+        pb.set_nested_row_anki_addable(Rc::new(VecModel::from(addable)).into());
+        pb.set_nested_row_reading_as_expression(Rc::new(VecModel::from(reading_as_expr)).into());
         pb.set_nested_revision(pb.get_nested_revision().wrapping_add(1));
         if nav_changed {
             pb.set_nested_nav_revision(pb.get_nested_nav_revision().wrapping_add(1));
@@ -139,10 +167,11 @@ impl RichUiBridge {
 
     pub(super) fn pop_nested_popup(&self, app: &MementoApp) {
         self.nested_epoch.fetch_add(1, Ordering::AcqRel);
-        let popped = {
+        let (popped, popped_depth) = {
             let mut st = self.state.borrow_mut();
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
+            let old_len = st.nested_stack.len();
             let popped = st.nested_stack.pop().is_some();
             let new_len = st.nested_stack.len();
             st.nested_body_hover_count = 0;
@@ -154,8 +183,12 @@ impl RichUiBridge {
                 st.nested_card_hovered = false;
                 st.pending_nested_anki_adds.clear();
             }
-            popped
+            (popped, old_len as i32)
         };
+        if popped && popped_depth > 0 {
+            clear_active_glossary_selections(self.instance_id, Some(popped_depth));
+            clear_active_row_hit_meta(self.instance_id, Some(popped_depth));
+        }
         self.cancel_nested_anki_check(app);
         if popped {
             let pb = app.global::<PopupBridge>();
@@ -168,18 +201,23 @@ impl RichUiBridge {
 
     pub(super) fn dismiss_all_nested_popups(&self, app: &MementoApp) {
         self.nested_epoch.fetch_add(1, Ordering::AcqRel);
-        let had_any = {
+        let (had_any, old_depth) = {
             let mut st = self.state.borrow_mut();
             st.nested_scan_timer.stop();
             st.nested_dismiss_timer.stop();
+            let old_depth = st.nested_stack.len();
             let had_any = !st.nested_stack.is_empty() || st.root_scan_highlight.is_some();
             st.nested_stack.clear();
             st.root_scan_highlight = None;
             st.nested_card_hovered = false;
             st.nested_body_hover_count = 0;
             st.pending_nested_anki_adds.clear();
-            had_any
+            (had_any, old_depth)
         };
+        for d in 1..=old_depth {
+            clear_active_glossary_selections(self.instance_id, Some(d as i32));
+            clear_active_row_hit_meta(self.instance_id, Some(d as i32));
+        }
         self.cancel_nested_anki_check(app);
         let pb = app.global::<PopupBridge>();
         pb.set_nested_searching(false);
@@ -187,6 +225,9 @@ impl RichUiBridge {
             pb.set_tooltip_visible(false);
             self.sync_nested_popup_to_bridge(app, true);
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
+        }
+        if !app.get_dict_open() {
+            self.clear_glossary_selections_at_depth(app, 0);
         }
         self.schedule_idle_memory_shrink_if_closed(app);
     }
@@ -311,8 +352,17 @@ impl RichUiBridge {
             return true;
         }
 
-        let (mut rows, grouped_hits) =
-            build_dictionary_result_rows_grouped(&resp.hits, &resp.excluded_glossaries);
+        let (compact_glossaries, compact_tags) = {
+            let st = self.state.borrow();
+            (st.settings.compact_glossaries, st.settings.compact_tags)
+        };
+        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped_with_options(
+            &resp.hits,
+            &resp.excluded_glossaries,
+            None,
+            compact_glossaries,
+            compact_tags,
+        );
         for row in &mut rows {
             if row.term_start && !row.is_kanji {
                 if let Some((_, _, graphs, freqs)) = resp.term_meta_rows.iter().find(|(e, r, _, _)| {
@@ -366,12 +416,14 @@ impl RichUiBridge {
                     &grouped_hits,
                     Some(&resp.term_pitch_details),
                     Some(&resp.kanji_frequencies),
+                    compact_tags,
                 );
                 apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
                 let row_count = rows.len();
                 let level = NestedPopupLevel {
                     label: resp.headword.clone(),
                     rows: rows.clone(),
+                    hits: grouped_hits,
                     headword: resp.headword,
                     reading: resp.reading,
                     anchor_x: resp.anchor_x,
@@ -383,13 +435,19 @@ impl RichUiBridge {
                     row_extras,
                     glossary_cache: GlossaryDocLruCache::new_nested(),
                     last_rendered_key: HashMap::new(),
-                    selection: None,
+                    selections: BTreeMap::new(),
+                    active_drag_selection_key: None,
                     scan_highlight: None,
                     expanded_cards: HashSet::new(),
                     row_anki_duplicates: vec![false; row_count],
                     row_anki_note_ids_i64: vec![0; row_count],
                     row_anki_browse_queries: vec![SharedString::default(); row_count],
                     row_anki_tags: vec![SharedString::default(); row_count],
+                    row_anki_addable: vec![true; row_count],
+                    row_reading_as_expression: vec![false; row_count],
+                    term_kanji_statuses: HashMap::new(),
+                    term_kana_statuses: HashMap::new(),
+                    manual_reading_as_expr: HashMap::new(),
                 };
                 st.nested_stack.push(level);
                 Some(st.nested_stack.len())
@@ -399,7 +457,7 @@ impl RichUiBridge {
         if let Some(new_depth) = new_depth_opt {
             self.sync_nested_popup_to_bridge(app, true);
             pb.set_rich_revision(pb.get_rich_revision().wrapping_add(1));
-            self.dispatch_anki_check_for_rows(app, &rows, Some(new_depth));
+            self.dispatch_anki_check_for_rows(app, &rows, AnkiCheckTarget::Nested(new_depth));
         }
         true
     }
@@ -447,12 +505,13 @@ impl RichUiBridge {
         });
         let (is_dragging, max_depth) = {
             let st = self.state.borrow();
-            let dragging = if depth == 0 {
-                st.selection.as_ref().is_some_and(|s| s.dragging)
+            let dragging = if depth < 0 {
+                st.panel.selections.values().any(|s| s.dragging)
+            } else if depth == 0 {
+                st.selections.values().any(|s| s.dragging)
             } else {
                 st.nested_level(depth)
-                    .and_then(|lvl| lvl.selection.as_ref())
-                    .is_some_and(|s| s.dragging)
+                    .is_some_and(|lvl| lvl.selections.values().any(|s| s.dragging))
             };
             (dragging, st.settings.max_recursion_depth)
         };
@@ -542,12 +601,13 @@ impl RichUiBridge {
                 };
                 let current_opt = {
                     let st = br.state.borrow();
-                    let dragging = if expected_depth == 0 {
-                        st.selection.as_ref().is_some_and(|s| s.dragging)
+                    let dragging = if expected_depth < 0 {
+                        st.panel.selections.values().any(|s| s.dragging)
+                    } else if expected_depth == 0 {
+                        st.selections.values().any(|s| s.dragging)
                     } else {
                         st.nested_level(expected_depth)
-                            .and_then(|l| l.selection.as_ref())
-                            .is_some_and(|s| s.dragging)
+                            .is_some_and(|l| l.selections.values().any(|s| s.dragging))
                     };
                     if dragging {
                         None
@@ -731,8 +791,17 @@ impl RichUiBridge {
             }
             return;
         }
-        let (mut rows, grouped_hits) =
-            build_dictionary_result_rows_grouped(&resp.hits, &resp.excluded);
+        let (compact_glossaries, compact_tags) = {
+            let st = self.state.borrow();
+            (st.settings.compact_glossaries, st.settings.compact_tags)
+        };
+        let (mut rows, grouped_hits) = build_dictionary_result_rows_grouped_with_options(
+            &resp.hits,
+            &resp.excluded,
+            None,
+            compact_glossaries,
+            compact_tags,
+        );
         for row in &mut rows {
             if row.term_start && !row.is_kanji {
                 if let Some((_, _, graphs, freqs)) = resp.term_meta_rows.iter().find(|(e, r, _, _)| {
@@ -771,12 +840,14 @@ impl RichUiBridge {
                 &grouped_hits,
                 Some(&resp.term_pitch_details),
                 Some(&resp.kanji_frequencies),
+                compact_tags,
             );
             apply_kanji_freq_updates_to_rows(&mut rows, kanji_freq_updates);
             let row_count = rows.len();
             let level = NestedPopupLevel {
                 label: resp.headword.clone(),
                 rows: rows.clone(),
+                hits: grouped_hits,
                 headword: resp.headword,
                 reading: resp.reading,
                 anchor_x,
@@ -788,13 +859,19 @@ impl RichUiBridge {
                 row_extras,
                 glossary_cache: GlossaryDocLruCache::new_nested(),
                 last_rendered_key: HashMap::new(),
-                selection: None,
+                selections: BTreeMap::new(),
+                active_drag_selection_key: None,
                 scan_highlight: None,
                 expanded_cards: HashSet::new(),
                 row_anki_duplicates: vec![false; row_count],
                 row_anki_note_ids_i64: vec![0; row_count],
                 row_anki_browse_queries: vec![SharedString::default(); row_count],
                 row_anki_tags: vec![SharedString::default(); row_count],
+                row_anki_addable: vec![true; row_count],
+                row_reading_as_expression: vec![false; row_count],
+                term_kanji_statuses: HashMap::new(),
+                term_kana_statuses: HashMap::new(),
+                manual_reading_as_expr: HashMap::new(),
             };
             let base = (from_depth.max(0) as usize).min(st.nested_stack.len());
             st.nested_stack.truncate(base);
@@ -808,7 +885,7 @@ impl RichUiBridge {
             st.nested_stack.len()
         };
         self.sync_nested_popup_to_bridge(app, true);
-        self.dispatch_anki_check_for_rows(app, &rows, Some(target_depth));
+        self.dispatch_anki_check_for_rows(app, &rows, AnkiCheckTarget::Nested(target_depth));
     }
 
     pub(super) fn is_nested_target_already_shown(&self, target: &HoveredGlossaryTarget) -> bool {
@@ -883,6 +960,15 @@ impl RichUiBridge {
     }
 
     pub(super) fn add_nested_anki_note(&self, app: &MementoApp, row_zero_idx: i32) {
+        self.add_nested_anki_note_with_audio(app, row_zero_idx, None);
+    }
+
+    pub(super) fn add_nested_anki_note_with_audio(
+        &self,
+        app: &MementoApp,
+        row_zero_idx: i32,
+        audio_source_override: Option<i32>,
+    ) {
         let (depth, nested_rows) = {
             let mut st = self.state.borrow_mut();
             let depth = st.nested_stack.len();
@@ -894,12 +980,18 @@ impl RichUiBridge {
             let Some(target) = top.rows.get(idx) else {
                 return;
             };
+            let rae = top
+                .row_reading_as_expression
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
             let pending = PendingNestedAnkiAdd {
                 depth,
                 row_index: idx,
                 expression: target.expression.to_string(),
                 reading: target.reading.to_string(),
                 is_kanji: target.is_kanji,
+                reading_as_expression: rae,
             };
             let rows = top.rows.clone();
             while st.pending_nested_anki_adds.len() >= MAX_PENDING_NESTED_ANKI_ADDS {
@@ -909,9 +1001,9 @@ impl RichUiBridge {
             (depth, rows)
         };
 
-        // `main.rs`'s `on_add_anki_note` reads `app.get_dict_results()` synchronously before
-        // spawning its background Anki thread. Guard the temporary swap with an RAII Drop guard
-        // so root `dict_results` is always restored immediately and never left clobbered.
+        // `anki_actions.rs`'s `on_add_anki_note` reads `app.get_dict_results()` synchronously
+        // before spawning its background Anki thread. Guard the temporary swap with an RAII Drop
+        // guard so root `dict_results` is always restored immediately and never left clobbered.
         let parent_rows = app.get_dict_results();
         let swapped_rows: slint::ModelRc<DictResult> = Rc::new(VecModel::from(nested_rows)).into();
         {
@@ -921,10 +1013,150 @@ impl RichUiBridge {
                 swapped: swapped_rows,
                 parent: parent_rows,
             };
+            let _override_guard = ScopedAnkiAddOverride::new(
+                AnkiAddTarget::Nested(depth as i32),
+                audio_source_override,
+            );
             app.invoke_add_anki_note(row_zero_idx);
         }
         if depth > 0 {
             app.global::<PopupBridge>().set_nested_locked(true);
+        }
+    }
+
+    pub(super) fn sync_panel_popup_to_bridge(&self, app: &MementoApp, sync_results: bool) {
+        let (rows, dups, note_ids, queries, tags, addable, reading_as_expr, hit_meta) = {
+            let st = self.state.borrow();
+            let panel = &st.panel;
+            let note_ids: Vec<i32> = panel
+                .row_anki_note_ids_i64
+                .iter()
+                .copied()
+                .map(encode_note_id_i32)
+                .collect();
+            let hit_meta: Vec<ActiveRowHitMeta> = panel
+                .hits
+                .iter()
+                .map(|h| ActiveRowHitMeta {
+                    dictionary_id: h.dictionary_id,
+                    dict_name: h.dict_name.clone(),
+                    raw_glossary: h.raw_glossary.clone(),
+                })
+                .collect();
+            (
+                sync_results.then(|| panel.rows.clone()),
+                panel.row_anki_duplicates.clone(),
+                note_ids,
+                panel.row_anki_browse_queries.clone(),
+                panel.row_anki_tags.clone(),
+                panel.row_anki_addable.clone(),
+                panel.row_reading_as_expression.clone(),
+                hit_meta,
+            )
+        };
+        set_active_row_hit_meta(self.instance_id, -1, hit_meta);
+        let pb = app.global::<PopupBridge>();
+        if let Some(rows) = rows {
+            pb.set_panel_results(Rc::new(VecModel::from(rows)).into());
+        }
+        pb.set_panel_row_anki_duplicates(Rc::new(VecModel::from(dups)).into());
+        pb.set_panel_row_anki_note_ids(Rc::new(VecModel::from(note_ids)).into());
+        pb.set_panel_row_anki_browse_queries(Rc::new(VecModel::from(queries)).into());
+        pb.set_panel_row_anki_tags(Rc::new(VecModel::from(tags)).into());
+        pb.set_panel_row_anki_addable(Rc::new(VecModel::from(addable)).into());
+        pb.set_panel_row_reading_as_expression(Rc::new(VecModel::from(reading_as_expr)).into());
+        pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
+    }
+
+    pub(super) fn toggle_panel_select_definition(&self, app: &MementoApp, zero_based_idx: i32) {
+        if zero_based_idx < 0 {
+            return;
+        }
+        let changed = {
+            let mut st = self.state.borrow_mut();
+            if let Some(row) = st.panel.rows.get_mut(zero_based_idx as usize) {
+                row.selected = !row.selected;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.sync_panel_popup_to_bridge(app, true);
+        }
+    }
+
+    pub(super) fn toggle_panel_term_collapse(&self, app: &MementoApp, term_start_zero_idx: i32) {
+        if term_start_zero_idx < 0 {
+            return;
+        }
+        let changed = {
+            let mut st = self.state.borrow_mut();
+            let start = term_start_zero_idx as usize;
+            if start < st.panel.rows.len() {
+                let target_collapsed = !st.panel.rows[start].collapsed;
+                st.panel.rows[start].collapsed = target_collapsed;
+                for row in st.panel.rows.iter_mut().skip(start + 1) {
+                    if row.term_start {
+                        break;
+                    }
+                    row.collapsed = target_collapsed;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.sync_panel_popup_to_bridge(app, true);
+        }
+    }
+
+    pub(super) fn add_panel_anki_note(
+        &self,
+        app: &MementoApp,
+        row_zero_idx: i32,
+        audio_source_override: Option<i32>,
+    ) {
+        let panel_rows = {
+            let mut st = self.state.borrow_mut();
+            let idx = row_zero_idx.max(0) as usize;
+            let Some(target) = st.panel.rows.get(idx) else {
+                return;
+            };
+            let rae = st
+                .panel
+                .row_reading_as_expression
+                .get(idx)
+                .copied()
+                .unwrap_or(false);
+            let pending = PendingPanelAnkiAdd {
+                row_index: idx,
+                expression: target.expression.to_string(),
+                reading: target.reading.to_string(),
+                is_kanji: target.is_kanji,
+                reading_as_expression: rae,
+            };
+            let rows = st.panel.rows.clone();
+            while st.pending_panel_anki_adds.len() >= MAX_PENDING_NESTED_ANKI_ADDS {
+                st.pending_panel_anki_adds.pop_front();
+            }
+            st.pending_panel_anki_adds.push_back(pending);
+            rows
+        };
+
+        let parent_rows = app.get_dict_results();
+        let swapped_rows: slint::ModelRc<DictResult> = Rc::new(VecModel::from(panel_rows)).into();
+        {
+            app.set_dict_results(swapped_rows.clone());
+            let _restore = RestoreDictResultsGuard {
+                app,
+                swapped: swapped_rows,
+                parent: parent_rows,
+            };
+            let _override_guard =
+                ScopedAnkiAddOverride::new(AnkiAddTarget::Panel, audio_source_override);
+            app.invoke_add_anki_note(row_zero_idx);
         }
     }
 }
