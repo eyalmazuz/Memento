@@ -1,6 +1,7 @@
 //! Asynchronous raw RGBA screenshot worker backed by a weak libmpv client.
 
-use std::ffi::CStr;
+use std::cell::Cell;
+use std::ffi::{c_int, CStr};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -9,6 +10,98 @@ use std::sync::{Arc, Mutex};
 use super::ffi;
 use super::node::{copy_mpv_string, iter_node_map};
 use super::types::RawFrame;
+
+/// RAII guard that temporarily enables `sub-visibility` during a subtitle
+/// screenshot (`subtitles == true`) and unconditionally restores the original
+/// value on [`Drop`], even on error or panic.
+///
+/// When `subtitles == false` (video-only screenshot / OCR), this guard is a
+/// complete no-op and never reads or modifies `sub-visibility`.
+pub(super) struct SubVisibilityGuard<R: FnOnce(bool)> {
+    original: bool,
+    restore: Option<R>,
+}
+
+impl<R: FnOnce(bool)> SubVisibilityGuard<R> {
+    pub(super) fn acquire<G, E>(subtitles: bool, get: G, enable: E, restore: R) -> Self
+    where
+        G: FnOnce() -> Option<bool>,
+        E: FnOnce() -> bool,
+    {
+        if !subtitles {
+            return Self {
+                original: false,
+                restore: None,
+            };
+        }
+        match get() {
+            Some(false) if enable() => Self {
+                original: false,
+                restore: Some(restore),
+            },
+            _ => Self {
+                original: true,
+                restore: None,
+            },
+        }
+    }
+}
+
+impl<R: FnOnce(bool)> Drop for SubVisibilityGuard<R> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            restore(self.original);
+        }
+    }
+}
+
+pub(super) unsafe fn get_sub_visibility(handle: *mut ffi::mpv_handle) -> Option<bool> {
+    if handle.is_null() {
+        return None;
+    }
+    let mut flag: c_int = 0;
+    let status = unsafe {
+        ffi::mpv_get_property(
+            handle,
+            c"sub-visibility".as_ptr(),
+            ffi::MPV_FORMAT_FLAG,
+            (&mut flag as *mut c_int).cast(),
+        )
+    };
+    (status >= 0).then_some(flag != 0)
+}
+
+pub(super) unsafe fn set_sub_visibility(handle: *mut ffi::mpv_handle, visible: bool) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    let mut flag: c_int = c_int::from(visible);
+    let status = unsafe {
+        ffi::mpv_set_property(
+            handle,
+            c"sub-visibility".as_ptr(),
+            ffi::MPV_FORMAT_FLAG,
+            (&mut flag as *mut c_int).cast(),
+        )
+    };
+    status >= 0
+}
+
+pub(super) unsafe fn set_sub_visibility_async(handle: *mut ffi::mpv_handle, visible: bool) {
+    if handle.is_null() {
+        return;
+    }
+    let flag: c_int = c_int::from(visible);
+    let _ = unsafe {
+        ffi::mpv_set_property_async(
+            handle,
+            0,
+            c"sub-visibility".as_ptr(),
+            ffi::MPV_FORMAT_FLAG,
+            (&flag as *const c_int).cast_mut().cast(),
+        )
+    };
+}
 
 /// A queued capture. Wait on a worker, never on the UI/render thread: mpv
 /// needs that thread to service its GPU screenshot request even while paused.
@@ -48,6 +141,22 @@ impl ScreenshotClient {
         if self.closing.load(Ordering::Acquire) {
             return Err("Player closed during screenshot capture".into());
         }
+        // When `subtitles == true`, temporarily force `sub-visibility = yes` if
+        // currently disabled, and unconditionally restore it on drop (even on
+        // error). When `subtitles == false`, never touch `sub-visibility`.
+        let async_restore = Cell::new(false);
+        let _sub_visibility_guard = SubVisibilityGuard::acquire(
+            subtitles,
+            || unsafe { get_sub_visibility(self.handle) },
+            || unsafe { set_sub_visibility(self.handle, true) },
+            |original| unsafe {
+                if async_restore.get() || self.closing.load(Ordering::Acquire) {
+                    set_sub_visibility_async(self.handle, original);
+                } else {
+                    set_sub_visibility(self.handle, original);
+                }
+            },
+        );
         let mut args = [
             c"screenshot-raw".as_ptr(),
             if subtitles {
@@ -65,14 +174,17 @@ impl ScreenshotClient {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if self.closing.load(Ordering::Acquire) {
+                async_restore.set(true);
                 return Err("Player closed during screenshot capture".into());
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                async_restore.set(true);
                 return Err("mpv screenshot timed out waiting for a video frame".into());
             }
             let event = unsafe { ffi::mpv_wait_event(self.handle, remaining.as_secs_f64()) };
             let Some(event) = (unsafe { event.as_ref() }) else {
+                async_restore.set(true);
                 return Err("mpv returned no screenshot event".into());
             };
             match event.event_id {
@@ -87,12 +199,15 @@ impl ScreenshotClient {
                     return unsafe { copy_screenshot_node(&result.result) };
                 }
                 ffi::MPV_EVENT_SHUTDOWN => {
-                    return Err("Player closed during screenshot capture".into())
+                    async_restore.set(true);
+                    return Err("Player closed during screenshot capture".into());
                 }
                 ffi::MPV_EVENT_QUEUE_OVERFLOW => {
-                    return Err("mpv screenshot event queue overflowed".into())
+                    async_restore.set(true);
+                    return Err("mpv screenshot event queue overflowed".into());
                 }
                 ffi::MPV_EVENT_NONE if self.closing.load(Ordering::Acquire) => {
+                    async_restore.set(true);
                     return Err("Player closed during screenshot capture".into());
                 }
                 _ => {}

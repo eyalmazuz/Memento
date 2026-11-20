@@ -4,13 +4,14 @@ use std::ffi::{c_char, c_int, CStr};
 use std::ptr;
 
 use super::extract::{
-    extract_chapters_from_node, extract_osd_dimensions_from_node, extract_sub_lines_from_node,
-    extract_tracks_from_node,
+    extract_all_tracks_from_node, extract_chapters_from_node, extract_osd_dimensions_from_node,
+    extract_string_list_from_node, extract_sub_lines_from_node,
 };
 use super::ffi;
 use super::node::copy_mpv_string;
 use super::types::{
     AudioTrack, CursorAutohide, MpvPropertyValue, OsdDimensions, SubLine, SubtitleTrack, TrackType,
+    VideoTrack,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,14 @@ pub(super) enum ObservedProperty {
     ChapterList,
     Chapters,
     Path,
+    StreamOpenFilename,
+    ScriptOpts,
+    HttpHeaderFields,
+    Referrer,
+    UserAgent,
+    Cookies,
+    CookiesFile,
+    YtdlRawOptions,
     MediaTitle,
     TimePos,
     Duration,
@@ -71,6 +80,14 @@ impl ObservedProperty {
             b"chapter-list" => Some(Self::ChapterList),
             b"chapters" => Some(Self::Chapters),
             b"path" => Some(Self::Path),
+            b"stream-open-filename" => Some(Self::StreamOpenFilename),
+            b"script-opts" => Some(Self::ScriptOpts),
+            b"http-header-fields" => Some(Self::HttpHeaderFields),
+            b"referrer" => Some(Self::Referrer),
+            b"user-agent" => Some(Self::UserAgent),
+            b"cookies" => Some(Self::Cookies),
+            b"cookies-file" => Some(Self::CookiesFile),
+            b"ytdl-raw-options" => Some(Self::YtdlRawOptions),
             b"media-title" => Some(Self::MediaTitle),
             b"time-pos" => Some(Self::TimePos),
             b"duration" => Some(Self::Duration),
@@ -143,6 +160,14 @@ pub(super) const PLAYBACK_PROPERTIES: &[ObservedPropertySpec] = &[
     prop_spec!(c"chapter-list", "chapter-list", ChapterList, ffi::MPV_FORMAT_NODE),
     prop_spec!(c"chapters", "chapters", Chapters, ffi::MPV_FORMAT_INT64),
     prop_spec!(c"path", "path", Path, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"stream-open-filename", "stream-open-filename", StreamOpenFilename, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"script-opts", "script-opts", ScriptOpts, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"http-header-fields", "http-header-fields", HttpHeaderFields, ffi::MPV_FORMAT_NODE),
+    prop_spec!(c"referrer", "referrer", Referrer, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"user-agent", "user-agent", UserAgent, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"cookies", "cookies", Cookies, ffi::MPV_FORMAT_FLAG),
+    prop_spec!(c"cookies-file", "cookies-file", CookiesFile, ffi::MPV_FORMAT_STRING),
+    prop_spec!(c"ytdl-raw-options", "ytdl-raw-options", YtdlRawOptions, ffi::MPV_FORMAT_STRING),
     prop_spec!(c"media-title", "media-title", MediaTitle, ffi::MPV_FORMAT_STRING),
     prop_spec!(c"time-pos", "time-pos", TimePos, ffi::MPV_FORMAT_DOUBLE),
     prop_spec!(c"duration", "duration", Duration, ffi::MPV_FORMAT_DOUBLE),
@@ -199,6 +224,14 @@ pub(super) const PLAYBACK_PROPERTIES: &[ObservedPropertySpec] = &[
 /// not wait on mpv's core, which must never block the UI's render thread.
 pub struct PlaybackState {
     pub path: String,
+    pub stream_open_filename: String,
+    pub script_opts: String,
+    pub http_header_fields: Vec<String>,
+    pub referrer: String,
+    pub user_agent: String,
+    pub cookies: bool,
+    pub cookies_file: String,
+    pub ytdl_raw_options: String,
     pub media_title: String,
     pub file_loaded: bool,
     pub playback_ready: bool,
@@ -240,6 +273,7 @@ pub struct PlaybackState {
     pub secondary_sub_delay: f64,
     pub secondary_sub_visibility: bool,
     pub audio_tracks: Vec<AudioTrack>,
+    pub video_tracks: Vec<VideoTrack>,
     pub subtitle_tracks: Vec<SubtitleTrack>,
     pub sub_lines: Vec<SubLine>,
     pub frame_drops: i64,
@@ -253,6 +287,14 @@ impl Default for PlaybackState {
     fn default() -> Self {
         Self {
             path: String::new(),
+            stream_open_filename: String::new(),
+            script_opts: String::new(),
+            http_header_fields: Vec::new(),
+            referrer: String::new(),
+            user_agent: String::new(),
+            cookies: false,
+            cookies_file: String::new(),
+            ytdl_raw_options: String::new(),
             media_title: String::new(),
             file_loaded: false,
             playback_ready: false,
@@ -294,6 +336,7 @@ impl Default for PlaybackState {
             secondary_sub_delay: 0.0,
             secondary_sub_visibility: false,
             audio_tracks: Vec::new(),
+            video_tracks: Vec::new(),
             subtitle_tracks: Vec::new(),
             sub_lines: Vec::new(),
             frame_drops: 0,
@@ -362,14 +405,15 @@ impl PlaybackState {
             }
             ObservedProperty::TrackList => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let (audio, subtitle, all) = extract_tracks_from_node(data.cast());
-                    self.audio_tracks.clone_from(&audio);
-                    self.subtitle_tracks.clone_from(&subtitle);
+                    let extracted = extract_all_tracks_from_node(data.cast());
+                    self.audio_tracks.clone_from(&extracted.audio);
+                    self.video_tracks = extracted.video;
+                    self.subtitle_tracks.clone_from(&extracted.subtitle);
                     let mut primary_sid = 0;
                     let mut secondary_sid = 0;
                     let mut audio_id = 0;
                     let mut video_id = 0;
-                    for t in &all {
+                    for t in &extracted.all {
                         if !t.selected {
                             continue;
                         }
@@ -386,17 +430,37 @@ impl PlaybackState {
                     self.audio_id = audio_id;
                     self.video_id = video_id;
                     return MpvPropertyValue::Tracks {
-                        audio,
-                        subtitle,
-                        all,
+                        audio: extracted.audio,
+                        subtitle: extracted.subtitle,
+                        all: extracted.all,
                     };
                 }
                 self.audio_tracks.clear();
+                self.video_tracks.clear();
                 self.subtitle_tracks.clear();
                 self.primary_sid = 0;
                 self.secondary_sid = 0;
                 self.audio_id = 0;
                 self.video_id = 0;
+                return MpvPropertyValue::None;
+            }
+            ObservedProperty::HttpHeaderFields => {
+                if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
+                    let headers = extract_string_list_from_node(data.cast());
+                    self.http_header_fields.clone_from(&headers);
+                    return MpvPropertyValue::StringList(headers);
+                }
+                if property.format == ffi::MPV_FORMAT_STRING && !data.is_null() {
+                    let raw = copy_mpv_string(unsafe { *data.cast::<*const c_char>() });
+                    let headers = if raw.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![raw]
+                    };
+                    self.http_header_fields.clone_from(&headers);
+                    return MpvPropertyValue::StringList(headers);
+                }
+                self.http_header_fields.clear();
                 return MpvPropertyValue::None;
             }
             ObservedProperty::SubLines => {
@@ -463,6 +527,35 @@ impl PlaybackState {
             ObservedProperty::Path => match &value {
                 MpvPropertyValue::String(s) => assign_str(&mut self.path, s),
                 _ => self.path.clear(),
+            },
+            ObservedProperty::StreamOpenFilename => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.stream_open_filename, s),
+                _ => self.stream_open_filename.clear(),
+            },
+            ObservedProperty::ScriptOpts => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.script_opts, s),
+                _ => self.script_opts.clear(),
+            },
+            ObservedProperty::Referrer => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.referrer, s),
+                _ => self.referrer.clear(),
+            },
+            ObservedProperty::UserAgent => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.user_agent, s),
+                _ => self.user_agent.clear(),
+            },
+            ObservedProperty::Cookies => {
+                if let MpvPropertyValue::Flag(v) = value {
+                    self.cookies = v;
+                }
+            }
+            ObservedProperty::CookiesFile => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.cookies_file, s),
+                _ => self.cookies_file.clear(),
+            },
+            ObservedProperty::YtdlRawOptions => match &value {
+                MpvPropertyValue::String(s) => assign_str(&mut self.ytdl_raw_options, s),
+                _ => self.ytdl_raw_options.clear(),
             },
             ObservedProperty::MediaTitle => match &value {
                 MpvPropertyValue::String(s) => assign_str(&mut self.media_title, s),
@@ -627,6 +720,7 @@ impl PlaybackState {
             ObservedProperty::Chapters
             | ObservedProperty::ChapterList
             | ObservedProperty::TrackList
+            | ObservedProperty::HttpHeaderFields
             | ObservedProperty::SubLines
             | ObservedProperty::OsdDimensions
             | ObservedProperty::CursorAutohide => {}

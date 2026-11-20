@@ -6,17 +6,20 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use crate::autopause::subtitle_raw_time;
+use crate::autopause::{subtitle_raw_time, subtitle_to_media_time};
 
 use super::asr_stream::format_webvtt_cues;
 use super::event::MpvEvent;
 use super::ffi;
 use super::instance::MpvInstance;
 use super::node::{cue_valid, id_valid, OwnedNode};
-use super::screenshot::{copy_screenshot_node, screenshot_error, CaptureJob, ScreenshotRequest};
+use super::screenshot::{
+    copy_screenshot_node, get_sub_visibility, screenshot_error, set_sub_visibility, CaptureJob,
+    ScreenshotRequest, SubVisibilityGuard,
+};
 use super::types::{
     AsrCue, AudioTrack, CommandReplyResult, EncodeContext, OsdDimensions, RawFrame, SubLine,
-    SubtitleTrack, ASR_STREAM_URI,
+    SubtitleTrack, VideoTrack, ASR_STREAM_URI,
 };
 
 const MPV_LOADFILE_INDEX_API_VERSION: u64 = (2 << 16) | 3;
@@ -30,6 +33,10 @@ impl MpvInstance {
 
     pub fn audio_tracks(&self) -> Vec<AudioTrack> {
         self.playback.borrow().audio_tracks.clone()
+    }
+
+    pub fn video_tracks(&self) -> Vec<VideoTrack> {
+        self.playback.borrow().video_tracks.clone()
     }
 
     pub fn subtitle_tracks(&self) -> Vec<SubtitleTrack> {
@@ -48,9 +55,29 @@ impl MpvInstance {
 
     pub fn capture_encode_context(&self) -> Option<EncodeContext> {
         let state = self.playback.borrow();
-        (state.file_loaded && !state.path.is_empty()).then(|| EncodeContext {
-            path: state.path.clone(),
-            audio_id: state.audio_id,
+        let stream_open_filename = if EncodeContext::is_internal_asr_uri(&state.stream_open_filename)
+        {
+            String::new()
+        } else {
+            state.stream_open_filename.clone()
+        };
+        let has_media = !state.path.is_empty() || !stream_open_filename.trim().is_empty();
+        (state.file_loaded && has_media).then(|| {
+            let external_audio_filename =
+                EncodeContext::select_external_audio(&state.audio_tracks, state.audio_id);
+            EncodeContext {
+                path: state.path.clone(),
+                audio_id: state.audio_id,
+                stream_open_filename,
+                script_opts: state.script_opts.clone(),
+                http_header_fields: state.http_header_fields.clone(),
+                referrer: state.referrer.clone(),
+                user_agent: state.user_agent.clone(),
+                cookies: state.cookies,
+                cookies_file: state.cookies_file.clone(),
+                ytdl_raw_options: state.ytdl_raw_options.clone(),
+                external_audio_filename,
+            }
         })
     }
 
@@ -72,6 +99,14 @@ impl MpvInstance {
         if self.is_opengl_active() {
             return Err("OpenGL screenshots must use request_screenshot on a worker".into());
         }
+        let _sub_visibility_guard = SubVisibilityGuard::acquire(
+            subtitles,
+            || unsafe { get_sub_visibility(self.handle) },
+            || unsafe { set_sub_visibility(self.handle, true) },
+            |original| unsafe {
+                let _ = set_sub_visibility(self.handle, original);
+            },
+        );
         let mut pointers = [
             c"screenshot-raw".as_ptr(),
             if subtitles {
@@ -94,6 +129,10 @@ impl MpvInstance {
 
     pub fn selected_aid(&self) -> i64 {
         self.playback.borrow().audio_id
+    }
+
+    pub fn selected_vid(&self) -> i64 {
+        self.playback.borrow().video_id
     }
 
     pub fn primary_sid(&self) -> i64 {
@@ -124,6 +163,12 @@ impl MpvInstance {
         subtitle_raw_time(playback_time, self.get_sub_speed(), self.get_sub_delay())
     }
 
+    /// Convert a raw primary subtitle cue timestamp to the media playback timeline
+    /// using the player's current `sub-speed` and `sub-delay`.
+    pub fn sub_to_media_time(&self, cue_time: f64) -> f64 {
+        subtitle_to_media_time(cue_time, self.get_sub_speed(), self.get_sub_delay())
+    }
+
     pub fn get_secondary_sub_start(&self) -> f64 {
         self.playback.borrow().secondary_sub_start
     }
@@ -143,6 +188,16 @@ impl MpvInstance {
     pub fn get_secondary_sub_raw_time(&self, playback_time: f64) -> f64 {
         subtitle_raw_time(
             playback_time,
+            self.get_secondary_sub_speed(),
+            self.get_secondary_sub_delay(),
+        )
+    }
+
+    /// Convert a raw secondary subtitle cue timestamp to the media playback timeline
+    /// using the player's current `sub-speed` and `secondary-sub-delay`.
+    pub fn secondary_sub_to_media_time(&self, cue_time: f64) -> f64 {
+        subtitle_to_media_time(
+            cue_time,
             self.get_secondary_sub_speed(),
             self.get_secondary_sub_delay(),
         )
@@ -172,12 +227,42 @@ impl MpvInstance {
         self.set_track_property(c"aid", id)
     }
 
+    pub fn set_vid(&self, id: i64) -> Result<(), String> {
+        self.set_track_property(c"vid", id)
+    }
+
     pub fn set_sid(&self, id: i64) -> Result<(), String> {
         self.set_track_property(c"sid", id)
     }
 
     pub fn set_secondary_sid(&self, id: i64) -> Result<(), String> {
         self.set_track_property(c"secondary-sid", id)
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.playback.borrow().fullscreen
+    }
+
+    /// Synchronize mpv's `fullscreen` property asynchronously without blocking
+    /// the UI/render thread.
+    pub fn set_fullscreen(&self, fullscreen: bool) -> Result<(), String> {
+        let flag: c_int = c_int::from(fullscreen);
+        let status = unsafe {
+            ffi::mpv_set_property_async(
+                self.handle,
+                0,
+                c"fullscreen".as_ptr(),
+                ffi::MPV_FORMAT_FLAG,
+                (&flag as *const c_int).cast_mut().cast(),
+            )
+        };
+        if status < 0 {
+            Err(format!(
+                "mpv set fullscreen property failed with code {status}"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Set mpv's `sub-scale` for native ASS/SSA rendering, enabling `sub-scale-signs`

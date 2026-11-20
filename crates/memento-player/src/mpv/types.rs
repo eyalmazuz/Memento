@@ -46,6 +46,18 @@ pub struct AudioTrack {
     pub selected: bool,
 }
 
+/// Owned metadata for a video track in mpv's `track-list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoTrack {
+    pub id: i64,
+    pub title: String,
+    pub language: String,
+    pub codec: String,
+    pub external: bool,
+    pub default_track: bool,
+    pub selected: bool,
+}
+
 /// Owned metadata for a subtitle track in mpv's `track-list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleTrack {
@@ -86,11 +98,64 @@ impl Default for OsdDimensions {
     }
 }
 
-/// Snapshot of the currently loaded media needed by an off-thread encoder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Snapshot of the currently loaded media and streaming context needed by an
+/// off-thread encoder (local files, YouTube/yt-dlp streams, split DASH audio,
+/// and HTTP headers/cookies).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EncodeContext {
     pub path: String,
     pub audio_id: i64,
+    pub stream_open_filename: String,
+    pub script_opts: String,
+    pub http_header_fields: Vec<String>,
+    pub referrer: String,
+    pub user_agent: String,
+    pub cookies: bool,
+    pub cookies_file: String,
+    pub ytdl_raw_options: String,
+    pub external_audio_filename: Option<String>,
+}
+
+impl EncodeContext {
+    /// Returns whether `uri` uses Memento's internal in-memory ASR stream scheme
+    /// (`memento-asr://`), which must never be treated as a media source URL.
+    pub fn is_internal_asr_uri(uri: &str) -> bool {
+        uri.trim()
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(ASR_STREAM_PROTOCOL))
+    }
+
+    /// Resolve the effective media path/URL for off-thread encoding.
+    ///
+    /// Prefers `stream_open_filename` (e.g. a resolved direct URL or `edl://`
+    /// stream rewritten by `ytdl_hook`) when non-empty and not an internal
+    /// `memento-asr://` URI; otherwise falls back to `path`.
+    pub fn resolve_media_path<'a>(stream_open_filename: &'a str, path: &'a str) -> &'a str {
+        let trimmed = stream_open_filename.trim();
+        if !trimmed.is_empty() && !Self::is_internal_asr_uri(trimmed) {
+            stream_open_filename
+        } else {
+            path
+        }
+    }
+
+    /// Resolve the effective media path/URL for this snapshot.
+    pub fn effective_media_path(&self) -> &str {
+        Self::resolve_media_path(&self.stream_open_filename, &self.path)
+    }
+
+    /// Resolve the `external_filename` of the currently selected audio track,
+    /// needed for split DASH / `edl://` external audio streams.
+    pub fn select_external_audio(audio_tracks: &[AudioTrack], audio_id: i64) -> Option<String> {
+        if audio_id <= 0 {
+            return None;
+        }
+        audio_tracks
+            .iter()
+            .find(|track| track.id == audio_id)
+            .filter(|track| !track.external_filename.trim().is_empty())
+            .map(|track| track.external_filename.clone())
+    }
 }
 
 /// Owned, source-resolution RGBA pixels returned by mpv's `screenshot-raw`.
@@ -265,6 +330,7 @@ pub enum MpvPropertyValue {
     Int64(i64),
     Double(f64),
     String(String),
+    StringList(Vec<String>),
     Chapters(Vec<f64>),
     Tracks {
         audio: Vec<AudioTrack>,

@@ -7,16 +7,27 @@ use crate::events::Track;
 
 use super::ffi;
 use super::node::{copy_mpv_string, iter_node_array, iter_node_map};
-use super::types::{AudioTrack, OsdDimensions, SubLine, SubtitleTrack, TrackType};
+use super::types::{AudioTrack, OsdDimensions, SubLine, SubtitleTrack, TrackType, VideoTrack};
 
-pub(super) fn extract_tracks_from_node(
-    node: *const ffi::mpv_node,
-) -> (Vec<AudioTrack>, Vec<SubtitleTrack>, Vec<Track>) {
+pub(super) struct ExtractedTracks {
+    pub(super) audio: Vec<AudioTrack>,
+    pub(super) video: Vec<VideoTrack>,
+    pub(super) subtitle: Vec<SubtitleTrack>,
+    pub(super) all: Vec<Track>,
+}
+
+pub(super) fn extract_all_tracks_from_node(node: *const ffi::mpv_node) -> ExtractedTracks {
     let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return ExtractedTracks {
+            audio: Vec::new(),
+            video: Vec::new(),
+            subtitle: Vec::new(),
+            all: Vec::new(),
+        };
     };
 
     let mut audio = Vec::new();
+    let mut video = Vec::new();
     let mut subtitle = Vec::new();
     let mut all = Vec::new();
 
@@ -84,6 +95,17 @@ pub(super) fn extract_tracks_from_node(
                     selected: track.selected,
                 });
             }
+            TrackType::Video => {
+                video.push(VideoTrack {
+                    id: track.id,
+                    title: track.title.clone(),
+                    language: track.language.clone(),
+                    codec: track.codec.clone(),
+                    external: track.external,
+                    default_track: track.default_track,
+                    selected: track.selected,
+                });
+            }
             TrackType::Subtitle => {
                 subtitle.push(SubtitleTrack {
                     id: track.id,
@@ -102,7 +124,36 @@ pub(super) fn extract_tracks_from_node(
         all.push(track);
     }
 
-    (audio, subtitle, all)
+    ExtractedTracks {
+        audio,
+        video,
+        subtitle,
+        all,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn extract_tracks_from_node(
+    node: *const ffi::mpv_node,
+) -> (Vec<AudioTrack>, Vec<SubtitleTrack>, Vec<Track>) {
+    let extracted = extract_all_tracks_from_node(node);
+    (extracted.audio, extracted.subtitle, extracted.all)
+}
+
+pub(super) fn extract_string_list_from_node(node: *const ffi::mpv_node) -> Vec<String> {
+    let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for entry in array_iter {
+        if entry.format == ffi::MPV_FORMAT_STRING {
+            let value = copy_mpv_string(unsafe { entry.u.string });
+            if !value.is_empty() {
+                items.push(value);
+            }
+        }
+    }
+    items
 }
 
 pub(super) fn extract_sub_lines_from_node(node: *const ffi::mpv_node) -> Vec<SubLine> {

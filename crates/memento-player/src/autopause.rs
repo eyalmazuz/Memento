@@ -45,6 +45,35 @@ pub fn subtitle_raw_time(playback_time: f64, speed: f64, delay: f64) -> f64 {
     (playback_time - delay) / speed
 }
 
+/// Converts a raw subtitle cue timestamp to the media playback timeline
+/// (`(cue_time * safe_speed) + safe_delay`, clamped `>= 0.0`).
+///
+/// This is the exact inverse of [`subtitle_raw_time`] (`(playback_time - delay) / speed`)
+/// for non-negative media timestamps, matching mpv's `sub-speed` (timestamp multiplier)
+/// and `sub-delay` semantics while safely handling `NaN`/non-finite/`<= 0.0` `sub_speed`
+/// (falling back to `1.0`) and non-finite `sub_delay` (falling back to `0.0`).
+pub fn subtitle_to_media_time(cue_time: f64, sub_speed: f64, sub_delay: f64) -> f64 {
+    if !cue_time.is_finite() {
+        return 0.0;
+    }
+    let safe_speed = if sub_speed.is_finite() && sub_speed > 0.0 {
+        sub_speed
+    } else {
+        1.0
+    };
+    let safe_delay = if sub_delay.is_finite() {
+        sub_delay
+    } else {
+        0.0
+    };
+    let media = cue_time * safe_speed + safe_delay;
+    if !media.is_finite() || media <= 0.0 {
+        0.0
+    } else {
+        media
+    }
+}
+
 impl AutoPauseState {
     /// Corrects auto-pause state on player position updates, matching
     /// `PlayerManager::handleAutoPausePosition(double position)`.
@@ -172,6 +201,76 @@ mod tests {
         let playback = subtitle_playback_time(raw, speed, delay);
         let back = subtitle_raw_time(playback, speed, delay);
         assert!((back - raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn subtitle_to_media_time_roundtrips_with_subtitle_raw_time() {
+        let cases = [
+            // (cue_time, sub_speed, sub_delay, expected_media)
+            (0.0, 1.0, 0.0, 0.0),
+            (10.0, 1.0, 0.0, 10.0),
+            (10.0, 1.0, 2.5, 12.5),
+            (10.0, 1.0, -2.5, 7.5),
+            (10.0, 1.5, 0.75, 15.75),
+            (10.0, 0.5, -1.25, 3.75),
+            (25.0, 23.976 / 25.0, 1.2, 25.0 * (23.976 / 25.0) + 1.2),
+            (42.5, 25.0 / 23.976, -3.5, 42.5 * (25.0 / 23.976) - 3.5),
+        ];
+
+        for (cue, speed, delay, expected_media) in cases {
+            let media = subtitle_to_media_time(cue, speed, delay);
+            assert!(
+                (media - expected_media).abs() < 1e-12,
+                "cue={cue}, speed={speed}, delay={delay}: got {media}, expected {expected_media}"
+            );
+            // Round-trip: cue -> media -> cue
+            let back_to_cue = subtitle_raw_time(media, speed, delay);
+            assert!(
+                (back_to_cue - cue).abs() < 1e-12,
+                "cue={cue}, speed={speed}, delay={delay}: round-trip gave {back_to_cue}"
+            );
+            // Reverse round-trip: media -> cue -> media
+            let back_to_media = subtitle_to_media_time(back_to_cue, speed, delay);
+            assert!(
+                (back_to_media - media).abs() < 1e-12,
+                "media={media}, speed={speed}, delay={delay}: reverse round-trip gave {back_to_media}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_to_media_time_clamps_negative_and_handles_invalid_inputs() {
+        // Negative media times clamp to +0.0.
+        let clamped = subtitle_to_media_time(1.0, 1.0, -5.0);
+        assert_eq!(clamped, 0.0);
+        assert!(clamped.is_sign_positive());
+        assert_eq!(subtitle_to_media_time(-2.0, 1.5, 1.0), 0.0);
+
+        // Invalid / non-positive sub_speed safely falls back to 1.0.
+        for bad_speed in [0.0, -0.0, -1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let media = subtitle_to_media_time(10.0, bad_speed, 0.5);
+            assert!(
+                (media - 10.5).abs() < 1e-12,
+                "bad_speed={bad_speed}: expected 10.5, got {media}"
+            );
+        }
+
+        // Non-finite sub_delay falls back to 0.0.
+        for bad_delay in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let media = subtitle_to_media_time(10.0, 1.5, bad_delay);
+            assert!(
+                (media - 15.0).abs() < 1e-12,
+                "bad_delay={bad_delay}: expected 15.0, got {media}"
+            );
+        }
+
+        // Non-finite cue_time returns 0.0.
+        for bad_cue in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(subtitle_to_media_time(bad_cue, 1.0, 2.0), 0.0);
+        }
+
+        // Overflow returns 0.0 rather than infinity.
+        assert_eq!(subtitle_to_media_time(f64::MAX, 2.0, 0.0), 0.0);
     }
 
     #[test]

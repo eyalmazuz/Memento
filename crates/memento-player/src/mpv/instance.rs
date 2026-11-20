@@ -14,9 +14,10 @@ use crate::controller::CliOption;
 
 use super::asr_stream::stream_cb_open_ro;
 use super::event::MpvEvent;
+use super::extract::extract_string_list_from_node;
 use super::ffi;
 use super::hwdec::{compatible_opengl_hwdec_for_session, compatible_software_hwdec};
-use super::node::{copy_mpv_string, supports_memory_subtitles};
+use super::node::{copy_mpv_string, supports_memory_subtitles, OwnedNode};
 use super::playback_state::{ObservedProperty, PlaybackState, PLAYBACK_PROPERTIES};
 use super::render::{
     create_opengl_context_with_options, create_software_context, render_rgba_context,
@@ -230,14 +231,48 @@ impl MpvInstance {
             }
         }
 
-        let configured_hwdec = unsafe {
-            let value = ffi::mpv_get_property_string(handle, c"hwdec".as_ptr());
+        let read_string_prop = |name: &CStr| unsafe {
+            let value = ffi::mpv_get_property_string(handle, name.as_ptr());
             let text = copy_mpv_string(value);
             if !value.is_null() {
                 ffi::mpv_free(value.cast());
             }
             text
         };
+        let read_flag_prop = |name: &CStr| unsafe {
+            let mut flag: c_int = 0;
+            let status = ffi::mpv_get_property(
+                handle,
+                name.as_ptr(),
+                ffi::MPV_FORMAT_FLAG,
+                (&mut flag as *mut c_int).cast(),
+            );
+            status >= 0 && flag != 0
+        };
+        let read_string_list_prop = |name: &CStr| unsafe {
+            let mut node = OwnedNode::new();
+            let status = ffi::mpv_get_property(
+                handle,
+                name.as_ptr(),
+                ffi::MPV_FORMAT_NODE,
+                (&mut node.0 as *mut ffi::mpv_node).cast(),
+            );
+            if status < 0 {
+                Vec::new()
+            } else {
+                extract_string_list_from_node(&node.0)
+            }
+        };
+
+        let configured_hwdec = read_string_prop(c"hwdec");
+        let initial_script_opts = read_string_prop(c"script-opts");
+        let initial_http_header_fields = read_string_list_prop(c"http-header-fields");
+        let initial_referrer = read_string_prop(c"referrer");
+        let initial_user_agent = read_string_prop(c"user-agent");
+        let initial_cookies = read_flag_prop(c"cookies");
+        let initial_cookies_file = read_string_prop(c"cookies-file");
+        let initial_ytdl_raw_options = read_string_prop(c"ytdl-raw-options");
+        let initial_fullscreen = read_flag_prop(c"fullscreen");
         let memory_subtitles_supported = unsafe { supports_memory_subtitles(handle) };
 
         let asr_stream: Arc<RwLock<Arc<[u8]>>> =
@@ -342,7 +377,15 @@ impl MpvInstance {
                 paused: true,
                 volume: 100.0,
                 volume_max: 100,
+                fullscreen: initial_fullscreen,
                 sub_speed: 1.0,
+                script_opts: initial_script_opts,
+                http_header_fields: initial_http_header_fields,
+                referrer: initial_referrer,
+                user_agent: initial_user_agent,
+                cookies: initial_cookies,
+                cookies_file: initial_cookies_file,
+                ytdl_raw_options: initial_ytdl_raw_options,
                 ..Default::default()
             }),
             queued_events: RefCell::new(VecDeque::new()),
@@ -428,6 +471,7 @@ impl MpvInstance {
                 state.primary_sid = 0;
                 state.secondary_sid = 0;
                 state.video_id = 0;
+                state.stream_open_filename.clear();
                 state.sub_ass_extradata.clear();
                 state.sub_text_ass_full.clear();
                 let playlist_entry_id =
@@ -477,6 +521,7 @@ impl MpvInstance {
                 state.primary_sid = 0;
                 state.secondary_sid = 0;
                 state.video_id = 0;
+                state.stream_open_filename.clear();
                 state.sub_ass_extradata.clear();
                 state.sub_text_ass_full.clear();
                 let (reason, playlist_entry_id) =
@@ -584,6 +629,8 @@ impl MpvInstance {
                         if name != "track-list"
                             && name != "sid"
                             && name != "aid"
+                            && name != "vid"
+                            && name != "fullscreen"
                             && name != "sub-ass-extradata"
                             && name != "sub-text/ass-full"
                             && name != "osd-dimensions"
