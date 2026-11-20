@@ -1130,6 +1130,47 @@ mod tests {
     }
 
     #[test]
+    fn double_left_click_mouse_btn0_cycles_mpv_fullscreen_once() {
+        let player = MpvInstance::new_software(None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let _ = player.drain_events();
+        assert!(!player.is_fullscreen());
+
+        // Forward two rapid MOUSE_BTN0 clicks exactly as MouseInputForwarder does.
+        for _ in 0..2 {
+            player.command_async(&["mouse", "100", "100"]).unwrap();
+            player.command_async(&["keydown", "MOUSE_BTN0"]).unwrap();
+            player.command_async(&["keyup", "MOUSE_BTN0"]).unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut transitions = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for ev in player.drain_events() {
+                if let MpvEvent::PropertyChange {
+                    name,
+                    value: MpvPropertyValue::Flag(f),
+                } = ev
+                {
+                    if name == "fullscreen" {
+                        transitions.push(f);
+                    }
+                }
+            }
+            if !transitions.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            transitions,
+            vec![true],
+            "double MOUSE_BTN0 must cycle mpv fullscreen once to true"
+        );
+        assert!(player.is_fullscreen());
+    }
+
+    #[test]
     fn video_tracks_and_vid_extraction_and_observation() {
         let mut vid_keys = [
             c"id".as_ptr().cast_mut(),

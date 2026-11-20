@@ -7,6 +7,12 @@ use memento_player::controller::{
 };
 use memento_player::{format_modifiers, MouseButton, MpvInstance, WheelButton};
 
+/// Minimum logical pixel scroll accumulation before emitting one discrete
+/// mpv `WHEEL_*` step. Discrete mouse-wheel notches (`>= 15 px`) still fire
+/// immediately, while smooth touchpad pixel streams accumulate cleanly and
+/// micro-jitter never triggers unintended horizontal `seek ±10` jumps.
+const WHEEL_DETENT_THRESHOLD: f32 = 15.0;
+
 /// Stateful pointer/wheel forwarder from Slint's video area into `libmpv`
 /// (`mouse`, `keydown`/`keyup` `MOUSE_BTN*`, and wheel buttons `3..6`) for
 /// `mpv` scripts such as `uosc`.
@@ -14,6 +20,8 @@ use memento_player::{format_modifiers, MouseButton, MpvInstance, WheelButton};
 pub struct MouseInputForwarder {
     last_pos: Option<(i32, i32)>,
     pressed_buttons: HashMap<u32, String>,
+    wheel_accum_x: f32,
+    wheel_accum_y: f32,
 }
 
 impl MouseInputForwarder {
@@ -146,19 +154,47 @@ impl MouseInputForwarder {
         delta_x: f32,
         delta_y: f32,
     ) -> Option<[String; 4]> {
-        let dx = if delta_x.abs() >= 0.5 {
-            delta_x.round() as i32
-        } else if delta_x != 0.0 {
-            delta_x.signum() as i32
+        let delta_x = if delta_x.is_finite() { delta_x } else { 0.0 };
+        let delta_y = if delta_y.is_finite() { delta_y } else { 0.0 };
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return None;
+        }
+        // Track only the dominant scroll axis per event so diagonal touchpad
+        // gestures never leak horizontal `WHEEL_LEFT`/`WHEEL_RIGHT` seeks.
+        let (dx, dy) = if delta_y.abs() >= delta_x.abs() {
+            self.wheel_accum_x = 0.0;
+            if self.wheel_accum_y != 0.0 && self.wheel_accum_y.signum() != delta_y.signum() {
+                self.wheel_accum_y = 0.0;
+            }
+            self.wheel_accum_y += delta_y;
+            if self.wheel_accum_y.abs() >= WHEEL_DETENT_THRESHOLD {
+                let step = self.wheel_accum_y.signum() as i32;
+                if delta_y.abs() >= WHEEL_DETENT_THRESHOLD {
+                    self.wheel_accum_y = 0.0;
+                } else {
+                    self.wheel_accum_y -= (step as f32) * WHEEL_DETENT_THRESHOLD;
+                }
+                (0, step)
+            } else {
+                (0, 0)
+            }
         } else {
-            0
-        };
-        let dy = if delta_y.abs() >= 0.5 {
-            delta_y.round() as i32
-        } else if delta_y != 0.0 {
-            delta_y.signum() as i32
-        } else {
-            0
+            self.wheel_accum_y = 0.0;
+            if self.wheel_accum_x != 0.0 && self.wheel_accum_x.signum() != delta_x.signum() {
+                self.wheel_accum_x = 0.0;
+            }
+            self.wheel_accum_x += delta_x;
+            if self.wheel_accum_x.abs() >= WHEEL_DETENT_THRESHOLD {
+                let step = self.wheel_accum_x.signum() as i32;
+                if delta_x.abs() >= WHEEL_DETENT_THRESHOLD {
+                    self.wheel_accum_x = 0.0;
+                } else {
+                    self.wheel_accum_x -= (step as f32) * WHEEL_DETENT_THRESHOLD;
+                }
+                (step, 0)
+            } else {
+                (0, 0)
+            }
         };
         let wheel = WheelButton::from_deltas(dx, dy)?;
         self.last_pos = Some((x, y));
@@ -181,5 +217,41 @@ impl MouseInputForwarder {
         if let Some(cmd) = self.record_wheel(x, y, delta_x, delta_y) {
             let _ = player.command_async(&[&cmd[0], &cmd[1], &cmd[2], &cmd[3]]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_accumulator_suppresses_touchpad_micro_jitter_and_fires_per_detent() {
+        let mut mouse = MouseInputForwarder::new();
+
+        // Small horizontal touchpad grazes below detent threshold must not seek.
+        assert_eq!(mouse.record_wheel(100, 100, 2.5, 0.0), None);
+        assert_eq!(mouse.record_wheel(100, 100, -3.0, 0.0), None);
+
+        // Diagonal vertical scrolls reset horizontal accumulator and only emit vertical steps.
+        assert_eq!(mouse.record_wheel(100, 100, 3.0, 6.0), None);
+        assert_eq!(mouse.record_wheel(100, 100, 3.0, 6.0), None);
+        assert_eq!(
+            mouse.record_wheel(100, 100, 3.0, 6.0),
+            Some(["mouse".into(), "100".into(), "100".into(), "3".into()])
+        );
+
+        // Deliberate horizontal scroll accumulates cleanly to one WHEEL_RIGHT step ("6").
+        assert_eq!(mouse.record_wheel(100, 100, 8.0, 0.0), None);
+        assert_eq!(
+            mouse.record_wheel(100, 100, 8.0, 0.0),
+            Some(["mouse".into(), "100".into(), "100".into(), "6".into()])
+        );
+
+        // Large discrete mouse-wheel notch fires once without storing unbounded remainder.
+        assert_eq!(
+            mouse.record_wheel(100, 100, 0.0, -60.0),
+            Some(["mouse".into(), "100".into(), "100".into(), "4".into()])
+        );
+        assert_eq!(mouse.record_wheel(100, 100, 0.0, -1.0), None);
     }
 }

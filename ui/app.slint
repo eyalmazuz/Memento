@@ -856,13 +856,9 @@ export component MementoApp inherits Window {
                             }
                             reject
                         }
-                        double-clicked => {
-                            // Only toggle fullscreen locally when Memento's built-in OSC is active;
-                            // when custom OSC is enabled (`osc-enabled == false`), mpv handles MBTN_LEFT_DBL via forwarded MOUSE_BTN0 (H3.2).
-                            if root.osc-enabled {
-                                root.toggle-fullscreen();
-                            }
-                        }
+                        // Double-click fullscreen is handled by libmpv (`MBTN_LEFT_DBL`) via the
+                        // forwarded `MOUSE_BTN0` pointer events above and synced back through
+                        // `mpv_fullscreen_change`, avoiding a double-toggle race and respecting `input.conf`.
                     }
 
                     // Branded Empty / Placeholder State (opaque #000000 canvas so a stale video frame never bleeds through)
@@ -1474,6 +1470,7 @@ export component MementoApp inherits Window {
                     // Bottom OSC Bar (Floating, 50px — hidden when custom OSC active or during OCR mode)
                     osc := PlayerOscBar {
                         property <bool> target-visible: root.osc-enabled && root.osc-visible && !root.ocr-mode;
+                        interactive: self.target-visible;
                         opacity: self.target-visible ? 1.0 : 0.0;
                         animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
                         visible: self.target-visible || self.opacity > 0.01;

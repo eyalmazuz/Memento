@@ -916,6 +916,7 @@ pub(crate) fn install_window_chrome_handlers(
         renderer_overrides.disable_windows_borderless_workaround,
     )));
     let saved_native_maximized = Rc::new(Cell::new(false));
+    let pending_native_fullscreen = Rc::new(Cell::new(None::<bool>));
     #[cfg(target_os = "windows")]
     let win32_fs_snapshot: Rc<RefCell<Option<memento_os::Win32WindowStyleSnapshot>>> =
         Rc::new(RefCell::new(None));
@@ -925,8 +926,15 @@ pub(crate) fn install_window_chrome_handlers(
         };
         let mut fs = fullscreen_ctrl.borrow_mut();
         // Sync directly from the OS window's fullscreen state so external WM exits
-        // (e.g. Alt+F11 / compositor shortcut) never leave `fs` stuck thinking it's fullscreen.
-        fs.sync_external_native_fullscreen(app.window().is_fullscreen());
+        // (e.g. Alt+F11 / compositor shortcut) never leave `fs` stuck thinking it's fullscreen,
+        // while avoiding clobbering an in-flight async Wayland `set_fullscreen` transition.
+        let os_is_fullscreen = app.window().is_fullscreen();
+        if pending_native_fullscreen.get() == Some(os_is_fullscreen) {
+            pending_native_fullscreen.set(None);
+        }
+        if pending_native_fullscreen.get().is_none() {
+            fs.sync_external_native_fullscreen(os_is_fullscreen);
+        }
         let pos = app.window().position();
         let size = app.window().size();
         let current_rect = memento_os::WindowRect::new(pos.x, pos.y, size.width, size.height);
@@ -949,6 +957,11 @@ pub(crate) fn install_window_chrome_handlers(
                         app.window().set_maximized(true);
                     }
                 }
+                pending_native_fullscreen.set(if app.window().is_fullscreen() == *fullscreen {
+                    None
+                } else {
+                    Some(*fullscreen)
+                });
                 app.set_window_bottom_margin(0.0);
                 *fullscreen
             }
