@@ -272,7 +272,13 @@ struct GlVideoSurface {
 }
 
 impl GlVideoSurface {
-    fn from_context(gl: glow::Context, player: &MpvInstance, prefer_16f: bool) -> Self {
+    fn from_context(
+        gl: glow::Context,
+        player: &MpvInstance,
+        prefer_16f: bool,
+        planned_hwdec: &str,
+        use_advanced_control: bool,
+    ) -> Self {
         let caps = GlCapabilities::from_context(&gl);
         let (renderer, version, max_texture_size) = unsafe {
             let renderer = gl.get_parameter_string(glow::RENDERER);
@@ -284,7 +290,9 @@ impl GlVideoSurface {
                 u32::try_from(max_tex).ok().filter(|&v| v > 0),
             )
         };
-        eprintln!("OpenGL video device: {renderer}; {version}");
+        eprintln!(
+            "OpenGL video device: {renderer}; {version} (hwdec={planned_hwdec}, advanced_control={use_advanced_control})"
+        );
         if let Err(error) = player.configure_opengl_decoder(&renderer) {
             eprintln!("Could not configure video decoder interop: {error}");
         }
@@ -510,6 +518,25 @@ fn build_owned_gl_proc_resolver(
     })
 }
 
+#[cfg(target_os = "macos")]
+fn build_owned_gl_proc_resolver_macos(
+) -> impl Fn(&std::ffi::CStr) -> *const std::ffi::c_void + Send + Sync + 'static {
+    move |name: &std::ffi::CStr| unsafe {
+        let handle = libc::dlopen(
+            c"/System/Library/Frameworks/OpenGL.framework/OpenGL".as_ptr(),
+            libc::RTLD_LAZY | libc::RTLD_NOLOAD,
+        );
+        if !handle.is_null() {
+            let ptr = libc::dlsym(handle, name.as_ptr());
+            libc::dlclose(handle);
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr())
+    }
+}
+
 fn video_render_size(app: &MementoApp, player: &MpvInstance, opengl_active: bool) -> (u32, u32) {
     compute_video_render_size(
         app.get_video_width(),
@@ -556,6 +583,8 @@ pub(crate) fn install_video_pipeline(
     let notifier_pending_frame = pending_playback_frame;
     let notifier_trigger_initial = trigger_initial_loads.clone();
     let notifier_prefer_16f = gl_prefer_16f;
+    let use_advanced_control = renderer_plan.use_advanced_control();
+    let planned_hwdec = renderer_plan.effective_hwdec().to_owned();
 
     if renderer_plan.primary == PlatformRendererKind::Software {
         eprintln!("Video renderer: libmpv software (per startup renderer plan)");
@@ -588,10 +617,11 @@ pub(crate) fn install_video_pipeline(
                                         *get_proc_address,
                                         wl_display.is_some(),
                                     ) {
-                                        player.activate_opengl_owned_with_display(
+                                        player.activate_opengl_owned_with_options(
                                             owned_resolver,
                                             x11_display,
                                             wl_display,
+                                            use_advanced_control,
                                         )
                                     } else {
                                         player.activate_opengl_with_display(
@@ -601,7 +631,16 @@ pub(crate) fn install_video_pipeline(
                                         )
                                     }
                                 }
-                                #[cfg(not(target_os = "linux"))]
+                                #[cfg(target_os = "macos")]
+                                {
+                                    player.activate_opengl_owned_with_options(
+                                        build_owned_gl_proc_resolver_macos(),
+                                        x11_display,
+                                        wl_display,
+                                        use_advanced_control,
+                                    )
+                                }
+                                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                                 {
                                     player.activate_opengl_with_display(
                                         *get_proc_address,
@@ -617,6 +656,8 @@ pub(crate) fn install_video_pipeline(
                                             gl,
                                             player,
                                             notifier_prefer_16f.get(),
+                                            &planned_hwdec,
+                                            use_advanced_control,
                                         ));
                                     notifier_pending.set(true);
                                     eprintln!("Video renderer: libmpv OpenGL");

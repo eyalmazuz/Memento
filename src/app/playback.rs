@@ -10,9 +10,12 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model as _, VecModel};
 
-use crate::app::clipboard::read_copied_text_or_clipboard;
+use crate::app::clipboard::{copy_text_to_clipboard, read_copied_text_or_clipboard};
+use crate::app::keybinds::AudioContextMarkState;
 use crate::app::paths::{memento_xdg_dir, resolve_config_file_open_dir};
-use crate::app::preferences::{clear_recent_titles, record_recent_media, refresh_recent_files};
+use crate::app::preferences::{
+    clear_recent_titles, record_recent_media, refresh_recent_files, setting_enabled,
+};
 use crate::app::subtitle_drawer::{refresh_secondary_subtitle_list, refresh_subtitle_list};
 use crate::app::subtitle_io::parse_external_subtitles;
 use crate::app::window_chrome::chapter_title_at_time;
@@ -20,14 +23,135 @@ use crate::app::workers::{ChannelSlot, ThumbRequest, UiEvent, UiRelay};
 use crate::controller::asr::{AsrController, AsrSettings};
 use crate::controller::ass::AssOverlayController;
 use crate::controller::config::ConfigController;
+use crate::controller::dictmanager::DictionaryManager;
 use crate::controller::player::{
     clear_primary_subtitle, effective_media_title, is_subtitle_file, LivePlayerCoordinator,
 };
 use crate::controller::subtitles::SubtitleController;
 use crate::ui::{self, MementoApp, SubEntry};
 use memento_player::{MpvInstance, PlaylistLoad};
+use memento_setting::keys as raw;
 
 pub(crate) const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Complete set of subtitle extensions recognized for drag-and-drop and CLI loads (C5.3).
+const SUPPORTED_SUBTITLE_EXTENSIONS: &[&str] = &[
+    "ass", "ssa", "srt", "vtt", "sub", "idx", "sup", "lrc", "mks", "ttml", "smi", "rt",
+];
+
+pub(crate) fn is_supported_subtitle_path(path: &Path) -> bool {
+    if is_subtitle_file(path) {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            SUPPORTED_SUBTITLE_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+pub(crate) fn is_supported_subtitle_str(path: &str) -> bool {
+    is_supported_subtitle_path(Path::new(path))
+}
+
+pub(crate) fn is_dictionary_archive_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+/// Persist `main-window/subtitle-list` and `main-window/search` open state across launches (M3).
+pub(crate) fn persist_window_panel_state(
+    app: &MementoApp,
+    config_ctrl: &ConfigController,
+    config_dir: &Path,
+) {
+    let sub_list_key = format!("{}/{}", raw::window::GROUP, raw::window::SUBTITLE_LIST);
+    let search_key = format!("{}/{}", raw::window::GROUP, raw::window::SEARCH);
+    let _ = config_ctrl.persist_single_setting(
+        &sub_list_key,
+        if app.get_sub_drawer_open() {
+            "true"
+        } else {
+            "false"
+        },
+        config_dir,
+        "memento.conf",
+    );
+    let _ = config_ctrl.persist_single_setting(
+        &search_key,
+        if app.get_dict_search_open() {
+            "true"
+        } else {
+            "false"
+        },
+        config_dir,
+        "memento.conf",
+    );
+}
+
+/// Restore `main-window/subtitle-list` and `main-window/search` open state on startup (M3).
+pub(crate) fn restore_window_panel_state(app: &MementoApp, config_ctrl: &ConfigController) {
+    let sub_list_open = setting_enabled(
+        config_ctrl,
+        raw::window::GROUP,
+        raw::window::SUBTITLE_LIST,
+        false,
+    );
+    let search_open = setting_enabled(config_ctrl, raw::window::GROUP, raw::window::SEARCH, false);
+    app.set_sub_drawer_open(sub_list_open);
+    app.set_dict_search_open(search_open);
+}
+
+fn should_resume_on_subtitle_unhover(config_ctrl: &ConfigController) -> bool {
+    setting_enabled(
+        config_ctrl,
+        raw::search::GROUP,
+        raw::search::HOVER_PAUSE_RESUME,
+        raw::search::HOVER_PAUSE_RESUME_DEFAULT,
+    )
+}
+
+/// Unconditionally load picked subtitle paths via `mpv` `sub-add`, NEVER falling
+/// back to `loadfile` regardless of filename extension (C5.3).
+fn add_subtitle_paths_unconditionally(
+    app: &MementoApp,
+    player: Option<&MpvInstance>,
+    sub_ctrl: &RefCell<SubtitleController>,
+    sub_model: &Rc<VecModel<SubEntry>>,
+    paths: &[PathBuf],
+) {
+    for sub_path in paths {
+        let sub_str = sub_path.to_string_lossy().into_owned();
+        if let Some(player) = player {
+            if let Err(error) = player.command(&["sub-add", &sub_str]) {
+                app.set_status_message(format!("Could not add subtitles: {error}").into());
+            }
+            continue;
+        }
+        if sub_path.is_file() {
+            match parse_external_subtitles(sub_path) {
+                Ok(cues) => {
+                    let mut subtitles = sub_ctrl.borrow_mut();
+                    let sid = if subtitles.primary_sid() > 0 {
+                        subtitles.primary_sid()
+                    } else {
+                        subtitles.set_primary_sid(1);
+                        app.set_primary_sid(1);
+                        1
+                    };
+                    subtitles.set_external_cues(sid, &sub_str, cues);
+                    refresh_subtitle_list(app, sub_model, &subtitles);
+                }
+                Err(error) => {
+                    app.set_status_message(format!("Could not add subtitles: {error}").into());
+                }
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_playlist_into(
@@ -45,7 +169,7 @@ pub(crate) fn load_playlist_into(
         if entry.path.is_empty() {
             continue;
         }
-        if is_subtitle_file(entry.path.as_str()) {
+        if is_supported_subtitle_str(entry.path.as_str()) {
             subtitle_paths.push(entry.path.clone());
         } else {
             media_entries.push(entry);
@@ -100,6 +224,7 @@ pub(crate) fn load_playlist_into(
     app.set_secondary_sub_text("".into());
     app.set_thumbnail_frame(slint::Image::default());
     app.set_hover_chapter_title("".into());
+    app.invoke_clear_audio_context();
     clear_primary_subtitle(app);
     Ok(Some(first_path))
 }
@@ -131,6 +256,7 @@ pub(crate) fn load_media_into(
 pub(crate) struct PlaybackHandles {
     pub(crate) trigger_initial_loads: Rc<dyn Fn()>,
     pub(crate) handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)>,
+    pub(crate) handle_add_subtitle_paths: Rc<dyn Fn(Vec<PathBuf>)>,
     pub(crate) quit_timer: Rc<slint::Timer>,
     pub(crate) hover_resume_timer: Rc<slint::Timer>,
     pub(crate) hover_pause_owned: Rc<Cell<bool>>,
@@ -157,14 +283,45 @@ pub(crate) fn install_playback_handlers(
     closing: Rc<Cell<bool>>,
     thumb_tx: ChannelSlot<ThumbRequest>,
     ui_relay: UiRelay,
+    audio_context_marks: Rc<RefCell<AudioContextMarkState>>,
+    dictionary_manager: Option<DictionaryManager>,
     initial_loads: Vec<PlaylistLoad>,
     cli_keep_paused: bool,
     #[cfg(feature = "ocr")] ocr_controller: Result<crate::controller::ocr::OcrController, String>,
 ) -> PlaybackHandles {
-    // ── Subtitle hover-pause ────────────────────────────────────────────────
+    let ocr_epoch = Arc::new(AtomicU64::new(0));
+
+    // ── Manual A/B Audio Context Clearing (H5.2 / #136) ─────────────────────
+    let clear_audio_marks = audio_context_marks;
+    let clear_audio_app = app.as_weak();
+    app.on_clear_audio_context(move || {
+        clear_audio_marks.borrow_mut().clear();
+        if let Some(app) = clear_audio_app.upgrade() {
+            if !app.get_audio_context_hud_text().is_empty() {
+                app.set_audio_context_hud_text("".into());
+            }
+        }
+    });
+
+    // ── Copy subtitle text on double-click (M2) ─────────────────────────────
+    let copy_sub_app = app.as_weak();
+    app.on_copy_subtitle_text(move |text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        copy_text_to_clipboard(trimmed);
+        if let Some(app) = copy_sub_app.upgrade() {
+            app.set_copied_subtitle_text(trimmed.into());
+            app.set_status_message("Copied subtitle text".into());
+        }
+    });
+
+    // ── Subtitle hover-pause (respecting `search/hover-pause-resume`) ───────
     let hover_pause_owned = Rc::new(Cell::new(false));
     let hover_resume_timer = Rc::new(slint::Timer::default());
     let hover_player = mpv.clone();
+    let hover_config = config_ctrl.clone();
     let hover_app = app.as_weak();
     let hover_owned = hover_pause_owned.clone();
     let resume_timer = hover_resume_timer.clone();
@@ -180,6 +337,11 @@ pub(crate) fn install_playback_handlers(
                 }
             }
         } else if hover_owned.get() {
+            if !should_resume_on_subtitle_unhover(&hover_config) {
+                resume_timer.stop();
+                hover_owned.set(false);
+                return;
+            }
             let weak = hover_app.clone();
             let player = hover_player.clone();
             let owned = hover_owned.clone();
@@ -270,6 +432,8 @@ pub(crate) fn install_playback_handlers(
         let open_generation = media_generation.clone();
         let open_shared_gen = shared_media_generation.clone();
         let open_cache = config_dir.clone();
+        let open_dict_manager = dictionary_manager;
+        let open_relay = ui_relay.clone();
         Rc::new(move |paths: Vec<PathBuf>| {
             if paths.is_empty() {
                 return;
@@ -277,13 +441,54 @@ pub(crate) fn install_playback_handlers(
             let Some(app) = weak_app.upgrade() else {
                 return;
             };
+            let mut zip_paths = Vec::new();
             let mut media_paths = Vec::new();
             let mut subtitle_paths = Vec::new();
             for path in paths {
-                if is_subtitle_file(path.as_path()) {
+                if is_dictionary_archive_path(path.as_path()) {
+                    zip_paths.push(path);
+                } else if is_supported_subtitle_path(path.as_path()) {
                     subtitle_paths.push(path);
                 } else {
                     media_paths.push(path);
+                }
+            }
+            if !zip_paths.is_empty() {
+                if let Some(manager) = open_dict_manager.clone() {
+                    app.set_status_message(
+                        format!("Importing {} dictionary archive(s)…", zip_paths.len()).into(),
+                    );
+                    let relay = open_relay.clone();
+                    std::thread::spawn(move || {
+                        let mut imported = 0usize;
+                        let mut errors = Vec::new();
+                        let mut all_dicts = Vec::new();
+                        for archive in zip_paths {
+                            match manager.add_dictionary(&archive) {
+                                Ok(dicts) => {
+                                    imported += 1;
+                                    all_dicts = dicts;
+                                }
+                                Err(err) => {
+                                    let label = archive
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("archive");
+                                    errors.push(format!("{label}: {err}"));
+                                }
+                            }
+                        }
+                        if all_dicts.is_empty() {
+                            all_dicts = manager.list_dictionaries().unwrap_or_default();
+                        }
+                        relay.send_event(UiEvent::DictionariesImported {
+                            imported,
+                            errors,
+                            all_dicts,
+                        });
+                    });
+                } else {
+                    app.set_status_message("Dictionary manager is unavailable".into());
                 }
             }
             let player_ref = open_mpv.borrow();
@@ -398,13 +603,42 @@ pub(crate) fn install_playback_handlers(
         })
     };
 
+    // C5.3: Dedicated Add Subtitle handler that ALWAYS invokes `sub-add`, never `loadfile`.
+    let handle_add_subtitle_paths: Rc<dyn Fn(Vec<PathBuf>)> = {
+        let weak_app = app.as_weak();
+        let add_mpv = mpv.clone();
+        let add_sub_ctrl = sub_ctrl.clone();
+        let add_sub_model = sub_model.clone();
+        Rc::new(move |paths: Vec<PathBuf>| {
+            if paths.is_empty() {
+                return;
+            }
+            let Some(app) = weak_app.upgrade() else {
+                return;
+            };
+            let player_ref = add_mpv.borrow();
+            add_subtitle_paths_unconditionally(
+                &app,
+                player_ref.as_ref(),
+                &add_sub_ctrl,
+                &add_sub_model,
+                &paths,
+            );
+        })
+    };
+
+    // C1.1: Route Open File dialog through `open_files_on_main_thread` so macOS
+    // runs `NSOpenPanel` strictly on the main AppKit thread while Linux/Windows stay async.
     let open_file_config = config_ctrl.clone();
     let open_file_relay = ui_relay.clone();
     app.on_open_file(move || {
         let start_dir = resolve_config_file_open_dir(&open_file_config);
         let relay = open_file_relay.clone();
-        memento_os::open_files_async(
+        memento_os::open_files_on_main_thread(
             memento_os::FileDialogOptions::media_and_subtitles(start_dir),
+            |task| {
+                let _ = slint::invoke_from_event_loop(task);
+            },
             move |paths| {
                 if !paths.is_empty() {
                     relay.send_event(UiEvent::OpenPaths(paths));
@@ -591,6 +825,23 @@ pub(crate) fn install_playback_handlers(
     });
 
     // ── Track & ASR Selection ───────────────────────────────────────────────
+    let video_mpv = mpv.clone();
+    let video_app = app.as_weak();
+    app.on_select_video_track(move |id| {
+        if let Some(player) = &*video_mpv.borrow() {
+            match player.set_vid(id.into()) {
+                Ok(()) => {
+                    if let Some(app) = video_app.upgrade() {
+                        app.set_video_id(id);
+                    }
+                }
+                Err(error) => eprintln!("Cannot select video track {id}: {error}"),
+            }
+        } else if let Some(app) = video_app.upgrade() {
+            app.set_video_id(id);
+        }
+    });
+
     let audio_mpv = mpv.clone();
     let audio_app = app.as_weak();
     app.on_select_audio_track(move |id| {
@@ -887,7 +1138,9 @@ pub(crate) fn install_playback_handlers(
     let close_ass = ass_ctrl;
     let close_screensaver = screensaver.clone();
     let close_thumb_tx = thumb_tx.clone();
+    let close_ocr_epoch = ocr_epoch.clone();
     app.on_close_media(move || {
+        close_ocr_epoch.fetch_add(1, Ordering::AcqRel);
         {
             let player_ref = close_mpv.borrow();
             if let Some(mpv_inst) = player_ref.as_ref() {
@@ -912,6 +1165,7 @@ pub(crate) fn install_playback_handlers(
         close_sec_sub_model.set_vec(Vec::new());
         if let Some(app) = weak_close.upgrade() {
             app.invoke_dismiss_definition();
+            app.invoke_clear_audio_context();
             ui::clear_rich_bridge_ass_lookup(&app);
             if let Ok(mut ass) = close_ass.try_borrow_mut() {
                 ass.clear_for_new_media(&app);
@@ -938,7 +1192,7 @@ pub(crate) fn install_playback_handlers(
         crate::app::trim_os_heap();
     });
 
-    // ── Bounded Graceful Quit / Close Window Handler ────────────────────────
+    // ── Bounded Graceful Quit / Close Window Handler (C5.1 & M3) ────────────
     let quit_timer = Rc::new(slint::Timer::default());
     let asr_shutdown_timed_out = Rc::new(Cell::new(false));
     let quit_poll = quit_timer.clone();
@@ -950,17 +1204,22 @@ pub(crate) fn install_playback_handlers(
     let quit_hover_owned = hover_pause_owned.clone();
     let quit_screensaver = screensaver;
     let quit_timed_out = asr_shutdown_timed_out.clone();
+    let quit_config = config_ctrl.clone();
+    let quit_config_dir = config_dir;
+    let quit_ocr_epoch = ocr_epoch.clone();
     let quit_app = app.as_weak();
     app.on_quit_app(move || {
         if quit_closing.replace(true) {
             return;
         }
+        quit_ocr_epoch.fetch_add(1, Ordering::AcqRel);
         quit_screensaver.borrow_mut().uninhibit();
         quit_restart.set(false);
         quit_hover_resume.stop();
         quit_hover_owned.set(false);
         quit_asr.borrow_mut().begin_shutdown();
         if let Some(app) = quit_app.upgrade() {
+            persist_window_panel_state(&app, &quit_config, &quit_config_dir);
             app.invoke_dismiss_definition();
             app.set_asr_track_selected(false);
             app.set_asr_running(false);
@@ -1019,16 +1278,21 @@ pub(crate) fn install_playback_handlers(
         }
     });
 
+    // C1.1 & C5.3: Add Subtitle uses main-thread-safe file dialog and sends
+    // `UiEvent::AddSubtitles` so `sub-add` is called unconditionally (never `loadfile`).
     let add_sub_config = config_ctrl.clone();
     let add_sub_relay = ui_relay;
     app.on_add_subtitle(move || {
         let start_dir = resolve_config_file_open_dir(&add_sub_config);
         let relay = add_sub_relay.clone();
-        memento_os::open_files_async(
+        memento_os::open_files_on_main_thread(
             memento_os::FileDialogOptions::subtitles_only(start_dir),
+            |task| {
+                let _ = slint::invoke_from_event_loop(task);
+            },
             move |paths| {
                 if !paths.is_empty() {
-                    relay.send_event(UiEvent::OpenPaths(paths));
+                    relay.send_event(UiEvent::AddSubtitles(paths));
                 }
             },
         );
@@ -1042,6 +1306,7 @@ pub(crate) fn install_playback_handlers(
     });
 
     let ocr_mode_app = app.as_weak();
+    let ocr_start_epoch = ocr_epoch.clone();
     app.on_start_ocr(move || {
         if let Some(app) = ocr_mode_app.upgrade() {
             if !app.get_ocr_enabled() {
@@ -1049,27 +1314,40 @@ pub(crate) fn install_playback_handlers(
             } else if app.get_duration() <= 0.0 {
                 app.set_status_message("Open a video before selecting text for OCR".into());
             } else {
+                ocr_start_epoch.fetch_add(1, Ordering::AcqRel);
                 app.set_status_message("Drag a rectangle around text in the video".into());
                 app.set_ocr_mode(true);
             }
         }
     });
 
+    // H3.6: Wire `on_ocr_cancelled` so right-click / Escape / rapid re-trigger
+    // cancels any in-flight OCR request cleanly via the atomic `ocr_epoch` guard.
+    let cancel_ocr_app = app.as_weak();
+    let cancel_ocr_epoch = ocr_epoch.clone();
+    app.on_ocr_cancelled(move || {
+        cancel_ocr_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(app) = cancel_ocr_app.upgrade() {
+            app.set_ocr_mode(false);
+            app.set_status_message("OCR cancelled".into());
+        }
+    });
+
     #[cfg(feature = "ocr")]
     {
-        use crate::app::preferences::setting_enabled;
         use crate::controller::ocr::{OcrFrame, OcrRegion, OcrSettings, OcrViewport};
         use crate::ui::PopupBridge;
         use memento_config::Value;
-        use memento_setting::keys as raw;
 
         let ocr_region_app = app.as_weak();
         let ocr_region_mpv = mpv;
         let ocr_region_config = config_ctrl;
+        let ocr_region_epoch = ocr_epoch;
         app.on_ocr_region(move |x, y, width, height| {
             let Some(app) = ocr_region_app.upgrade() else {
                 return;
             };
+            let req_epoch = ocr_region_epoch.fetch_add(1, Ordering::AcqRel) + 1;
             app.set_status_message("Recognizing selected text…".into());
             let Some(controller) = ocr_controller.as_ref().ok().cloned() else {
                 return;
@@ -1077,6 +1355,7 @@ pub(crate) fn install_playback_handlers(
             let Some(player) = &*ocr_region_mpv.borrow() else {
                 return;
             };
+            // Keep `request_screenshot(false)` so OCR captures video only (not text subtitles).
             let capture = match player.request_screenshot(false) {
                 Ok(capture) => capture,
                 Err(error) => {
@@ -1106,6 +1385,7 @@ pub(crate) fn install_playback_handlers(
                 ),
             };
             let response_app = ocr_region_app.clone();
+            let thread_epoch = ocr_region_epoch.clone();
             let viewport = OcrViewport {
                 width: app.get_video_width().into(),
                 height: app.get_video_height().into(),
@@ -1115,16 +1395,26 @@ pub(crate) fn install_playback_handlers(
                     OcrFrame::from_rgba(raw.width, raw.height, raw.pixels)
                         .map_err(|error| error.to_string())
                 });
+                if thread_epoch.load(Ordering::Acquire) != req_epoch {
+                    return;
+                }
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(error) => {
+                        let ui_epoch = thread_epoch.clone();
                         let _ = response_app.upgrade_in_event_loop(move |app| {
-                            app.set_status_message(format!("Cannot capture video: {error}").into());
+                            if ui_epoch.load(Ordering::Acquire) == req_epoch {
+                                app.set_status_message(
+                                    format!("Cannot capture video: {error}").into(),
+                                );
+                            }
                         });
                         return;
                     }
                 };
                 let error_app = response_app.clone();
+                let cb_epoch = thread_epoch.clone();
+                let err_epoch = thread_epoch.clone();
                 let result = controller.read_region_async(
                     frame,
                     OcrRegion {
@@ -1136,33 +1426,44 @@ pub(crate) fn install_playback_handlers(
                     viewport,
                     settings,
                     move |recognized| {
-                        let _ = response_app.upgrade_in_event_loop(move |app| match recognized {
-                            Ok(text) => {
-                                let text = text.trim();
-                                if !text.is_empty() {
-                                    app.invoke_dismiss_definition();
-                                    app.set_dict_search_open(true);
-                                    if app.global::<PopupBridge>().get_rich_enabled() {
-                                        app.global::<PopupBridge>()
-                                            .invoke_panel_search_requested(text.into());
-                                    } else {
-                                        app.set_dict_query(text.into());
-                                        app.invoke_search_dictionary(text.into());
-                                    }
-                                    app.set_status_message(format!("OCR: {text}").into());
-                                } else {
-                                    app.set_status_message(
-                                        "No text recognized in selected region".into(),
-                                    );
-                                }
+                        if cb_epoch.load(Ordering::Acquire) != req_epoch {
+                            return;
+                        }
+                        let ui_epoch = cb_epoch.clone();
+                        let _ = response_app.upgrade_in_event_loop(move |app| {
+                            if ui_epoch.load(Ordering::Acquire) != req_epoch {
+                                return;
                             }
-                            Err(error) => app.set_status_message(error.to_string().into()),
+                            match recognized {
+                                Ok(text) => {
+                                    let text = text.trim();
+                                    if !text.is_empty() {
+                                        app.invoke_dismiss_definition();
+                                        app.set_dict_search_open(true);
+                                        if app.global::<PopupBridge>().get_rich_enabled() {
+                                            app.global::<PopupBridge>()
+                                                .invoke_panel_search_requested(text.into());
+                                        } else {
+                                            app.set_dict_query(text.into());
+                                            app.invoke_search_dictionary(text.into());
+                                        }
+                                        app.set_status_message(format!("OCR: {text}").into());
+                                    } else {
+                                        app.set_status_message(
+                                            "No text recognized in selected region".into(),
+                                        );
+                                    }
+                                }
+                                Err(error) => app.set_status_message(error.to_string().into()),
+                            }
                         });
                     },
                 );
                 if let Err(error) = result {
                     let _ = error_app.upgrade_in_event_loop(move |app| {
-                        app.set_status_message(error.to_string().into());
+                        if err_epoch.load(Ordering::Acquire) == req_epoch {
+                            app.set_status_message(error.to_string().into());
+                        }
                     });
                 }
             });
@@ -1194,9 +1495,145 @@ pub(crate) fn install_playback_handlers(
     PlaybackHandles {
         trigger_initial_loads,
         handle_open_or_drop_paths,
+        handle_add_subtitle_paths,
         quit_timer,
         hover_resume_timer,
         hover_pause_owned,
         asr_shutdown_timed_out,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_subtitle_extensions_include_all_twelve_formats_and_ttml() {
+        for ext in [
+            "ass", "ssa", "srt", "vtt", "sub", "idx", "sup", "lrc", "mks", "ttml", "smi", "rt",
+            "TTML", "SRT",
+        ] {
+            let p = PathBuf::from(format!("/tmp/episode.{ext}"));
+            assert!(
+                is_supported_subtitle_path(&p),
+                "expected .{ext} to be recognized as a subtitle extension"
+            );
+        }
+        assert!(!is_supported_subtitle_path(Path::new("/tmp/video.mkv")));
+        assert!(!is_supported_subtitle_path(Path::new("/tmp/dict.zip")));
+        assert!(is_dictionary_archive_path(Path::new("/tmp/jmdict.ZIP")));
+    }
+
+    #[test]
+    fn add_subtitle_unconditional_never_replaces_media_even_for_unlisted_extension() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let custom_sub = dir.path().join("notes.customext");
+        std::fs::write(&custom_sub, "1\n00:00:01,000 --> 00:00:03,000\nHello\n").unwrap();
+        app.set_media_title("Original Video".into());
+
+        let sub_ctrl = RefCell::new(SubtitleController::new());
+        let sub_model = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(sub_model.clone().into());
+        add_subtitle_paths_unconditionally(&app, None, &sub_ctrl, &sub_model, &[custom_sub]);
+        assert_eq!(app.get_media_title().as_str(), "Original Video");
+    }
+
+    #[test]
+    fn panel_persistence_roundtrip_and_hover_pause_resume_setting() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = ConfigController::new();
+        let app = MementoApp::new().unwrap();
+        app.set_sub_drawer_open(true);
+        app.set_dict_search_open(true);
+        persist_window_panel_state(&app, &cfg, dir.path());
+
+        let app2 = MementoApp::new().unwrap();
+        assert!(!app2.get_sub_drawer_open());
+        assert!(!app2.get_dict_search_open());
+        restore_window_panel_state(&app2, &cfg);
+        assert!(app2.get_sub_drawer_open());
+        assert!(app2.get_dict_search_open());
+
+        assert!(should_resume_on_subtitle_unhover(&cfg));
+        cfg.edit_setting("search/hover-pause-resume", "false")
+            .unwrap();
+        assert!(!should_resume_on_subtitle_unhover(&cfg));
+    }
+
+    #[test]
+    fn copy_subtitle_text_clear_audio_context_and_ocr_cancel_handlers_work() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = Rc::new(ConfigController::new());
+        let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
+        let coord: Rc<RefCell<Option<LivePlayerCoordinator>>> = Rc::new(RefCell::new(None));
+        let sub_ctrl = Rc::new(RefCell::new(SubtitleController::new()));
+        let sub_model = Rc::new(VecModel::<SubEntry>::default());
+        let sec_model = Rc::new(VecModel::<SubEntry>::default());
+        let current_media = Rc::new(RefCell::new(None));
+        let media_gen = Rc::new(Cell::new(0u64));
+        let shared_gen = Arc::new(AtomicU64::new(0));
+        let asr = Rc::new(RefCell::new(AsrController::new()));
+        let asr_restart = Rc::new(Cell::new(false));
+        let ass = Rc::new(RefCell::new(AssOverlayController::new()));
+        let screensaver = Rc::new(RefCell::new(memento_os::Screensaver::new()));
+        let closing = Rc::new(Cell::new(false));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let thumb_tx = ChannelSlot::new(tx);
+        let ui_relay = UiRelay::new();
+        let audio_marks = Rc::new(RefCell::new(AudioContextMarkState::default()));
+
+        let _handles = install_playback_handlers(
+            &app,
+            mpv,
+            coord,
+            sub_ctrl,
+            sub_model,
+            sec_model,
+            cfg,
+            dir.path().to_path_buf(),
+            current_media,
+            media_gen,
+            shared_gen,
+            asr,
+            asr_restart,
+            ass,
+            screensaver,
+            closing,
+            thumb_tx,
+            ui_relay,
+            audio_marks.clone(),
+            None,
+            Vec::new(),
+            false,
+            #[cfg(feature = "ocr")]
+            Err("disabled in test".to_owned()),
+        );
+
+        // M2: copy subtitle text on double-click
+        app.invoke_copy_subtitle_text("  日本語の字幕  ".into());
+        assert_eq!(app.get_copied_subtitle_text().as_str(), "日本語の字幕");
+
+        // H5.2: clear audio context resets marks + HUD text
+        let hud = audio_marks.borrow_mut().mark_at(10.0);
+        app.set_audio_context_hud_text(hud.into());
+        assert!(!app.get_audio_context_hud_text().is_empty());
+        app.invoke_clear_audio_context();
+        assert_eq!(app.get_audio_context_hud_text().as_str(), "");
+        assert_eq!(*audio_marks.borrow(), AudioContextMarkState::Empty);
+
+        // H3.6: ocr_cancelled exits ocr_mode and updates status
+        app.set_ocr_mode(true);
+        app.invoke_ocr_cancelled();
+        assert!(!app.get_ocr_mode());
+        assert_eq!(app.get_status_message().as_str(), "OCR cancelled");
+
+        // LOW: select_video_track updates video_id cleanly
+        app.invoke_select_video_track(2);
+        assert_eq!(app.get_video_id(), 2);
     }
 }

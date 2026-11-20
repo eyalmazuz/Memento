@@ -13,11 +13,14 @@ use std::time::{Duration, Instant};
 use slint::{ComponentHandle, Model as _, VecModel};
 
 use crate::app::paths::memento_xdg_dir;
+use crate::app::playback::persist_window_panel_state;
 use crate::app::preferences::{
-    cached_furigana_ratio, record_recent_media_title, refresh_recent_files,
+    cached_furigana_ratio, record_recent_media, record_recent_media_title,
+    refresh_player_preferences, refresh_recent_files,
 };
 use crate::app::subtitle_drawer::{
-    auto_scroll_subtitle_drawer_if_needed, refresh_secondary_subtitle_list, refresh_subtitle_list,
+    auto_scroll_subtitle_drawer_if_needed, refresh_secondary_subtitle_list_with_timing,
+    refresh_subtitle_list_with_timing, rerun_active_subtitle_search_silently,
 };
 use crate::app::video_pipeline::{SyncTiming, VideoParamsObserver, VideoTimings};
 use crate::app::window_chrome::{chapter_marks_for_duration, query_window_monitor_logical};
@@ -27,16 +30,54 @@ use crate::controller::ass::{
     is_matroska_path, mpv_ass_params_from_playback, AssOverlayController,
 };
 use crate::controller::config::ConfigController;
-use crate::controller::player::{is_image_subtitle_codec, LivePlayerCoordinator};
+use crate::controller::player::{is_image_subtitle_codec, track_label, LivePlayerCoordinator};
 use crate::controller::subtitles::{
     create_cue, prewarm_subtitle_furigana, ExternalSubtitleLoad, SubtitleController,
 };
+use crate::platform_renderer::DisplayServer;
 use crate::platform_window::compute_auto_fit_window_rect;
 use crate::ui::{
     active_subtitle_style_for_app, prewarm_subtitle_tokens, publish_active_subtitle,
-    subtitle_lines_for_app, MementoApp, SubEntry,
+    subtitle_lines_for_app, MementoApp, PlayerTrack, SubEntry, SubtitleOverlayBridge,
 };
-use memento_player::MpvInstance;
+use memento_player::{MpvInstance, VideoTrack};
+
+fn update_subtitle_bounds_properties(app: &MementoApp, player: &MpvInstance) {
+    let ass_native = app
+        .global::<SubtitleOverlayBridge>()
+        .get_ass_native_active();
+    let (can_inc, can_dec, can_up, can_down) = if ass_native {
+        let sub_scale = player.sub_scale();
+        let sub_pos = player.sub_pos();
+        (
+            sub_scale < 3.0 - 0.001,
+            sub_scale > 0.2 + 0.001,
+            sub_pos > 0.0 + 0.1,
+            sub_pos < 150.0 - 0.1,
+        )
+    } else {
+        let scale = app.get_subtitle_scale();
+        let offset = app.get_subtitle_offset();
+        (
+            scale < 1.0 - 0.0005,
+            scale > 0.001 + 0.0005,
+            offset < 1.0 - 0.0005,
+            offset > 0.0 + 0.0005,
+        )
+    };
+    if app.get_can_increase_sub_size() != can_inc {
+        app.set_can_increase_sub_size(can_inc);
+    }
+    if app.get_can_decrease_sub_size() != can_dec {
+        app.set_can_decrease_sub_size(can_dec);
+    }
+    if app.get_can_move_sub_up() != can_up {
+        app.set_can_move_sub_up(can_up);
+    }
+    if app.get_can_move_sub_down() != can_down {
+        app.set_can_move_sub_down(can_down);
+    }
+}
 
 pub(crate) struct SyncLoopHandles {
     pub(crate) housekeeping_timer: slint::Timer,
@@ -57,6 +98,7 @@ pub(crate) fn install_sync_loop(
     lookup_epoch: Arc<AtomicU64>,
     asr_session: Rc<RefCell<AsrController>>,
     config_ctrl: Rc<ConfigController>,
+    config_dir: PathBuf,
     asr_restart_pending: Rc<Cell<bool>>,
     closing: Rc<Cell<bool>>,
     hover_pause_owned: Rc<Cell<bool>>,
@@ -70,21 +112,12 @@ pub(crate) fn install_sync_loop(
     screensaver: Rc<RefCell<memento_os::Screensaver>>,
     ui_relay: UiRelay,
     handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)>,
+    handle_add_subtitle_paths: Rc<dyn Fn(Vec<PathBuf>)>,
     gl_prefer_16f: Rc<Cell<bool>>,
     default_prefer_16f: bool,
     video_params_observer: Rc<RefCell<VideoParamsObserver>>,
     verbose_video_timings: bool,
 ) -> SyncLoopHandles {
-    // Keep a local unbounded sender view into `furigana_tx` for `ui::publish_active_subtitle`.
-    // Wait: `publish_active_subtitle` takes `&std::sync::mpsc::Sender<(u64, String)>`.
-    // Let's bridge via a tiny forwarding helper or pass a dedicated `Sender` cloned?
-    // Even better: `ChannelSlot` exposes `with_sender`? No — `publish_active_subtitle` is in `src/ui/`
-    // and expects `&std::sync::mpsc::Sender<(u64, String)>`. We hold a local `Sender` ONLY inside
-    // `run_player_sync`? Wait: if `run_player_sync` holds a `Sender`, it is dropped when `SyncLoopHandles`
-    // and `housekeeping_timer` drop. Even simpler: `furigana_tx.with_sender(|tx| publish_active_subtitle(...))`!
-    // Let's check: `publish_active_subtitle` only borrows `&Sender`, never clones it!
-    // Wait: `ChannelSlot` doesn't have `with_sender` yet; let's check if we should add `with_sender` to `ChannelSlot`!
-    // Yes! Adding `with_sender` to `ChannelSlot` takes 5 lines and guarantees ZERO leaked `Sender` clones!
     let run_player_sync: Rc<dyn Fn()> = {
         let sync_app = app.as_weak();
         let sync_mpv = mpv.clone();
@@ -97,7 +130,8 @@ pub(crate) fn install_sync_loop(
         let sync_current_media = current_media;
         let sync_lookup_epoch = lookup_epoch;
         let sync_asr = asr_session.clone();
-        let sync_asr_config = config_ctrl;
+        let sync_asr_config = config_ctrl.clone();
+        let sync_config_dir = config_dir;
         let sync_asr_restart = asr_restart_pending.clone();
         let sync_closing = closing.clone();
         let sync_hover_owned = hover_pause_owned;
@@ -125,7 +159,13 @@ pub(crate) fn install_sync_loop(
         let previous_chapters_dur = Cell::new(0.0f64);
         let previous_title_pair: RefCell<(String, String)> =
             RefCell::new((String::new(), String::new()));
-        let previous_sec_state: Cell<(i64, usize, Option<usize>)> = Cell::new((0, 0, None));
+        let last_recorded_recent: RefCell<(u64, String)> = RefCell::new((0, String::new()));
+        let previous_video_tracks: RefCell<Vec<VideoTrack>> = RefCell::new(Vec::new());
+        let previous_primary_timing: Cell<(u64, u64)> =
+            Cell::new((1.0f64.to_bits(), 0.0f64.to_bits()));
+        let previous_sec_state: Cell<(i64, usize, Option<usize>, u64, u64)> =
+            Cell::new((0, 0, None, 1.0f64.to_bits(), 0.0f64.to_bits()));
+        let previous_cue_counts: Cell<(usize, usize)> = Cell::new((0, 0));
         let previous_playback_active: Cell<Option<bool>> = Cell::new(None);
         let previous_active_scroll: Cell<(bool, i32, Option<usize>, Option<usize>)> =
             Cell::new((false, 0, None, None));
@@ -189,8 +229,27 @@ pub(crate) fn install_sync_loop(
                     });
                 },
             );
+
+            // C5.1: Quit cleanly on `MpvEvent::Shutdown` (e.g. `q`/`Q` or `quit` via mpv).
+            if coord.take_shutdown_requested() {
+                drop(coord_ref);
+                drop(player_ref);
+                drop(subtitles);
+                drop(asr);
+                persist_window_panel_state(&app, &sync_asr_config, &sync_config_dir);
+                app.invoke_quit_app();
+                if !sync_closing.get() {
+                    let _ = slint::quit_event_loop();
+                }
+                return;
+            }
+
+            // H3.1: Consume any external mpv `fullscreen` change to drive after releasing borrows.
+            let mpv_fullscreen_change = coord.take_mpv_fullscreen_change();
+
             let gen_after = sync_media_generation.get();
-            if gen_after != gen_before {
+            let media_changed = gen_after != gen_before;
+            if media_changed {
                 sync_shared_gen.store(gen_after, Ordering::Release);
                 extracted_mkv_fonts_gen.set(None);
                 extracted_mkv_tracks.borrow_mut().clear();
@@ -208,6 +267,54 @@ pub(crate) fn install_sync_loop(
 
             let primary_is_native_ass = coord.primary_is_native_ass(&app);
             let state = coord.playback_state();
+
+            // LOW: Sync video tracks & selected video track ID for MenuBar Video submenu.
+            {
+                let mut prev_vid = previous_video_tracks.borrow_mut();
+                if *prev_vid != state.video_tracks {
+                    let ui_tracks: Vec<PlayerTrack> = state
+                        .video_tracks
+                        .iter()
+                        .filter_map(|track| {
+                            Some(PlayerTrack {
+                                id: i32::try_from(track.id).ok()?,
+                                label: track_label(track.id, &track.language, &track.title).into(),
+                                selected: track.selected,
+                            })
+                        })
+                        .collect();
+                    app.set_video_tracks(Rc::new(VecModel::from(ui_tracks)).into());
+                    prev_vid.clone_from(&state.video_tracks);
+                }
+            }
+            let ui_vid = i32::try_from(state.video_id).unwrap_or(0);
+            if app.get_video_id() != ui_vid {
+                app.set_video_id(ui_vid);
+            }
+
+            // M3: Record opened URLs, CLI URLs, and playlist auto-advances into `recent/files`
+            // on `FileLoaded` (deduplicated per `(gen_after, state.path)`).
+            if state.file_loaded && !state.path.is_empty() {
+                let is_new_loaded_path = {
+                    let mut prev_recent = last_recorded_recent.borrow_mut();
+                    if prev_recent.0 != gen_after || prev_recent.1 != state.path {
+                        *prev_recent = (gen_after, state.path.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if is_new_loaded_path {
+                    if !state.media_title.is_empty() {
+                        record_recent_media_title(&state.path, &state.media_title);
+                    }
+                    if let Err(error) =
+                        record_recent_media(&app, &sync_asr_config, &sync_config_dir, &state.path)
+                    {
+                        eprintln!("Cannot save recent media: {error}");
+                    }
+                }
+            }
 
             // Drain non-blocking `video-params/*` observer and switch OpenGL FBO format
             // between `GL_RGBA8` (8-bit SDR: half VRAM & bandwidth) and `GL_RGBA16F`
@@ -321,8 +428,11 @@ pub(crate) fn install_sync_loop(
                 );
             }
 
-            // Auto-fit window size on newly loaded media using real monitor bounds via
-            // `platform_window::compute_auto_fit_window_rect` (never hardcoded >= 1920x1080).
+            // LOW: Keep MenuBar subtitle size/position bounds properties in sync (ASS & non-ASS).
+            update_subtitle_bounds_properties(&app, player);
+
+            // H3.5: Auto-fit window size & centering on newly loaded media using real monitor
+            // bounds (`1..=1000` percent, positioning guarded on non-Wayland).
             if state.file_loaded && last_autofit_generation.get() != Some(gen_after) {
                 let (vw, vh) = if state.dimensions.0 > 0 && state.dimensions.1 > 0 {
                     state.dimensions
@@ -339,7 +449,7 @@ pub(crate) fn install_sync_loop(
                         } else {
                             0
                         };
-                        let percent = app.get_autofit_percent().clamp(10, 100) as u32;
+                        let percent = app.get_autofit_percent().clamp(1, 1000) as u32;
                         let monitor = query_window_monitor_logical(app.window());
                         if let Some(rect) = compute_auto_fit_window_rect(
                             vw,
@@ -354,6 +464,12 @@ pub(crate) fn install_sync_loop(
                                 rect.width as f32,
                                 rect.height as f32,
                             ));
+                            if !DisplayServer::detect_current().is_wayland() {
+                                app.window().set_position(slint::LogicalPosition::new(
+                                    rect.x as f32,
+                                    rect.y as f32,
+                                ));
+                            }
                         }
                     }
                 }
@@ -374,6 +490,16 @@ pub(crate) fn install_sync_loop(
             }
             let prim_sid = subtitles.primary_sid();
             let prim_active = subtitles.active_indices(prim_sid).first().copied();
+            let primary_timing = (state.sub_speed.to_bits(), state.sub_delay.to_bits());
+            if previous_primary_timing.replace(primary_timing) != primary_timing {
+                refresh_subtitle_list_with_timing(
+                    &app,
+                    &sync_sub_model,
+                    &subtitles,
+                    state.sub_speed,
+                    state.sub_delay,
+                );
+            }
             let subtitle_overlay_shown = app.get_subtitles_visible()
                 && !primary_is_native_ass
                 && !(app.get_hide_memento_while_playing() && !state.paused);
@@ -409,12 +535,30 @@ pub(crate) fn install_sync_loop(
             }
             let sec_sid = subtitles.secondary_sid();
             let sec_count = subtitles.secondary_entries().len();
-            let sec_active = subtitles.active_indices(sec_sid).first().copied();
-            if previous_sec_state.replace((sec_sid, sec_count, sec_active))
-                != (sec_sid, sec_count, sec_active)
-            {
-                refresh_secondary_subtitle_list(&app, &sync_sec_sub_model, &subtitles);
+            let has_secondary = state.secondary_sid > 0 || sec_count > 0;
+            if app.get_has_secondary_subtitles() != has_secondary {
+                app.set_has_secondary_subtitles(has_secondary);
             }
+            let sec_active = subtitles.active_indices(sec_sid).first().copied();
+            let sec_state = (
+                sec_sid,
+                sec_count,
+                sec_active,
+                state.sub_speed.to_bits(),
+                state.secondary_sub_delay.to_bits(),
+            );
+            if previous_sec_state.replace(sec_state) != sec_state {
+                refresh_secondary_subtitle_list_with_timing(
+                    &app,
+                    &sync_sec_sub_model,
+                    &subtitles,
+                    state.sub_speed,
+                    state.secondary_sub_delay,
+                );
+            }
+            let cue_counts = (subtitles.primary_entries().len(), sec_count);
+            let need_live_search_refresh = previous_cue_counts.replace(cue_counts) != cue_counts
+                && !app.get_subtitle_search_query().trim().is_empty();
             let scroll_state = (
                 app.get_sub_drawer_open(),
                 app.get_subtitle_drawer_tab(),
@@ -493,6 +637,25 @@ pub(crate) fn install_sync_loop(
                     app.set_active_sub_lines(Rc::new(VecModel::from(lines)).into());
                 }
             }
+
+            // Release all `RefCell` borrows BEFORE invoking re-entrant UI callbacks.
+            drop(coord_ref);
+            drop(player_ref);
+            drop(subtitles);
+            drop(asr);
+
+            if media_changed {
+                app.invoke_clear_audio_context();
+            }
+            if need_live_search_refresh {
+                rerun_active_subtitle_search_silently(&app);
+            }
+            if let Some(target_fs) = mpv_fullscreen_change {
+                let current_fs = app.window().is_fullscreen() || app.get_is_fullscreen();
+                if target_fs != current_fs {
+                    app.invoke_toggle_fullscreen();
+                }
+            }
         })
     };
 
@@ -505,7 +668,9 @@ pub(crate) fn install_sync_loop(
     let dispatch_sec_model = secondary_sub_model;
     let dispatch_coord = coordinator;
     let dispatch_ass = ass_ctrl;
+    let dispatch_config = config_ctrl;
     let dispatch_open_paths = handle_open_or_drop_paths;
+    let dispatch_add_subtitles = handle_add_subtitle_paths;
     let dispatch_sync = run_player_sync.clone();
     let dispatch_guard = UiDispatchGuard::install(Rc::new(move || {
         // Clear coalesced wakeup flag BEFORE draining so concurrent wakeups re-arm cleanly.
@@ -517,6 +682,36 @@ pub(crate) fn install_sync_loop(
             match event {
                 UiEvent::OpenPaths(paths) => {
                     dispatch_open_paths(paths);
+                }
+                UiEvent::AddSubtitles(paths) => {
+                    dispatch_add_subtitles(paths);
+                }
+                UiEvent::SystemThemeChanged(_scheme) => {
+                    if let Some(app) = dispatch_app.upgrade() {
+                        refresh_player_preferences(&app, &dispatch_config);
+                    }
+                }
+                UiEvent::DictionariesImported {
+                    imported,
+                    errors,
+                    all_dicts,
+                } => {
+                    if let Some(app) = dispatch_app.upgrade() {
+                        if !all_dicts.is_empty() {
+                            app.set_no_dicts_dialog_open(false);
+                        }
+                        let msg = if errors.is_empty() {
+                            format!("Imported {imported} dictionary archive(s)")
+                        } else if imported > 0 {
+                            format!(
+                                "Imported {imported} dictionary archive(s); failed: {}",
+                                errors.join("; ")
+                            )
+                        } else {
+                            format!("Dictionary import failed: {}", errors.join("; "))
+                        };
+                        app.set_status_message(msg.into());
+                    }
                 }
                 UiEvent::ExternalSubtitle {
                     generation,
@@ -530,37 +725,60 @@ pub(crate) fn install_sync_loop(
                     if dispatch_ui_gen.get() != generation {
                         continue;
                     }
-                    let Ok(mut subtitles) = dispatch_subs.try_borrow_mut() else {
-                        continue;
-                    };
-                    match result {
-                        Ok(cues) => {
-                            if app.get_furigana_visible() {
-                                let lines: Vec<String> = cues
-                                    .iter()
-                                    .take(2048)
-                                    .map(|cue| String::from_utf16_lossy(&cue.text))
-                                    .collect();
-                                prewarm_subtitle_furigana(lines);
+                    let (sub_speed, sub_delay, secondary_sub_delay) = {
+                        let Ok(mut subtitles) = dispatch_subs.try_borrow_mut() else {
+                            continue;
+                        };
+                        match result {
+                            Ok(cues) => {
+                                if app.get_furigana_visible() {
+                                    let lines: Vec<String> = cues
+                                        .iter()
+                                        .take(2048)
+                                        .map(|cue| String::from_utf16_lossy(&cue.text))
+                                        .collect();
+                                    prewarm_subtitle_furigana(lines);
+                                }
+                                subtitles.set_external_cues(track_id, &path, cues);
                             }
-                            subtitles.set_external_cues(track_id, &path, cues);
+                            Err(error) => {
+                                subtitles.set_external_cues(track_id, &path, Vec::new());
+                                app.set_status_message(error.into());
+                            }
                         }
-                        Err(error) => {
-                            subtitles.set_external_cues(track_id, &path, Vec::new());
-                            app.set_status_message(error.into());
-                        }
-                    }
-                    if let Ok(coord_guard) = dispatch_coord.try_borrow() {
-                        if let Some(coord) = coord_guard.as_ref() {
-                            let st = coord.playback_state();
-                            let speed = st.sub_speed.max(f64::EPSILON);
-                            let raw_primary = (st.position - st.sub_delay) / speed;
-                            let raw_secondary = (st.position - st.secondary_sub_delay) / speed;
-                            subtitles.update_positions(raw_primary, raw_secondary);
-                        }
-                    }
-                    refresh_subtitle_list(&app, &dispatch_model, &subtitles);
-                    refresh_secondary_subtitle_list(&app, &dispatch_sec_model, &subtitles);
+                        let timing = dispatch_coord
+                            .try_borrow()
+                            .ok()
+                            .and_then(|guard| {
+                                guard.as_ref().map(|coord| {
+                                    let st = coord.playback_state();
+                                    let speed = st.sub_speed.max(f64::EPSILON);
+                                    let raw_primary = (st.position - st.sub_delay) / speed;
+                                    let raw_secondary =
+                                        (st.position - st.secondary_sub_delay) / speed;
+                                    subtitles.update_positions(raw_primary, raw_secondary);
+                                    (st.sub_speed, st.sub_delay, st.secondary_sub_delay)
+                                })
+                            })
+                            .unwrap_or((1.0, 0.0, 0.0));
+                        refresh_subtitle_list_with_timing(
+                            &app,
+                            &dispatch_model,
+                            &subtitles,
+                            timing.0,
+                            timing.1,
+                        );
+                        refresh_secondary_subtitle_list_with_timing(
+                            &app,
+                            &dispatch_sec_model,
+                            &subtitles,
+                            timing.0,
+                            timing.2,
+                        );
+                        timing
+                    };
+                    let _ = (sub_speed, sub_delay, secondary_sub_delay);
+                    rerun_active_subtitle_search_silently(&app);
                 }
                 UiEvent::MkvFonts { generation, fonts } => {
                     if dispatch_ui_gen.get() != generation {
@@ -582,49 +800,76 @@ pub(crate) fn install_sync_loop(
                     if dispatch_ui_gen.get() != generation {
                         continue;
                     }
-                    let Ok(mut subtitles) = dispatch_subs.try_borrow_mut() else {
-                        continue;
-                    };
-                    if subtitles
-                        .track(sid)
-                        .is_some_and(|t| t.is_external() || t.is_asr_track())
-                    {
-                        continue;
-                    }
-                    let entries: Vec<memento_subtitle::SubtitleEntry> = cues
-                        .into_iter()
-                        .filter_map(|cue| {
-                            if cue.plain_text.trim().is_empty() || cue.end_ms <= cue.start_ms {
-                                return None;
+                    let updated = {
+                        let Ok(mut subtitles) = dispatch_subs.try_borrow_mut() else {
+                            continue;
+                        };
+                        if subtitles
+                            .track(sid)
+                            .is_some_and(|t| t.is_external() || t.is_asr_track())
+                        {
+                            false
+                        } else {
+                            let entries: Vec<memento_subtitle::SubtitleEntry> = cues
+                                .into_iter()
+                                .filter_map(|cue| {
+                                    if cue.plain_text.trim().is_empty()
+                                        || cue.end_ms <= cue.start_ms
+                                    {
+                                        return None;
+                                    }
+                                    Some(create_cue(
+                                        &cue.plain_text,
+                                        cue.start_ms as f64 / 1000.0,
+                                        cue.end_ms as f64 / 1000.0,
+                                    ))
+                                })
+                                .collect();
+                            if app.get_furigana_visible() {
+                                let lines: Vec<String> = entries
+                                    .iter()
+                                    .take(2048)
+                                    .map(|e| String::from_utf16_lossy(&e.text))
+                                    .collect();
+                                prewarm_subtitle_furigana(lines);
                             }
-                            Some(create_cue(
-                                &cue.plain_text,
-                                cue.start_ms as f64 / 1000.0,
-                                cue.end_ms as f64 / 1000.0,
-                            ))
-                        })
-                        .collect();
-                    if app.get_furigana_visible() {
-                        let lines: Vec<String> = entries
-                            .iter()
-                            .take(2048)
-                            .map(|e| String::from_utf16_lossy(&e.text))
-                            .collect();
-                        prewarm_subtitle_furigana(lines);
-                    }
-                    subtitles.ensure_track(sid);
-                    subtitles.set_track_cues(sid, entries);
-                    if let Ok(coord_guard) = dispatch_coord.try_borrow() {
-                        if let Some(coord) = coord_guard.as_ref() {
-                            let st = coord.playback_state();
-                            let speed = st.sub_speed.max(f64::EPSILON);
-                            let raw_primary = (st.position - st.sub_delay) / speed;
-                            let raw_secondary = (st.position - st.secondary_sub_delay) / speed;
-                            subtitles.update_positions(raw_primary, raw_secondary);
+                            subtitles.ensure_track(sid);
+                            subtitles.set_track_cues(sid, entries);
+                            let timing = dispatch_coord
+                                .try_borrow()
+                                .ok()
+                                .and_then(|guard| {
+                                    guard.as_ref().map(|coord| {
+                                        let st = coord.playback_state();
+                                        let speed = st.sub_speed.max(f64::EPSILON);
+                                        let raw_primary = (st.position - st.sub_delay) / speed;
+                                        let raw_secondary =
+                                            (st.position - st.secondary_sub_delay) / speed;
+                                        subtitles.update_positions(raw_primary, raw_secondary);
+                                        (st.sub_speed, st.sub_delay, st.secondary_sub_delay)
+                                    })
+                                })
+                                .unwrap_or((1.0, 0.0, 0.0));
+                            refresh_subtitle_list_with_timing(
+                                &app,
+                                &dispatch_model,
+                                &subtitles,
+                                timing.0,
+                                timing.1,
+                            );
+                            refresh_secondary_subtitle_list_with_timing(
+                                &app,
+                                &dispatch_sec_model,
+                                &subtitles,
+                                timing.0,
+                                timing.2,
+                            );
+                            true
                         }
+                    };
+                    if updated {
+                        rerun_active_subtitle_search_silently(&app);
                     }
-                    refresh_subtitle_list(&app, &dispatch_model, &subtitles);
-                    refresh_secondary_subtitle_list(&app, &dispatch_sec_model, &subtitles);
                 }
             }
         }

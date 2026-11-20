@@ -15,11 +15,13 @@ pub mod window_chrome;
 pub mod workers;
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use slint::winit_030::{winit, CustomApplicationHandler, EventResult};
 use slint::{ComponentHandle, VecModel};
 
 pub use clipboard::{copy_text_to_clipboard, read_copied_text_or_clipboard};
@@ -46,9 +48,12 @@ use memento_player::MpvInstance;
 use memento_setting::keys as raw;
 
 use self::anki_actions::{install_anki_and_audio_handlers, PopupAudioState};
-use self::keybinds::install_keybind_handlers;
+use self::keybinds::{install_keybind_handlers, AudioContextMarkState};
 use self::paths::{format_time, memento_xdg_dir, migrate_xdg_config_if_needed};
-use self::playback::{install_playback_handlers, ASR_SHUTDOWN_TIMEOUT};
+use self::playback::{
+    install_playback_handlers, persist_window_panel_state, restore_window_panel_state,
+    ASR_SHUTDOWN_TIMEOUT,
+};
 use self::preferences::{
     apply_dictionary_order, install_settings_and_preference_handlers, refresh_player_preferences,
     refresh_recent_files, setting_enabled,
@@ -61,7 +66,225 @@ use self::updater::{
 };
 use self::video_pipeline::{install_video_pipeline, VideoParamsObserver, VideoTimings};
 use self::window_chrome::install_window_chrome_handlers;
-use self::workers::{install_dictionary_lookup_handlers, UiRelay, WorkerPool};
+use self::workers::{install_dictionary_lookup_handlers, UiEvent, UiRelay, WorkerPool};
+
+/// Format the About-modal / menu version string from `CARGO_PKG_VERSION` + optional `MEMENTO_GIT_HASH` (H1.6).
+pub(crate) fn format_app_version_display(pkg_version: &str, git_hash: Option<&str>) -> String {
+    match git_hash.map(str::trim).filter(|hash| !hash.is_empty()) {
+        Some(hash) => format!("{pkg_version}-{hash}"),
+        None => pkg_version.to_owned(),
+    }
+}
+
+#[derive(Default)]
+struct ExternalOpenBridge {
+    pending: Vec<PathBuf>,
+    relay: Option<UiRelay>,
+}
+
+static EXTERNAL_OPEN_BRIDGE: OnceLock<Mutex<ExternalOpenBridge>> = OnceLock::new();
+
+fn external_open_bridge() -> &'static Mutex<ExternalOpenBridge> {
+    EXTERNAL_OPEN_BRIDGE.get_or_init(|| Mutex::new(ExternalOpenBridge::default()))
+}
+
+/// Enqueue file paths delivered externally by the OS (e.g. macOS Finder "Open With"
+/// or Dock icon drop, H1.2) for dispatch into the main UI's `files_dropped` handler.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn enqueue_external_open_paths(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut bridge = external_open_bridge()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(relay) = bridge.relay.as_ref() {
+        relay.send_event(UiEvent::OpenPaths(paths));
+    } else {
+        for path in paths {
+            if !bridge.pending.contains(&path) {
+                bridge.pending.push(path);
+            }
+        }
+    }
+}
+
+fn attach_external_open_relay(relay: UiRelay) {
+    let drained = {
+        let mut bridge = external_open_bridge()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        bridge.relay = Some(relay.clone());
+        std::mem::take(&mut bridge.pending)
+    };
+    if !drained.is_empty() {
+        relay.send_event(UiEvent::OpenPaths(drained));
+    }
+}
+
+fn detach_external_open_relay() {
+    let mut bridge = external_open_bridge()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    bridge.relay = None;
+}
+
+/// On macOS, hook `application:openURLs:` and `application:openFile:` on winit's
+/// `NSApplicationDelegate` so Finder "Open With" and Dock drops route cleanly into
+/// Memento's `files_dropped` pipeline without extra Objective-C crates (H1.2).
+#[cfg(target_os = "macos")]
+fn install_macos_open_urls_hook() {
+    use std::ffi::{c_char, c_void, CStr};
+    use std::sync::Once;
+
+    static HOOK_ONCE: Once = Once::new();
+    HOOK_ONCE.call_once(|| {
+        type Id = *mut c_void;
+        type Sel = *mut c_void;
+        type Class = *mut c_void;
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> Class;
+            fn object_getClass(obj: Id) -> Class;
+            fn sel_registerName(name: *const c_char) -> Sel;
+            fn class_addMethod(cls: Class, sel: Sel, imp: *const c_void, types: *const c_char) -> bool;
+            fn class_replaceMethod(
+                cls: Class,
+                sel: Sel,
+                imp: *const c_void,
+                types: *const c_char,
+            ) -> *const c_void;
+            fn objc_msgSend();
+        }
+
+        unsafe fn msg_id_0(obj: Id, sel: Sel) -> Id {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc_msgSend as *const ());
+            f(obj, sel)
+        }
+        unsafe fn msg_usize_0(obj: Id, sel: Sel) -> usize {
+            let f: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc_msgSend as *const ());
+            f(obj, sel)
+        }
+        unsafe fn msg_bool_0(obj: Id, sel: Sel) -> bool {
+            let f: unsafe extern "C" fn(Id, Sel) -> bool = std::mem::transmute(objc_msgSend as *const ());
+            f(obj, sel)
+        }
+        unsafe fn msg_id_1_usize(obj: Id, sel: Sel, idx: usize) -> Id {
+            let f: unsafe extern "C" fn(Id, Sel, usize) -> Id = std::mem::transmute(objc_msgSend as *const ());
+            f(obj, sel, idx)
+        }
+        unsafe fn msg_cstr_0(obj: Id, sel: Sel) -> *const c_char {
+            let f: unsafe extern "C" fn(Id, Sel) -> *const c_char = std::mem::transmute(objc_msgSend as *const ());
+            f(obj, sel)
+        }
+
+        unsafe extern "C" fn handle_open_urls(_self: Id, _cmd: Sel, _app: Id, urls: Id) {
+            if urls.is_null() {
+                return;
+            }
+            let sel_count = sel_registerName(c"count".as_ptr());
+            let sel_obj_at = sel_registerName(c"objectAtIndex:".as_ptr());
+            let sel_is_file_url = sel_registerName(c"isFileURL".as_ptr());
+            let sel_path = sel_registerName(c"path".as_ptr());
+            let sel_utf8 = sel_registerName(c"UTF8String".as_ptr());
+            let count = msg_usize_0(urls, sel_count);
+            let mut paths = Vec::with_capacity(count);
+            for idx in 0..count {
+                let url = msg_id_1_usize(urls, sel_obj_at, idx);
+                if url.is_null() || !msg_bool_0(url, sel_is_file_url) {
+                    continue;
+                }
+                let ns_path = msg_id_0(url, sel_path);
+                if ns_path.is_null() {
+                    continue;
+                }
+                let utf8 = msg_cstr_0(ns_path, sel_utf8);
+                if !utf8.is_null() {
+                    let text = CStr::from_ptr(utf8).to_string_lossy();
+                    if !text.is_empty() {
+                        paths.push(PathBuf::from(text.into_owned()));
+                    }
+                }
+            }
+            enqueue_external_open_paths(paths);
+        }
+
+        unsafe extern "C" fn handle_open_file(_self: Id, _cmd: Sel, _app: Id, filename: Id) -> bool {
+            if filename.is_null() {
+                return false;
+            }
+            let sel_utf8 = sel_registerName(c"UTF8String".as_ptr());
+            let utf8 = msg_cstr_0(filename, sel_utf8);
+            if utf8.is_null() {
+                return false;
+            }
+            let text = CStr::from_ptr(utf8).to_string_lossy();
+            if text.is_empty() {
+                return false;
+            }
+            enqueue_external_open_paths(vec![PathBuf::from(text.into_owned())]);
+            true
+        }
+
+        unsafe {
+            let ns_app_cls = objc_getClass(c"NSApplication".as_ptr());
+            if ns_app_cls.is_null() {
+                return;
+            }
+            let ns_app = msg_id_0(ns_app_cls, sel_registerName(c"sharedApplication".as_ptr()));
+            if ns_app.is_null() {
+                return;
+            }
+            let delegate = msg_id_0(ns_app, sel_registerName(c"delegate".as_ptr()));
+            if delegate.is_null() {
+                return;
+            }
+            let delegate_cls = object_getClass(delegate);
+            if delegate_cls.is_null() {
+                return;
+            }
+            let open_urls_sel = sel_registerName(c"application:openURLs:".as_ptr());
+            if !class_addMethod(
+                delegate_cls,
+                open_urls_sel,
+                handle_open_urls as *const c_void,
+                c"v@:@@".as_ptr(),
+            ) {
+                class_replaceMethod(
+                    delegate_cls,
+                    open_urls_sel,
+                    handle_open_urls as *const c_void,
+                    c"v@:@@".as_ptr(),
+                );
+            }
+            let open_file_sel = sel_registerName(c"application:openFile:".as_ptr());
+            if !class_addMethod(
+                delegate_cls,
+                open_file_sel,
+                handle_open_file as *const c_void,
+                c"B@:@@".as_ptr(),
+            ) {
+                class_replaceMethod(
+                    delegate_cls,
+                    open_file_sel,
+                    handle_open_file as *const c_void,
+                    c"B@:@@".as_ptr(),
+                );
+            }
+        }
+    });
+}
+
+struct MementoWinitAppHandler;
+
+impl CustomApplicationHandler for MementoWinitAppHandler {
+    fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) -> EventResult {
+        #[cfg(target_os = "macos")]
+        install_macos_open_urls_hook();
+        EventResult::Propagate
+    }
+}
 
 /// Return freed glibc heap pages back to the Linux kernel after dropping large
 /// allocations (media decoder buffers, embedded fonts, ASR models, etc.).
@@ -108,6 +331,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
+    // H1.4: Augment macOS `.app` bundle `PATH` (Homebrew / MacPorts / local tools)
+    // BEFORE OCR/Python probing or `MpvInstance` creation.
+    memento_os::augment_macos_bundle_path();
     #[cfg(feature = "ocr")]
     crate::controller::ocr::prepare_python_executable();
     let _ = log::set_logger(&APP_LOGGER);
@@ -133,12 +359,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // libmpv shares the UI's context. On desktop platforms prefer desktop GL
-    // with the driver's supported version, rather than Slint's GLES 2 default.
+    // with the driver's supported version, rather than Slint's GLES 2 default,
+    // and install the custom winit application handler for macOS Finder/Dock drops (H1.2).
     // An explicitly selected Slint backend (including software) still wins.
-    if std::env::var_os("SLINT_BACKEND").is_none()
-        && renderer_plan.primary != PlatformRendererKind::Software
-    {
-        slint::BackendSelector::new().require_opengl().select()?;
+    if std::env::var_os("SLINT_BACKEND").is_none() {
+        let mut selector = slint::BackendSelector::new()
+            .with_winit_custom_application_handler(MementoWinitAppHandler);
+        if renderer_plan.primary != PlatformRendererKind::Software {
+            selector = selector.require_opengl();
+        }
+        selector.select()?;
     }
     let _ = slint::set_xdg_app_id(memento_os::WAYLAND_APP_ID);
     let app = MementoApp::new()?;
@@ -181,20 +411,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // mpv renders into a Slint image, never into the toplevel native window:
     // a native child would occlude the OSC, subtitles and dictionary popup.
-    let (mpv, coordinator) =
-        match MpvInstance::new_with_options(Some(&config_dir), &parsed_args.global_options) {
-            Ok(instance) => {
-                let coord = LivePlayerCoordinator::new(&instance);
-                (
-                    Rc::new(RefCell::new(Some(instance))),
-                    Rc::new(RefCell::new(Some(coord))),
-                )
-            }
-            Err(err) => {
-                eprintln!("Could not initialize video playback: {err}");
-                (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)))
-            }
-        };
+    // H1.1: Propagate `renderer_plan.effective_hwdec()` (e.g. `videotoolbox-copy` on macOS).
+    let mut mpv_options = parsed_args.global_options.clone();
+    if !renderer_plan.effective_hwdec().is_empty() {
+        mpv_options.push(memento_player::CliOption {
+            name: "hwdec".into(),
+            value: renderer_plan.effective_hwdec().to_owned(),
+        });
+    }
+    let (mpv, coordinator) = match MpvInstance::new_with_options(Some(&config_dir), &mpv_options) {
+        Ok(instance) => {
+            let coord = LivePlayerCoordinator::new(&instance);
+            (
+                Rc::new(RefCell::new(Some(instance))),
+                Rc::new(RefCell::new(Some(coord))),
+            )
+        }
+        Err(err) => {
+            eprintln!("Could not initialize video playback: {err}");
+            (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)))
+        }
+    };
     let screensaver = Rc::new(RefCell::new(memento_os::Screensaver::new()));
     let video_timings = Rc::new(RefCell::new(VideoTimings::default()));
     let pending_playback_frame = Rc::new(Cell::new(None::<i32>));
@@ -248,12 +485,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     app.set_current_time("00:00".into());
     app.set_duration_time("00:00".into());
     app.set_app_version(env!("CARGO_PKG_VERSION").into());
+    app.set_app_version_display(
+        format_app_version_display(env!("CARGO_PKG_VERSION"), option_env!("MEMENTO_GIT_HASH"))
+            .into(),
+    );
+    #[cfg(target_os = "macos")]
+    app.set_key_quit(crate::controller::config::QUIT_SHORTCUT_MACOS.into());
     app.on_format_timestamp(|sec| format_time(sec as f64).into());
     refresh_player_preferences(&app, &config_ctrl);
+    restore_window_panel_state(&app, &config_ctrl);
     refresh_recent_files(&app, &config_ctrl);
 
     #[cfg(feature = "ocr")]
-    let ocr_controller = crate::controller::ocr::OcrController::new();
+    let ocr_controller =
+        crate::controller::ocr::OcrController::new().map_err(|error| error.to_string());
     #[cfg(feature = "ocr")]
     if let Err(error) = &ocr_controller {
         eprintln!("OCR unavailable: {error}");
@@ -286,6 +531,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let settings_session: Rc<RefCell<Option<SettingsSession>>> = Rc::new(RefCell::new(None));
+    let playback_dict_manager = dictionary_manager.as_deref().cloned();
+    let has_zero_dictionaries = dictionary_manager
+        .as_ref()
+        .and_then(|manager| manager.list_dictionaries().ok())
+        .is_some_and(|dicts| dicts.is_empty());
     let pref_saver = install_settings_and_preference_handlers(
         &app,
         config_ctrl.clone(),
@@ -304,15 +554,52 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         settings_session.clone(),
     );
 
+    // LOW: Startup "No Dictionaries Installed" prompt & direct navigation to Dictionaries tab.
+    {
+        let dismiss_app = app.as_weak();
+        app.on_dismiss_no_dicts_dialog(move || {
+            if let Some(app) = dismiss_app.upgrade() {
+                app.set_no_dicts_dialog_open(false);
+            }
+        });
+        let open_dict_app = app.as_weak();
+        let open_dict_session = settings_session.clone();
+        app.on_open_dict_settings(move || {
+            let Some(app) = open_dict_app.upgrade() else {
+                return;
+            };
+            app.set_no_dicts_dialog_open(false);
+            app.invoke_open_options();
+            if let Ok(guard) = open_dict_session.try_borrow() {
+                if let Some(session) = guard.as_ref() {
+                    session.window.set_active_category(4);
+                    session.window.invoke_category_changed(4);
+                }
+            }
+        });
+        if has_zero_dictionaries {
+            app.set_no_dicts_dialog_open(true);
+        }
+    }
+
     let current_media: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let media_generation = Rc::new(Cell::new(0u64));
     let shared_media_generation = Arc::new(AtomicU64::new(0));
     let lookup_epoch = Arc::new(AtomicU64::new(0));
     let hover_cursor = Rc::new(RefCell::new(None::<(String, i32)>));
+    let audio_context_marks = Rc::new(RefCell::new(AudioContextMarkState::default()));
     let popup_audio_cache: Arc<Mutex<PopupAudioState>> =
         Arc::new(Mutex::new(PopupAudioState::default()));
     let ass_ctrl = Rc::new(RefCell::new(AssOverlayController::new()));
     let ui_relay = UiRelay::new();
+
+    // H2 & #331: Live OS color-scheme watcher (Linux xdg-desktop-portal / Windows registry).
+    {
+        let theme_relay = ui_relay.clone();
+        memento_os::spawn_color_scheme_watcher(move |scheme| {
+            theme_relay.send_event(UiEvent::SystemThemeChanged(scheme));
+        });
+    }
 
     // Spawn all background worker threads (thumb, dict lookup, furigana, ext sub, MKV).
     let workers = WorkerPool::spawn(
@@ -323,22 +610,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         ui_relay.clone(),
     );
 
-    // Wire keybinds, window chrome (OSC / pointer / fullscreen), drawer selection, updates.
+    // Wire keybinds, window chrome (OSC / pointer / fullscreen / drag-drop / icon), drawer, updates.
     install_keybind_handlers(
         &app,
+        config_ctrl.clone(),
         mpv.clone(),
         closing.clone(),
         hover_cursor.clone(),
-        config_dir.clone(),
+        audio_context_marks.clone(),
     );
     let chrome_handles = install_window_chrome_handlers(
         &app,
+        config_ctrl.clone(),
         mpv.clone(),
         coordinator.clone(),
         current_render_size.clone(),
         &renderer_plan,
         &renderer_overrides,
     );
+    if mpv.borrow().as_ref().is_some_and(MpvInstance::is_fullscreen) {
+        app.invoke_toggle_fullscreen();
+    }
     install_subtitle_selection(&app, sub_ctrl.clone(), sub_model.clone());
     install_update_and_link_handlers(
         &app,
@@ -370,6 +662,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         closing.clone(),
         workers.thumb_tx.clone(),
         ui_relay.clone(),
+        audio_context_marks,
+        playback_dict_manager,
         parsed_args.loads,
         cli_keep_paused,
         #[cfg(feature = "ocr")]
@@ -399,7 +693,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         mpv.clone(),
         dictionary_database_path,
         dictionary_resources_path,
-        config_dir,
+        config_dir.clone(),
         lookup_epoch.clone(),
     );
 
@@ -416,6 +710,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         lookup_epoch,
         asr_session.clone(),
         config_ctrl.clone(),
+        config_dir.clone(),
         asr_restart_pending,
         closing,
         playback_handles.hover_pause_owned,
@@ -427,13 +722,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         workers.mkv_tx.clone(),
         ass_ctrl,
         screensaver.clone(),
-        ui_relay,
+        ui_relay.clone(),
         playback_handles.handle_open_or_drop_paths,
+        playback_handles.handle_add_subtitle_paths,
         gl_prefer_16f.clone(),
         default_prefer_16f,
         video_params_observer.clone(),
         verbose_video_timings,
     );
+    attach_external_open_relay(ui_relay);
 
     let render_worker = install_video_pipeline(
         &app,
@@ -456,10 +753,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let run_result = app.run();
 
     // ── Deterministic, Bounded Shutdown ─────────────────────────────────────
+    detach_external_open_relay();
+    persist_window_panel_state(&app, &config_ctrl, &config_dir);
     sync_handles.housekeeping_timer.stop();
     playback_handles.quit_timer.stop();
     playback_handles.hover_resume_timer.stop();
     chrome_handles.osc_timer.stop();
+    chrome_handles.cursor_timer.stop();
+    chrome_handles.drop_timer.stop();
     hover_timer.stop();
     pref_saver.flush();
     screensaver.borrow_mut().uninhibit();
@@ -502,4 +803,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     run_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_version_display_appends_git_hash_when_present() {
+        assert_eq!(
+            format_app_version_display("2.0.2", Some("abcdef1")),
+            "2.0.2-abcdef1"
+        );
+        assert_eq!(format_app_version_display("2.0.2", Some("   ")), "2.0.2");
+        assert_eq!(format_app_version_display("2.0.2", None), "2.0.2");
+    }
+
+    #[test]
+    fn external_open_paths_buffer_until_relay_attached() {
+        let relay = UiRelay::new();
+        let path = PathBuf::from("/tmp/finder-opened.mkv");
+        detach_external_open_relay();
+        enqueue_external_open_paths(vec![path.clone()]);
+        attach_external_open_relay(relay.clone());
+        let events = relay.drain_events();
+        detach_external_open_relay();
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            UiEvent::OpenPaths(paths) if paths.contains(&path)
+        )));
+    }
 }

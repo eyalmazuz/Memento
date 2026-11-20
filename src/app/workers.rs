@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -71,6 +71,13 @@ impl<T> ChannelSlot<T> {
 /// coalesced `UiRelay` (replacing the 4 legacy `thread_local!` global sinks).
 pub(crate) enum UiEvent {
     OpenPaths(Vec<PathBuf>),
+    AddSubtitles(Vec<PathBuf>),
+    SystemThemeChanged(memento_os::SystemColorScheme),
+    DictionariesImported {
+        imported: usize,
+        errors: Vec<String>,
+        all_dicts: Vec<crate::controller::dictmanager::InstalledDictionary>,
+    },
     ExternalSubtitle {
         generation: u64,
         track_id: i64,
@@ -192,6 +199,34 @@ pub(crate) enum ThumbRequest {
 /// Idle timeout after which the thumbnail preview `libmpv` instance is dropped
 /// to reclaim 50–150 MB of RAM (lazily recreated on the next timeline hover).
 const THUMB_IDLE_TIMEOUT: Duration = Duration::from_secs(40);
+const MAX_THUMB_WIDTH: u32 = 208;
+const MAX_THUMB_HEIGHT: u32 = 117;
+const DEFAULT_THUMB_WIDTH: u32 = 192;
+const DEFAULT_THUMB_HEIGHT: u32 = 108;
+
+pub(crate) fn resolve_thumbnail_media_path(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("file://") {
+        let decoded = memento_os::decode_file_uri(trimmed)?;
+        return decoded.is_file().then_some(decoded);
+    }
+    let candidate = PathBuf::from(trimmed);
+    candidate.is_file().then_some(candidate)
+}
+
+pub(crate) fn compute_thumbnail_dimensions(video_w: u32, video_h: u32) -> (u32, u32) {
+    if video_w == 0 || video_h == 0 {
+        return (DEFAULT_THUMB_WIDTH, DEFAULT_THUMB_HEIGHT);
+    }
+    let scale = (MAX_THUMB_WIDTH as f64 / video_w as f64)
+        .min(MAX_THUMB_HEIGHT as f64 / video_h as f64);
+    let width = ((video_w as f64 * scale).round() as u32).clamp(1, MAX_THUMB_WIDTH);
+    let height = ((video_h as f64 * scale).round() as u32).clamp(1, MAX_THUMB_HEIGHT);
+    (width, height)
+}
 
 struct ThumbMpvState {
     // Declared before `inst` so the software renderer handle drops before `MpvInstance`.
@@ -411,9 +446,10 @@ impl WorkerPool {
                         continue;
                     }
                     ThumbRequest::Seek { path, time_sec } => {
-                        if path.is_empty() || !Path::new(&path).is_file() {
+                        let Some(resolved_path) = resolve_thumbnail_media_path(&path) else {
                             continue;
-                        }
+                        };
+                        let resolved_str = resolved_path.to_string_lossy().into_owned();
                         if thumb_mpv.is_none() {
                             let opts = [
                                 memento_player::CliOption {
@@ -482,16 +518,17 @@ impl WorkerPool {
                         let Some(state) = thumb_mpv.as_ref() else {
                             continue;
                         };
-                        if loaded_path != path {
-                            if state.inst.load_file(&path).is_err() {
+                        if loaded_path != resolved_str {
+                            if state.inst.load_file(&resolved_str).is_err() {
                                 continue;
                             }
-                            loaded_path = path.clone();
+                            loaded_path = resolved_str;
                             wait_for_render_update(
                                 &state.inst,
                                 &state.wake_signal,
                                 Duration::from_millis(160),
                             );
+                            let _ = state.inst.poll_playback_state();
                         }
                         let _ = state.inst.command(&[
                             "seek",
@@ -503,11 +540,20 @@ impl WorkerPool {
                             &state.wake_signal,
                             Duration::from_millis(80),
                         );
-                        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(160, 90);
-                        if unsafe { state.renderer.render_rgba(160, 90, buffer.make_mut_bytes()) }
-                            .is_ok()
+                        let _ = state.inst.poll_playback_state();
+                        let (video_w, video_h) = state.inst.cached_video_dimensions();
+                        let (thumb_w, thumb_h) = compute_thumbnail_dimensions(video_w, video_h);
+                        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(thumb_w, thumb_h);
+                        if unsafe {
+                            state
+                                .renderer
+                                .render_rgba(thumb_w, thumb_h, buffer.make_mut_bytes())
+                        }
+                        .is_ok()
                         {
                             let _ = thumb_worker_app.upgrade_in_event_loop(move |app| {
+                                app.set_preview_box_width(thumb_w as f32);
+                                app.set_preview_box_height(thumb_h as f32);
                                 app.set_thumbnail_frame(slint::Image::from_rgba8(buffer));
                             });
                         }
@@ -1130,4 +1176,41 @@ pub(crate) fn install_dictionary_lookup_handlers(
     });
 
     hover_timer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_thumbnail_dimensions_preserves_aspect_ratio_up_to_208x117() {
+        assert_eq!(compute_thumbnail_dimensions(0, 0), (192, 108));
+        assert_eq!(compute_thumbnail_dimensions(1920, 1080), (208, 117));
+        assert_eq!(compute_thumbnail_dimensions(1440, 1080), (156, 117));
+        assert_eq!(compute_thumbnail_dimensions(2560, 1080), (208, 88));
+        assert_eq!(compute_thumbnail_dimensions(1080, 1920), (66, 117));
+    }
+
+    #[test]
+    fn resolve_thumbnail_media_path_accepts_file_uri() {
+        let dir = std::env::temp_dir().join(format!(
+            "memento-thumb-uri-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("sample clip.mkv");
+        std::fs::write(&file, b"demo").expect("write temp file");
+        let uri = format!(
+            "file://{}",
+            file.to_string_lossy().replace(' ', "%20")
+        );
+        assert_eq!(resolve_thumbnail_media_path(&uri), Some(file.clone()));
+        assert_eq!(
+            resolve_thumbnail_media_path(&file.to_string_lossy()),
+            Some(file.clone())
+        );
+        assert_eq!(resolve_thumbnail_media_path(""), None);
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

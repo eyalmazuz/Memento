@@ -2,18 +2,267 @@
 //! OSC auto-hide timer, pointer/mouse forwarding, and chapter marks.
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model as _};
+use slint::winit_030::{
+    winit::event::WindowEvent as WinitWindowEvent, EventResult, WinitWindowAccessor,
+};
+use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
+use crate::app::preferences::refresh_player_preferences;
+use crate::controller::config::ConfigController;
 use crate::controller::player::{
     mpv_cursor_should_hide, subtitle_cursor_zones, LivePlayerCoordinator, MouseInputForwarder,
 };
 use crate::platform_renderer::{PlatformRendererConfig, RendererOverrides, TargetOs};
 use crate::platform_window::{FullscreenAction, PlatformFullscreenController};
 use crate::ui::{ChapterMark, MementoApp};
+use memento_player::mpv::CursorAutohide;
 use memento_player::MpvInstance;
+
+const WINDOW_ICON_ICO: &[u8] = include_bytes!("../../res/memento.ico");
+const OSC_MOVE_ANCHOR_RESET: Duration = Duration::from_millis(100);
+const DROP_COALESCE_DELAY: Duration = Duration::from_millis(50);
+
+/// Decode an embedded Windows `.ico` file (PNG-compressed or 32-bit BGRA BMP DIB
+/// entry) into tightly packed RGBA8 pixels and `(width, height)`.
+pub(crate) fn decode_ico_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if bytes.len() < 6 {
+        return None;
+    }
+    let reserved = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let ico_type = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+    if reserved != 0 || ico_type != 1 || count == 0 {
+        return None;
+    }
+    let dir_end = 6usize.checked_add(count.checked_mul(16)?)?;
+    if bytes.len() < dir_end {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for idx in 0..count {
+        let base = 6 + idx * 16;
+        let width = if bytes[base] == 0 {
+            256u32
+        } else {
+            u32::from(bytes[base])
+        };
+        let height = if bytes[base + 1] == 0 {
+            256u32
+        } else {
+            u32::from(bytes[base + 1])
+        };
+        let size = u32::from_le_bytes(bytes[base + 8..base + 12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(bytes[base + 12..base + 16].try_into().ok()?) as usize;
+        let end = offset.checked_add(size)?;
+        if end <= bytes.len() && size > 0 {
+            let payload = &bytes[offset..end];
+            let is_png = payload.starts_with(b"\x89PNG\r\n\x1a\n");
+            entries.push((is_png, width * height, payload));
+        }
+    }
+    // Prefer PNG entries, then largest dimensions.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+    for (is_png, _, payload) in entries {
+        if is_png {
+            if let Ok(img) = image::load_from_memory_with_format(payload, image::ImageFormat::Png) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                if w > 0 && h > 0 {
+                    return Some((rgba.into_raw(), w, h));
+                }
+            }
+            continue;
+        }
+        if payload.len() >= 40 {
+            let header_size = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
+            let bmp_w = i32::from_le_bytes(payload[4..8].try_into().ok()?).unsigned_abs();
+            let bmp_h_raw = i32::from_le_bytes(payload[8..12].try_into().ok()?);
+            let bmp_h = bmp_h_raw.unsigned_abs() / 2;
+            let bpp = u16::from_le_bytes(payload[14..16].try_into().ok()?);
+            let compression = u32::from_le_bytes(payload[16..20].try_into().ok()?);
+            if header_size >= 40 && bpp == 32 && compression == 0 && bmp_w > 0 && bmp_h > 0 {
+                let pixel_bytes = (bmp_w as usize).checked_mul(bmp_h as usize)?.checked_mul(4)?;
+                let pixel_end = header_size.checked_add(pixel_bytes)?;
+                if payload.len() >= pixel_end {
+                    let src = &payload[header_size..pixel_end];
+                    let row_stride = (bmp_w as usize) * 4;
+                    let mut rgba = vec![0u8; pixel_bytes];
+                    let bottom_up = bmp_h_raw > 0;
+                    for y in 0..(bmp_h as usize) {
+                        let src_y = if bottom_up {
+                            (bmp_h as usize) - 1 - y
+                        } else {
+                            y
+                        };
+                        let src_row = &src[src_y * row_stride..(src_y + 1) * row_stride];
+                        let dst_row = &mut rgba[y * row_stride..(y + 1) * row_stride];
+                        for x in 0..(bmp_w as usize) {
+                            let i = x * 4;
+                            dst_row[i] = src_row[i + 2];
+                            dst_row[i + 1] = src_row[i + 1];
+                            dst_row[i + 2] = src_row[i];
+                            dst_row[i + 3] = src_row[i + 3];
+                        }
+                    }
+                    return Some((rgba, bmp_w, bmp_h));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn apply_icon_to_winit_window(winit_window: &slint::winit_030::winit::window::Window) -> bool {
+    let Some((rgba, width, height)) = decode_ico_rgba(WINDOW_ICON_ICO) else {
+        return false;
+    };
+    let Ok(icon) = slint::winit_030::winit::window::Icon::from_rgba(rgba, width, height) else {
+        return false;
+    };
+    winit_window.set_window_icon(Some(icon));
+    true
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn apply_icon_to_winit_window(_winit_window: &slint::winit_030::winit::window::Window) -> bool {
+    true
+}
+
+/// Apply the embedded `res/memento.ico` window icon via winit on Windows and X11/Linux.
+pub(crate) fn apply_runtime_window_icon(window: &slint::Window) -> bool {
+    window
+        .with_winit_window(apply_icon_to_winit_window)
+        .unwrap_or(false)
+}
+
+pub(crate) fn drop_hover_label_for_path(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
+        "Drop dictionary archive (.zip) to import"
+    } else {
+        "Drop media or subtitle files to open"
+    }
+}
+
+pub(crate) fn should_restore_maximized_after_native_fullscreen(
+    target_os: TargetOs,
+    was_maximized: bool,
+) -> bool {
+    was_maximized && target_os != TargetOs::MacOs
+}
+
+pub(crate) fn should_keep_cursor_hidden_on_move(
+    osc_mpv_cursor: bool,
+    autohide: CursorAutohide,
+    fs_only: bool,
+    fullscreen: bool,
+    overlay_interactive: bool,
+) -> bool {
+    osc_mpv_cursor
+        && matches!(autohide, CursorAutohide::Always)
+        && (!fs_only || fullscreen)
+        && !overlay_interactive
+}
+
+pub(crate) fn compute_cursor_should_hide(
+    osc_mpv_cursor: bool,
+    autohide: CursorAutohide,
+    fs_only: bool,
+    fullscreen: bool,
+    has_media: bool,
+    idle_elapsed_ms: u64,
+    osc_duration_ms: u64,
+    overlay_interactive: bool,
+) -> bool {
+    if osc_mpv_cursor {
+        mpv_cursor_should_hide(
+            autohide,
+            fs_only,
+            fullscreen,
+            idle_elapsed_ms,
+            overlay_interactive,
+        )
+    } else {
+        (has_media || fullscreen) && !overlay_interactive && idle_elapsed_ms >= osc_duration_ms
+    }
+}
+
+pub(crate) fn mpv_cursor_timer_delay_ms(
+    autohide: CursorAutohide,
+    fs_only: bool,
+    fullscreen: bool,
+) -> Option<u64> {
+    if fs_only && !fullscreen {
+        return None;
+    }
+    match autohide {
+        CursorAutohide::Never => None,
+        CursorAutohide::Always => Some(0),
+        CursorAutohide::Number(ms) if ms >= 0 => Some(ms as u64),
+        CursorAutohide::Number(_) => None,
+    }
+}
+
+/// Evaluate `behavior/osc-min-move` with a 100 ms sliding reference anchor reset
+/// so slow sub-threshold cursor drift never accumulates to trigger the OSC.
+pub(crate) fn evaluate_osc_move_threshold(
+    anchor: Option<(f32, f32, Instant)>,
+    x: f32,
+    y: f32,
+    now: Instant,
+    min_move: f32,
+) -> (bool, Option<(f32, f32, Instant)>) {
+    if min_move <= 0.0 {
+        return (true, Some((x, y, now)));
+    }
+    let Some((old_x, old_y, anchor_at)) = anchor else {
+        return (true, Some((x, y, now)));
+    };
+    let moved = (x - old_x).hypot(y - old_y);
+    if moved > min_move {
+        return (true, Some((x, y, now)));
+    }
+    if now.saturating_duration_since(anchor_at) >= OSC_MOVE_ANCHOR_RESET {
+        return (false, Some((x, y, now)));
+    }
+    (false, anchor)
+}
+
+fn is_overlay_interactive(app: &MementoApp) -> bool {
+    app.get_menu_open()
+        || app.get_dict_open()
+        || app.get_osc_hovered()
+        || app.get_ocr_mode()
+        || app.get_about_open()
+        || app.get_url_dialog_open()
+        || app.get_update_dialog_open()
+        || app.get_no_dicts_dialog_open()
+}
+
+fn current_mpv_cursor_policy(
+    coordinator: &Rc<RefCell<Option<LivePlayerCoordinator>>>,
+) -> (CursorAutohide, bool) {
+    coordinator
+        .try_borrow()
+        .ok()
+        .and_then(|guard| {
+            guard.as_ref().map(|coord| {
+                let st = coord.playback_state();
+                (st.cursor_autohide, st.cursor_autohide_fs_only)
+            })
+        })
+        .unwrap_or((CursorAutohide::Number(1000), false))
+}
 
 #[cfg(target_os = "windows")]
 pub(crate) fn native_window_hwnd(window: &slint::Window) -> Option<isize> {
@@ -237,11 +486,14 @@ pub(crate) fn chapter_title_at_time(app: &MementoApp, time_sec: f32) -> String {
 
 pub(crate) struct WindowChromeHandles {
     pub(crate) osc_timer: Rc<slint::Timer>,
+    pub(crate) cursor_timer: Rc<slint::Timer>,
+    pub(crate) drop_timer: Rc<slint::Timer>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_window_chrome_handlers(
     app: &MementoApp,
+    config_ctrl: Rc<ConfigController>,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
     current_render_size: Rc<Cell<(u32, u32)>>,
@@ -249,78 +501,241 @@ pub(crate) fn install_window_chrome_handlers(
     renderer_overrides: &RendererOverrides,
 ) -> WindowChromeHandles {
     // The video surface is a Slint window, so mpv's fullscreen key cannot
-    // fullscreen it. Keep the OSC timer and fullscreen cursor auto-hide in the UI layer.
+    // fullscreen it directly. Keep OSC auto-hide, windowed/fullscreen cursor
+    // auto-hide, OS drag-and-drop, theme change, and window icon in the UI layer.
     let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
     let osc_timer = Rc::new(slint::Timer::default());
+    let cursor_timer = Rc::new(slint::Timer::default());
+    let drop_timer = Rc::new(slint::Timer::default());
+    let icon_applied = Rc::new(Cell::new(apply_runtime_window_icon(app.window())));
+
+    // OS drag-and-drop (C2), live OS ThemeChanged (C2), and deferred icon apply (H1.6).
+    let pending_dropped_paths: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let winit_app = app.as_weak();
+    let winit_config = config_ctrl;
+    let winit_drop_paths = pending_dropped_paths.clone();
+    let winit_drop_timer = drop_timer.clone();
+    let winit_icon_applied = icon_applied;
+    app.window().on_winit_window_event(move |slint_window, event| {
+        if !winit_icon_applied.get() && apply_runtime_window_icon(slint_window) {
+            winit_icon_applied.set(true);
+        }
+        let Some(app) = winit_app.upgrade() else {
+            return EventResult::Propagate;
+        };
+        match event {
+            WinitWindowEvent::HoveredFile(path) => {
+                app.set_drop_hover_label(drop_hover_label_for_path(path).into());
+                app.set_drop_hover_active(true);
+            }
+            WinitWindowEvent::HoveredFileCancelled => {
+                app.set_drop_hover_active(false);
+            }
+            WinitWindowEvent::DroppedFile(path) => {
+                app.set_drop_hover_active(false);
+                winit_drop_paths
+                    .borrow_mut()
+                    .push(path.to_string_lossy().into_owned());
+                let flush_app = winit_app.clone();
+                let flush_paths = winit_drop_paths.clone();
+                winit_drop_timer.start(
+                    slint::TimerMode::SingleShot,
+                    DROP_COALESCE_DELAY,
+                    move || {
+                        let drained: Vec<SharedString> = flush_paths
+                            .borrow_mut()
+                            .drain(..)
+                            .map(SharedString::from)
+                            .collect();
+                        if drained.is_empty() {
+                            return;
+                        }
+                        if let Some(app) = flush_app.upgrade() {
+                            app.invoke_files_dropped(Rc::new(VecModel::from(drained)).into());
+                        }
+                    },
+                );
+            }
+            WinitWindowEvent::ThemeChanged(_) => {
+                refresh_player_preferences(&app, &winit_config);
+            }
+            _ => {}
+        }
+        EventResult::Propagate
+    });
+
+    let arm_cursor_timer: Rc<dyn Fn(&MementoApp)> = {
+        let timer = cursor_timer.clone();
+        let coord_rc = coordinator.clone();
+        let activity = last_pointer_activity.clone();
+        Rc::new(move |app: &MementoApp| {
+            let win_fs = app.window().is_fullscreen();
+            let fullscreen = win_fs || app.get_is_fullscreen();
+            let overlay_interactive = is_overlay_interactive(app);
+            if app.get_osc_mpv_cursor() {
+                let (autohide, fs_only) = current_mpv_cursor_policy(&coord_rc);
+                if should_keep_cursor_hidden_on_move(
+                    true,
+                    autohide,
+                    fs_only,
+                    fullscreen,
+                    overlay_interactive,
+                ) {
+                    timer.stop();
+                    if !app.get_cursor_hidden() {
+                        app.set_cursor_hidden(true);
+                    }
+                    return;
+                }
+                let Some(delay_ms) = mpv_cursor_timer_delay_ms(autohide, fs_only, fullscreen)
+                else {
+                    timer.stop();
+                    if app.get_cursor_hidden() {
+                        app.set_cursor_hidden(false);
+                    }
+                    return;
+                };
+                let timer_app = app.as_weak();
+                let timer_coord = coord_rc.clone();
+                let timer_activity = activity.clone();
+                let timer_self = timer.clone();
+                let interval = Duration::from_millis(delay_ms.max(16));
+                timer.start(slint::TimerMode::SingleShot, interval, move || {
+                    let Some(app) = timer_app.upgrade() else {
+                        return;
+                    };
+                    if !app.get_osc_mpv_cursor() {
+                        return;
+                    }
+                    let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
+                    let overlay_interactive = is_overlay_interactive(&app);
+                    let (autohide, fs_only) = current_mpv_cursor_policy(&timer_coord);
+                    let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
+                    let hide = mpv_cursor_should_hide(
+                        autohide,
+                        fs_only,
+                        fullscreen,
+                        elapsed_ms,
+                        overlay_interactive,
+                    );
+                    if app.get_cursor_hidden() != hide {
+                        app.set_cursor_hidden(hide);
+                    }
+                    // If an overlay is temporarily blocking hide or elapsed hasn't reached
+                    // the configured timeout yet, keep re-checking cleanly until hidden.
+                    if !hide {
+                        if let Some(target_ms) =
+                            mpv_cursor_timer_delay_ms(autohide, fs_only, fullscreen)
+                        {
+                            let retry_ms = target_ms.saturating_sub(elapsed_ms).clamp(50, 500);
+                            timer_self.set_interval(Duration::from_millis(retry_ms));
+                            timer_self.restart();
+                        }
+                    }
+                });
+            } else {
+                let duration_ms = app.get_osc_duration_ms().max(50) as u64;
+                let timer_app = app.as_weak();
+                let timer_activity = activity.clone();
+                timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_millis(duration_ms),
+                    move || {
+                        let Some(app) = timer_app.upgrade() else {
+                            return;
+                        };
+                        if app.get_osc_mpv_cursor() {
+                            return;
+                        }
+                        let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
+                        let overlay_interactive = is_overlay_interactive(&app);
+                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
+                        let hide = compute_cursor_should_hide(
+                            false,
+                            CursorAutohide::Never,
+                            false,
+                            fullscreen,
+                            app.get_duration() > 0.0,
+                            elapsed_ms,
+                            app.get_osc_duration_ms().max(50) as u64,
+                            overlay_interactive,
+                        );
+                        if hide && !app.get_cursor_hidden() {
+                            app.set_cursor_hidden(true);
+                        }
+                    },
+                );
+            }
+        })
+    };
 
     let arm_osc_timer: Rc<dyn Fn(&MementoApp)> = {
         let timer = osc_timer.clone();
         let coord_rc = coordinator.clone();
         let activity = last_pointer_activity.clone();
+        let arm_cursor = arm_cursor_timer.clone();
         Rc::new(move |app: &MementoApp| {
             let duration_ms = app.get_osc_duration_ms().max(50) as u64;
-            let use_mpv_cursor = app.get_osc_mpv_cursor();
-            let mode = if use_mpv_cursor {
-                slint::TimerMode::Repeated
-            } else {
-                slint::TimerMode::SingleShot
-            };
             let timer_app = app.as_weak();
             let timer_coord = coord_rc.clone();
             let timer_activity = activity.clone();
-            timer.start(mode, Duration::from_millis(duration_ms), move || {
-                let Some(app) = timer_app.upgrade() else {
-                    return;
-                };
-                let win_fs = app.window().is_fullscreen();
-                let fullscreen = win_fs || app.get_is_fullscreen();
-                if win_fs && !app.get_is_fullscreen() {
-                    app.set_is_fullscreen(true);
-                }
-                let vis_mode = app.get_osc_visibility_mode();
-                if vis_mode == 1 {
-                    app.set_osc_visible(true);
-                } else if vis_mode == 2 {
-                    app.set_osc_visible(false);
-                } else if app.get_duration() > 0.0
-                    && !app.get_menu_open()
-                    && !app.get_dict_open()
-                    && !app.get_osc_hovered()
-                {
-                    app.set_osc_visible(false);
-                }
-                let overlay_interactive = app.get_menu_open()
-                    || app.get_dict_open()
-                    || app.get_osc_hovered()
-                    || app.get_ocr_mode()
-                    || app.get_about_open()
-                    || app.get_url_dialog_open()
-                    || app.get_update_dialog_open();
-                if app.get_osc_mpv_cursor() {
-                    let hide = timer_coord
-                        .try_borrow()
-                        .ok()
-                        .and_then(|guard| {
-                            guard.as_ref().map(|coord| {
-                                let st = coord.playback_state();
-                                let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
-                                mpv_cursor_should_hide(
-                                    st.cursor_autohide,
-                                    st.cursor_autohide_fs_only,
-                                    fullscreen,
-                                    elapsed_ms,
-                                    overlay_interactive,
-                                )
-                            })
-                        })
-                        .unwrap_or(false);
-                    if app.get_cursor_hidden() != hide {
-                        app.set_cursor_hidden(hide);
+            timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(duration_ms),
+                move || {
+                    let Some(app) = timer_app.upgrade() else {
+                        return;
+                    };
+                    let win_fs = app.window().is_fullscreen();
+                    let fullscreen = win_fs || app.get_is_fullscreen();
+                    if win_fs && !app.get_is_fullscreen() {
+                        app.set_is_fullscreen(true);
                     }
-                } else if fullscreen && !overlay_interactive {
-                    app.set_cursor_hidden(true);
-                }
-            });
+                    let vis_mode = app.get_osc_visibility_mode();
+                    if vis_mode == 1 {
+                        app.set_osc_visible(true);
+                    } else if vis_mode == 2 {
+                        app.set_osc_visible(false);
+                    } else if app.get_duration() > 0.0
+                        && !app.get_menu_open()
+                        && !app.get_dict_open()
+                        && !app.get_osc_hovered()
+                    {
+                        app.set_osc_visible(false);
+                    }
+                    let overlay_interactive = is_overlay_interactive(&app);
+                    if !app.get_osc_mpv_cursor() {
+                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
+                        let hide = compute_cursor_should_hide(
+                            false,
+                            CursorAutohide::Never,
+                            false,
+                            fullscreen,
+                            app.get_duration() > 0.0,
+                            elapsed_ms,
+                            app.get_osc_duration_ms().max(50) as u64,
+                            overlay_interactive,
+                        );
+                        if hide && !app.get_cursor_hidden() {
+                            app.set_cursor_hidden(true);
+                        }
+                    } else {
+                        let (autohide, fs_only) = current_mpv_cursor_policy(&timer_coord);
+                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
+                        let hide = mpv_cursor_should_hide(
+                            autohide,
+                            fs_only,
+                            fullscreen,
+                            elapsed_ms,
+                            overlay_interactive,
+                        );
+                        if app.get_cursor_hidden() != hide {
+                            app.set_cursor_hidden(hide);
+                        }
+                    }
+                },
+            );
+            arm_cursor(app);
         })
     };
 
@@ -332,7 +747,7 @@ pub(crate) fn install_window_chrome_handlers(
     let pointer_coord = coordinator.clone();
     let pointer_render_size = current_render_size.clone();
     let pointer_activity = last_pointer_activity.clone();
-    let last_pointer = Rc::new(Cell::new(None::<(f32, f32)>));
+    let last_pointer_anchor = Rc::new(Cell::new(None::<(f32, f32, Instant)>));
     app.on_pointer_moved(move |x, y| {
         let Some(app) = pointer_app.upgrade() else {
             return;
@@ -344,12 +759,28 @@ pub(crate) fn install_window_chrome_handlers(
         if app.get_cursor_in_bottom_sub_zone() != in_bottom {
             app.set_cursor_in_bottom_sub_zone(in_bottom);
         }
+        // Counteract Slint's unconditional `root.cursor-hidden = false` on move when
+        // `osc-mpv-cursor` is enabled and mpv's `cursor-autohide=always` is active (H3.4).
+        let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
+        let overlay_interactive = is_overlay_interactive(&app);
+        let (autohide, fs_only) = current_mpv_cursor_policy(&pointer_coord);
+        let keep_hidden = should_keep_cursor_hidden_on_move(
+            app.get_osc_mpv_cursor(),
+            autohide,
+            fs_only,
+            fullscreen,
+            overlay_interactive,
+        );
+        if keep_hidden {
+            app.set_cursor_hidden(true);
+        }
         if !app.get_dict_open()
             && !app.get_menu_open()
             && !app.get_ocr_mode()
             && !app.get_about_open()
             && !app.get_url_dialog_open()
             && !app.get_update_dialog_open()
+            && !app.get_no_dicts_dialog_open()
         {
             if let (Ok(player_ref), Ok(mut coord_ref)) =
                 (pointer_mpv.try_borrow(), pointer_coord.try_borrow_mut())
@@ -367,14 +798,16 @@ pub(crate) fn install_window_chrome_handlers(
                 }
             }
         }
+        let now = Instant::now();
         let minimum = app.get_osc_min_move().max(0) as f32;
-        let last = last_pointer.get();
-        if last.is_some_and(|(old_x, old_y)| (x - old_x).hypot(y - old_y) <= minimum) {
+        let (triggered, next_anchor) =
+            evaluate_osc_move_threshold(last_pointer_anchor.get(), x, y, now, minimum);
+        last_pointer_anchor.set(next_anchor);
+        if !triggered {
             return;
         }
-        last_pointer.set(Some((x, y)));
-        pointer_activity.set(Instant::now());
-        if app.get_cursor_hidden() {
+        pointer_activity.set(now);
+        if !keep_hidden && app.get_cursor_hidden() {
             app.set_cursor_hidden(false);
         }
         if app.get_osc_visibility_mode() != 2 {
@@ -418,8 +851,8 @@ pub(crate) fn install_window_chrome_handlers(
     });
 
     let wheel_app = app.as_weak();
-    let wheel_mpv = mpv;
-    let wheel_coord = coordinator;
+    let wheel_mpv = mpv.clone();
+    let wheel_coord = coordinator.clone();
     let wheel_render_size = current_render_size;
     app.on_video_wheel(move |x, y, delta_x, delta_y| {
         let Some(app) = wheel_app.upgrade() else {
@@ -447,12 +880,25 @@ pub(crate) fn install_window_chrome_handlers(
     let activity_app = app.as_weak();
     let activity_arm_osc = arm_osc_timer;
     let activity_pointer_ts = last_pointer_activity;
+    let activity_coord = coordinator.clone();
     app.on_osc_activity(move || {
         let Some(app) = activity_app.upgrade() else {
             return;
         };
         activity_pointer_ts.set(Instant::now());
-        if app.get_cursor_hidden() {
+        let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
+        let overlay_interactive = is_overlay_interactive(&app);
+        let (autohide, fs_only) = current_mpv_cursor_policy(&activity_coord);
+        let keep_hidden = should_keep_cursor_hidden_on_move(
+            app.get_osc_mpv_cursor(),
+            autohide,
+            fs_only,
+            fullscreen,
+            overlay_interactive,
+        );
+        if keep_hidden {
+            app.set_cursor_hidden(true);
+        } else if app.get_cursor_hidden() {
             app.set_cursor_hidden(false);
         }
         if app.get_osc_visibility_mode() != 2 {
@@ -462,11 +908,14 @@ pub(crate) fn install_window_chrome_handlers(
     });
 
     let weak_fs = app.as_weak();
+    let fs_mpv = mpv;
+    let fs_coord = coordinator;
     let fullscreen_ctrl = Rc::new(RefCell::new(PlatformFullscreenController::for_platform(
         TargetOs::current(),
         renderer_plan.primary,
         renderer_overrides.disable_windows_borderless_workaround,
     )));
+    let saved_native_maximized = Rc::new(Cell::new(false));
     #[cfg(target_os = "windows")]
     let win32_fs_snapshot: Rc<RefCell<Option<memento_os::Win32WindowStyleSnapshot>>> =
         Rc::new(RefCell::new(None));
@@ -488,13 +937,25 @@ pub(crate) fn install_window_chrome_handlers(
         let next = match &action {
             FullscreenAction::NoOp => fs.is_fullscreen(),
             FullscreenAction::SetNativeFullscreen { fullscreen } => {
-                app.window().set_fullscreen(*fullscreen);
+                if *fullscreen {
+                    saved_native_maximized.set(currently_maximized);
+                    app.window().set_fullscreen(true);
+                } else {
+                    app.window().set_fullscreen(false);
+                    if should_restore_maximized_after_native_fullscreen(
+                        TargetOs::current(),
+                        saved_native_maximized.replace(false),
+                    ) {
+                        app.window().set_maximized(true);
+                    }
+                }
                 app.set_window_bottom_margin(0.0);
                 *fullscreen
             }
             FullscreenAction::EnterWindowsBorderless {
                 bottom_margin_px, ..
             } => {
+                saved_native_maximized.set(currently_maximized);
                 #[cfg(target_os = "windows")]
                 if let Some(hwnd) = native_window_hwnd(app.window()) {
                     let mut snap = win32_fs_snapshot.borrow_mut();
@@ -513,8 +974,11 @@ pub(crate) fn install_window_chrome_handlers(
                 true
             }
             FullscreenAction::ExitWindowsBorderless {
-                bottom_margin_px, ..
+                restore_maximized,
+                bottom_margin_px,
+                ..
             } => {
+                let was_maximized = saved_native_maximized.replace(false) || *restore_maximized;
                 #[cfg(target_os = "windows")]
                 if let Some(hwnd) = native_window_hwnd(app.window()) {
                     let mut snap = win32_fs_snapshot.borrow_mut();
@@ -523,16 +987,41 @@ pub(crate) fn install_window_chrome_handlers(
                     ) {
                         eprintln!("Windows borderless fullscreen exit failed: {err}");
                         app.window().set_fullscreen(false);
+                        if was_maximized {
+                            app.window().set_maximized(true);
+                        }
                     }
                 } else {
                     app.window().set_fullscreen(false);
+                    if was_maximized {
+                        app.window().set_maximized(true);
+                    }
                 }
                 #[cfg(not(target_os = "windows"))]
-                app.window().set_fullscreen(false);
+                {
+                    app.window().set_fullscreen(false);
+                    if should_restore_maximized_after_native_fullscreen(
+                        TargetOs::current(),
+                        was_maximized,
+                    ) {
+                        app.window().set_maximized(true);
+                    }
+                }
                 app.set_window_bottom_margin(*bottom_margin_px as f32);
                 false
             }
         };
+        // Bidirectional mpv fullscreen sync with echo suppression (H1.3 / H3.1).
+        if let Ok(mut coord_ref) = fs_coord.try_borrow_mut() {
+            if let Some(coord) = coord_ref.as_mut() {
+                coord.note_window_fullscreen_state(next);
+            }
+        }
+        if let Ok(player_ref) = fs_mpv.try_borrow() {
+            if let Some(player) = player_ref.as_ref() {
+                let _ = player.set_fullscreen(next);
+            }
+        }
         app.set_is_fullscreen(next);
         app.set_cursor_hidden(false);
         if app.get_osc_visibility_mode() != 2 {
@@ -541,7 +1030,11 @@ pub(crate) fn install_window_chrome_handlers(
         app.invoke_osc_activity();
     });
 
-    WindowChromeHandles { osc_timer }
+    WindowChromeHandles {
+        osc_timer,
+        cursor_timer,
+        drop_timer,
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +1203,8 @@ mod tests {
 
         app.set_active_sub_text("Primary line".into());
         app.set_secondary_sub_text("Secondary line".into());
+        // H3.6 precedence: explicit hide (`subtitles_visible == false`) and
+        // `hide_memento_while_playing && is_playing` must NOT be bypassed by cursor zones.
         app.set_subtitles_visible(false);
         app.set_hide_memento_while_playing(true);
         app.set_is_playing(true);
@@ -720,6 +1215,29 @@ mod tests {
         });
         assert!(!app.get_cursor_in_top_sub_zone());
         assert!(!app.get_cursor_in_bottom_sub_zone());
+        assert!(!app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 610.),
+        });
+        assert!(app.get_cursor_in_bottom_sub_zone());
+        assert!(!app.get_cursor_in_top_sub_zone());
+        assert!(!app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        app.set_subtitles_visible(true);
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 610.),
+        });
+        assert!(!app.get_primary_subtitle_effective_visible());
+        assert!(!app.get_secondary_subtitle_effective_visible());
+
+        // Once paused with subtitles visible, cursor reveal zones show each band cleanly.
+        app.set_is_playing(false);
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(640., 360.),
+        });
         assert!(!app.get_primary_subtitle_effective_visible());
         assert!(!app.get_secondary_subtitle_effective_visible());
 
@@ -754,5 +1272,106 @@ mod tests {
         assert!(!app.get_primary_subtitle_effective_visible());
         assert!(app.get_secondary_subtitle_effective_visible());
         app.hide().unwrap();
+    }
+
+    #[test]
+    fn embedded_memento_ico_decodes_to_valid_rgba() {
+        let (rgba, width, height) =
+            decode_ico_rgba(WINDOW_ICON_ICO).expect("res/memento.ico must decode cleanly");
+        assert!(width >= 32 && height >= 32);
+        assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
+    }
+
+    #[test]
+    fn cursor_autohide_windowed_and_mpv_always_policy_behave_correctly() {
+        // Windowed mode hides cursor when osc_mpv_cursor == false and media is loaded.
+        assert!(compute_cursor_should_hide(
+            false,
+            CursorAutohide::Never,
+            false,
+            false,
+            true,
+            700,
+            700,
+            false,
+        ));
+        assert!(!compute_cursor_should_hide(
+            false,
+            CursorAutohide::Never,
+            false,
+            false,
+            true,
+            700,
+            700,
+            true,
+        ));
+        // mpv `cursor-autohide=always` keeps cursor hidden even on mouse move.
+        assert!(should_keep_cursor_hidden_on_move(
+            true,
+            CursorAutohide::Always,
+            false,
+            false,
+            false,
+        ));
+        assert!(!should_keep_cursor_hidden_on_move(
+            true,
+            CursorAutohide::Always,
+            true,
+            false,
+            false,
+        ));
+        assert!(should_keep_cursor_hidden_on_move(
+            true,
+            CursorAutohide::Always,
+            true,
+            true,
+            false,
+        ));
+        assert_eq!(
+            mpv_cursor_timer_delay_ms(CursorAutohide::Number(250), false, false),
+            Some(250)
+        );
+        assert_eq!(
+            mpv_cursor_timer_delay_ms(CursorAutohide::Never, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn osc_min_move_resets_reference_anchor_every_100ms() {
+        let t0 = Instant::now();
+        let (hit0, a0) = evaluate_osc_move_threshold(None, 0.0, 0.0, t0, 10.0);
+        assert!(hit0);
+        let (hit1, a1) = evaluate_osc_move_threshold(a0, 4.0, 0.0, t0 + Duration::from_millis(50), 10.0);
+        assert!(!hit1);
+        // After 100ms, anchor resets to (8, 0) instead of accumulating from (0, 0).
+        let (hit2, a2) = evaluate_osc_move_threshold(a1, 8.0, 0.0, t0 + Duration::from_millis(120), 10.0);
+        assert!(!hit2);
+        // Moving another 5px from (8, 0) to (13, 0) is only 5px from the reset anchor -> no trigger.
+        let (hit3, a3) = evaluate_osc_move_threshold(a2, 13.0, 0.0, t0 + Duration::from_millis(150), 10.0);
+        assert!(!hit3);
+        // Deliberate 15px jump within 100ms -> triggers!
+        let (hit4, _) = evaluate_osc_move_threshold(a3, 25.0, 0.0, t0 + Duration::from_millis(170), 10.0);
+        assert!(hit4);
+    }
+
+    #[test]
+    fn fullscreen_restore_maximized_guards_macos_spaces() {
+        assert!(should_restore_maximized_after_native_fullscreen(
+            TargetOs::Linux,
+            true
+        ));
+        assert!(should_restore_maximized_after_native_fullscreen(
+            TargetOs::Windows,
+            true
+        ));
+        assert!(!should_restore_maximized_after_native_fullscreen(
+            TargetOs::MacOs,
+            true
+        ));
+        assert!(!should_restore_maximized_after_native_fullscreen(
+            TargetOs::Linux,
+            false
+        ));
     }
 }

@@ -1,7 +1,8 @@
 //! Subtitle drawer row height estimation with incremental prefix-sum caching,
-//! O(N) search highlighting, differential secondary-list updates, and drawer callbacks.
+//! O(N) search highlighting, delay-adjusted timestamps (`H3.7`), Primary &
+//! Secondary selection/copy/lookup (`M1`), and drawer callbacks.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -10,10 +11,12 @@ use slint::{ComponentHandle, Model as _, VecModel};
 use crate::app::clipboard::copy_text_to_clipboard;
 use crate::controller::dict;
 use crate::controller::player::{
-    refresh_subtitle_list as base_refresh_subtitle_list, refresh_subtitle_marks,
+    refresh_subtitle_list_with_timing as base_refresh_subtitle_list_with_timing,
+    refresh_subtitle_marks,
 };
 use crate::controller::subtitles::SubtitleController;
-use crate::ui::{MementoApp, SubEntry};
+use crate::ui::{self, MementoApp, PopupBridge, SubEntry};
+use memento_player::subtitle_to_media_time;
 
 pub(crate) fn estimate_drawer_row_height(
     text: &str,
@@ -75,12 +78,92 @@ struct TabHeightCache {
 }
 
 #[derive(Default)]
+struct SecondarySelectionState {
+    sid: i64,
+    selected: Vec<usize>,
+    anchor: Option<usize>,
+}
+
+impl SecondarySelectionState {
+    fn sync_track(&mut self, sid: i64, entry_count: usize) {
+        if self.sid != sid {
+            self.sid = sid;
+            self.selected.clear();
+            self.anchor = None;
+        }
+        self.selected.retain(|&idx| idx < entry_count);
+        if self.anchor.is_some_and(|a| a >= entry_count) {
+            self.anchor = None;
+        }
+    }
+
+    fn apply_click(&mut self, index: usize, entry_count: usize, ctrl: bool, shift: bool) {
+        if index >= entry_count {
+            return;
+        }
+        if shift {
+            let anchor = *self.anchor.get_or_insert(index);
+            if !ctrl {
+                self.selected.clear();
+            }
+            self.selected.extend(anchor.min(index)..=anchor.max(index));
+            self.selected.sort_unstable();
+            self.selected.dedup();
+        } else if ctrl {
+            self.anchor = Some(index);
+            if let Some(pos) = self.selected.iter().position(|&i| i == index) {
+                self.selected.remove(pos);
+            } else {
+                self.selected.push(index);
+                self.selected.sort_unstable();
+            }
+        } else {
+            self.selected.clear();
+            self.selected.push(index);
+            self.anchor = Some(index);
+        }
+    }
+
+    fn select_range(&mut self, first: usize, last: usize, previous: &[usize], entry_count: usize) {
+        if first >= entry_count || last >= entry_count {
+            return;
+        }
+        self.anchor = Some(first);
+        self.selected = previous
+            .iter()
+            .copied()
+            .filter(|&i| i < entry_count)
+            .collect();
+        self.selected.extend(first.min(last)..=first.max(last));
+        self.selected.sort_unstable();
+        self.selected.dedup();
+    }
+
+    fn set_selected(&mut self, index: usize, entry_count: usize, selected: bool) {
+        if index >= entry_count {
+            return;
+        }
+        self.anchor = Some(index);
+        if let Some(pos) = self.selected.iter().position(|&i| i == index) {
+            if !selected {
+                self.selected.remove(pos);
+            }
+        } else if selected {
+            self.selected.push(index);
+            self.selected.sort_unstable();
+        }
+    }
+}
+
+#[derive(Default)]
 struct DrawerCaches {
     primary_revision: u64,
     secondary_revision: u64,
     primary_heights: TabHeightCache,
     secondary_heights: TabHeightCache,
     last_secondary_model: Option<SecondaryModelState>,
+    secondary_selection: SecondarySelectionState,
+    suppress_search_auto_seek: bool,
 }
 
 struct SecondaryModelState {
@@ -88,6 +171,8 @@ struct SecondaryModelState {
     sid: i64,
     entry_count: usize,
     remove_regex: String,
+    sub_speed_bits: u64,
+    secondary_sub_delay_bits: u64,
     first_cue_sig: Option<(u64, usize)>,
     last_cue_sig: Option<(u64, usize)>,
 }
@@ -229,20 +314,82 @@ pub fn auto_scroll_subtitle_drawer_if_needed(app: &MementoApp, subtitles: &Subti
     }
 }
 
+fn apply_secondary_selection_marks<M: slint::Model<Data = SubEntry>>(
+    model: &M,
+    selected: &[usize],
+) {
+    let selected_set: HashSet<usize> = selected.iter().copied().collect();
+    for model_row in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(model_row) {
+            let entry_idx = usize::try_from(row.id - 1).unwrap_or(model_row);
+            let is_sel = selected_set.contains(&entry_idx);
+            if row.selected != is_sel {
+                row.selected = is_sel;
+                model.set_row_data(model_row, row);
+            }
+        }
+    }
+}
+
+/// Re-run the currently active subtitle search without seeking playback (used
+/// when live ASR or newly parsed embedded cues arrive in `sync_loop.rs`, M1).
+pub(crate) fn rerun_active_subtitle_search_silently(app: &MementoApp) {
+    let query = app.get_subtitle_search_query();
+    if query.trim().is_empty() {
+        return;
+    }
+    DRAWER_CACHES.with(|slot| {
+        slot.borrow_mut().suppress_search_auto_seek = true;
+    });
+    app.invoke_search_subtitles(query);
+    DRAWER_CACHES.with(|slot| {
+        slot.borrow_mut().suppress_search_auto_seek = false;
+    });
+}
+
+/// Extract the lookup slice starting at character index `char_idx` from a cue line.
+pub(crate) fn slice_lookup_from_char(text: &str, char_idx: i32) -> Option<String> {
+    let char_count = text.chars().count();
+    if char_count == 0 {
+        return None;
+    }
+    let clamped = (char_idx.max(0) as usize).min(char_count - 1);
+    let byte_start = text
+        .char_indices()
+        .nth(clamped)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(0);
+    let tail = text[byte_start..].trim_start();
+    let candidate = if tail.is_empty() { text.trim() } else { tail };
+    (!candidate.is_empty()).then(|| candidate.to_owned())
+}
+
+pub fn refresh_subtitle_list_with_timing(
+    app: &MementoApp,
+    model: &VecModel<SubEntry>,
+    subtitles: &SubtitleController,
+    sub_speed: f64,
+    sub_delay: f64,
+) {
+    base_refresh_subtitle_list_with_timing(app, model, subtitles, sub_speed, sub_delay);
+    invalidate_height_cache(false);
+    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+}
+
 pub fn refresh_subtitle_list(
     app: &MementoApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
 ) {
-    base_refresh_subtitle_list(app, model, subtitles);
-    invalidate_height_cache(false);
-    auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+    refresh_subtitle_list_with_timing(app, model, subtitles, 1.0, 0.0);
 }
 
-pub fn refresh_secondary_subtitle_list(
+pub fn refresh_secondary_subtitle_list_with_timing(
     app: &MementoApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
+    sub_speed: f64,
+    secondary_sub_delay: f64,
 ) {
     let query = app.get_subtitle_search_query();
     let active_tab = app.get_subtitle_drawer_tab();
@@ -250,20 +397,32 @@ pub fn refresh_secondary_subtitle_list(
     let remove_regex = app.get_search_remove_regex();
     let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
     let entries = subtitles.secondary_entries();
+    let sid = subtitles.secondary_sid();
+    app.set_has_secondary_subtitles(sid > 0 || !entries.is_empty());
+
+    let selected_snapshot = DRAWER_CACHES.with(|slot| {
+        let mut caches = slot.borrow_mut();
+        caches.secondary_selection.sync_track(sid, entries.len());
+        caches.secondary_selection.selected.clone()
+    });
+    let selected_set: HashSet<usize> = selected_snapshot.iter().copied().collect();
+
     let matching = if active_tab == 1 && !query.trim().is_empty() {
         search_entries(entries, &query, ignore_whitespace, compiled_regex.as_ref())
     } else {
         Vec::new()
     };
-    let active = subtitles.active_indices(subtitles.secondary_sid());
+    let active = subtitles.active_indices(sid);
     let active_set: HashSet<usize> = active.iter().copied().collect();
 
     let model_ptr = (model as *const VecModel<SubEntry>) as usize;
     let first_cue_sig = entries.first().map(|c| (c.start.to_bits(), c.text.len()));
     let last_cue_sig = entries.last().map(|c| (c.start.to_bits(), c.text.len()));
-    let sid = subtitles.secondary_sid();
+    let sub_speed_bits = sub_speed.to_bits();
+    let secondary_sub_delay_bits = secondary_sub_delay.to_bits();
 
-    let can_patch_in_place = model.row_count() == entries.len()
+    let can_patch_in_place = compiled_regex.is_none()
+        && model.row_count() == entries.len()
         && DRAWER_CACHES.with(|slot| {
             let caches = slot.borrow();
             caches.last_secondary_model.as_ref().is_some_and(|prev| {
@@ -271,13 +430,14 @@ pub fn refresh_secondary_subtitle_list(
                     && prev.sid == sid
                     && prev.entry_count == entries.len()
                     && prev.remove_regex == remove_regex.as_str()
+                    && prev.sub_speed_bits == sub_speed_bits
+                    && prev.secondary_sub_delay_bits == secondary_sub_delay_bits
                     && prev.first_cue_sig == first_cue_sig
                     && prev.last_cue_sig == last_cue_sig
             })
         });
 
     if can_patch_in_place {
-        // Only touch rows whose `is_active` or `search_match` actually changed.
         let mut match_cursor = 0usize;
         for index in 0..entries.len() {
             while match_cursor < matching.len() && matching[match_cursor] < index {
@@ -285,40 +445,47 @@ pub fn refresh_secondary_subtitle_list(
             }
             let is_match = matching.get(match_cursor) == Some(&index);
             let is_active = active_set.contains(&index);
+            let is_selected = selected_set.contains(&index);
             if let Some(mut row) = model.row_data(index) {
-                if row.is_active != is_active || row.search_match != is_match {
+                if row.is_active != is_active
+                    || row.search_match != is_match
+                    || row.selected != is_selected
+                {
                     row.is_active = is_active;
                     row.search_match = is_match;
+                    row.selected = is_selected;
                     model.set_row_data(index, row);
                 }
             }
         }
     } else {
         let mut match_cursor = 0usize;
-        let rows: Vec<SubEntry> = entries
-            .iter()
-            .enumerate()
-            .map(|(index, cue)| {
-                while match_cursor < matching.len() && matching[match_cursor] < index {
-                    match_cursor += 1;
-                }
-                let is_match = matching.get(match_cursor) == Some(&index);
-                let raw = String::from_utf16_lossy(&cue.text);
-                let display = memento_dict::normalize::apply_compiled_remove_regex(
-                    &raw,
-                    compiled_regex.as_ref(),
-                );
-                SubEntry {
-                    id: (index + 1) as i32,
-                    start: cue.start as f32,
-                    end: cue.end as f32,
-                    text: display.into_owned().into(),
-                    selected: false,
-                    is_active: active_set.contains(&index),
-                    search_match: is_match,
-                }
-            })
-            .collect();
+        let mut rows = Vec::with_capacity(entries.len());
+        for (index, cue) in entries.iter().enumerate() {
+            while match_cursor < matching.len() && matching[match_cursor] < index {
+                match_cursor += 1;
+            }
+            let is_match = matching.get(match_cursor) == Some(&index);
+            let raw = String::from_utf16_lossy(&cue.text);
+            let display = memento_dict::normalize::apply_compiled_remove_regex(
+                &raw,
+                compiled_regex.as_ref(),
+            );
+            if compiled_regex.is_some() && display.trim().is_empty() {
+                continue;
+            }
+            let start = subtitle_to_media_time(cue.start, sub_speed, secondary_sub_delay) as f32;
+            let end = subtitle_to_media_time(cue.end, sub_speed, secondary_sub_delay) as f32;
+            rows.push(SubEntry {
+                id: (index + 1) as i32,
+                start,
+                end,
+                text: display.into_owned().into(),
+                selected: selected_set.contains(&index),
+                is_active: active_set.contains(&index),
+                search_match: is_match,
+            });
+        }
         model.set_vec(rows);
         DRAWER_CACHES.with(|slot| {
             let mut caches = slot.borrow_mut();
@@ -327,6 +494,8 @@ pub fn refresh_secondary_subtitle_list(
                 sid,
                 entry_count: entries.len(),
                 remove_regex: remove_regex.to_string(),
+                sub_speed_bits,
+                secondary_sub_delay_bits,
                 first_cue_sig,
                 last_cue_sig,
             });
@@ -335,6 +504,25 @@ pub fn refresh_secondary_subtitle_list(
     }
 
     auto_scroll_subtitle_drawer_if_needed(app, subtitles);
+}
+
+pub fn refresh_secondary_subtitle_list(
+    app: &MementoApp,
+    model: &VecModel<SubEntry>,
+    subtitles: &SubtitleController,
+) {
+    refresh_secondary_subtitle_list_with_timing(app, model, subtitles, 1.0, 0.0);
+}
+
+fn normalize_search_text(text: &str, ignore_whitespace: bool) -> String {
+    if ignore_whitespace {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    } else {
+        text.chars().flat_map(char::to_lowercase).collect()
+    }
 }
 
 fn search_entries(
@@ -347,15 +535,7 @@ fn search_entries(
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let normalized_query: String = if ignore_whitespace {
-        trimmed
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect()
-    } else {
-        trimmed.chars().flat_map(char::to_lowercase).collect()
-    };
+    let normalized_query = normalize_search_text(trimmed, ignore_whitespace);
     if normalized_query.is_empty() {
         return Vec::new();
     }
@@ -365,15 +545,31 @@ fn search_entries(
         .filter_map(|(idx, cue)| {
             let raw = String::from_utf16_lossy(&cue.text);
             let text = memento_dict::normalize::apply_compiled_remove_regex(&raw, remove_regex);
-            let haystack: String = if ignore_whitespace {
-                text.chars()
-                    .filter(|c| !c.is_whitespace())
-                    .flat_map(char::to_lowercase)
-                    .collect()
-            } else {
-                text.chars().flat_map(char::to_lowercase).collect()
-            };
+            let haystack = normalize_search_text(&text, ignore_whitespace);
             haystack.contains(&normalized_query).then_some(idx)
+        })
+        .collect()
+}
+
+fn search_model_rows<M: slint::Model<Data = SubEntry>>(
+    model: &M,
+    query: &str,
+    ignore_whitespace: bool,
+) -> Vec<usize> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let normalized_query = normalize_search_text(trimmed, ignore_whitespace);
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+    (0..model.row_count())
+        .filter(|&row_idx| {
+            model.row_data(row_idx).is_some_and(|row| {
+                normalize_search_text(row.text.as_str(), ignore_whitespace)
+                    .contains(&normalized_query)
+            })
         })
         .collect()
 }
@@ -411,53 +607,300 @@ pub(crate) fn auto_seek_to_matched_row(app: &MementoApp, row: usize) {
     }
 }
 
+fn entry_index_for_model_row<M: slint::Model<Data = SubEntry>>(
+    model: &M,
+    row_idx: usize,
+) -> usize {
+    model
+        .row_data(row_idx)
+        .and_then(|row| usize::try_from(row.id - 1).ok())
+        .unwrap_or(row_idx)
+}
+
+fn apply_primary_click_selection(
+    subtitles: &mut SubtitleController,
+    anchor_cell: &Cell<Option<usize>>,
+    entry_index: usize,
+    ctrl: bool,
+    shift: bool,
+) {
+    let count = subtitles.primary_entries().len();
+    if entry_index >= count {
+        return;
+    }
+    if shift {
+        let anchor = anchor_cell
+            .get()
+            .filter(|&a| a < count)
+            .unwrap_or(entry_index);
+        anchor_cell.set(Some(anchor));
+        let lo = anchor.min(entry_index);
+        let hi = anchor.max(entry_index);
+        if ctrl {
+            let prev = subtitles.selected_indices().to_vec();
+            subtitles.select_range(lo, hi, &prev);
+        } else {
+            subtitles.clear_selection();
+            subtitles.select_range(lo, hi, &[]);
+        }
+    } else if ctrl {
+        subtitles.toggle_select(entry_index);
+        anchor_cell.set(Some(entry_index));
+    } else {
+        subtitles.clear_selection();
+        subtitles.set_selected(entry_index, true);
+        anchor_cell.set(Some(entry_index));
+    }
+}
+
 pub(crate) fn install_subtitle_selection(
     app: &MementoApp,
     subtitles: Rc<RefCell<SubtitleController>>,
     rows: Rc<VecModel<SubEntry>>,
 ) {
     let search_matches: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+    let primary_anchor: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // Track whether the current primary selection came solely from a drawer lookup
+    // so hover-lookup (e.g. Shift+move before Shift+Click) never clobbers an explicit
+    // click/drag selection or range anchor.
+    let selection_from_lookup: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // `subtitle_drawer.slint` emits `subtitle-row-clicked-mod` followed immediately
+    // by legacy `row-clicked`; suppress the trailing legacy callback so clicks never double-toggle.
+    let mod_click_handled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    let mod_app = app.as_weak();
+    let mod_subs = subtitles.clone();
+    let mod_rows = rows.clone();
+    let mod_anchor = primary_anchor.clone();
+    let mod_lookup_sel = selection_from_lookup.clone();
+    let mod_handled_flag = mod_click_handled.clone();
+    app.on_subtitle_row_clicked_mod(move |tab, row_idx, ctrl, shift| {
+        mod_handled_flag.set(true);
+        let Ok(model_row) = usize::try_from(row_idx) else {
+            return;
+        };
+        let Some(app) = mod_app.upgrade() else {
+            return;
+        };
+        if tab == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            let entry_idx = entry_index_for_model_row(&sec_model, model_row);
+            let subs = mod_subs.borrow();
+            let sid = subs.secondary_sid();
+            let count = subs.secondary_entries().len().max(sec_model.row_count());
+            let selected = DRAWER_CACHES.with(|slot| {
+                let mut caches = slot.borrow_mut();
+                caches.secondary_selection.sync_track(sid, count);
+                caches
+                    .secondary_selection
+                    .apply_click(entry_idx, count, ctrl, shift);
+                caches.secondary_selection.selected.clone()
+            });
+            apply_secondary_selection_marks(&sec_model, &selected);
+        } else {
+            mod_lookup_sel.set(false);
+            let entry_idx = entry_index_for_model_row(mod_rows.as_ref(), model_row);
+            let mut subs = mod_subs.borrow_mut();
+            apply_primary_click_selection(&mut subs, &mod_anchor, entry_idx, ctrl, shift);
+            refresh_subtitle_marks(&mod_rows, &subs);
+        }
+    });
 
     let controller = subtitles.clone();
     let model = rows.clone();
+    let legacy_anchor = primary_anchor.clone();
+    let legacy_lookup_sel = selection_from_lookup.clone();
+    let legacy_handled_flag = mod_click_handled;
     app.on_select_row(move |row, extend_range| {
-        let Ok(index) = usize::try_from(row) else {
+        if legacy_handled_flag.replace(false) {
+            return;
+        }
+        let Ok(model_row) = usize::try_from(row) else {
             return;
         };
+        legacy_lookup_sel.set(false);
+        let entry_idx = entry_index_for_model_row(model.as_ref(), model_row);
         let mut subtitles = controller.borrow_mut();
-        subtitles.select_row(index, extend_range);
+        apply_primary_click_selection(
+            &mut subtitles,
+            &legacy_anchor,
+            entry_idx,
+            false,
+            extend_range,
+        );
         refresh_subtitle_marks(&model, &subtitles);
     });
+
+    let range_app = app.as_weak();
     let controller = subtitles.clone();
     let model = rows.clone();
-    let drag_marks = RefCell::new((0, Vec::new()));
+    let range_anchor = primary_anchor.clone();
+    let range_lookup_sel = selection_from_lookup.clone();
+    let drag_marks: RefCell<(i32, i64, Vec<usize>)> = RefCell::new((0, 0, Vec::new()));
     app.on_select_subtitle_range(move |first, last, begin| {
-        let (Ok(first), Ok(last)) = (usize::try_from(first), usize::try_from(last)) else {
+        let (Ok(first_row), Ok(last_row)) = (usize::try_from(first), usize::try_from(last)) else {
             return;
         };
-        let mut subtitles = controller.borrow_mut();
+        let Some(app) = range_app.upgrade() else {
+            return;
+        };
+        let active_tab = app.get_subtitle_drawer_tab();
         let mut previous = drag_marks.borrow_mut();
+        if active_tab == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            let first_idx = entry_index_for_model_row(&sec_model, first_row);
+            let last_idx = entry_index_for_model_row(&sec_model, last_row);
+            let subs = controller.borrow();
+            let sid = subs.secondary_sid();
+            let count = subs.secondary_entries().len().max(sec_model.row_count());
+            let selected = DRAWER_CACHES.with(|slot| {
+                let mut caches = slot.borrow_mut();
+                caches.secondary_selection.sync_track(sid, count);
+                if begin {
+                    *previous = (1, sid, caches.secondary_selection.selected.clone());
+                }
+                if previous.0 != 1 || previous.1 != sid {
+                    return caches.secondary_selection.selected.clone();
+                }
+                caches
+                    .secondary_selection
+                    .select_range(first_idx, last_idx, &previous.2, count);
+                caches.secondary_selection.selected.clone()
+            });
+            apply_secondary_selection_marks(&sec_model, &selected);
+            return;
+        }
+        range_lookup_sel.set(false);
+        let first_idx = entry_index_for_model_row(model.as_ref(), first_row);
+        let last_idx = entry_index_for_model_row(model.as_ref(), last_row);
+        let mut subtitles = controller.borrow_mut();
         if begin {
             *previous = (
+                0,
                 subtitles.primary_sid(),
                 subtitles.selected_indices().to_vec(),
             );
         }
-        if previous.0 != subtitles.primary_sid() {
+        if previous.0 != 0 || previous.1 != subtitles.primary_sid() {
             return;
         }
-        subtitles.select_range(first, last, &previous.1);
+        range_anchor.set(Some(first_idx));
+        subtitles.select_range(first_idx, last_idx, &previous.2);
         refresh_subtitle_marks(&model, &subtitles);
     });
+
+    let mark_app = app.as_weak();
     let controller = subtitles.clone();
     let model = rows.clone();
+    let mark_anchor = primary_anchor.clone();
+    let mark_lookup_sel = selection_from_lookup.clone();
     app.on_mark_subtitle_row(move |row| {
-        let Ok(index) = usize::try_from(row) else {
+        let Ok(model_row) = usize::try_from(row) else {
             return;
         };
+        let Some(app) = mark_app.upgrade() else {
+            return;
+        };
+        if app.get_subtitle_drawer_tab() == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            let entry_idx = entry_index_for_model_row(&sec_model, model_row);
+            let subs = controller.borrow();
+            let sid = subs.secondary_sid();
+            let count = subs.secondary_entries().len().max(sec_model.row_count());
+            let selected = DRAWER_CACHES.with(|slot| {
+                let mut caches = slot.borrow_mut();
+                caches.secondary_selection.sync_track(sid, count);
+                caches
+                    .secondary_selection
+                    .set_selected(entry_idx, count, true);
+                caches.secondary_selection.selected.clone()
+            });
+            apply_secondary_selection_marks(&sec_model, &selected);
+            return;
+        }
+        mark_lookup_sel.set(false);
+        let entry_idx = entry_index_for_model_row(model.as_ref(), model_row);
         let mut subtitles = controller.borrow_mut();
-        subtitles.set_selected(index, true);
+        mark_anchor.set(Some(entry_idx));
+        subtitles.set_selected(entry_idx, true);
         refresh_subtitle_marks(&model, &subtitles);
+    });
+
+    // M1: Dictionary lookup inside Primary/Secondary subtitle drawer rows, setting
+    // that row as the active sentence & timing context for Anki mining without
+    // clobbering an explicit click/drag multi-selection or range anchor.
+    let lookup_app = app.as_weak();
+    let lookup_subs = subtitles.clone();
+    let lookup_rows = rows.clone();
+    let lookup_sel_flag = selection_from_lookup;
+    app.on_subtitle_row_lookup(move |tab, row_idx, char_idx, _lx, _ly| {
+        let Ok(model_row) = usize::try_from(row_idx) else {
+            return;
+        };
+        let Some(app) = lookup_app.upgrade() else {
+            return;
+        };
+        let (row_entry, entry_idx) = if tab == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            let Some(entry) = sec_model.row_data(model_row) else {
+                return;
+            };
+            let idx = entry_index_for_model_row(&sec_model, model_row);
+            (entry, idx)
+        } else {
+            let Some(entry) = lookup_rows.row_data(model_row) else {
+                return;
+            };
+            let idx = entry_index_for_model_row(lookup_rows.as_ref(), model_row);
+            (entry, idx)
+        };
+        let Some(query) = slice_lookup_from_char(row_entry.text.as_str(), char_idx) else {
+            return;
+        };
+        ui::clear_rich_bridge_ass_lookup(&app);
+        if tab == 1 {
+            let sec_model = app.get_secondary_subtitle_entries();
+            {
+                let subs = lookup_subs.borrow();
+                let sid = subs.secondary_sid();
+                let count = subs.secondary_entries().len().max(sec_model.row_count());
+                let selected = DRAWER_CACHES.with(|slot| {
+                    let mut caches = slot.borrow_mut();
+                    caches.secondary_selection.sync_track(sid, count);
+                    if caches.secondary_selection.selected.is_empty() {
+                        caches
+                            .secondary_selection
+                            .set_selected(entry_idx, count, true);
+                    }
+                    caches.secondary_selection.selected.clone()
+                });
+                apply_secondary_selection_marks(&sec_model, &selected);
+            }
+            app.set_active_sub_text(row_entry.text.clone());
+            app.set_secondary_sub_text(row_entry.text.clone());
+        } else {
+            {
+                let mut subs = lookup_subs.borrow_mut();
+                if subs.selected_indices().is_empty() || lookup_sel_flag.get() {
+                    subs.clear_selection();
+                    subs.set_selected(entry_idx, true);
+                    lookup_sel_flag.set(true);
+                    refresh_subtitle_marks(&lookup_rows, &subs);
+                }
+            }
+            app.set_active_sub_text(row_entry.text.clone());
+        }
+        // Position popup cleanly near the right edge of the video area adjacent to the drawer.
+        let half_video = (app.get_video_width() as f32) * 0.5;
+        if half_video > 0.0 {
+            app.set_popup_offset_x((half_video - 60.0).max(0.0));
+        }
+        let pb = app.global::<PopupBridge>();
+        if pb.get_rich_enabled() {
+            pb.invoke_panel_lookup_requested(query.into());
+        } else {
+            app.invoke_lookup_word(query.into());
+        }
     });
 
     let search_subs = subtitles.clone();
@@ -471,58 +914,38 @@ pub(crate) fn install_subtitle_selection(
         app.set_subtitle_search_query(query.clone());
         let active_tab = app.get_subtitle_drawer_tab();
         let ignore_whitespace = app.get_subtitle_search_ignore_whitespace();
-        let remove_regex = app.get_search_remove_regex();
-        let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+        let suppress_seek = DRAWER_CACHES.with(|slot| slot.borrow().suppress_search_auto_seek);
         let mut matching = if query.trim().is_empty() {
             Vec::new()
         } else if active_tab == 1 {
-            let subs = search_subs.borrow();
-            let sec_matches = search_entries(
-                subs.secondary_entries(),
-                &query,
-                ignore_whitespace,
-                compiled_regex.as_ref(),
-            );
-            if !sec_matches.is_empty() || !subs.secondary_entries().is_empty() {
-                sec_matches
+            let sec_model = app.get_secondary_subtitle_entries();
+            if sec_model.row_count() > 0 {
+                search_model_rows(&sec_model, &query, ignore_whitespace)
             } else {
-                let sec_model = app.get_secondary_subtitle_entries();
-                let q_norm: String = if ignore_whitespace {
-                    query
-                        .trim()
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .flat_map(char::to_lowercase)
-                        .collect()
-                } else {
-                    query.trim().chars().flat_map(char::to_lowercase).collect()
-                };
-                (0..sec_model.row_count())
-                    .filter(|&i| {
-                        sec_model.row_data(i).is_some_and(|r| {
-                            let h: String = if ignore_whitespace {
-                                r.text
-                                    .chars()
-                                    .filter(|c| !c.is_whitespace())
-                                    .flat_map(char::to_lowercase)
-                                    .collect()
-                            } else {
-                                r.text.chars().flat_map(char::to_lowercase).collect()
-                            };
-                            h.contains(&q_norm)
-                        })
-                    })
-                    .collect()
+                let remove_regex = app.get_search_remove_regex();
+                let compiled_regex =
+                    memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+                let subs = search_subs.borrow();
+                search_entries(
+                    subs.secondary_entries(),
+                    &query,
+                    ignore_whitespace,
+                    compiled_regex.as_ref(),
+                )
             }
-        } else if compiled_regex.is_some() {
+        } else if search_rows.row_count() > 0 {
+            search_model_rows(search_rows.as_ref(), &query, ignore_whitespace)
+        } else {
+            let remove_regex = app.get_search_remove_regex();
+            let compiled_regex =
+                memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+            let subs = search_subs.borrow();
             search_entries(
-                search_subs.borrow().primary_entries(),
+                subs.primary_entries(),
                 &query,
                 ignore_whitespace,
                 compiled_regex.as_ref(),
             )
-        } else {
-            search_subs.borrow().search(&query, ignore_whitespace)
         };
         // Ensure strictly ascending order for O(N) two-pointer highlight update.
         matching.sort_unstable();
@@ -539,10 +962,26 @@ pub(crate) fn install_subtitle_selection(
         let total = matching.len() as i32;
         app.set_subtitle_search_total_matches(total);
         if let Some(&first_row) = matching.first() {
-            app.set_subtitle_search_current_match(1);
-            app.set_subtitle_search_focused_row(first_row as i32);
-            scroll_drawer_to_row_accurate(&app, first_row);
-            auto_seek_to_matched_row(&app, first_row);
+            if suppress_seek {
+                let prev_row = app.get_subtitle_search_focused_row();
+                if prev_row >= 0 {
+                    if let Some(pos) = matching.iter().position(|&r| r as i32 == prev_row) {
+                        app.set_subtitle_search_current_match((pos + 1) as i32);
+                        app.set_subtitle_search_focused_row(prev_row);
+                    } else {
+                        app.set_subtitle_search_current_match(1);
+                        app.set_subtitle_search_focused_row(first_row as i32);
+                    }
+                } else {
+                    app.set_subtitle_search_current_match(1);
+                    app.set_subtitle_search_focused_row(first_row as i32);
+                }
+            } else {
+                app.set_subtitle_search_current_match(1);
+                app.set_subtitle_search_focused_row(first_row as i32);
+                scroll_drawer_to_row_accurate(&app, first_row);
+                auto_seek_to_matched_row(&app, first_row);
+            }
         } else {
             app.set_subtitle_search_current_match(0);
             app.set_subtitle_search_focused_row(-1);
@@ -629,25 +1068,60 @@ pub(crate) fn install_subtitle_selection(
         };
         let subs = copy_subs.borrow();
         let remove_regex = app.get_search_remove_regex();
-        let selected_cues = subs.selected_cues();
-        let text = if !selected_cues.is_empty() {
-            selected_cues
-                .iter()
-                .map(|c| {
-                    let raw = String::from_utf16_lossy(&c.text);
-                    dict::apply_remove_regex(&raw, remove_regex.as_str())
-                })
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            let active = app.get_active_sub_text().to_string();
-            if !active.is_empty() {
-                active
+        let text = if app.get_subtitle_drawer_tab() == 1 {
+            let sec_entries = subs.secondary_entries();
+            let sid = subs.secondary_sid();
+            let sec_model = app.get_secondary_subtitle_entries();
+            let selected = DRAWER_CACHES.with(|slot| {
+                let mut caches = slot.borrow_mut();
+                caches
+                    .secondary_selection
+                    .sync_track(sid, sec_entries.len().max(sec_model.row_count()));
+                caches.secondary_selection.selected.clone()
+            });
+            if !selected.is_empty() && !sec_entries.is_empty() {
+                selected
+                    .iter()
+                    .filter_map(|&idx| sec_entries.get(idx))
+                    .map(|c| {
+                        let raw = String::from_utf16_lossy(&c.text);
+                        dict::apply_remove_regex(&raw, remove_regex.as_str())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if !selected.is_empty() {
+                selected
+                    .iter()
+                    .filter_map(|&idx| sec_model.row_data(idx))
+                    .map(|r| r.text.to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else {
-                subs.active_cue_text()
-                    .map(|raw| dict::apply_remove_regex(&raw, remove_regex.as_str()))
-                    .unwrap_or_default()
+                app.get_secondary_sub_text().to_string()
+            }
+        } else {
+            let selected_cues = subs.selected_cues();
+            if !selected_cues.is_empty() {
+                selected_cues
+                    .iter()
+                    .map(|c| {
+                        let raw = String::from_utf16_lossy(&c.text);
+                        dict::apply_remove_regex(&raw, remove_regex.as_str())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                let active = app.get_active_sub_text().to_string();
+                if !active.is_empty() {
+                    active
+                } else {
+                    subs.active_cue_text()
+                        .map(|raw| dict::apply_remove_regex(&raw, remove_regex.as_str()))
+                        .unwrap_or_default()
+                }
             }
         };
         if !text.is_empty() {
@@ -773,7 +1247,14 @@ mod tests {
             text: Key::Shift.into(),
         });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        // M1: Ctrl+Click toggles an individual row out of the selection without clearing others.
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
         click(1100., 112.);
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
         app.invoke_search_subtitles("Middle".into());
         assert!(rows.row_data(1).unwrap().search_match);
@@ -844,7 +1325,14 @@ mod tests {
             position: slint::LogicalPosition::new(1100., 112.),
         });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
+        // M1: Ctrl+Click toggles an individual row out of the selection without clearing others.
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Control.into(),
+        });
         click(1100., 112.);
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Control.into(),
+        });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 2]);
         subtitles.borrow_mut().load_cues(
             (0..100)
@@ -1181,5 +1669,95 @@ mod tests {
             !hover_state.get(),
             "Moving pointer from YomitanPopup onto menu bar / OSC / sidebar must release hover-pause"
         );
+    }
+
+    #[test]
+    fn subtitle_drawer_m1_secondary_selection_copy_lookup_unicode_whitespace_and_h37_delay_seek() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = MementoApp::new().unwrap();
+        let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
+        subtitles.borrow_mut().load_cues(vec![
+            create_cue("世界\u{3000}旅行", 10.0, 12.0),
+            create_cue("別の字幕", 20.0, 22.0),
+        ]);
+        subtitles.borrow_mut().ensure_track(2);
+        subtitles.borrow_mut().set_track_cues(
+            2,
+            vec![
+                create_cue("Secondary one", 10.0, 12.0),
+                create_cue("Secondary two", 20.0, 22.0),
+                create_cue("Secondary three", 30.0, 32.0),
+            ],
+        );
+        subtitles.borrow_mut().set_secondary_sid(2);
+        app.set_secondary_sid(2);
+
+        let primary_rows = Rc::new(VecModel::<SubEntry>::default());
+        let secondary_rows = Rc::new(VecModel::<SubEntry>::default());
+        app.set_subtitle_entries(primary_rows.clone().into());
+        app.set_secondary_subtitle_entries(secondary_rows.clone().into());
+
+        // H3.7: Apply sub-delay (+2.5s) and secondary-sub-delay (-1.5s) to timestamps & auto-seek.
+        refresh_subtitle_list_with_timing(&app, &primary_rows, &subtitles.borrow(), 1.0, 2.5);
+        refresh_secondary_subtitle_list_with_timing(
+            &app,
+            &secondary_rows,
+            &subtitles.borrow(),
+            1.0,
+            -1.5,
+        );
+        assert!(app.get_has_secondary_subtitles());
+        assert!((primary_rows.row_data(0).unwrap().start - 12.5).abs() < 1e-3);
+        assert!((secondary_rows.row_data(0).unwrap().start - 8.5).abs() < 1e-3);
+
+        install_subtitle_selection(&app, subtitles.clone(), primary_rows.clone());
+
+        let sought = Rc::new(Cell::new(-1.0f32));
+        let seek_sink = sought.clone();
+        app.on_seek_to(move |sec| seek_sink.set(sec));
+        app.set_subtitle_search_auto_seek(true);
+        app.set_subtitle_search_ignore_whitespace(true);
+        // M1: Ignore Whitespace matches across fullwidth Unicode ideographic space U+3000.
+        app.invoke_search_subtitles("世界旅行".into());
+        assert_eq!(app.get_subtitle_search_total_matches(), 1);
+        assert!(
+            (sought.get() - 12.5).abs() < 1e-3,
+            "primary search auto-seek must include sub-delay (got {})",
+            sought.get()
+        );
+
+        // M1: Secondary tab selection (ClearAndSelect, Ctrl+Click, Shift+Click) & Ctrl+Shift+C copy.
+        app.set_subtitle_drawer_tab(1);
+        app.invoke_subtitle_row_clicked_mod(1, 0, false, false);
+        assert!(secondary_rows.row_data(0).unwrap().selected);
+        assert!(!secondary_rows.row_data(1).unwrap().selected);
+        app.invoke_subtitle_row_clicked_mod(1, 2, false, true);
+        assert!(secondary_rows.row_data(0).unwrap().selected);
+        assert!(secondary_rows.row_data(1).unwrap().selected);
+        assert!(secondary_rows.row_data(2).unwrap().selected);
+        app.invoke_subtitle_row_clicked_mod(1, 1, true, false);
+        assert!(!secondary_rows.row_data(1).unwrap().selected);
+        app.invoke_copy_selected_subtitles();
+        assert_eq!(
+            app.get_copied_subtitle_text().as_str(),
+            "Secondary one\nSecondary three"
+        );
+
+        // Secondary search auto-seek uses secondary-sub-delay.
+        app.invoke_search_subtitles("Secondary one".into());
+        assert!(
+            (sought.get() - 8.5).abs() < 1e-3,
+            "secondary search auto-seek must include secondary-sub-delay (got {})",
+            sought.get()
+        );
+
+        // M1: subtitle_row_lookup triggers lookup at char offset and sets row as sentence/timing context.
+        let looked_up = Rc::new(RefCell::new(String::new()));
+        let lookup_sink = looked_up.clone();
+        app.on_lookup_word(move |q| *lookup_sink.borrow_mut() = q.to_string());
+        app.invoke_subtitle_row_lookup(0, 1, 2, 100.0, 80.0);
+        assert_eq!(looked_up.borrow().as_str(), "字幕");
+        assert_eq!(app.get_active_sub_text().as_str(), "別の字幕");
+        assert_eq!(subtitles.borrow().selected_indices(), &[1]);
     }
 }

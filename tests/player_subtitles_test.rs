@@ -1897,19 +1897,24 @@ fn subtitle_cursor_zones_and_overlay_visibility_reveal_primary_bottom_and_second
         compute_subtitle_overlay_visibility, subtitle_cursor_zones,
     };
 
-    // 1000px tall video: top <= 200px, bottom >= 800px, middle = neither.
+    // 1000px tall video: 25% top band (<= 250px), 25% bottom band (>= 750px), middle = neither.
     assert_eq!(subtitle_cursor_zones(0.0, 1000.0), (true, false));
     assert_eq!(subtitle_cursor_zones(150.0, 1000.0), (true, false));
+    assert_eq!(subtitle_cursor_zones(220.0, 1000.0), (true, false));
     assert_eq!(subtitle_cursor_zones(500.0, 1000.0), (false, false));
+    assert_eq!(subtitle_cursor_zones(780.0, 1000.0), (false, true));
     assert_eq!(subtitle_cursor_zones(850.0, 1000.0), (false, true));
     assert_eq!(subtitle_cursor_zones(1000.0, 1000.0), (false, true));
     assert_eq!(subtitle_cursor_zones(-5.0, 1000.0), (false, false));
     assert_eq!(subtitle_cursor_zones(500.0, 0.0), (false, false));
 
-    // When cursor-show is enabled and pointer is in the zone, subtitles reveal even if
-    // `!subtitles_visible` or `(hide_while_playing && is_playing)`.
-    assert!(compute_subtitle_overlay_visibility(true, false, false, false, true, true));
-    assert!(compute_subtitle_overlay_visibility(true, true, true, true, true, true));
+    // H3.6 precedence: `!subtitles_visible` and `(hide_while_playing && is_playing)`
+    // always hide subtitles even when cursor-show is enabled and the pointer is in the zone.
+    assert!(!compute_subtitle_overlay_visibility(true, false, false, false, true, true));
+    assert!(!compute_subtitle_overlay_visibility(true, true, true, true, true, true));
+    // When subtitles are visible and not hidden while playing (e.g. paused), cursor-show reveals in zone.
+    assert!(compute_subtitle_overlay_visibility(true, true, true, false, true, true));
+    assert!(compute_subtitle_overlay_visibility(true, true, false, true, true, true));
     // Outside the zone with cursor-show enabled -> hidden.
     assert!(!compute_subtitle_overlay_visibility(true, true, false, false, true, false));
     // No subtitle text -> never visible even in zone.
@@ -2030,10 +2035,11 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
         Some(Value::Int(raw::behavior::OSC_FADE_DEFAULT as i64))
     );
 
-    // Verify `application/language` and `interface/system-icons` keep full config round-trip
-    // AND expose accurate non-empty compatibility descriptions in Settings.
+    // Verify `application/language` and `interface/theme` round-trip through category apply,
+    // `application/language` exposes an honest description, and hidden dead switch
+    // `interface/system-icons` is omitted from Settings UI groups while loading cleanly.
     reloaded.edit_setting("application/language", "한국어 (MTL)").unwrap();
-    reloaded.edit_setting("interface/system-icons", "false").unwrap();
+    reloaded.edit_setting("interface/theme", "light").unwrap();
     let anki_path = dir.path().join("anki_connect.json");
     reloaded.apply_settings(1, dir.path(), "memento.conf", &anki_path).unwrap();
     reloaded.apply_settings(5, dir.path(), "memento.conf", &anki_path).unwrap();
@@ -2043,8 +2049,8 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
         Some(Value::Int(2))
     );
     assert_eq!(
-        reloaded2.effective_setting(raw::interface::GROUP, raw::interface::SYSTEM_ICONS),
-        Some(Value::Bool(false))
+        reloaded2.effective_setting(raw::interface::GROUP, raw::interface::THEME),
+        Some(Value::Text("light".to_owned()))
     );
 
     let groups = reloaded2.settings_groups();
@@ -2061,11 +2067,9 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
         "language setting must honestly explain available UI language: {:?}",
         lang_field.description
     );
-    let icons_field = find_field("interface/system-icons").expect("interface/system-icons field");
     assert!(
-        icons_field.description.as_str().contains("bundled SVG"),
-        "system-icons setting must honestly describe bundled SVG icons: {:?}",
-        icons_field.description
+        find_field("interface/system-icons").is_none(),
+        "dead switch interface/system-icons must be hidden from Settings UI groups"
     );
 }
 
