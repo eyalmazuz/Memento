@@ -25,8 +25,8 @@ pub use crate::databasemanager::{PitchEntryDetail, PitchPosition};
 pub use self::connection::{
     configure_read_only_connection, configure_read_write_connection, db_file_fingerprint,
     ensure_frequency_mode_column_conn, init_cache_conn, open_read_only_connection,
-    open_read_write_connection, query_data_version_conn, validate_schema_conn, DbFileFingerprint,
-    FileMetaStamp,
+    open_read_write_connection, query_data_version_conn, shrink_memory_conn, validate_schema_conn,
+    DbFileFingerprint, FileMetaStamp,
 };
 pub use self::freq::{format_g, parse_freq_blob_utf8, parse_freq_blob_with_mode_utf8, ParsedFreqUtf8};
 pub use self::queries::{

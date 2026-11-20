@@ -178,6 +178,7 @@ impl RichUiBridge {
             IDLE_DICT_ASSET_CACHE_MAX_BYTES,
         );
         crate::controller::dict::shrink_parsed_glossary_cache(IDLE_PARSED_GLOSSARY_MAX_ENTRIES);
+        crate::controller::dict::shrink_all_readonly_dbs();
         crate::ui::release_os_memory();
     }
 

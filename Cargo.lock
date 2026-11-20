@@ -1439,15 +1439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "font-types"
-version = "0.12.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
 name = "fontdb"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1473,7 +1464,7 @@ dependencies = [
  "objc2-core-text",
  "objc2-foundation 0.3.2",
  "parlance",
- "read-fonts 0.37.0",
+ "read-fonts",
  "roxmltree",
  "smallvec",
  "windows 0.62.2",
@@ -1834,7 +1825,7 @@ dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
  "core_maths",
- "read-fonts 0.37.0",
+ "read-fonts",
  "smallvec",
 ]
 
@@ -2025,7 +2016,7 @@ dependencies = [
  "fontique",
  "htmlparser",
  "pulldown-cmark",
- "skrifa 0.40.0",
+ "skrifa",
 ]
 
 [[package]]
@@ -2052,7 +2043,7 @@ dependencies = [
  "resvg",
  "rowan",
  "rspolib",
- "skrifa 0.40.0",
+ "skrifa",
  "smol_str 0.3.6",
  "strum",
  "swash",
@@ -2094,7 +2085,7 @@ dependencies = [
  "rgb",
  "scoped-tls-hkt",
  "scopeguard",
- "skrifa 0.40.0",
+ "skrifa",
  "slab",
  "strum",
  "swash",
@@ -2169,7 +2160,7 @@ dependencies = [
  "pin-weak",
  "raw-window-handle",
  "raw-window-metal",
- "read-fonts 0.37.0",
+ "read-fonts",
  "scoped-tls-hkt",
  "skia-safe",
  "softbuffer",
@@ -2194,7 +2185,7 @@ dependencies = [
  "integer-sqrt",
  "lyon_path",
  "num-traits",
- "skrifa 0.40.0",
+ "skrifa",
  "swash",
  "zeno",
 ]
@@ -3664,7 +3655,7 @@ dependencies = [
  "linebender_resource_handle",
  "parlance",
  "parley_data",
- "skrifa 0.40.0",
+ "skrifa",
 ]
 
 [[package]]
@@ -4123,18 +4114,7 @@ checksum = "7b634fabf032fab15307ffd272149b622260f55974d9fad689292a5d33df02e5"
 dependencies = [
  "bytemuck",
  "core_maths",
- "font-types 0.11.3",
-]
-
-[[package]]
-name = "read-fonts"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
-dependencies = [
- "bytemuck",
- "font-types 0.12.7",
- "once_cell",
+ "font-types",
 ]
 
 [[package]]
@@ -4616,17 +4596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fbdfe3d2475fbd7ddd1f3e5cf8288a30eb3e5f95832829570cd88115a7434ac"
 dependencies = [
  "bytemuck",
- "read-fonts 0.37.0",
-]
-
-[[package]]
-name = "skrifa"
-version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "819ab7d62b1d3e72d9d9dea5650bac30424f9111364bb94928dbf5ecad1baa68"
-dependencies = [
- "bytemuck",
- "read-fonts 0.41.0",
+ "read-fonts",
 ]
 
 [[package]]
@@ -4905,7 +4875,7 @@ version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c2499c2d826531388872b2268718aed907a39bd785ab0dcfe57fab26283f92e"
 dependencies = [
- "skrifa 0.44.0",
+ "skrifa",
  "yazi",
  "zeno",
 ]
@@ -6303,11 +6273,11 @@ version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f12725b0845073e20b04e79b500dbfb465904d7cbd84883a1f1bbd084debc515"
 dependencies = [
- "font-types 0.11.3",
+ "font-types",
  "indexmap",
  "kurbo",
  "log",
- "read-fonts 0.37.0",
+ "read-fonts",
 ]
 
 [[package]]

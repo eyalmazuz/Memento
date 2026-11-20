@@ -91,6 +91,14 @@ strip = "symbols"
 debug-assertions = false
 overflow-checks = false
 
+# Distribution release profile: inherits size/speed tuning and per-package
+# overrides from `release` while upgrading to fat LTO for maximum cross-crate
+# inlining and dead-code elimination. Keep unwinding enabled (`catch_unwind` is
+# relied upon across FFI/clipboard/testing boundaries).
+[profile.release-dist]
+inherits = "release"
+lto = "fat"
+
 # Keep hot rendering, text shaping, dictionary search, ASS, and ASR DSP crates at -O3
 # while cold UI glue and generated Slint code optimize for binary size (`opt-level = "s"`).
 [profile.release.package.swash]
@@ -154,14 +162,8 @@ opt-level = 2
 [profile.dev.package.harfrust]
 opt-level = 2
 
-[profile.dev.package."skrifa@0.40.0"]
+[profile.dev.package.skrifa]
 opt-level = 2
 
-[profile.dev.package."skrifa@0.44.0"]
-opt-level = 2
-
-[profile.dev.package."read-fonts@0.37.0"]
-opt-level = 2
-
-[profile.dev.package."read-fonts@0.41.0"]
+[profile.dev.package."read-fonts"]
 opt-level = 2

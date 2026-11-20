@@ -15,11 +15,13 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use memento_util::ocrutils::{map_ocr_region, resolve_venv_python_str, OcrRegionStatus};
 
 const MOCR_MODE_RGBA: c_int = 4;
 const OCR_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+const DEFAULT_OCR_IDLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 static OCR_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -158,7 +160,7 @@ fn format_library_unavailable_message(
 struct MocrApi {
     // Keep libmocr loaded until every context and returned text is released,
     // and drop it before any explicitly retained libpython handle.
-    _library: Library,
+    _library: Option<Library>,
     #[cfg(unix)]
     _python_library: Option<libloading::os::unix::Library>,
     init: MocrInit,
@@ -168,6 +170,19 @@ struct MocrApi {
 }
 
 impl MocrApi {
+    #[cfg(test)]
+    fn mock(init: MocrInit, destroy: MocrDestroy, read: MocrRead, free: MocrFree) -> Self {
+        Self {
+            _library: None,
+            #[cfg(unix)]
+            _python_library: None,
+            init,
+            destroy,
+            read,
+            free,
+        }
+    }
+
     fn load() -> Result<Self, OcrError> {
         #[cfg(target_os = "linux")]
         let candidates: Vec<PathBuf> = [
@@ -260,7 +275,7 @@ impl MocrApi {
             match symbols {
                 Ok((init, destroy, read, free)) => {
                     return Ok(Self {
-                        _library: library,
+                        _library: Some(library),
                         #[cfg(unix)]
                         _python_library: python_library,
                         init,
@@ -502,6 +517,7 @@ impl RequestSlot {
 struct OcrControllerInner {
     queue: Arc<(Mutex<RequestSlot>, Condvar)>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    idle_unload_timeout: Duration,
 }
 
 impl Drop for OcrControllerInner {
@@ -533,8 +549,9 @@ impl Drop for OcrControllerInner {
 /// Neither `libpython`/`libmocr` loading nor the 8 MiB worker thread happens in
 /// [`OcrController::new`]; both initialize lazily on the first OCR request.
 /// Native contexts are created, used, switched, and destroyed exclusively on
-/// the worker thread, which shuts down and joins cleanly when the last
-/// controller handle drops.
+/// the worker thread, which unloads the heavy model context after an idle
+/// timeout (keeping `libmocr`/`libpython` loaded) and shuts down and joins
+/// cleanly when the last controller handle drops.
 #[derive(Clone)]
 pub struct OcrController {
     inner: Arc<OcrControllerInner>,
@@ -544,12 +561,45 @@ impl OcrController {
     /// Creates a lazy OCR controller. Native libraries and the worker thread
     /// are initialized on the first [`Self::read_region_async`] call.
     pub fn new() -> Result<Self, OcrError> {
-        Ok(Self {
+        Ok(Self::from_idle_unload_timeout(
+            DEFAULT_OCR_IDLE_UNLOAD_TIMEOUT,
+        ))
+    }
+
+    fn from_idle_unload_timeout(idle_unload_timeout: Duration) -> Self {
+        Self {
             inner: Arc::new(OcrControllerInner {
                 queue: Arc::new((Mutex::new(RequestSlot::new()), Condvar::new())),
                 worker: Mutex::new(None),
+                idle_unload_timeout,
             }),
-        })
+        }
+    }
+
+    #[cfg(test)]
+    fn with_idle_unload_timeout(idle_timeout: Duration) -> Self {
+        Self::from_idle_unload_timeout(idle_timeout)
+    }
+
+    #[cfg(test)]
+    fn start_test_worker(
+        &self,
+        make_worker: impl FnOnce() -> OcrWorker + Send + 'static,
+        deliver: impl Fn(OcrCallback, Result<String, OcrError>) + Send + 'static,
+    ) {
+        let mut handle_slot = self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(handle_slot.is_none(), "test worker already started");
+        let queue = Arc::clone(&self.inner.queue);
+        let idle_timeout = self.inner.idle_unload_timeout;
+        let handle = thread::Builder::new()
+            .name("memento-ocr-test".to_owned())
+            .spawn(move || worker_loop_with(queue, idle_timeout, make_worker(), deliver))
+            .expect("spawn test OCR worker");
+        *handle_slot = Some(handle);
     }
 
     fn ensure_worker_started(&self) -> Result<(), OcrError> {
@@ -562,12 +612,13 @@ impl OcrController {
             return Ok(());
         }
         let queue = Arc::clone(&self.inner.queue);
+        let idle_timeout = self.inner.idle_unload_timeout;
         OCR_WORKER_STARTED.store(true, Ordering::Release);
         let handle = thread::Builder::new()
             .name("memento-ocr".to_owned())
             // libmocr's model initialization needs a larger stack on macOS.
             .stack_size(OCR_WORKER_STACK_SIZE)
-            .spawn(move || worker_loop(queue))
+            .spawn(move || worker_loop(queue, idle_timeout))
             .map_err(|error| OcrError::WorkerStartFailed(error.to_string()))?;
         *worker = Some(handle);
         Ok(())
@@ -610,9 +661,26 @@ impl OcrController {
     }
 }
 
-fn pop_latest_request(queue: &(Mutex<RequestSlot>, Condvar)) -> Option<OcrRequest> {
+/// Waits for the next latest-wins OCR request or queue shutdown.
+///
+/// When a native OCR model is currently loaded (`model_loaded == true`), waits
+/// up to `idle_timeout` before invoking `on_idle_unload` **without holding the
+/// queue mutex** so new requests or `Drop` shutdown never stall on model
+/// teardown. After unloading, re-locks and parks indefinitely until a request
+/// or shutdown arrives.
+fn pop_latest_request_with_idle_unload(
+    queue: &(Mutex<RequestSlot>, Condvar),
+    model_loaded: bool,
+    idle_timeout: Duration,
+    mut on_idle_unload: impl FnMut(),
+) -> Option<OcrRequest> {
     let (lock, cvar) = queue;
     let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut idle_deadline = if model_loaded {
+        Instant::now().checked_add(idle_timeout)
+    } else {
+        None
+    };
     loop {
         if slot.closed {
             slot.pending = None;
@@ -621,28 +689,76 @@ fn pop_latest_request(queue: &(Mutex<RequestSlot>, Condvar)) -> Option<OcrReques
         if let Some(request) = slot.pending.take() {
             return Some(request);
         }
-        slot = cvar
-            .wait(slot)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(deadline) = idle_deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                drop(slot);
+                on_idle_unload();
+                idle_deadline = None;
+                slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, wait_result) = cvar
+                .wait_timeout(slot, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot = next;
+            if wait_result.timed_out() && slot.pending.is_none() && !slot.closed {
+                drop(slot);
+                on_idle_unload();
+                idle_deadline = None;
+                slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        } else {
+            slot = cvar
+                .wait(slot)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
     }
 }
 
-fn worker_loop(queue: Arc<(Mutex<RequestSlot>, Condvar)>) {
-    let mut worker = OcrWorker {
-        model: None,
-        api: None,
-    };
-    while let Some(request) = pop_latest_request(&queue) {
+fn deliver_to_slint(callback: OcrCallback, result: Result<String, OcrError>) {
+    if let Err(error) = slint::invoke_from_event_loop(move || callback(result)) {
+        eprintln!("Could not deliver OCR result to Slint event loop: {error}");
+    }
+}
+
+fn worker_loop(queue: Arc<(Mutex<RequestSlot>, Condvar)>, idle_timeout: Duration) {
+    worker_loop_with(
+        queue,
+        idle_timeout,
+        OcrWorker {
+            model: None,
+            api: None,
+        },
+        deliver_to_slint,
+    );
+}
+
+fn worker_loop_with(
+    queue: Arc<(Mutex<RequestSlot>, Condvar)>,
+    idle_timeout: Duration,
+    mut worker: OcrWorker,
+    deliver: impl Fn(OcrCallback, Result<String, OcrError>),
+) {
+    loop {
+        let model_loaded = worker.is_model_loaded();
+        let Some(request) =
+            pop_latest_request_with_idle_unload(&queue, model_loaded, idle_timeout, || {
+                worker.unload_model();
+            })
+        else {
+            break;
+        };
         let result = worker.read(
             request.frame,
             request.region,
             request.viewport,
             request.settings,
         );
-        if let Err(error) = slint::invoke_from_event_loop(move || (request.callback)(result)) {
-            eprintln!("Could not deliver OCR result to Slint event loop: {error}");
-        }
+        deliver(request.callback, result);
     }
+    worker.unload_model();
 }
 
 fn normalize_model_name(raw: &str) -> Result<&str, OcrError> {
@@ -667,6 +783,25 @@ struct LoadedModel {
 }
 
 impl OcrWorker {
+    fn is_model_loaded(&self) -> bool {
+        self.model.is_some()
+    }
+
+    /// Drops the loaded Manga OCR model context (invoking `mocr_destroy` to
+    /// release the ~400-800 MiB PyTorch/model weights) while keeping `self.api`
+    /// (`libmocr` + `RTLD_GLOBAL` `libpython`) resident to avoid unsafe CPython
+    /// `dlclose` + re-initialization crashes. Trims the OS heap when a model
+    /// was actually unloaded.
+    fn unload_model(&mut self) -> bool {
+        if let Some(model) = self.model.take() {
+            drop(model);
+            crate::app::trim_os_heap();
+            true
+        } else {
+            false
+        }
+    }
+
     fn ensure_api(&mut self) -> Result<&MocrApi, OcrError> {
         if self.api.is_none() {
             self.api = Some(MocrApi::load()?);
@@ -1244,5 +1379,303 @@ mod tests {
         );
         assert!(broken_deps_msg.contains("found at C:\\Memento\\libmocr.dll"));
         assert!(broken_deps_msg.contains("Python 3"));
+    }
+
+    fn test_ocr_request_args(tag: u8) -> (OcrFrame, OcrRegion, OcrViewport, OcrSettings) {
+        (
+            OcrFrame::from_rgba(1, 1, vec![tag, 0, 0, 255]).unwrap(),
+            OcrRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            OcrViewport {
+                width: 1.0,
+                height: 1.0,
+            },
+            OcrSettings {
+                enabled: true,
+                model: "mock/manga-ocr".to_owned(),
+                use_gpu: false,
+            },
+        )
+    }
+
+    unsafe extern "C" fn test_mock_read(
+        _ctx: *mut MocrContextOpaque,
+        pixels: *const c_void,
+        _width: usize,
+        _height: usize,
+        _mode: c_int,
+    ) -> *mut c_char {
+        let tag = *(pixels as *const u8);
+        CString::new(format!("frame-{tag}")).unwrap().into_raw()
+    }
+
+    unsafe extern "C" fn test_mock_free(ptr: *mut c_void) -> c_int {
+        drop(CString::from_raw(ptr.cast::<c_char>()));
+        0
+    }
+
+    #[test]
+    fn ocr_worker_unload_model_drops_context_keeps_api_loaded_and_is_idempotent() {
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
+            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
+        }
+
+        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
+            DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
+            drop(Box::from_raw(ptr.cast::<u8>()));
+            0
+        }
+
+        let mut worker = OcrWorker {
+            model: None,
+            api: Some(MocrApi::mock(
+                mock_init,
+                mock_destroy,
+                test_mock_read,
+                test_mock_free,
+            )),
+        };
+
+        assert!(!worker.is_model_loaded());
+        assert!(!worker.unload_model());
+
+        let (frame, region, viewport, settings) = test_ocr_request_args(7);
+        assert_eq!(
+            worker.read(frame, region, viewport, settings.clone()).unwrap(),
+            "frame-7"
+        );
+        assert!(worker.is_model_loaded());
+        assert!(worker.api.is_some());
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 0);
+
+        assert!(worker.unload_model());
+        assert!(!worker.is_model_loaded());
+        assert!(
+            worker.api.is_some(),
+            "libmocr/libpython API handle must remain loaded across idle model unloads"
+        );
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
+
+        // Second unload is a no-op.
+        assert!(!worker.unload_model());
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
+
+        // Reloading after idle unload reuses the resident API cleanly.
+        let (frame2, region2, viewport2, settings2) = test_ocr_request_args(9);
+        assert_eq!(
+            worker.read(frame2, region2, viewport2, settings2).unwrap(),
+            "frame-9"
+        );
+        assert!(worker.is_model_loaded());
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 2);
+        drop(worker);
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn ocr_idle_unload_reclaims_model_after_timeout_and_reloads_on_next_request() {
+        use std::sync::mpsc;
+
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DESTROY_TX: Mutex<Option<mpsc::Sender<usize>>> = Mutex::new(None);
+
+        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
+            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
+        }
+
+        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
+            drop(Box::from_raw(ptr.cast::<u8>()));
+            let count = DESTROY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(tx) = DESTROY_TX
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                let _ = tx.send(count);
+            }
+            0
+        }
+
+        let (destroy_tx, destroy_rx) = mpsc::channel();
+        *DESTROY_TX.lock().unwrap() = Some(destroy_tx);
+
+        let controller = OcrController::with_idle_unload_timeout(Duration::from_millis(30));
+        controller.start_test_worker(
+            || OcrWorker {
+                model: None,
+                api: Some(MocrApi::mock(
+                    mock_init,
+                    mock_destroy,
+                    test_mock_read,
+                    test_mock_free,
+                )),
+            },
+            |callback, result| callback(result),
+        );
+
+        // First request loads the model and returns OCR text.
+        let (res1_tx, res1_rx) = mpsc::channel();
+        let (frame1, region1, viewport1, settings1) = test_ocr_request_args(1);
+        controller
+            .read_region_async(frame1, region1, viewport1, settings1, move |res| {
+                let _ = res1_tx.send(res);
+            })
+            .unwrap();
+        assert_eq!(
+            res1_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok("frame-1".to_owned())
+        );
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+
+        // After the 30 ms idle timeout, the model unloads automatically.
+        let first_destroy = destroy_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("model should unload after idle timeout");
+        assert_eq!(first_destroy, 1);
+
+        // A subsequent request after idle unload reloads MocrContext cleanly.
+        let (res2_tx, res2_rx) = mpsc::channel();
+        let (frame2, region2, viewport2, settings2) = test_ocr_request_args(2);
+        controller
+            .read_region_async(frame2, region2, viewport2, settings2, move |res| {
+                let _ = res2_tx.send(res);
+            })
+            .unwrap();
+        assert_eq!(
+            res2_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok("frame-2".to_owned())
+        );
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 2);
+
+        // Dropping the controller shuts down the worker and destroys the reloaded model.
+        drop(controller);
+        *DESTROY_TX.lock().unwrap() = None;
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn ocr_drop_shutdown_wakes_timed_idle_wait_immediately_without_waiting_for_timeout() {
+        use std::sync::mpsc;
+
+        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
+            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
+        }
+
+        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
+            drop(Box::from_raw(ptr.cast::<u8>()));
+            DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        let controller = OcrController::with_idle_unload_timeout(Duration::from_secs(60));
+        controller.start_test_worker(
+            || OcrWorker {
+                model: None,
+                api: Some(MocrApi::mock(
+                    mock_init,
+                    mock_destroy,
+                    test_mock_read,
+                    test_mock_free,
+                )),
+            },
+            |callback, result| callback(result),
+        );
+
+        let (res_tx, res_rx) = mpsc::channel();
+        let (frame, region, viewport, settings) = test_ocr_request_args(5);
+        controller
+            .read_region_async(frame, region, viewport, settings, move |res| {
+                let _ = res_tx.send(res);
+            })
+            .unwrap();
+        assert_eq!(
+            res_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok("frame-5".to_owned())
+        );
+        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 0);
+
+        // Worker is now parked in the 60s timed idle wait; Drop must wake and join immediately.
+        let started = Instant::now();
+        drop(controller);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Drop shutdown must wake timed idle wait immediately, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pop_latest_request_with_idle_unload_releases_mutex_before_unload_callback() {
+        use std::sync::mpsc;
+
+        let queue = Arc::new((Mutex::new(RequestSlot::new()), Condvar::new()));
+        let queue_bg = Arc::clone(&queue);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let unload_calls = Arc::new(AtomicUsize::new(0));
+        let unload_calls_bg = Arc::clone(&unload_calls);
+
+        let worker = thread::spawn(move || {
+            pop_latest_request_with_idle_unload(
+                &queue_bg,
+                true,
+                Duration::from_millis(20),
+                || {
+                    // The queue mutex must NOT be held while unloading the model.
+                    assert!(
+                        queue_bg.0.try_lock().is_ok(),
+                        "queue mutex must be dropped before calling idle unload callback"
+                    );
+                    unload_calls_bg.fetch_add(1, Ordering::SeqCst);
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.recv_timeout(Duration::from_secs(2));
+                },
+            )
+        });
+
+        // Wait until the idle-unload callback has started.
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("idle unload callback should fire after timeout");
+
+        // Enqueue a new request WHILE the unload callback is still running; this
+        // must not block on the unload callback because the mutex was released.
+        let (frame, region, viewport, settings) = test_ocr_request_args(42);
+        {
+            let (lock, cvar) = &*queue;
+            let mut slot = lock.lock().unwrap();
+            slot.push_latest(OcrRequest {
+                frame,
+                region,
+                viewport,
+                settings,
+                callback: Box::new(|_| {}),
+            })
+            .unwrap();
+            cvar.notify_one();
+        }
+
+        // Let the unload callback finish; the worker should immediately pop the queued request.
+        resume_tx.send(()).unwrap();
+        let popped = worker.join().unwrap().expect("expected queued request");
+        assert_eq!(popped.frame.pixels[0], 42);
+        assert_eq!(unload_calls.load(Ordering::SeqCst), 1);
     }
 }

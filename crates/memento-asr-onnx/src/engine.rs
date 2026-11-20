@@ -487,6 +487,7 @@ impl Engine {
             {
                 let mut cuda_options = OrtCUDAProviderOptions::default();
                 cuda_options.device_id = self.options.gpu_device.max(0);
+                cuda_options.arena_extend_strategy = ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED;
                 // C++ wraps the append in try/catch and downgrades a failure
                 // to a qWarning; the warning side effect is not reproduced.
                 let _ = session_options.append_cuda(&cuda_options);
@@ -2278,5 +2279,16 @@ mod tests {
         );
         trigger.join().unwrap();
         assert_eq!(result, Ok(false));
+    }
+
+    #[test]
+    fn cuda_provider_options_defaults_to_same_as_requested_arena_strategy() {
+        assert_eq!(ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED, 1);
+        let options = OrtCUDAProviderOptions::default();
+        assert_eq!(
+            options.arena_extend_strategy,
+            ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED
+        );
+        assert_eq!(options.arena_extend_strategy, 1);
     }
 }

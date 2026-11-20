@@ -175,6 +175,12 @@ impl ReadOnlyDictionaryDb {
         f(&conn)
     }
 
+    /// Releases idle SQLite page-cache and scratch memory via `PRAGMA shrink_memory;`
+    /// without clearing cached dictionary metadata snapshots.
+    pub fn shrink_memory(&self) -> Result<(), sqlite_db::DictError> {
+        self.with_conn(sqlite_db::shrink_memory_conn)
+    }
+
     /// Refreshes cached dictionary metadata if the database file/WAL or `PRAGMA data_version`
     /// changed, throttling repeated `PRAGMA data_version` queries when the file fingerprint is
     /// unchanged within [`REFRESH_THROTTLE`].
@@ -404,6 +410,29 @@ pub fn invalidate_shared_readonly_db(path: &Path) {
     }
 }
 
+/// Runs `PRAGMA shrink_memory;` on all live shared read-only SQLite dictionary
+/// handles and prunes dead `Weak` entries from the process registry.
+pub fn shrink_all_readonly_dbs() {
+    let live_dbs: Vec<Arc<ReadOnlyDictionaryDb>> = {
+        let mut registry = shared_db_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = Vec::with_capacity(registry.len());
+        registry.retain(|_, weak| {
+            if let Some(db) = weak.upgrade() {
+                live.push(db);
+                true
+            } else {
+                false
+            }
+        });
+        live
+    };
+    for db in live_dbs {
+        let _ = db.shrink_memory();
+    }
+}
+
 fn load_dictionary_names_and_disabled_conn(
     conn: &sqlite_db::rusqlite::Connection,
 ) -> Result<(HashMap<i64, String>, HashSet<i64>), sqlite_db::DictError> {
@@ -447,4 +476,137 @@ fn load_dictionary_tags_conn(
         );
     }
     Ok(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_temp_dict_db(dir: &Path, filename: &str) -> PathBuf {
+        let db_path = dir.join(filename);
+        let conn = sqlite_db::rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE directory (
+                dic_id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL UNIQUE,
+                format INTEGER NOT NULL DEFAULT 3,
+                revision TEXT NOT NULL DEFAULT '1',
+                sequenced INTEGER NOT NULL DEFAULT 0,
+                frequency_mode TEXT NOT NULL DEFAULT 'rank-based'
+            );
+            CREATE TABLE dict_disabled (dic_id INTEGER PRIMARY KEY);
+            CREATE TABLE tag_bank (
+                dic_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                ord INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                score INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(dic_id, name)
+            );
+            CREATE TABLE term_bank (
+                dic_id INTEGER NOT NULL,
+                expression TEXT NOT NULL,
+                reading TEXT NOT NULL,
+                def_tags TEXT NOT NULL DEFAULT '',
+                rules TEXT NOT NULL DEFAULT '',
+                score INTEGER NOT NULL DEFAULT 0,
+                glossary TEXT NOT NULL DEFAULT '[]',
+                sequence INTEGER NOT NULL DEFAULT 0,
+                term_tags TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE kanji_bank (
+                dic_id INTEGER NOT NULL,
+                char TEXT NOT NULL,
+                onyomi TEXT NOT NULL DEFAULT '',
+                kunyomi TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                meanings TEXT NOT NULL DEFAULT '[]',
+                stats TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE term_meta_bank (
+                dic_id INTEGER NOT NULL,
+                expression TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                type INTEGER NOT NULL DEFAULT 0,
+                data BLOB
+            );
+            CREATE TABLE kanji_meta_bank (
+                dic_id INTEGER NOT NULL,
+                expression TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                type INTEGER NOT NULL DEFAULT 0,
+                data BLOB
+            );
+            INSERT INTO directory (dic_id, title) VALUES (1, 'JMdict');
+            INSERT INTO term_bank (dic_id, expression, reading, rules, score, glossary)
+                VALUES (1, '食べる', 'たべる', 'v1', 20, '["to eat"]');
+            "#,
+        )
+        .unwrap();
+        db_path
+    }
+
+    #[test]
+    fn shrink_all_readonly_dbs_shrinks_live_preserves_metadata_and_prunes_dead_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_live = create_temp_dict_db(dir.path(), "live.sqlite");
+        let path_dead = create_temp_dict_db(dir.path(), "dead.sqlite");
+
+        let db_live = shared_readonly_db(&path_live).unwrap();
+        let db_dead = shared_readonly_db(&path_dead).unwrap();
+        let key_live = canonical_db_key(&path_live);
+        let key_dead = canonical_db_key(&path_dead);
+
+        let snap_before = db_live.metadata_snapshot().unwrap();
+        assert_eq!(snap_before.names.get(&1).map(String::as_str), Some("JMdict"));
+
+        {
+            let registry = shared_db_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(registry.contains_key(&key_live));
+            assert!(registry.contains_key(&key_dead));
+        }
+
+        // Drop one handle to leave a dead Weak entry in the registry.
+        drop(db_dead);
+
+        db_live.shrink_memory().unwrap();
+        shrink_all_readonly_dbs();
+
+        {
+            let registry = shared_db_registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.get(&key_live).and_then(Weak::upgrade).is_some(),
+                "live readonly DB entry must remain in registry"
+            );
+            assert!(
+                !registry.contains_key(&key_dead),
+                "dead Weak entry must be pruned by shrink_all_readonly_dbs"
+            );
+        }
+
+        // Cached metadata snapshots must remain intact without being cleared or rebuilt.
+        let snap_after = db_live.metadata_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&snap_before.names, &snap_after.names));
+        assert!(Arc::ptr_eq(&snap_before.tags, &snap_after.tags));
+        assert!(Arc::ptr_eq(&snap_before.disabled, &snap_after.disabled));
+        assert!(Arc::ptr_eq(
+            &snap_before.frequency_modes,
+            &snap_after.frequency_modes
+        ));
+
+        // Subsequent queries on the shrunk read-only connection continue to work cleanly.
+        let rows = db_live
+            .with_conn(|conn| {
+                sqlite_db::query_term_details_batch_conn(conn, &["食べる".to_owned()])
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reading, "たべる");
+    }
 }

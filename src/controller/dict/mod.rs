@@ -29,8 +29,8 @@ pub use memento_dict::sqlite_db::{
 };
 
 pub use self::db::{
-    invalidate_shared_readonly_db, shared_readonly_db, DictionaryMetadataSnapshot,
-    ReadOnlyDictionaryDb,
+    invalidate_shared_readonly_db, shared_readonly_db, shrink_all_readonly_dbs,
+    DictionaryMetadataSnapshot, ReadOnlyDictionaryDb,
 };
 pub use self::glossary::{
     format_glossary, parse_glossary_entry, parse_glossary_json_cached, parse_rich_glossary,

@@ -32,6 +32,10 @@ pub type OrtChar = c_char;
 /// engine never invokes.
 pub type OrtCallback = Option<unsafe extern "system" fn()>;
 
+/// Arena extend strategy `kSameAsRequested` (1), avoiding `kNextPowerOfTwo` (0)
+/// power-of-two CUDA BFC VRAM doubling.
+pub const ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED: c_int = 1;
+
 /// CUDA provider options (legacy struct; layout copied from
 /// `onnxruntime_c_api.h` 1.22.0). `OrtApi::SessionOptionsAppendExecutionProvider_CUDA`
 /// consumes a pointer to this struct.
@@ -43,7 +47,9 @@ pub struct OrtCUDAProviderOptions {
     pub cudnn_conv_algo_search: c_int,
     /// C++ default `SIZE_MAX` (all memory).
     pub gpu_mem_limit: usize,
-    /// C++ default 0 (kNextPowerOfTwo).
+    /// Arena extend strategy. Memento defaults to `1` (`kSameAsRequested`,
+    /// [`ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED`]) instead of C++'s `0`
+    /// (`kNextPowerOfTwo`) to prevent VRAM over-allocation.
     pub arena_extend_strategy: c_int,
     /// C++ default 1.
     pub do_copy_in_default_stream: c_int,
@@ -57,14 +63,16 @@ pub struct OrtCUDAProviderOptions {
 }
 
 impl Default for OrtCUDAProviderOptions {
-    /// The C++ `OrtCUDAProviderOptions{}` member initializers (`SIZE_MAX`
-    /// memory limit, `Exhaustive` search, copy on default stream).
+    /// Matches the C++ `OrtCUDAProviderOptions{}` member initializers (`SIZE_MAX`
+    /// memory limit, `Exhaustive` search, copy on default stream) with
+    /// `arena_extend_strategy` set to
+    /// [`ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED`] (`1` / `kSameAsRequested`).
     fn default() -> Self {
         Self {
             device_id: 0,
             cudnn_conv_algo_search: 0,
             gpu_mem_limit: usize::MAX,
-            arena_extend_strategy: 0,
+            arena_extend_strategy: ORT_ARENA_EXTEND_STRATEGY_SAME_AS_REQUESTED,
             do_copy_in_default_stream: 1,
             has_user_compute_stream: 0,
             user_compute_stream: std::ptr::null_mut(),

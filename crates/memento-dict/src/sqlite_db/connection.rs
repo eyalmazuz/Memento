@@ -170,6 +170,12 @@ pub fn query_data_version_conn(conn: &Connection) -> Result<i64, DictError> {
     Ok(v)
 }
 
+/// Releases idle SQLite page-cache and scratch memory on `conn` via `PRAGMA shrink_memory;`.
+pub fn shrink_memory_conn(conn: &Connection) -> Result<(), DictError> {
+    conn.execute_batch("PRAGMA shrink_memory;")?;
+    Ok(())
+}
+
 /// Validates database schema, reads dictionary metadata, and checks table non-emptiness
 /// in O(1) via `EXISTS (SELECT 1 FROM ... LIMIT 1)` on a `rusqlite::Connection`.
 pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
@@ -235,4 +241,45 @@ pub fn init_cache_conn(conn: &Connection) -> Result<CacheInfo, DictError> {
         dictionaries,
         table_counts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrink_memory_conn_succeeds_on_temp_sqlite_db_and_preserves_queries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("shrink_test.sqlite");
+
+        {
+            let rw = open_read_write_connection(&db_path).unwrap();
+            rw.execute_batch(
+                "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+            )
+            .unwrap();
+            let mut stmt = rw
+                .prepare("INSERT INTO kv (k, v) VALUES (?1, ?2);")
+                .unwrap();
+            for i in 0..500i64 {
+                stmt.execute(rusqlite::params![i, format!("payload-{i:04}-{}", "x".repeat(64))])
+                    .unwrap();
+            }
+            drop(stmt);
+            shrink_memory_conn(&rw).unwrap();
+        }
+
+        let ro = open_read_only_connection(&db_path).unwrap();
+        let count_before: i64 = ro
+            .query_row("SELECT COUNT(*) FROM kv;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, 500);
+
+        shrink_memory_conn(&ro).unwrap();
+
+        let count_after: i64 = ro
+            .query_row("SELECT COUNT(*) FROM kv;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_after, 500);
+    }
 }
