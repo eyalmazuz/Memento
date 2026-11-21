@@ -223,6 +223,8 @@ impl RichUiBridge {
             sel_join_left,
             sel_join_right,
             has_selection: has_sel,
+            has_stroke: shaped.has_stroke,
+            rendered_stroke: shaped.stroke_image,
             rendered: shaped.image,
         }
     }

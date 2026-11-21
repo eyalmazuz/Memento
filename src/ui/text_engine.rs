@@ -98,6 +98,8 @@ pub struct ShapedSubtitleToken {
     /// Precomputed hitboxes for zero-reshaping hover hit-testing in
     /// `subtitle_cluster_at_point_with_style`.
     pub(super) cluster_hitboxes: Vec<SubtitleClusterHitbox>,
+    pub has_stroke: bool,
+    pub stroke_image: slint::Image,
     pub image: slint::Image,
 }
 
@@ -1246,8 +1248,16 @@ impl TextEngine {
 
         let pix_w = ((layout_width + bleed_x * 2.0).ceil() as u32).max(1);
         let pix_h = (total_height.ceil() as u32).max(1);
-        let mut pixmap = tiny_skia::Pixmap::new(pix_w, pix_h)
+        let mut fill_pixmap = tiny_skia::Pixmap::new(pix_w, pix_h)
             .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+
+        let has_stroke_paths = base_geom.path.is_some()
+            || ruby_geom.as_ref().is_some_and(|g| g.path.is_some());
+        let mut stroke_pixmap = (stroke_px > 0.0 && style.stroke_rgba[3] > 0 && has_stroke_paths)
+            .then(|| {
+                tiny_skia::Pixmap::new(pix_w, pix_h)
+                    .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap())
+            });
 
         let ruby_stroke_px = (stroke_px * 0.65).max(if stroke_px > 0.0 { 1.0 } else { 0.0 });
         let mut fill_paint = tiny_skia::Paint::default();
@@ -1272,9 +1282,13 @@ impl TextEngine {
         shadow_paint.set_color_rgba8(0, 0, 0, (style.stroke_rgba[3] / 2).max(80));
         shadow_paint.anti_alias = true;
 
-        let paint_layer = |pixmap: &mut tiny_skia::Pixmap,
-                           geom: &SubtitleLayerGeometry,
-                           s_width: f32| {
+        // Render outer outlines + drop shadows into a separate pass from glyph fills so
+        // the UI can composite all token strokes for a line underneath all token fills
+        // (matching libass 2-pass rendering and preventing token i+1's outline from
+        // painting over token i's fill at MeCab token boundaries).
+        let paint_stroke_layer = |pixmap: &mut tiny_skia::Pixmap,
+                                  geom: &SubtitleLayerGeometry,
+                                  s_width: f32| {
             if let Some(ref path) = geom.path {
                 if s_width > 0.0 && style.stroke_rgba[3] > 0 {
                     let stroke = tiny_skia::Stroke {
@@ -1300,6 +1314,11 @@ impl TextEngine {
                         None,
                     );
                 }
+            }
+        };
+
+        let paint_fill_layer = |pixmap: &mut tiny_skia::Pixmap, geom: &SubtitleLayerGeometry| {
+            if let Some(ref path) = geom.path {
                 pixmap.fill_path(
                     path,
                     &fill_paint,
@@ -1313,10 +1332,17 @@ impl TextEngine {
             }
         };
 
-        if let Some(ref rg) = ruby_geom {
-            paint_layer(&mut pixmap, rg, ruby_stroke_px);
+        if let Some(ref mut sp) = stroke_pixmap {
+            if let Some(ref rg) = ruby_geom {
+                paint_stroke_layer(sp, rg, ruby_stroke_px);
+            }
+            paint_stroke_layer(sp, &base_geom, stroke_px);
         }
-        paint_layer(&mut pixmap, &base_geom, stroke_px);
+
+        if let Some(ref rg) = ruby_geom {
+            paint_fill_layer(&mut fill_pixmap, rg);
+        }
+        paint_fill_layer(&mut fill_pixmap, &base_geom);
 
         let has_color = ruby_geom
             .as_ref()
@@ -1330,7 +1356,7 @@ impl TextEngine {
             };
             let ruby_imgs = ruby_geom.map_or_else(Vec::new, |g| g.color_images);
             for (ix, iy, img_pm) in ruby_imgs.into_iter().chain(base_geom.color_images) {
-                pixmap.draw_pixmap(
+                fill_pixmap.draw_pixmap(
                     ix.round() as i32,
                     iy.round() as i32,
                     (*img_pm).as_ref(),
@@ -1351,7 +1377,8 @@ impl TextEngine {
             glyph_height_px: base_height,
             clusters,
             cluster_hitboxes,
-            pixels: pixmap_to_pixel_buffer(&pixmap),
+            stroke_pixels: stroke_pixmap.as_ref().map(pixmap_to_pixel_buffer),
+            pixels: pixmap_to_pixel_buffer(&fill_pixmap),
         }
     }
 
@@ -1446,11 +1473,16 @@ struct RasterizedSubtitleToken {
     glyph_height_px: f32,
     clusters: Vec<(usize, usize, f32, f32)>,
     cluster_hitboxes: Vec<SubtitleClusterHitbox>,
+    stroke_pixels: Option<SharedPixelBuffer<Rgba8Pixel>>,
     pixels: SharedPixelBuffer<Rgba8Pixel>,
 }
 
 impl RasterizedSubtitleToken {
     fn into_shaped(self) -> ShapedSubtitleToken {
+        let (has_stroke, stroke_image) = match self.stroke_pixels {
+            Some(buf) => (true, slint::Image::from_rgba8_premultiplied(buf)),
+            None => (false, slint::Image::default()),
+        };
         ShapedSubtitleToken {
             width_px: self.width_px,
             height_px: self.height_px,
@@ -1461,6 +1493,8 @@ impl RasterizedSubtitleToken {
             glyph_height_px: self.glyph_height_px,
             clusters: self.clusters,
             cluster_hitboxes: self.cluster_hitboxes,
+            has_stroke,
+            stroke_image,
             image: slint::Image::from_rgba8_premultiplied(self.pixels),
         }
     }
@@ -1861,6 +1895,89 @@ mod tests {
             "scaled ruby layout width ({}) should stay tight over base ({})",
             long_tok.width_px,
             long_base.width_px
+        );
+    }
+
+    #[test]
+    fn subtitle_stroke_and_fill_are_rasterized_into_separate_layers() {
+        let mut engine = TextEngine::new();
+        let mut style = SubtitleRenderStyle::default();
+        style.text_rgba = [255, 255, 255, 255];
+        style.stroke_rgba = [0, 0, 0, 255];
+        style.stroke_size = 10.0;
+
+        let tok = engine.rasterize_subtitle_token("年", "", 48.0, false, &style);
+        let stroke_buf = tok
+            .stroke_pixels
+            .as_ref()
+            .expect("stroked subtitle token must emit a dedicated stroke layer");
+        assert_eq!(stroke_buf.width(), tok.pixels.width());
+        assert_eq!(stroke_buf.height(), tok.pixels.height());
+
+        // Stroke layer must carry dark outline pixels (including in the horizontal bleed margin),
+        // and no white fill pixels.
+        let stroke_px_count = stroke_buf
+            .as_slice()
+            .iter()
+            .filter(|p| p.a > 0 && p.r == 0 && p.g == 0 && p.b == 0)
+            .count();
+        assert!(
+            stroke_px_count > 100,
+            "stroke layer should contain dark outline pixels (got {stroke_px_count})"
+        );
+
+        let bleed_cols = (tok.bleed_x_px.floor() as usize).min(stroke_buf.width() as usize);
+        let left_bleed_stroke = (0..stroke_buf.height() as usize)
+            .flat_map(|y| (0..bleed_cols).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = stroke_buf.as_slice()[y * stroke_buf.width() as usize + x];
+                p.a > 0
+            })
+            .count();
+        assert!(
+            left_bleed_stroke > 0,
+            "heavy stroke must bleed into left margin of the stroke layer"
+        );
+
+        // Fill layer must carry white glyph fill pixels and zero opaque dark stroke pixels,
+        // so adjacent tokens' outlines cannot paint over the previous token's white fill.
+        let fill_white_count = tok
+            .pixels
+            .as_slice()
+            .iter()
+            .filter(|p| p.a == 255 && p.r == 255 && p.g == 255 && p.b == 255)
+            .count();
+        let fill_dark_count = tok
+            .pixels
+            .as_slice()
+            .iter()
+            .filter(|p| p.a > 0 && (p.r < p.a || p.g < p.a || p.b < p.a))
+            .count();
+        assert!(
+            fill_white_count > 100,
+            "fill layer must contain white glyph pixels (got {fill_white_count})"
+        );
+        assert_eq!(
+            fill_dark_count, 0,
+            "fill layer must not bake dark outline pixels into the foreground pass"
+        );
+
+        // Disabling stroke or rasterizing whitespace omits the stroke buffer completely.
+        let mut no_stroke = style.clone();
+        no_stroke.stroke_size = 0.0;
+        assert!(
+            engine
+                .rasterize_subtitle_token("年", "", 48.0, false, &no_stroke)
+                .stroke_pixels
+                .is_none(),
+            "zero stroke size must omit stroke layer"
+        );
+        assert!(
+            engine
+                .rasterize_subtitle_token(" ", "", 48.0, false, &style)
+                .stroke_pixels
+                .is_none(),
+            "whitespace-only token must omit stroke layer"
         );
     }
 }

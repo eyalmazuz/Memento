@@ -720,6 +720,7 @@ mod rich_subtitle_phase4_tests {
         let second_word = app.get_active_sub_words().row_data(1).unwrap();
         let m0 = sb.invoke_render_token(first_word.clone(), 40.0, false, false, 0, 0);
         assert!(m0.bleed_x_px > 2.0, "heavy stroke must reserve bleed_x_px ({})", m0.bleed_x_px);
+        assert!(m0.has_stroke, "heavy stroke must populate the dedicated stroke pass");
 
         // Multi-character word selection (`私は`, tokens 0..2) must produce a continuous
         // blue bar across adjacent tokens with zero gap or inner corner seams!

@@ -17,6 +17,7 @@ import {
 } from "popup.slint";
 import {
     SubtitleWord, SubtitleLine, InteractiveSubtitleToken, SubtitleOverlayBridge,
+    SubtitleTokenSelectionSlice, SubtitleTokenStrokeSlice,
     AssLineHitbox, AssHighlightPatch, AssRubyItem,
 } from "subtitle_overlay.slint";
 import { SubEntry, PlayerTrack, ChapterMark } from "player/types.slint";
@@ -545,6 +546,7 @@ export component MementoApp inherits Window {
     changed popup-tooltip-timer-seq => {
         if PopupBridge.pending-tooltip-text != "" {
             if PopupBridge.tooltip-hover-delay-ms > 0 {
+                popup-tooltip-timer.running = true;
                 popup-tooltip-timer.restart();
             } else {
                 popup-tooltip-timer.running = false;
@@ -1161,36 +1163,80 @@ export component MementoApp inherits Window {
                             height: self.preferred-height;
                             spacing: 4px;
                             alignment: center;
-                            for line in root.active-sub-lines : HorizontalLayout {
-                                alignment: center;
-                                spacing: 0px;
-                                for word in line.words : InteractiveSubtitleToken {
-                                    word: word;
-                                    type-size: video-area.height * root.subtitle-scale;
-                                    show-furigana: root.furigana-visible;
-                                    selected: word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
-                                    popup-anchor-requested(local-x) => {
-                                        root.pending-popup-offset-x = (16px + self.x + local-x) - subtitle-box.width / 2;
+                            for line in root.active-sub-lines : Rectangle {
+                                preferred-width: line-fg.preferred-width;
+                                min-width: line-fg.min-width;
+                                preferred-height: line-fg.preferred-height;
+                                min-height: line-fg.min-height;
+                                background: transparent;
+
+                                // Layer 0: continuous selection highlights behind all outlines & fills
+                                if SubtitleOverlayBridge.rich-enabled && root.selected-token-index >= 0 : HorizontalLayout {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    alignment: center;
+                                    spacing: 0px;
+                                    for word in line.words : SubtitleTokenSelectionSlice {
+                                        word: word;
+                                        type-size: video-area.height * root.subtitle-scale;
+                                        show-furigana: root.furigana-visible;
+                                        selected: root.selected-token-index >= 0 && word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
                                     }
-                                    hover-state(hovering) => {
-                                        root.token-hovered = hovering;
-                                        if hovering && word.query != "" && !SubtitleOverlayBridge.rich-enabled {
-                                            root.pending-popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
+                                }
+
+                                // Layer 1: outlines & drop shadows for every token in the line (underneath all fills)
+                                if SubtitleOverlayBridge.rich-enabled : HorizontalLayout {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    alignment: center;
+                                    spacing: 0px;
+                                    for word in line.words : SubtitleTokenStrokeSlice {
+                                        word: word;
+                                        type-size: video-area.height * root.subtitle-scale;
+                                        show-furigana: root.furigana-visible;
+                                    }
+                                }
+
+                                // Layer 2: glyph fills + interactive hitboxes
+                                line-fg := HorizontalLayout {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    alignment: center;
+                                    spacing: 0px;
+                                    for word in line.words : InteractiveSubtitleToken {
+                                        word: word;
+                                        type-size: video-area.height * root.subtitle-scale;
+                                        show-furigana: root.furigana-visible;
+                                        selected: root.selected-token-index >= 0 && word.index >= root.selected-token-index && word.index < (root.selected-token-index + root.selected-token-count);
+                                        popup-anchor-requested(local-x) => {
+                                            root.pending-popup-offset-x = (16px + self.x + local-x) - subtitle-box.width / 2;
                                         }
-                                    }
-                                    hovered(query, control, shift, alt, meta) => {
-                                        root.osc-activity();
-                                        root.hover-word(query, word.index, control, shift, alt, meta);
-                                    }
-                                    clicked => {
-                                        root.popup-offset-x = root.pending-popup-offset-x;
-                                        root.selected-token-index = word.index;
-                                        root.hover-word("", word.index, false, false, false, false);
-                                        root.lookup-word(word.query);
-                                    }
-                                    double-clicked => {
-                                        if root.active-sub-text != "" {
-                                            root.copy-subtitle-text(root.active-sub-text);
+                                        hover-state(hovering) => {
+                                            root.token-hovered = hovering;
+                                            if hovering && word.query != "" && !SubtitleOverlayBridge.rich-enabled {
+                                                root.pending-popup-offset-x = (16px + self.x + self.width / 2) - subtitle-box.width / 2;
+                                            }
+                                        }
+                                        hovered(query, control, shift, alt, meta) => {
+                                            root.osc-activity();
+                                            root.hover-word(query, word.index, control, shift, alt, meta);
+                                        }
+                                        clicked => {
+                                            root.popup-offset-x = root.pending-popup-offset-x;
+                                            root.selected-token-index = word.index;
+                                            root.hover-word("", word.index, false, false, false, false);
+                                            root.lookup-word(word.query);
+                                        }
+                                        double-clicked => {
+                                            if root.active-sub-text != "" {
+                                                root.copy-subtitle-text(root.active-sub-text);
+                                            }
                                         }
                                     }
                                 }

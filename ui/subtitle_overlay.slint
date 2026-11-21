@@ -22,6 +22,8 @@ export struct SubtitleTokenMetrics {
     sel-join-left: bool,
     sel-join-right: bool,
     has-selection: bool,
+    has-stroke: bool,
+    rendered-stroke: image,
     rendered: image,
 }
 
@@ -104,18 +106,13 @@ export global SubtitleOverlayBridge {
     callback ass-middle-clicked(float, float);
 }
 
-export component InteractiveSubtitleToken inherits Rectangle {
+// Layer 0 (bottom): continuous selection highlight behind all strokes & fills in a line
+export component SubtitleTokenSelectionSlice inherits Rectangle {
     in property <SubtitleWord> word;
     in property <length> type-size;
     in property <bool> selected;
     in property <bool> show-furigana: false;
-    callback clicked();
-    callback double-clicked();
-    callback hovered(string, bool, bool, bool, bool);
-    callback hover-state(bool);
-    callback popup-anchor-requested(length);
 
-    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
     private property <SubtitleTokenMetrics> rich-metrics: SubtitleOverlayBridge.rich-enabled
         ? SubtitleOverlayBridge.render-token(
             root.word,
@@ -136,6 +133,108 @@ export component InteractiveSubtitleToken inherits Rectangle {
             sel-join-left: false,
             sel-join-right: false,
             has-selection: false,
+            has-stroke: false,
+        };
+    private property <bool> use-rich: SubtitleOverlayBridge.rich-enabled && root.rich-metrics.width-px > 0.0;
+
+    preferred-width: root.use-rich ? root.rich-metrics.width-px * 1px : 0px;
+    min-width: root.preferred-width;
+    preferred-height: root.use-rich ? root.rich-metrics.height-px * 1px : 0px;
+    min-height: root.preferred-height;
+    background: transparent;
+
+    if root.use-rich && root.rich-metrics.has-selection && root.word.query != "" : Rectangle {
+        x: root.rich-metrics.sel-x-px * 1px;
+        y: root.rich-metrics.glyph-y-px * 1px;
+        width: root.rich-metrics.sel-width-px * 1px;
+        height: root.rich-metrics.glyph-height-px * 1px;
+        border-top-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
+        border-bottom-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
+        border-top-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
+        border-bottom-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
+        background: #38a6d6;
+    }
+}
+
+// Layer 1 (middle): outer stroke + drop-shadow pass for every token in a line, painted beneath all fills
+export component SubtitleTokenStrokeSlice inherits Rectangle {
+    in property <SubtitleWord> word;
+    in property <length> type-size;
+    in property <bool> show-furigana: false;
+
+    private property <SubtitleTokenMetrics> rich-metrics: SubtitleOverlayBridge.rich-enabled
+        ? SubtitleOverlayBridge.render-token(
+            root.word,
+            root.type-size / 1px,
+            root.show-furigana,
+            false,
+            SubtitleOverlayBridge.style-revision,
+            0
+        )
+        : {
+            width-px: 0.0,
+            height-px: 0.0,
+            bleed-x-px: 0.0,
+            glyph-y-px: 0.0,
+            glyph-height-px: 0.0,
+            sel-x-px: 0.0,
+            sel-width-px: 0.0,
+            sel-join-left: false,
+            sel-join-right: false,
+            has-selection: false,
+            has-stroke: false,
+        };
+    private property <bool> use-rich: SubtitleOverlayBridge.rich-enabled && root.rich-metrics.width-px > 0.0;
+
+    preferred-width: root.use-rich ? root.rich-metrics.width-px * 1px : 0px;
+    min-width: root.preferred-width;
+    preferred-height: root.use-rich ? root.rich-metrics.height-px * 1px : 0px;
+    min-height: root.preferred-height;
+    background: transparent;
+
+    if root.use-rich && root.rich-metrics.has-stroke : Image {
+        x: -root.rich-metrics.bleed-x-px * 1px;
+        y: 0px;
+        width: (root.rich-metrics.width-px + root.rich-metrics.bleed-x-px * 2.0) * 1px;
+        height: root.rich-metrics.height-px * 1px;
+        source: root.rich-metrics.rendered-stroke;
+        image-fit: fill;
+    }
+}
+
+export component InteractiveSubtitleToken inherits Rectangle {
+    in property <SubtitleWord> word;
+    in property <length> type-size;
+    in property <bool> selected;
+    in property <bool> show-furigana: false;
+    callback clicked();
+    callback double-clicked();
+    callback hovered(string, bool, bool, bool, bool);
+    callback hover-state(bool);
+    callback popup-anchor-requested(length);
+
+    private property <length> ruby-space: root.show-furigana ? root.type-size * 0.7 + 2px : 0px;
+    private property <SubtitleTokenMetrics> rich-metrics: SubtitleOverlayBridge.rich-enabled
+        ? SubtitleOverlayBridge.render-token(
+            root.word,
+            root.type-size / 1px,
+            root.show-furigana,
+            false,
+            SubtitleOverlayBridge.style-revision,
+            0
+        )
+        : {
+            width-px: 0.0,
+            height-px: 0.0,
+            bleed-x-px: 0.0,
+            glyph-y-px: 0.0,
+            glyph-height-px: 0.0,
+            sel-x-px: 0.0,
+            sel-width-px: 0.0,
+            sel-join-left: false,
+            sel-join-right: false,
+            has-selection: false,
+            has-stroke: false,
         };
     private property <bool> use-rich: SubtitleOverlayBridge.rich-enabled && root.rich-metrics.width-px > 0.0;
 
@@ -149,19 +248,7 @@ export component InteractiveSubtitleToken inherits Rectangle {
     min-height: root.preferred-height;
     background: transparent;
 
-    // Selection highlight behind vector-stroked or plain glyph run
-    if root.use-rich && root.rich-metrics.has-selection && root.word.query != "" : Rectangle {
-        x: root.rich-metrics.sel-x-px * 1px;
-        y: root.rich-metrics.glyph-y-px * 1px;
-        width: root.rich-metrics.sel-width-px * 1px;
-        height: root.rich-metrics.glyph-height-px * 1px;
-        border-top-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
-        border-bottom-left-radius: root.rich-metrics.sel-join-left ? 0px : 3px;
-        border-top-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
-        border-bottom-right-radius: root.rich-metrics.sel-join-right ? 0px : 3px;
-        background: #38a6d6;
-    }
-
+    // Plain fallback selection highlight (rich mode renders selection in SubtitleTokenSelectionSlice)
     if !root.use-rich && root.selected && root.word.query != "" : Rectangle {
         x: glyph.x;
         y: glyph.y;

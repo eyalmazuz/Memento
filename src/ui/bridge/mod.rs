@@ -1541,4 +1541,71 @@ mod tests {
         assert!(attrs.strikeout);
         assert!((attrs.letter_spacing - 2.0).abs() < 1e-3);
     }
+
+    #[test]
+    fn popup_hover_tooltip_timer_starts_cancels_and_restarts_cleanly() {
+        i_slint_backend_testing::init_no_event_loop();
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = dir.path().join("dictionaries.sqlite");
+        create_test_dict_db(&db_path);
+
+        let cfg = ConfigController::new();
+        let app = MementoApp::new().unwrap();
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
+        app.show().unwrap();
+
+        let pb = app.global::<PopupBridge>();
+        assert_eq!(pb.get_tooltip_hover_delay_ms(), 500);
+        assert!(!pb.get_tooltip_visible());
+
+        // 1) First hover starts the previously-stopped timer and fires after 500ms.
+        pb.invoke_request_popup_tooltip("Search by kana reading".into(), 24.0, 60.0);
+        // Flush Slint's ChangeTracker queue at t=0 (done automatically at the end of
+        // WindowInner::process_mouse_input in real UI pointer events).
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        assert!(!pb.get_tooltip_visible(), "delayed tooltip must not appear immediately");
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+        assert!(!pb.get_tooltip_visible(), "delayed tooltip must not fire before 500ms");
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(150));
+        assert!(
+            pb.get_tooltip_visible(),
+            "delayed tooltip timer must start and show tooltip once 500ms elapses"
+        );
+        assert_eq!(pb.get_tooltip_text().as_str(), "Search by kana reading");
+
+        // 2) Leaving the hovered target cancels the pending tooltip before it fires.
+        pb.invoke_hide_tooltip();
+        assert!(!pb.get_tooltip_visible());
+        pb.invoke_request_popup_tooltip("Kanji info: 亡".into(), 30.0, 64.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(250));
+        pb.invoke_cancel_pending_tooltip();
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+        assert!(
+            !pb.get_tooltip_visible(),
+            "cancelled pending tooltip must never appear after mouse leaves"
+        );
+
+        // 3) Moving straight to another target restarts the 500ms countdown cleanly.
+        pb.invoke_request_popup_tooltip("Play audio".into(), 100.0, 40.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        assert!(!pb.get_tooltip_visible());
+        pb.invoke_request_popup_tooltip("Kanji info: 食".into(), 40.0, 64.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(300));
+        assert!(
+            !pb.get_tooltip_visible(),
+            "re-requesting tooltip must reset the 500ms delay"
+        );
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(250));
+        assert!(pb.get_tooltip_visible());
+        assert_eq!(pb.get_tooltip_text().as_str(), "Kanji info: 食");
+
+        app.hide().unwrap();
+    }
 }
