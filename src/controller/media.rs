@@ -200,6 +200,29 @@ fn ytdl_flag(media_path: &str) -> &'static str {
     }
 }
 
+fn append_lean_encode_options(
+    ytdl: &str,
+    include_subtitles: bool,
+    options: &mut Vec<(&'static str, String)>,
+) {
+    options.push(("terminal", "no".to_owned()));
+    options.push(("osc", "no".to_owned()));
+    options.push(("osd-level", "0".to_owned()));
+    options.push(("audio-display", "no".to_owned()));
+    options.push(("audio-file-auto", "no".to_owned()));
+    options.push(("sub-auto", "no".to_owned()));
+    options.push(("load-osd-console", "no".to_owned()));
+    options.push(("load-stats-overlay", "no".to_owned()));
+    options.push(("load-auto-profiles", "no".to_owned()));
+    if !include_subtitles {
+        options.push(("embeddedfonts", "no".to_owned()));
+    }
+    if ytdl == "no" {
+        options.push(("load-scripts", "no".to_owned()));
+        options.push(("demuxer-readahead-secs", "1".to_owned()));
+    }
+}
+
 fn append_streaming_options(
     media: &MediaContext,
     include_audio: bool,
@@ -262,6 +285,7 @@ fn build_asr_audio_options(
     } else {
         media.audio_id.to_string()
     };
+    let ytdl = ytdl_flag(media_path);
     let mut options = vec![
         ("vid", "no".to_owned()),
         ("aid", aid_value),
@@ -273,12 +297,13 @@ fn build_asr_audio_options(
         ("cover-art-auto", "no".to_owned()),
         ("keep-open", "no".to_owned()),
         ("config", "no".to_owned()),
-        ("ytdl", ytdl_flag(media_path).to_owned()),
+        ("ytdl", ytdl.to_owned()),
         ("o", output.to_owned()),
     ];
     if force_wav_format {
         options.push(("of", "wav".to_owned()));
     }
+    append_lean_encode_options(ytdl, false, &mut options);
     append_streaming_options(media, true, &mut options);
     Ok(options)
 }
@@ -307,6 +332,7 @@ fn build_anki_audio_clip_options(
         } else {
             media.audio_id.to_string()
         };
+        let ytdl = ytdl_flag(media_path);
         let mut opts = vec![
             ("vid", "no".to_owned()),
             ("aid", aid_value),
@@ -316,9 +342,10 @@ fn build_anki_audio_clip_options(
             ("cover-art-auto", "no".to_owned()),
             ("keep-open", "no".to_owned()),
             ("config", "no".to_owned()),
-            ("ytdl", ytdl_flag(media_path).to_owned()),
+            ("ytdl", ytdl.to_owned()),
             ("o", output.to_owned()),
         ];
+        append_lean_encode_options(ytdl, false, &mut opts);
         append_streaming_options(media, true, &mut opts);
         opts
     };
@@ -360,6 +387,7 @@ fn build_anki_video_clip_options(
     } else {
         "no".to_owned()
     };
+    let ytdl = ytdl_flag(media_path);
     let mut options = vec![
         ("ovc", "libx264".to_owned()),
         ("oac", "aac".to_owned()),
@@ -370,9 +398,10 @@ fn build_anki_video_clip_options(
         ("cover-art-auto", "no".to_owned()),
         ("keep-open", "no".to_owned()),
         ("config", "no".to_owned()),
-        ("ytdl", ytdl_flag(media_path).to_owned()),
+        ("ytdl", ytdl.to_owned()),
         ("o", output.to_owned()),
     ];
+    append_lean_encode_options(ytdl, subtitles, &mut options);
     append_streaming_options(media, audio, &mut options);
     if let Some(db) = normalize_db.filter(|_| audio) {
         if !db.is_finite() {

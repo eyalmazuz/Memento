@@ -2,7 +2,6 @@
 //! popup pronunciation audio source resolution, and word audio playback.
 
 use std::cell::{Cell, RefCell};
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,7 +14,7 @@ use slint::{ComponentHandle, Model as _, VecModel};
 use crate::app::preferences::dictionary_order_map;
 use crate::controller::anki::AnkiController;
 use crate::controller::config::{AnkiNoteConfig, AudioSourceEntry, ConfigController};
-use crate::controller::dict::{shared_readonly_db, TermFrequency, TermPitchGraph};
+use crate::controller::dict::{TermFrequency, TermPitchGraph};
 use crate::controller::player::filter_subtitle_text;
 use crate::controller::subtitles::SubtitleController;
 use crate::controller::{anki, anki_media, audio, media};
@@ -250,6 +249,7 @@ pub(crate) fn register_audio_invalidation_target(
 /// `audio/download-timeout-ms` change in Settings (H3.8 / `#1876`).
 pub(crate) fn invalidate_audio_caches_for_config_change(timeout_ms: u64) {
     audio::set_download_timeout_ms(timeout_ms);
+    audio::clear_shared_audio_cache();
     REGISTERED_AUDIO_TARGETS.with(|slot| {
         let mut targets = slot.borrow_mut();
         targets.retain(|entry| {
@@ -681,215 +681,20 @@ pub(crate) struct PreparedAnkiNoteRequest {
     pub(crate) context: anki::NoteFieldsContext,
     pub(crate) selected_occurrences: Vec<(String, usize)>,
     pub(crate) selected_hit_meta: Vec<ActiveRowHitMeta>,
-    pub(crate) screenshot_request: Option<Result<memento_player::mpv::ScreenshotRequest, String>>,
-    pub(crate) video_screenshot_request:
-        Option<Result<memento_player::mpv::ScreenshotRequest, String>>,
+    pub(crate) pending_screenshots: anki_media::PendingScreenshots,
     pub(crate) media_input: anki_media::NoteMediaInput,
     pub(crate) unavailable: Vec<String>,
     pub(crate) show_tag: bool,
     pub(crate) is_panel_add: bool,
 }
 
-fn dict_order_sort_key(dictionary_order: &HashMap<i64, i64>, dic_id: i64) -> (i64, i64) {
-    (
-        dictionary_order.get(&dic_id).copied().unwrap_or(i64::MAX),
-        dic_id,
-    )
-}
-
-/// Resolves exact SQLite `(dic_id, rowid)` tuples for the checked glossary rows so
-/// `populate_note_context_from_sqlite_ordered` exports `{glossary}`, `{frequencies}`, and
-/// `{pitch*}` in the user's exact dictionary priority order and checked selection (C3.5).
-pub(crate) fn resolve_selected_rowids_from_sqlite(
-    db_path: &Path,
-    ctx: &anki::NoteFieldsContext,
-    selected_occurrences: &[(String, usize)],
-    selected_hit_meta: &[ActiveRowHitMeta],
-) -> Vec<(i64, i64)> {
-    if !ctx.selected_rowids.is_empty() {
-        return ctx.selected_rowids.clone();
-    }
-    if !db_path.is_file() || (selected_occurrences.is_empty() && selected_hit_meta.is_empty()) {
-        return Vec::new();
-    }
-    let Ok(db) = shared_readonly_db(db_path) else {
-        return Vec::new();
-    };
-    let Ok(meta) = db.metadata_snapshot() else {
-        return Vec::new();
-    };
-    let titles = &meta.names;
-    let is_kanji = ctx.is_kanji || !ctx.character.is_empty();
-
-    if is_kanji {
-        let target_char = if !ctx.character.is_empty() {
-            ctx.character.as_str()
-        } else {
-            ctx.expression.as_str()
-        };
-        let Ok(mut rows) = db.with_conn(|conn| {
-            const SQL: &str = "SELECT rowid, dic_id FROM kanji_bank \
-                WHERE dic_id NOT IN (SELECT dic_id FROM dict_disabled) AND char = ?1 \
-                ORDER BY dic_id ASC, rowid ASC;";
-            let mut stmt = conn.prepare_cached(SQL).map_err(|e| e.to_string())?;
-            let mut q = stmt.query([target_char]).map_err(|e| e.to_string())?;
-            let mut out = Vec::new();
-            while let Some(row) = q.next().map_err(|e| e.to_string())? {
-                let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
-                let dic_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-                out.push((rowid, dic_id));
-            }
-            Ok::<_, String>(out)
-        }) else {
-            return Vec::new();
-        };
-        rows.sort_by_key(|&(rowid, dic_id)| (dict_order_sort_key(&ctx.dictionary_order, dic_id), rowid));
-
-        let mut used = vec![false; rows.len()];
-        let mut out = Vec::new();
-        if !selected_hit_meta.is_empty() && selected_hit_meta.iter().all(|m| m.dictionary_id > 0) {
-            for want in selected_hit_meta {
-                if let Some((idx, &(rowid, dic_id))) = rows
-                    .iter()
-                    .enumerate()
-                    .find(|&(i, &(_, did))| !used[i] && did == want.dictionary_id)
-                {
-                    used[idx] = true;
-                    out.push((dic_id, rowid));
-                }
-            }
-            if out.len() == selected_hit_meta.len() {
-                return out;
-            }
-            out.clear();
-        }
-        let mut occ_counts: HashMap<String, usize> = HashMap::new();
-        let mut indexed: Vec<(String, usize, i64, i64)> = Vec::new();
-        for (rowid, dic_id) in rows {
-            if meta.disabled.contains(&dic_id) {
-                continue;
-            }
-            let Some(dict_name) = titles.get(&dic_id).cloned() else {
-                continue;
-            };
-            let occ = *occ_counts
-                .entry(dict_name.clone())
-                .and_modify(|c| *c += 1)
-                .or_insert(0);
-            indexed.push((dict_name, occ, dic_id, rowid));
-        }
-        for (want_dict, want_occ) in selected_occurrences {
-            if let Some(&(_, _, dic_id, rowid)) = indexed
-                .iter()
-                .find(|(name, occ, _, _)| name == want_dict && occ == want_occ)
-            {
-                out.push((dic_id, rowid));
-            }
-        }
-        return out;
-    }
-
-    let Ok(mut rows) = db.with_conn(|conn| {
-        const SQL: &str = "SELECT rowid, dic_id, glossary, score, sequence \
-            FROM term_bank \
-            WHERE expression = ?1 \
-              AND (reading = ?2 OR (?2 = ?1 AND reading = '')) \
-              AND dic_id NOT IN (SELECT dic_id FROM dict_disabled) \
-            ORDER BY dic_id ASC, score DESC, sequence ASC, rowid ASC;";
-        let mut stmt = conn.prepare_cached(SQL).map_err(|e| e.to_string())?;
-        let mut q = stmt
-            .query([ctx.expression.as_str(), ctx.reading.as_str()])
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::new();
-        while let Some(row) = q.next().map_err(|e| e.to_string())? {
-            let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let dic_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-            let glossary: String = match row.get_ref(2) {
-                Ok(memento_dict::sqlite_db::rusqlite::types::ValueRef::Text(bytes)) => {
-                    String::from_utf8_lossy(bytes).into_owned()
-                }
-                Ok(memento_dict::sqlite_db::rusqlite::types::ValueRef::Blob(bytes)) => {
-                    String::from_utf8_lossy(bytes).into_owned()
-                }
-                _ => String::new(),
-            };
-            let score: i64 = row.get(3).map_err(|e| e.to_string())?;
-            let sequence: i64 = row.get(4).map_err(|e| e.to_string())?;
-            out.push((rowid, dic_id, glossary, score, sequence));
-        }
-        Ok::<_, String>(out)
-    }) else {
-        return Vec::new();
-    };
-    rows.sort_by_key(|&(rowid, dic_id, _, score, sequence)| {
-        (
-            dict_order_sort_key(&ctx.dictionary_order, dic_id),
-            Reverse(score),
-            sequence,
-            rowid,
-        )
-    });
-
-    let mut out = Vec::new();
-    if !selected_hit_meta.is_empty() && selected_hit_meta.iter().all(|m| m.dictionary_id > 0) {
-        let mut used = vec![false; rows.len()];
-        for want in selected_hit_meta {
-            let matched = rows
-                .iter()
-                .enumerate()
-                .find(|&(i, (_, did, gloss, _, _))| {
-                    !used[i]
-                        && *did == want.dictionary_id
-                        && !want.raw_glossary.is_empty()
-                        && *gloss == want.raw_glossary
-                })
-                .or_else(|| {
-                    rows.iter()
-                        .enumerate()
-                        .find(|&(i, (_, did, _, _, _))| !used[i] && *did == want.dictionary_id)
-                });
-            if let Some((idx, &(rowid, dic_id, _, _, _))) = matched {
-                used[idx] = true;
-                out.push((dic_id, rowid));
-            }
-        }
-        if out.len() == selected_hit_meta.len() {
-            return out;
-        }
-        out.clear();
-    }
-
-    let mut occ_counts: HashMap<String, usize> = HashMap::new();
-    let mut indexed: Vec<(String, usize, i64, i64)> = Vec::new();
-    for (rowid, dic_id, glossary, _, _) in rows {
-        if meta.disabled.contains(&dic_id) {
-            continue;
-        }
-        let Some(dict_name) = titles.get(&dic_id).cloned() else {
-            continue;
-        };
-        let has_non_empty_items = match serde_json::from_str::<serde_json::Value>(&glossary) {
-            Ok(serde_json::Value::Array(arr)) => arr.iter().any(|item| !item.is_array()),
-            Ok(_) | Err(_) => true,
-        };
-        if !has_non_empty_items {
-            continue;
-        }
-        let occ = *occ_counts
-            .entry(dict_name.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(0);
-        indexed.push((dict_name, occ, dic_id, rowid));
-    }
-    for (want_dict, want_occ) in selected_occurrences {
-        if let Some(&(_, _, dic_id, rowid)) = indexed
-            .iter()
-            .find(|(name, occ, _, _)| name == want_dict && occ == want_occ)
-        {
-            out.push((dic_id, rowid));
-        }
-    }
-    out
+fn active_hit_meta_to_hints(meta: Vec<ActiveRowHitMeta>) -> Vec<anki::SelectedHitHint> {
+    meta.into_iter()
+        .map(|m| anki::SelectedHitHint {
+            dictionary_id: m.dictionary_id,
+            raw_glossary: m.raw_glossary,
+        })
+        .collect()
 }
 
 pub(crate) fn prepare_anki_note_request(
@@ -1174,9 +979,14 @@ pub(crate) fn prepare_anki_note_request(
             .unwrap_or_default();
     }
 
-    let (wants_screenshot, wants_video_screenshot) = anki_media::requested_screenshots(&profile);
-    let mut screenshot_request = None;
-    let mut video_screenshot_request = None;
+    let screenshot_plan = anki_media::requested_screenshot_plan(&profile);
+    let mut pending_screenshots = anki_media::PendingScreenshots {
+        allow_fallback_screenshot: screenshot_plan.fallback_screenshot
+            && !screenshot_plan.primary_screenshot,
+        allow_fallback_video_screenshot: screenshot_plan.fallback_video_screenshot
+            && !screenshot_plan.primary_video_screenshot,
+        ..Default::default()
+    };
     let prefer_manual_hud = is_panel_add
         || (ass_lookup.is_none() && app.get_selected_token_index() < 0);
     let hud_text = app.get_audio_context_hud_text();
@@ -1210,9 +1020,25 @@ pub(crate) fn prepare_anki_note_request(
             prefer_manual_hud,
         );
 
+        // Queue only primary screenshots upfront (for `{screenshot-video | screenshot}`,
+        // that is video-only — no redundant subtitle-toggled GPU readback). Keep a
+        // lightweight capturer handle so fallback kinds capture lazily only on failure.
+        if pending_screenshots.allow_fallback_screenshot
+            || pending_screenshots.allow_fallback_video_screenshot
+        {
+            pending_screenshots.capturer = player.map(MpvInstance::screenshot_capturer);
+        }
         for (wanted, with_subs, request) in [
-            (wants_screenshot, true, &mut screenshot_request),
-            (wants_video_screenshot, false, &mut video_screenshot_request),
+            (
+                screenshot_plan.primary_video_screenshot,
+                false,
+                &mut pending_screenshots.screenshot_video,
+            ),
+            (
+                screenshot_plan.primary_screenshot,
+                true,
+                &mut pending_screenshots.screenshot,
+            ),
         ] {
             if wanted {
                 *request = Some(
@@ -1298,8 +1124,7 @@ pub(crate) fn prepare_anki_note_request(
         context,
         selected_occurrences,
         selected_hit_meta,
-        screenshot_request,
-        video_screenshot_request,
+        pending_screenshots,
         media_input,
         unavailable,
         show_tag,
@@ -1363,9 +1188,8 @@ pub(crate) fn install_update_anki_note_handler(
                 mut context,
                 selected_occurrences,
                 selected_hit_meta,
-                screenshot_request,
-                video_screenshot_request,
-                mut media_input,
+                pending_screenshots,
+                media_input,
                 unavailable,
                 show_tag,
                 is_panel_add,
@@ -1378,35 +1202,25 @@ pub(crate) fn install_update_anki_note_handler(
             let res_dir = resources_path.clone();
             let cfg_dir = config_dir.clone();
             std::thread::spawn(move || {
-                media_input.screenshot = screenshot_request
-                    .and_then(|request| request.ok())
-                    .and_then(|request| request.wait().ok());
-                media_input.screenshot_video = video_screenshot_request
-                    .and_then(|request| request.ok())
-                    .and_then(|request| request.wait().ok());
                 let controller = AnkiController::new(profile.endpoint());
                 let resource_roots = vec![cfg_dir.join("dict_resources"), res_dir];
-                let selected_rowids = resolve_selected_rowids_from_sqlite(
-                    &metadata_path,
-                    &context,
-                    &selected_occurrences,
-                    &selected_hit_meta,
-                );
-                context.selected_rowids = selected_rowids.clone();
                 let dict_order = context.dictionary_order.clone();
-                let _ = anki::populate_note_context_from_sqlite_ordered(
+                let hit_hints = active_hit_meta_to_hints(selected_hit_meta);
+                let _ = anki::populate_note_context_from_sqlite_with_hints(
                     &mut context,
                     &metadata_path,
                     &resource_roots,
                     &selected_occurrences,
-                    &selected_rowids,
+                    &[],
+                    &hit_hints,
                     &dict_order,
                 );
-                let result = controller.update_existing_note_with_media_outcome(
+                let result = controller.update_existing_note_with_media_and_screenshots(
                     note_id,
                     &profile,
                     &mut context,
                     media_input,
+                    pending_screenshots,
                     anki::AnkiUpdateMode::OverwriteNonEmpty,
                 );
                 let updated_profile = profile.clone();
@@ -1790,9 +1604,8 @@ pub(crate) fn install_anki_and_audio_handlers(
             mut context,
             selected_occurrences,
             selected_hit_meta,
-            screenshot_request,
-            video_screenshot_request,
-            mut media_input,
+            pending_screenshots,
+            media_input,
             unavailable,
             show_tag,
             is_panel_add,
@@ -1805,33 +1618,25 @@ pub(crate) fn install_anki_and_audio_handlers(
         let res_dir = note_resources_path.clone();
         let cfg_dir = note_config_dir.clone();
         std::thread::spawn(move || {
-            media_input.screenshot = screenshot_request
-                .and_then(|request| request.ok())
-                .and_then(|request| request.wait().ok());
-            media_input.screenshot_video = video_screenshot_request
-                .and_then(|request| request.ok())
-                .and_then(|request| request.wait().ok());
             let controller = AnkiController::new(profile.endpoint());
             let resource_roots = vec![cfg_dir.join("dict_resources"), res_dir];
-            let selected_rowids = resolve_selected_rowids_from_sqlite(
-                &metadata_path,
-                &context,
-                &selected_occurrences,
-                &selected_hit_meta,
-            );
-            context.selected_rowids = selected_rowids.clone();
             let dict_order = context.dictionary_order.clone();
-            let _ = anki::populate_note_context_from_sqlite_ordered(
+            let hit_hints = active_hit_meta_to_hints(selected_hit_meta);
+            let _ = anki::populate_note_context_from_sqlite_with_hints(
                 &mut context,
                 &metadata_path,
                 &resource_roots,
                 &selected_occurrences,
-                &selected_rowids,
+                &[],
+                &hit_hints,
                 &dict_order,
             );
-            let result =
-                anki_media::prepare_note_media_with_warnings(&profile, &mut context, media_input)
-                    .and_then(|_| controller.add_note_from_profile_with_warnings(&profile, &context));
+            let result = controller.add_note_from_profile_with_media_and_screenshots(
+                &profile,
+                context,
+                media_input,
+                pending_screenshots,
+            );
             let added_profile = profile.clone();
             let expire_app = response_app.clone();
             let _ = response_app.upgrade_in_event_loop(move |app| {

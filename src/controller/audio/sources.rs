@@ -1,10 +1,11 @@
 //! Pronunciation audio source URL classification, template expansion,
 //! JSON `audioSourceList` parsing, shared HTTP lookups, and incremental MD5.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use memento_audio::audiofiles::{
@@ -24,9 +25,148 @@ use super::super::config::AudioSourceEntry;
 
 const MAX_JSON_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const AUDIO_USER_AGENT: &str = "Memento";
+const MAX_CACHED_JSON_EXPANSIONS: usize = 64;
+const MAX_CACHED_AUDIO_ENTRIES: usize = 32;
+const MAX_CACHED_AUDIO_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SINGLE_CACHED_AUDIO_BYTES: usize = 2 * 1024 * 1024;
 
 static AUDIO_DOWNLOAD_TIMEOUT_MS: AtomicU64 = AtomicU64::new(DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
 static SHARED_HTTP_CLIENT: OnceLock<HttpClient> = OnceLock::new();
+static SHARED_WORD_AUDIO_CACHE: OnceLock<Mutex<SharedWordAudioCache>> = OnceLock::new();
+
+#[derive(Clone)]
+pub(super) enum CachedAudioEntry {
+    Payload {
+        bytes: Vec<u8>,
+        md5: String,
+        ext: String,
+    },
+    Skipped {
+        md5: String,
+    },
+}
+
+#[derive(Default)]
+struct SharedWordAudioCache {
+    json_expansions: VecDeque<((String, String, String, String), Vec<(String, String)>)>,
+    payloads: VecDeque<(String, CachedAudioEntry)>,
+    total_payload_bytes: usize,
+}
+
+impl SharedWordAudioCache {
+    fn get_json(
+        &mut self,
+        key: &(String, String, String, String),
+    ) -> Option<Vec<(String, String)>> {
+        let pos = self.json_expansions.iter().position(|(k, _)| k == key)?;
+        let entry = self.json_expansions.remove(pos)?;
+        let res = entry.1.clone();
+        self.json_expansions.push_back(entry);
+        Some(res)
+    }
+
+    fn insert_json(
+        &mut self,
+        key: (String, String, String, String),
+        candidates: Vec<(String, String)>,
+    ) {
+        if let Some(pos) = self.json_expansions.iter().position(|(k, _)| k == &key) {
+            self.json_expansions.remove(pos);
+        }
+        while self.json_expansions.len() >= MAX_CACHED_JSON_EXPANSIONS {
+            self.json_expansions.pop_front();
+        }
+        self.json_expansions.push_back((key, candidates));
+    }
+
+    fn get_payload(&mut self, url: &str) -> Option<CachedAudioEntry> {
+        let pos = self.payloads.iter().position(|(k, _)| k == url)?;
+        let entry = self.payloads.remove(pos)?;
+        let res = entry.1.clone();
+        self.payloads.push_back(entry);
+        Some(res)
+    }
+
+    fn insert_payload(&mut self, url: String, entry: CachedAudioEntry) {
+        let new_bytes = match &entry {
+            CachedAudioEntry::Payload { bytes, .. } => {
+                if bytes.len() > MAX_SINGLE_CACHED_AUDIO_BYTES {
+                    return;
+                }
+                bytes.len()
+            }
+            CachedAudioEntry::Skipped { .. } => 0,
+        };
+        if let Some(pos) = self.payloads.iter().position(|(k, _)| k == &url) {
+            if let Some((_, old)) = self.payloads.remove(pos) {
+                if let CachedAudioEntry::Payload { bytes, .. } = old {
+                    self.total_payload_bytes = self.total_payload_bytes.saturating_sub(bytes.len());
+                }
+            }
+        }
+        while self.payloads.len() >= MAX_CACHED_AUDIO_ENTRIES
+            || (self.total_payload_bytes.saturating_add(new_bytes) > MAX_CACHED_AUDIO_TOTAL_BYTES
+                && !self.payloads.is_empty())
+        {
+            if let Some((_, old)) = self.payloads.pop_front() {
+                if let CachedAudioEntry::Payload { bytes, .. } = old {
+                    self.total_payload_bytes = self.total_payload_bytes.saturating_sub(bytes.len());
+                }
+            }
+        }
+        self.total_payload_bytes = self.total_payload_bytes.saturating_add(new_bytes);
+        self.payloads.push_back((url, entry));
+    }
+
+    fn clear(&mut self) {
+        self.json_expansions.clear();
+        self.payloads.clear();
+        self.total_payload_bytes = 0;
+    }
+}
+
+fn shared_audio_cache() -> &'static Mutex<SharedWordAudioCache> {
+    SHARED_WORD_AUDIO_CACHE.get_or_init(|| Mutex::new(SharedWordAudioCache::default()))
+}
+
+/// Clears the shared word-audio payload & JSON expansion cache (e.g. when audio
+/// sources or download timeout change in Settings).
+pub fn clear_shared_audio_cache() {
+    let mut cache = shared_audio_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clear();
+}
+
+pub(super) fn cache_shared_audio_payload(url: &str, bytes: Vec<u8>, md5: String, ext: String) {
+    if !has_http_scheme(url) {
+        return;
+    }
+    let mut cache = shared_audio_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert_payload(url.to_owned(), CachedAudioEntry::Payload { bytes, md5, ext });
+}
+
+pub(super) fn cache_shared_audio_skipped(url: &str, md5: String) {
+    if !has_http_scheme(url) {
+        return;
+    }
+    let mut cache = shared_audio_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert_payload(url.to_owned(), CachedAudioEntry::Skipped { md5 });
+}
+
+pub(super) fn lookup_shared_audio_payload(url: &str) -> Option<CachedAudioEntry> {
+    if !has_http_scheme(url) {
+        return None;
+    }
+    let mut cache = shared_audio_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.get_payload(url)
+}
 
 /// Updates the bounded pronunciation audio download timeout (`audio/download-timeout-ms`),
 /// clamped to `1_000..=30_000` ms via [`AudioDownloadConfig`] (Yomitan `#1876`).
@@ -56,11 +196,14 @@ pub(super) fn shared_audio_http_client() -> &'static HttpClient {
     })
 }
 
-fn default_timeout_for_client(http: &HttpClient) -> Option<Duration> {
+fn is_shared_http_client(http: &HttpClient) -> bool {
     SHARED_HTTP_CLIENT
         .get()
         .is_some_and(|shared| std::ptr::eq(http, shared))
-        .then(|| download_timeout_config().timeout())
+}
+
+fn default_timeout_for_client(http: &HttpClient) -> Option<Duration> {
+    is_shared_http_client(http).then(|| download_timeout_config().timeout())
 }
 
 /// Incremental RFC 1321 MD5 hasher for streaming audio downloads without
@@ -355,9 +498,26 @@ fn expand_audio_source_candidates_with_timeout(
     match kind {
         AudioSourceType::AudioSourceTypeFile => Ok(vec![(source.name.clone(), source_url)]),
         AudioSourceType::AudioSourceTypeJson => {
+            let use_cache = is_shared_http_client(http) && has_http_scheme(&source_url);
+            let cache_key = use_cache.then(|| {
+                (
+                    source_url.clone(),
+                    source.name.clone(),
+                    expression.to_owned(),
+                    reading.to_owned(),
+                )
+            });
+            if let Some(ref key) = cache_key {
+                let mut cache = shared_audio_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(cached) = cache.get_json(key) {
+                    return Ok(cached);
+                }
+            }
             let (body, base_http_url) = read_json_source_body(http, &source_url, timeout)?;
             let entries = parse_json_audio_entries(&body)?;
-            let resolved = entries
+            let resolved: Vec<(String, String)> = entries
                 .into_iter()
                 .filter_map(|(entry_name, raw_url)| {
                     let url = resolve_json_candidate_url(
@@ -374,6 +534,12 @@ fn expand_audio_source_candidates_with_timeout(
                     Some((display_name, url))
                 })
                 .collect();
+            if let Some(key) = cache_key {
+                let mut cache = shared_audio_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                cache.insert_json(key, resolved.clone());
+            }
             Ok(resolved)
         }
     }
@@ -513,6 +679,7 @@ pub(super) fn fetch_word_audio_with_client_and_timeout(
     sources: &[AudioSourceEntry],
     timeout: Option<Duration>,
 ) -> Result<(Vec<u8>, String), String> {
+    let use_shared_cache = is_shared_http_client(http);
     let mut last_error: Option<String> = None;
 
     for source in sources {
@@ -527,6 +694,32 @@ pub(super) fn fetch_word_audio_with_client_and_timeout(
         };
 
         for (candidate_name, candidate_url) in candidates {
+            if use_shared_cache {
+                if let Some(cached) = lookup_shared_audio_payload(&candidate_url) {
+                    match cached {
+                        CachedAudioEntry::Skipped { md5 } => {
+                            if md5_matches_skip_hash(&md5, &source.md5) {
+                                last_error = Some(skip_hash_message());
+                                continue;
+                            }
+                        }
+                        CachedAudioEntry::Payload { bytes, md5, ext } => {
+                            if md5_matches_skip_hash(&md5, &source.md5) {
+                                last_error = Some(skip_hash_message());
+                                continue;
+                            }
+                            let filename = ascii_safe_audio_filename_with_ext(
+                                &candidate_name,
+                                reading,
+                                expression,
+                                Some(&md5),
+                                &ext,
+                            );
+                            return Ok((bytes, filename));
+                        }
+                    }
+                }
+            }
             let (bytes, content_type) = match fetch_audio_payload(http, &candidate_url, timeout) {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -540,6 +733,9 @@ pub(super) fn fetch_word_audio_with_client_and_timeout(
             }
             let hex = md5_hex(Md5Hasher::digest(&bytes));
             if md5_matches_skip_hash(&hex, &source.md5) {
+                if use_shared_cache {
+                    cache_shared_audio_skipped(&candidate_url, hex);
+                }
                 last_error = Some(skip_hash_message());
                 continue;
             }
@@ -548,6 +744,14 @@ pub(super) fn fetch_word_audio_with_client_and_timeout(
                 continue;
             }
             let ext = detect_audio_extension(&bytes, content_type.as_deref(), &candidate_url);
+            if use_shared_cache {
+                cache_shared_audio_payload(
+                    &candidate_url,
+                    bytes.clone(),
+                    hex.clone(),
+                    ext.to_owned(),
+                );
+            }
             let filename = ascii_safe_audio_filename_with_ext(
                 &candidate_name,
                 reading,

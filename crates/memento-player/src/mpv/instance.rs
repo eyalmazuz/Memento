@@ -47,7 +47,7 @@ pub struct MpvInstance {
     pub(super) asr_stream: Arc<RwLock<Arc<[u8]>>>,
     asr_stream_raw: Option<*const RwLock<Arc<[u8]>>>,
     pub(super) next_reply_id: AtomicU64,
-    pub(super) screenshot_jobs: Option<SyncSender<CaptureJob>>,
+    pub(super) screenshot_jobs: Arc<Mutex<Option<SyncSender<CaptureJob>>>>,
     screenshot_closing: Arc<AtomicBool>,
     screenshot_wake_handle: Arc<Mutex<Option<RawMpvHandle>>>,
     screenshot_thread: Option<std::thread::JoinHandle<()>>,
@@ -394,7 +394,7 @@ impl MpvInstance {
             asr_stream,
             asr_stream_raw: Some(asr_stream_raw),
             next_reply_id: AtomicU64::new(1),
-            screenshot_jobs: Some(worker.jobs),
+            screenshot_jobs: Arc::new(Mutex::new(Some(worker.jobs))),
             screenshot_closing: worker.closing,
             screenshot_wake_handle: worker.wake_handle,
             screenshot_thread: Some(worker.thread),
@@ -1041,7 +1041,9 @@ impl Drop for MpvInstance {
         // 1. Disconnect the screenshot channel, signal closing, and wake any
         //    blocked screenshot worker immediately so idle weak clients exit
         //    before render-context teardown.
-        self.screenshot_jobs.take();
+        if let Ok(mut guard) = self.screenshot_jobs.lock() {
+            guard.take();
+        }
         self.screenshot_closing.store(true, Ordering::Release);
         if let Ok(guard) = self.screenshot_wake_handle.lock() {
             if let Some(weak) = *guard {

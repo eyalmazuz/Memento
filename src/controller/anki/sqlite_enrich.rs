@@ -2,7 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use memento_anki::glossary::build_glossary;
@@ -387,6 +387,14 @@ pub fn populate_note_context_from_sqlite(
 }
 
 /// Enriches `ctx` from the shared read-only Yomitan SQLite database while explicitly
+/// Metadata hint from `RichUiBridge` allowing single-pass `(dic_id, rowid)` resolution
+/// without issuing a second `term_bank` / `kanji_bank` SQLite query before enrichment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectedHitHint {
+    pub dictionary_id: i64,
+    pub raw_glossary: String,
+}
+
 /// honoring `selected_rowids` (`(dic_id, rowid)`) and `dictionary_order` (`dic_id -> priority`).
 pub fn populate_note_context_from_sqlite_ordered(
     ctx: &mut NoteFieldsContext,
@@ -394,6 +402,29 @@ pub fn populate_note_context_from_sqlite_ordered(
     resource_roots: &[PathBuf],
     selected_occurrences: &[(String, usize)],
     selected_rowids: &[(i64, i64)],
+    dictionary_order: &HashMap<i64, i64>,
+) -> Result<(), String> {
+    populate_note_context_from_sqlite_with_hints(
+        ctx,
+        db_path,
+        resource_roots,
+        selected_occurrences,
+        selected_rowids,
+        &[],
+        dictionary_order,
+    )
+}
+
+/// Single-pass SQLite enrichment that resolves exact `(dic_id, rowid)` selections from
+/// `selected_hit_hints` (when `selected_rowids` is empty) using the same SQL query as
+/// glossary/frequency/pitch enrichment, eliminating duplicate `term_bank` queries & JSON parses.
+pub fn populate_note_context_from_sqlite_with_hints(
+    ctx: &mut NoteFieldsContext,
+    db_path: &Path,
+    resource_roots: &[PathBuf],
+    selected_occurrences: &[(String, usize)],
+    selected_rowids: &[(i64, i64)],
+    selected_hit_hints: &[SelectedHitHint],
     dictionary_order: &HashMap<i64, i64>,
 ) -> Result<(), String> {
     if !db_path.is_file() {
@@ -405,29 +436,28 @@ pub fn populate_note_context_from_sqlite_ordered(
     let titles = &meta.names;
     let tag_bank = &meta.tags;
 
-    let inferred_rowids: Vec<(i64, i64)> = if selected_rowids.is_empty() {
-        let from_ctx: Vec<(i64, i64)> = ctx
-            .glossary_definitions
-            .iter()
-            .filter_map(|def| {
-                (def.dictionary_id != 0)
-                    .then_some(def.rowid)
-                    .flatten()
-                    .map(|rowid| (def.dictionary_id, rowid))
-            })
-            .collect();
-        if !from_ctx.is_empty() && from_ctx.len() == ctx.glossary_definitions.len() {
-            from_ctx
+    let mut inferred_rowids: Vec<(i64, i64)> = if selected_rowids.is_empty() {
+        if !ctx.selected_rowids.is_empty() {
+            ctx.selected_rowids.clone()
         } else {
-            Vec::new()
+            let from_ctx: Vec<(i64, i64)> = ctx
+                .glossary_definitions
+                .iter()
+                .filter_map(|def| {
+                    (def.dictionary_id != 0)
+                        .then_some(def.rowid)
+                        .flatten()
+                        .map(|rowid| (def.dictionary_id, rowid))
+                })
+                .collect();
+            if !from_ctx.is_empty() && from_ctx.len() == ctx.glossary_definitions.len() {
+                from_ctx
+            } else {
+                Vec::new()
+            }
         }
     } else {
         Vec::new()
-    };
-    let active_rowids: &[(i64, i64)] = if !selected_rowids.is_empty() {
-        selected_rowids
-    } else {
-        &inferred_rowids
     };
 
     let is_kanji = ctx.is_kanji || !ctx.character.is_empty();
@@ -476,6 +506,34 @@ pub fn populate_note_context_from_sqlite_ordered(
         })?;
 
         kanji_rows.sort_by_key(|row| (dict_sort_key(dictionary_order, row.dic_id), row.rowid));
+
+        if selected_rowids.is_empty()
+            && inferred_rowids.is_empty()
+            && !selected_hit_hints.is_empty()
+            && selected_hit_hints.iter().all(|h| h.dictionary_id > 0)
+        {
+            let mut used = vec![false; kanji_rows.len()];
+            let mut resolved = Vec::with_capacity(selected_hit_hints.len());
+            for want in selected_hit_hints {
+                if let Some((idx, row)) = kanji_rows
+                    .iter()
+                    .enumerate()
+                    .find(|&(i, r)| !used[i] && r.dic_id == want.dictionary_id)
+                {
+                    used[idx] = true;
+                    resolved.push((row.dic_id, row.rowid));
+                }
+            }
+            if resolved.len() == selected_hit_hints.len() {
+                inferred_rowids = resolved;
+                ctx.selected_rowids = inferred_rowids.clone();
+            }
+        }
+        let active_rowids: &[(i64, i64)] = if !selected_rowids.is_empty() {
+            selected_rowids
+        } else {
+            &inferred_rowids
+        };
 
         let mut occ_counts: HashMap<String, usize> = HashMap::new();
         let mut matched_defs: Vec<(usize, GlossaryDefinition)> = Vec::new();
@@ -614,9 +672,10 @@ pub fn populate_note_context_from_sqlite_ordered(
         return Ok(());
     }
 
-    // Term card SQLite enrichment: fetch rows while holding the SQLite connection lock briefly,
-    // then perform JSON parsing, CSS scoping, and resource I/O outside the lock.
-    let mut term_rows = db.with_conn(|conn| {
+    // Term card SQLite enrichment: fetch term rows and term frequencies in a single
+    // connection lock acquisition, then perform JSON parsing, CSS scoping, and resource I/O
+    // outside the lock.
+    let (mut term_rows, term_freqs_with_mode) = db.with_conn(|conn| {
         const TERM_SQL: &str = "SELECT rowid, dic_id, glossary, rules, def_tags, term_tags, score, sequence \
             FROM term_bank \
             WHERE expression = ?1 \
@@ -640,7 +699,13 @@ pub fn populate_note_context_from_sqlite_ordered(
                 sequence: row.get(7).map_err(|e| e.to_string())?,
             });
         }
-        Ok::<_, String>(out)
+        let freqs = sqlite_db::query_term_frequencies_with_mode_conn(
+            conn,
+            &ctx.expression,
+            &ctx.reading,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>((out, freqs))
     })?;
 
     term_rows.sort_by_key(|row| {
@@ -651,6 +716,45 @@ pub fn populate_note_context_from_sqlite_ordered(
             row.rowid,
         )
     });
+
+    if selected_rowids.is_empty()
+        && inferred_rowids.is_empty()
+        && !selected_hit_hints.is_empty()
+        && selected_hit_hints.iter().all(|h| h.dictionary_id > 0)
+    {
+        let mut used = vec![false; term_rows.len()];
+        let mut resolved = Vec::with_capacity(selected_hit_hints.len());
+        for want in selected_hit_hints {
+            let matched = term_rows
+                .iter()
+                .enumerate()
+                .find(|&(i, r)| {
+                    !used[i]
+                        && r.dic_id == want.dictionary_id
+                        && !want.raw_glossary.is_empty()
+                        && r.glossary == want.raw_glossary
+                })
+                .or_else(|| {
+                    term_rows
+                        .iter()
+                        .enumerate()
+                        .find(|&(i, r)| !used[i] && r.dic_id == want.dictionary_id)
+                });
+            if let Some((idx, row)) = matched {
+                used[idx] = true;
+                resolved.push((row.dic_id, row.rowid));
+            }
+        }
+        if resolved.len() == selected_hit_hints.len() {
+            inferred_rowids = resolved;
+            ctx.selected_rowids = inferred_rowids.clone();
+        }
+    }
+    let active_rowids: &[(i64, i64)] = if !selected_rowids.is_empty() {
+        selected_rowids
+    } else {
+        &inferred_rowids
+    };
 
     let mut occ_counts: HashMap<String, usize> = HashMap::new();
     let mut matched_defs: Vec<(usize, GlossaryDefinition)> = Vec::new();
@@ -670,6 +774,13 @@ pub fn populate_note_context_from_sqlite_ordered(
         let Some(dict_name) = titles.get(&row.dic_id).cloned() else {
             continue;
         };
+        if !active_rowids.is_empty()
+            && !active_rowids
+                .iter()
+                .any(|&(d, r)| d == row.dic_id && r == row.rowid)
+        {
+            continue;
+        }
 
         let parsed_val: serde_json::Value = match serde_json::from_str(&row.glossary) {
             Ok(val) => val,
@@ -743,7 +854,7 @@ pub fn populate_note_context_from_sqlite_ordered(
         let qjson_defs: Vec<memento_anki::json::JsonValue> =
             filtered_items.iter().map(to_qjson).collect();
 
-        let mut verified_files: HashMap<String, PathBuf> = HashMap::new();
+        let mut verified_files: HashMap<String, Vec<u8>> = HashMap::new();
         let (rendered_u16, file_map) =
             build_glossary(&qjson_defs, &basepath_u16, |full_path_u16| {
                 let base = canon_base.as_ref()?;
@@ -752,24 +863,21 @@ pub fn populate_note_context_from_sqlite_ordered(
                 if !canon_file.starts_with(base) || !canon_file.is_file() {
                     return None;
                 }
-                let file = File::open(&canon_file).ok()?;
-                let md5 = memento_util::fileutils::calculate_md5(file).ok()?;
+                let bytes = fs::read(&canon_file).ok()?;
+                let md5 = memento_util::fileutils::calculate_md5(bytes.as_slice()).ok()?;
                 let hex = format!("{:032x}", u128::from_be_bytes(md5));
                 let mut hex_u16 = [0u16; 32];
                 for (dst, b) in hex_u16.iter_mut().zip(hex.bytes()) {
                     *dst = u16::from(b);
                 }
-                verified_files.insert(String::from_utf16_lossy(full_path_u16), canon_file);
+                verified_files.insert(String::from_utf16_lossy(full_path_u16), bytes);
                 Some(hex_u16)
             });
 
         let mut media_files = Vec::new();
         for (full_path_u16, hash_name_u16) in file_map {
             let key = String::from_utf16_lossy(&full_path_u16);
-            let Some(canon_file) = verified_files.get(&key) else {
-                continue;
-            };
-            let Ok(bytes) = fs::read(canon_file) else {
+            let Some(bytes) = verified_files.remove(&key) else {
                 continue;
             };
             let Ok(data_base64) = encode_base64(&bytes) else {
@@ -858,13 +966,8 @@ pub fn populate_note_context_from_sqlite_ordered(
         }
     }
 
-    // Query term frequencies paired with each dictionary's `frequencyMode` (`rank-based` vs
-    // `occurrence-based`, Yomitan PR #2373/#2329) so `*-rank` and `*-occurrence` never mix.
-    let term_freqs_with_mode = db
-        .with_conn(|conn| {
-            sqlite_db::query_term_frequencies_with_mode_conn(conn, &ctx.expression, &ctx.reading)
-        })
-        .map_err(|e| e.to_string())?;
+    // Apply term frequencies paired with each dictionary's `frequencyMode` (`rank-based` vs
+    // `occurrence-based`, Yomitan PR #2373/#2329) fetched in the single SQLite pass above.
     let freq_entries_with_mode: Vec<ModeFreqEntry> = term_freqs_with_mode
         .into_iter()
         .filter(|row| !meta.disabled.contains(&row.dic_id))

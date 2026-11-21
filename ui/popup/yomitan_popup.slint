@@ -28,15 +28,12 @@ import { DefinitionCardGrid, DefinitionEntryBody } from "definition_body.slint";
 component LeadingActionsBox inherits Rectangle {
     in property <DictResult> res;
     in property <length> spacing: 6px;
-    in property <bool> show-kana: false;
     in property <bool> show-reading-as-expr: false;
     in property <bool> reading-as-expression: false;
     in property <bool> show-browse: false;
     in property <length> btn-size: 28px;
     in property <length> icon-size: 16px;
-    callback kana-clicked();
     callback reading-as-expression-clicked();
-    callback kanji-clicked();
     callback audio-clicked();
     callback audio-right-clicked(length);
     callback browse-clicked();
@@ -54,13 +51,10 @@ component LeadingActionsBox inherits Rectangle {
         spacing: root.spacing;
         btn-size: root.btn-size;
         icon-size: root.icon-size;
-        show-kana: root.show-kana;
         show-reading-as-expr: root.show-reading-as-expr;
         reading-as-expression: root.reading-as-expression;
         show-browse: root.show-browse;
-        kana-clicked => { root.kana-clicked(); }
         reading-as-expression-clicked => { root.reading-as-expression-clicked(); }
-        kanji-clicked => { root.kanji-clicked(); }
         audio-clicked => { root.audio-clicked(); }
         audio-right-clicked(x) => { root.audio-right-clicked(x); }
         browse-clicked => { root.browse-clicked(); }
@@ -433,9 +427,8 @@ export component NestedYomitanPopup inherits Rectangle {
                                 spacing: 5px;
                                 min-height: root.action-btn-size + 4px;
                                 property <length> nbuttons-w:
-                                    (!nres.is-kanji && nres.reading != "" && nres.reading != nres.expression ? (39px + root.action-btn-size + 5px) : 0px)
-                                    + (!nres.is-kanji && nres.has-kanji ? (root.action-btn-size + 5px) : 0px)
-                                    + (!nres.is-kanji ? (root.action-btn-size + 5px) : 0px)
+                                    (!nres.is-kanji ? (root.action-btn-size + 5px) : 0px)
+                                    + (root.anki-enabled && !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression ? (root.action-btn-size + 5px) : 0px)
                                     + (nested-term-segment.nshow-browse-btn || root.anki-enabled ? (root.action-btn-size + 5px) : 0px)
                                     + (nested-term-segment.nshow-update-btn ? (root.action-btn-size + 5px) : 0px)
                                     + (root.action-btn-size + 5px);
@@ -446,6 +439,8 @@ export component NestedYomitanPopup inherits Rectangle {
                                     nested: true;
                                     compact: root.compact-glossaries;
                                     reading-as-expression: nested-term-segment.nrow-reading-as-expr;
+                                    kana-clickable: PopupBridge.rich-enabled;
+                                    kana-active: PopupBridge.kana-reading-active && PopupBridge.active-kana-reading == nres.reading;
                                     scan-depth: PopupBridge.nested-depth;
                                     bridge-rev: PopupBridge.nested-revision;
                                     avail-width: nterm-header.navail-title-w;
@@ -453,6 +448,18 @@ export component NestedYomitanPopup inherits Rectangle {
                                     kanji-clicked(ch) => {
                                         PopupBridge.lock-nested-popup();
                                         PopupBridge.nested-lookup-kanji-char(PopupBridge.nested-depth, nres.expression, ch);
+                                    }
+                                    kana-clicked => {
+                                        PopupBridge.toggle-kana-reading-search(nres.expression, nres.reading);
+                                    }
+                                    request-tooltip(tip, x-off) => {
+                                        PopupBridge.request-popup-tooltip(
+                                            tip,
+                                            (root.x - root.parent-x + root.card-pad + x-off) / 1px,
+                                            (root.y - root.parent-y + (nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y < 44px
+                                                ? nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + nterm-header.height + 34px
+                                                : nested-definition-list.y + nested-definition-list.viewport-y + nested-row-wrapper.y + 4px)) / 1px
+                                        );
                                     }
                                 }
 
@@ -469,20 +476,12 @@ export component NestedYomitanPopup inherits Rectangle {
                                             spacing: 5px;
                                             btn-size: root.action-btn-size;
                                             icon-size: 15px;
-                                            show-kana: !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression;
                                             show-reading-as-expr: root.anki-enabled && !nres.is-kanji && nres.reading != "" && nres.reading != nres.expression;
                                             reading-as-expression: nested-term-segment.nrow-reading-as-expr;
                                             show-browse: nested-term-segment.nshow-browse-btn;
-                                            kana-clicked => {
-                                                PopupBridge.toggle-kana-reading-search(nres.expression, nres.reading);
-                                            }
                                             reading-as-expression-clicked => {
                                                 PopupBridge.lock-nested-popup();
                                                 PopupBridge.nested-toggle-reading-as-expression(PopupBridge.nested-depth, nres.index - 1);
-                                            }
-                                            kanji-clicked => {
-                                                PopupBridge.lock-nested-popup();
-                                                PopupBridge.nested-lookup-kanji-char(PopupBridge.nested-depth, nres.expression, "");
                                             }
                                             audio-clicked => {
                                                 PopupBridge.lock-nested-popup();
@@ -1092,10 +1091,8 @@ export component YomitanPopup inherits Rectangle {
                                 spacing: 6px;
                                 min-height: 34px;
                                 property <length> buttons-reserved-w:
-                                    (PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 40px : 0px)
+                                    (!res.is-kanji ? 34px : 0px)
                                     + (root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 34px : 0px)
-                                    + (!res.is-kanji && res.has-kanji ? 34px : 0px)
-                                    + (!res.is-kanji ? 34px : 0px)
                                     + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
                                     + (term-segment.show-update-btn ? 34px : 0px)
                                     + 34px;
@@ -1106,12 +1103,26 @@ export component YomitanPopup inherits Rectangle {
                                     nested: false;
                                     compact: root.compact-glossaries;
                                     reading-as-expression: term-segment.row-reading-as-expr;
+                                    kana-clickable: PopupBridge.rich-enabled;
+                                    kana-active: PopupBridge.kana-reading-active && PopupBridge.active-kana-reading == res.reading;
                                     scan-depth: 0;
                                     bridge-rev: PopupBridge.rich-revision;
                                     avail-width: term-header.avail-title-w;
                                     headword-color: term-segment.term-headword-color;
                                     kanji-clicked(ch) => {
                                         PopupBridge.lookup-kanji-char(res.expression, ch);
+                                    }
+                                    kana-clicked => {
+                                        PopupBridge.toggle-kana-reading-search(res.expression, res.reading);
+                                    }
+                                    request-tooltip(tip, x-off) => {
+                                        PopupBridge.request-popup-tooltip(
+                                            tip,
+                                            (PopupBridge.css-popup-padding + x-off) / 1px,
+                                            (12px + definition-list.y + definition-list.viewport-y + row-wrapper.y < 44px
+                                                ? 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + term-header.height + 34px
+                                                : 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 4px) / 1px
+                                        );
                                     }
                                 }
 
@@ -1128,22 +1139,11 @@ export component YomitanPopup inherits Rectangle {
                                             spacing: 6px;
                                             btn-size: 28px;
                                             icon-size: 16px;
-                                            show-kana: PopupBridge.rich-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression;
                                             show-reading-as-expr: root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression;
                                             reading-as-expression: term-segment.row-reading-as-expr;
                                             show-browse: term-segment.show-browse-btn;
-                                            kana-clicked => {
-                                                PopupBridge.toggle-kana-reading-search(res.expression, res.reading);
-                                            }
                                             reading-as-expression-clicked => {
                                                 root.toggle-reading-as-expression(res.index - 1);
-                                            }
-                                            kanji-clicked => {
-                                                if PopupBridge.rich-enabled {
-                                                    PopupBridge.lookup-kanji-char(res.expression, "");
-                                                } else {
-                                                    root.kanji-info(res.expression);
-                                                }
                                             }
                                             audio-clicked => {
                                                 if (!root.audio-menu-open) { root.play-audio(res.expression, res.reading); }

@@ -39,6 +39,7 @@
 //! `storeMediaFile` (via `multi`).
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -389,18 +390,37 @@ pub struct AnkiClient
     http: HttpClient,
 }
 
+fn shared_anki_http_client(timeout: Option<Duration>) -> HttpClient
+{
+    static POOL: OnceLock<Mutex<Vec<(Option<Duration>, HttpClient)>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, client)) = guard.iter().find(|(t, _)| *t == timeout)
+    {
+        return client.clone();
+    }
+    let config = HttpClientConfig {
+        timeout,
+        connect_timeout: timeout,
+        ..HttpClientConfig::default()
+    };
+    let client = HttpClient::new(config);
+    if guard.len() >= 8
+    {
+        guard.remove(0);
+    }
+    guard.push((timeout, client.clone()));
+    client
+}
+
 impl AnkiClient
 {
     /// Endpoint with the ported `ankiclient.cpp` semantics: 5000 ms
     /// transfer timeout, transport kept on tap through settings.
     pub fn new(endpoint: AnkiEndpoint) -> Self
     {
-        let config = HttpClientConfig {
-            timeout: endpoint.timeout,
-            connect_timeout: endpoint.timeout,
-            ..HttpClientConfig::default()
-        };
-        Self::with_transport(endpoint, HttpClient::new(config))
+        let http = shared_anki_http_client(endpoint.timeout);
+        Self::with_transport(endpoint, http)
     }
 
     /// Plug in a shared/custom `HttpClient` when a profile needs a different

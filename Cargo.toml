@@ -137,6 +137,21 @@ opt-level = 3
 [profile.release.package.memento-asr-whisper]
 opt-level = 3
 
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package."png@0.18.1"]
+opt-level = 3
+
+[profile.release.package.fdeflate]
+opt-level = 3
+
+[profile.release.package.flate2]
+opt-level = 3
+
+[profile.release.package.image-webp]
+opt-level = 3
+
 # `cargo run` is also used for playback. Keep debug symbols/assertions while
 # optimizing the UI libraries' per-frame work.
 [profile.dev.package.i-slint-core]
@@ -166,4 +181,20 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package."read-fonts"]
+opt-level = 2
+
+# Optimize screenshot resizing and PNG/JPEG/WebP encoding during Anki card mining.
+[profile.dev.package.image]
+opt-level = 2
+
+[profile.dev.package."png@0.18.1"]
+opt-level = 2
+
+[profile.dev.package.fdeflate]
+opt-level = 2
+
+[profile.dev.package.flate2]
+opt-level = 2
+
+[profile.dev.package.image-webp]
 opt-level = 2

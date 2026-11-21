@@ -77,6 +77,7 @@ impl Default for HttpClientConfig
     }
 }
 
+#[derive(Clone)]
 pub struct HttpClient
 {
     config: HttpClientConfig,
@@ -111,7 +112,8 @@ impl HttpClient
             .http_status_as_error(false)
             .max_redirects(0)
             .max_response_header_size(config.max_header_bytes)
-            .max_idle_connections(0)
+            .max_idle_connections(8)
+            .max_idle_connections_per_host(4)
             .accept_encoding("identity")
             .user_agent(ureq::config::AutoHeaderValue::None)
             .accept(ureq::config::AutoHeaderValue::None)

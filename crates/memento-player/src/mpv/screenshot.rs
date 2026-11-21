@@ -117,6 +117,30 @@ impl ScreenshotRequest {
     }
 }
 
+/// Thread-safe handle for requesting a screenshot lazily from a background
+/// worker (e.g. `{screenshot-video | screenshot}` fallback) without keeping
+/// the underlying channel sender alive past `MpvInstance::drop`.
+#[derive(Clone)]
+pub struct ScreenshotCapturer {
+    pub(super) jobs: Arc<Mutex<Option<SyncSender<CaptureJob>>>>,
+}
+
+impl ScreenshotCapturer {
+    pub fn request_screenshot(&self, subtitles: bool) -> Result<ScreenshotRequest, String> {
+        let (result, receiver) = mpsc::sync_channel(1);
+        let guard = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .ok_or("Player is closing")?
+            .try_send(CaptureJob { subtitles, result })
+            .map_err(|error| format!("Cannot queue screenshot: {error}"))?;
+        Ok(ScreenshotRequest { result: receiver })
+    }
+}
+
 pub(super) struct CaptureJob {
     pub(super) subtitles: bool,
     pub(super) result: SyncSender<Result<RawFrame, String>>,

@@ -19,6 +19,7 @@ pub use events::Track;
 pub use mpv::{
     format_webvtt_cues, format_webvtt_timestamp, AsrCue, AsrSubtitleTrack, AsrTrackMode,
     AudioInstance, AudioTrack, CommandReplyResult, CursorAutohide, EncodeContext, EndFileReason,
-    MpvEvent, MpvInstance, MpvPropertyName, MpvPropertyValue, OsdDimensions, RawFrame, SubLine,
-    SubtitleTrack, TrackType, VideoTrack, ASR_STREAM_PROTOCOL, ASR_STREAM_URI,
+    MpvEvent, MpvInstance, MpvPropertyName, MpvPropertyValue, OsdDimensions, RawFrame,
+    ScreenshotCapturer, ScreenshotRequest, SubLine, SubtitleTrack, TrackType, VideoTrack,
+    ASR_STREAM_PROTOCOL, ASR_STREAM_URI,
 };

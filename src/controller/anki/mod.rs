@@ -9,6 +9,7 @@ mod query;
 mod sqlite_enrich;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use memento_net::anki::{AnkiClient, AnkiEndpoint, MediaFilePayload};
 
@@ -44,6 +45,7 @@ pub use self::query::{
 };
 pub use self::sqlite_enrich::{
     populate_note_context_from_sqlite, populate_note_context_from_sqlite_ordered,
+    populate_note_context_from_sqlite_with_hints, SelectedHitHint,
 };
 
 pub(crate) use self::context::encode_base64;
@@ -64,6 +66,22 @@ use self::query::{
 pub struct AddNoteOutcome {
     pub note_id: i64,
     pub warnings: Vec<String>,
+}
+
+const MAX_UPLOADED_DICT_MEDIA_CACHE: usize = 4096;
+static UPLOADED_DICT_MEDIA: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+
+fn uploaded_dict_media_cache() -> &'static Mutex<HashSet<(String, String)>> {
+    UPLOADED_DICT_MEDIA.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Clears the session cache of content-addressed dictionary media files already
+/// stored in Anki via `storeMediaFile`.
+pub fn clear_uploaded_media_cache() {
+    let mut cache = uploaded_dict_media_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clear();
 }
 
 // ── AnkiController ──────────────────────────────────────────────────────────
@@ -463,6 +481,43 @@ impl AnkiController {
         Ok(statuses)
     }
 
+    fn store_uncached_dict_media(&self, dict_files: Vec<MediaFilePayload>) -> Result<(), String> {
+        if dict_files.is_empty() {
+            return Ok(());
+        }
+        let endpoint_key = self.client.endpoint_url();
+        let uncached: Vec<MediaFilePayload> = {
+            let cache = uploaded_dict_media_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            dict_files
+                .into_iter()
+                .filter(|file| {
+                    file.filename.is_empty()
+                        || !cache.contains(&(endpoint_key.clone(), file.filename.clone()))
+                })
+                .collect()
+        };
+        if uncached.is_empty() {
+            return Ok(());
+        }
+        self.client
+            .store_media_files(&uncached)
+            .map_err(|error| error.to_string())?;
+        let mut cache = uploaded_dict_media_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len().saturating_add(uncached.len()) > MAX_UPLOADED_DICT_MEDIA_CACHE {
+            cache.clear();
+        }
+        for file in uncached {
+            if !file.filename.is_empty() {
+                cache.insert((endpoint_key.clone(), file.filename));
+            }
+        }
+        Ok(())
+    }
+
     /// Builds and sends a profile-backed note, uploading any referenced
     /// dictionary media files via `store_media_files` BEFORE `add_note`.
     pub fn add_note_from_profile(
@@ -476,11 +531,7 @@ impl AnkiController {
                 .map_err(|error| error.to_string())?;
         let dict_files =
             referenced_dictionary_media_files_with_data(&profile.field_templates, ctx, &rendered);
-        if !dict_files.is_empty() {
-            self.client
-                .store_media_files(&dict_files)
-                .map_err(|error| error.to_string())?;
-        }
+        self.store_uncached_dict_media(dict_files)?;
         self.client
             .add_note(payload.into_value())
             .map_err(|error| error.to_string())
@@ -499,11 +550,7 @@ impl AnkiController {
                 .map_err(|error| error.to_string())?;
         let dict_files =
             referenced_dictionary_media_files_with_data(&profile.field_templates, &ctx, &rendered);
-        if !dict_files.is_empty() {
-            self.client
-                .store_media_files(&dict_files)
-                .map_err(|error| error.to_string())?;
-        }
+        self.store_uncached_dict_media(dict_files)?;
         payload.audio = std::mem::take(&mut ctx.audio_attachments);
         payload.picture = std::mem::take(&mut ctx.picture_attachments);
         payload.video = std::mem::take(&mut ctx.video_attachments);
@@ -534,8 +581,68 @@ impl AnkiController {
         ctx: &mut NoteFieldsContext,
         media_input: crate::controller::anki_media::NoteMediaInput,
     ) -> Result<AddNoteOutcome, String> {
-        crate::controller::anki_media::prepare_note_media(profile, ctx, media_input)?;
-        self.add_note_from_profile_with_warnings(profile, ctx)
+        let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
+        crate::controller::anki_media::prepare_note_media_with_rendered_and_screenshots(
+            profile,
+            ctx,
+            &rendered,
+            media_input,
+            crate::controller::anki_media::PendingScreenshots::default(),
+        )?;
+        let mut payload =
+            build_note_payload_from_profile_with_data(profile, ctx, &rendered, true, false)
+                .map_err(|error| error.to_string())?;
+        let dict_files =
+            referenced_dictionary_media_files_with_data(&profile.field_templates, ctx, &rendered);
+        self.store_uncached_dict_media(dict_files)?;
+        payload.audio = std::mem::take(&mut ctx.audio_attachments);
+        payload.picture = std::mem::take(&mut ctx.picture_attachments);
+        payload.video = std::mem::take(&mut ctx.video_attachments);
+        let note_id = self
+            .client
+            .add_note(payload.into_value())
+            .map_err(|error| error.to_string())?;
+        Ok(AddNoteOutcome {
+            note_id,
+            warnings: ctx.media_warnings.clone(),
+        })
+    }
+
+    /// Fast owned pipeline used by the UI note-creation worker: renders templates once,
+    /// waits on pending/lazy-fallback screenshots in parallel with audio capture & encoding,
+    /// skips re-uploading already-stored dictionary assets, and moves media payloads without cloning.
+    pub(crate) fn add_note_from_profile_with_media_and_screenshots(
+        &self,
+        profile: &AnkiNoteConfig,
+        mut ctx: NoteFieldsContext,
+        media_input: crate::controller::anki_media::NoteMediaInput,
+        pending_screenshots: crate::controller::anki_media::PendingScreenshots,
+    ) -> Result<AddNoteOutcome, String> {
+        let rendered = RenderedTemplateData::for_templates(&profile.field_templates, &ctx);
+        crate::controller::anki_media::prepare_note_media_with_rendered_and_screenshots(
+            profile,
+            &mut ctx,
+            &rendered,
+            media_input,
+            pending_screenshots,
+        )?;
+        let mut payload =
+            build_note_payload_from_profile_with_data(profile, &ctx, &rendered, true, false)
+                .map_err(|error| error.to_string())?;
+        let dict_files =
+            referenced_dictionary_media_files_with_data(&profile.field_templates, &ctx, &rendered);
+        self.store_uncached_dict_media(dict_files)?;
+        payload.audio = std::mem::take(&mut ctx.audio_attachments);
+        payload.picture = std::mem::take(&mut ctx.picture_attachments);
+        payload.video = std::mem::take(&mut ctx.video_attachments);
+        let note_id = self
+            .client
+            .add_note(payload.into_value())
+            .map_err(|error| error.to_string())?;
+        Ok(AddNoteOutcome {
+            note_id,
+            warnings: ctx.media_warnings,
+        })
     }
 
     /// Updates an existing Anki note (`note_id`) using `profile` and `ctx` according to `mode`.
@@ -555,13 +662,25 @@ impl AnkiController {
             return Err("Anki note ID must be a positive integer".to_owned());
         }
         let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
-        let payload =
-            build_note_payload_from_profile_with_data(profile, ctx, &rendered, true, false)
-                .map_err(|error| error.to_string())?;
         let infos = self
             .client
             .notes_info(&[note_id])
             .map_err(|error| error.to_string())?;
+        self.apply_note_update_with_rendered(note_id, profile, ctx, &rendered, infos, mode)
+    }
+
+    fn apply_note_update_with_rendered(
+        &self,
+        note_id: i64,
+        profile: &AnkiNoteConfig,
+        ctx: &NoteFieldsContext,
+        rendered: &RenderedTemplateData,
+        infos: Vec<memento_net::anki::AnkiNoteInfo>,
+        mode: AnkiUpdateMode,
+    ) -> Result<i64, String> {
+        let payload =
+            build_note_payload_from_profile_with_data(profile, ctx, rendered, true, false)
+                .map_err(|error| error.to_string())?;
         let existing = infos
             .into_iter()
             .find(|info| info.note_id == note_id)
@@ -582,7 +701,7 @@ impl AnkiController {
             let dict_files: Vec<MediaFilePayload> = referenced_dictionary_media_files_with_data(
                 &profile.field_templates,
                 ctx,
-                &rendered,
+                rendered,
             )
             .into_iter()
             .filter(|file| {
@@ -592,11 +711,7 @@ impl AnkiController {
                 })
             })
             .collect();
-            if !dict_files.is_empty() {
-                self.client
-                    .store_media_files(&dict_files)
-                    .map_err(|error| error.to_string())?;
-            }
+            self.store_uncached_dict_media(dict_files)?;
         }
 
         if merged.has_field_or_media_changes() {
@@ -645,11 +760,55 @@ impl AnkiController {
         media_input: crate::controller::anki_media::NoteMediaInput,
         mode: AnkiUpdateMode,
     ) -> Result<AddNoteOutcome, String> {
+        self.update_existing_note_with_media_and_screenshots(
+            note_id,
+            profile,
+            ctx,
+            media_input,
+            crate::controller::anki_media::PendingScreenshots::default(),
+            mode,
+        )
+    }
+
+    /// Fast update pipeline: renders templates once, overlaps AnkiConnect `notesInfo` with
+    /// concurrent media capture & deferred screenshot resolution, skips already-uploaded
+    /// dictionary media, and pushes merged field/tag updates.
+    pub(crate) fn update_existing_note_with_media_and_screenshots(
+        &self,
+        note_id: i64,
+        profile: &AnkiNoteConfig,
+        ctx: &mut NoteFieldsContext,
+        media_input: crate::controller::anki_media::NoteMediaInput,
+        pending_screenshots: crate::controller::anki_media::PendingScreenshots,
+        mode: AnkiUpdateMode,
+    ) -> Result<AddNoteOutcome, String> {
         if note_id <= 0 {
             return Err("Anki note ID must be a positive integer".to_owned());
         }
-        crate::controller::anki_media::prepare_note_media(profile, ctx, media_input)?;
-        let updated_id = self.update_existing_note(note_id, profile, ctx, mode)?;
+        let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
+        let (media_res, infos_res) = std::thread::scope(|scope| {
+            let infos_handle = scope.spawn(|| {
+                self.client
+                    .notes_info(&[note_id])
+                    .map_err(|error| error.to_string())
+            });
+            let media_res =
+                crate::controller::anki_media::prepare_note_media_with_rendered_and_screenshots(
+                    profile,
+                    ctx,
+                    &rendered,
+                    media_input,
+                    pending_screenshots,
+                );
+            let infos_res = infos_handle
+                .join()
+                .unwrap_or_else(|_| Err("Anki notesInfo worker panicked".to_owned()));
+            (media_res, infos_res)
+        });
+        media_res?;
+        let infos = infos_res?;
+        let updated_id =
+            self.apply_note_update_with_rendered(note_id, profile, ctx, &rendered, infos, mode)?;
         Ok(AddNoteOutcome {
             note_id: updated_id,
             warnings: ctx.media_warnings.clone(),
@@ -1703,5 +1862,55 @@ mod tests {
         assert!(statuses[0].is_duplicate);
         assert_eq!(statuses[0].note_ids, vec![1669909168888]);
         assert_eq!(statuses[0].browse_query, "nid:1669909168888");
+    }
+
+    #[test]
+    fn store_uncached_dict_media_skips_redundant_uploads_on_second_note() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut actions = Vec::new();
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = read_http_json_body(&mut stream);
+                actions.push(body["action"].as_str().unwrap().to_owned());
+                let reply = match step {
+                    0 => serde_json::json!({ "error": null, "result": ["deadbeef.png"] }).to_string(),
+                    1 => serde_json::json!({ "error": null, "result": 1669909169001_i64 }).to_string(),
+                    _ => serde_json::json!({ "error": null, "result": 1669909169002_i64 }).to_string(),
+                };
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(http.as_bytes()).unwrap();
+            }
+            actions
+        });
+
+        let profile = test_profile(
+            port,
+            HashMap::from([
+                ("Expression".into(), "{expression}".into()),
+                ("Glossary".into(), "{glossary}".into()),
+            ]),
+        );
+        let mut ctx = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
+        ctx.glossary_definitions.push(GlossaryDefinition {
+            dictionary_id: 1,
+            dictionary_name: "Jitendex".into(),
+            rendered_items: vec!["<span>eat <img src=\"deadbeef.png\"></span>".into()],
+            media_files: vec![MediaFilePayload {
+                filename: "deadbeef.png".into(),
+                data_base64: "AAAA".into(),
+            }],
+            ..Default::default()
+        });
+
+        let ctrl = AnkiController::new(profile.endpoint());
+        assert_eq!(ctrl.add_note_from_profile(&profile, &ctx).unwrap(), 1669909169001);
+        // Second note with the same dict asset skips the redundant `multi`/`storeMediaFile` round-trip.
+        assert_eq!(ctrl.add_note_from_profile(&profile, &ctx).unwrap(), 1669909169002);
+        assert_eq!(server.join().unwrap(), vec!["multi", "addNote", "addNote"]);
     }
 }

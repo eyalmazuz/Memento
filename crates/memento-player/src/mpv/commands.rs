@@ -3,7 +3,6 @@
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
 use std::sync::Arc;
 
 use crate::autopause::{subtitle_raw_time, subtitle_to_media_time};
@@ -14,8 +13,8 @@ use super::ffi;
 use super::instance::MpvInstance;
 use super::node::{cue_valid, id_valid, OwnedNode};
 use super::screenshot::{
-    copy_screenshot_node, get_sub_visibility, screenshot_error, set_sub_visibility, CaptureJob,
-    ScreenshotRequest, SubVisibilityGuard,
+    copy_screenshot_node, get_sub_visibility, screenshot_error, set_sub_visibility,
+    ScreenshotCapturer, ScreenshotRequest, SubVisibilityGuard,
 };
 use super::types::{
     AsrCue, AudioTrack, CommandReplyResult, EncodeContext, OsdDimensions, RawFrame, SubLine,
@@ -84,13 +83,15 @@ impl MpvInstance {
     /// Queue the capture now, then consume it on a worker so mpv can continue
     /// receiving render updates while it waits for the current video frame.
     pub fn request_screenshot(&self, subtitles: bool) -> Result<ScreenshotRequest, String> {
-        let (result, receiver) = mpsc::sync_channel(1);
-        self.screenshot_jobs
-            .as_ref()
-            .ok_or("Player is closing")?
-            .try_send(CaptureJob { subtitles, result })
-            .map_err(|error| format!("Cannot queue screenshot: {error}"))?;
-        Ok(ScreenshotRequest { result: receiver })
+        self.screenshot_capturer().request_screenshot(subtitles)
+    }
+
+    /// Returns a lightweight thread-safe handle that can lazily queue fallback
+    /// screenshots from a background thread without blocking `MpvInstance::drop`.
+    pub fn screenshot_capturer(&self) -> ScreenshotCapturer {
+        ScreenshotCapturer {
+            jobs: self.screenshot_jobs.clone(),
+        }
     }
 
     /// Capture the active video at source resolution without the software

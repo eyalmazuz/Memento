@@ -32,7 +32,7 @@ pub use render::{
     create_opengl_context_with_display, create_opengl_context_with_options, GlProcResolver,
     MpvSoftwareRenderer,
 };
-pub use screenshot::ScreenshotRequest;
+pub use screenshot::{ScreenshotCapturer, ScreenshotRequest};
 pub use types::{
     AsrCue, AsrTrackMode, AudioTrack, CommandReplyResult, CursorAutohide, EncodeContext,
     EndFileReason, GlDisplayBackend, MpvPropertyName, MpvPropertyValue, OsdDimensions, RawFrame,

@@ -3,10 +3,10 @@
 use std::io::{Read, Write};
 use std::ops::Deref;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use image::codecs::jpeg::JpegEncoder;
-use image::codecs::png::PngEncoder;
+use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgba};
 use memento_anki::note::{
@@ -14,7 +14,7 @@ use memento_anki::note::{
     AudioMediaParams, ScreenshotParams, VideoParams,
 };
 use memento_anki::tokenizer::{tokenize, Marker};
-use memento_player::RawFrame;
+use memento_player::{RawFrame, ScreenshotCapturer, ScreenshotRequest};
 use serde_json::json;
 
 use super::anki::{
@@ -37,34 +37,85 @@ pub struct NoteMediaInput {
     pub audio_sources: Vec<AudioSourceEntry>,
 }
 
+/// Deferred GPU screenshot captures handed into `prepare_note_media_with_rendered`
+/// so screenshot wait/fallback runs concurrently with SQLite enrichment, word audio
+/// fetch, and sentence audio clip extraction instead of blocking ahead of them.
+#[derive(Default)]
+pub struct PendingScreenshots {
+    pub screenshot: Option<Result<ScreenshotRequest, String>>,
+    pub screenshot_video: Option<Result<ScreenshotRequest, String>>,
+    pub capturer: Option<ScreenshotCapturer>,
+    pub allow_fallback_screenshot: bool,
+    pub allow_fallback_video_screenshot: bool,
+}
+
+/// Primary vs. fallback screenshot requirements for a profile.
+///
+/// For `{screenshot-video | screenshot}` (all 5 built-in presets), only
+/// `primary_video_screenshot` is captured eagerly; `fallback_screenshot` is
+/// captured lazily ONLY if `screenshot-video` fails, avoiding a redundant GPU
+/// readback and `sub-visibility` toggle on every mined card.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenshotCapturePlan {
+    pub primary_screenshot: bool,
+    pub primary_video_screenshot: bool,
+    pub fallback_screenshot: bool,
+    pub fallback_video_screenshot: bool,
+}
+
+impl ScreenshotCapturePlan {
+    pub fn wants_screenshot(self) -> bool {
+        self.primary_screenshot || self.fallback_screenshot
+    }
+
+    pub fn wants_video_screenshot(self) -> bool {
+        self.primary_video_screenshot || self.fallback_video_screenshot
+    }
+}
+
+/// Inspects every valid screenshot marker across `profile.field_templates`,
+/// classifying the first screenshot alternative in each token as primary and
+/// later screenshot alternatives in the same `{a | b}` token as lazy fallbacks.
+pub fn requested_screenshot_plan(profile: &AnkiNoteConfig) -> ScreenshotCapturePlan {
+    let mut plan = ScreenshotCapturePlan::default();
+    for template in profile.field_templates.values() {
+        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
+            let mut saw_screenshot_in_token = false;
+            for marker in token.markers {
+                let name = String::from_utf16_lossy(&marker.name);
+                match name.as_str() {
+                    "screenshot" | "image" if screenshot_params(&marker).is_some() => {
+                        if saw_screenshot_in_token {
+                            plan.fallback_screenshot = true;
+                        } else {
+                            plan.primary_screenshot = true;
+                            saw_screenshot_in_token = true;
+                        }
+                    }
+                    "screenshot-video" if screenshot_params(&marker).is_some() => {
+                        if saw_screenshot_in_token {
+                            plan.fallback_video_screenshot = true;
+                        } else {
+                            plan.primary_video_screenshot = true;
+                            saw_screenshot_in_token = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    plan
+}
+
 /// Use the same marker grammar for capture and attachment generation, including
 /// whitespace and alternatives such as `{screenshot-video | screenshot}`.
 /// Inspects every valid alternative in each token so fallback screenshot kinds
 /// are captured whenever an earlier alternative (e.g. `screenshot-video`) may
 /// be unavailable.
 pub fn requested_screenshots(profile: &AnkiNoteConfig) -> (bool, bool) {
-    let mut pictures = false;
-    let mut video_pictures = false;
-    for template in profile.field_templates.values() {
-        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
-            for marker in token.markers {
-                let name = String::from_utf16_lossy(&marker.name);
-                match name.as_str() {
-                    "screenshot" | "image" if screenshot_params(&marker).is_some() => {
-                        pictures = true;
-                    }
-                    "screenshot-video" if screenshot_params(&marker).is_some() => {
-                        video_pictures = true;
-                    }
-                    _ => {}
-                }
-                if pictures && video_pictures {
-                    return (true, true);
-                }
-            }
-        }
-    }
-    (pictures, video_pictures)
+    let plan = requested_screenshot_plan(profile);
+    (plan.wants_screenshot(), plan.wants_video_screenshot())
 }
 
 fn media_filename(bytes: &[u8], extension: &str) -> Result<String, String> {
@@ -193,7 +244,17 @@ fn pipe_command_io(mut cmd: Command, write_stdin: impl FnOnce(&mut dyn Write) ->
 
 fn encode_webp_via_cwebp(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("cwebp");
-    cmd.args(["-quiet", "-q", &quality.to_string(), "-o", "-", "--", "-"]);
+    cmd.args([
+        "-quiet",
+        "-m",
+        "2",
+        "-q",
+        &quality.to_string(),
+        "-o",
+        "-",
+        "--",
+        "-",
+    ]);
     let header = format!(
         "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
     );
@@ -223,6 +284,8 @@ fn encode_webp_via_ffmpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> R
         "libwebp",
         "-quality",
         &quality.to_string(),
+        "-compression_level",
+        "2",
         "-lossless",
         "0",
         "-f",
@@ -266,7 +329,7 @@ where
     match format {
         1 => {
             let mut output = Vec::new();
-            PngEncoder::new(&mut output)
+            PngEncoder::new_with_quality(&mut output, CompressionType::Fast, PngFilterType::Sub)
                 .write_image(raw, image.width(), image.height(), ExtendedColorType::Rgba8)
                 .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
             Ok((output, ".png"))
@@ -329,7 +392,7 @@ fn encode_picture(
             &view,
             target_w,
             target_h,
-            image::imageops::FilterType::Lanczos3,
+            image::imageops::FilterType::CatmullRom,
         );
         encode_rgba_buffer(&resized, format)
     } else {
@@ -467,12 +530,91 @@ fn invalid_media_marker_error(name: &str, field: &str) -> String {
     }
 }
 
+struct ScreenshotResolver<'a> {
+    eager_sub: Option<&'a RawFrame>,
+    eager_video: Option<&'a RawFrame>,
+    pending_sub: Mutex<Option<Result<ScreenshotRequest, String>>>,
+    pending_video: Mutex<Option<Result<ScreenshotRequest, String>>>,
+    capturer: Option<ScreenshotCapturer>,
+    allow_fallback_sub: bool,
+    allow_fallback_video: bool,
+    resolved_sub: OnceLock<Option<RawFrame>>,
+    resolved_video: OnceLock<Option<RawFrame>>,
+}
+
+impl<'a> ScreenshotResolver<'a> {
+    fn new(input: &'a NoteMediaInput, pending: PendingScreenshots) -> Self {
+        Self {
+            eager_sub: input.screenshot.as_ref(),
+            eager_video: input.screenshot_video.as_ref(),
+            pending_sub: Mutex::new(pending.screenshot),
+            pending_video: Mutex::new(pending.screenshot_video),
+            capturer: pending.capturer,
+            allow_fallback_sub: pending.allow_fallback_screenshot,
+            allow_fallback_video: pending.allow_fallback_video_screenshot,
+            resolved_sub: OnceLock::new(),
+            resolved_video: OnceLock::new(),
+        }
+    }
+
+    fn get(&self, is_video_only: bool) -> Option<&RawFrame> {
+        if is_video_only {
+            if let Some(frame) = self.eager_video {
+                return Some(frame);
+            }
+            self.resolved_video
+                .get_or_init(|| {
+                    let req = self
+                        .pending_video
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    match req {
+                        Some(Ok(request)) => request.wait().ok(),
+                        Some(Err(_)) => None,
+                        None if self.allow_fallback_video => self
+                            .capturer
+                            .as_ref()
+                            .and_then(|cap| cap.request_screenshot(false).ok())
+                            .and_then(|request| request.wait().ok()),
+                        None => None,
+                    }
+                })
+                .as_ref()
+        } else {
+            if let Some(frame) = self.eager_sub {
+                return Some(frame);
+            }
+            self.resolved_sub
+                .get_or_init(|| {
+                    let req = self
+                        .pending_sub
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    match req {
+                        Some(Ok(request)) => request.wait().ok(),
+                        Some(Err(_)) => None,
+                        None if self.allow_fallback_sub => self
+                            .capturer
+                            .as_ref()
+                            .and_then(|cap| cap.request_screenshot(true).ok())
+                            .and_then(|request| request.wait().ok()),
+                        None => None,
+                    }
+                })
+                .as_ref()
+        }
+    }
+}
+
 fn execute_media_task(
     task: MediaTaskKey,
     profile: &AnkiNoteConfig,
     expression: &str,
     reading: &str,
     input: &NoteMediaInput,
+    screenshots: &ScreenshotResolver<'_>,
 ) -> MediaResult {
     match task {
         MediaTaskKey::WordAudio => {
@@ -501,12 +643,9 @@ fn execute_media_task(
             Ok((encode_base64(&data)?, media_filename(&data, ".aac")?))
         }
         MediaTaskKey::Picture(is_video_only, params) => {
-            let frame = if is_video_only {
-                input.screenshot_video.as_ref()
-            } else {
-                input.screenshot.as_ref()
-            }
-            .ok_or("Could not capture the video screenshot for Anki")?;
+            let frame = screenshots
+                .get(is_video_only)
+                .ok_or("Could not capture the video screenshot for Anki")?;
             let (data, extension) = encode_picture(frame, params, profile.screenshot_type)?;
             Ok((encode_base64(&data)?, media_filename(&data, extension)?))
         }
@@ -554,9 +693,26 @@ pub fn prepare_note_media(
     ctx: &mut NoteFieldsContext,
     input: NoteMediaInput,
 ) -> Result<(), String> {
+    let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
+    prepare_note_media_with_rendered_and_screenshots(
+        profile,
+        ctx,
+        &rendered,
+        input,
+        PendingScreenshots::default(),
+    )
+}
+
+pub(crate) fn prepare_note_media_with_rendered_and_screenshots(
+    profile: &AnkiNoteConfig,
+    ctx: &mut NoteFieldsContext,
+    rendered: &RenderedTemplateData,
+    input: NoteMediaInput,
+    pending_screenshots: PendingScreenshots,
+) -> Result<(), String> {
     ctx.media_warnings.clear();
     ctx.resolved_media_markers.clear();
-    let rendered = RenderedTemplateData::for_templates(&profile.field_templates, ctx);
+    let screenshots = ScreenshotResolver::new(&input, pending_screenshots);
 
     let mut sorted_fields: Vec<(&String, Vec<_>)> = profile
         .field_templates
@@ -584,7 +740,7 @@ pub fn prepare_note_media(
         for (_, tokens) in &sorted_fields {
             for token in tokens {
                 for marker in &token.markers {
-                    match evaluate_template_marker_kind(marker, ctx, &rendered) {
+                    match evaluate_template_marker_kind(marker, ctx, rendered) {
                         MarkerEvalKind::NonEmptyText => break,
                         MarkerEvalKind::EmptyText | MarkerEvalKind::Unknown => continue,
                         MarkerEvalKind::Media => {}
@@ -613,7 +769,7 @@ pub fn prepare_note_media(
             let task = pending[0];
             vec![(
                 task,
-                execute_media_task(task, profile, expression, reading, &input),
+                execute_media_task(task, profile, expression, reading, &input, &screenshots),
             )]
         } else {
             std::thread::scope(|scope| {
@@ -621,8 +777,16 @@ pub fn prepare_note_media(
                     .into_iter()
                     .map(|task| {
                         let input_ref = &input;
+                        let screenshots_ref = &screenshots;
                         let handle = scope.spawn(move || {
-                            execute_media_task(task, profile, expression, reading, input_ref)
+                            execute_media_task(
+                                task,
+                                profile,
+                                expression,
+                                reading,
+                                input_ref,
+                                screenshots_ref,
+                            )
                         });
                         (task, handle)
                     })
@@ -660,7 +824,7 @@ pub fn prepare_note_media(
             let mut token_succeeded = false;
 
             for marker in &token.markers {
-                match evaluate_template_marker_kind(marker, ctx, &rendered) {
+                match evaluate_template_marker_kind(marker, ctx, rendered) {
                     MarkerEvalKind::NonEmptyText => {
                         token_succeeded = true;
                         break;
@@ -1491,5 +1655,74 @@ mod tests {
         assert_eq!(manual_payload.fields["Video"], "");
         assert_eq!(manual_payload.fields["Pic"], "");
         assert_eq!(manual_payload.fields["PicClean"], "");
+    }
+
+    #[test]
+    fn requested_screenshot_plan_defers_fallback_screenshot_across_all_presets() {
+        for preset in [
+            AnkiNotePreset::Lapis,
+            AnkiNotePreset::Kiku,
+            AnkiNotePreset::Senren,
+            AnkiNotePreset::Animecards,
+            AnkiNotePreset::Jpmn,
+        ] {
+            let fields = anki_note_preset_fields(preset)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            let profile = AnkiNoteConfig {
+                enabled: true,
+                endpoint: memento_net::anki::AnkiEndpoint::default(),
+                deck: "Japanese".into(),
+                model: "Preset".into(),
+                field_templates: fields,
+                tags: Vec::new(),
+                duplicate_policy: 1,
+                screenshot_type: 0,
+                audio_pad_start: 0.0,
+                audio_pad_end: 0.0,
+                audio_normalize: false,
+                audio_db: -20.0,
+                newline_replacer: "<br>".into(),
+            };
+            assert_eq!(
+                requested_screenshot_plan(&profile),
+                ScreenshotCapturePlan {
+                    primary_screenshot: false,
+                    primary_video_screenshot: true,
+                    fallback_screenshot: true,
+                    fallback_video_screenshot: false,
+                },
+                "preset {preset:?} should only eagerly capture video-only screenshot and defer subtitle fallback"
+            );
+        }
+
+        let both_primary = AnkiNoteConfig {
+            enabled: true,
+            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            deck: "Japanese".into(),
+            model: "Dual".into(),
+            field_templates: std::collections::HashMap::from([
+                ("PicSub".into(), "{screenshot}".into()),
+                ("PicClean".into(), "{screenshot-video}".into()),
+            ]),
+            tags: Vec::new(),
+            duplicate_policy: 1,
+            screenshot_type: 0,
+            audio_pad_start: 0.0,
+            audio_pad_end: 0.0,
+            audio_normalize: false,
+            audio_db: -20.0,
+            newline_replacer: "<br>".into(),
+        };
+        assert_eq!(
+            requested_screenshot_plan(&both_primary),
+            ScreenshotCapturePlan {
+                primary_screenshot: true,
+                primary_video_screenshot: true,
+                fallback_screenshot: false,
+                fallback_video_screenshot: false,
+            }
+        );
     }
 }

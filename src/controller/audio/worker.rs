@@ -21,8 +21,9 @@ use tempfile::TempDir;
 
 use super::super::config::AudioSourceEntry;
 use super::sources::{
-    classify_url, expand_audio_source_candidates, http_get, md5_hex, shared_audio_http_client,
-    skip_hash_message, Md5Hasher, SourceLocation,
+    cache_shared_audio_payload, cache_shared_audio_skipped, classify_url, clear_shared_audio_cache,
+    expand_audio_source_candidates, http_get, lookup_shared_audio_payload, md5_hex,
+    shared_audio_http_client, skip_hash_message, CachedAudioEntry, Md5Hasher, SourceLocation,
 };
 
 const MAGIC_SNIFF_MIN_BYTES: usize = 64;
@@ -248,6 +249,7 @@ impl AudioController {
     /// Clears the worker's 10-entry LRU pronunciation audio cache cleanly (e.g.
     /// whenever Audio Sources are changed in Settings).
     pub fn clear_cache(&self) {
+        clear_shared_audio_cache();
         let state = self
             .inner
             .channel
@@ -484,27 +486,70 @@ impl<P: PlaybackBackend> AudioWorker<P> {
             CacheHit::Miss => {}
         }
 
-        // 2. Download, validate, and stream-hash audio payload inline.
-        let (file, md5) = match self.download_audio(url, skip_hash)? {
-            DownloadedAudio::Skipped(md5) => {
-                let _evicted = self.cache.insert(url.to_owned(), None, md5);
-                return Err(skip_hash_message());
+        // 2. Check cross-subsystem shared word-audio cache (e.g. warmed by Anki export)
+        //    before hitting the network when using the shared production HTTP client.
+        let use_shared_cache = matches!(self.http, WorkerHttp::Shared);
+        let shared_downloaded = if use_shared_cache {
+            match lookup_shared_audio_payload(url) {
+                Some(CachedAudioEntry::Skipped { md5 })
+                    if md5_matches_skip_hash(&md5, skip_hash) =>
+                {
+                    let _evicted = self.cache.insert(url.to_owned(), None, md5);
+                    return Err(skip_hash_message());
+                }
+                Some(CachedAudioEntry::Payload { bytes, md5, ext }) => {
+                    if md5_matches_skip_hash(&md5, skip_hash) {
+                        let _evicted = self.cache.insert(url.to_owned(), None, md5);
+                        return Err(skip_hash_message());
+                    }
+                    let dir = ensure_temp_dir(&mut self.temp_dir)?;
+                    let (temp, mut file) = TemporaryAudioFile::create_in(dir, &ext)?;
+                    let write_res = file.write_all(&bytes).and_then(|()| file.flush());
+                    drop(file);
+                    write_res.map_err(|error| {
+                        format!("could not finish pronunciation audio file: {error}")
+                    })?;
+                    Some((temp, md5))
+                }
+                _ => None,
             }
-            DownloadedAudio::File { file, md5 } => (file, md5),
+        } else {
+            None
+        };
+
+        // 3. Download, validate, and stream-hash audio payload inline on cache miss.
+        let (file, md5, freshly_downloaded) = match shared_downloaded {
+            Some((file, md5)) => (file, md5, false),
+            None => match self.download_audio(url, skip_hash)? {
+                DownloadedAudio::Skipped(md5) => {
+                    if use_shared_cache {
+                        cache_shared_audio_skipped(url, md5.clone());
+                    }
+                    let _evicted = self.cache.insert(url.to_owned(), None, md5);
+                    return Err(skip_hash_message());
+                }
+                DownloadedAudio::File { file, md5 } => (file, md5, true),
+            },
         };
 
         let file = Arc::new(file);
         if self.is_superseded(generation) {
-            // Keep the validated download warm in cache for future clicks without
-            // interrupting the newer request.
+            // Keep the validated download warm in cache for future clicks & Anki export
+            // without interrupting the newer request.
+            if use_shared_cache && freshly_downloaded {
+                share_temp_audio_file(url, file.path(), &md5);
+            }
             let _evicted = self.cache.insert(url.to_owned(), Some(file), md5);
             return Ok(());
         }
 
-        // 3. Start playback BEFORE caching/swapping `active_file` so unplayable
+        // 4. Start playback BEFORE caching/swapping `active_file` so unplayable
         //    corrupt files never poison the cache and the previous audio file stays
         //    on disk until libmpv switches to the new one.
         self.player.play_file(file.path())?;
+        if use_shared_cache && freshly_downloaded {
+            share_temp_audio_file(url, file.path(), &md5);
+        }
         let _evicted = self
             .cache
             .insert(url.to_owned(), Some(Arc::clone(&file)), md5);
@@ -714,6 +759,21 @@ impl<P: PlaybackBackend> AudioWorker<P> {
             }
         }
     }
+}
+
+fn share_temp_audio_file(url: &str, path: &Path, md5: &str) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_else(|| ".mp3".to_owned());
+    cache_shared_audio_payload(url, bytes, md5.to_owned(), ext);
 }
 
 fn ensure_temp_dir(slot: &mut Option<TempDir>) -> Result<&Path, String> {

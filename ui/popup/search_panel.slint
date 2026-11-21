@@ -438,12 +438,11 @@ export component DictionarySearchPanel inherits Rectangle {
                             }
                         }
 
-                        // Card Header: Headword + Reading + Actions (かな, 漢/か, 字, Audio, Browse, Add, Collapse)
+                        // Card Header: Headword + Reading + Actions (Audio, 漢/か, Browse, Add, Collapse)
                         if hit.term-start || idx == 0 : panel-term-header := HorizontalLayout {
                             property <length> pbuttons-w:
-                                (root.anki-enabled && !hit.is-kanji && hit.reading != "" && hit.reading != hit.expression ? 30px : 0px)
-                                + (!hit.is-kanji && hit.has-kanji ? 30px : 0px)
-                                + (!hit.is-kanji ? 30px : 0px)
+                                (!hit.is-kanji ? 30px : 0px)
+                                + (root.anki-enabled && !hit.is-kanji && hit.reading != "" && hit.reading != hit.expression ? 30px : 0px)
                                 + (panel-row.show-browse-btn || root.anki-enabled ? 30px : 0px)
                                 + 30px;
                             property <length> pavail-title-w: max(80px, panel-card-col.width - self.pbuttons-w);
@@ -464,6 +463,8 @@ export component DictionarySearchPanel inherits Rectangle {
                                     nested: false;
                                     compact: true;
                                     reading-as-expression: panel-row.row-reading-as-expr;
+                                    kana-clickable: PopupBridge.panel-rich-enabled || PopupBridge.rich-enabled;
+                                    kana-active: false;
                                     scan-depth: -1;
                                     bridge-rev: PopupBridge.panel-revision;
                                     avail-width: panel-term-header.pavail-title-w;
@@ -477,6 +478,16 @@ export component DictionarySearchPanel inherits Rectangle {
                                             root.kanji-info(ch);
                                         }
                                     }
+                                    kana-clicked => {
+                                        if PopupBridge.panel-rich-enabled {
+                                            PopupBridge.panel-search-requested(hit.reading);
+                                        } else if PopupBridge.rich-enabled {
+                                            PopupBridge.toggle-kana-reading-search(hit.expression, hit.reading);
+                                        } else {
+                                            root.lookup(hit.reading);
+                                        }
+                                    }
+                                    request-tooltip(tip, x-off) => {}
                                 }
 
                                 // Allow clicking non-rich headword to open in popup
@@ -499,7 +510,6 @@ export component DictionarySearchPanel inherits Rectangle {
                                         spacing: 4px;
                                         btn-size: 26px;
                                         icon-size: 14px;
-                                        show-kana: false;
                                         show-reading-as-expr: root.anki-enabled && !hit.is-kanji && hit.reading != "" && hit.reading != hit.expression;
                                         reading-as-expression: panel-row.row-reading-as-expr;
                                         show-browse: panel-row.show-browse-btn;
@@ -507,15 +517,6 @@ export component DictionarySearchPanel inherits Rectangle {
                                             root.toggle-reading-as-expression(panel-row.row-zero-idx);
                                             if PopupBridge.panel-rich-enabled {
                                                 PopupBridge.panel-toggle-reading-as-expression(panel-row.row-zero-idx);
-                                            }
-                                        }
-                                        kanji-clicked => {
-                                            if PopupBridge.panel-rich-enabled {
-                                                PopupBridge.panel-lookup-kanji-char(hit.expression, "");
-                                            } else if PopupBridge.rich-enabled {
-                                                PopupBridge.panel-lookup-requested(hit.expression);
-                                            } else {
-                                                root.kanji-info(hit.expression);
                                             }
                                         }
                                         audio-clicked => {

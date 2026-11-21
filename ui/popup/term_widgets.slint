@@ -221,18 +221,15 @@ export component TermTagPillRow inherits HorizontalLayout {
     }
 }
 
-// ── Shared Term Header Leading Actions (`かな`, `漢/か`, `字`, Audio, Browse Anki) ─
+// ── Shared Term Header Leading Actions (Audio, `漢/か`, Browse Anki) ────────
 export component TermLeadingActions inherits HorizontalLayout {
     in property <DictResult> res;
-    in property <bool> show-kana: false;
     in property <bool> show-reading-as-expr: false;
     in property <bool> reading-as-expression: false;
     in property <bool> show-browse: false;
     in property <length> btn-size: 28px;
     in property <length> icon-size: 16px;
-    callback kana-clicked();
     callback reading-as-expression-clicked();
-    callback kanji-clicked();
     callback audio-clicked();
     callback audio-right-clicked(length);
     callback browse-clicked();
@@ -241,23 +238,17 @@ export component TermLeadingActions inherits HorizontalLayout {
     horizontal-stretch: 0;
     alignment: end;
 
-    // `かな` reading-search toggle button
-    if root.show-kana : PopupActionButton {
-        property <bool> kana-active: PopupBridge.kana-reading-active && PopupBridge.active-kana-reading == root.res.reading;
-        btn-width: 34px;
+    // Audio play + right-click audio source menu
+    if !root.res.is-kanji : PopupActionButton {
+        btn-width: root.btn-size;
         btn-height: root.btn-size;
-        label: "かな";
-        label-font-size: 11px;
-        bg-normal: self.kana-active ? MementoPalette.teal-accent : MementoPalette.button-bg;
-        bg-hover: self.kana-active ? MementoPalette.teal-hover : MementoPalette.button-hover;
-        bg-pressed: self.kana-active ? MementoPalette.teal-pressed : MementoPalette.button-pressed;
-        border-normal: self.kana-active ? MementoPalette.teal-border : MementoPalette.border;
-        border-hover: self.kana-active ? MementoPalette.teal-border : MementoPalette.border-light;
-        fg-color: self.kana-active ? #FFFFFF : MementoPalette.icon;
-        fg-hover-color: self.kana-active ? #FFFFFF : MementoPalette.text;
-        tooltip: "Search by kana reading";
-        clicked => { root.kana-clicked(); }
-        request-tooltip(tip) => { root.request-tooltip(tip, 180px); }
+        has-icon: true;
+        icon: @image-url("../icons/volume-on.svg");
+        icon-size: root.icon-size;
+        tooltip: "Play audio (right-click for sources)";
+        clicked => { root.audio-clicked(); }
+        right-clicked => { root.audio-right-clicked(self.x); }
+        request-tooltip(tip) => { root.request-tooltip(tip, 220px); }
     }
 
     // `漢`/`か` readingAsExpression toggle (flip expression ↔ kana reading for Anki export & dedup)
@@ -278,31 +269,6 @@ export component TermLeadingActions inherits HorizontalLayout {
             ? "Using kana reading as Anki expression (click for kanji)"
             : "Use kana reading as Anki expression";
         clicked => { root.reading-as-expression-clicked(); }
-        request-tooltip(tip) => { root.request-tooltip(tip, 220px); }
-    }
-
-    // `字` Kanji info button (matching filled surface pill)
-    if !root.res.is-kanji && root.res.has-kanji : PopupActionButton {
-        btn-width: root.btn-size;
-        btn-height: root.btn-size;
-        label: "字";
-        label-font-size: 15px;
-        label-font-weight: 600;
-        tooltip: "Kanji info";
-        clicked => { root.kanji-clicked(); }
-        request-tooltip(tip) => { root.request-tooltip(tip, 120px); }
-    }
-
-    // Audio play + right-click audio source menu
-    if !root.res.is-kanji : PopupActionButton {
-        btn-width: root.btn-size;
-        btn-height: root.btn-size;
-        has-icon: true;
-        icon: @image-url("../icons/volume-on.svg");
-        icon-size: root.icon-size;
-        tooltip: "Play audio (right-click for sources)";
-        clicked => { root.audio-clicked(); }
-        right-clicked => { root.audio-right-clicked(self.x); }
         request-tooltip(tip) => { root.request-tooltip(tip, 220px); }
     }
 
@@ -421,9 +387,12 @@ export component AnkiTagRow inherits HorizontalLayout {
 // ── Per-Character Headword Cell (TouchArea mounted ONLY on kanji) ───────────
 component HeadwordCharCell inherits Rectangle {
     in property <RichHeadwordChar> ch;
+    in property <string> font-family: PopupBridge.css-headword-font-family;
     in property <length> font-size;
+    in property <int> font-weight: 700;
     in property <color> text-color;
     callback kanji-clicked(string);
+    callback request-tooltip(string, length);
 
     private property <bool> hovered: false;
 
@@ -434,36 +403,121 @@ component HeadwordCharCell inherits Rectangle {
 
     ch-text := DictionaryText {
         text: root.ch.text;
-        font-family: PopupBridge.css-headword-font-family;
+        font-family: root.font-family;
         font-size: root.font-size;
-        font-weight: 700;
+        font-weight: root.font-weight;
         color: root.hovered ? PopupBridge.css-link-color : root.text-color;
     }
 
     if root.ch.is-kanji : TouchArea {
         mouse-cursor: pointer;
-        changed has-hover => { root.hovered = self.has-hover; }
-        clicked => { root.kanji-clicked(root.ch.text); }
+        changed has-hover => {
+            root.hovered = self.has-hover;
+            if self.has-hover && PopupBridge.rich-enabled {
+                PopupBridge.tooltip-next-immediate = false;
+                root.request-tooltip("Kanji info: " + root.ch.text, 0px);
+            } else if !self.has-hover && PopupBridge.rich-enabled {
+                PopupBridge.cancel-pending-tooltip();
+                PopupBridge.hide-tooltip();
+            }
+        }
+        clicked => {
+            if PopupBridge.rich-enabled {
+                PopupBridge.cancel-pending-tooltip();
+                PopupBridge.hide-tooltip();
+            }
+            root.kanji-clicked(root.ch.text);
+        }
     }
 }
 
 export component HeadwordCharRow inherits VerticalLayout {
     in property <string> expression;
     in property <length> avail-width: 240px;
+    in property <string> font-family: PopupBridge.css-headword-font-family;
     in property <length> font-size: PopupBridge.css-headword-size;
+    in property <int> font-weight: 700;
     in property <color> text-color: PopupBridge.css-headword-color;
     callback kanji-clicked(string);
+    callback request-tooltip(string, length);
 
     spacing: 1px;
 
     for hw-line in PopupBridge.headword-lines(root.expression, root.avail-width / 1px) : HorizontalLayout {
         alignment: start;
         spacing: 0px;
-        for ch in hw-line.chars : HeadwordCharCell {
+        for ch in hw-line.chars : cell := HeadwordCharCell {
             ch: ch;
+            font-family: root.font-family;
             font-size: root.font-size;
+            font-weight: root.font-weight;
             text-color: root.text-color;
             kanji-clicked(c) => { root.kanji-clicked(c); }
+            request-tooltip(tip, x-off) => { root.request-tooltip(tip, cell.x + x-off); }
+        }
+    }
+}
+
+// ── Clickable Kana Reading Text (triggers kana-reading homophone search) ────
+component ClickableReadingText inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> font-family: PopupBridge.css-reading-font-family;
+    in property <length> font-size: PopupBridge.css-reading-size;
+    in property <int> font-weight: 400;
+    in property <color> text-color: PopupBridge.css-reading-color;
+    in property <length> avail-width: 240px;
+    in property <bool> clickable: false;
+    in property <bool> active: false;
+    callback clicked();
+    callback request-tooltip(string, length);
+
+    alignment: start;
+
+    pill := Rectangle {
+        private property <bool> hovered: false;
+        private property <string> tip-text: root.active
+            ? "Back to previous lookup"
+            : "Search by kana reading";
+        width: min(root.avail-width, reading-label.preferred-width + (root.clickable ? 4px : 0px));
+        height: reading-label.preferred-height;
+        border-radius: 3px;
+        background: root.clickable && self.hovered
+            ? MementoPalette.hover-bg
+            : (root.clickable && root.active ? MementoPalette.accent-muted : transparent);
+
+        reading-label := DictionaryText {
+            x: root.clickable ? 2px : 0px;
+            width: parent.width - (root.clickable ? 4px : 0px);
+            text: root.text;
+            height: self.preferred-height;
+            wrap: word-wrap;
+            font-family: root.font-family;
+            font-size: root.font-size;
+            font-weight: root.font-weight;
+            color: root.clickable && pill.hovered
+                ? PopupBridge.css-link-color
+                : (root.clickable && root.active ? MementoPalette.teal-accent : root.text-color);
+        }
+
+        if root.clickable : TouchArea {
+            mouse-cursor: pointer;
+            changed has-hover => {
+                pill.hovered = self.has-hover;
+                if self.has-hover && PopupBridge.rich-enabled {
+                    PopupBridge.tooltip-next-immediate = false;
+                    root.request-tooltip(pill.tip-text, 0px);
+                } else if !self.has-hover && PopupBridge.rich-enabled {
+                    PopupBridge.cancel-pending-tooltip();
+                    PopupBridge.hide-tooltip();
+                }
+            }
+            clicked => {
+                if PopupBridge.rich-enabled {
+                    PopupBridge.cancel-pending-tooltip();
+                    PopupBridge.hide-tooltip();
+                }
+                root.clicked();
+            }
         }
     }
 }
@@ -474,13 +528,18 @@ export component TermHeadwordBlock inherits VerticalLayout {
     in property <bool> nested: false;
     in property <bool> compact: false;
     in property <bool> reading-as-expression: false;
+    in property <bool> kana-clickable: false;
+    in property <bool> kana-active: false;
     in property <int> scan-depth: 0;
     in property <int> bridge-rev: 0;
     in property <length> avail-width: 240px;
     in property <color> headword-color: PopupBridge.css-headword-color;
     callback kanji-clicked(string);
+    callback kana-clicked();
+    callback request-tooltip(string, length);
 
     property <bool> flip-to-kana: root.reading-as-expression && !root.res.is-kanji && root.res.reading != "" && root.res.reading != root.res.expression;
+    property <bool> can-search-kana: root.kana-clickable && !root.res.is-kanji && root.res.reading != "" && root.res.reading != root.res.expression;
     property <string> display-main: self.flip-to-kana ? root.res.reading : root.res.expression;
     property <string> display-sub: self.flip-to-kana ? root.res.expression : root.res.reading;
 
@@ -496,7 +555,33 @@ export component TermHeadwordBlock inherits VerticalLayout {
     preferred-width: 0px;
     spacing: 2px;
 
-    if !root.res.is-kanji && root.display-sub != "" && root.display-sub != root.display-main : DictionaryText {
+    // Sub-line: kana reading (normal mode) — clickable to search homophones by reading
+    if !root.res.is-kanji && !root.flip-to-kana && root.display-sub != "" && root.display-sub != root.display-main : ClickableReadingText {
+        text: root.display-sub;
+        avail-width: root.avail-width;
+        font-family: PopupBridge.css-reading-font-family;
+        font-size: PopupBridge.css-reading-size;
+        font-weight: 400;
+        text-color: PopupBridge.css-reading-color;
+        clickable: root.can-search-kana;
+        active: root.kana-active;
+        clicked => { root.kana-clicked(); }
+        request-tooltip(tip, x-off) => { root.request-tooltip(tip, x-off); }
+    }
+
+    // Sub-line: kanji expression (when flipped via `か` mode) — keep kanji individually clickable
+    if !root.res.is-kanji && root.flip-to-kana && PopupBridge.rich-enabled && root.display-sub != "" && root.display-sub != root.display-main : HeadwordCharRow {
+        expression: root.display-sub;
+        avail-width: root.avail-width;
+        font-family: PopupBridge.css-reading-font-family;
+        font-size: PopupBridge.css-reading-size;
+        font-weight: 400;
+        text-color: PopupBridge.css-reading-color;
+        kanji-clicked(c) => { root.kanji-clicked(c); }
+        request-tooltip(tip, x-off) => { root.request-tooltip(tip, x-off); }
+    }
+
+    if !root.res.is-kanji && root.flip-to-kana && !PopupBridge.rich-enabled && root.display-sub != "" && root.display-sub != root.display-main : DictionaryText {
         text: root.display-sub;
         height: self.preferred-height;
         wrap: word-wrap;
@@ -505,15 +590,34 @@ export component TermHeadwordBlock inherits VerticalLayout {
         color: PopupBridge.css-reading-color;
     }
 
+    // Main line: kanji expression (normal rich mode) — each kanji clickable with tooltip
     if PopupBridge.rich-enabled && !root.res.is-kanji && !root.flip-to-kana : HeadwordCharRow {
         expression: root.display-main;
         avail-width: root.avail-width;
+        font-family: PopupBridge.css-headword-font-family;
         font-size: root.hw-font-size;
+        font-weight: 700;
         text-color: root.headword-color;
         kanji-clicked(c) => { root.kanji-clicked(c); }
+        request-tooltip(tip, x-off) => { root.request-tooltip(tip, x-off); }
     }
 
-    if !PopupBridge.rich-enabled || root.res.is-kanji || root.flip-to-kana : DictionaryText {
+    // Main line: kana reading (flipped via `か` mode) — stays clickable for kana reading search
+    if !root.res.is-kanji && root.flip-to-kana : ClickableReadingText {
+        text: root.display-main;
+        avail-width: root.avail-width;
+        font-family: PopupBridge.css-headword-font-family;
+        font-size: root.hw-font-size;
+        font-weight: 700;
+        text-color: root.headword-color;
+        clickable: root.can-search-kana;
+        active: root.kana-active;
+        clicked => { root.kana-clicked(); }
+        request-tooltip(tip, x-off) => { root.request-tooltip(tip, x-off); }
+    }
+
+    // Main line fallback (kanji entry or non-rich term)
+    if root.res.is-kanji || (!PopupBridge.rich-enabled && !root.flip-to-kana) : DictionaryText {
         text: root.display-main;
         height: self.preferred-height;
         wrap: word-wrap;

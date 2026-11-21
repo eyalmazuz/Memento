@@ -10,8 +10,9 @@ mod worker;
 
 pub(crate) use sources::sanitize_anki_filename;
 pub use sources::{
-    ascii_safe_audio_filename, download_timeout_config, download_timeout_ms,
-    enumerate_word_audio_sources, fetch_word_audio, resolve_word_audio, set_download_timeout_ms,
+    ascii_safe_audio_filename, clear_shared_audio_cache, download_timeout_config,
+    download_timeout_ms, enumerate_word_audio_sources, fetch_word_audio, resolve_word_audio,
+    set_download_timeout_ms,
 };
 pub use worker::AudioController;
 
@@ -19,11 +20,11 @@ pub use worker::AudioController;
 mod tests {
     use super::super::config::AudioSourceEntry;
     use super::sources::{
-        classify_url, download_timeout_config, download_timeout_ms, enumerate_word_audio_sources,
-        expand_source_url, fetch_word_audio, fetch_word_audio_with_client,
-        fetch_word_audio_with_client_and_timeout, first_audio_candidate, md5_hex,
-        parse_json_audio_entries, parse_json_audio_sources, resolve_word_audio,
-        set_download_timeout_ms, Md5Hasher, SourceLocation,
+        classify_url, clear_shared_audio_cache, download_timeout_config, download_timeout_ms,
+        enumerate_word_audio_sources, expand_source_url, fetch_word_audio,
+        fetch_word_audio_with_client, fetch_word_audio_with_client_and_timeout,
+        first_audio_candidate, md5_hex, parse_json_audio_entries, parse_json_audio_sources,
+        resolve_word_audio, set_download_timeout_ms, Md5Hasher, SourceLocation,
     };
     use super::worker::{AudioController, AudioWorker, PlaybackBackend};
     use memento_net::http::{HttpClient, HttpClientConfig};
@@ -471,9 +472,13 @@ mod tests {
     fn remote_json_audio_source_rejects_file_urls_and_resolves_relative_http_urls() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
+            while let Ok((mut stream, _)) = listener.accept() {
+                if server_done.load(Ordering::Acquire) {
+                    break;
+                }
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
                 let body = r#"{"type":"audioSourceList","audioSources":[{"name":"evil_file","url":"file:///etc/passwd"},{"name":"evil_ftp","url":"ftp://example.test/x.mp3"},{"url":"/clips/{expression}.ogg"},{"name":"rel","url":"sub/word.mp3"}]}"#;
@@ -515,6 +520,8 @@ mod tests {
             format!("http://{}:{}/api/sub/word.mp3", addr.ip(), addr.port())
         );
 
+        done.store(true, Ordering::Release);
+        let _ = std::net::TcpStream::connect(addr);
         let _ = handle.join();
     }
 
@@ -1146,6 +1153,71 @@ mod tests {
             ctrl_played.lock().unwrap()[0].1.as_slice(),
             b"ID3payload-v3"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_audio_cache_reuses_downloaded_audio_and_json_and_clears() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let json_hits = Arc::new(AtomicUsize::new(0));
+        let mp3_hits = Arc::new(AtomicUsize::new(0));
+        let server_json_hits = Arc::clone(&json_hits);
+        let server_mp3_hits = Arc::clone(&mp3_hits);
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (ct, body) = if req.starts_with("GET /index.json") {
+                    server_json_hits.fetch_add(1, Ordering::AcqRel);
+                    (
+                        "application/json",
+                        format!(
+                            r#"{{"type":"audioSourceList","audioSources":[{{"name":"CachedSrc","url":"http://{addr}/clip.mp3"}}]}}"#
+                        ),
+                    )
+                } else {
+                    server_mp3_hits.fetch_add(1, Ordering::AcqRel);
+                    ("audio/mpeg", "ID3cached-anki-audio-payload".to_owned())
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ct}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let sources = vec![source(
+            "JsonAudio",
+            &format!("http://{addr}/index.json?w={{expression}}"),
+            AudioSourceType::AudioSourceTypeJson,
+            "",
+        )];
+
+        // 1st fetch populates both JSON expansion cache and audio payload cache.
+        let (bytes1, fname1) = fetch_word_audio("橋", "はし", &sources).unwrap();
+        assert_eq!(bytes1, b"ID3cached-anki-audio-payload");
+        assert!(fname1.ends_with(".mp3"));
+        assert_eq!(json_hits.load(Ordering::Acquire), 1);
+        assert_eq!(mp3_hits.load(Ordering::Acquire), 1);
+
+        // 2nd fetch hits shared cache with zero extra HTTP requests.
+        let (bytes2, fname2) = fetch_word_audio("橋", "はし", &sources).unwrap();
+        assert_eq!(bytes2, bytes1);
+        assert_eq!(fname2, fname1);
+        assert_eq!(json_hits.load(Ordering::Acquire), 1);
+        assert_eq!(mp3_hits.load(Ordering::Acquire), 1);
+
+        // Clearing shared cache forces fresh JSON + MP3 fetches.
+        clear_shared_audio_cache();
+        let (bytes3, _) = fetch_word_audio("橋", "はし", &sources).unwrap();
+        assert_eq!(bytes3, bytes1);
+        assert_eq!(json_hits.load(Ordering::Acquire), 2);
+        assert_eq!(mp3_hits.load(Ordering::Acquire), 2);
+
         server.join().unwrap();
     }
 }
