@@ -44,10 +44,15 @@ export component ModalDialog inherits Rectangle {
 
         card-layout := VerticalLayout {
             width: parent.width;
-            padding: 20px;
+            padding-top: root.title != "" ? 20px : 6px;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-bottom: 20px;
             spacing: 14px;
 
-            if root.title != "" : Text {
+            title-lbl := Text {
+                visible: root.title != "";
+                height: root.title != "" ? self.preferred-height : 0px;
                 text: root.title;
                 color: root.title-color;
                 font-size: 16px;
@@ -57,11 +62,15 @@ export component ModalDialog inherits Rectangle {
 
             @children
 
-            if root.show-footer : HorizontalLayout {
+            HorizontalLayout {
+                visible: root.show-footer;
+                height: root.show-footer ? self.preferred-height : 0px;
                 alignment: end;
                 spacing: 8px;
 
-                if root.cancel-text != "" : ActionButton {
+                ActionButton {
+                    visible: root.cancel-text != "";
+                    width: root.cancel-text != "" ? self.preferred-width : 0px;
                     text: root.cancel-text;
                     ghost: true;
                     clicked => { root.dismissed(); }
@@ -75,6 +84,40 @@ export component ModalDialog inherits Rectangle {
                     clicked => { root.primary-clicked(); }
                 }
             }
+        }
+    }
+}
+
+export component DropOverlay inherits Rectangle {
+    in property <bool> active: false;
+    in property <string> label: "";
+
+    visible: root.active;
+    width: 100%;
+    height: 100%;
+    background: SubomiPalette.accent-subtle;
+    border-width: 3px;
+    border-color: SubomiPalette.cyan-accent;
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(parent.width - 64px, drop-lbl.preferred-width + 44px);
+        height: 54px;
+        border-radius: 12px;
+        background: SubomiPalette.surface-elevated;
+        border-width: 1.5px;
+        border-color: SubomiPalette.cyan-accent;
+        drop-shadow-blur: 20px;
+        drop-shadow-color: SubomiPalette.shadow;
+
+        drop-lbl := Text {
+            text: root.label;
+            color: SubomiPalette.text;
+            font-size: 14px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
 }

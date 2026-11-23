@@ -9,6 +9,7 @@ import {
     RichDerivationStep,
     RichHeadwordChar,
     RichKanjiDetail,
+    RichKanjiStat,
     RichPitchEntry,
     RichPitchGraph,
     RichPitchMora,
@@ -359,7 +360,8 @@ export component AnkiTagRow inherits HorizontalLayout {
             vertical-alignment: center;
         }
 
-        if PopupBridge.rich-enabled : TouchArea {
+        TouchArea {
+            visible: PopupBridge.rich-enabled;
             mouse-cursor: help;
             clicked => {
                 if parent.pinned && PopupBridge.tooltip-visible && PopupBridge.tooltip-text == parent.tip-str {
@@ -413,7 +415,8 @@ component HeadwordCharCell inherits Rectangle {
         color: root.hovered ? PopupBridge.css-link-color : root.text-color;
     }
 
-    if root.ch.is-kanji : TouchArea {
+    TouchArea {
+        visible: root.ch.is-kanji;
         mouse-cursor: pointer;
         changed has-hover => {
             root.hovered = self.has-hover;
@@ -503,7 +506,8 @@ component ClickableReadingText inherits HorizontalLayout {
                 : (root.clickable && root.active ? SubomiPalette.teal-accent : root.text-color);
         }
 
-        if root.clickable : TouchArea {
+        TouchArea {
+            visible: root.clickable;
             mouse-cursor: pointer;
             changed has-hover => {
                 pill.hovered = self.has-hover;
@@ -798,9 +802,9 @@ export component FrequencyBadgeList inherits VerticalLayout {
         width: parent.width;
         spacing: 6px;
         alignment: start;
-        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: SubomiPalette.success-text; font-size: 11px; }
-        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: SubomiPalette.success-text; font-size: 11px; }
-        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: SubomiPalette.badge-purple-text; font-size: 11px; }
+        DictionaryText { visible: root.jpdb-rank != ""; width: root.jpdb-rank != "" ? self.preferred-width : 0px; text: "JPDB " + root.jpdb-rank; color: SubomiPalette.success-text; font-size: 11px; }
+        DictionaryText { visible: root.freq-rank != ""; width: root.freq-rank != "" ? self.preferred-width : 0px; text: root.freq-rank; color: SubomiPalette.success-text; font-size: 11px; }
+        DictionaryText { visible: root.pitch-accent != ""; width: root.pitch-accent != "" ? self.preferred-width : 0px; text: root.pitch-accent; color: SubomiPalette.badge-purple-text; font-size: 11px; }
     }
 
     // Bridge-provided compact frequency items (explicit omit-dict-name per badge)
@@ -1234,33 +1238,23 @@ export component KanjiDetailCard inherits VerticalLayout {
         }
     }
 
-    if PopupBridge.css-show-kanji-extra && root.detail.classifications.length > 0 : VerticalLayout {
+    for sec-idx in (PopupBridge.css-show-kanji-extra ? [0, 1, 2] : []) : VerticalLayout {
+        property <[RichKanjiStat]> items: sec-idx == 0
+            ? root.detail.classifications
+            : (sec-idx == 1 ? root.detail.codepoints : root.detail.indices);
         spacing: 3px;
-        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
-        DictionaryText { text: "Classifications"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
-        for item in root.detail.classifications : HorizontalLayout {
-            spacing: 6px;
-            DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
-            DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
+        visible: self.items.length > 0;
+        height: self.items.length > 0 ? self.preferred-height : 0px;
+        Rectangle { visible: parent.items.length > 0; height: parent.items.length > 0 ? 1px : 0px; width: parent.width; background: PopupBridge.css-divider-color; }
+        DictionaryText {
+            visible: parent.items.length > 0;
+            height: parent.items.length > 0 ? self.preferred-height : 0px;
+            text: sec-idx == 0 ? "Classifications" : (sec-idx == 1 ? "Codepoints" : "Dictionary Indices");
+            font-size: 11px;
+            font-weight: 700;
+            color: PopupBridge.css-text-color;
         }
-    }
-
-    if PopupBridge.css-show-kanji-extra && root.detail.codepoints.length > 0 : VerticalLayout {
-        spacing: 3px;
-        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
-        DictionaryText { text: "Codepoints"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
-        for item in root.detail.codepoints : HorizontalLayout {
-            spacing: 6px;
-            DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
-            DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
-        }
-    }
-
-    if PopupBridge.css-show-kanji-extra && root.detail.indices.length > 0 : VerticalLayout {
-        spacing: 3px;
-        Rectangle { height: 1px; width: parent.width; background: PopupBridge.css-divider-color; }
-        DictionaryText { text: "Dictionary Indices"; font-size: 11px; font-weight: 700; color: PopupBridge.css-text-color; }
-        for item in root.detail.indices : HorizontalLayout {
+        for item in self.items : HorizontalLayout {
             spacing: 6px;
             DictionaryText { horizontal-stretch: 1; text: item.label; font-size: 11px; font-weight: 600; color: PopupBridge.css-muted-color; wrap: word-wrap; }
             DictionaryText { text: item.value; font-size: 11px; color: PopupBridge.css-text-color; }
@@ -1372,29 +1366,14 @@ export component AudioSourceMenu inherits Rectangle {
                     Rectangle { height: 1px; background: SubomiPalette.border; }
                 }
 
-                if root.loading : Rectangle {
+                if root.loading || root.audio-sources.length == 0 : Rectangle {
                     width: parent.width;
-                    height: 28px;
+                    height: root.loading ? 28px : 30px;
                     DictionaryText {
                         x: 8px;
                         width: parent.width - 16px;
                         height: parent.height;
-                        text: "Loading recordings…";
-                        font-size: 12px;
-                        color: SubomiPalette.text-secondary;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                }
-
-                if !root.loading && root.audio-sources.length == 0 : Rectangle {
-                    width: parent.width;
-                    height: 30px;
-                    DictionaryText {
-                        x: 8px;
-                        width: parent.width - 16px;
-                        height: parent.height;
-                        text: "No audio sources available";
+                        text: root.loading ? "Loading recordings…" : "No audio sources available";
                         font-size: 12px;
                         color: SubomiPalette.text-secondary;
                         vertical-alignment: center;

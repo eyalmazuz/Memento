@@ -511,7 +511,9 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                             vertical-alignment: center;
                         }
 
-                        if item.kind != "" : VerticalLayout {
+                        VerticalLayout {
+                            visible: item.kind != "";
+                            width: item.kind != "" ? self.preferred-width : 0px;
                             alignment: center;
                             Rectangle {
                                 height: 15px;
@@ -529,7 +531,8 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                             }
                         }
 
-                        if item.detail != "" : Text {
+                        Text {
+                            visible: item.detail != "";
                             horizontal-stretch: 1;
                             text: item.detail;
                             font-size: 10.5px;
@@ -573,7 +576,9 @@ component PreviewRubyWord inherits VerticalLayout {
     spacing: 1px;
     alignment: end;
 
-    if root.show-furigana : Text {
+    Text {
+        visible: root.show-furigana;
+        height: root.show-furigana ? self.preferred-height : 0px;
         text: root.ruby-text != "" ? root.ruby-text : " ";
         font-family: root.font-family;
         font-size: root.ruby-sz;
@@ -839,7 +844,9 @@ export component KeybindCaptureControl inherits VerticalLayout {
         }
     }
 
-    if root.field.conflict != "" : Text {
+    Text {
+        visible: root.field.conflict != "";
+        height: root.field.conflict != "" ? self.preferred-height : 0px;
         text: "⚠ " + root.field.conflict;
         color: SubomiPalette.warning-text;
         font-size: 11px;

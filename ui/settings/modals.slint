@@ -274,57 +274,6 @@ export component ColorPickerModal inherits ModalDialog {
     }
 }
 
-export component AudioHelpModal inherits ModalDialog {
-    title: "Audio Sources Help";
-    dialog-width: 540px;
-    primary-text: "OK";
-
-    Text {
-        text: "Source Name: The name of the audio source as it will appear in Subomi.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
-        color: SubomiPalette.text-secondary;
-        font-size: 13px;
-        wrap: word-wrap;
-    }
-}
-
-export component AnkiConnectionModal inherits ModalDialog {
-    in property <bool> ok: false;
-    in property <string> message: "";
-
-    title: root.ok ? "✔ Connected to Anki" : "✖ Connection Failed";
-    title-color: root.ok ? SubomiPalette.success-text : SubomiPalette.danger-text;
-    accent-border: root.ok ? SubomiPalette.success : SubomiPalette.danger;
-    dialog-width: 420px;
-    primary-text: "OK";
-
-    Text {
-        text: root.message;
-        color: SubomiPalette.text-secondary;
-        font-size: 13px;
-        wrap: word-wrap;
-    }
-}
-
-export component ConfirmDeleteModal inherits ModalDialog {
-    in property <string> item-title: "";
-    in property <string> detail-text: "";
-
-    title: root.item-title;
-    title-color: SubomiPalette.text;
-    accent-border: SubomiPalette.danger;
-    dialog-width: 420px;
-    cancel-text: "Cancel";
-    primary-text: "Delete";
-    primary-danger: true;
-
-    Text {
-        text: root.detail-text;
-        color: SubomiPalette.text-secondary;
-        font-size: 13px;
-        wrap: word-wrap;
-    }
-}
-
 export component ProfileModal inherits ModalDialog {
     in property <bool> is-rename: false;
     in property <string> kind-label: "Anki";
@@ -355,7 +304,7 @@ export component ProfileModal inherits ModalDialog {
     }
 
     VerticalLayout {
-        spacing: 10px;
+        spacing: 0px;
 
         Text {
             text: root.is-rename
@@ -365,6 +314,8 @@ export component ProfileModal inherits ModalDialog {
             font-size: 12.5px;
             wrap: word-wrap;
         }
+
+        Rectangle { height: 10px; background: transparent; }
 
         name-edit := LineEdit {
             text <=> root.profile-name;
@@ -381,27 +332,42 @@ export component ProfileModal inherits ModalDialog {
             }
         }
 
-        if root.profile-name-error != "" : Rectangle {
-            height: err-lbl.preferred-height + 12px;
-            border-radius: 6px;
-            background: SubomiPalette.danger-bg;
-            border-width: 1px;
-            border-color: SubomiPalette.danger;
-            err-lbl := Text {
-                x: 10px;
-                y: 6px;
-                width: parent.width - 20px;
-                text: "⚠ " + root.profile-name-error;
-                color: SubomiPalette.danger-text;
-                font-size: 12px;
-                font-weight: 600;
-                wrap: word-wrap;
+        Rectangle {
+            visible: root.profile-name-error != "";
+            height: root.profile-name-error != "" ? (err-box.height + 10px) : 0px;
+            background: transparent;
+
+            err-box := Rectangle {
+                y: 10px;
+                width: parent.width;
+                height: err-lbl.preferred-height + 12px;
+                border-radius: 6px;
+                background: SubomiPalette.danger-bg;
+                border-width: 1px;
+                border-color: SubomiPalette.danger;
+                err-lbl := Text {
+                    x: 10px;
+                    y: 6px;
+                    width: parent.width - 20px;
+                    text: "⚠ " + root.profile-name-error;
+                    color: SubomiPalette.danger-text;
+                    font-size: 12px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                }
             }
         }
 
-        if !root.is-rename : SubomiCheckBox {
-            label: "Copy current profile";
-            checked <=> root.copy-current-profile;
+        Rectangle {
+            visible: !root.is-rename;
+            height: !root.is-rename ? (copy-chk.preferred-height + 10px) : 0px;
+            background: transparent;
+
+            copy-chk := SubomiCheckBox {
+                y: 10px;
+                label: "Copy current profile";
+                checked <=> root.copy-current-profile;
+            }
         }
     }
 }

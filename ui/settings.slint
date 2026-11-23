@@ -18,13 +18,8 @@ import { DictionariesPanel } from "settings/dictionaries.slint";
 import { AsrModelsPanel } from "settings/asr.slint";
 import { CustomPopupCssPanel } from "settings/custom_css.slint";
 import { TextReplacementsPanel } from "settings/text_replacements.slint";
-import {
-    AnkiConnectionModal,
-    AudioHelpModal,
-    ColorPickerModal,
-    ConfirmDeleteModal,
-    ProfileModal,
-} from "settings/modals.slint";
+import { DropOverlay, ModalDialog } from "components/modal.slint";
+import { ColorPickerModal, ProfileModal } from "settings/modals.slint";
 
 export {
     SettingsField,
@@ -563,38 +558,28 @@ export component SettingsWindow inherits Window {
                         spacing: 18px;
                         alignment: start;
 
-                        if !root.searching && ((root.active-category == 7 && !root.ocr-available) || (root.active-category == 8 && !root.asr-available)) : Rectangle {
-                            height: 40px;
-                            background: SubomiPalette.warning-bg;
+                        if (root.searching && root.settings-groups.length == 0)
+                            || (!root.searching && ((root.active-category == 7 && !root.ocr-available) || (root.active-category == 8 && !root.asr-available))) : Rectangle {
+                            property <bool> is-empty-search: root.searching && root.settings-groups.length == 0;
+                            height: self.is-empty-search ? 92px : 40px;
+                            background: self.is-empty-search ? SubomiPalette.card-bg : SubomiPalette.warning-bg;
                             border-width: 1px;
-                            border-color: SubomiPalette.warning-border;
-                            border-radius: 8px;
+                            border-color: self.is-empty-search ? SubomiPalette.card-border : SubomiPalette.warning-border;
+                            border-radius: self.is-empty-search ? 10px : 8px;
                             Text {
-                                x: 14px;
-                                width: parent.width - 28px;
+                                x: self.horizontal-alignment == TextHorizontalAlignment.center ? 0px : 14px;
+                                width: self.horizontal-alignment == TextHorizontalAlignment.center ? parent.width : parent.width - 28px;
                                 height: parent.height;
-                                text: root.active-category == 7
-                                    ? "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable."
-                                    : "⚠ ASR runtime unavailable; preferences remain editable.";
-                                color: SubomiPalette.warning-text;
-                                font-size: 12px;
+                                text: parent.is-empty-search
+                                    ? ("No settings match \"" + root.settings-search-query + "\".")
+                                    : (root.active-category == 7
+                                        ? "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable."
+                                        : "⚠ ASR runtime unavailable; preferences remain editable.");
+                                color: parent.is-empty-search ? SubomiPalette.text-muted : SubomiPalette.warning-text;
+                                font-size: parent.is-empty-search ? 13px : 12px;
+                                horizontal-alignment: parent.is-empty-search ? center : left;
                                 vertical-alignment: center;
                                 overflow: elide;
-                            }
-                        }
-
-                        if root.searching && root.settings-groups.length == 0 : Rectangle {
-                            height: 92px;
-                            border-radius: 10px;
-                            background: SubomiPalette.card-bg;
-                            border-width: 1px;
-                            border-color: SubomiPalette.card-border;
-                            Text {
-                                text: "No settings match \"" + root.settings-search-query + "\".";
-                                color: SubomiPalette.text-muted;
-                                font-size: 13px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
                             }
                         }
 
@@ -828,29 +813,59 @@ export component SettingsWindow inherits Window {
             }
         }
 
-        if root.showing-audio-help : AudioHelpModal {
-            dismissed => { root.showing-audio-help = false; }
-            primary-clicked => { root.showing-audio-help = false; }
-        }
-
-        if root.connection-popup-open : AnkiConnectionModal {
-            ok: root.connection-popup-ok;
-            message: root.connection-popup-text;
-            dismissed => { root.connection-popup-open = false; }
-            primary-clicked => { root.connection-popup-open = false; }
-        }
-
-        if root.confirm-delete-open : ConfirmDeleteModal {
-            item-title: root.confirm-delete-title;
-            detail-text: root.confirm-delete-message;
-            dismissed => { root.confirm-delete-open = false; }
-            primary-clicked => {
-                root.confirm-delete-open = false;
-                if root.confirm-delete-kind == "dictionary" {
-                    root.delete-dictionary(root.confirm-delete-dict-id);
+        if root.showing-audio-help || root.connection-popup-open || root.confirm-delete-open : ModalDialog {
+            title: root.confirm-delete-open
+                ? root.confirm-delete-title
+                : (root.connection-popup-open
+                    ? (root.connection-popup-ok ? "✔ Connected to Anki" : "✖ Connection Failed")
+                    : "Audio Sources Help");
+            title-color: root.confirm-delete-open
+                ? SubomiPalette.text
+                : (root.connection-popup-open
+                    ? (root.connection-popup-ok ? SubomiPalette.success-text : SubomiPalette.danger-text)
+                    : SubomiPalette.text);
+            accent-border: root.confirm-delete-open
+                ? SubomiPalette.danger
+                : (root.connection-popup-open
+                    ? (root.connection-popup-ok ? SubomiPalette.success : SubomiPalette.danger)
+                    : SubomiPalette.border-light);
+            dialog-width: root.confirm-delete-open || root.connection-popup-open ? 420px : 540px;
+            cancel-text: root.confirm-delete-open ? "Cancel" : "";
+            primary-text: root.confirm-delete-open ? "Delete" : "OK";
+            primary-danger: root.confirm-delete-open;
+            dismissed => {
+                if root.confirm-delete-open {
+                    root.confirm-delete-open = false;
+                } else if root.connection-popup-open {
+                    root.connection-popup-open = false;
                 } else {
-                    root.remove-entry(root.confirm-delete-category, root.confirm-delete-id);
+                    root.showing-audio-help = false;
                 }
+            }
+            primary-clicked => {
+                if root.confirm-delete-open {
+                    root.confirm-delete-open = false;
+                    if root.confirm-delete-kind == "dictionary" {
+                        root.delete-dictionary(root.confirm-delete-dict-id);
+                    } else {
+                        root.remove-entry(root.confirm-delete-category, root.confirm-delete-id);
+                    }
+                } else if root.connection-popup-open {
+                    root.connection-popup-open = false;
+                } else {
+                    root.showing-audio-help = false;
+                }
+            }
+
+            Text {
+                text: root.confirm-delete-open
+                    ? root.confirm-delete-message
+                    : (root.connection-popup-open
+                        ? root.connection-popup-text
+                        : "Source Name: The name of the audio source as it will appear in Subomi.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.");
+                color: SubomiPalette.text-secondary;
+                font-size: 13px;
+                wrap: word-wrap;
             }
         }
 
@@ -886,34 +901,9 @@ export component SettingsWindow inherits Window {
         }
 
         // Subtle OS Drag-and-Drop Overlay for Yomitan .zip dictionary imports (C2)
-        if root.drop-hover-active : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: SubomiPalette.accent-subtle;
-            border-width: 3px;
-            border-color: SubomiPalette.cyan-accent;
-
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: min(parent.width - 64px, drop-lbl.preferred-width + 44px);
-                height: 54px;
-                border-radius: 12px;
-                background: SubomiPalette.surface-elevated;
-                border-width: 1.5px;
-                border-color: SubomiPalette.cyan-accent;
-                drop-shadow-blur: 20px;
-                drop-shadow-color: SubomiPalette.shadow;
-
-                drop-lbl := Text {
-                    text: "Drop Yomitan .zip dictionary archive to import";
-                    color: SubomiPalette.text;
-                    font-size: 14px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
+        DropOverlay {
+            active: root.drop-hover-active;
+            label: "Drop Yomitan .zip dictionary archive to import";
         }
     }
 }

@@ -152,7 +152,9 @@ export component DictionarySearchPanel inherits Rectangle {
                 }
             }
 
-            if root.active-query != "" : VerticalLayout {
+            VerticalLayout {
+                visible: root.active-query != "";
+                width: root.active-query != "" ? 28px : 0px;
                 alignment: center;
                 horizontal-stretch: 0;
                 IconButton {
@@ -393,7 +395,8 @@ export component DictionarySearchPanel inherits Rectangle {
                     background: transparent;
 
                     // Term-group divider
-                    if !panel-row.row-hidden && hit.term-start && idx > 0 : Rectangle {
+                    Rectangle {
+                        visible: !panel-row.row-hidden && hit.term-start && idx > 0;
                         x: 0px;
                         y: 0px;
                         width: parent.width;
@@ -494,7 +497,8 @@ export component DictionarySearchPanel inherits Rectangle {
                                 }
 
                                 // Allow clicking non-rich headword to open in popup
-                                if !PopupBridge.rich-enabled : TouchArea {
+                                TouchArea {
+                                    visible: !PopupBridge.rich-enabled;
                                     mouse-cursor: pointer;
                                     clicked => { root.lookup(hit.expression); }
                                 }

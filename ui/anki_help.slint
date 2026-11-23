@@ -23,9 +23,11 @@ export struct HelpSection {
 
 component CodeExampleChip inherits Rectangle {
     in property <string> snippet;
+    in property <length> chip-height: 28px;
+    in property <length> snippet-size: 12px;
     callback clicked(string);
 
-    height: 28px;
+    height: root.chip-height;
     width: code-row.preferred-width;
     border-radius: 6px;
     background: touch.pressed
@@ -47,7 +49,7 @@ component CodeExampleChip inherits Rectangle {
             text: root.snippet;
             color: SubomiPalette.cyan-text;
             font-family: "monospace";
-            font-size: 12px;
+            font-size: root.snippet-size;
             font-weight: 700;
             vertical-alignment: center;
         }
@@ -158,53 +160,16 @@ component MarkerCard inherits Rectangle {
             spacing: 8px;
 
             // Clickable marker pill copies `{name}` without width jitter on hover
-            marker-pill := Rectangle {
-                height: 26px;
-                width: pill-row.preferred-width;
-                border-radius: 6px;
-                background: pill-touch.pressed
-                    ? SubomiPalette.accent-muted-hover
-                    : (pill-touch.has-hover ? SubomiPalette.accent-muted : SubomiPalette.card-inset);
-                border-width: 1px;
-                border-color: pill-touch.has-hover ? SubomiPalette.cyan-accent : SubomiPalette.border-light;
-
-                animate background { duration: 100ms; }
-                animate border-color { duration: 100ms; }
-
-                pill-row := HorizontalLayout {
-                    padding-left: 9px;
-                    padding-right: 9px;
-                    spacing: 8px;
-                    alignment: center;
-
-                    Text {
-                        text: "{" + root.marker.name + "}";
-                        color: SubomiPalette.cyan-text;
-                        font-family: "monospace";
-                        font-size: 13px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        width: 28px;
-                        text: "Copy";
-                        color: SubomiPalette.cyan-text;
-                        font-size: 10px;
-                        font-weight: 600;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
-                        opacity: pill-touch.has-hover ? 0.9 : 0.0;
-                        animate opacity { duration: 120ms; }
-                    }
-                }
-
-                pill-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.copy-marker("{" + root.marker.name + "}"); }
-                }
+            CodeExampleChip {
+                snippet: "{" + root.marker.name + "}";
+                chip-height: 26px;
+                snippet-size: 13px;
+                clicked(s) => { root.copy-marker(s); }
             }
 
-            if root.marker.arguments.length > 0 : VerticalLayout {
+            VerticalLayout {
+                visible: root.marker.arguments.length > 0;
+                width: root.marker.arguments.length > 0 ? self.preferred-width : 0px;
                 alignment: center;
                 Rectangle {
                     height: 22px;
@@ -244,8 +209,9 @@ component MarkerCard inherits Rectangle {
 
                 for argument[idx] in root.marker.arguments : VerticalLayout {
                     spacing: 4px;
-                    if idx > 0 : Rectangle {
-                        height: 1px;
+                    Rectangle {
+                        visible: idx > 0;
+                        height: idx > 0 ? 1px : 0px;
                         background: SubomiPalette.border;
                     }
                     HorizontalLayout {
@@ -390,7 +356,9 @@ export component AnkiHelpWindow inherits Window {
                             }
                         }
 
-                        if root.copied-notice != "" : VerticalLayout {
+                        VerticalLayout {
+                            visible: root.copied-notice != "";
+                            width: root.copied-notice != "" ? self.preferred-width : 0px;
                             alignment: center;
                             Rectangle {
                                 height: 28px;
@@ -428,7 +396,9 @@ export component AnkiHelpWindow inherits Window {
                                     }
                                 }
 
-                                if root.search-query != "" : VerticalLayout {
+                                VerticalLayout {
+                                    visible: root.search-query != "";
+                                    width: root.search-query != "" ? 28px : 0px;
                                     alignment: center;
                                     IconButton {
                                         icon: @image-url("icons/close.svg");
@@ -479,49 +449,23 @@ export component AnkiHelpWindow inherits Window {
                         property <bool> compact-wrap: root.width < (self.is-term ? 680px : 660px);
                         height: compact-wrap ? 58px : 26px;
 
-                        if !compact-wrap : HorizontalLayout {
+                        VerticalLayout {
                             x: 0px;
                             y: 0px;
                             width: parent.width;
-                            height: 26px;
-                            spacing: 6px;
-                            alignment: start;
-
-                            FilterChip {
-                                label: "All Sections";
-                                active: sub-filter.active-sec == -1;
-                                clicked => {
-                                    if root.active-tab == 1 { root.active-term-section = -1; }
-                                    else { root.active-kanji-section = -1; }
-                                    help-scroll.viewport-y = 0px;
-                                }
-                            }
-                            for name[idx] in sub-filter.sec-names : FilterChip {
-                                label: name;
-                                active: sub-filter.active-sec == idx;
-                                clicked => {
-                                    if root.active-tab == 1 { root.active-term-section = idx; }
-                                    else { root.active-kanji-section = idx; }
-                                    help-scroll.viewport-y = 0px;
-                                }
-                            }
-                        }
-
-                        if compact-wrap : VerticalLayout {
-                            x: 0px;
-                            y: 0px;
-                            width: parent.width;
-                            height: 58px;
+                            height: parent.height;
                             spacing: 6px;
 
                             HorizontalLayout {
+                                height: 26px;
                                 spacing: 0px;
                                 alignment: start;
+
                                 HorizontalLayout {
                                     padding-right: 6px;
                                     FilterChip {
                                         label: "All Sections";
-                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == -1;
+                                        active: sub-filter.active-sec == -1;
                                         clicked => {
                                             if root.active-tab == 1 { root.active-term-section = -1; }
                                             else { root.active-kanji-section = -1; }
@@ -529,11 +473,14 @@ export component AnkiHelpWindow inherits Window {
                                         }
                                     }
                                 }
-                                for name[idx] in (root.active-tab == 1 ? root.term-section-names : root.kanji-section-names) : HorizontalLayout {
-                                    padding-right: idx < 2 ? 6px : 0px;
-                                    if idx < 2 : FilterChip {
+                                for name[idx] in sub-filter.sec-names : HorizontalLayout {
+                                    property <bool> on-row1: !sub-filter.compact-wrap || idx < 2;
+                                    visible: self.on-row1;
+                                    width: self.on-row1 ? self.preferred-width : 0px;
+                                    padding-right: self.on-row1 ? 6px : 0px;
+                                    FilterChip {
                                         label: name;
-                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == idx;
+                                        active: sub-filter.active-sec == idx;
                                         clicked => {
                                             if root.active-tab == 1 { root.active-term-section = idx; }
                                             else { root.active-kanji-section = idx; }
@@ -542,14 +489,19 @@ export component AnkiHelpWindow inherits Window {
                                     }
                                 }
                             }
-                            HorizontalLayout {
+
+                            if sub-filter.compact-wrap : HorizontalLayout {
+                                height: 26px;
                                 spacing: 0px;
                                 alignment: start;
-                                for name[idx] in (root.active-tab == 1 ? root.term-section-names : root.kanji-section-names) : HorizontalLayout {
-                                    padding-right: idx >= 2 ? 6px : 0px;
-                                    if idx >= 2 : FilterChip {
+                                for name[idx] in sub-filter.sec-names : HorizontalLayout {
+                                    property <bool> on-row2: idx >= 2;
+                                    visible: self.on-row2;
+                                    width: self.on-row2 ? self.preferred-width : 0px;
+                                    padding-right: self.on-row2 ? 6px : 0px;
+                                    FilterChip {
                                         label: name;
-                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == idx;
+                                        active: sub-filter.active-sec == idx;
                                         clicked => {
                                             if root.active-tab == 1 { root.active-term-section = idx; }
                                             else { root.active-kanji-section = idx; }

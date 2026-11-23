@@ -1,6 +1,7 @@
 import { Palette } from "std-widgets.slint";
 import { SubomiPalette } from "palette.slint";
 import { ActionButton } from "components/buttons.slint";
+import { DropOverlay } from "components/modal.slint";
 import {
     SettingsWindow,
     AnkiExcludedDictRow,
@@ -2080,7 +2081,9 @@ export component SubomiApp inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        if !root.update-dialog-opt-in && root.update-dialog-release-tag != "" : VerticalLayout {
+                        VerticalLayout {
+                            visible: !root.update-dialog-opt-in && root.update-dialog-release-tag != "";
+                            width: (!root.update-dialog-opt-in && root.update-dialog-release-tag != "") ? self.preferred-width : 0px;
                             alignment: center;
                             Rectangle {
                                 height: 24px;
@@ -2170,36 +2173,11 @@ export component SubomiApp inherits Window {
         }
 
         // Subtle OS Drag-and-Drop Overlay (C2)
-        if root.drop-hover-active : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: SubomiPalette.accent-subtle;
-            border-width: 3px;
-            border-color: SubomiPalette.cyan-accent;
-
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: min(parent.width - 64px, main-drop-lbl.preferred-width + 44px);
-                height: 54px;
-                border-radius: 12px;
-                background: SubomiPalette.surface-elevated;
-                border-width: 1.5px;
-                border-color: SubomiPalette.cyan-accent;
-                drop-shadow-blur: 20px;
-                drop-shadow-color: SubomiPalette.shadow;
-
-                main-drop-lbl := Text {
-                    text: root.drop-hover-label != ""
-                        ? root.drop-hover-label
-                        : "Drop media or subtitle files to open";
-                    color: SubomiPalette.text;
-                    font-size: 14px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
+        DropOverlay {
+            active: root.drop-hover-active;
+            label: root.drop-hover-label != ""
+                ? root.drop-hover-label
+                : "Drop media or subtitle files to open";
         }
     }
 }
