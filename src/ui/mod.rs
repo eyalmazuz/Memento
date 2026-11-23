@@ -1,6 +1,6 @@
 //! Generated Slint UI bindings and rich dictionary/subtitle bridges for Subomi.
 
-slint::include_modules!();
+pub use subomi_ui::*;
 
 mod bridge;
 mod dict_assets;

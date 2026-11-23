@@ -54,6 +54,7 @@ subomi-net = { path = "crates/subomi-net" }
 subomi-audio = { path = "crates/subomi-audio" }
 subomi-util = { path = "crates/subomi-util" }
 subomi-os = { path = "crates/subomi-os" }
+subomi-ui = { path = "crates/subomi-ui" }
 subomi-asr = { path = "crates/subomi-asr" }
 subomi-asr-onnx = { path = "crates/subomi-asr-onnx", optional = true }
 subomi-asr-whisper = { path = "crates/subomi-asr-whisper", optional = true }
@@ -63,9 +64,6 @@ base64 = "=0.22.1"
 libloading = "=0.8.9"
 i-slint-backend-testing = "=1.16.1"
 i-slint-renderer-femtovg = { version = "=1.16.1", features = ["opengl"] }
-
-[build-dependencies]
-slint-build = "=1.16.1"
 
 [lib]
 name = "subomi_app"
@@ -85,21 +83,22 @@ members = [
 [profile.release]
 opt-level = "z"
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = "symbols"
 debug-assertions = false
 overflow-checks = false
 
 # Distribution release profile: inherits size/speed tuning and per-package
-# overrides from `release` while upgrading to fat LTO for maximum cross-crate
-# inlining and dead-code elimination. Keep unwinding enabled (`catch_unwind` is
-# relied upon across FFI/clipboard/testing boundaries).
+# overrides from `release` while upgrading to fat LTO + single codegen unit
+# for maximum cross-crate inlining and dead-code elimination. Keep unwinding
+# enabled (`catch_unwind` is relied upon across FFI/clipboard/testing boundaries).
 [profile.release-dist]
 inherits = "release"
 lto = "fat"
+codegen-units = 1
 
 # Keep hot rendering, text shaping, dictionary search, ASS, and ASR DSP crates at -O3
-# while cold UI glue and generated Slint code optimize for binary size (`opt-level = "s"`).
+# while cold UI glue and generated Slint code optimize for binary size (`opt-level = "z"`).
 [profile.release.package.swash]
 opt-level = 3
 
@@ -153,6 +152,14 @@ opt-level = 3
 
 [profile.release.package.image-webp]
 opt-level = 3
+
+# Keep full file:line panic backtraces in dev/test while eliminating ~750 MB of
+# full-variable DWARF bloat per binary (especially across generated Slint UI).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.subomi-ui]
+debug = 0
 
 # `cargo run` is also used for playback. Keep debug symbols/assertions while
 # optimizing the UI libraries' per-frame work.
