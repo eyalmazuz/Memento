@@ -386,7 +386,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = slint::set_xdg_app_id(subomi_os::WAYLAND_APP_ID);
     let app = SubomiApp::new()?;
-    ui::prepare_text_fonts();
+    ui::spawn_prepare_text_fonts();
 
     if let Some(cache_dir) = subomi_xdg_dir("XDG_CACHE_HOME", ".cache") {
         if let Err(error) = migrate_xdg_config_if_needed(&cache_dir, &config_dir, "subomi.conf") {

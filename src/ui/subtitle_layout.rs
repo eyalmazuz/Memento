@@ -111,15 +111,15 @@ fn subtitle_style_for_app(app: &SubomiApp) -> SubtitleRenderStyle {
     active_subtitle_render_style()
 }
 
-pub fn subtitle_token_width_with_style(
+fn subtitle_token_width_with_engine(
+    engine: &mut super::text_engine::TextEngine,
     word: &SubtitleWord,
     font_px: f32,
     furigana: bool,
     style: &SubtitleRenderStyle,
 ) -> f32 {
-    if let Some(shaped_width) = with_shared_text_engine(|engine| {
-        engine.measure_subtitle_token_width(word, font_px, furigana, style)
-    }) {
+    if let Some(shaped_width) = engine.measure_subtitle_token_width(word, font_px, furigana, style)
+    {
         return shaped_width;
     }
     let base_width = estimated_subtitle_text_width(word.text.as_str(), font_px);
@@ -140,6 +140,17 @@ pub fn subtitle_token_width_with_style(
     base_width.max(reading_width - max_ruby_bleed * 2.0) + 2.0
 }
 
+pub fn subtitle_token_width_with_style(
+    word: &SubtitleWord,
+    font_px: f32,
+    furigana: bool,
+    style: &SubtitleRenderStyle,
+) -> f32 {
+    with_shared_text_engine(|engine| {
+        subtitle_token_width_with_engine(engine, word, font_px, furigana, style)
+    })
+}
+
 pub fn subtitle_token_width(word: &SubtitleWord, font_px: f32, furigana: bool) -> f32 {
     let style = active_subtitle_render_style();
     subtitle_token_width_with_style(word, font_px, furigana, &style)
@@ -152,40 +163,43 @@ pub fn subtitle_lines_from_words_with_style(
     furigana: bool,
     style: &SubtitleRenderStyle,
 ) -> Vec<SubtitleLine> {
-    let mut lines = Vec::new();
-    let mut current_line: Vec<SubtitleWord> = Vec::new();
-    let mut current_width = 0.0;
+    with_shared_text_engine(|engine| {
+        let mut lines = Vec::new();
+        let mut current_line: Vec<SubtitleWord> = Vec::new();
+        let mut current_width = 0.0;
 
-    for word in all_words {
-        let word_text = word.text.as_str();
-        if word_text.contains('\n') {
-            if !current_line.is_empty() {
+        for word in all_words {
+            let word_text = word.text.as_str();
+            if word_text.contains('\n') {
+                if !current_line.is_empty() {
+                    lines.push(SubtitleLine {
+                        words: Rc::new(VecModel::from(std::mem::take(&mut current_line))).into(),
+                    });
+                    current_width = 0.0;
+                }
+                continue;
+            }
+            let token_width =
+                subtitle_token_width_with_engine(engine, &word, font_px, furigana, style);
+            if current_width + token_width > max_width_px && !current_line.is_empty() {
                 lines.push(SubtitleLine {
                     words: Rc::new(VecModel::from(std::mem::take(&mut current_line))).into(),
                 });
                 current_width = 0.0;
+                if word_text.trim().is_empty() {
+                    continue;
+                }
             }
-            continue;
+            current_width += token_width;
+            current_line.push(word);
         }
-        let token_width = subtitle_token_width_with_style(&word, font_px, furigana, style);
-        if current_width + token_width > max_width_px && !current_line.is_empty() {
+        if !current_line.is_empty() {
             lines.push(SubtitleLine {
-                words: Rc::new(VecModel::from(std::mem::take(&mut current_line))).into(),
+                words: Rc::new(VecModel::from(current_line)).into(),
             });
-            current_width = 0.0;
-            if word_text.trim().is_empty() {
-                continue;
-            }
         }
-        current_width += token_width;
-        current_line.push(word);
-    }
-    if !current_line.is_empty() {
-        lines.push(SubtitleLine {
-            words: Rc::new(VecModel::from(current_line)).into(),
-        });
-    }
-    lines
+        lines
+    })
 }
 
 pub fn subtitle_lines_from_words(

@@ -26,8 +26,8 @@ pub use dict_assets::{
 pub use glossary_render::{
     compute_collapsible_metrics, extract_glossary_scan_substring,
     render_structured_glossary_entry, render_structured_glossary_entry_in_dirs,
-    strict_char_index_at_point, GlossaryCharCell, GlossaryHitZone, GlossaryZoneAction,
-    RenderedGlossaryDoc, MAX_NESTED_POPUP_DEPTH,
+    strict_char_index_at_point, GlossaryCharCell, GlossaryHitZone, GlossaryLineBand,
+    GlossaryZoneAction, RenderedGlossaryDoc, MAX_NESTED_POPUP_DEPTH,
 };
 pub use popup_css::{
     default_custom_popup_css_template, default_custom_popup_outer_css_template,
@@ -39,7 +39,7 @@ pub use popup_css::{
 pub use popup_model::{
     dictionary_result_rows, install_popup_navigation, is_kanji_char, next_popup_batch_end,
     popup_pitch_graphs, prepare_text_fonts, rich_pitch_graphs_from_details, set_dictionary_rows,
-    split_anki_tags_str,
+    spawn_prepare_text_fonts, split_anki_tags_str,
 };
 pub use subtitle_layout::{
     active_subtitle_style_for_app, apply_subtitle_furigana, publish_active_subtitle,

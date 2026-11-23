@@ -31,9 +31,8 @@ use super::popup_css::{
 };
 use super::subtitle_layout::is_japanese_lookup_char;
 use super::text_engine::{
-    blit_alpha_glyph, composite_rgb_over_opaque, pixmap_to_pixel_buffer, quantize_subpixel_x,
-    with_shared_text_engine, BorrowFontExt, PositionedMaskGlyph, TextEngine,
-    RICH_EMOJI_FALLBACK_STACK,
+    blit_alpha_glyph, composite_rgb_over_opaque, quantize_subpixel_x, with_shared_text_engine,
+    BorrowFontExt, PositionedMaskGlyph, TextEngine, RICH_EMOJI_FALLBACK_STACK,
 };
 use super::RichSelectionRect;
 
@@ -63,13 +62,22 @@ pub struct GlossaryCharCell {
     pub line_id: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
+pub struct GlossaryLineBand {
+    pub min_y: f32,
+    pub max_y: f32,
+    pub start_idx: usize,
+    pub end_idx: usize,
+}
+
+#[derive(Clone, Default)]
 pub struct RenderedGlossaryDoc {
     pub width_px: f32,
     pub height_px: f32,
     pub image: slint::Image,
     pub hit_zones: Vec<GlossaryHitZone>,
     pub selectable_chars: Vec<GlossaryCharCell>,
+    pub line_bands: Vec<GlossaryLineBand>,
     pub line_bottoms: Vec<f32>,
     pub plain_text: String,
 }
@@ -86,14 +94,48 @@ pub(super) struct RasterizedGlossaryDoc {
     pub(super) plain_text: String,
 }
 
+fn compute_line_bands(chars: &[GlossaryCharCell]) -> Vec<GlossaryLineBand> {
+    let mut bands = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let first = &chars[i];
+        if first.ch == '\n' || first.w <= 0.0 || first.h <= 0.0 {
+            i += 1;
+            continue;
+        }
+        let line_id = first.line_id;
+        let start_idx = i;
+        let mut min_y = first.y;
+        let mut max_y = first.y + first.h;
+        i += 1;
+        while i < chars.len() && chars[i].line_id == line_id {
+            let cell = &chars[i];
+            if cell.ch != '\n' && cell.w > 0.0 && cell.h > 0.0 {
+                min_y = min_y.min(cell.y);
+                max_y = max_y.max(cell.y + cell.h);
+            }
+            i += 1;
+        }
+        bands.push(GlossaryLineBand {
+            min_y,
+            max_y,
+            start_idx,
+            end_idx: i,
+        });
+    }
+    bands
+}
+
 impl RasterizedGlossaryDoc {
     pub(super) fn into_rendered_doc(self) -> RenderedGlossaryDoc {
+        let line_bands = compute_line_bands(&self.selectable_chars);
         RenderedGlossaryDoc {
             width_px: self.width_px,
             height_px: self.height_px,
             image: slint::Image::from_rgba8_premultiplied(self.pixels),
             hit_zones: self.hit_zones,
             selectable_chars: self.selectable_chars,
+            line_bands,
             line_bottoms: self.line_bottoms,
             plain_text: self.plain_text,
         }
@@ -114,52 +156,81 @@ fn is_japanese_scan_continue_char(ch: char) -> bool {
     is_japanese_lookup_char(ch) && ch != '\u{30fb}'
 }
 
-/// Strict bounding-box hit-test over `RenderedGlossaryDoc::selectable_chars` for
-/// hover-scanning inside glossary definitions (returns `None` on blank margins/empty space).
-pub fn strict_char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> Option<usize> {
-    if doc.selectable_chars.is_empty() {
-        return None;
+#[inline]
+fn eval_strict_char_cell(
+    chars: &[GlossaryCharCell],
+    idx: usize,
+    x: f32,
+    y: f32,
+    best: &mut Option<(usize, bool, f32)>,
+) {
+    let cell = &chars[idx];
+    if cell.ch == '\n' || cell.w <= 0.0 || cell.h <= 0.0 {
+        return;
     }
-    let mut best: Option<(usize, bool, f32)> = None;
-    for (idx, cell) in doc.selectable_chars.iter().enumerate() {
-        if cell.ch == '\n' || cell.w <= 0.0 || cell.h <= 0.0 {
-            continue;
-        }
-        let is_line_end = doc
-            .selectable_chars
-            .get(idx + 1)
-            .is_none_or(|next| next.ch == '\n' || next.line_id != cell.line_id);
-        let pad_left = 1.5f32;
+    const PAD_LEFT: f32 = 1.5;
+    const PAD_Y: f32 = 1.5;
+    const MAX_LINE_END_PAD_RIGHT: f32 = 4.5;
+    if y < cell.y - PAD_Y
+        || y > cell.y + cell.h + PAD_Y
+        || x < cell.x - PAD_LEFT
+        || x > cell.x + cell.w + MAX_LINE_END_PAD_RIGHT
+    {
+        return;
+    }
+    let right_base = cell.x + cell.w;
+    if x > right_base + PAD_LEFT {
         // Slightly widen the right hit-edge of the final visible character on a line so
         // scanning the last word of a glossary line without trailing punctuation (#2232)
         // resolves cleanly while blank margins still return `None`.
-        let pad_right = if is_line_end {
-            (cell.w * 0.25).clamp(2.0, 4.5)
-        } else {
-            1.5f32
-        };
-        let pad_y = 1.5f32;
-        if x < cell.x - pad_left
-            || x > cell.x + cell.w + pad_right
-            || y < cell.y - pad_y
-            || y > cell.y + cell.h + pad_y
-        {
-            continue;
+        let is_line_end = chars
+            .get(idx + 1)
+            .is_none_or(|next| next.ch == '\n' || next.line_id != cell.line_id);
+        if !is_line_end {
+            return;
         }
-        let strictly_inside =
-            x >= cell.x && x <= cell.x + cell.w && y >= cell.y && y <= cell.y + cell.h;
-        let cx = cell.x + cell.w * 0.5;
-        let cy = cell.y + cell.h * 0.5;
-        let dist = (x - cx).hypot(y - cy);
-        let is_better = match best {
-            None => true,
-            Some((_, best_inside, best_dist)) => {
-                (strictly_inside && !best_inside)
-                    || (strictly_inside == best_inside && dist < best_dist)
+        let pad_right = (cell.w * 0.25).clamp(2.0, MAX_LINE_END_PAD_RIGHT);
+        if x > right_base + pad_right {
+            return;
+        }
+    }
+    let strictly_inside = x >= cell.x && x <= right_base && y >= cell.y && y <= cell.y + cell.h;
+    let dx = x - (cell.x + cell.w * 0.5);
+    let dy = y - (cell.y + cell.h * 0.5);
+    let dist_sq = dx * dx + dy * dy;
+    let is_better = match *best {
+        None => true,
+        Some((_, best_inside, best_dist_sq)) => {
+            (strictly_inside && !best_inside)
+                || (strictly_inside == best_inside && dist_sq < best_dist_sq)
+        }
+    };
+    if is_better {
+        *best = Some((idx, strictly_inside, dist_sq));
+    }
+}
+
+/// Strict bounding-box hit-test over `RenderedGlossaryDoc::selectable_chars` for
+/// hover-scanning inside glossary definitions (returns `None` on blank margins/empty space).
+pub fn strict_char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> Option<usize> {
+    let chars = doc.selectable_chars.as_slice();
+    if chars.is_empty() {
+        return None;
+    }
+    const PAD_Y: f32 = 1.5;
+    let mut best: Option<(usize, bool, f32)> = None;
+    if !doc.line_bands.is_empty() {
+        for band in &doc.line_bands {
+            if y < band.min_y - PAD_Y || y > band.max_y + PAD_Y {
+                continue;
             }
-        };
-        if is_better {
-            best = Some((idx, strictly_inside, dist));
+            for idx in band.start_idx..band.end_idx {
+                eval_strict_char_cell(chars, idx, x, y, &mut best);
+            }
+        }
+    } else {
+        for idx in 0..chars.len() {
+            eval_strict_char_cell(chars, idx, x, y, &mut best);
         }
     }
     best.map(|(idx, _, _)| idx)
@@ -350,17 +421,34 @@ fn parse_css_invert_ratio(filter_value: &str) -> Option<f32> {
 fn invert_pixmap(src: &tiny_skia::Pixmap, ratio: f32) -> Arc<tiny_skia::Pixmap> {
     let ratio = ratio.clamp(0.0, 1.0);
     let mut out = src.clone();
+    if (ratio - 1.0).abs() <= f32::EPSILON {
+        for px in out.pixels_mut() {
+            let a = px.alpha();
+            if a == 0 {
+                continue;
+            }
+            if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(
+                a.saturating_sub(px.red()),
+                a.saturating_sub(px.green()),
+                a.saturating_sub(px.blue()),
+                a,
+            ) {
+                *px = p;
+            }
+        }
+        return Arc::new(out);
+    }
+    // In premultiplied RGBA, unpremultiplying then re-premultiplying cancels alpha:
+    //   ((c / a_f) * (1 - r) + (255 - c / a_f) * r) * a_f == c * (1 - 2r) + a * r
+    let scale = 1.0 - 2.0 * ratio;
     for px in out.pixels_mut() {
         let a = px.alpha();
         if a == 0 {
             continue;
         }
-        let af = f32::from(a) / 255.0;
-        let inv_chan = |c: u8| -> u8 {
-            let unp = (f32::from(c) / af).clamp(0.0, 255.0);
-            let blended = unp * (1.0 - ratio) + (255.0 - unp) * ratio;
-            (blended * af).round().clamp(0.0, f32::from(a)) as u8
-        };
+        let af_term = f32::from(a) * ratio;
+        let max_c = f32::from(a);
+        let inv_chan = |c: u8| -> u8 { (f32::from(c) * scale + af_term).round().clamp(0.0, max_c) as u8 };
         if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(
             inv_chan(px.red()),
             inv_chan(px.green()),
@@ -2232,18 +2320,18 @@ fn layout_and_collect_block(
 }
 
 #[derive(Clone)]
-struct AtomSpanMeta {
+struct AtomSpanMeta<'a> {
     byte_range: std::ops::Range<usize>,
-    style: InlineStyleIR,
+    style: &'a InlineStyleIR,
     selectable: bool,
-    detail_toggle: Option<String>,
+    detail_toggle: Option<&'a str>,
 }
 
-struct RubyBoxItem {
+struct RubyBoxItem<'a> {
     box_id: u64,
-    base: String,
-    reading: String,
-    style: InlineStyleIR,
+    base: &'a str,
+    reading: &'a str,
+    style: &'a InlineStyleIR,
     w: f32,
     h: f32,
     base_y: f32,
@@ -2254,13 +2342,24 @@ struct RubyBoxItem {
     ruby_layout: parley::Layout<[u8; 4]>,
 }
 
-struct ImageBoxItem {
+struct ImageBoxItem<'a> {
     box_id: u64,
-    pixmap: Arc<tiny_skia::Pixmap>,
+    pixmap: &'a Arc<tiny_skia::Pixmap>,
     w: f32,
     h: f32,
-    link_href: Option<String>,
-    tooltip: Option<String>,
+    link_href: Option<&'a str>,
+    tooltip: Option<&'a str>,
+}
+
+#[inline]
+fn find_span_for_byte<'a>(spans: &'a [AtomSpanMeta<'a>], byte: usize) -> Option<&'a AtomSpanMeta<'a>> {
+    let idx = spans.partition_point(|s| s.byte_range.end <= byte);
+    spans.get(idx).filter(|s| byte >= s.byte_range.start)
+}
+
+enum GlyphRunRasterizer<'a> {
+    Mono(super::text_engine::AlphaGlyphRun<'a>),
+    Color(&'a mut TextEngine),
 }
 
 fn layout_inline_atoms(
@@ -2278,9 +2377,9 @@ fn layout_inline_atoms(
     }
 
     let mut full_text = String::new();
-    let mut spans: Vec<AtomSpanMeta> = Vec::new();
-    let mut ruby_boxes: Vec<RubyBoxItem> = Vec::new();
-    let mut image_boxes: Vec<ImageBoxItem> = Vec::new();
+    let mut spans: Vec<AtomSpanMeta<'_>> = Vec::new();
+    let mut ruby_boxes: Vec<RubyBoxItem<'_>> = Vec::new();
+    let mut image_boxes: Vec<ImageBoxItem<'_>> = Vec::new();
     let mut inline_boxes: Vec<InlineBox> = Vec::new();
     let mut next_box_id = 1u64;
 
@@ -2306,7 +2405,7 @@ fn layout_inline_atoms(
                 let end = full_text.len();
                 spans.push(AtomSpanMeta {
                     byte_range: start..end,
-                    style: style.clone(),
+                    style,
                     selectable: *selectable,
                     detail_toggle: None,
                 });
@@ -2325,9 +2424,9 @@ fn layout_inline_atoms(
                 let end = full_text.len();
                 spans.push(AtomSpanMeta {
                     byte_range: start..end,
-                    style: style.clone(),
+                    style,
                     selectable: false,
-                    detail_toggle: Some(detail_id.clone()),
+                    detail_toggle: Some(detail_id.as_str()),
                 });
             }
             InlineAtom::LineBreak => {
@@ -2380,9 +2479,9 @@ fn layout_inline_atoms(
                 });
                 ruby_boxes.push(RubyBoxItem {
                     box_id: id,
-                    base: base.clone(),
-                    reading: reading.clone(),
-                    style: style.clone(),
+                    base: base.as_str(),
+                    reading: reading.as_str(),
+                    style,
                     w,
                     h,
                     base_y: rh,
@@ -2413,11 +2512,11 @@ fn layout_inline_atoms(
                 });
                 image_boxes.push(ImageBoxItem {
                     box_id: id,
-                    pixmap: pixmap.clone(),
+                    pixmap,
                     w: dw,
                     h: dh,
-                    link_href: link_href.clone(),
-                    tooltip: tooltip.clone(),
+                    link_href: link_href.as_deref(),
+                    tooltip: tooltip.as_deref(),
                 });
             }
         }
@@ -2492,13 +2591,6 @@ fn layout_inline_atoms(
         return (max_line_w.max(0.0), total_h);
     }
 
-    let mut byte_to_span = vec![usize::MAX; full_text.len() + 1];
-    for (s_idx, span) in spans.iter().enumerate() {
-        for b in span.byte_range.start..span.byte_range.end.min(byte_to_span.len()) {
-            byte_to_span[b] = s_idx;
-        }
-    }
-
     let total_lines = layout.len();
     for (line_idx, line) in layout.lines().enumerate() {
         let line_text_range = line.text_range();
@@ -2534,11 +2626,22 @@ fn layout_inline_atoms(
                     let glyph_end = glyph_start + glyph_count;
 
                     let font_size = run.font_size();
+                    let scale = collector.render_scale;
+                    let scaled_font_size = font_size * scale;
                     let brush = glyph_run.style().brush;
                     let run_ul = glyph_run.style().underline.is_some();
                     let run_st = glyph_run.style().strikethrough.is_some();
                     let synth_italic = run.synthesis().skew().is_some();
                     let is_color_font = engine.font_supports_color(run_font.borrow_font());
+                    let mut rasterizer = if is_color_font {
+                        GlyphRunRasterizer::Color(&mut *engine)
+                    } else {
+                        GlyphRunRasterizer::Mono(engine.alpha_glyph_run(
+                            run_font.borrow_font(),
+                            scaled_font_size,
+                            synth_italic,
+                        ))
+                    };
                     let mut x_cursor = origin_x + glyph_run.offset();
                     let mut cluster_glyph_idx = 0usize;
                     let mut prev_cluster_in_slice = false;
@@ -2560,11 +2663,7 @@ fn layout_inline_atoms(
 
                         let range = cluster.text_range();
                         let adv = cluster.advance();
-                        let span_meta = byte_to_span
-                            .get(range.start)
-                            .copied()
-                            .filter(|&idx| idx != usize::MAX)
-                            .and_then(|idx| spans.get(idx));
+                        let span_meta = find_span_for_byte(&spans, range.start);
 
                         if let Some(meta) = span_meta {
                             if let Some(bg) = meta.style.pill_bg {
@@ -2592,8 +2691,8 @@ fn layout_inline_atoms(
                                     border_col,
                                 ));
                             }
-                            let action = if let Some(ref did) = meta.detail_toggle {
-                                Some(GlossaryZoneAction::ToggleDetails(did.clone()))
+                            let action = if let Some(did) = meta.detail_toggle {
+                                Some(GlossaryZoneAction::ToggleDetails(did.to_owned()))
                             } else if let Some(did) = summary_detail_id {
                                 Some(GlossaryZoneAction::ToggleDetails(did.to_owned()))
                             } else {
@@ -2612,50 +2711,66 @@ fn layout_inline_atoms(
                         }
 
                         if c_glyph_count > 0 {
-                            let scale = collector.render_scale;
-                            let scaled_font_size = font_size * scale;
                             let mut gx = x_cursor;
                             for g in cluster.glyphs() {
                                 let phys_x = (gx + g.x) * scale;
                                 let phys_y = (baseline + g.y) * scale;
-                                let rendered_color = is_color_font
-                                    && engine
-                                        .try_render_color_glyph(
-                                            run_font.borrow_font(),
-                                            g.id as u16,
-                                            scaled_font_size,
-                                        )
-                                        .is_some_and(|cg| {
-                                            let cw = cg.pixmap.width() as f32;
-                                            let ch = cg.pixmap.height() as f32;
-                                            collector.images.push(PositionedGlossaryImage {
-                                                phys_x: phys_x + cg.left,
-                                                phys_y: phys_y - cg.top,
-                                                phys_w: cw,
-                                                phys_h: ch,
-                                                pixmap: cg.pixmap,
+                                match &mut rasterizer {
+                                    GlyphRunRasterizer::Mono(alpha_run) => {
+                                        let (glyph_x, sub_q) = if scale < 1.75 {
+                                            quantize_subpixel_x(phys_x)
+                                        } else {
+                                            (phys_x.round() as i32, 0)
+                                        };
+                                        if let Some(ag) = alpha_run.render(g.id as u16, sub_q) {
+                                            collector.mask_glyphs.push(PositionedMaskGlyph {
+                                                x: glyph_x + ag.left,
+                                                y: phys_y.round() as i32 - ag.top,
+                                                glyph: ag,
+                                                rgba: brush,
                                             });
-                                            true
-                                        });
-                                if !rendered_color {
-                                    let (glyph_x, sub_q) = if scale < 1.75 {
-                                        quantize_subpixel_x(phys_x)
-                                    } else {
-                                        (phys_x.round() as i32, 0)
-                                    };
-                                    if let Some(ag) = engine.try_render_alpha_glyph(
-                                        run_font.borrow_font(),
-                                        g.id as u16,
-                                        scaled_font_size,
-                                        synth_italic,
-                                        sub_q,
-                                    ) {
-                                        collector.mask_glyphs.push(PositionedMaskGlyph {
-                                            x: glyph_x + ag.left,
-                                            y: phys_y.round() as i32 - ag.top,
-                                            glyph: ag,
-                                            rgba: brush,
-                                        });
+                                        }
+                                    }
+                                    GlyphRunRasterizer::Color(eng) => {
+                                        let rendered_color = eng
+                                            .try_render_color_glyph(
+                                                run_font.borrow_font(),
+                                                g.id as u16,
+                                                scaled_font_size,
+                                            )
+                                            .is_some_and(|cg| {
+                                                let cw = cg.pixmap.width() as f32;
+                                                let ch = cg.pixmap.height() as f32;
+                                                collector.images.push(PositionedGlossaryImage {
+                                                    phys_x: phys_x + cg.left,
+                                                    phys_y: phys_y - cg.top,
+                                                    phys_w: cw,
+                                                    phys_h: ch,
+                                                    pixmap: cg.pixmap,
+                                                });
+                                                true
+                                            });
+                                        if !rendered_color {
+                                            let (glyph_x, sub_q) = if scale < 1.75 {
+                                                quantize_subpixel_x(phys_x)
+                                            } else {
+                                                (phys_x.round() as i32, 0)
+                                            };
+                                            if let Some(ag) = eng.try_render_alpha_glyph(
+                                                run_font.borrow_font(),
+                                                g.id as u16,
+                                                scaled_font_size,
+                                                synth_italic,
+                                                sub_q,
+                                            ) {
+                                                collector.mask_glyphs.push(PositionedMaskGlyph {
+                                                    x: glyph_x + ag.left,
+                                                    y: phys_y.round() as i32 - ag.top,
+                                                    glyph: ag,
+                                                    rgba: brush,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                                 gx += g.advance;
@@ -2673,21 +2788,24 @@ fn layout_inline_atoms(
                         }
 
                         if let Some(slice) = full_text.get(range.clone()) {
-                            let visible_chars: Vec<char> = slice
-                                .chars()
-                                .filter(|&c| c != '\n' && c != '\r')
-                                .collect();
-                            if !visible_chars.is_empty() {
-                                let selectable = span_meta.is_none_or(|m| m.selectable);
-                                if selectable {
-                                    let char_count = visible_chars.len();
+                            let selectable = span_meta.is_none_or(|m| m.selectable);
+                            if selectable {
+                                let char_count = slice
+                                    .chars()
+                                    .filter(|&c| c != '\n' && c != '\r')
+                                    .count();
+                                if char_count > 0 {
                                     let effective_adv = if adv > 0.0 {
                                         adv
                                     } else {
                                         font_size * 0.45 * (char_count as f32)
                                     };
                                     let per_w = (effective_adv / (char_count as f32)).max(2.0);
-                                    for (ci, ch) in visible_chars.into_iter().enumerate() {
+                                    for (ci, ch) in slice
+                                        .chars()
+                                        .filter(|&c| c != '\n' && c != '\r')
+                                        .enumerate()
+                                    {
                                         let norm_ch = if ch == '\u{00A0}' { ' ' } else { ch };
                                         collector.selectable_chars.push(GlossaryCharCell {
                                             ch: norm_ch,
@@ -2772,8 +2890,10 @@ fn layout_inline_atoms(
                                 y: by,
                                 w: img.w + 2.0,
                                 h: img.h + 2.0,
-                                action: img.link_href.clone().map(GlossaryZoneAction::Link),
-                                tooltip: img.tooltip.clone(),
+                                action: img
+                                    .link_href
+                                    .map(|href| GlossaryZoneAction::Link(href.to_owned())),
+                                tooltip: img.tooltip.map(str::to_owned),
                             });
                         }
                     }
@@ -3462,11 +3582,10 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
 
     if top_blocks.is_empty() {
         if had_hidden_elements {
-            let empty_pm = tiny_skia::Pixmap::new(1, 1)?;
             return Some(RasterizedGlossaryDoc {
                 width_px: 1.0,
                 height_px: 1.0,
-                pixels: pixmap_to_pixel_buffer(&empty_pm),
+                pixels: SharedPixelBuffer::<Rgba8Pixel>::new(1, 1),
                 hit_zones: Vec::new(),
                 selectable_chars: Vec::new(),
                 line_bottoms: Vec::new(),
@@ -3511,51 +3630,54 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
     let logical_h = (cur_y + 2.0).ceil().clamp(18.0, max_logical_h);
     let pw = (logical_w * scale).ceil().clamp(1.0, 4200.0) as u32;
     let ph = (logical_h * scale).ceil().clamp(1.0, 16384.0) as u32;
-    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    let mut pixel_buf = SharedPixelBuffer::<Rgba8Pixel>::new(pw, ph);
+    {
+        let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixel_buf.make_mut_bytes(), pw, ph)?;
 
-    for &(rx, ry, rw, rh, col) in &collector.rects {
-        if let Some(rect) = tiny_skia::Rect::from_xywh(
-            (rx * scale).round(),
-            (ry * scale).round(),
-            (rw * scale).round().max(1.0),
-            (rh * scale).round().max(1.0),
-        ) {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color_rgba8(col[0], col[1], col[2], col[3]);
-            pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
+        for &(rx, ry, rw, rh, col) in &collector.rects {
+            if let Some(rect) = tiny_skia::Rect::from_xywh(
+                (rx * scale).round(),
+                (ry * scale).round(),
+                (rw * scale).round().max(1.0),
+                (rh * scale).round().max(1.0),
+            ) {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color_rgba8(col[0], col[1], col[2], col[3]);
+                pixmap.fill_rect(rect, &paint, tiny_skia::Transform::default(), None);
+            }
         }
-    }
 
-    let img_paint = tiny_skia::PixmapPaint {
-        opacity: 1.0,
-        blend_mode: tiny_skia::BlendMode::SourceOver,
-        quality: tiny_skia::FilterQuality::Bilinear,
-    };
-    for img in &collector.images {
-        let src_w = img.pixmap.width().max(1) as f32;
-        let src_h = img.pixmap.height().max(1) as f32;
-        if (src_w - img.phys_w).abs() <= 0.75 && (src_h - img.phys_h).abs() <= 0.75 {
-            pixmap.draw_pixmap(
-                img.phys_x.round() as i32,
-                img.phys_y.round() as i32,
-                (*img.pixmap).as_ref(),
-                &img_paint,
-                tiny_skia::Transform::default(),
-                None,
-            );
-        } else {
-            let sx = img.phys_w / src_w;
-            let sy = img.phys_h / src_h;
-            let xform =
-                tiny_skia::Transform::from_scale(sx, sy).post_translate(img.phys_x, img.phys_y);
-            pixmap.draw_pixmap(0, 0, (*img.pixmap).as_ref(), &img_paint, xform, None);
+        let img_paint = tiny_skia::PixmapPaint {
+            opacity: 1.0,
+            blend_mode: tiny_skia::BlendMode::SourceOver,
+            quality: tiny_skia::FilterQuality::Bilinear,
+        };
+        for img in &collector.images {
+            let src_w = img.pixmap.width().max(1) as f32;
+            let src_h = img.pixmap.height().max(1) as f32;
+            if (src_w - img.phys_w).abs() <= 0.75 && (src_h - img.phys_h).abs() <= 0.75 {
+                pixmap.draw_pixmap(
+                    img.phys_x.round() as i32,
+                    img.phys_y.round() as i32,
+                    (*img.pixmap).as_ref(),
+                    &img_paint,
+                    tiny_skia::Transform::default(),
+                    None,
+                );
+            } else {
+                let sx = img.phys_w / src_w;
+                let sy = img.phys_h / src_h;
+                let xform = tiny_skia::Transform::from_scale(sx, sy)
+                    .post_translate(img.phys_x, img.phys_y);
+                pixmap.draw_pixmap(0, 0, (*img.pixmap).as_ref(), &img_paint, xform, None);
+            }
         }
-    }
 
-    let card_bg = theme.resolve_dict_style(dict_name).card_bg;
-    let backdrop_rgb = composite_rgb_over_opaque(card_bg, theme.popup_bg);
-    for mg in &collector.mask_glyphs {
-        blit_alpha_glyph(&mut pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, backdrop_rgb);
+        let card_bg = theme.resolve_dict_style(dict_name).card_bg;
+        let backdrop_rgb = composite_rgb_over_opaque(card_bg, theme.popup_bg);
+        for mg in &collector.mask_glyphs {
+            blit_alpha_glyph(&mut pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, backdrop_rgb);
+        }
     }
 
     while collector
@@ -3571,7 +3693,7 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
     Some(RasterizedGlossaryDoc {
         width_px: pw as f32 / scale,
         height_px: ph as f32 / scale,
-        pixels: pixmap_to_pixel_buffer(&pixmap),
+        pixels: pixel_buf,
         hit_zones: collector.hit_zones,
         selectable_chars: collector.selectable_chars,
         line_bottoms,

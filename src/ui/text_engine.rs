@@ -1,7 +1,7 @@
 //! Shared Parley + Swash + Tiny-Skia text shaping, glyph caching, and
 //! direct vector subtitle rasterization engine.
 
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -23,8 +23,13 @@ use super::subtitle_layout::active_subtitle_render_style;
 use super::SubtitleWord;
 
 const SUBTITLE_CACHE_MAX_ENTRIES: usize = 256;
+const SUBTITLE_WIDTH_CACHE_MAX_ENTRIES: usize = 512;
 const EMOJI_CACHE_MAX_ENTRIES: usize = 512;
 const ALPHA_GLYPH_CACHE_MAX_ENTRIES: usize = 8192;
+const IDLE_SUBTITLE_CACHE_MAX_ENTRIES: usize = 64;
+const IDLE_SUBTITLE_WIDTH_CACHE_MAX_ENTRIES: usize = 128;
+const IDLE_EMOJI_CACHE_MAX_ENTRIES: usize = 64;
+const IDLE_ALPHA_GLYPH_CACHE_MAX_ENTRIES: usize = 1024;
 const SUBTITLE_PREWARM_MAX_TOKENS: usize = 96;
 const SUBTITLE_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -103,13 +108,10 @@ pub struct ShapedSubtitleToken {
     pub image: slint::Image,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
-struct SubtitleCacheKey {
-    text: String,
-    reading: String,
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+struct SubtitleStyleKey {
     font_tenth_px: i32,
     show_furigana: bool,
-    font_family: String,
     text_rgba: [u8; 4],
     stroke_rgba: [u8; 4],
     stroke_tenth: i32,
@@ -117,6 +119,92 @@ struct SubtitleCacheKey {
     line_spacing_tenth: i32,
     bold: bool,
     italic: bool,
+}
+
+#[derive(Clone, Eq)]
+struct SubtitleCacheKey {
+    text: String,
+    reading: String,
+    font_family: String,
+    style: SubtitleStyleKey,
+}
+
+struct SubtitleKeyRef<'a> {
+    text: &'a str,
+    reading: &'a str,
+    font_family: &'a str,
+    style: SubtitleStyleKey,
+}
+
+trait SubtitleCacheKeyLike {
+    fn key_parts(&self) -> (&str, &str, &str, SubtitleStyleKey);
+}
+
+impl SubtitleCacheKeyLike for SubtitleCacheKey {
+    #[inline]
+    fn key_parts(&self) -> (&str, &str, &str, SubtitleStyleKey) {
+        (
+            self.text.as_str(),
+            self.reading.as_str(),
+            self.font_family.as_str(),
+            self.style,
+        )
+    }
+}
+
+impl SubtitleCacheKeyLike for SubtitleKeyRef<'_> {
+    #[inline]
+    fn key_parts(&self) -> (&str, &str, &str, SubtitleStyleKey) {
+        (self.text, self.reading, self.font_family, self.style)
+    }
+}
+
+impl PartialEq for SubtitleCacheKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key_parts() == other.key_parts()
+    }
+}
+
+impl Hash for SubtitleCacheKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn SubtitleCacheKeyLike + '_ {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key_parts() == other.key_parts()
+    }
+}
+
+impl Eq for dyn SubtitleCacheKeyLike + '_ {}
+
+impl Hash for dyn SubtitleCacheKeyLike + '_ {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key_parts().hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn SubtitleCacheKeyLike + 'a> for SubtitleCacheKey {
+    #[inline]
+    fn borrow(&self) -> &(dyn SubtitleCacheKeyLike + 'a) {
+        self
+    }
+}
+
+impl SubtitleKeyRef<'_> {
+    fn to_owned_key(&self) -> SubtitleCacheKey {
+        SubtitleCacheKey {
+            text: self.text.to_owned(),
+            reading: self.reading.to_owned(),
+            font_family: self.font_family.to_owned(),
+            style: self.style,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -158,7 +246,10 @@ impl<K: Eq + Hash, V> BoundedLruCache<K, V> {
         self.clock
     }
 
-    fn get(&mut self, key: &K) -> Option<&V> {
+    fn get<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         let stamp = self.next_stamp();
         let entry = self.entries.get_mut(key)?;
         entry.0 = stamp;
@@ -191,12 +282,30 @@ impl<K: Eq + Hash, V> BoundedLruCache<K, V> {
         self.entries.retain(|_, (s, _)| *s > cutoff);
     }
 
+    fn shrink_to(&mut self, target_entries: usize) {
+        if self.entries.len() > target_entries {
+            if target_entries == 0 {
+                self.entries.clear();
+            } else {
+                let drop_count = self.entries.len() - target_entries;
+                let mut stamps: Vec<u64> = self.entries.values().map(|(s, _)| *s).collect();
+                let (_, threshold, _) = stamps.select_nth_unstable(drop_count - 1);
+                let cutoff = *threshold;
+                self.entries.retain(|_, (s, _)| *s > cutoff);
+            }
+        }
+        self.entries.shrink_to_fit();
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    fn contains_key(&self, key: &K) -> bool {
+    fn contains_key<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
         self.entries.contains_key(key)
     }
 }
@@ -214,14 +323,21 @@ fn srgb_luma(r: u8, g: u8, b: u8) -> f32 {
     (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
 }
 
+/// Exact rounded division by 255 for `x <= 65_025` (`(x + 127) / 255` without integer division).
+#[inline]
+pub(super) fn div255(x: u32) -> u32 {
+    let t = x + 128;
+    (t + (t >> 8)) >> 8
+}
+
 #[inline]
 pub(super) fn composite_rgb_over_opaque(fg: [u8; 4], bg: [u8; 4]) -> [u8; 3] {
     let a = u32::from(fg[3]);
     let inv = 255 - a;
     [
-        ((u32::from(fg[0]) * a + u32::from(bg[0]) * inv + 127) / 255) as u8,
-        ((u32::from(fg[1]) * a + u32::from(bg[1]) * inv + 127) / 255) as u8,
-        ((u32::from(fg[2]) * a + u32::from(bg[2]) * inv + 127) / 255) as u8,
+        div255(u32::from(fg[0]) * a + u32::from(bg[0]) * inv) as u8,
+        div255(u32::from(fg[1]) * a + u32::from(bg[1]) * inv) as u8,
+        div255(u32::from(fg[2]) * a + u32::from(bg[2]) * inv) as u8,
     ]
 }
 
@@ -262,7 +378,7 @@ fn light_on_dark_lut_level(fg_lum: f32, bg_lum: f32) -> usize {
 }
 
 pub(super) fn blit_alpha_glyph(
-    pixmap: &mut tiny_skia::Pixmap,
+    pixmap: &mut tiny_skia::PixmapMut<'_>,
     x0: i32,
     y0: i32,
     glyph: &CachedAlphaGlyph,
@@ -289,55 +405,96 @@ pub(super) fn blit_alpha_glyph(
     let fg_lum = srgb_luma(sr, sg, sb);
     let base_bg_lum = srgb_luma(backdrop_rgb[0], backdrop_rgb[1], backdrop_rgb[2]);
     let base_lut = &tables[light_on_dark_lut_level(fg_lum, base_bg_lum)];
+    let opaque_pm = tiny_skia::PremultipliedColorU8::from_rgba(sr, sg, sb, 255);
+    let sr_u = u32::from(sr);
+    let sg_u = u32::from(sg);
+    let sb_u = u32::from(sb);
+    let br_u = u32::from(backdrop_rgb[0]);
+    let bg_u = u32::from(backdrop_rgb[1]);
+    let bb_u = u32::from(backdrop_rgb[2]);
 
     let pixels = pixmap.pixels_mut();
     let pw_u = pw as usize;
     let gw_u = gw as usize;
+    let span_w = (sx_end - sx_start) as usize;
+    let dst_x_off = (x0 + sx_start) as usize;
+    let mask_x_off = sx_start as usize;
+
     for sy in sy_start..sy_end {
-        let row_off = (y0 + sy) as usize * pw_u;
-        let mask_row = (sy as usize) * gw_u;
-        for sx in sx_start..sx_end {
-            let raw_cov = glyph.mask[mask_row + sx as usize];
+        let dst_start = (y0 + sy) as usize * pw_u + dst_x_off;
+        let mask_start = (sy as usize) * gw_u + mask_x_off;
+        let dst_row = &mut pixels[dst_start..dst_start + span_w];
+        let mask_row = &glyph.mask[mask_start..mask_start + span_w];
+
+        for (dst_slot, &raw_cov) in dst_row.iter_mut().zip(mask_row.iter()) {
             if raw_cov == 0 {
                 continue;
             }
-            let idx = row_off + (x0 + sx) as usize;
-            let dst = pixels[idx];
-            let cov = if dst.alpha() == 0 {
-                u32::from(base_lut[usize::from(raw_cov)])
-            } else {
-                let da = u32::from(dst.alpha());
-                let inv_da = 255 - da;
-                let eff_r = (u32::from(dst.red())
-                    + (u32::from(backdrop_rgb[0]) * inv_da + 127) / 255)
-                    .min(255) as u8;
-                let eff_g = (u32::from(dst.green())
-                    + (u32::from(backdrop_rgb[1]) * inv_da + 127) / 255)
-                    .min(255) as u8;
-                let eff_b = (u32::from(dst.blue())
-                    + (u32::from(backdrop_rgb[2]) * inv_da + 127) / 255)
-                    .min(255) as u8;
-                let eff_lum = srgb_luma(eff_r, eff_g, eff_b);
-                u32::from(tables[light_on_dark_lut_level(fg_lum, eff_lum)][usize::from(raw_cov)])
-            };
+            let dst = *dst_slot;
+            if dst.alpha() == 0 {
+                let cov = base_lut[usize::from(raw_cov)];
+                if cov == 0 {
+                    continue;
+                }
+                if sa == 255 && cov == 255 {
+                    if let Some(pm) = opaque_pm {
+                        *dst_slot = pm;
+                    }
+                    continue;
+                }
+                let alpha = if sa == 255 {
+                    u32::from(cov)
+                } else {
+                    div255(u32::from(cov) * sa_u)
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                let out_r = div255(sr_u * alpha).min(alpha) as u8;
+                let out_g = div255(sg_u * alpha).min(alpha) as u8;
+                let out_b = div255(sb_u * alpha).min(alpha) as u8;
+                if let Some(pm) =
+                    tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, alpha as u8)
+                {
+                    *dst_slot = pm;
+                }
+                continue;
+            }
+
+            let da = u32::from(dst.alpha());
+            let inv_da = 255 - da;
+            let eff_r = (u32::from(dst.red()) + div255(br_u * inv_da)).min(255) as u8;
+            let eff_g = (u32::from(dst.green()) + div255(bg_u * inv_da)).min(255) as u8;
+            let eff_b = (u32::from(dst.blue()) + div255(bb_u * inv_da)).min(255) as u8;
+            let eff_lum = srgb_luma(eff_r, eff_g, eff_b);
+            let cov = u32::from(tables[light_on_dark_lut_level(fg_lum, eff_lum)][usize::from(raw_cov)]);
             if cov == 0 {
                 continue;
             }
-            let alpha = (cov * sa_u + 127) / 255;
+            let alpha = if sa == 255 {
+                cov
+            } else {
+                div255(cov * sa_u)
+            };
             if alpha == 0 {
                 continue;
             }
+            if alpha == 255 {
+                if let Some(pm) = opaque_pm {
+                    *dst_slot = pm;
+                }
+                continue;
+            }
             let inv_a = 255 - alpha;
-            let out_a = (alpha + (u32::from(dst.alpha()) * inv_a + 127) / 255).min(255) as u8;
-            let out_r = ((u32::from(sr) * alpha + u32::from(dst.red()) * inv_a + 127) / 255)
-                .min(u32::from(out_a)) as u8;
-            let out_g = ((u32::from(sg) * alpha + u32::from(dst.green()) * inv_a + 127) / 255)
-                .min(u32::from(out_a)) as u8;
-            let out_b = ((u32::from(sb) * alpha + u32::from(dst.blue()) * inv_a + 127) / 255)
-                .min(u32::from(out_a)) as u8;
-            if let Some(pm) = tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a)
+            let out_a = (alpha + div255(da * inv_a)).min(255) as u8;
+            let out_a_u = u32::from(out_a);
+            let out_r = div255(sr_u * alpha + u32::from(dst.red()) * inv_a).min(out_a_u) as u8;
+            let out_g = div255(sg_u * alpha + u32::from(dst.green()) * inv_a).min(out_a_u) as u8;
+            let out_b = div255(sb_u * alpha + u32::from(dst.blue()) * inv_a).min(out_a_u) as u8;
+            if let Some(pm) =
+                tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a)
             {
-                pixels[idx] = pm;
+                *dst_slot = pm;
             }
         }
     }
@@ -434,6 +591,7 @@ pub(super) struct TextEngine {
     alpha_glyph_cache: BoundedLruCache<(u64, u32, u16, i32, i8, u8), Option<CachedAlphaGlyph>>,
     default_svg_fonts_primed: bool,
     subtitle_cache: BoundedLruCache<SubtitleCacheKey, ShapedSubtitleToken>,
+    subtitle_width_cache: BoundedLruCache<SubtitleCacheKey, f32>,
     devoice_circle: Option<slint::Image>,
 }
 
@@ -443,6 +601,14 @@ thread_local! {
 
 pub(super) fn with_shared_text_engine<R>(f: impl FnOnce(&mut TextEngine) -> R) -> R {
     SHARED_TEXT_ENGINE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+pub(super) fn shrink_shared_text_engine_caches() {
+    SHARED_TEXT_ENGINE.with(|cell| {
+        if let Ok(mut engine) = cell.try_borrow_mut() {
+            engine.shrink_caches_for_idle();
+        }
+    });
 }
 
 impl TextEngine {
@@ -464,8 +630,20 @@ impl TextEngine {
             alpha_glyph_cache: BoundedLruCache::new(ALPHA_GLYPH_CACHE_MAX_ENTRIES),
             default_svg_fonts_primed: false,
             subtitle_cache: BoundedLruCache::new(SUBTITLE_CACHE_MAX_ENTRIES),
+            subtitle_width_cache: BoundedLruCache::new(SUBTITLE_WIDTH_CACHE_MAX_ENTRIES),
             devoice_circle: None,
         }
+    }
+
+    pub(super) fn shrink_caches_for_idle(&mut self) {
+        self.alpha_glyph_cache
+            .shrink_to(IDLE_ALPHA_GLYPH_CACHE_MAX_ENTRIES);
+        self.emoji_cache.shrink_to(IDLE_EMOJI_CACHE_MAX_ENTRIES);
+        self.subtitle_cache
+            .shrink_to(IDLE_SUBTITLE_CACHE_MAX_ENTRIES);
+        self.subtitle_width_cache
+            .shrink_to(IDLE_SUBTITLE_WIDTH_CACHE_MAX_ENTRIES);
+        self.font_cx.source_cache.prune(2, true);
     }
 
     /// Ensure `self.fontdb` has a real CJK-capable sans-serif font registered and mapped
@@ -565,6 +743,128 @@ impl TextEngine {
         self.emoji_cache.insert(key, rendered.clone());
         rendered
     }
+}
+
+enum LazyAlphaScaler<'a> {
+    Uninit(&'a mut swash::scale::ScaleContext),
+    Ready(swash::scale::Scaler<'a>),
+    Failed,
+}
+
+/// Per-`GlyphRun` alpha mask cache/rasterizer helper.
+/// Warm cache hits pay zero scaler setup; the first cold miss lazily builds a
+/// single `swash::Scaler` reused across all subsequent misses in the same run.
+pub(super) struct AlphaGlyphRun<'a> {
+    font_bytes: &'a [u8],
+    font_id: u64,
+    font_index: u32,
+    font_size: f32,
+    size_tenth: i32,
+    skew_key: i8,
+    synthetic_italic: bool,
+    scaler: LazyAlphaScaler<'a>,
+    cache: &'a mut BoundedLruCache<(u64, u32, u16, i32, i8, u8), Option<CachedAlphaGlyph>>,
+}
+
+impl<'a> AlphaGlyphRun<'a> {
+    pub(super) fn render(&mut self, glyph_id: u16, subpixel_quarter: u8) -> Option<CachedAlphaGlyph> {
+        let sub_q = subpixel_quarter & 3;
+        let key = (
+            self.font_id,
+            self.font_index,
+            glyph_id,
+            self.size_tenth,
+            self.skew_key,
+            sub_q,
+        );
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        let synth_italic = self.synthetic_italic;
+        let rendered = self
+            .ensure_scaler()
+            .and_then(|scaler| render_alpha_mask_with_scaler(scaler, glyph_id, sub_q, synth_italic));
+        self.cache.insert(key, rendered.clone());
+        rendered
+    }
+
+    fn ensure_scaler(&mut self) -> Option<&mut swash::scale::Scaler<'a>> {
+        if matches!(self.scaler, LazyAlphaScaler::Uninit(_)) {
+            let prev = std::mem::replace(&mut self.scaler, LazyAlphaScaler::Failed);
+            if let LazyAlphaScaler::Uninit(scale_cx) = prev {
+                if let Some(font_ref) =
+                    swash::FontRef::from_index(self.font_bytes, self.font_index as usize)
+                {
+                    let scaler = scale_cx
+                        .builder(font_ref)
+                        .size(self.font_size.max(6.0))
+                        .hint(true)
+                        .build();
+                    self.scaler = LazyAlphaScaler::Ready(scaler);
+                }
+            }
+        }
+        match &mut self.scaler {
+            LazyAlphaScaler::Ready(scaler) => Some(scaler),
+            _ => None,
+        }
+    }
+}
+
+fn render_alpha_mask_with_scaler(
+    scaler: &mut swash::scale::Scaler<'_>,
+    glyph_id: u16,
+    sub_q: u8,
+    synthetic_italic: bool,
+) -> Option<CachedAlphaGlyph> {
+    let mut render = swash::scale::Render::new(&[
+        swash::scale::Source::Outline,
+        swash::scale::Source::Bitmap(swash::scale::StrikeWith::BestFit),
+    ]);
+    if sub_q != 0 {
+        render.offset(swash::zeno::Vector::new(f32::from(sub_q) * 0.25, 0.0));
+    }
+    if synthetic_italic {
+        render.transform(Some(swash::zeno::Transform::skew(
+            swash::zeno::Angle::from_degrees(-14.0),
+            swash::zeno::Angle::ZERO,
+        )));
+    }
+    let image = render.render(scaler, glyph_id)?;
+    if image.content != swash::scale::image::Content::Mask
+        || image.placement.width == 0
+        || image.placement.height == 0
+    {
+        return None;
+    }
+    Some(CachedAlphaGlyph {
+        width: image.placement.width,
+        height: image.placement.height,
+        left: image.placement.left,
+        top: image.placement.top,
+        mask: Arc::from(image.data),
+    })
+}
+
+impl TextEngine {
+    pub(super) fn alpha_glyph_run<'a>(
+        &'a mut self,
+        font: &'a parley::FontData,
+        font_size: f32,
+        synthetic_italic: bool,
+    ) -> AlphaGlyphRun<'a> {
+        AlphaGlyphRun {
+            font_bytes: font.data.data(),
+            font_id: font.data.id(),
+            font_index: font.index,
+            font_size,
+            size_tenth: (font_size * 10.0).round() as i32,
+            skew_key: if synthetic_italic { 1 } else { 0 },
+            synthetic_italic,
+            scaler: LazyAlphaScaler::Uninit(&mut self.scale_cx),
+            cache: &mut self.alpha_glyph_cache,
+        }
+    }
 
     pub(super) fn try_render_alpha_glyph(
         &mut self,
@@ -574,51 +874,8 @@ impl TextEngine {
         synthetic_italic: bool,
         subpixel_quarter: u8,
     ) -> Option<CachedAlphaGlyph> {
-        let sub_q = subpixel_quarter & 3;
-        let size_tenth = (font_size * 10.0).round() as i32;
-        let skew_key: i8 = if synthetic_italic { 1 } else { 0 };
-        let key = (font.data.id(), font.index, glyph_id, size_tenth, skew_key, sub_q);
-        if let Some(cached) = self.alpha_glyph_cache.get(&key) {
-            return cached.clone();
-        }
-        let rendered = (|| -> Option<CachedAlphaGlyph> {
-            let font_ref = swash::FontRef::from_index(font.data.data(), font.index as usize)?;
-            let mut scaler = self
-                .scale_cx
-                .builder(font_ref)
-                .size(font_size.max(6.0))
-                .hint(true)
-                .build();
-            let mut render = swash::scale::Render::new(&[
-                swash::scale::Source::Outline,
-                swash::scale::Source::Bitmap(swash::scale::StrikeWith::BestFit),
-            ]);
-            if sub_q != 0 {
-                render.offset(swash::zeno::Vector::new(f32::from(sub_q) * 0.25, 0.0));
-            }
-            if synthetic_italic {
-                render.transform(Some(swash::zeno::Transform::skew(
-                    swash::zeno::Angle::from_degrees(-14.0),
-                    swash::zeno::Angle::ZERO,
-                )));
-            }
-            let image = render.render(&mut scaler, glyph_id)?;
-            if image.content != swash::scale::image::Content::Mask
-                || image.placement.width == 0
-                || image.placement.height == 0
-            {
-                return None;
-            }
-            Some(CachedAlphaGlyph {
-                width: image.placement.width,
-                height: image.placement.height,
-                left: image.placement.left,
-                top: image.placement.top,
-                mask: Arc::from(image.data),
-            })
-        })();
-        self.alpha_glyph_cache.insert(key, rendered.clone());
-        rendered
+        self.alpha_glyph_run(font, font_size, synthetic_italic)
+            .render(glyph_id, subpixel_quarter)
     }
 
     pub(super) fn collect_glossary_glyphs_from_layout(
@@ -644,13 +901,39 @@ impl TextEngine {
                     let synth_italic = run.synthesis().skew().is_some();
                     let run_x = origin_x + glyph_run.offset();
                     let mut gx = run_x;
-                    for g in glyph_run.positioned_glyphs() {
-                        let px = origin_x + g.x;
-                        let py = origin_y + g.y;
-                        let phys_x = px * scale;
-                        let phys_y = py * scale;
-                        let rendered_color = is_color_font
-                            && self
+                    if !is_color_font {
+                        let mut alpha_run = self.alpha_glyph_run(
+                            run_font.borrow_font(),
+                            scaled_font_size,
+                            synth_italic,
+                        );
+                        for g in glyph_run.positioned_glyphs() {
+                            let px = origin_x + g.x;
+                            let py = origin_y + g.y;
+                            let phys_x = px * scale;
+                            let phys_y = py * scale;
+                            let (glyph_x, sub_q) = if scale < 1.75 {
+                                quantize_subpixel_x(phys_x)
+                            } else {
+                                (phys_x.round() as i32, 0)
+                            };
+                            if let Some(ag) = alpha_run.render(g.id as u16, sub_q) {
+                                collector.mask_glyphs.push(PositionedMaskGlyph {
+                                    x: glyph_x + ag.left,
+                                    y: phys_y.round() as i32 - ag.top,
+                                    glyph: ag,
+                                    rgba: brush,
+                                });
+                            }
+                            gx = gx.max(px + g.advance);
+                        }
+                    } else {
+                        for g in glyph_run.positioned_glyphs() {
+                            let px = origin_x + g.x;
+                            let py = origin_y + g.y;
+                            let phys_x = px * scale;
+                            let phys_y = py * scale;
+                            let rendered_color = self
                                 .try_render_color_glyph(
                                     run_font.borrow_font(),
                                     g.id as u16,
@@ -668,28 +951,29 @@ impl TextEngine {
                                     });
                                     true
                                 });
-                        if !rendered_color {
-                            let (glyph_x, sub_q) = if scale < 1.75 {
-                                quantize_subpixel_x(phys_x)
-                            } else {
-                                (phys_x.round() as i32, 0)
-                            };
-                            if let Some(ag) = self.try_render_alpha_glyph(
-                                run_font.borrow_font(),
-                                g.id as u16,
-                                scaled_font_size,
-                                synth_italic,
-                                sub_q,
-                            ) {
-                                collector.mask_glyphs.push(PositionedMaskGlyph {
-                                    x: glyph_x + ag.left,
-                                    y: phys_y.round() as i32 - ag.top,
-                                    glyph: ag,
-                                    rgba: brush,
-                                });
+                            if !rendered_color {
+                                let (glyph_x, sub_q) = if scale < 1.75 {
+                                    quantize_subpixel_x(phys_x)
+                                } else {
+                                    (phys_x.round() as i32, 0)
+                                };
+                                if let Some(ag) = self.try_render_alpha_glyph(
+                                    run_font.borrow_font(),
+                                    g.id as u16,
+                                    scaled_font_size,
+                                    synth_italic,
+                                    sub_q,
+                                ) {
+                                    collector.mask_glyphs.push(PositionedMaskGlyph {
+                                        x: glyph_x + ag.left,
+                                        y: phys_y.round() as i32 - ag.top,
+                                        glyph: ag,
+                                        rgba: brush,
+                                    });
+                                }
                             }
+                            gx = gx.max(px + g.advance);
                         }
-                        gx = gx.max(px + g.advance);
                     }
                     let adv = (gx - run_x).max(0.0);
                     if underline && adv > 0.0 {
@@ -756,11 +1040,13 @@ impl TextEngine {
         italic: bool,
         color: [u8; 4],
     ) -> Layout<[u8; 4]> {
-        let family_stack = if font_family.trim().is_empty() {
-            Cow::Borrowed(RICH_EMOJI_FALLBACK_STACK)
-        } else {
-            Cow::Owned(format!("{font_family}, {RICH_EMOJI_FALLBACK_STACK}"))
-        };
+        let trimmed = font_family.trim();
+        let family_stack =
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Noto Sans CJK JP") {
+                Cow::Borrowed(RICH_EMOJI_FALLBACK_STACK)
+            } else {
+                Cow::Owned(format!("{trimmed}, {RICH_EMOJI_FALLBACK_STACK}"))
+            };
         let mut builder = self
             .layout_cx
             .ranged_builder(&mut self.font_cx, text, 1.0, true);
@@ -780,6 +1066,33 @@ impl TextEngine {
         layout
     }
 
+    fn make_subtitle_key_ref<'a>(
+        text: &'a str,
+        reading: &'a str,
+        font_px: f32,
+        show_furigana: bool,
+        style: &'a SubtitleRenderStyle,
+    ) -> SubtitleKeyRef<'a> {
+        let font_px = font_px.clamp(8.0, 140.0);
+        let line_spacing_extra = style.line_spacing.clamp(0.0, 120.0);
+        SubtitleKeyRef {
+            text,
+            reading: if show_furigana { reading } else { "" },
+            font_family: style.font_family.as_str(),
+            style: SubtitleStyleKey {
+                font_tenth_px: (font_px * 10.0).round() as i32,
+                show_furigana,
+                text_rgba: style.text_rgba,
+                stroke_rgba: style.stroke_rgba,
+                stroke_tenth: (style.stroke_size * 10.0).round() as i32,
+                furigana_pct: (style.furigana_ratio * 100.0).round() as i32,
+                line_spacing_tenth: (line_spacing_extra * 10.0).round() as i32,
+                bold: style.bold,
+                italic: style.italic,
+            },
+        }
+    }
+
     fn make_subtitle_cache_key_parts(
         text: &str,
         reading: &str,
@@ -787,41 +1100,7 @@ impl TextEngine {
         show_furigana: bool,
         style: &SubtitleRenderStyle,
     ) -> SubtitleCacheKey {
-        let font_px = font_px.clamp(8.0, 140.0);
-        let line_spacing_extra = style.line_spacing.clamp(0.0, 120.0);
-        SubtitleCacheKey {
-            text: text.to_owned(),
-            reading: if show_furigana {
-                reading.to_owned()
-            } else {
-                String::new()
-            },
-            font_tenth_px: (font_px * 10.0).round() as i32,
-            show_furigana,
-            font_family: style.font_family.clone(),
-            text_rgba: style.text_rgba,
-            stroke_rgba: style.stroke_rgba,
-            stroke_tenth: (style.stroke_size * 10.0).round() as i32,
-            furigana_pct: (style.furigana_ratio * 100.0).round() as i32,
-            line_spacing_tenth: (line_spacing_extra * 10.0).round() as i32,
-            bold: style.bold,
-            italic: style.italic,
-        }
-    }
-
-    fn make_subtitle_cache_key(
-        word: &SubtitleWord,
-        font_px: f32,
-        show_furigana: bool,
-        style: &SubtitleRenderStyle,
-    ) -> SubtitleCacheKey {
-        Self::make_subtitle_cache_key_parts(
-            word.text.as_str(),
-            word.reading.as_str(),
-            font_px,
-            show_furigana,
-            style,
-        )
+        Self::make_subtitle_key_ref(text, reading, font_px, show_furigana, style).to_owned_key()
     }
 
     /// Measure the logical layout width of a subtitle token using Parley layout metrics
@@ -837,9 +1116,19 @@ impl TextEngine {
         if word.text.is_empty() {
             return Some(0.0);
         }
-        let key = Self::make_subtitle_cache_key(word, font_px, show_furigana, style);
-        if let Some(cached) = self.subtitle_cache.get(&key) {
+        let key_ref = Self::make_subtitle_key_ref(
+            word.text.as_str(),
+            word.reading.as_str(),
+            font_px,
+            show_furigana,
+            style,
+        );
+        let lookup: &dyn SubtitleCacheKeyLike = &key_ref;
+        if let Some(cached) = self.subtitle_cache.get(lookup) {
             return (cached.width_px > 0.0).then_some(cached.width_px);
+        }
+        if let Some(&cached_w) = self.subtitle_width_cache.get(lookup) {
+            return (cached_w > 0.0).then_some(cached_w);
         }
 
         let font_px = font_px.clamp(8.0, 140.0);
@@ -866,6 +1155,8 @@ impl TextEngine {
             show_furigana,
             style,
         );
+        self.subtitle_width_cache
+            .insert(key_ref.to_owned_key(), layout_width);
         (layout_width > 0.0).then_some(layout_width)
     }
 
@@ -1248,16 +1539,12 @@ impl TextEngine {
 
         let pix_w = ((layout_width + bleed_x * 2.0).ceil() as u32).max(1);
         let pix_h = (total_height.ceil() as u32).max(1);
-        let mut fill_pixmap = tiny_skia::Pixmap::new(pix_w, pix_h)
-            .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+        let mut fill_pixels = SharedPixelBuffer::<Rgba8Pixel>::new(pix_w, pix_h);
 
         let has_stroke_paths = base_geom.path.is_some()
             || ruby_geom.as_ref().is_some_and(|g| g.path.is_some());
-        let mut stroke_pixmap = (stroke_px > 0.0 && style.stroke_rgba[3] > 0 && has_stroke_paths)
-            .then(|| {
-                tiny_skia::Pixmap::new(pix_w, pix_h)
-                    .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap())
-            });
+        let mut stroke_pixels = (stroke_px > 0.0 && style.stroke_rgba[3] > 0 && has_stroke_paths)
+            .then(|| SharedPixelBuffer::<Rgba8Pixel>::new(pix_w, pix_h));
 
         let ruby_stroke_px = (stroke_px * 0.65).max(if stroke_px > 0.0 { 1.0 } else { 0.0 });
         let mut fill_paint = tiny_skia::Paint::default();
@@ -1286,7 +1573,7 @@ impl TextEngine {
         // the UI can composite all token strokes for a line underneath all token fills
         // (matching libass 2-pass rendering and preventing token i+1's outline from
         // painting over token i's fill at MeCab token boundaries).
-        let paint_stroke_layer = |pixmap: &mut tiny_skia::Pixmap,
+        let paint_stroke_layer = |pixmap: &mut tiny_skia::PixmapMut<'_>,
                                   geom: &SubtitleLayerGeometry,
                                   s_width: f32| {
             if let Some(ref path) = geom.path {
@@ -1317,53 +1604,62 @@ impl TextEngine {
             }
         };
 
-        let paint_fill_layer = |pixmap: &mut tiny_skia::Pixmap, geom: &SubtitleLayerGeometry| {
-            if let Some(ref path) = geom.path {
-                pixmap.fill_path(
-                    path,
-                    &fill_paint,
-                    tiny_skia::FillRule::Winding,
-                    tiny_skia::Transform::default(),
-                    None,
-                );
-            }
-            for mg in &geom.fallback_masks {
-                blit_alpha_glyph(pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, [0, 0, 0]);
-            }
-        };
-
-        if let Some(ref mut sp) = stroke_pixmap {
-            if let Some(ref rg) = ruby_geom {
-                paint_stroke_layer(sp, rg, ruby_stroke_px);
-            }
-            paint_stroke_layer(sp, &base_geom, stroke_px);
-        }
-
-        if let Some(ref rg) = ruby_geom {
-            paint_fill_layer(&mut fill_pixmap, rg);
-        }
-        paint_fill_layer(&mut fill_pixmap, &base_geom);
-
-        let has_color = ruby_geom
-            .as_ref()
-            .is_some_and(|g| !g.color_images.is_empty())
-            || !base_geom.color_images.is_empty();
-        if has_color {
-            let img_paint = tiny_skia::PixmapPaint {
-                opacity: 1.0,
-                blend_mode: tiny_skia::BlendMode::SourceOver,
-                quality: tiny_skia::FilterQuality::Bilinear,
+        let paint_fill_layer =
+            |pixmap: &mut tiny_skia::PixmapMut<'_>, geom: &SubtitleLayerGeometry| {
+                if let Some(ref path) = geom.path {
+                    pixmap.fill_path(
+                        path,
+                        &fill_paint,
+                        tiny_skia::FillRule::Winding,
+                        tiny_skia::Transform::default(),
+                        None,
+                    );
+                }
+                for mg in &geom.fallback_masks {
+                    blit_alpha_glyph(pixmap, mg.x, mg.y, &mg.glyph, mg.rgba, [0, 0, 0]);
+                }
             };
-            let ruby_imgs = ruby_geom.map_or_else(Vec::new, |g| g.color_images);
-            for (ix, iy, img_pm) in ruby_imgs.into_iter().chain(base_geom.color_images) {
-                fill_pixmap.draw_pixmap(
-                    ix.round() as i32,
-                    iy.round() as i32,
-                    (*img_pm).as_ref(),
-                    &img_paint,
-                    tiny_skia::Transform::default(),
-                    None,
-                );
+
+        if let Some(ref mut sp_buf) = stroke_pixels {
+            if let Some(mut sp) =
+                tiny_skia::PixmapMut::from_bytes(sp_buf.make_mut_bytes(), pix_w, pix_h)
+            {
+                if let Some(ref rg) = ruby_geom {
+                    paint_stroke_layer(&mut sp, rg, ruby_stroke_px);
+                }
+                paint_stroke_layer(&mut sp, &base_geom, stroke_px);
+            }
+        }
+
+        if let Some(mut fill_pm) =
+            tiny_skia::PixmapMut::from_bytes(fill_pixels.make_mut_bytes(), pix_w, pix_h)
+        {
+            if let Some(ref rg) = ruby_geom {
+                paint_fill_layer(&mut fill_pm, rg);
+            }
+            paint_fill_layer(&mut fill_pm, &base_geom);
+
+            let has_color = ruby_geom
+                .as_ref()
+                .is_some_and(|g| !g.color_images.is_empty())
+                || !base_geom.color_images.is_empty();
+            if has_color {
+                let img_paint = tiny_skia::PixmapPaint {
+                    opacity: 1.0,
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                };
+                let ruby_imgs = ruby_geom.map_or_else(Vec::new, |g| g.color_images);
+                for (ix, iy, img_pm) in ruby_imgs.into_iter().chain(base_geom.color_images) {
+                    fill_pm.draw_pixmap(
+                        ix.round() as i32,
+                        iy.round() as i32,
+                        (*img_pm).as_ref(),
+                        &img_paint,
+                        tiny_skia::Transform::default(),
+                        None,
+                    );
+                }
             }
         }
 
@@ -1377,8 +1673,8 @@ impl TextEngine {
             glyph_height_px: base_height,
             clusters,
             cluster_hitboxes,
-            stroke_pixels: stroke_pixmap.as_ref().map(pixmap_to_pixel_buffer),
-            pixels: pixmap_to_pixel_buffer(&fill_pixmap),
+            stroke_pixels,
+            pixels: fill_pixels,
         }
     }
 
@@ -1389,8 +1685,15 @@ impl TextEngine {
         show_furigana: bool,
         style: &SubtitleRenderStyle,
     ) -> ShapedSubtitleToken {
-        let key = Self::make_subtitle_cache_key(word, font_px, show_furigana, style);
-        if let Some(cached) = self.subtitle_cache.get(&key) {
+        let key_ref = Self::make_subtitle_key_ref(
+            word.text.as_str(),
+            word.reading.as_str(),
+            font_px,
+            show_furigana,
+            style,
+        );
+        let lookup: &dyn SubtitleCacheKeyLike = &key_ref;
+        if let Some(cached) = self.subtitle_cache.get(lookup) {
             return cached.clone();
         }
         let shaped = self
@@ -1402,7 +1705,8 @@ impl TextEngine {
                 style,
             )
             .into_shaped();
-        self.subtitle_cache.insert(key, shaped.clone());
+        self.subtitle_cache
+            .insert(key_ref.to_owned_key(), shaped.clone());
         shaped
     }
 
@@ -1979,5 +2283,29 @@ mod tests {
                 .is_none(),
             "whitespace-only token must omit stroke layer"
         );
+    }
+
+    #[test]
+    fn div255_matches_rounded_division_for_all_u8_products() {
+        for x in 0..=65_025u32 {
+            assert_eq!(div255(x), (x + 127) / 255, "mismatch at x={x}");
+        }
+    }
+
+    #[test]
+    fn bounded_lru_cache_shrink_to_retains_hottest_entries() {
+        let mut cache: BoundedLruCache<u32, u32> = BoundedLruCache::new(32);
+        for i in 0..20 {
+            cache.insert(i, i * 10);
+        }
+        // Touch 0 and 1 so they become the hottest.
+        assert_eq!(cache.get(&0), Some(&0));
+        assert_eq!(cache.get(&1), Some(&10));
+        cache.shrink_to(4);
+        assert!(cache.len() <= 4);
+        assert!(cache.contains_key(&0));
+        assert!(cache.contains_key(&1));
+        assert!(cache.contains_key(&19));
+        assert!(!cache.contains_key(&2));
     }
 }

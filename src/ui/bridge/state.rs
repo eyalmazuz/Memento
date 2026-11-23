@@ -917,7 +917,7 @@ pub(super) struct GlossaryDocCacheKey {
 }
 
 struct GlossaryCacheEntry {
-    doc: RenderedGlossaryDoc,
+    doc: Arc<RenderedGlossaryDoc>,
     bytes: usize,
     last_used: u64,
 }
@@ -968,15 +968,15 @@ impl GlossaryDocLruCache {
             .max(1024)
     }
 
-    pub(super) fn get(&mut self, key: &GlossaryDocCacheKey) -> Option<RenderedGlossaryDoc> {
+    pub(super) fn get(&mut self, key: &GlossaryDocCacheKey) -> Option<Arc<RenderedGlossaryDoc>> {
         let entry = self.entries.get_mut(key)?;
         self.clock = self.clock.wrapping_add(1);
         entry.last_used = self.clock;
-        Some(entry.doc.clone())
+        Some(Arc::clone(&entry.doc))
     }
 
-    pub(super) fn peek(&self, key: &GlossaryDocCacheKey) -> Option<RenderedGlossaryDoc> {
-        self.entries.get(key).map(|e| e.doc.clone())
+    pub(super) fn peek(&self, key: &GlossaryDocCacheKey) -> Option<Arc<RenderedGlossaryDoc>> {
+        self.entries.get(key).map(|e| Arc::clone(&e.doc))
     }
 
     pub(super) fn contains_key(&self, key: &GlossaryDocCacheKey) -> bool {
@@ -987,15 +987,15 @@ impl GlossaryDocLruCache {
         &self,
         row_index: i32,
         rich_epoch: u64,
-    ) -> Option<RenderedGlossaryDoc> {
+    ) -> Option<Arc<RenderedGlossaryDoc>> {
         self.entries
             .iter()
             .filter(|(k, _)| k.row_index == row_index && k.rich_epoch == rich_epoch)
             .max_by_key(|(_, entry)| entry.last_used)
-            .map(|(_, entry)| entry.doc.clone())
+            .map(|(_, entry)| Arc::clone(&entry.doc))
     }
 
-    pub(super) fn insert(&mut self, key: GlossaryDocCacheKey, doc: RenderedGlossaryDoc) {
+    pub(super) fn insert(&mut self, key: GlossaryDocCacheKey, doc: Arc<RenderedGlossaryDoc>) {
         let bytes = Self::approx_doc_bytes(&doc);
         self.clock = self.clock.wrapping_add(1);
         let stamp = self.clock;

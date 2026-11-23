@@ -14,29 +14,55 @@ use super::{
     PopupGlossaryBlock, PopupLayout, RichPitchGraph, RichPitchMora,
 };
 
+fn warm_font_collection(mut collection: slint::fontique_08::fontique::Collection) {
+    use slint::fontique_08::fontique::{FallbackKey, GenericFamily, Script};
+
+    let mut seen = HashSet::new();
+    let mut families = Vec::new();
+    let mut push_unique = |id| {
+        if seen.insert(id) {
+            families.push(id);
+        }
+    };
+    for id in collection.generic_families(GenericFamily::Emoji) {
+        push_unique(id);
+    }
+    for script in [*b"Hani", *b"Hira", *b"Kana", *b"Zyyy", *b"Latn"] {
+        for id in collection.fallback_families(FallbackKey::new(Script::from_bytes(script), None))
+        {
+            push_unique(id);
+        }
+    }
+    if let Some(family) = collection.family_id("Noto Sans CJK JP") {
+        push_unique(family);
+    }
+    for family in families {
+        let _ = collection.family(family);
+    }
+}
+
 /// Resolve the system's fallback font metadata before media playback starts.
 /// Fontconfig can spend hundreds of milliseconds sorting its font set when a
 /// dictionary first introduces a symbol. Cache those family descriptions once;
 /// keep the system's font choices and load glyphs only when they are needed.
 pub fn prepare_text_fonts() {
-    use slint::fontique_08::{
-        fontique::{FallbackKey, GenericFamily, Script},
-        shared_collection,
-    };
-    let mut collection = shared_collection();
-    let mut families: Vec<_> = collection.generic_families(GenericFamily::Emoji).collect();
-    for script in [*b"Hani", *b"Hira", *b"Kana", *b"Zyyy", *b"Latn"] {
-        families.extend(
-            collection.fallback_families(FallbackKey::new(Script::from_bytes(script), None)),
-        );
+    if let Some(collection) = super::text_engine::capture_shared_font_collection() {
+        warm_font_collection(collection);
+    } else {
+        warm_font_collection(slint::fontique_08::shared_collection());
     }
-    if let Some(family) = collection.family_id("Noto Sans CJK JP") {
-        families.push(family);
+}
+
+/// Non-blocking startup variant of [`prepare_text_fonts`]: captures Slint's shared
+/// `fontique::Collection` on the UI thread and warms fallback family descriptions on
+/// a background thread so window creation, config/SQLite init, and libmpv startup do
+/// not stall behind Fontconfig (~200-250 ms).
+pub fn spawn_prepare_text_fonts() {
+    if let Some(collection) = super::text_engine::capture_shared_font_collection() {
+        let _ = std::thread::Builder::new()
+            .name("subomi-font-warmup".into())
+            .spawn(move || warm_font_collection(collection));
     }
-    for family in families {
-        let _ = collection.family(family);
-    }
-    let _ = super::text_engine::capture_shared_font_collection();
 }
 
 /// Bound the initial layout work, even for a term with many long definitions.

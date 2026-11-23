@@ -397,11 +397,16 @@ fn decode_and_rasterize_dictionary_asset(
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
         if let Some([tr, tg, tb, ta]) = monochrome_tint {
+            use super::text_engine::div255;
+            let tr_u = u32::from(tr);
+            let tg_u = u32::from(tg);
+            let tb_u = u32::from(tb);
+            let ta_u = u32::from(ta);
             for px in pixmap.pixels_mut() {
-                let a = (u32::from(px.alpha()) * u32::from(ta) + 127) / 255;
-                let r = (u32::from(tr) * a + 127) / 255;
-                let g = (u32::from(tg) * a + 127) / 255;
-                let b = (u32::from(tb) * a + 127) / 255;
+                let a = div255(u32::from(px.alpha()) * ta_u);
+                let r = div255(tr_u * a);
+                let g = div255(tg_u * a);
+                let b = div255(tb_u * a);
                 if let Some(tinted) =
                     tiny_skia::PremultipliedColorU8::from_rgba(r as u8, g as u8, b as u8, a as u8)
                 {
@@ -441,19 +446,24 @@ fn decode_and_rasterize_dictionary_asset(
         //   Yomitan CSS `mask-image`) preserve pixel alpha and replace RGB with the tint color.
         let use_inverted_luminance =
             !has_transparency || (visible_count > 0 && min_lum <= 55 && max_lum >= 200);
+        use super::text_engine::div255;
+        let tr_u = u32::from(tr);
+        let tg_u = u32::from(tg);
+        let tb_u = u32::from(tb);
+        let ta_u = u32::from(ta);
         for (dst, src) in src_pixmap.pixels_mut().iter_mut().zip(decoded.pixels()) {
             let [r, g, b, a] = src.0;
             let mask = if use_inverted_luminance {
                 let lum = (77 * u32::from(r) + 150 * u32::from(g) + 29 * u32::from(b) + 128) >> 8;
                 let ink = 255u32.saturating_sub(lum);
-                (ink * u32::from(a) + 127) / 255
+                div255(ink * u32::from(a))
             } else {
                 u32::from(a)
             };
-            let out_a = (mask * u32::from(ta) + 127) / 255;
-            let pr = (u32::from(tr) * out_a + 127) / 255;
-            let pg = (u32::from(tg) * out_a + 127) / 255;
-            let pb = (u32::from(tb) * out_a + 127) / 255;
+            let out_a = div255(mask * ta_u);
+            let pr = div255(tr_u * out_a);
+            let pg = div255(tg_u * out_a);
+            let pb = div255(tb_u * out_a);
             if let Some(pm) =
                 tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, out_a as u8)
             {
@@ -461,11 +471,13 @@ fn decode_and_rasterize_dictionary_asset(
             }
         }
     } else {
+        use super::text_engine::div255;
         for (dst, src) in src_pixmap.pixels_mut().iter_mut().zip(decoded.pixels()) {
             let [r, g, b, a] = src.0;
-            let pr = (u32::from(r) * u32::from(a) + 127) / 255;
-            let pg = (u32::from(g) * u32::from(a) + 127) / 255;
-            let pb = (u32::from(b) * u32::from(a) + 127) / 255;
+            let a_u = u32::from(a);
+            let pr = div255(u32::from(r) * a_u);
+            let pg = div255(u32::from(g) * a_u);
+            let pb = div255(u32::from(b) * a_u);
             if let Some(pm) =
                 tiny_skia::PremultipliedColorU8::from_rgba(pr as u8, pg as u8, pb as u8, a)
             {

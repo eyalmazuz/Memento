@@ -29,6 +29,7 @@
 //! `!important` stripping with diagnostics, `word-break` mapping, and
 //! precomputed tag / child-index candidate rule tables.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::element::{
@@ -56,98 +57,114 @@ fn is_letter_or_number(ch: char) -> bool {
 }
 
 /// Remove `/* ... */` comments outside quoted strings (preserving backslash-
-/// escaped quotes inside strings).
-fn without_css_comments(css: &str) -> String {
-    let mut source = String::with_capacity(css.len());
-    let mut chars = css.chars().peekable();
-    let mut in_comment = false;
+/// escaped quotes inside strings). Borrows input directly when no `/*` occurs.
+fn without_css_comments(css: &str) -> Cow<'_, str> {
+    if !css.contains("/*") {
+        return Cow::Borrowed(css);
+    }
+    let bytes = css.as_bytes();
+    let len = bytes.len();
+    let mut source = String::with_capacity(len);
+    let mut copy_start = 0usize;
+    let mut i = 0usize;
     let mut in_quote = false;
     let mut escaped = false;
-    let mut quote = '\0';
+    let mut quote = 0u8;
 
-    while let Some(ch) = chars.next() {
-        if !in_comment && !in_quote && ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            in_comment = true;
-            continue;
-        }
-        if in_comment {
-            if ch == '*' && chars.peek() == Some(&'/') {
-                chars.next();
-                in_comment = false;
-            }
-            continue;
-        }
-        source.push(ch);
+    while i < len {
+        let b = bytes[i];
         if in_quote {
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == quote {
+            } else if b == quote {
                 in_quote = false;
             }
-        } else if ch == '"' || ch == '\'' {
-            in_quote = true;
-            quote = ch;
+            i += 1;
+            continue;
         }
+        if b == b'"' || b == b'\'' {
+            in_quote = true;
+            quote = b;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            source.push_str(&css[copy_start..i]);
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = if i + 1 < len { i + 2 } else { len };
+            copy_start = i;
+            continue;
+        }
+        i += 1;
     }
-    source
+    source.push_str(&css[copy_start..]);
+    Cow::Owned(source)
 }
 
 /// Find the byte index of the `}` matching the `{` at `open`, respecting
 /// single/double quotes and backslash escapes.
 fn matching_css_brace(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
     let mut depth = 1usize;
     let mut in_quote = false;
     let mut escaped = false;
-    let mut quote = '\0';
-    for (offset, ch) in source[open + 1..].char_indices() {
+    let mut quote = 0u8;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        let b = bytes[i];
         if in_quote {
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == quote {
+            } else if b == quote {
                 in_quote = false;
             }
-            continue;
-        }
-        if ch == '"' || ch == '\'' {
+        } else if b == b'"' || b == b'\'' {
             in_quote = true;
-            quote = ch;
-        } else if ch == '{' {
+            quote = b;
+        } else if b == b'{' {
             depth += 1;
-        } else if ch == '}' {
+        } else if b == b'}' {
             depth -= 1;
             if depth == 0 {
-                return Some(open + 1 + offset);
+                return Some(i);
             }
         }
+        i += 1;
     }
     None
 }
 
 /// Find the next unquoted `{` starting at byte offset `start`.
 fn find_unquoted_brace(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
     let mut in_quote = false;
     let mut escaped = false;
-    let mut quote = '\0';
-    for (offset, ch) in source[start..].char_indices() {
+    let mut quote = 0u8;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
         if in_quote {
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == quote {
+            } else if b == quote {
                 in_quote = false;
             }
-        } else if ch == '"' || ch == '\'' {
+        } else if b == b'"' || b == b'\'' {
             in_quote = true;
-            quote = ch;
-        } else if ch == '{' {
-            return Some(start + offset);
+            quote = b;
+        } else if b == b'{' {
+            return Some(i);
         }
+        i += 1;
     }
     None
 }
@@ -155,86 +172,81 @@ fn find_unquoted_brace(source: &str, start: usize) -> Option<usize> {
 /// Skip an at-rule starting at `@` (`start`), returning the byte index of its
 /// terminating `;` or matching `}`, or `source.len()` if unterminated.
 fn skip_css_at_rule(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
     let mut in_quote = false;
     let mut escaped = false;
-    let mut quote = '\0';
-    for (offset, ch) in source[start..].char_indices() {
+    let mut quote = 0u8;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
         if in_quote {
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == quote {
+            } else if b == quote {
                 in_quote = false;
             }
-            continue;
-        }
-        if ch == '"' || ch == '\'' {
+        } else if b == b'"' || b == b'\'' {
             in_quote = true;
-            quote = ch;
-        } else if ch == ';' {
-            return start + offset;
-        } else if ch == '{' {
-            return matching_css_brace(source, start + offset).unwrap_or(source.len());
+            quote = b;
+        } else if b == b';' {
+            return i;
+        } else if b == b'{' {
+            return matching_css_brace(source, i).unwrap_or(source.len());
         }
+        i += 1;
     }
     source.len()
 }
 
-fn split_css_selectors(selector: &str) -> Vec<String> {
+fn split_css_selectors(selector: &str) -> Vec<&str> {
+    let bytes = selector.as_bytes();
     let mut selectors = Vec::new();
-    let mut current = String::new();
+    let mut seg_start = 0usize;
     let mut in_quote = false;
     let mut escaped = false;
-    let mut quote = '\0';
+    let mut quote = 0u8;
     let mut bracket_depth = 0i32;
     let mut paren_depth = 0i32;
 
-    for ch in selector.chars() {
+    for (i, &b) in bytes.iter().enumerate() {
         if in_quote {
-            current.push(ch);
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == quote {
+            } else if b == quote {
                 in_quote = false;
             }
-        } else if ch == '"' || ch == '\'' {
+        } else if b == b'"' || b == b'\'' {
             in_quote = true;
-            quote = ch;
-            current.push(ch);
-        } else if ch == '[' {
+            quote = b;
+        } else if b == b'[' {
             bracket_depth += 1;
-            current.push(ch);
-        } else if ch == ']' {
+        } else if b == b']' {
             bracket_depth -= 1;
-            current.push(ch);
-        } else if ch == '(' {
+        } else if b == b'(' {
             paren_depth += 1;
-            current.push(ch);
-        } else if ch == ')' {
+        } else if b == b')' {
             paren_depth -= 1;
-            current.push(ch);
-        } else if ch == ',' && bracket_depth == 0 && paren_depth == 0 {
-            let trimmed_part = current.trim();
+        } else if b == b',' && bracket_depth == 0 && paren_depth == 0 {
+            let trimmed_part = selector[seg_start..i].trim();
             if !trimmed_part.is_empty() {
-                selectors.push(trimmed_part.to_owned());
+                selectors.push(trimmed_part);
             }
-            current.clear();
-        } else {
-            current.push(ch);
+            seg_start = i + 1;
         }
     }
-    let trimmed_part = current.trim();
+    let trimmed_part = selector[seg_start..].trim();
     if !trimmed_part.is_empty() {
-        selectors.push(trimmed_part.to_owned());
+        selectors.push(trimmed_part);
     }
     selectors
 }
 
 fn expand_nested_css_selectors(
-    parents: &[String],
+    parents: &[&str],
     nested_selector: &str,
     diagnostics: &mut Vec<String>,
 ) -> Vec<String> {
@@ -351,7 +363,7 @@ fn exact_target_nth_child_index(rule: &CssRule) -> i64 {
 }
 
 fn parse_body(
-    selectors: &[String],
+    selectors: &[&str],
     body: &str,
     rules: &mut Vec<CssRule>,
     diagnostics: &mut Vec<String>,
@@ -360,80 +372,94 @@ fn parse_body(
 ) {
     let mut declarations_text = String::new();
     let mut last = 0usize;
-    let mut cursor = 0usize;
-    let mut last_top_semicolon: Option<usize> = None;
-    let mut in_quote = false;
-    let mut escaped = false;
-    let mut quote = '\0';
-    let mut paren_depth = 0i32;
 
-    while cursor < body.len() {
-        let mut found_open: Option<usize> = None;
-        for (offset, ch) in body[cursor..].char_indices() {
-            let idx = cursor + offset;
-            if in_quote {
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == quote {
-                    in_quote = false;
+    if body.contains('{') {
+        let bytes = body.as_bytes();
+        let mut cursor = 0usize;
+        let mut last_top_semicolon: Option<usize> = None;
+        let mut in_quote = false;
+        let mut escaped = false;
+        let mut quote = 0u8;
+        let mut paren_depth = 0i32;
+
+        while cursor < bytes.len() {
+            let mut found_open: Option<usize> = None;
+            let mut idx = cursor;
+            while idx < bytes.len() {
+                let b = bytes[idx];
+                if in_quote {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == quote {
+                        in_quote = false;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    in_quote = true;
+                    quote = b;
+                } else if b == b'(' {
+                    paren_depth += 1;
+                } else if b == b')' {
+                    paren_depth -= 1;
+                } else if b == b';' && paren_depth == 0 {
+                    last_top_semicolon = Some(idx);
+                } else if b == b'{' && paren_depth == 0 {
+                    found_open = Some(idx);
+                    break;
                 }
-            } else if ch == '"' || ch == '\'' {
-                in_quote = true;
-                quote = ch;
-            } else if ch == '(' {
-                paren_depth += 1;
-            } else if ch == ')' {
-                paren_depth -= 1;
-            } else if ch == ';' && paren_depth == 0 {
-                last_top_semicolon = Some(idx);
-            } else if ch == '{' && paren_depth == 0 {
-                found_open = Some(idx);
+                idx += 1;
+            }
+            let Some(open) = found_open else {
                 break;
-            }
-        }
-        let Some(open) = found_open else {
-            break;
-        };
-        let selector_start = last_top_semicolon
-            .filter(|&index| index >= last)
-            .map_or(last, |index| index + 1);
-        declarations_text.push_str(&body[last..selector_start]);
-        let nested_selector = body[selector_start..open].trim();
-        let Some(close) = matching_css_brace(body, open) else {
-            break;
-        };
-        if !nested_selector.starts_with('@') {
-            if depth >= MAX_NESTING_DEPTH {
-                diagnostics.push(
-                    "Ignoring nested dictionary CSS rule exceeding maximum nesting depth"
-                        .to_owned(),
-                );
-            } else {
-                let combined = expand_nested_css_selectors(selectors, nested_selector, diagnostics);
-                if !combined.is_empty() {
-                    parse_body(
-                        &combined,
-                        &body[open + 1..close],
-                        rules,
-                        diagnostics,
-                        order,
-                        depth + 1,
+            };
+            let selector_start = last_top_semicolon
+                .filter(|&index| index >= last)
+                .map_or(last, |index| index + 1);
+            declarations_text.push_str(&body[last..selector_start]);
+            let nested_selector = body[selector_start..open].trim();
+            let Some(close) = matching_css_brace(body, open) else {
+                break;
+            };
+            if !nested_selector.starts_with('@') {
+                if depth >= MAX_NESTING_DEPTH {
+                    diagnostics.push(
+                        "Ignoring nested dictionary CSS rule exceeding maximum nesting depth"
+                            .to_owned(),
                     );
+                } else {
+                    let combined =
+                        expand_nested_css_selectors(selectors, nested_selector, diagnostics);
+                    if !combined.is_empty() {
+                        let combined_refs: Vec<&str> =
+                            combined.iter().map(String::as_str).collect();
+                        parse_body(
+                            &combined_refs,
+                            &body[open + 1..close],
+                            rules,
+                            diagnostics,
+                            order,
+                            depth + 1,
+                        );
+                    }
                 }
             }
+            cursor = close + 1;
+            last = cursor;
+            last_top_semicolon = None;
+            in_quote = false;
+            escaped = false;
+            paren_depth = 0;
         }
-        cursor = close + 1;
-        last = cursor;
-        last_top_semicolon = None;
-        in_quote = false;
-        escaped = false;
-        paren_depth = 0;
     }
 
-    declarations_text.push_str(&body[last..]);
-    let mut declarations = parse_css_declarations(&declarations_text, diagnostics);
+    let decl_slice: &str = if last == 0 {
+        body
+    } else {
+        declarations_text.push_str(&body[last..]);
+        &declarations_text
+    };
+    let mut declarations = parse_css_declarations(decl_slice, diagnostics);
     if declarations.is_empty() {
         return;
     }

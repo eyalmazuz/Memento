@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use slint::{ComponentHandle, Model as _, VecModel};
 
@@ -202,7 +203,7 @@ impl RichUiBridge {
             if st.glossary_cache.contains_key(&done.cache_key) {
                 continue;
             }
-            let rendered = done.doc.into_rendered_doc();
+            let rendered = Arc::new(done.doc.into_rendered_doc());
             st.glossary_cache.insert(done.cache_key, rendered);
             inserted_any = true;
         }
@@ -215,7 +216,7 @@ impl RichUiBridge {
         row_index: i32,
         width_px: f32,
         selected: bool,
-    ) -> Option<RenderedGlossaryDoc> {
+    ) -> Option<Arc<RenderedGlossaryDoc>> {
         self.cancel_idle_memory_shrink();
         let bucket_w = ((width_px.max(120.0) / 4.0).floor() as i32 * 4).max(120);
         let app_opt = self.app_weak.upgrade();
@@ -249,40 +250,38 @@ impl RichUiBridge {
                 st.last_observed_col_width_px = Some((pw_rounded, use_two_cols, bucket_w));
             }
         }
-        let (hit, parsed_glossary, detail_states, epoch) = if depth < 0 {
+        // Build the cache key from borrowed row metadata first so cache hits never
+        // clone `SearchHit` or `detail_states`.
+        let (is_kanji, details_sig, epoch) = if depth < 0 {
             let extras = st.panel.row_extras.get(&row_index)?;
-            let hit = extras.hit.as_ref()?.clone();
+            let hit = extras.hit.as_ref()?;
             (
-                hit,
-                extras.parsed_glossary.clone(),
-                extras.detail_states.clone(),
+                hit.is_kanji,
+                format_details_sig(&extras.detail_states),
                 st.panel.rich_epoch,
             )
         } else if depth == 0 {
             let extras = st.row_extras.get(&row_index)?;
-            let hit = extras.hit.as_ref()?.clone();
+            let hit = extras.hit.as_ref()?;
             (
-                hit,
-                extras.parsed_glossary.clone(),
-                extras.detail_states.clone(),
+                hit.is_kanji,
+                format_details_sig(&extras.detail_states),
                 st.rich_epoch,
             )
         } else {
             let lvl = st.nested_level(depth)?;
             let extras = lvl.row_extras.get(&row_index)?;
-            let hit = extras.hit.as_ref()?.clone();
+            let hit = extras.hit.as_ref()?;
             (
-                hit,
-                extras.parsed_glossary.clone(),
-                extras.detail_states.clone(),
+                hit.is_kanji,
+                format_details_sig(&extras.detail_states),
                 lvl.rich_epoch,
             )
         };
-        if hit.is_kanji {
+        if is_kanji {
             return None;
         }
         let theme = st.effective_popup_theme();
-        let details_sig = format_details_sig(&detail_states);
         let cache_key = GlossaryDocCacheKey {
             row_index,
             width_px: bucket_w,
@@ -309,12 +308,35 @@ impl RichUiBridge {
                 return Some(doc);
             }
         }
+        let (hit, parsed_glossary, detail_states) = if depth < 0 {
+            let extras = st.panel.row_extras.get(&row_index)?;
+            (
+                extras.hit.as_ref()?.clone(),
+                extras.parsed_glossary.clone(),
+                extras.detail_states.clone(),
+            )
+        } else if depth == 0 {
+            let extras = st.row_extras.get(&row_index)?;
+            (
+                extras.hit.as_ref()?.clone(),
+                extras.parsed_glossary.clone(),
+                extras.detail_states.clone(),
+            )
+        } else {
+            let lvl = st.nested_level(depth)?;
+            let extras = lvl.row_extras.get(&row_index)?;
+            (
+                extras.hit.as_ref()?.clone(),
+                extras.parsed_glossary.clone(),
+                extras.detail_states.clone(),
+            )
+        };
         let res_dirs = st.dict_resource_dirs.clone();
         let legacy_style = st.settings.glossary_style;
         let sheet = st
             .stylesheets
             .get_for_dictionary(&res_dirs, hit.dictionary_id, &hit.dict_name);
-        let doc = render_structured_glossary_entry_with_value_scaled(
+        let doc = Arc::new(render_structured_glossary_entry_with_value_scaled(
             &hit.raw_glossary,
             &hit.glossary,
             parsed_glossary.as_deref(),
@@ -328,18 +350,20 @@ impl RichUiBridge {
             selected,
             &theme,
             render_scale,
-        )?;
+        )?);
         if depth < 0 {
             st.panel
                 .last_rendered_key
                 .insert(row_index, cache_key.clone());
-            st.panel.glossary_cache.insert(cache_key, doc.clone());
+            st.panel
+                .glossary_cache
+                .insert(cache_key, Arc::clone(&doc));
         } else if depth == 0 {
             st.last_rendered_key.insert(row_index, cache_key.clone());
-            st.glossary_cache.insert(cache_key, doc.clone());
+            st.glossary_cache.insert(cache_key, Arc::clone(&doc));
         } else if let Some(lvl) = st.nested_level_mut(depth) {
             lvl.last_rendered_key.insert(row_index, cache_key.clone());
-            lvl.glossary_cache.insert(cache_key, doc.clone());
+            lvl.glossary_cache.insert(cache_key, Arc::clone(&doc));
         }
         Some(doc)
     }
@@ -348,7 +372,7 @@ impl RichUiBridge {
         &self,
         depth: i32,
         row_index: i32,
-    ) -> Option<RenderedGlossaryDoc> {
+    ) -> Option<Arc<RenderedGlossaryDoc>> {
         let st = self.state.borrow();
         let (epoch, last_key, cache) = if depth < 0 {
             (
@@ -487,7 +511,7 @@ impl RichUiBridge {
             has_rich: true,
             width_px: doc.width_px,
             height_px: doc.height_px,
-            rendered: doc.image,
+            rendered: doc.image.clone(),
             selection_rects: Rc::new(VecModel::from(sel_rects)).into(),
             scan_highlight_rects: Rc::new(VecModel::from(scan_rects)).into(),
             collapsible,
@@ -498,32 +522,56 @@ impl RichUiBridge {
     }
 
     pub(super) fn char_index_at_point(doc: &RenderedGlossaryDoc, x: f32, y: f32) -> Option<usize> {
-        if doc.selectable_chars.is_empty() {
+        let chars = doc.selectable_chars.as_slice();
+        if chars.is_empty() {
             return None;
         }
         let mut best: Option<(usize, f32)> = None;
-        for (idx, cell) in doc.selectable_chars.iter().enumerate() {
-            if cell.ch == '\n' {
-                continue;
+        let eval_range = |start: usize, end: usize, best: &mut Option<(usize, f32)>| {
+            for (idx, cell) in chars[start..end].iter().enumerate() {
+                if cell.ch == '\n' {
+                    continue;
+                }
+                let dy = if y < cell.y {
+                    cell.y - y
+                } else if y > cell.y + cell.h {
+                    y - (cell.y + cell.h)
+                } else {
+                    0.0
+                };
+                let dy_score = dy * 8.0;
+                if best.is_some_and(|(_, b_score)| dy_score >= b_score) {
+                    continue;
+                }
+                let dx = if x < cell.x {
+                    cell.x - x
+                } else if x > cell.x + cell.w {
+                    x - (cell.x + cell.w)
+                } else {
+                    0.0
+                };
+                let score = dy_score + dx;
+                if best.is_none_or(|(_, b_score)| score < b_score) {
+                    *best = Some((start + idx, score));
+                }
             }
-            let dy = if y < cell.y {
-                cell.y - y
-            } else if y > cell.y + cell.h {
-                y - (cell.y + cell.h)
-            } else {
-                0.0
-            };
-            let dx = if x < cell.x {
-                cell.x - x
-            } else if x > cell.x + cell.w {
-                x - (cell.x + cell.w)
-            } else {
-                0.0
-            };
-            let score = dy * 8.0 + dx;
-            if best.is_none_or(|(_, b_score)| score < b_score) {
-                best = Some((idx, score));
+        };
+        if !doc.line_bands.is_empty() {
+            for band in &doc.line_bands {
+                let band_dy = if y < band.min_y {
+                    band.min_y - y
+                } else if y > band.max_y {
+                    y - band.max_y
+                } else {
+                    0.0
+                };
+                if best.is_some_and(|(_, b_score)| band_dy * 8.0 >= b_score) {
+                    continue;
+                }
+                eval_range(band.start_idx, band.end_idx, &mut best);
             }
+        } else {
+            eval_range(0, chars.len(), &mut best);
         }
         best.map(|(idx, _)| idx)
     }

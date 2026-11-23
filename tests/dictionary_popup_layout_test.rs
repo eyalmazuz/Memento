@@ -2377,6 +2377,7 @@ mod rich_popup_phase4_tests {
                 height_px: bad_h,
                 hit_zones: Vec::new(),
                 selectable_chars: Vec::new(),
+                line_bands: Vec::new(),
                 line_bottoms: vec![4.0, 8.0, 11.0],
                 plain_text: String::new(),
             };
