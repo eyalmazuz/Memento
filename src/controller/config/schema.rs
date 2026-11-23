@@ -1,18 +1,18 @@
-//! Settings schema: category enum, choice tables driven by `memento_setting::enums`,
+//! Settings schema: category enum, choice tables driven by `subomi_setting::enums`,
 //! ranges, defaults, value parsing/normalization, and category snapshots.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use memento_audio::{MAX_AUDIO_DOWNLOAD_TIMEOUT_MS, MIN_AUDIO_DOWNLOAD_TIMEOUT_MS};
-use memento_config::config::Config;
-use memento_config::keys::lookup;
-use memento_config::{ArgbColor, KeyPath, QtFontSpec, Value, ValueType};
-use memento_dict::searchcontroller::{TextReplacementOptions, TextReplacementRule};
-use memento_setting::enums::{
+use subomi_audio::{MAX_AUDIO_DOWNLOAD_TIMEOUT_MS, MIN_AUDIO_DOWNLOAD_TIMEOUT_MS};
+use subomi_config::config::Config;
+use subomi_config::keys::lookup;
+use subomi_config::{ArgbColor, FontSpec, KeyPath, Value, ValueType};
+use subomi_dict::searchcontroller::{TextReplacementOptions, TextReplacementRule};
+use subomi_setting::enums::{
     AudioSourceType, Directory, GlossaryStyle, Language, Modifier, SearchMethod, ThemeMode,
 };
-use memento_setting::keys as raw;
+use subomi_setting::keys as raw;
 
 use super::audio_sources::audio_sources;
 use super::keybinds::{
@@ -871,7 +871,7 @@ pub(crate) fn parse_config_value(
                 let parsed = ArgbColor::parse(value)?;
                 Ok(Value::Text(parsed.to_argb_hex()))
             } else if is_font_key(group, key) {
-                let _ = QtFontSpec::parse(value)?;
+                let _ = FontSpec::parse(value)?;
                 Ok(Value::Text(value.trim().to_owned()))
             } else {
                 Ok(Value::Text(value.to_owned()))

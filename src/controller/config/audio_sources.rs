@@ -1,8 +1,8 @@
 //! Audio source entries stored under `[audio-srcs]` and `[audio-srcs/<n>]`.
 
-use memento_config::config::Config;
-use memento_config::Value;
-use memento_setting::keys as raw;
+use subomi_config::config::Config;
+use subomi_config::Value;
+use subomi_setting::keys as raw;
 
 use super::schema::{effective_i64, effective_value, value_text};
 

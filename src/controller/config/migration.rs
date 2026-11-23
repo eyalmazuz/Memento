@@ -1,14 +1,14 @@
 //! Canonical config file loading, legacy QSettings INI migrations (`v1→6`),
-//! and Linux XDG cache config split helpers (Memento `#337`).
+//! and Linux XDG cache config split helpers (Subomi `#337`).
 
 use std::fs;
 use std::path::Path;
 
-use memento_config::canonical::FORMAT_MAGIC;
-use memento_config::config::{Config, RawDocument};
-use memento_config::{parse_legacy_ini, QtFontSpec, Value};
-use memento_setting::keys as raw;
-use memento_setting::migration::{migrate_2_to_3_list_result, migration_plan};
+use subomi_config::canonical::{FORMAT_MAGIC, LEGACY_FORMAT_MAGIC};
+use subomi_config::config::{Config, RawDocument};
+use subomi_config::{parse_legacy_ini, FontSpec, Value};
+use subomi_setting::keys as raw;
+use subomi_setting::migration::{migrate_2_to_3_list_result, migration_plan};
 
 use super::schema::{declared_setting_default, INTERFACE_FONT_KEYS};
 
@@ -21,7 +21,7 @@ pub(crate) struct MigrationPaths<'a> {
 }
 
 /// Returns `true` when `(group, key)` belongs to the volatile Linux XDG cache
-/// config file (`~/.cache/memento/memento.conf`, Memento `#337`):
+/// config file (`~/.cache/subomi/subomi.conf`, Subomi `#337`):
 /// `recent/files`, `dictionary/order`, and `main-window/*`.
 pub fn is_volatile_cache_key(group: &str, key: &str) -> bool {
     (group == raw::recent::GROUP && key == raw::recent::FILES)
@@ -31,7 +31,7 @@ pub fn is_volatile_cache_key(group: &str, key: &str) -> bool {
 
 /// Loads `config_dir/file_name`, reading the file at most once.
 ///
-/// Canonical `memento-config-store` files are parsed directly from the in-memory
+/// Canonical `subomi-config-store` files are parsed directly from the in-memory
 /// buffer via [`Config::from_document_text`]; legacy QSettings INI files are
 /// converted and migrated in memory.
 pub(crate) fn load_config_store(config_dir: &Path, file_name: &str) -> Result<Config, String> {
@@ -48,7 +48,7 @@ pub(crate) fn load_config_store(config_dir: &Path, file_name: &str) -> Result<Co
 }
 
 /// Loads `config_dir/file_name` with an optional legacy fallback directory
-/// (e.g. macOS `~/.config/memento`, Windows `%APPDATA%\memento`) and optional
+/// (e.g. macOS `~/.config/subomi`, Windows `%APPDATA%\subomi`) and optional
 /// migration paths / cache store output.
 pub(crate) fn load_config_store_with_fallback(
     config_dir: &Path,
@@ -79,7 +79,7 @@ pub(crate) fn load_config_store_with_fallback(
         Err(error) => return Err(format!("could not read settings: {error}")),
     };
     let clean = text.strip_prefix('\u{feff}').unwrap_or(&text).trim_start();
-    if clean.starts_with(FORMAT_MAGIC) {
+    if clean.starts_with(FORMAT_MAGIC) || clean.starts_with(LEGACY_FORMAT_MAGIC) {
         return Config::from_document_text(&text).map_err(|error| format!("{error:?}"));
     }
     let legacy = parse_legacy_ini(&text).map_err(|error| format!("{error:?}"))?;
@@ -236,8 +236,8 @@ fn normalize_legacy_qfont_v4_to_v5(config: &Config, key: &str, raw_value: &str) 
         || unwrapped.chars().any(char::is_control);
 
     if !looks_corrupt {
-        if let Ok(spec) = QtFontSpec::parse(unwrapped) {
-            return Some(spec.to_qt_string());
+        if let Ok(spec) = FontSpec::parse(unwrapped) {
+            return Some(spec.to_csv_string());
         }
     }
 
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn migrate_v1_to_v2_moves_dict_database_and_removes_dict_dir() {
         let root = tempfile::TempDir::new().unwrap();
-        let cfg_dir = root.path().join("config/memento");
+        let cfg_dir = root.path().join("config/subomi");
         let legacy_dict = cfg_dir.join("dict");
         fs::create_dir_all(&legacy_dict).unwrap();
         fs::write(legacy_dict.join("dictionaries.sqlite"), b"sqlite-db").unwrap();
@@ -461,8 +461,8 @@ mod tests {
     #[test]
     fn migrate_v5_to_v6_moves_dicts_to_data_dir_and_splits_volatile_keys_to_cache() {
         let root = tempfile::TempDir::new().unwrap();
-        let cfg_dir = root.path().join("config/memento");
-        let data_dir = root.path().join("data/memento");
+        let cfg_dir = root.path().join("config/subomi");
+        let data_dir = root.path().join("data/subomi");
         fs::create_dir_all(cfg_dir.join("res/img")).unwrap();
         fs::write(cfg_dir.join("dictionaries.sqlite"), b"db-v5").unwrap();
         fs::write(cfg_dir.join("res/img/a.png"), b"png").unwrap();
@@ -535,12 +535,12 @@ mod tests {
     #[test]
     fn full_v1_to_v6_chain_runs_every_step_in_order() {
         let root = tempfile::TempDir::new().unwrap();
-        let cfg_dir = root.path().join("config/memento");
-        let data_dir = root.path().join("data/memento");
+        let cfg_dir = root.path().join("config/subomi");
+        let data_dir = root.path().join("data/subomi");
         fs::create_dir_all(cfg_dir.join("dict")).unwrap();
         fs::write(cfg_dir.join("dict/dictionaries.sqlite"), b"v1-db").unwrap();
         fs::write(
-            cfg_dir.join("memento.conf"),
+            cfg_dir.join("subomi.conf"),
             "version=1\n\
              [search]\n\
              list-result=false\n\
@@ -555,7 +555,7 @@ mod tests {
         let mut cache_cfg = Config::default_empty();
         let loaded = load_config_store_with_fallback(
             &cfg_dir,
-            "memento.conf",
+            "subomi.conf",
             None,
             MigrationPaths {
                 config_dir: Some(&cfg_dir),

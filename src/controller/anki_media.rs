@@ -9,12 +9,12 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgba};
-use memento_anki::note::{
+use subomi_anki::note::{
     audio_context_params, audio_media_params, compute_clip_range, screenshot_params, video_params,
     AudioMediaParams, ScreenshotParams, VideoParams,
 };
-use memento_anki::tokenizer::{tokenize, Marker};
-use memento_player::{RawFrame, ScreenshotCapturer, ScreenshotRequest};
+use subomi_anki::tokenizer::{tokenize, Marker};
+use subomi_player::{RawFrame, ScreenshotCapturer, ScreenshotRequest};
 use serde_json::json;
 
 use super::anki::{
@@ -79,11 +79,10 @@ impl ScreenshotCapturePlan {
 pub fn requested_screenshot_plan(profile: &AnkiNoteConfig) -> ScreenshotCapturePlan {
     let mut plan = ScreenshotCapturePlan::default();
     for template in profile.field_templates.values() {
-        for token in tokenize(&template.encode_utf16().collect::<Vec<_>>()) {
+        for token in tokenize(template) {
             let mut saw_screenshot_in_token = false;
             for marker in token.markers {
-                let name = String::from_utf16_lossy(&marker.name);
-                match name.as_str() {
+                match marker.name.as_str() {
                     "screenshot" | "image" if screenshot_params(&marker).is_some() => {
                         if saw_screenshot_in_token {
                             plan.fallback_screenshot = true;
@@ -119,7 +118,7 @@ pub fn requested_screenshots(profile: &AnkiNoteConfig) -> (bool, bool) {
 }
 
 fn media_filename(bytes: &[u8], extension: &str) -> Result<String, String> {
-    let md5 = memento_util::fileutils::calculate_md5(bytes)
+    let md5 = subomi_util::fileutils::calculate_md5(bytes)
         .map_err(|error| format!("Could not hash Anki media: {error}"))?;
     let raw = format!("{:032x}{extension}", u128::from_be_bytes(md5));
     Ok(sanitize_anki_filename(&raw, extension))
@@ -717,12 +716,7 @@ pub(crate) fn prepare_note_media_with_rendered_and_screenshots(
     let mut sorted_fields: Vec<(&String, Vec<_>)> = profile
         .field_templates
         .iter()
-        .map(|(field, template)| {
-            (
-                field,
-                tokenize(&template.encode_utf16().collect::<Vec<_>>()),
-            )
-        })
+        .map(|(field, template)| (field, tokenize(template)))
         .collect();
     sorted_fields.sort_by_key(|(name, _)| *name);
 
@@ -745,8 +739,7 @@ pub(crate) fn prepare_note_media_with_rendered_and_screenshots(
                         MarkerEvalKind::EmptyText | MarkerEvalKind::Unknown => continue,
                         MarkerEvalKind::Media => {}
                     }
-                    let name = String::from_utf16_lossy(&marker.name);
-                    let Some(task_key) = parse_media_task_key(&name, marker, profile) else {
+                    let Some(task_key) = parse_media_task_key(&marker.name, marker, profile) else {
                         continue;
                     };
                     match caches.get(&task_key) {
@@ -841,10 +834,9 @@ pub(crate) fn prepare_note_media_with_rendered_and_screenshots(
                     MarkerEvalKind::Media => {}
                 }
 
-                let name = String::from_utf16_lossy(&marker.name);
-                let Some(task_key) = parse_media_task_key(&name, marker, profile) else {
-                    token_media_error = Some(invalid_media_marker_error(&name, field));
-                    token_failed_marker = Some(name);
+                let Some(task_key) = parse_media_task_key(&marker.name, marker, profile) else {
+                    token_media_error = Some(invalid_media_marker_error(&marker.name, field));
+                    token_failed_marker = Some(marker.name.clone());
                     token_handled_fallback = false;
                     continue;
                 };
@@ -892,13 +884,13 @@ pub(crate) fn prepare_note_media_with_rendered_and_screenshots(
                                 }
                             }
                         }
-                        record_resolved_media_marker(ctx, field, &name);
+                        record_resolved_media_marker(ctx, field, &marker.name);
                         token_succeeded = true;
                         break;
                     }
                     Some(Err(error)) => {
                         token_media_error = Some(error.clone());
-                        token_failed_marker = Some(name);
+                        token_failed_marker = Some(marker.name.clone());
                         token_handled_fallback = false;
                     }
                     None => {}
@@ -1020,7 +1012,7 @@ mod tests {
         for sample in samples {
             wave.extend_from_slice(&sample.to_le_bytes());
         }
-        let path = std::env::temp_dir().join(format!("memento-context-{}.wav", std::process::id()));
+        let path = std::env::temp_dir().join(format!("subomi-context-{}.wav", std::process::id()));
         std::fs::write(&path, wave).unwrap();
         let mut subtitles = SubtitleController::new();
         subtitles.load_cues(vec![
@@ -1035,7 +1027,7 @@ mod tests {
         let (context_start, context_end) = subtitles.selected_time_range().unwrap();
         let profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Basic".into(),
             field_templates: [
@@ -1163,7 +1155,7 @@ mod tests {
                 .collect();
             let profile = AnkiNoteConfig {
                 enabled: true,
-                endpoint: memento_net::anki::AnkiEndpoint::default(),
+                endpoint: subomi_net::anki::AnkiEndpoint::default(),
                 deck: "Japanese".into(),
                 model: "Preset".into(),
                 field_templates: fields,
@@ -1185,7 +1177,7 @@ mod tests {
 
         let make_single = |tmpl: &str| AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Basic".into(),
             field_templates: std::collections::HashMap::from([("Picture".into(), tmpl.into())]),
@@ -1218,7 +1210,7 @@ mod tests {
         );
         let profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Basic".into(),
             field_templates: fields,
@@ -1286,7 +1278,7 @@ mod tests {
     #[test]
     fn word_audio_is_attached_as_data_for_anki_and_short_circuits_clip_fallback() {
         let path = std::env::temp_dir().join(format!(
-            "memento-anki-word-audio-{}-{}.mp3",
+            "subomi-anki-word-audio-{}-{}.mp3",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1299,7 +1291,7 @@ mod tests {
         fields.insert("ExpressionAudio".into(), "{audio | audio-media}".into());
         let profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Lapis".into(),
             field_templates: fields,
@@ -1324,7 +1316,7 @@ mod tests {
             audio_sources: vec![AudioSourceEntry {
                 name: "Local 日本語".into(),
                 url: path.to_string_lossy().into_owned(),
-                kind: memento_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
+                kind: subomi_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
                 md5: String::new(),
             }],
         };
@@ -1345,7 +1337,7 @@ mod tests {
     #[test]
     fn concurrent_audio_and_picture_fallback_merge_deterministically() {
         let path = std::env::temp_dir().join(format!(
-            "memento-anki-concurrent-{}-{}.mp3",
+            "subomi-anki-concurrent-{}-{}.mp3",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1355,7 +1347,7 @@ mod tests {
         std::fs::write(&path, b"ID3concurrent-audio").unwrap();
         let profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Lapis".into(),
             field_templates: std::collections::HashMap::from([
@@ -1387,7 +1379,7 @@ mod tests {
             audio_sources: vec![AudioSourceEntry {
                 name: "Local".into(),
                 url: path.to_string_lossy().into_owned(),
-                kind: memento_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
+                kind: subomi_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
                 md5: String::new(),
             }],
         };
@@ -1407,7 +1399,7 @@ mod tests {
         fields.insert("Front".into(), "{audio | expression}".into());
         let profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Basic".into(),
             field_templates: fields,
@@ -1441,7 +1433,7 @@ mod tests {
 
         // 2. Audio succeeds -> attaches audio AND leaves field text empty (short-circuited)!
         let audio_path = std::env::temp_dir().join(format!(
-            "memento-anki-audio-text-fallback-{}-{}.mp3",
+            "subomi-anki-audio-text-fallback-{}-{}.mp3",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1462,7 +1454,7 @@ mod tests {
             audio_sources: vec![AudioSourceEntry {
                 name: "Local".into(),
                 url: audio_path.to_string_lossy().into_owned(),
-                kind: memento_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
+                kind: subomi_setting::enums::AudioSourceType::AudioSourceTypeFile as i64,
                 md5: String::new(),
             }],
         };
@@ -1545,7 +1537,7 @@ mod tests {
     fn failed_optional_media_records_non_fatal_warnings_and_preserves_note_creation() {
         let make_profile = |template: &str| AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Basic".into(),
             field_templates: std::collections::HashMap::from([
@@ -1620,7 +1612,7 @@ mod tests {
         //    with all failed attachments omitted and warnings collected.
         let manual_profile = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "FullMedia".into(),
             field_templates: std::collections::HashMap::from([
@@ -1672,7 +1664,7 @@ mod tests {
                 .collect();
             let profile = AnkiNoteConfig {
                 enabled: true,
-                endpoint: memento_net::anki::AnkiEndpoint::default(),
+                endpoint: subomi_net::anki::AnkiEndpoint::default(),
                 deck: "Japanese".into(),
                 model: "Preset".into(),
                 field_templates: fields,
@@ -1699,7 +1691,7 @@ mod tests {
 
         let both_primary = AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".into(),
             model: "Dual".into(),
             field_templates: std::collections::HashMap::from([

@@ -8,9 +8,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use memento_config::Value;
-use memento_os::{open_files_on_main_thread, FileDialogOptions};
-use memento_setting::keys as raw;
+use subomi_config::Value;
+use subomi_os::{open_files_on_main_thread, FileDialogOptions};
+use subomi_setting::keys as raw;
 use slint::{ComponentHandle, VecModel};
 
 use crate::controller::config::ConfigController;
@@ -144,7 +144,7 @@ where
 }
 
 /// RAII sentinel ensuring `dictionary_busy` clears cleanly if the native picker
-/// is cancelled (`memento_os::open_files_on_main_thread` drops the callback
+/// is cancelled (`subomi_os::open_files_on_main_thread` drops the callback
 /// without invoking it when the user cancels).
 struct PickerCancelGuard {
     window: slint::Weak<SettingsWindow>,
@@ -267,7 +267,7 @@ pub(crate) fn dictionary_settings_rows(
     .collect()
 }
 
-pub(crate) type DictListFingerprint = (memento_dict::sqlite_db::DbFileFingerprint, Vec<i64>);
+pub(crate) type DictListFingerprint = (subomi_dict::sqlite_db::DbFileFingerprint, Vec<i64>);
 
 fn current_dict_order(config: &ConfigController) -> Vec<i64> {
     match config.effective_setting(raw::dictionary::GROUP, raw::dictionary::ORDER) {
@@ -281,7 +281,7 @@ pub(crate) fn dict_list_fingerprint(
     config: &ConfigController,
 ) -> DictListFingerprint {
     (
-        memento_dict::sqlite_db::db_file_fingerprint(db_path),
+        subomi_dict::sqlite_db::db_file_fingerprint(db_path),
         current_dict_order(config),
     )
 }
@@ -359,7 +359,7 @@ pub(crate) fn save_dictionary_order(
     config.apply_settings(
         SettingsCategory::Dictionaries.as_i32(),
         cache_dir,
-        "memento.conf",
+        "subomi.conf",
         anki_json_path,
     )
 }
@@ -861,7 +861,7 @@ pub(crate) fn wire(
         picked_coord.enqueue_or_start_batch(&window, vec![PathBuf::from(path_str.as_str())]);
     });
 
-    // Multi-file dictionary import via macOS-main-thread-safe `memento_os::open_files_on_main_thread`
+    // Multi-file dictionary import via macOS-main-thread-safe `subomi_os::open_files_on_main_thread`
     let add_window = window.as_weak();
     let add_coord = coord.clone();
     window.on_add_dictionary_archive(move || {
@@ -1087,11 +1087,11 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use crate::controller::asr::AsrController;
         use crate::controller::subtitles::SubtitleController;
-        use crate::{MementoApp, SubEntry};
+        use crate::{SubomiApp, SubEntry};
 
         i_slint_backend_testing::init_no_event_loop();
         let dir = tempfile::tempdir().unwrap();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let win = SettingsWindow::new().unwrap();
         let ctx = Rc::new(SettingsContext {
             app_weak: app.as_weak(),

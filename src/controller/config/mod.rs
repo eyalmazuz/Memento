@@ -1,4 +1,4 @@
-//! Configuration controller connecting `memento-config`, `memento-setting`,
+//! Configuration controller connecting `subomi-config`, `subomi-setting`,
 //! typed AnkiConnect profiles, and the Slint Settings UI.
 
 mod anki_profiles;
@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use memento_config::config::{ChangelogEntry, Config};
-use memento_config::{ArgbColor, QtFontSpec, Value};
-use memento_dict::searchcontroller::TextReplacementOptions;
-use memento_net::anki::AnkiEndpoint;
-use memento_setting::enums::ThemeMode;
-use memento_setting::keys as raw;
+use subomi_config::config::{ChangelogEntry, Config};
+use subomi_config::{ArgbColor, FontSpec, Value};
+use subomi_dict::searchcontroller::TextReplacementOptions;
+use subomi_net::anki::AnkiEndpoint;
+use subomi_setting::enums::ThemeMode;
+use subomi_setting::keys as raw;
 
 use crate::ui::SettingsGroup;
 
@@ -122,7 +122,7 @@ impl BackgroundSaver {
         ));
         let worker_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
-            .name("memento-config-save".to_owned())
+            .name("subomi-config-save".to_owned())
             .spawn(move || {
                 let (lock, cvar) = &*worker_shared;
                 loop {
@@ -356,7 +356,7 @@ impl ConfigController {
     }
 
     /// Load config with optional legacy fallback read directory (macOS
-    /// `~/.config/memento`, Windows `%APPDATA%\memento`), optional Linux XDG
+    /// `~/.config/subomi`, Windows `%APPDATA%\subomi`), optional Linux XDG
     /// cache split directory (`#337`), and optional data directory for legacy
     /// migrations (`v1→6`).
     pub fn load_with_fallback_and_cache<P: AsRef<Path>>(
@@ -827,8 +827,8 @@ impl ConfigController {
                 _ => None,
             }
         };
-        let serialized = QtFontSpec::new(family, point_size, bold, italic)
-            .to_qt_string_preserving(existing_raw.as_deref());
+        let serialized = FontSpec::new(family, point_size, bold, italic)
+            .to_csv_string_preserving(existing_raw.as_deref());
         self.edit_setting(key, &serialized)
     }
 
@@ -854,7 +854,7 @@ impl ConfigController {
         let mut families = Vec::new();
         for key in INTERFACE_FONT_KEYS {
             if let Some(raw) = effective_text(&store, raw::interface::GROUP, key) {
-                if let Ok(spec) = QtFontSpec::parse(&raw) {
+                if let Ok(spec) = FontSpec::parse(&raw) {
                     if !families.contains(&spec.family) {
                         families.push(spec.family);
                     }
@@ -999,7 +999,7 @@ impl ConfigController {
     /// draft edits from the Options window.
     ///
     /// Reuses the in-memory last-persisted baseline so edits do not re-read
-    /// `memento.conf` from disk. When Linux XDG cache splitting (`#337`) is active,
+    /// `subomi.conf` from disk. When Linux XDG cache splitting (`#337`) is active,
     /// volatile keys (`recent/files`, `dictionary/order`, `main-window/*`) are
     /// persisted strictly to the cache file.
     pub fn persist_single_setting(
@@ -1506,7 +1506,7 @@ mod tests {
     fn temp_dir(label: &str) -> PathBuf {
         let id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "memento-ctrl-cfg-{label}-{}-{id}",
+            "subomi-ctrl-cfg-{label}-{}-{id}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -1599,20 +1599,20 @@ mod tests {
         let dir = temp_dir("split-brain");
         let anki = dir.join("anki_connect.json");
         let ctrl = ConfigController::new();
-        ctrl.save(&dir, "memento.conf").unwrap();
+        ctrl.save(&dir, "subomi.conf").unwrap();
         assert_eq!(ctrl.store().revision(), 1);
         assert!(!ctrl.store().is_dirty());
 
         ctrl.edit_setting("behavior/autofit", "false").unwrap();
-        ctrl.apply_settings(3, &dir, "memento.conf", &anki).unwrap();
+        ctrl.apply_settings(3, &dir, "subomi.conf", &anki).unwrap();
         assert_eq!(ctrl.store().revision(), 2);
         assert!(!ctrl.store().is_dirty());
 
         ctrl.recent_files_add("/tmp/video.mkv").unwrap();
-        ctrl.save(&dir, "memento.conf").unwrap();
+        ctrl.save(&dir, "subomi.conf").unwrap();
         assert_eq!(ctrl.store().revision(), 3);
 
-        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(reloaded.store().revision(), 3);
         assert_eq!(reloaded.store().changelog().len(), 3);
         assert_eq!(
@@ -1627,13 +1627,13 @@ mod tests {
     fn async_persist_coalesces_and_flushes_atomically() {
         let dir = temp_dir("async-save");
         let ctrl = ConfigController::new();
-        ctrl.persist_single_setting_async("behavior/osc-duration", "500", &dir, "memento.conf")
+        ctrl.persist_single_setting_async("behavior/osc-duration", "500", &dir, "subomi.conf")
             .unwrap();
-        ctrl.persist_single_setting_async("behavior/osc-duration", "750", &dir, "memento.conf")
+        ctrl.persist_single_setting_async("behavior/osc-duration", "750", &dir, "subomi.conf")
             .unwrap();
         ctrl.flush_async_saves().unwrap();
 
-        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             reloaded.effective_setting(raw::behavior::GROUP, raw::behavior::OSC_DURATION),
             Some(Value::Int(750))
@@ -1642,13 +1642,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ini_runs_memento_setting_migration() {
+    fn legacy_ini_runs_subomi_setting_migration() {
         let dir = temp_dir("legacy-migrate");
-        let conf_path = dir.join("memento.conf");
+        let conf_path = dir.join("subomi.conf");
         let anki_path = dir.join("anki_connect.json");
         fs::write(&conf_path, "version=2\n[search]\nlist-result=false\n").unwrap();
 
-        let loaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        let loaded = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             loaded.effective_setting(raw::search::GROUP, raw::search::GLOSSARY_STYLE),
             Some(Value::Int(1))
@@ -1656,7 +1656,7 @@ mod tests {
         assert_eq!(loaded.store().version().unwrap(), 6);
 
         loaded
-            .apply_settings(1, &dir, "memento.conf", &anki_path)
+            .apply_settings(1, &dir, "subomi.conf", &anki_path)
             .unwrap();
         assert!(
             !loaded.store().is_dirty(),
@@ -1697,9 +1697,9 @@ mod tests {
             .unwrap();
         ctrl.edit_setting("subtitle-list/auto-seek", "true")
             .unwrap();
-        ctrl.apply_settings(5, &dir, "memento.conf", &anki).unwrap();
+        ctrl.apply_settings(5, &dir, "subomi.conf", &anki).unwrap();
 
-        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             reloaded.effective_setting(
                 raw::subtitle_list::GROUP,
@@ -1925,16 +1925,16 @@ mod tests {
 
         // Old config containing hidden dead switches still loads without error.
         fs::write(
-            dir.join("memento.conf"),
+            dir.join("subomi.conf"),
             "version=6\n[interface]\nsearch-window=true\nsub-list-window=true\nsystem-icons=true\n",
         )
         .unwrap();
-        let legacy = ConfigController::load(&dir, "memento.conf").unwrap();
+        let legacy = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             legacy.effective_setting(raw::interface::GROUP, raw::interface::SEARCH_WINDOW),
             Some(Value::Bool(true))
         );
-        legacy.apply_settings(5, &dir, "memento.conf", &anki).unwrap();
+        legacy.apply_settings(5, &dir, "subomi.conf", &anki).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2035,23 +2035,23 @@ mod tests {
     #[test]
     fn linux_xdg_cache_config_split_and_legacy_fallback_read() {
         let root = temp_dir("xdg-cache-split");
-        let cfg_dir = root.join("config/memento");
-        let cache_dir = root.join("cache/memento");
+        let cfg_dir = root.join("config/subomi");
+        let cache_dir = root.join("cache/subomi");
         let anki = cfg_dir.join("anki_connect.json");
 
-        let ctrl = ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf")
+        let ctrl = ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "subomi.conf")
             .unwrap();
-        assert_eq!(ctrl.cache_split_path(), Some(cache_dir.join("memento.conf")));
+        assert_eq!(ctrl.cache_split_path(), Some(cache_dir.join("subomi.conf")));
 
         ctrl.edit_setting("behavior/autofit", "false").unwrap();
         ctrl.recent_files_add("/tmp/episode01.mkv").unwrap();
         ctrl.edit_setting("main-window/subtitle-list", "true")
             .unwrap();
         ctrl.edit_setting("dictionary/order", "1, 2").unwrap();
-        ctrl.save(&cfg_dir, "memento.conf").unwrap();
+        ctrl.save(&cfg_dir, "subomi.conf").unwrap();
 
-        let primary_text = fs::read_to_string(cfg_dir.join("memento.conf")).unwrap();
-        let cache_text = fs::read_to_string(cache_dir.join("memento.conf")).unwrap();
+        let primary_text = fs::read_to_string(cfg_dir.join("subomi.conf")).unwrap();
+        let cache_text = fs::read_to_string(cache_dir.join("subomi.conf")).unwrap();
         assert!(primary_text.contains("autofit"), "persistent key missing from config");
         assert!(!primary_text.contains("episode01.mkv"), "recent/files leaked into config");
         assert!(!primary_text.contains("[main-window]"), "main-window leaked into config");
@@ -2064,7 +2064,7 @@ mod tests {
 
         // Reload combines both files transparently.
         let reloaded =
-            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf").unwrap();
+            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "subomi.conf").unwrap();
         assert_eq!(
             reloaded.effective_setting(raw::behavior::GROUP, raw::behavior::AUTO_FIT),
             Some(Value::Bool(false))
@@ -2081,14 +2081,14 @@ mod tests {
 
         // Single-setting persist for volatile key writes ONLY to cache, not config.
         reloaded
-            .persist_single_setting("main-window/subtitle-list", "false", &cfg_dir, "memento.conf")
+            .persist_single_setting("main-window/subtitle-list", "false", &cfg_dir, "subomi.conf")
             .unwrap();
         reloaded.edit_setting("dictionary/order", "3, 1").unwrap();
         reloaded
-            .apply_settings(4, &cfg_dir, "memento.conf", &anki)
+            .apply_settings(4, &cfg_dir, "subomi.conf", &anki)
             .unwrap();
         let reloaded2 =
-            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "memento.conf").unwrap();
+            ConfigController::load_with_cache_split(&cfg_dir, &cache_dir, "subomi.conf").unwrap();
         assert_eq!(
             reloaded2.effective_setting(raw::window::GROUP, raw::window::SUBTITLE_LIST),
             Some(Value::Bool(false))
@@ -2099,17 +2099,17 @@ mod tests {
         );
 
         // Fallback read when OS-native config dir doesn't exist yet (macOS ~/.config / Windows %APPDATA%).
-        let native_dir = root.join("Library/Application Support/memento");
-        let fallback_dir = root.join(".config/memento");
+        let native_dir = root.join("Library/Application Support/subomi");
+        let fallback_dir = root.join(".config/subomi");
         fs::create_dir_all(&fallback_dir).unwrap();
         fs::write(
-            fallback_dir.join("memento.conf"),
+            fallback_dir.join("subomi.conf"),
             "version=6\n[behavior]\nautofit=false\n",
         )
         .unwrap();
         let migrated = ConfigController::load_with_fallback_and_cache(
             &native_dir,
-            "memento.conf",
+            "subomi.conf",
             Some(&fallback_dir),
             None,
             None,
@@ -2119,8 +2119,8 @@ mod tests {
             migrated.effective_setting(raw::behavior::GROUP, raw::behavior::AUTO_FIT),
             Some(Value::Bool(false))
         );
-        migrated.save(&native_dir, "memento.conf").unwrap();
-        assert!(native_dir.join("memento.conf").is_file());
+        migrated.save(&native_dir, "subomi.conf").unwrap();
+        assert!(native_dir.join("subomi.conf").is_file());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2171,9 +2171,9 @@ mod tests {
         );
         ctrl.edit_setting("search/max-recursion-depth", "6")
             .unwrap();
-        ctrl.apply_settings(9, &dir, "memento.conf", &anki).unwrap();
+        ctrl.apply_settings(9, &dir, "subomi.conf", &anki).unwrap();
 
-        let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+        let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
             Some(Value::Int(6))
@@ -2187,7 +2187,7 @@ mod tests {
             Some(Value::Int(2))
         );
         reloaded
-            .reset_settings(9, &dir, "memento.conf", &anki)
+            .reset_settings(9, &dir, "subomi.conf", &anki)
             .unwrap();
         assert_eq!(
             reloaded.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
@@ -2200,9 +2200,9 @@ mod tests {
             Some(Value::Int(4))
         );
         reloaded
-            .apply_settings(9, &dir, "memento.conf", &anki)
+            .apply_settings(9, &dir, "subomi.conf", &anki)
             .unwrap();
-        let after_defaults = ConfigController::load(&dir, "memento.conf").unwrap();
+        let after_defaults = ConfigController::load(&dir, "subomi.conf").unwrap();
         assert_eq!(
             after_defaults.effective_setting(raw::search::GROUP, raw::search::MAX_RECURSION_DEPTH),
             Some(Value::Int(4))

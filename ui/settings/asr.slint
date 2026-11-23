@@ -1,4 +1,4 @@
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton } from "../components/buttons.slint";
 import { SectionHeader } from "../components/controls.slint";
 import { AsrModelStatusRow } from "types.slint";
@@ -22,15 +22,15 @@ export component AsrModelsPanel inherits VerticalLayout {
             height: 24px;
             width: min(dir-lbl.preferred-width + 14px, 240px);
             border-radius: 5px;
-            background: MementoPalette.surface-bg;
+            background: SubomiPalette.surface-bg;
             border-width: 1px;
-            border-color: MementoPalette.border;
+            border-color: SubomiPalette.border;
             dir-lbl := Text {
                 x: 7px;
                 width: parent.width - 14px;
                 height: parent.height;
                 text: root.asr-models-dir;
-                color: MementoPalette.text-muted;
+                color: SubomiPalette.text-muted;
                 font-family: "monospace";
                 font-size: 10.5px;
                 vertical-alignment: center;
@@ -46,9 +46,9 @@ export component AsrModelsPanel inherits VerticalLayout {
     }
 
     if root.asr-download-active : Rectangle {
-        background: MementoPalette.teal-muted;
+        background: SubomiPalette.teal-muted;
         border-width: 1px;
-        border-color: MementoPalette.teal-border;
+        border-color: SubomiPalette.teal-border;
         border-radius: 8px;
 
         VerticalLayout {
@@ -60,7 +60,7 @@ export component AsrModelsPanel inherits VerticalLayout {
                 alignment: space-between;
                 Text {
                     text: root.asr-download-text;
-                    color: MementoPalette.text;
+                    color: SubomiPalette.text;
                     font-size: 12px;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -80,7 +80,7 @@ export component AsrModelsPanel inherits VerticalLayout {
             Rectangle {
                 height: 7px;
                 border-radius: 4px;
-                background: MementoPalette.border;
+                background: SubomiPalette.border;
                 clip: true;
                 Rectangle {
                     x: root.asr-download-progress >= 0.0
@@ -91,16 +91,16 @@ export component AsrModelsPanel inherits VerticalLayout {
                         : parent.width * 0.28;
                     height: parent.height;
                     border-radius: 4px;
-                    background: MementoPalette.teal-border;
+                    background: SubomiPalette.teal-border;
                 }
             }
         }
     }
 
     Rectangle {
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         border-radius: 10px;
 
         VerticalLayout {
@@ -112,7 +112,7 @@ export component AsrModelsPanel inherits VerticalLayout {
 
             for model[index] in root.asr-model-rows : VerticalLayout {
                 spacing: 0px;
-                if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
+                if index > 0 : Rectangle { height: 1px; background: SubomiPalette.border; }
                 HorizontalLayout {
                     min-height: 48px;
                     padding-top: 8px;
@@ -133,7 +133,7 @@ export component AsrModelsPanel inherits VerticalLayout {
                                     : (model.backend == "whisper-vad"
                                         ? "Whisper VAD · "
                                         : "ONNX · ")) + model.name;
-                                color: MementoPalette.text;
+                                color: SubomiPalette.text;
                                 font-size: 13px;
                                 font-weight: model.selected ? 700 : 500;
                                 vertical-alignment: center;
@@ -144,12 +144,12 @@ export component AsrModelsPanel inherits VerticalLayout {
                                     height: 18px;
                                     width: act-lbl.preferred-width + 12px;
                                     border-radius: 9px;
-                                    background: MementoPalette.success-bg;
+                                    background: SubomiPalette.success-bg;
                                     border-width: 1px;
-                                    border-color: MementoPalette.success;
+                                    border-color: SubomiPalette.success;
                                     act-lbl := Text {
                                         text: "Active";
-                                        color: MementoPalette.success-text;
+                                        color: SubomiPalette.success-text;
                                         font-size: 10px;
                                         font-weight: 700;
                                         horizontal-alignment: center;
@@ -161,7 +161,7 @@ export component AsrModelsPanel inherits VerticalLayout {
 
                         Text {
                             text: model.path;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             font-family: "monospace";
                             font-size: 10.5px;
                             overflow: elide;
@@ -170,7 +170,7 @@ export component AsrModelsPanel inherits VerticalLayout {
 
                     Text {
                         text: model.status-text;
-                        color: model.installed ? MementoPalette.success-text : MementoPalette.warning-text;
+                        color: model.installed ? SubomiPalette.success-text : SubomiPalette.warning-text;
                         font-size: 12px;
                         font-weight: 600;
                         vertical-alignment: center;

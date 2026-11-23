@@ -131,7 +131,7 @@ fn description(name: &str) -> &'static str {
         "audio-media" => "Audio of the current subtitle.",
         "character" => "The kanji character.",
         "clipboard" => "The current text in the clipboard.",
-        "cloze-body" => "The raw expression as recognized by Memento.",
+        "cloze-body" => "The raw expression as recognized by Subomi.",
         "cloze-prefix" => "The text before {cloze-body}.",
         "cloze-suffix" => "The text after {cloze-body}.",
         "context" => "Text of all selected lines in the primary subtitle list.",

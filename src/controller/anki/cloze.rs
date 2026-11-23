@@ -1,8 +1,8 @@
 //! Cloze deletion, subtitle context, and expression furigana formatting helpers.
 
-use memento_anki::note::{format_furigana, FuriganaPair};
-use memento_subtitle::SubtitleEntry;
-use memento_util::furiganautils::simplify_surface;
+use subomi_anki::note::{format_furigana, FuriganaPair};
+use subomi_subtitle::SubtitleEntry;
+use subomi_util::furiganautils::simplify_surface_str;
 
 use super::context::NoteFieldsContext;
 
@@ -178,10 +178,10 @@ pub fn secondary_context_for_range(
     fallback: &str,
 ) -> String {
     if start.is_finite() && end.is_finite() && end > start {
-        let lines: Vec<String> = secondary_entries
+        let lines: Vec<&str> = secondary_entries
             .iter()
             .filter(|cue| cue.start < end && cue.end > start)
-            .map(|cue| String::from_utf16_lossy(&cue.text))
+            .map(|cue| cue.text.as_str())
             .filter(|text| !text.is_empty())
             .collect();
         if !lines.is_empty() {
@@ -205,27 +205,22 @@ fn is_pure_kana(text: &str) -> bool {
 }
 
 /// Formats `{furigana}` (`<ruby>...</ruby>`) and `{furigana-plain}` (`漢字[かんじ]`),
-/// simplifying okurigana via `simplify_surface` and returning plain kana when there is no kanji.
+/// simplifying okurigana via `simplify_surface_str` and returning plain kana when there is no kanji.
 pub fn format_expression_furigana(expression: &str, reading: &str) -> (String, String) {
     if reading.is_empty() || reading == expression || is_pure_kana(expression) {
         return (expression.to_owned(), expression.to_owned());
     }
-    let surface: Vec<u16> = expression.encode_utf16().collect();
-    let pronunciation: Vec<u16> = reading.encode_utf16().collect();
-    let spans = simplify_surface(&surface, &pronunciation);
+    let spans = simplify_surface_str(expression, reading);
     let pairs: Vec<FuriganaPair<'_>> = spans
         .iter()
         .map(|span| FuriganaPair {
-            surface: surface
-                .get(span.surface_start as usize..span.surface_end as usize)
-                .unwrap_or(&[]),
-            reading: pronunciation
-                .get(span.reading_start as usize..span.reading_end as usize)
-                .unwrap_or(&[]),
+            surface: expression
+                .get(span.surface_start..span.surface_end)
+                .unwrap_or_default(),
+            reading: reading
+                .get(span.reading_start..span.reading_end)
+                .unwrap_or_default(),
         })
         .collect();
-    (
-        String::from_utf16_lossy(&format_furigana(&pairs, false)),
-        String::from_utf16_lossy(&format_furigana(&pairs, true)),
-    )
+    (format_furigana(&pairs, false), format_furigana(&pairs, true))
 }

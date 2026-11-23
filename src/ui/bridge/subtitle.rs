@@ -3,13 +3,13 @@ use slint::ComponentHandle;
 use crate::controller::dict::{DictController, SearchHit};
 use crate::ui::subtitle_layout::is_japanese_lookup_char;
 use crate::ui::text_engine::{subtitle_cluster_at_point_with_style, with_shared_text_engine};
-use crate::ui::{MementoApp, SubtitleOverlayBridge, SubtitleTokenMetrics, SubtitleWord};
+use crate::ui::{SubomiApp, SubtitleOverlayBridge, SubtitleTokenMetrics, SubtitleWord};
 
 use super::state::HoveredSubtitleCluster;
 use super::RichUiBridge;
 
 impl RichUiBridge {
-    pub(in crate::ui) fn clear_subtitle_scan_state(&self, app: &MementoApp) {
+    pub(in crate::ui) fn clear_subtitle_scan_state(&self, app: &SubomiApp) {
         let ass_ctrl = {
             let mut st = self.state.borrow_mut();
             st.scan_timer.stop();
@@ -38,7 +38,7 @@ impl RichUiBridge {
 
     pub(super) fn resolve_subtitle_cluster(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         word: &SubtitleWord,
         font_px: f32,
         show_furigana: bool,
@@ -231,7 +231,7 @@ impl RichUiBridge {
 
     pub(super) fn trigger_subtitle_scan_now(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         cluster: HoveredSubtitleCluster,
     ) {
         {
@@ -248,7 +248,7 @@ impl RichUiBridge {
 
     pub(super) fn trigger_ass_scan_now(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         target: crate::controller::ass::AssHoveredTarget,
     ) {
         let query = target.scan_substring.clone();

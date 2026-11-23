@@ -1,11 +1,10 @@
-//! Integration tests for Player and Subtitle Controllers in memento-app.
+//! Integration tests for Player and Subtitle Controllers in subomi-app.
 
-use memento_app::controller::player::{
-    format_time, is_subtitle_file, is_subtitle_file_utf16, PlayerController,
-    QT_ALT_MODIFIER, QT_CONTROL_MODIFIER, QT_KEY_ESCAPE, QT_KEY_F1, QT_KEY_F30,
-    QT_KEY_RETURN, QT_KEY_SHIFT, QT_NO_MODIFIER, QT_SHIFT_MODIFIER,
+use subomi_app::controller::player::{
+    format_time, is_subtitle_file, PlayerController, KEY_ESCAPE, KEY_F1, KEY_F30, KEY_RETURN,
+    KEY_SHIFT, MOD_ALT, MOD_CONTROL, MOD_NONE, MOD_SHIFT,
 };
-use memento_app::controller::subtitles::{create_cue, filter_and_sort_cues, MemorySubtitleCue, SubtitleController, SubtitleTrackInfo};
+use subomi_app::controller::subtitles::{create_cue, filter_and_sort_cues, MemorySubtitleCue, SubtitleController, SubtitleTrackInfo};
 
 #[test]
 fn context_marks_and_range_anchor_follow_live_cues() {
@@ -21,7 +20,7 @@ fn context_marks_and_range_anchor_follow_live_cues() {
     assert_eq!(ctrl.selected_indices(), &[0, 1, 2], "playback must not replace context selection");
 
     let cue = |id, text: &str, start, end| MemorySubtitleCue {
-        id, text: text.encode_utf16().collect(), start, end,
+        id, text: text.to_owned(), start, end,
     };
     ctrl.update_memory_cues(1, &[
         cue(4, "Earlier", 0.0, 0.5), cue(1, "First", 1.0, 2.0),
@@ -56,7 +55,7 @@ fn asr_cues_accumulate_survive_mpv_sync_and_follow_playback() {
     let mut ctrl = SubtitleController::new();
     ctrl.start_asr_track();
     let cue = |id, text: &str, start, end| MemorySubtitleCue {
-        id, text: text.encode_utf16().collect(), start, end,
+        id, text: text.to_owned(), start, end,
     };
     assert!(ctrl.add_asr_cue(cue(1, "Second", 5.0, 7.0), 0.0));
     assert!(ctrl.add_asr_cue(cue(0, "First", 1.0, 3.0), 0.0));
@@ -83,7 +82,7 @@ fn switching_subtitle_tracks_retains_asr_cues_and_restores_current_position() {
     ctrl.set_track_cues(2, vec![create_cue("File subtitle", 10.0, 12.0)]);
     ctrl.start_asr_track();
     let cue = |id, text: &str, start, end| MemorySubtitleCue {
-        id, text: text.encode_utf16().collect(), start, end,
+        id, text: text.to_owned(), start, end,
     };
     ctrl.add_asr_cue(cue(1, "Earlier ASR", 1.0, 3.0), 2.0);
     ctrl.add_asr_cue(cue(2, "Current ASR", 10.0, 12.0), 2.0);
@@ -140,7 +139,7 @@ fn test_subtitle_cue_filtering_and_sorting() {
 
     let texts: Vec<String> = filtered
         .iter()
-        .map(|c| String::from_utf16_lossy(&c.text))
+        .map(|c| c.text.clone())
         .collect();
 
     assert_eq!(
@@ -189,7 +188,7 @@ fn test_subtitle_controller_loading_and_selection() {
     assert_eq!(ctrl.selected_indices(), &[1]);
     assert_eq!(ctrl.selected_cues().len(), 1);
     assert_eq!(
-        String::from_utf16_lossy(&ctrl.selected_cues()[0].text),
+        ctrl.selected_cues()[0].text.as_str(),
         "Line 2"
     );
 
@@ -218,7 +217,7 @@ fn test_subtitle_search_english_and_japanese() {
     let mut ctrl = SubtitleController::new();
 
     let cues = vec![
-        create_cue("Hello World from Memento", 1.0, 3.0),
+        create_cue("Hello World from Subomi", 1.0, 3.0),
         create_cue("「いったい何を…」", 4.0, 6.0),
         create_cue("「ロケットを打ち上げるんだ」", 7.0, 9.0),
         create_cue("Quick Brown Fox jumps over lazy dog", 10.0, 12.0),
@@ -412,52 +411,47 @@ fn test_player_time_formatting_and_display() {
 fn test_player_keypress_formatting() {
     // Bare modifier key returns None
     assert_eq!(
-        PlayerController::format_keypress(QT_KEY_SHIFT, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(KEY_SHIFT, MOD_NONE, false, ""),
         None
     );
 
     // Regular key with and without modifiers
     let a_key = 0x41; // 'A'
     assert_eq!(
-        PlayerController::format_keypress(a_key, QT_NO_MODIFIER, false, "a"),
+        PlayerController::format_keypress(a_key, MOD_NONE, false, "a"),
         Some("a".to_string())
     );
     assert_eq!(
-        PlayerController::format_keypress(a_key, QT_SHIFT_MODIFIER, false, "A"),
+        PlayerController::format_keypress(a_key, MOD_SHIFT, false, "A"),
         Some("Shift+A".to_string())
     );
     assert_eq!(
-        PlayerController::format_keypress(
-            a_key,
-            QT_CONTROL_MODIFIER | QT_ALT_MODIFIER,
-            false,
-            "a"
-        ),
+        PlayerController::format_keypress(a_key, MOD_CONTROL | MOD_ALT, false, "a"),
         Some("Ctrl+Alt+a".to_string())
     );
 
     // Named keys
     assert_eq!(
-        PlayerController::format_keypress(QT_KEY_ESCAPE, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(KEY_ESCAPE, MOD_NONE, false, ""),
         Some("ESC".to_string())
     );
     assert_eq!(
-        PlayerController::format_keypress(QT_KEY_RETURN, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(KEY_RETURN, MOD_NONE, false, ""),
         Some("ENTER".to_string())
     );
 
     // Function keys
     assert_eq!(
-        PlayerController::format_keypress(QT_KEY_F1, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(KEY_F1, MOD_NONE, false, ""),
         Some("F1".to_string())
     );
-    let f11_key = QT_KEY_F1 + 10;
+    let f11_key = KEY_F1 + 10;
     assert_eq!(
-        PlayerController::format_keypress(f11_key, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(f11_key, MOD_NONE, false, ""),
         Some("F11".to_string())
     );
     assert_eq!(
-        PlayerController::format_keypress(QT_KEY_F30, QT_NO_MODIFIER, false, ""),
+        PlayerController::format_keypress(KEY_F30, MOD_NONE, false, ""),
         Some("F30".to_string())
     );
 }
@@ -484,13 +478,6 @@ fn test_player_is_subtitle_file() {
     assert!(!is_subtitle_file("document.txt"));
     assert!(!is_subtitle_file("movie."));
     assert!(!is_subtitle_file(""));
-
-    // UTF-16 code units check
-    let srt_u16: Vec<u16> = "video.srt".encode_utf16().collect();
-    assert!(is_subtitle_file_utf16(&srt_u16));
-
-    let mp4_u16: Vec<u16> = "video.mp4".encode_utf16().collect();
-    assert!(!is_subtitle_file_utf16(&mp4_u16));
 }
 
 mod phase2c_live_wire_tests {
@@ -498,15 +485,15 @@ mod phase2c_live_wire_tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use memento_app::controller::asr::{AsrController, AsrCue as ControllerAsrCue, AsrEvent};
-    use memento_app::controller::player::{
+    use subomi_app::controller::asr::{AsrController, AsrCue as ControllerAsrCue, AsrEvent};
+    use subomi_app::controller::player::{
         compute_mpv_subtitle_visibility, compute_video_render_size, effective_media_title,
         is_image_subtitle_codec, refresh_subtitle_list, LivePlayerCoordinator, MouseInputForwarder,
-        QT_CONTROL_MODIFIER, QT_SHIFT_MODIFIER,
+        MOD_CONTROL, MOD_SHIFT,
     };
-    use memento_app::controller::subtitles::SubtitleController;
-    use memento_app::{MementoApp, SubEntry};
-    use memento_player::{CliOption, MpvInstance};
+    use subomi_app::controller::subtitles::SubtitleController;
+    use subomi_app::{SubomiApp, SubEntry};
+    use subomi_player::{CliOption, MpvInstance};
     use slint::{Model as _, VecModel};
 
     fn make_headless_mpv(dir: &Path) -> MpvInstance {
@@ -530,7 +517,7 @@ mod phase2c_live_wire_tests {
     #[allow(clippy::too_many_arguments)]
     fn pump_sync_until(
         coord: &mut LivePlayerCoordinator,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -540,7 +527,7 @@ mod phase2c_live_wire_tests {
         asr_restart_pending: &Cell<bool>,
         hover_pause_owned: &Cell<bool>,
         timeout: Duration,
-        mut predicate: impl FnMut(&LivePlayerCoordinator, &MementoApp, &SubtitleController) -> bool,
+        mut predicate: impl FnMut(&LivePlayerCoordinator, &SubomiApp, &SubtitleController) -> bool,
     ) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -621,7 +608,7 @@ mod phase2c_live_wire_tests {
         );
         assert_eq!(mouse.record_move(120, 240), None, "duplicate coordinates coalesce");
         let mods = MouseInputForwarder::modifiers_mask(true, true, false, false);
-        assert_eq!(mods, QT_CONTROL_MODIFIER | QT_SHIFT_MODIFIER);
+        assert_eq!(mods, MOD_CONTROL | MOD_SHIFT);
         let press_cmds = mouse.record_button(125, 245, 1, mods, true);
         assert_eq!(
             press_cmds,
@@ -673,7 +660,7 @@ mod phase2c_live_wire_tests {
     #[test]
     fn live_asr_track_drives_mpv_sid_and_autopause_without_skipping_events() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_asr_enabled(true);
         let temp = tempfile::TempDir::new().unwrap();
         let wav_path = temp.path().join("speech.wav");
@@ -890,7 +877,7 @@ mod phase2c_live_wire_tests {
         assert_eq!(effective_media_title("   ", "/tmp/folder/ep02.mkv"), "ep02.mkv");
 
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_asr_enabled(true);
         let temp = tempfile::TempDir::new().unwrap();
         let player = make_headless_mpv(temp.path());
@@ -1038,7 +1025,7 @@ mod phase2c_live_wire_tests {
     #[test]
     fn dual_observer_none_preserves_track_ids_set_sid_no_suspends_asr_and_silent_playlist_clears_restart() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_asr_enabled(true);
         let temp = tempfile::TempDir::new().unwrap();
 
@@ -1271,7 +1258,7 @@ mod phase2c_live_wire_tests {
     #[cfg(feature = "asr-onnx")]
     mod real_onnx_asr_integration {
         use super::*;
-        use memento_app::controller::asr::{AsrBackend, AsrSettings, OnnxSettings, WhisperSettings};
+        use subomi_app::controller::asr::{AsrBackend, AsrSettings, OnnxSettings, WhisperSettings};
 
         // Minimal protobuf wire-format helpers to build tiny real ONNX graphs in-memory.
         fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
@@ -1467,7 +1454,7 @@ mod phase2c_live_wire_tests {
         #[test]
         fn seeking_during_asr_calls_notify_seek_and_wakes_paused_worker() {
             i_slint_backend_testing::init_no_event_loop();
-            let app = MementoApp::new().unwrap();
+            let app = SubomiApp::new().unwrap();
             app.set_asr_enabled(true);
             let temp = tempfile::TempDir::new().unwrap();
             let failing_model_dir = temp.path().join("failing_ctc");
@@ -1589,7 +1576,7 @@ mod phase2c_live_wire_tests {
         #[test]
         fn switching_aid_updates_live_asr_and_clears_previous_track_cues() {
             i_slint_backend_testing::init_no_event_loop();
-            let app = MementoApp::new().unwrap();
+            let app = SubomiApp::new().unwrap();
             app.set_asr_enabled(true);
             let temp = tempfile::TempDir::new().unwrap();
             let model_dir = temp.path().join("valid_ctc");
@@ -1669,9 +1656,9 @@ mod phase2c_live_wire_tests {
             // Plant a sentinel cue on aid=1 (`99.0..100.0`, outside the 4s file) so we deterministically
             // verify BOTH that aid=1's stale cues were wiped AND that aid=2 transcribed fresh ONNX cues!
             subtitles.add_asr_cue(
-                memento_app::controller::subtitles::MemorySubtitleCue {
+                subomi_app::controller::subtitles::MemorySubtitleCue {
                     id: 999_999,
-                    text: "STALE_AID1_SENTINEL".encode_utf16().collect(),
+                    text: "STALE_AID1_SENTINEL".to_owned(),
                     start: 99.0,
                     end: 100.0,
                 },
@@ -1680,7 +1667,7 @@ mod phase2c_live_wire_tests {
             assert!(subtitles
                 .primary_entries()
                 .iter()
-                .any(|e| String::from_utf16_lossy(&e.text).contains("STALE_AID1_SENTINEL")));
+                .any(|e| e.text.contains("STALE_AID1_SENTINEL")));
 
             // (d) Switch to real embedded container stream `aid = 2`!
             player.set_aid(2).unwrap();
@@ -1703,7 +1690,7 @@ mod phase2c_live_wire_tests {
                         && !subtitles
                             .primary_entries()
                             .iter()
-                            .any(|e| String::from_utf16_lossy(&e.text).contains("STALE_AID1_SENTINEL")),
+                            .any(|e| e.text.contains("STALE_AID1_SENTINEL")),
                 ),
                 "Switching aid=1 -> aid=2 must clear stale aid=1 cues and transcribe fresh aid=2 cues"
             );
@@ -1780,7 +1767,7 @@ file:///home/user/Videos/Episode%2001.en.ass\r\n\
 file:///home/user/Videos/Episode%2001.vtt\r\n\
 file:///home/user/Videos/Episode%2001.sub\r\n";
 
-    let paths = memento_os::parse_uri_list(uri_list);
+    let paths = subomi_os::parse_uri_list(uri_list);
     assert_eq!(paths.len(), 6);
     let (subtitles, media): (Vec<_>, Vec<_>) = paths
         .into_iter()
@@ -1793,7 +1780,7 @@ file:///home/user/Videos/Episode%2001.sub\r\n";
 
 #[test]
 fn test_screensaver_playback_inhibition_lifecycle() {
-    let mut ss = memento_os::Screensaver::new();
+    let mut ss = subomi_os::Screensaver::new();
     assert!(!ss.is_inhibited());
     // Paused or unloaded media must never leave screensaver inhibited.
     ss.sync_playback(false, false, "Playing media");
@@ -1806,8 +1793,8 @@ fn test_screensaver_playback_inhibition_lifecycle() {
 
 #[test]
 fn refresh_active_rows_clears_previous_highlights_even_when_previous_slice_is_stale() {
-    use memento_app::controller::player::refresh_active_rows;
-    use memento_app::SubEntry;
+    use subomi_app::controller::player::refresh_active_rows;
+    use subomi_app::SubEntry;
     use slint::{Model, VecModel};
 
     let model = VecModel::from(vec![
@@ -1838,7 +1825,7 @@ fn refresh_active_rows_clears_previous_highlights_even_when_previous_slice_is_st
 
 #[test]
 fn autofit_window_size_scales_accounts_for_drawer_clamps_and_skips_fullscreen_or_maximized() {
-    use memento_app::controller::player::compute_autofit_window_size;
+    use subomi_app::controller::player::compute_autofit_window_size;
 
     // 100% 720p video fits cleanly without drawer.
     assert_eq!(
@@ -1893,7 +1880,7 @@ fn autofit_window_size_scales_accounts_for_drawer_clamps_and_skips_fullscreen_or
 
 #[test]
 fn subtitle_cursor_zones_and_overlay_visibility_reveal_primary_bottom_and_secondary_top() {
-    use memento_app::controller::player::{
+    use subomi_app::controller::player::{
         compute_subtitle_overlay_visibility, subtitle_cursor_zones,
     };
 
@@ -1928,8 +1915,8 @@ fn subtitle_cursor_zones_and_overlay_visibility_reveal_primary_bottom_and_second
 
 #[test]
 fn mpv_cursor_autohide_policy_respects_never_always_timeout_fs_only_and_interactive_overlay() {
-    use memento_app::controller::player::mpv_cursor_should_hide;
-    use memento_player::mpv::CursorAutohide;
+    use subomi_app::controller::player::mpv_cursor_should_hide;
+    use subomi_player::mpv::CursorAutohide;
 
     assert!(!mpv_cursor_should_hide(CursorAutohide::Never, false, true, 10_000, false));
     assert!(mpv_cursor_should_hide(CursorAutohide::Always, false, false, 0, false));
@@ -1945,8 +1932,8 @@ fn mpv_cursor_autohide_policy_respects_never_always_timeout_fs_only_and_interact
 
 #[test]
 fn filter_subtitle_text_and_refresh_subtitle_list_respect_regex_newlines_and_ignore_whitespace() {
-    use memento_app::controller::player::{filter_subtitle_text, refresh_subtitle_list};
-    use memento_app::{MementoApp, SubEntry};
+    use subomi_app::controller::player::{filter_subtitle_text, refresh_subtitle_list};
+    use subomi_app::{SubomiApp, SubEntry};
     use slint::{Model, VecModel};
 
     assert_eq!(
@@ -1959,7 +1946,7 @@ fn filter_subtitle_text_and_refresh_subtitle_list_respect_regex_newlines_and_ign
     );
 
     i_slint_backend_testing::init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     let mut subs = SubtitleController::new();
     subs.load_cues(vec![
         create_cue("（SE）Alpha one", 1.0, 2.0),
@@ -1985,9 +1972,9 @@ fn filter_subtitle_text_and_refresh_subtitle_list_respect_regex_newlines_and_ign
 
 #[test]
 fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descriptions() {
-    use memento_app::controller::config::ConfigController;
-    use memento_config::Value;
-    use memento_setting::keys as raw;
+    use subomi_app::controller::config::ConfigController;
+    use subomi_config::Value;
+    use subomi_setting::keys as raw;
     use slint::Model;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -1997,19 +1984,19 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
     cfg.edit_setting("behavior/osc-fade", "900").unwrap();
 
     // Persist individual live toggles via `persist_single_setting`.
-    cfg.persist_single_setting("interface/sub-list-timestamps", "true", dir.path(), "memento.conf")
+    cfg.persist_single_setting("interface/sub-list-timestamps", "true", dir.path(), "subomi.conf")
         .unwrap();
-    cfg.persist_single_setting("subtitle-list/ignore-whitespace", "true", dir.path(), "memento.conf")
+    cfg.persist_single_setting("subtitle-list/ignore-whitespace", "true", dir.path(), "subomi.conf")
         .unwrap();
-    cfg.persist_single_setting("subtitle-list/auto-seek", "true", dir.path(), "memento.conf")
+    cfg.persist_single_setting("subtitle-list/auto-seek", "true", dir.path(), "subomi.conf")
         .unwrap();
-    cfg.persist_single_setting("internal/auto-update-opt-in-shown", "true", dir.path(), "memento.conf")
+    cfg.persist_single_setting("internal/auto-update-opt-in-shown", "true", dir.path(), "subomi.conf")
         .unwrap();
-    cfg.persist_single_setting("application/auto-update-check", "true", dir.path(), "memento.conf")
+    cfg.persist_single_setting("application/auto-update-check", "true", dir.path(), "subomi.conf")
         .unwrap();
 
     // Reloading from disk must have persisted all single settings WITHOUT committing the draft osc-fade.
-    let reloaded = ConfigController::load(dir.path(), "memento.conf").unwrap();
+    let reloaded = ConfigController::load(dir.path(), "subomi.conf").unwrap();
     assert_eq!(
         reloaded.effective_setting(raw::interface::GROUP, raw::interface::subtitle_list::TIMESTAMPS),
         Some(Value::Bool(true))
@@ -2041,9 +2028,9 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
     reloaded.edit_setting("application/language", "한국어 (MTL)").unwrap();
     reloaded.edit_setting("interface/theme", "light").unwrap();
     let anki_path = dir.path().join("anki_connect.json");
-    reloaded.apply_settings(1, dir.path(), "memento.conf", &anki_path).unwrap();
-    reloaded.apply_settings(5, dir.path(), "memento.conf", &anki_path).unwrap();
-    let reloaded2 = ConfigController::load(dir.path(), "memento.conf").unwrap();
+    reloaded.apply_settings(1, dir.path(), "subomi.conf", &anki_path).unwrap();
+    reloaded.apply_settings(5, dir.path(), "subomi.conf", &anki_path).unwrap();
+    let reloaded2 = ConfigController::load(dir.path(), "subomi.conf").unwrap();
     assert_eq!(
         reloaded2.effective_setting(raw::application::GROUP, raw::application::LANGUAGE),
         Some(Value::Int(2))
@@ -2075,9 +2062,9 @@ fn config_single_setting_persistence_preserves_unapplied_drafts_and_status_descr
 
 #[test]
 fn embedded_mkv_ass_track_never_inserts_combined_duplicate_and_highlights_simultaneous_rows() {
-    use memento_app::controller::anki::{apply_subtitle_cloze, NoteFieldsContext};
-    use memento_app::controller::player::{refresh_active_rows, refresh_subtitle_list};
-    use memento_app::{MementoApp, SubEntry};
+    use subomi_app::controller::anki::{apply_subtitle_cloze, NoteFieldsContext};
+    use subomi_app::controller::player::{refresh_active_rows, refresh_subtitle_list};
+    use subomi_app::{SubomiApp, SubEntry};
     use slint::{Model, VecModel};
 
     let mut ctrl = SubtitleController::new();
@@ -2116,7 +2103,7 @@ fn embedded_mkv_ass_track_never_inserts_combined_duplicate_and_highlights_simult
         1,
         &[MemorySubtitleCue {
             id: 1,
-            text: "いいわけあるか〜っ！！\nうわっ！".encode_utf16().collect(),
+            text: "いいわけあるか〜っ！！\nうわっ！".to_owned(),
             start: 1021.99,
             end: 1024.16,
         }],
@@ -2129,7 +2116,7 @@ fn embedded_mkv_ass_track_never_inserts_combined_duplicate_and_highlights_simult
 
     // UI model highlights BOTH simultaneous rows cleanly with zero 3rd duplicate row.
     i_slint_backend_testing::init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     let model = VecModel::<SubEntry>::default();
     refresh_subtitle_list(&app, &model, &ctrl);
     assert_eq!(model.row_count(), 2);
@@ -2152,7 +2139,7 @@ fn embedded_mkv_ass_track_never_inserts_combined_duplicate_and_highlights_simult
     let selected_texts: Vec<String> = ctrl
         .selected_cues()
         .iter()
-        .map(|cue| String::from_utf16_lossy(&cue.text))
+        .map(|cue| cue.text.clone())
         .collect();
     assert_eq!(selected_texts, vec!["いいわけあるか〜っ！！", "うわっ！"]);
     let mut ctx = NoteFieldsContext::default();
@@ -2201,7 +2188,7 @@ fn embedded_mkv_srt_track_normalizes_blank_lines_crlf_and_never_duplicates() {
         2,
         &[MemorySubtitleCue {
             id: 1,
-            text: "あっ。\n勝った勝った！".encode_utf16().collect(),
+            text: "あっ。\n勝った勝った！".to_owned(),
             start: 926.526,
             end: 929.028,
         }],
@@ -2247,13 +2234,13 @@ fn live_memory_track_accumulation_still_works_when_not_loaded_complete_and_reset
         &[
             MemorySubtitleCue {
                 id: 10,
-                text: "Mem A".encode_utf16().collect(),
+                text: "Mem A".to_owned(),
                 start: 1.0,
                 end: 2.0,
             },
             MemorySubtitleCue {
                 id: 11,
-                text: "Mem B".encode_utf16().collect(),
+                text: "Mem B".to_owned(),
                 start: 3.0,
                 end: 4.0,
             },
@@ -2330,7 +2317,7 @@ fn filter_and_sort_cues_normalizes_line_breaks_and_deduplicates_exact_matches_wi
     let filtered = filter_and_sort_cues(&cues);
     let texts: Vec<String> = filtered
         .iter()
-        .map(|c| String::from_utf16_lossy(&c.text))
+        .map(|c| c.text.clone())
         .collect();
     assert_eq!(
         texts,
@@ -2353,10 +2340,10 @@ fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines()
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    use memento_app::controller::asr::AsrController;
-    use memento_app::controller::player::{refresh_subtitle_list, LivePlayerCoordinator};
-    use memento_app::{MementoApp, SubEntry};
-    use memento_player::{CliOption, MpvInstance};
+    use subomi_app::controller::asr::AsrController;
+    use subomi_app::controller::player::{refresh_subtitle_list, LivePlayerCoordinator};
+    use subomi_app::{SubomiApp, SubEntry};
+    use subomi_player::{CliOption, MpvInstance};
     use slint::{Model as _, VecModel};
 
     let mkv_path = Path::new(
@@ -2366,11 +2353,11 @@ fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines()
         return;
     }
 
-    // Extract both embedded tracks with memento-ass exactly like src/main.rs does.
+    // Extract both embedded tracks with subomi-ass exactly like src/main.rs does.
     let ass_extracted =
-        memento_ass::extract_mkv_subtitle_track(mkv_path, 3).expect("extract ep01 ASS track");
+        subomi_ass::extract_mkv_subtitle_track(mkv_path, 3).expect("extract ep01 ASS track");
     let srt_extracted =
-        memento_ass::extract_mkv_subtitle_track(mkv_path, 4).expect("extract ep01 SRT track");
+        subomi_ass::extract_mkv_subtitle_track(mkv_path, 4).expect("extract ep01 SRT track");
     assert_eq!(ass_extracted.cues.len(), 430);
     assert_eq!(srt_extracted.cues.len(), 297);
     assert!(
@@ -2388,7 +2375,7 @@ fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines()
         "ep01 SRT cue 197 must normalize cleanly to 'あっ。\\n勝った勝った！'"
     );
 
-    let to_entries = |cues: &[memento_ass::MkvSubtitleCue]| {
+    let to_entries = |cues: &[subomi_ass::MkvSubtitleCue]| {
         cues.iter()
             .filter_map(|c| {
                 if c.plain_text.trim().is_empty() || c.end_ms <= c.start_ms {
@@ -2404,7 +2391,7 @@ fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines()
     };
 
     i_slint_backend_testing::init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     let temp = tempfile::TempDir::new().unwrap();
     std::fs::write(temp.path().join("input.conf"), "").unwrap();
     std::fs::write(
@@ -2435,7 +2422,7 @@ fn summer_pockets_ep01_live_mpv_ass_and_srt_zero_duplicates_and_clean_newlines()
 
     let mut pump = |subtitles: &mut SubtitleController,
                     timeout: Duration,
-                    mut pred: Box<dyn FnMut(&LivePlayerCoordinator, &MementoApp, &SubtitleController) -> bool>|
+                    mut pred: Box<dyn FnMut(&LivePlayerCoordinator, &SubomiApp, &SubtitleController) -> bool>|
      -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {

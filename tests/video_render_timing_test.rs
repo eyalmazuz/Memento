@@ -1,11 +1,11 @@
 //! Optional headless playback test using the actual Slint/FemtoVG window.
 //! It includes scene rendering, but not desktop/compositor presentation.
-//! Supply MEMENTO_VIDEO_TEST_MEDIA to test a file.
+//! Supply SUBOMI_VIDEO_TEST_MEDIA to test a file.
 #![cfg(target_os = "linux")]
 
 use glow::HasContext;
-use memento_app::{DictResult, MementoApp, PopupGlossaryBlock, SubtitleLine, SubtitleWord};
-use memento_player::mpv::MpvInstance;
+use subomi_app::{DictResult, SubomiApp, PopupGlossaryBlock, SubtitleLine, SubtitleWord};
+use subomi_player::mpv::MpvInstance;
 use slint::{ComponentHandle, Model};
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
@@ -23,7 +23,7 @@ mod compact_popup;
 #[path = "../src/video_gl.rs"]
 mod video_gl;
 
-fn change_subtitle(app: &MementoApp, index: usize) {
+fn change_subtitle(app: &SubomiApp, index: usize) {
     let lines = [
         &[
             ("生前", "せいぜん"),
@@ -80,10 +80,10 @@ fn change_subtitle(app: &MementoApp, index: usize) {
     );
 }
 
-fn open_dictionary(app: &MementoApp) {
-    if std::env::var_os("MEMENTO_VIDEO_TEST_COMPACT_POPUP").is_some() {
-        memento_app::install_popup_navigation(app);
-        memento_app::set_dictionary_rows(app, compact_popup::definitions());
+fn open_dictionary(app: &SubomiApp) {
+    if std::env::var_os("SUBOMI_VIDEO_TEST_COMPACT_POPUP").is_some() {
+        subomi_app::install_popup_navigation(app);
+        subomi_app::set_dictionary_rows(app, compact_popup::definitions());
         app.set_anki_enabled(true);
         app.set_dict_open(true);
         return;
@@ -110,7 +110,7 @@ fn open_dictionary(app: &MementoApp) {
         .collect();
     let rows = Rc::new(slint::VecModel::from(rows));
     app.set_dict_results(rows.clone().into());
-    let count = memento_app::next_popup_batch_end(&rows.clone().into(), 0);
+    let count = subomi_app::next_popup_batch_end(&rows.clone().into(), 0);
     app.set_popup_results(
         Rc::new(slint::VecModel::from(
             (0..count)
@@ -279,7 +279,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
             make_current: *make_current,
             get_proc: *get_proc,
         });
-        memento_app::prepare_text_fonts();
+        subomi_app::prepare_text_fonts();
         app.set_video_frame(
             slint::BorrowedOpenGLTextureBuilder::new_gl_2d_rgba_texture(
                 texture.0,
@@ -294,7 +294,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         window.renderer.render().unwrap();
         gl.finish();
         let directory =
-            std::env::temp_dir().join(format!("memento-gl-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("subomi-gl-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("input.conf"), "").unwrap();
         std::fs::write(
@@ -315,14 +315,14 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         player.set_render_wakeup(move || {
             let _ = wake.send(());
         });
-        let source = std::env::var("MEMENTO_VIDEO_TEST_MEDIA").unwrap_or_else(|_| {
+        let source = std::env::var("SUBOMI_VIDEO_TEST_MEDIA").unwrap_or_else(|_| {
             "av://lavfi:testsrc2=size=1920x1080:rate=24000/1001,format=yuv420p10le".into()
         });
-        if let Ok(start) = std::env::var("MEMENTO_VIDEO_TEST_START") {
+        if let Ok(start) = std::env::var("SUBOMI_VIDEO_TEST_START") {
             player.command(&["set", "start", &start]).unwrap();
         }
         player.load_file(&source).unwrap();
-        let mut startup_subtitles = std::env::var_os("MEMENTO_VIDEO_TEST_STARTUP_FURIGANA")
+        let mut startup_subtitles = std::env::var_os("SUBOMI_VIDEO_TEST_STARTUP_FURIGANA")
             .map(|_| startup_subtitles::StartupSubtitles::new());
         // Match application startup: prepare the first decoded frame and the
         // playback metadata in the real UI before starting the audio clock.
@@ -472,7 +472,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         let request = player.request_screenshot(false).unwrap();
         let playing_capture = std::thread::spawn(move || request.wait());
         let started = Instant::now();
-        let seconds = std::env::var("MEMENTO_VIDEO_TEST_SECONDS")
+        let seconds = std::env::var("SUBOMI_VIDEO_TEST_SECONDS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(5);
@@ -487,8 +487,8 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
         let mut drawn = 0;
         let mut subtitle_index = 0;
         let mut popup_opened = false;
-        let with_popup = std::env::var_os("MEMENTO_VIDEO_TEST_POPUP").is_some();
-        let mut actions = std::env::var_os("MEMENTO_VIDEO_TEST_INTERACTIONS")
+        let with_popup = std::env::var_os("SUBOMI_VIDEO_TEST_POPUP").is_some();
+        let mut actions = std::env::var_os("SUBOMI_VIDEO_TEST_INTERACTIONS")
             .map(|_| playback_actions::PlaybackActions::new(&app));
         assert!(
             actions.is_none() || startup_subtitles.is_none(),
@@ -635,7 +635,7 @@ fn opengl_frames_and_async_state_keep_up_with_1080p_video() {
                 }
             }
         }
-        if let Some(path) = std::env::var_os("MEMENTO_VIDEO_TEST_SCREENSHOT") {
+        if let Some(path) = std::env::var_os("SUBOMI_VIDEO_TEST_SCREENSHOT") {
             if app.get_dict_results().row_count() > 0 {
                 app.set_dict_open(true);
             }

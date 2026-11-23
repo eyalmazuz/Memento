@@ -10,7 +10,7 @@ use crate::ui::glossary_render::{
 };
 use crate::ui::popup_model::active_rich_bridge_for_app;
 use crate::ui::subtitle_layout::is_japanese_lookup_char;
-use crate::ui::{DictResult, MementoApp, PopupBridge, RichGlossaryRender};
+use crate::ui::{DictResult, SubomiApp, PopupBridge, RichGlossaryRender};
 
 use super::state::{
     build_selection_rects_for_cells, row_term_def_key, row_term_def_key_model, GlossaryDocCacheKey,
@@ -31,7 +31,7 @@ pub(super) fn format_details_sig(detail_states: &HashMap<String, bool>) -> Strin
         .collect()
 }
 
-fn popup_width_and_cols(app: &MementoApp) -> (f32, bool, f32, f32) {
+fn popup_width_and_cols(app: &SubomiApp) -> (f32, bool, f32, f32) {
     let pb = app.global::<PopupBridge>();
     let live_w = app.get_popup_width();
     let popup_w = if live_w > 1.0 {
@@ -51,7 +51,7 @@ fn popup_width_and_cols(app: &MementoApp) -> (f32, bool, f32, f32) {
     (popup_w, use_two_cols, popup_pad, col_gap)
 }
 
-pub(super) fn drain_glossary_prerender_results_for_app(app: &MementoApp) -> bool {
+pub(super) fn drain_glossary_prerender_results_for_app(app: &SubomiApp) -> bool {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.drain_glossary_prerender_results(app)
     } else {
@@ -60,7 +60,7 @@ pub(super) fn drain_glossary_prerender_results_for_app(app: &MementoApp) -> bool
 }
 
 impl RichUiBridge {
-    pub(super) fn dispatch_glossary_prerender(&self, app: &MementoApp, rows: &[DictResult]) {
+    pub(super) fn dispatch_glossary_prerender(&self, app: &SubomiApp, rows: &[DictResult]) {
         let Some(ref tx) = self.glossary_render_tx else {
             return;
         };
@@ -179,7 +179,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn drain_glossary_prerender_results(&self, app: &MementoApp) -> bool {
+    pub(super) fn drain_glossary_prerender_results(&self, app: &SubomiApp) -> bool {
         let mut completed = Vec::new();
         if let Ok(guard) = self.glossary_render_res_rx.lock() {
             while let Ok(item) = guard.try_recv() {
@@ -528,7 +528,7 @@ impl RichUiBridge {
         best.map(|(idx, _)| idx)
     }
 
-    pub(super) fn update_glossary_selection_text_at_depth(&self, app: &MementoApp, depth: i32) {
+    pub(super) fn update_glossary_selection_text_at_depth(&self, app: &SubomiApp, depth: i32) {
         let ordered_selections: Vec<GlossarySelectionState> = {
             let st = self.state.borrow();
             if depth < 0 {
@@ -580,7 +580,7 @@ impl RichUiBridge {
         pb.set_selection_revision(pb.get_selection_revision().wrapping_add(1));
     }
 
-    pub(super) fn clear_glossary_selections_at_depth(&self, app: &MementoApp, depth: i32) {
+    pub(super) fn clear_glossary_selections_at_depth(&self, app: &SubomiApp, depth: i32) {
         let had_any = {
             let mut st = self.state.borrow_mut();
             if depth < 0 {
@@ -612,7 +612,7 @@ impl RichUiBridge {
 
     pub(super) fn toggle_glossary_details_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         detail_id: &str,
@@ -720,12 +720,12 @@ impl RichUiBridge {
 
     pub(super) fn handle_internal_link_str_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: Option<i32>,
         link: &str,
     ) -> bool {
-        if let Some(rest) = link.strip_prefix("memento://glossary-details?") {
+        if let Some(rest) = link.strip_prefix("subomi://glossary-details?") {
             let mut id = String::new();
             let mut link_row: Option<i32> = None;
             for (k, v) in url::form_urlencoded::parse(rest.as_bytes()) {
@@ -744,7 +744,7 @@ impl RichUiBridge {
             }
             return true;
         }
-        if let Some(rest) = link.strip_prefix("memento://glossary-link?") {
+        if let Some(rest) = link.strip_prefix("subomi://glossary-link?") {
             let mut target = String::new();
             let mut link_row: Option<i32> = None;
             for (k, v) in url::form_urlencoded::parse(rest.as_bytes()) {
@@ -788,7 +788,7 @@ impl RichUiBridge {
 
     pub(super) fn handle_glossary_pointer_down_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,
@@ -869,7 +869,7 @@ impl RichUiBridge {
 
     pub(super) fn handle_glossary_pointer_drag_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,
@@ -926,7 +926,7 @@ impl RichUiBridge {
 
     pub(super) fn handle_glossary_pointer_up_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,
@@ -997,7 +997,7 @@ impl RichUiBridge {
 
     pub(super) fn handle_glossary_double_click_at_depth(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,

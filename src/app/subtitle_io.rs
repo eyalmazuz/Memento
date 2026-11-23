@@ -139,7 +139,7 @@ fn strip_ass_tags(text: &str) -> String {
     out
 }
 
-pub(crate) fn parse_lenient_subtitles(text: &str) -> Vec<memento_subtitle::SubtitleEntry> {
+pub(crate) fn parse_lenient_subtitles(text: &str) -> Vec<subomi_subtitle::SubtitleEntry> {
     const DIALOGUE_PREFIX: &[u8] = b"dialogue:";
     let mut entries = Vec::new();
     for line in text.lines() {
@@ -170,8 +170,8 @@ pub(crate) fn parse_lenient_subtitles(text: &str) -> Vec<memento_subtitle::Subti
                         let clean = strip_ass_tags(&text_joined);
                         let clean_trimmed = clean.trim();
                         if !clean_trimmed.is_empty() {
-                            entries.push(memento_subtitle::SubtitleEntry {
-                                text: clean_trimmed.encode_utf16().collect(),
+                            entries.push(subomi_subtitle::SubtitleEntry {
+                                text: clean_trimmed.to_owned(),
                                 start,
                                 end,
                             });
@@ -193,37 +193,36 @@ pub(crate) fn parse_lenient_subtitles(text: &str) -> Vec<memento_subtitle::Subti
 /// Embedded tracks have no path; those are populated from mpv's live cue data.
 pub(crate) fn parse_external_subtitles(
     path: &Path,
-) -> Result<Vec<memento_subtitle::SubtitleEntry>, String> {
+) -> Result<Vec<subomi_subtitle::SubtitleEntry>, String> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
     let text = read_subtitle_file(path)?;
-    let u16_text: Vec<u16> = text.encode_utf16().collect();
 
     let primary_format = match extension.as_str() {
-        "ass" | "ssa" => Some(memento_subtitle::Format::Ass),
-        "srt" => Some(memento_subtitle::Format::Srt),
-        "vtt" => Some(memento_subtitle::Format::Vtt),
+        "ass" | "ssa" => Some(subomi_subtitle::Format::Ass),
+        "srt" => Some(subomi_subtitle::Format::Srt),
+        "vtt" => Some(subomi_subtitle::Format::Vtt),
         _ => None,
     };
     if let Some(format) = primary_format {
-        if let Ok(cues) = memento_subtitle::parse_subtitles(format, &u16_text) {
+        if let Ok(cues) = subomi_subtitle::parse_subtitles(format, &text) {
             if !cues.is_empty() {
                 return Ok(cues);
             }
         }
     }
     for format in [
-        memento_subtitle::Format::Ass,
-        memento_subtitle::Format::Srt,
-        memento_subtitle::Format::Vtt,
+        subomi_subtitle::Format::Ass,
+        subomi_subtitle::Format::Srt,
+        subomi_subtitle::Format::Vtt,
     ] {
         if Some(format) == primary_format {
             continue;
         }
-        if let Ok(cues) = memento_subtitle::parse_subtitles(format, &u16_text) {
+        if let Ok(cues) = subomi_subtitle::parse_subtitles(format, &text) {
             if !cues.is_empty() {
                 return Ok(cues);
             }
@@ -272,9 +271,9 @@ mod tests {
         let cues_le = parse_external_subtitles(&srt_le).unwrap();
         let cues_be = parse_external_subtitles(&srt_be).unwrap();
         assert_eq!(cues_le.len(), 1);
-        assert_eq!(String::from_utf16_lossy(&cues_le[0].text), "一話「旅立ち」");
+        assert_eq!(cues_le[0].text, "一話「旅立ち」");
         assert_eq!(cues_be.len(), 1);
-        assert_eq!(String::from_utf16_lossy(&cues_be[0].text), "一話「旅立ち」");
+        assert_eq!(cues_be[0].text, "一話「旅立ち」");
     }
 
     #[test]
@@ -285,14 +284,8 @@ DIALOGUE:0,0:00:04.00,0:00:06.00,Default,,0,0,0,,UPPERCASE, with comma\n\
 Dialogue: 0,0:00:07.00,0:00:09.00,Default,,0,0,0,,Mixed case\n";
         let cues = parse_lenient_subtitles(ass);
         assert_eq!(cues.len(), 3);
-        assert_eq!(
-            String::from_utf16_lossy(&cues[0].text),
-            "lowercase line\nsecond"
-        );
-        assert_eq!(
-            String::from_utf16_lossy(&cues[1].text),
-            "UPPERCASE, with comma"
-        );
-        assert_eq!(String::from_utf16_lossy(&cues[2].text), "Mixed case");
+        assert_eq!(cues[0].text, "lowercase line\nsecond");
+        assert_eq!(cues[1].text, "UPPERCASE, with comma");
+        assert_eq!(cues[2].text, "Mixed case");
     }
 }

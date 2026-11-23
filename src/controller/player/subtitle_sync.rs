@@ -4,10 +4,10 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use memento_dict::normalize::{
+use subomi_dict::normalize::{
     apply_compiled_remove_regex, apply_replace_lines, compile_remove_regex, Regex,
 };
-use memento_player::{subtitle_to_media_time, ASR_STREAM_URI};
+use subomi_player::{subtitle_to_media_time, ASR_STREAM_URI};
 use slint::{Model as _, VecModel};
 
 use super::format_time;
@@ -15,7 +15,7 @@ use crate::app::subtitle_drawer::sync_sub_entries_model;
 use crate::controller::subtitles::{
     ExternalSubtitleLoad, SubtitleController, SubtitleTrackInfo, ASR_TRACK_ID,
 };
-use crate::{MementoApp, PlayerTrack, SubEntry};
+use crate::{SubomiApp, PlayerTrack, SubEntry};
 
 /// Cached subtitle text filter (`search/remove-regex`, `search/replace-lines`,
 /// `search/replace-with`) avoiding per-tick regex compilation.
@@ -30,7 +30,7 @@ pub(super) struct CachedSubtitleFilter {
 impl CachedSubtitleFilter {
     /// Synchronizes filter settings from `app`, returning `true` iff any filter
     /// setting changed since the last tick.
-    pub(super) fn sync_from_app(&mut self, app: &MementoApp) -> bool {
+    pub(super) fn sync_from_app(&mut self, app: &SubomiApp) -> bool {
         let pattern = app.get_search_remove_regex();
         let replace_lines = app.get_search_replace_lines();
         let replace_with = app.get_search_replace_with();
@@ -206,7 +206,7 @@ pub fn track_label(id: i64, language: &str, title: &str) -> String {
     label
 }
 
-pub fn clear_primary_subtitle(app: &MementoApp) {
+pub fn clear_primary_subtitle(app: &SubomiApp) {
     app.set_active_sub_text("".into());
     app.set_active_sub_words(Rc::new(VecModel::from(Vec::new())).into());
     app.set_active_sub_lines(Rc::new(VecModel::from(Vec::new())).into());
@@ -225,24 +225,11 @@ fn normalize_search_str(s: &str, ignore_whitespace: bool) -> String {
     }
 }
 
-fn utf16_equals_str(u16s: &[u16], s: &str) -> bool {
-    let mut u16_iter = std::char::decode_utf16(u16s.iter().copied())
-        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER));
-    let mut str_iter = s.chars();
-    loop {
-        match (u16_iter.next(), str_iter.next()) {
-            (Some(a), Some(b)) if a == b => continue,
-            (None, None) => return true,
-            _ => return false,
-        }
-    }
-}
-
 /// Refresh the primary subtitle list model applying `sub-speed` and `sub-delay`
 /// to displayed timestamps (H3.7) and omitting rows stripped completely empty
 /// by `search/remove-regex` so blank 24px rows never appear (M1).
 pub fn refresh_subtitle_list_with_timing(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
     sub_speed: f64,
@@ -278,12 +265,12 @@ pub fn refresh_subtitle_list_with_timing(
 
         // Fast path: when no regex filter is active and existing rows already have
         // identical count, IDs, and display text, patch only changed flags/timings
-        // in-place with zero Vec/UTF-16 allocations and zero `model.set_vec` reset.
+        // in-place with zero allocations and zero `model.set_vec` reset.
         let can_patch_directly = compiled_regex.is_none()
             && model.row_count() == entries.len()
             && entries.iter().enumerate().all(|(index, cue)| {
                 model.row_data(index).is_some_and(|old| {
-                    old.id == (index + 1) as i32 && utf16_equals_str(&cue.text, old.text.as_str())
+                    old.id == (index + 1) as i32 && cue.text == old.text.as_str()
                 })
             });
         if can_patch_directly {
@@ -327,8 +314,7 @@ pub fn refresh_subtitle_list_with_timing(
         let mut rows = Vec::with_capacity(entries.len());
         let mut kept_entries: Option<Vec<usize>> = None;
         for (index, cue) in entries.iter().enumerate() {
-            let raw = String::from_utf16_lossy(&cue.text);
-            let display = apply_compiled_remove_regex(&raw, compiled_regex);
+            let display = apply_compiled_remove_regex(&cue.text, compiled_regex);
             if compiled_regex.is_some() && display.trim().is_empty() {
                 // Lazily allocate the mapping only when at least one row is actually dropped.
                 if kept_entries.is_none() {
@@ -372,7 +358,7 @@ pub fn refresh_subtitle_list_with_timing(
 /// `secondary-sub-delay` to displayed timestamps (H3.7) and omitting rows
 /// stripped completely empty by `search/remove-regex` (M1).
 pub fn refresh_secondary_subtitle_list_with_timing(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
     sub_speed: f64,
@@ -398,7 +384,7 @@ pub fn refresh_secondary_subtitle_list_with_timing(
             && model.row_count() == entries.len()
             && entries.iter().enumerate().all(|(index, cue)| {
                 model.row_data(index).is_some_and(|old| {
-                    old.id == (index + 1) as i32 && utf16_equals_str(&cue.text, old.text.as_str())
+                    old.id == (index + 1) as i32 && cue.text == old.text.as_str()
                 })
             });
         if can_patch_directly {
@@ -444,8 +430,7 @@ pub fn refresh_secondary_subtitle_list_with_timing(
         let mut rows = Vec::with_capacity(entries.len());
         let mut kept_entries: Option<Vec<usize>> = None;
         for (index, cue) in entries.iter().enumerate() {
-            let raw = String::from_utf16_lossy(&cue.text);
-            let display = apply_compiled_remove_regex(&raw, compiled_regex);
+            let display = apply_compiled_remove_regex(&cue.text, compiled_regex);
             if compiled_regex.is_some() && display.trim().is_empty() {
                 if kept_entries.is_none() {
                     kept_entries = Some((0..rows.len()).collect());
@@ -479,7 +464,7 @@ pub fn refresh_secondary_subtitle_list_with_timing(
 }
 
 pub fn refresh_subtitle_list(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
 ) {
@@ -632,16 +617,16 @@ pub fn clear_subtitle_marks_on_advance(
     }
 }
 
-/// Synchronize `PlaybackState` audio & subtitle track lists with `MementoApp`
+/// Synchronize `PlaybackState` audio & subtitle track lists with `SubomiApp`
 /// and `SubtitleController`, returning any external subtitle files that must be
 /// parsed on a background worker.
 pub fn sync_player_tracks(
-    app: &MementoApp,
-    state: &memento_player::mpv::PlaybackState,
+    app: &SubomiApp,
+    state: &subomi_player::mpv::PlaybackState,
     subtitles: &mut SubtitleController,
     subtitle_rows: &VecModel<SubEntry>,
-    previous_audio: &mut Vec<memento_player::AudioTrack>,
-    previous_subtitles: &mut Vec<memento_player::SubtitleTrack>,
+    previous_audio: &mut Vec<subomi_player::AudioTrack>,
+    previous_subtitles: &mut Vec<subomi_player::SubtitleTrack>,
     asr_mpv_sid: Option<i64>,
 ) -> Vec<ExternalSubtitleLoad> {
     let audio = &state.audio_tracks;
@@ -750,7 +735,7 @@ mod tests {
     #[test]
     fn subtitle_list_applies_sub_delay_secondary_sub_delay_and_sub_speed() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let mut subs = SubtitleController::new();
         subs.ensure_track(1);
         subs.set_primary_sid(1);
@@ -795,7 +780,7 @@ mod tests {
     #[test]
     fn remove_regex_omits_blank_rows_while_preserving_active_and_selected_mapping() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let mut subs = SubtitleController::new();
         subs.ensure_track(1);
         subs.set_primary_sid(1);
@@ -864,7 +849,7 @@ mod tests {
     #[test]
     fn subtitle_list_patches_in_place_for_search_active_selected_and_sub_delay() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let mut subs = SubtitleController::new();
         subs.ensure_track(1);
         subs.set_primary_sid(1);

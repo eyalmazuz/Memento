@@ -2,10 +2,8 @@
 
 use std::collections::HashMap;
 
-use memento_player::controller::{
-    QT_ALT_MODIFIER, QT_CONTROL_MODIFIER, QT_META_MODIFIER, QT_NO_MODIFIER, QT_SHIFT_MODIFIER,
-};
-use memento_player::{format_modifiers, MouseButton, MpvInstance, WheelButton};
+use subomi_player::controller::{MOD_ALT, MOD_CONTROL, MOD_META, MOD_NONE, MOD_SHIFT};
+use subomi_player::{format_modifiers, MouseButton, MpvInstance, WheelButton};
 
 /// Minimum logical pixel scroll accumulation before emitting one discrete
 /// mpv `WHEEL_*` step. Discrete mouse-wheel notches (`>= 15 px`) still fire
@@ -30,18 +28,18 @@ impl MouseInputForwarder {
     }
 
     pub fn modifiers_mask(control: bool, shift: bool, alt: bool, meta: bool) -> i32 {
-        let mut mods = QT_NO_MODIFIER;
+        let mut mods = MOD_NONE;
         if shift {
-            mods |= QT_SHIFT_MODIFIER;
+            mods |= MOD_SHIFT;
         }
         if control {
-            mods |= QT_CONTROL_MODIFIER;
+            mods |= MOD_CONTROL;
         }
         if alt {
-            mods |= QT_ALT_MODIFIER;
+            mods |= MOD_ALT;
         }
         if meta {
-            mods |= QT_META_MODIFIER;
+            mods |= MOD_META;
         }
         mods
     }
@@ -93,11 +91,11 @@ impl MouseInputForwarder {
         &mut self,
         x: i32,
         y: i32,
-        qt_button: u32,
+        button_mask: u32,
         modifiers: i32,
         pressed: bool,
     ) -> Vec<Vec<String>> {
-        let Some(button) = MouseButton::from_qt(qt_button) else {
+        let Some(button) = MouseButton::from_button_mask(button_mask) else {
             return Vec::new();
         };
         let mut commands = Vec::with_capacity(3);
@@ -105,13 +103,13 @@ impl MouseInputForwarder {
         commands.push(vec!["mouse".to_owned(), x.to_string(), y.to_string()]);
         let key = format!("{}{}", format_modifiers(modifiers), button.as_str());
         if pressed {
-            if let Some(prev_key) = self.pressed_buttons.remove(&qt_button) {
+            if let Some(prev_key) = self.pressed_buttons.remove(&button_mask) {
                 commands.push(vec!["keyup".to_owned(), prev_key]);
             }
-            self.pressed_buttons.insert(qt_button, key.clone());
+            self.pressed_buttons.insert(button_mask, key.clone());
             commands.push(vec!["keydown".to_owned(), key]);
         } else {
-            let release_key = self.pressed_buttons.remove(&qt_button).unwrap_or(key);
+            let release_key = self.pressed_buttons.remove(&button_mask).unwrap_or(key);
             commands.push(vec!["keyup".to_owned(), release_key]);
         }
         commands
@@ -122,11 +120,11 @@ impl MouseInputForwarder {
         player: &MpvInstance,
         x: i32,
         y: i32,
-        qt_button: u32,
+        button_mask: u32,
         modifiers: i32,
         pressed: bool,
     ) {
-        for cmd in self.record_button(x, y, qt_button, modifiers, pressed) {
+        for cmd in self.record_button(x, y, button_mask, modifiers, pressed) {
             let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
             let _ = player.command_async(&refs);
         }

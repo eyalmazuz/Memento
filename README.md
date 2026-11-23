@@ -1,12 +1,12 @@
-# Memento
+# Subomi
 
-**Memento** is a fast, open-source video player built for learning Japanese — written in Rust with a Slint interface and powered by `libmpv`.
+**Subomi** (*蕾*) is a fast, open-source video player built for learning Japanese — written in Rust with a Slint interface and powered by `libmpv`.
 
 Watch anime, dramas, or YouTube videos with instant hover dictionary lookups, pitch accent graphs, frequency rankings, automatic furigana, live speech-to-text subtitles, OCR, and one-click Anki card creation.
 
-![Memento Screenshot](example.png)
+![Subomi Screenshot](example.png)
 
-> Built upon the original [ripose-jp/Memento](https://github.com/ripose-jp/Memento) and inspired by [Yomitan](https://github.com/yomidevs/yomitan).
+> Originally forked from [ripose-jp/Memento](https://github.com/ripose-jp/Memento) and inspired by [Yomitan](https://github.com/yomidevs/yomitan).
 
 ---
 
@@ -42,16 +42,16 @@ Watch anime, dramas, or YouTube videos with instant hover dictionary lookups, pi
 Install stable [Rust](https://rustup.rs/) and the system libraries below, then build and run:
 
 ```bash
-git clone https://github.com/eyalmazuz/Memento.git
-cd Memento
+git clone https://github.com/eyalmazuz/Subomi.git
+cd Subomi
 cargo build --release
-./target/release/memento
+./target/release/subomi
 ```
 
 The default build includes video playback, dictionaries, MeCab furigana/lookup, subtitles, and Anki integration. Pass a file path, URL, or standard `mpv` options directly on the command line:
 
 ```bash
-./target/release/memento "/path/to/video.mkv"
+./target/release/subomi "/path/to/video.mkv"
 ```
 
 <details>
@@ -90,7 +90,7 @@ brew install pkgconf mpv libass sqlite mecab mecab-ipadic yt-dlp
 
 * Rust stable MSVC toolchain (`x86_64-pc-windows-msvc`) and LLVM/Clang (for `bindgen`).
 * `libmpv` (`mpv-2.dll` / import library), `libass`, and `sqlite3` development libraries on your build/runtime path.
-* Optional runtime extras: `libmecab.dll` + IPADic/UniDic (placed next to `memento.exe`, via `MECAB_DICDIR`, or standard MeCab install — paths with spaces are handled automatically via 8.3 short paths), `yt-dlp.exe`, and `libmocr.dll` (when built with `--features ocr`).
+* Optional runtime extras: `libmecab.dll` + IPADic/UniDic (placed next to `subomi.exe`, via `MECAB_DICDIR`, or standard MeCab install — paths with spaces are handled automatically via 8.3 short paths), `yt-dlp.exe`, and `libmocr.dll` (when built with `--features ocr`).
 
 </details>
 
@@ -163,36 +163,36 @@ Import one or multiple `.zip` dictionaries at once in **Settings → Dictionarie
 ## Feature Setup Notes
 
 ### Speech-to-Text (ASR)
-* **Whisper**: Download models directly from **Settings → ASR**, or drop GGML models (such as `ggml-large-v3-turbo.bin` and optional Silero VAD `ggml-silero-v6.2.0.bin`) into the `models/` subdirectory of your Memento config directory.
+* **Whisper**: Download models directly from **Settings → ASR**, or drop GGML models (such as `ggml-large-v3-turbo.bin` and optional Silero VAD `ggml-silero-v6.2.0.bin`) into the `models/` subdirectory of your Subomi config directory.
 * **ONNX Runtime**: Supports local or downloaded ONNX speech models (e.g., `kitsune-transcribe-t0.6b-ja`) inside the same `models/` directory.
 
 ### Manga OCR
 * Compile with `--features ocr`.
-* At runtime, install [libmocr](https://github.com/ripose-jp/libmocr) and the Python [`manga-ocr`](https://github.com/kha-white/manga-ocr) package in your Python environment (on Windows, place `libmocr.dll` next to `memento.exe`, in `%LOCALAPPDATA%\memento`, or on `PATH`).
+* At runtime, install [libmocr](https://github.com/ripose-jp/libmocr) and the Python [`manga-ocr`](https://github.com/kha-white/manga-ocr) package in your Python environment (on Windows, place `libmocr.dll` next to `subomi.exe`, in `%LOCALAPPDATA%\subomi`, or on `PATH`).
 * Press **`Ctrl+L`** (default; **`Cmd+L`** on macOS) to drag a screen region on the video for instant OCR + dictionary lookup (right-click cancels).
 
 ### MeCab (Furigana & Compound Matching)
-* Built in automatically — no Cargo feature flag required, and Memento does not bundle a MeCab dictionary in the repo.
+* Built in automatically — no Cargo feature flag required, and Subomi does not bundle a MeCab dictionary in the repo.
 * Both **IPADic** (smallest/easiest via system packages) and **UniDic** *(recommended for noticeably more accurate modern readings and compound lookup)* are detected and supported automatically.
 * **Install MeCab + a dictionary:**
   * **Debian / Ubuntu (IPADic):** `sudo apt install mecab libmecab2 mecab-ipadic-utf8`
   * **Arch Linux:** install `mecab` + `mecab-ipadic` (or `unidic`) from the AUR
   * **macOS (Homebrew):** `brew install mecab mecab-ipadic`
   * **UniDic via Python (any platform):** `pip install unidic && python -m unidic download`
-* **Selecting your dictionary:** Memento loads `libmecab` in-process (falling back to the `mecab` CLI) and automatically checks `MECAB_DICDIR`, bundled executable-adjacent `ipadic`/`unidic`/`dic` folders, `/etc/mecabrc` (`$MECABRC`), and standard Homebrew/Linux/Windows dictionary paths. If you install UniDic via Python or have multiple dictionaries installed, set `MECAB_DICDIR` or `dicdir = /path/to/unidic/dicdir` in `/etc/mecabrc` (run `python -c "import unidic; print(unidic.DICDIR)"` to find the path).
+* **Selecting your dictionary:** Subomi loads `libmecab` in-process (falling back to the `mecab` CLI) and automatically checks `MECAB_DICDIR`, bundled executable-adjacent `ipadic`/`unidic`/`dic` folders, `/etc/mecabrc` (`$MECABRC`), and standard Homebrew/Linux/Windows dictionary paths. If you install UniDic via Python or have multiple dictionaries installed, set `MECAB_DICDIR` or `dicdir = /path/to/unidic/dicdir` in `/etc/mecabrc` (run `python -c "import unidic; print(unidic.DICDIR)"` to find the path).
 * **Enabling furigana:** Turn on **Show furigana over subtitles** in **Settings → Search** (or toggle it from the Subtitle menu / shortcut). MeCab loads lazily on first use and unloads automatically when both furigana and MeCab lookup are disabled.
 
 ---
 
 ## Configuration & Directories
 
-Memento keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its own config folder, separate from your global `mpv` setup. On Linux, volatile state (`recent/files`, `dictionary/order`, window panel state) is split into the cache config file so your main `memento.conf` stays clean for dotfile version control.
+Subomi keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its own config folder, separate from your global `mpv` setup. On Linux, volatile state (`recent/files`, `dictionary/order`, window panel state) is split into the cache config file so your main `subomi.conf` stays clean for dotfile version control.
 
-| Platform | Config (`memento.conf`, `mpv.conf`, Anki, ASR models) | Data (dictionary DB & assets) | Cache (volatile state / temp) |
+| Platform | Config (`subomi.conf`, `mpv.conf`, Anki, ASR models) | Data (dictionary DB & assets) | Cache (volatile state / temp) |
 | --- | --- | --- | --- |
-| **Linux** | `$XDG_CONFIG_HOME/memento` (`~/.config/memento`) | `$XDG_DATA_HOME/memento` (`~/.local/share/memento`) | `$XDG_CACHE_HOME/memento` (`~/.cache/memento`) |
-| **macOS** | `~/Library/Application Support/memento` *(falls back to `~/.config/memento` if present)* | `~/Library/Application Support/memento` | `~/Library/Caches/memento` |
-| **Windows** | `%LOCALAPPDATA%\memento` *(falls back to `%APPDATA%\memento` if present)* | `%LOCALAPPDATA%\memento` | `%LOCALAPPDATA%\memento\cache` |
+| **Linux** | `$XDG_CONFIG_HOME/subomi` (`~/.config/subomi`) | `$XDG_DATA_HOME/subomi` (`~/.local/share/subomi`) | `$XDG_CACHE_HOME/subomi` (`~/.cache/subomi`) |
+| **macOS** | `~/Library/Application Support/subomi` *(falls back to `~/.config/subomi` if present)* | `~/Library/Application Support/subomi` | `~/Library/Caches/subomi` |
+| **Windows** | `%LOCALAPPDATA%\subomi` *(falls back to `%APPDATA%\subomi` if present)* | `%LOCALAPPDATA%\subomi` | `%LOCALAPPDATA%\subomi\cache` |
 
 ---
 
@@ -206,7 +206,8 @@ Memento keeps its `mpv.conf`, `input.conf`, `scripts/`, and `shaders/` in its ow
 
 ## Acknowledgements & License
 
-* Original project by [ripose-jp/Memento](https://github.com/ripose-jp/Memento)
+* Originally forked from [ripose-jp/Memento](https://github.com/ripose-jp/Memento)
+* Deconjugator foundations by Spacehamster
 * Dictionary design & formatting inspired by [Yomitan](https://github.com/yomidevs/yomitan) and [Yomichan](https://github.com/FooSoft/yomichan)
 * Icons from [Google Material Symbols](https://fonts.google.com/icons)
 * OCR powered by [manga-ocr](https://github.com/kha-white/manga-ocr)

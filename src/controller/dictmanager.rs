@@ -4,12 +4,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use memento_dict::sqlite_db::{self, rusqlite};
-use memento_dict::yomidbbuilder::{self, YomiError};
+use subomi_dict::sqlite_db::{self, rusqlite};
+use subomi_dict::yomidbbuilder::{self, YomiError};
 
 use crate::controller::dict::invalidate_shared_readonly_db;
 
-/// An installed dictionary row read from Memento's Yomitan database.
+/// An installed dictionary row read from Subomi's Yomitan database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledDictionary {
     pub id: i64,
@@ -332,7 +332,7 @@ mod tests {
         fn new() -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "memento-dictmanager-test-{}-{}",
+                "subomi-dictmanager-test-{}-{}",
                 std::process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));

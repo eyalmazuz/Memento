@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Deep twilight indigo-plum rounded app tile -->
+    <linearGradient id="bg" x1="12%" y1="6%" x2="88%" y2="96%">
+      <stop offset="0%" stop-color="#251C3E"/>
+      <stop offset="52%" stop-color="#151026"/>
+      <stop offset="100%" stop-color="#0B0816"/>
+    </linearGradient>
+    <linearGradient id="tile-stroke" x1="10%" y1="0%" x2="90%" y2="100%">
+      <stop offset="0%" stop-color="#E9D5FF" stop-opacity="0.36"/>
+      <stop offset="50%" stop-color="#C084FC" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#7E22CE" stop-opacity="0.18"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="55%" cy="46%" r="48%">
+      <stop offset="0%" stop-color="#D896FF" stop-opacity="0.22"/>
+      <stop offset="54%" stop-color="#9333EA" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#7E22CE" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Stem & katakuri basal leaves -->
+    <linearGradient id="stem" x1="12%" y1="100%" x2="72%" y2="0%">
+      <stop offset="0%" stop-color="#246653"/>
+      <stop offset="55%" stop-color="#47A281"/>
+      <stop offset="100%" stop-color="#80D8B3"/>
+    </linearGradient>
+    <linearGradient id="leaf-main" x1="25%" y1="98%" x2="65%" y2="8%">
+      <stop offset="0%" stop-color="#194B3E"/>
+      <stop offset="55%" stop-color="#32846B"/>
+      <stop offset="100%" stop-color="#6AC6A0"/>
+    </linearGradient>
+    <linearGradient id="leaf-sub" x1="0%" y1="80%" x2="100%" y2="20%">
+      <stop offset="0%" stop-color="#164236"/>
+      <stop offset="100%" stop-color="#3E967A"/>
+    </linearGradient>
+
+    <!-- Outer / back recurved katakuri tepals (rich amethyst-orchid) -->
+    <linearGradient id="petal-back-l" x1="88%" y1="80%" x2="10%" y2="20%">
+      <stop offset="0%" stop-color="#6B21A8"/>
+      <stop offset="46%" stop-color="#9B3CE8"/>
+      <stop offset="100%" stop-color="#D092FF"/>
+    </linearGradient>
+    <linearGradient id="petal-back-top" x1="58%" y1="95%" x2="32%" y2="5%">
+      <stop offset="0%" stop-color="#5B1B8E"/>
+      <stop offset="45%" stop-color="#9333EA"/>
+      <stop offset="100%" stop-color="#CE8EFF"/>
+    </linearGradient>
+    <linearGradient id="petal-back-r" x1="12%" y1="84%" x2="92%" y2="16%">
+      <stop offset="0%" stop-color="#6B21A8"/>
+      <stop offset="48%" stop-color="#9A3BE6"/>
+      <stop offset="100%" stop-color="#D498FF"/>
+    </linearGradient>
+
+    <!-- Inner / front luminous katakuri tepals (pearl-lilac throat -> Japanese usumurasaki orchid-violet) -->
+    <linearGradient id="petal-front-l" x1="86%" y1="88%" x2="10%" y2="10%">
+      <stop offset="0%" stop-color="#FDF4FF"/>
+      <stop offset="22%" stop-color="#F0D0FF"/>
+      <stop offset="58%" stop-color="#D07BF9"/>
+      <stop offset="100%" stop-color="#A843EB"/>
+    </linearGradient>
+    <linearGradient id="petal-front-c" x1="48%" y1="98%" x2="54%" y2="4%">
+      <stop offset="0%" stop-color="#FFF7FF"/>
+      <stop offset="20%" stop-color="#F4D8FF"/>
+      <stop offset="56%" stop-color="#D687FB"/>
+      <stop offset="100%" stop-color="#AC49EE"/>
+    </linearGradient>
+    <linearGradient id="petal-front-r" x1="14%" y1="88%" x2="88%" y2="10%">
+      <stop offset="0%" stop-color="#FDF4FF"/>
+      <stop offset="22%" stop-color="#EFCBFF"/>
+      <stop offset="58%" stop-color="#CE76F8"/>
+      <stop offset="100%" stop-color="#9E3CE6"/>
+    </linearGradient>
+
+    <!-- Filaments softly blending out of the violet throat to luminous ivory-white -->
+    <linearGradient id="filament" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#D8B4FE" stop-opacity="0.82"/>
+      <stop offset="28%" stop-color="#F5EAFF"/>
+      <stop offset="100%" stop-color="#FFFFFF"/>
+    </linearGradient>
+
+    <!-- Warm golden-amber anthers -->
+    <linearGradient id="anther" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#FEF08A"/>
+      <stop offset="55%" stop-color="#FACC15"/>
+      <stop offset="100%" stop-color="#CA8A04"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded squircle app tile -->
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bg)" stroke="url(#tile-stroke)" stroke-width="3.5"/>
+  <circle cx="140" cy="116" r="100" fill="url(#halo)"/>
+
+  <!-- Companion basal leaf -->
+  <path d="M 70 222 C 84 206, 102 199, 120 203 C 105 215, 88 223, 70 222 Z"
+        fill="url(#leaf-sub)" opacity="0.94"/>
+  <path d="M 76 218 C 88 211, 100 206, 111 205"
+        fill="none" stroke="#86EFAC" stroke-opacity="0.28" stroke-width="1.3" stroke-linecap="round"/>
+
+  <!-- Graceful variable-width arching Katakuri stem tucked cleanly into the basal leaves -->
+  <path d="M 69 216 C 53 171, 50 112, 71 76 C 85 52, 115 55, 131 94 C 135 104, 138 114, 140 124 L 136 125 C 133 115, 131 106, 126 96 C 112 62, 88 60, 76 80 C 58 113, 60 169, 75 216 Z"
+        fill="url(#stem)"/>
+
+  <!-- Main katakuri lance-shaped basal leaf wrapping cleanly over the stem base -->
+  <path d="M 71 223 C 46 207, 32 172, 37 132 C 52 152, 66 180, 75 220 C 74 223, 72 224, 71 223 Z"
+        fill="url(#leaf-main)"/>
+  <path d="M 70 217 C 56 193, 46 168, 43 146"
+        fill="none" stroke="#A7F3D0" stroke-opacity="0.42" stroke-width="1.7" stroke-linecap="round"/>
+
+  <!-- Small green calyx behind the blossom throat -->
+  <ellipse cx="138" cy="126" rx="8.5" ry="6.5" transform="rotate(-22 138 126)" fill="#52B08B"/>
+
+  <!-- BACK LAYER: 3 gracefully recurved outer katakuri tepals -->
+  <path d="M 131 136 C 103 141, 74 135, 43 104 C 65 107, 97 112, 133 126 Z"
+        fill="url(#petal-back-l)"/>
+  <path d="M 133 129 C 114 102, 102 70, 90 34 C 113 54, 130 88, 142 124 Z"
+        fill="url(#petal-back-top)"/>
+  <path d="M 148 137 C 176 132, 204 114, 224 80 C 201 90, 174 106, 147 127 Z"
+        fill="url(#petal-back-r)"/>
+
+  <!-- FRONT LAYER: 3 luminous inner reflexed katakuri tepals with fluid S-curves -->
+  <path d="M 136 146 C 111 149, 82 126, 56 71 C 82 82, 111 106, 139 133 Z"
+        fill="url(#petal-front-l)"/>
+  <path d="M 147 146 C 173 136, 197 104, 211 47 C 185 68, 162 100, 144 133 Z"
+        fill="url(#petal-front-r)"/>
+  <path d="M 138 151 C 124 121, 126 76, 152 32 C 167 64, 166 111, 149 148 Z"
+        fill="url(#petal-front-c)"/>
+
+  <!-- Delicate translucent midrib highlights on the 3 front tepals -->
+  <path d="M 132 138 C 110 125, 89 104, 70 83"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.34" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M 145 141 C 141 108, 143 76, 151 47"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.38" stroke-width="1.7" stroke-linecap="round"/>
+  <path d="M 151 138 C 170 119, 188 92, 201 62"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.34" stroke-width="1.6" stroke-linecap="round"/>
+
+  <!-- Signature Katakuri deep-amethyst W-shaped nectar chevron inside the throat -->
+  <path d="M 123 141 C 129 148, 136 148, 143 153 C 149 148, 155 147, 160 140 C 154 151, 148 156, 143 155 C 136 156, 129 151, 123 141 Z"
+        fill="#6B21A8" opacity="0.82"/>
+  <path d="M 126 144 C 132 149, 138 150, 143 153 C 148 149, 153 147, 158 143"
+        fill="none" stroke="#FAE8FF" stroke-opacity="0.72" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Graceful curved drooping Katakuri stamen & pistil bouquet -->
+  <path d="M 136 152 C 134 167, 131 180, 126 191" fill="none" stroke="url(#filament)" stroke-width="2.1" stroke-linecap="round"/>
+  <path d="M 142 153 C 142 170, 143 184, 143 198" fill="none" stroke="url(#filament)" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M 147 154 C 151 172, 156 189, 161 207" fill="none" stroke="url(#filament)" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M 152 152 C 159 167, 166 179, 174 190" fill="none" stroke="url(#filament)" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M 156 149 C 165 161, 174 171, 183 179" fill="none" stroke="url(#filament)" stroke-width="2.0" stroke-linecap="round"/>
+
+  <!-- Sleek golden-amber anthers tipping the drooping stamens -->
+  <ellipse cx="125" cy="194" rx="3.1" ry="6.1" transform="rotate(18 125 194)" fill="url(#anther)"/>
+  <ellipse cx="143" cy="201" rx="3.2" ry="6.3" transform="rotate(-2 143 201)" fill="url(#anther)"/>
+  <ellipse cx="176" cy="193" rx="3.2" ry="6.3" transform="rotate(-30 176 193)" fill="url(#anther)"/>
+  <ellipse cx="185" cy="181" rx="3.0" ry="5.7" transform="rotate(-42 185 181)" fill="url(#anther)"/>
+  <!-- Slightly longer central style with delicate pale-lilac stigma tip -->
+  <circle cx="162" cy="210" r="3.6" fill="#FFFFFF"/>
+  <circle cx="162" cy="210" r="1.8" fill="#D8B4FE"/>
+</svg>

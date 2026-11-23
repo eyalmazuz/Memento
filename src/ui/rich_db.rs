@@ -94,7 +94,7 @@ impl RichDbHelper {
         self.refresh_if_needed();
         let db = self.db.as_ref()?;
         let rows = db
-            .with_conn(|conn| memento_dict::sqlite_db::query_kanji_utf8_conn(conn, character).ok())?;
+            .with_conn(|conn| subomi_dict::sqlite_db::query_kanji_utf8_conn(conn, character).ok())?;
         let row = rows
             .iter()
             .find(|r| dic_id == 0 || r.dic_id == dic_id)

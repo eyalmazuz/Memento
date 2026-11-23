@@ -1,5 +1,5 @@
 import { TextEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton, TabPill } from "../components/buttons.slint";
 import { SectionHeader } from "../components/controls.slint";
 
@@ -26,15 +26,15 @@ export component CustomPopupCssPanel inherits VerticalLayout {
             height: 22px;
             width: min(css-path-lbl.preferred-width + 16px, 340px);
             border-radius: 5px;
-            background: MementoPalette.surface-bg;
+            background: SubomiPalette.surface-bg;
             border-width: 1px;
-            border-color: MementoPalette.border;
+            border-color: SubomiPalette.border;
             css-path-lbl := Text {
                 x: 8px;
                 width: parent.width - 16px;
                 height: parent.height;
                 text: root.active-path;
-                color: MementoPalette.text-muted;
+                color: SubomiPalette.text-muted;
                 font-family: "monospace";
                 font-size: 10.5px;
                 vertical-alignment: center;
@@ -44,9 +44,9 @@ export component CustomPopupCssPanel inherits VerticalLayout {
     }
 
     Rectangle {
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         border-radius: 10px;
 
         VerticalLayout {
@@ -75,7 +75,7 @@ export component CustomPopupCssPanel inherits VerticalLayout {
                 text: root.custom-css-tab == 0
                     ? "Inner popup styling (popup.css): fonts, text/pitch headword colors, 2-column card grid (--definition-columns: 2), per-dictionary badge/tint colors & hover-to-reveal ([data-dictionary^=\"...\"]), frequency colors ([data-frequency^=\"...\"]), and glossary rules. External edits hot-reload automatically."
                     : "Outer popup frame styling (popup-outer.css): translucent background (rgba), border, radius, drop shadow, padding, and popup width/height (--popup-width / width). External edits hot-reload automatically.";
-                color: MementoPalette.text-secondary;
+                color: SubomiPalette.text-secondary;
                 font-size: 12px;
                 wrap: word-wrap;
             }
@@ -104,7 +104,7 @@ export component CustomPopupCssPanel inherits VerticalLayout {
 
                 Text {
                     text: "Also saved automatically when clicking Apply";
-                    color: MementoPalette.text-muted;
+                    color: SubomiPalette.text-muted;
                     font-size: 11px;
                     vertical-alignment: center;
                     horizontal-stretch: 1;

@@ -18,11 +18,11 @@ use crate::controller::player::{
 };
 use crate::platform_renderer::{PlatformRendererConfig, RendererOverrides, TargetOs};
 use crate::platform_window::{FullscreenAction, PlatformFullscreenController};
-use crate::ui::{ChapterMark, MementoApp};
-use memento_player::mpv::CursorAutohide;
-use memento_player::MpvInstance;
+use crate::ui::{ChapterMark, SubomiApp};
+use subomi_player::mpv::CursorAutohide;
+use subomi_player::MpvInstance;
 
-const WINDOW_ICON_ICO: &[u8] = include_bytes!("../../res/memento.ico");
+const WINDOW_ICON_ICO: &[u8] = include_bytes!("../../res/subomi.ico");
 const OSC_MOVE_ANCHOR_RESET: Duration = Duration::from_millis(100);
 const DROP_COALESCE_DELAY: Duration = Duration::from_millis(50);
 
@@ -135,7 +135,7 @@ fn apply_icon_to_winit_window(_winit_window: &slint::winit_030::winit::window::W
     true
 }
 
-/// Apply the embedded `res/memento.ico` window icon via winit on Windows and X11/Linux.
+/// Apply the embedded `res/subomi.ico` window icon via winit on Windows and X11/Linux.
 pub(crate) fn apply_runtime_window_icon(window: &slint::Window) -> bool {
     window
         .with_winit_window(apply_icon_to_winit_window)
@@ -238,7 +238,7 @@ pub(crate) fn evaluate_osc_move_threshold(
     (false, anchor)
 }
 
-fn is_overlay_interactive(app: &MementoApp) -> bool {
+fn is_overlay_interactive(app: &SubomiApp) -> bool {
     app.get_menu_open()
         || app.get_dict_open()
         || app.get_osc_hovered()
@@ -396,33 +396,33 @@ fn query_macos_main_display_size() -> Option<(u32, u32)> {
 
 /// Probe the current monitor's physical pixel bounds (`MonitorRect`), falling back
 /// cleanly to the current window bounds when running headless or on Wayland without DRM info.
-pub(crate) fn query_window_monitor_physical(window: &slint::Window) -> memento_os::MonitorRect {
+pub(crate) fn query_window_monitor_physical(window: &slint::Window) -> subomi_os::MonitorRect {
     let pos = window.position();
     let size = window.size();
     let scale = f64::from(window.scale_factor().max(0.5));
 
     #[cfg(target_os = "windows")]
     if let Some(monitor) =
-        native_window_hwnd(window).and_then(|hwnd| memento_os::query_window_monitor(hwnd).ok())
+        native_window_hwnd(window).and_then(|hwnd| subomi_os::query_window_monitor(hwnd).ok())
     {
         return monitor;
     }
 
     #[cfg(target_os = "linux")]
     if let Some((w, h)) = query_x11_screen_size(window).or_else(query_drm_monitor_size) {
-        return memento_os::MonitorRect::new(0, 0, w, h, scale);
+        return subomi_os::MonitorRect::new(0, 0, w, h, scale);
     }
 
     #[cfg(target_os = "macos")]
     if let Some((w, h)) = query_macos_main_display_size() {
-        return memento_os::MonitorRect::new(0, 0, w, h, scale);
+        return subomi_os::MonitorRect::new(0, 0, w, h, scale);
     }
 
-    memento_os::MonitorRect::new(pos.x, pos.y, size.width.max(1), size.height.max(1), scale)
+    subomi_os::MonitorRect::new(pos.x, pos.y, size.width.max(1), size.height.max(1), scale)
 }
 
 /// Probe the current monitor's logical bounds (`MonitorRect`) for Slint `LogicalSize` auto-fit.
-pub(crate) fn query_window_monitor_logical(window: &slint::Window) -> memento_os::MonitorRect {
+pub(crate) fn query_window_monitor_logical(window: &slint::Window) -> subomi_os::MonitorRect {
     let phys = query_window_monitor_physical(window);
     let scale = phys.sanitized_scale();
     // On macOS, `CGDisplayPixelsWide`/`High` already report logical points; on Windows/Linux
@@ -436,7 +436,7 @@ pub(crate) fn query_window_monitor_logical(window: &slint::Window) -> memento_os
         ((phys.x as f64) / scale).round() as i32,
         ((phys.y as f64) / scale).round() as i32,
     );
-    memento_os::MonitorRect::new(lx, ly, lw, lh, scale)
+    subomi_os::MonitorRect::new(lx, ly, lw, lh, scale)
 }
 
 pub(crate) fn chapter_marks_for_duration(chapters: &[f64], duration: f64) -> Vec<ChapterMark> {
@@ -454,7 +454,7 @@ pub(crate) fn chapter_marks_for_duration(chapters: &[f64], duration: f64) -> Vec
         .collect()
 }
 
-pub(crate) fn chapter_title_at_time(app: &MementoApp, time_sec: f32) -> String {
+pub(crate) fn chapter_title_at_time(app: &SubomiApp, time_sec: f32) -> String {
     let marks = app.get_chapter_marks();
     let mut best_title = String::new();
     let mut best_time = -1.0f32;
@@ -492,7 +492,7 @@ pub(crate) struct WindowChromeHandles {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_window_chrome_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
@@ -564,11 +564,11 @@ pub(crate) fn install_window_chrome_handlers(
         EventResult::Propagate
     });
 
-    let arm_cursor_timer: Rc<dyn Fn(&MementoApp)> = {
+    let arm_cursor_timer: Rc<dyn Fn(&SubomiApp)> = {
         let timer = cursor_timer.clone();
         let coord_rc = coordinator.clone();
         let activity = last_pointer_activity.clone();
-        Rc::new(move |app: &MementoApp| {
+        Rc::new(move |app: &SubomiApp| {
             let win_fs = app.window().is_fullscreen();
             let fullscreen = win_fs || app.get_is_fullscreen();
             let overlay_interactive = is_overlay_interactive(app);
@@ -669,12 +669,12 @@ pub(crate) fn install_window_chrome_handlers(
         })
     };
 
-    let arm_osc_timer: Rc<dyn Fn(&MementoApp)> = {
+    let arm_osc_timer: Rc<dyn Fn(&SubomiApp)> = {
         let timer = osc_timer.clone();
         let coord_rc = coordinator.clone();
         let activity = last_pointer_activity.clone();
         let arm_cursor = arm_cursor_timer.clone();
-        Rc::new(move |app: &MementoApp| {
+        Rc::new(move |app: &SubomiApp| {
             let duration_ms = app.get_osc_duration_ms().max(50) as u64;
             let timer_app = app.as_weak();
             let timer_coord = coord_rc.clone();
@@ -918,7 +918,7 @@ pub(crate) fn install_window_chrome_handlers(
     let saved_native_maximized = Rc::new(Cell::new(false));
     let pending_native_fullscreen = Rc::new(Cell::new(None::<bool>));
     #[cfg(target_os = "windows")]
-    let win32_fs_snapshot: Rc<RefCell<Option<memento_os::Win32WindowStyleSnapshot>>> =
+    let win32_fs_snapshot: Rc<RefCell<Option<subomi_os::Win32WindowStyleSnapshot>>> =
         Rc::new(RefCell::new(None));
     app.on_toggle_fullscreen(move || {
         let Some(app) = weak_fs.upgrade() else {
@@ -937,7 +937,7 @@ pub(crate) fn install_window_chrome_handlers(
         }
         let pos = app.window().position();
         let size = app.window().size();
-        let current_rect = memento_os::WindowRect::new(pos.x, pos.y, size.width, size.height);
+        let current_rect = subomi_os::WindowRect::new(pos.x, pos.y, size.width, size.height);
         let currently_maximized = app.window().is_maximized();
         let monitor = query_window_monitor_physical(app.window());
 
@@ -1063,7 +1063,7 @@ mod tests {
     fn yomitan_popup_anchors_to_hovered_word_clamps_above_or_below_primary_subtitles_and_secondary_stays_at_top(
     ) {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_subtitles_visible(true);
         app.set_active_sub_text("生前に世界中を旅行して集めた遺品が".into());
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn about_modal_click_shield_url_modal_volume_max_mute_chapters_and_recent_titles() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_about_open(true);
         app.show().unwrap();
@@ -1199,7 +1199,7 @@ mod tests {
         cfg.edit_setting("behavior/subtitle-cursor-show-secondary", "true")
             .unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         refresh_player_preferences(&app, &cfg);
         assert_eq!(app.get_osc_fade_ms(), 0);
@@ -1217,9 +1217,9 @@ mod tests {
         app.set_active_sub_text("Primary line".into());
         app.set_secondary_sub_text("Secondary line".into());
         // H3.6 precedence: explicit hide (`subtitles_visible == false`) and
-        // `hide_memento_while_playing && is_playing` must NOT be bypassed by cursor zones.
+        // `hide_subomi_while_playing && is_playing` must NOT be bypassed by cursor zones.
         app.set_subtitles_visible(false);
-        app.set_hide_memento_while_playing(true);
+        app.set_hide_subomi_while_playing(true);
         app.set_is_playing(true);
         app.show().unwrap();
 
@@ -1288,9 +1288,9 @@ mod tests {
     }
 
     #[test]
-    fn embedded_memento_ico_decodes_to_valid_rgba() {
+    fn embedded_subomi_ico_decodes_to_valid_rgba() {
         let (rgba, width, height) =
-            decode_ico_rgba(WINDOW_ICON_ICO).expect("res/memento.ico must decode cleanly");
+            decode_ico_rgba(WINDOW_ICON_ICO).expect("res/subomi.ico must decode cleanly");
         assert!(width >= 32 && height >= 32);
         assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
     }

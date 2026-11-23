@@ -1,5 +1,5 @@
 use i_slint_backend_testing::ElementQuery;
-use memento_app::MementoApp;
+use subomi_app::SubomiApp;
 use slint::platform::{PointerEventButton, WindowEvent};
 use slint::ComponentHandle;
 use std::cell::Cell;
@@ -21,7 +21,7 @@ fn format_time(sec: f32) -> String {
 fn hovering_and_seeking_timeline_does_not_reenter_sharedparley_font_context() {
     i_slint_backend_testing::init_no_event_loop();
 
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     let hover_calls = Rc::new(Cell::new(0usize));
     let hover_calls_cb = hover_calls.clone();
     app.on_format_timestamp(|sec| format_time(sec).into());

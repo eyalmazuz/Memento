@@ -6,7 +6,7 @@ use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
 use crate::controller::anki::EntryAnkiStatus;
 use crate::ui::popup_model::{active_rich_bridge_for_app, split_anki_tags_str};
-use crate::ui::{DictResult, MementoApp, PopupBridge};
+use crate::ui::{DictResult, SubomiApp, PopupBridge};
 
 use super::state::{
     current_external_lookup_epoch, encode_note_id_i32, AnkiCheckTarget, AnkiPopupCheckRequest,
@@ -14,7 +14,7 @@ use super::state::{
 };
 use super::RichUiBridge;
 
-pub(super) fn drain_anki_results_for_app(app: &MementoApp) -> bool {
+pub(super) fn drain_anki_results_for_app(app: &SubomiApp) -> bool {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.drain_anki_results(app)
     } else {
@@ -22,7 +22,7 @@ pub(super) fn drain_anki_results_for_app(app: &MementoApp) -> bool {
     }
 }
 
-pub(super) fn sync_anki_checking_for_app(app: &MementoApp) {
+pub(super) fn sync_anki_checking_for_app(app: &SubomiApp) {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.sync_anki_checking_flag(app);
     }
@@ -143,20 +143,20 @@ fn resolve_row_anki_vectors(
 }
 
 impl RichUiBridge {
-    pub(super) fn sync_anki_checking_flag(&self, app: &MementoApp) {
+    pub(super) fn sync_anki_checking_flag(&self, app: &SubomiApp) {
         let checking = self.root_anki_in_flight.load(Ordering::Acquire) != 0
             || self.nested_anki_in_flight.load(Ordering::Acquire) != 0
             || self.panel_anki_in_flight.load(Ordering::Acquire) != 0;
         app.global::<PopupBridge>().set_anki_checking(checking);
     }
 
-    pub(super) fn cancel_nested_anki_check(&self, app: &MementoApp) {
+    pub(super) fn cancel_nested_anki_check(&self, app: &SubomiApp) {
         self.nested_anki_nav_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_anki_in_flight.store(0, Ordering::Release);
         self.sync_anki_checking_flag(app);
     }
 
-    pub(super) fn cancel_panel_anki_check(&self, app: &MementoApp) {
+    pub(super) fn cancel_panel_anki_check(&self, app: &SubomiApp) {
         self.panel_anki_nav_epoch.fetch_add(1, Ordering::AcqRel);
         self.panel_anki_in_flight.store(0, Ordering::Release);
         self.sync_anki_checking_flag(app);
@@ -164,7 +164,7 @@ impl RichUiBridge {
 
     pub(super) fn dispatch_anki_check_for_rows(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         rows: &[DictResult],
         target: AnkiCheckTarget,
     ) {
@@ -332,7 +332,7 @@ impl RichUiBridge {
 
     pub(super) fn toggle_reading_as_expression(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         target: AnkiCheckTarget,
         row_zero_idx: i32,
     ) {
@@ -526,7 +526,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn drain_anki_results(&self, app: &MementoApp) -> bool {
+    pub(super) fn drain_anki_results(&self, app: &SubomiApp) -> bool {
         let mut latest_root: Option<AnkiPopupCheckResponse> = None;
         let mut latest_nested: Option<AnkiPopupCheckResponse> = None;
         let mut latest_panel: Option<AnkiPopupCheckResponse> = None;
@@ -681,7 +681,7 @@ impl RichUiBridge {
 
 /// Returns the lossless 64-bit Anki note ID for a popup row (or active nested row if
 /// `nested_depth > 0`), avoiding `i32` truncation for 13-digit AnkiConnect epoch-ms note IDs.
-pub fn popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i64> {
+pub fn popup_row_anki_note_id_i64(app: &SubomiApp, row_idx: usize) -> Option<i64> {
     let pb = app.global::<PopupBridge>();
     if pb.get_nested_depth() > 0 {
         return nested_popup_row_anki_note_id_i64(app, row_idx);
@@ -711,7 +711,7 @@ pub fn popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i6
 }
 
 /// Returns the lossless 64-bit Anki note ID for a row in the active nested popup level.
-pub fn nested_popup_row_anki_note_id_i64(app: &MementoApp, row_idx: usize) -> Option<i64> {
+pub fn nested_popup_row_anki_note_id_i64(app: &SubomiApp, row_idx: usize) -> Option<i64> {
     let from_bridge = active_rich_bridge_for_app(app).and_then(|b| {
         b.state
             .borrow()
@@ -888,7 +888,7 @@ enum AnkiStateTarget {
 }
 
 fn mark_popup_term_anki_state(
-    app: &MementoApp,
+    app: &SubomiApp,
     row_index: usize,
     note_id: i64,
     profile: &crate::controller::config::AnkiNoteConfig,
@@ -1159,7 +1159,7 @@ fn mark_popup_term_anki_state(
 /// `add_note_from_profile` succeeds so the `Browse in Anki` / `Update existing note` badges stay
 /// accurate without waiting.
 pub fn mark_popup_term_anki_added(
-    app: &MementoApp,
+    app: &SubomiApp,
     added_index: usize,
     note_id: i64,
     profile: &crate::controller::config::AnkiNoteConfig,
@@ -1178,7 +1178,7 @@ pub fn mark_popup_term_anki_added(
 /// Immediately refreshes `PopupBridge` Anki duplicate/browse/tag/note-id state for a term right
 /// after `update_existing_note_with_media` succeeds (supporting both root and nested popups).
 pub fn mark_popup_term_anki_updated(
-    app: &MementoApp,
+    app: &SubomiApp,
     updated_index: usize,
     nested_depth: i32,
     note_id: i64,

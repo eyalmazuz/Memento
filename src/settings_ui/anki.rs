@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use memento_os::SystemColorScheme;
+use subomi_os::SystemColorScheme;
 use slint::winit_030::winit::event::WindowEvent;
 use slint::winit_030::winit::window::Theme as WinitTheme;
 use slint::winit_030::{EventResult, WinitWindowAccessor};
@@ -492,7 +492,7 @@ pub(crate) fn maybe_auto_fetch_decks_and_models(window: &SettingsWindow, ctx: &S
     let in_flight = Arc::clone(&ctx.anki_auto_fetch_in_flight);
     let response_window = window.as_weak();
     let _ = std::thread::Builder::new()
-        .name("memento-anki-autofetch".to_owned())
+        .name("subomi-anki-autofetch".to_owned())
         .spawn(move || {
             let controller = AnkiController::new(endpoint);
             let fetched = controller.client().deck_names().and_then(|decks| {

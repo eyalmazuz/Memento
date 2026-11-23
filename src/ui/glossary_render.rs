@@ -1,4 +1,4 @@
-//! Rich structured-content glossary layout & rasterizer (`memento-definition` + `parley` + `swash`).
+//! Rich structured-content glossary layout & rasterizer (`subomi-definition` + `parley` + `swash`).
 //! Operates directly on `&serde_json::Value` (zero `DefJson` conversion) with physical-DPI
 //! pixel-exact rendering and light-on-dark stem contrast preservation.
 
@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memento_definition::{
+use subomi_definition::{
     self as mdef,
     element::{BOTTOM, LEFT, RIGHT, TOP},
-    split_ruby_content_value, structured_content_text_value, Color as DefColor,
+    parse_css_color, split_ruby_content_value, structured_content_text_value,
     Context as DefContext, CssTheme, ElementLayout, LayoutDirection, LegacyGlossaryStyle,
     ParsedStylesheet, Renderer as DefRenderer, ScreenMetrics, SiblingState,
 };
@@ -472,29 +472,15 @@ enum BlockIR {
 }
 
 fn parse_def_rgba(value: &str, fallback: [u8; 4]) -> [u8; 4] {
-    if let Some(c) = DefColor::from_string(value.trim()) {
-        let r = ((u32::from(c.red) + 128) / 257) as u8;
-        let g = ((u32::from(c.green) + 128) / 257) as u8;
-        let b = ((u32::from(c.blue) + 128) / 257) as u8;
-        let a = ((u32::from(c.alpha) + 128) / 257) as u8;
-        [r, g, b, a]
-    } else {
-        fallback
-    }
+    parse_css_color(value).unwrap_or(fallback)
 }
 
 fn parse_def_rgba_opt(value: &str) -> Option<[u8; 4]> {
-    if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("transparent") {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("transparent") {
         return None;
     }
-    DefColor::from_string(value.trim()).map(|c| {
-        [
-            ((u32::from(c.red) + 128) / 257) as u8,
-            ((u32::from(c.green) + 128) / 257) as u8,
-            ((u32::from(c.blue) + 128) / 257) as u8,
-            ((u32::from(c.alpha) + 128) / 257) as u8,
-        ]
-    })
+    parse_css_color(trimmed)
 }
 
 fn parse_weight_css(value: Option<&String>, default_weight: u16) -> u16 {
@@ -3025,7 +3011,7 @@ pub fn render_structured_glossary_entry_in_dirs(
 
 /// Theme-aware variant of [`render_structured_glossary_entry_in_dirs`].
 /// When `is_light_theme` is `true`, uses light popup defaults and passes `CssTheme::Light`
-/// into `memento-definition` stylesheet / `:root[data-theme="light"]` variable resolution.
+/// into `subomi-definition` stylesheet / `:root[data-theme="light"]` variable resolution.
 #[allow(dead_code, clippy::too_many_arguments)]
 pub fn render_structured_glossary_entry_in_dirs_with_theme(
     raw_glossary: &str,
@@ -3254,7 +3240,7 @@ pub(super) fn rasterize_structured_glossary_entry_with_engine(
     // `[data-theme="dark"|"light"]`, `[data-compact-glossaries="true"]`, and `.gloss-item` rules
     // match without interfering with bare tag selectors (`div`, `li`) in dictionary `styles.css`.
     let mut dict_root = mdef::StructuredElement::new();
-    dict_root.tag = "memento-dict".to_owned();
+    dict_root.tag = "subomi-dict".to_owned();
     dict_root.classes.insert("gloss-item".to_owned());
     dict_root.classes.insert("yomitan-glossary".to_owned());
     dict_root
@@ -3633,7 +3619,7 @@ pub(super) fn render_structured_glossary_entry_with_value_scaled(
 }
 
 /// Build and rasterize a rich structured-content glossary entry into a `RenderedGlossaryDoc`
-/// with full `memento-definition` CSS styling, tables, ruby, details, links, images/SVGs, and
+/// with full `subomi-definition` CSS styling, tables, ruby, details, links, images/SVGs, and
 /// per-character selection hit-boxes.
 #[allow(clippy::too_many_arguments)]
 pub fn render_structured_glossary_entry(

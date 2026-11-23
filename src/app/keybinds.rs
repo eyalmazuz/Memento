@@ -11,10 +11,10 @@ use crate::controller::config::{
     ConfigController, KEYBIND_CLEAR_AUDIO_CONTEXT, KEYBIND_MARK_AUDIO_CONTEXT,
     SETTINGS_SHORTCUT_DEFAULT, SETTINGS_SHORTCUT_MACOS,
 };
-use crate::ui::{DictResult, MementoApp, PopupBridge, SubtitleOverlayBridge};
-use memento_config::Value;
-use memento_player::MpvInstance;
-use memento_setting::keys as raw;
+use crate::ui::{DictResult, SubomiApp, PopupBridge, SubtitleOverlayBridge};
+use subomi_config::Value;
+use subomi_player::MpvInstance;
+use subomi_setting::keys as raw;
 
 /// Manual A/B audio context marking state (`H5.2 / #136`).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -550,7 +550,7 @@ pub(crate) fn popup_top_term_group_at_scroll(rows: &[DictResult], scroll_y: f32)
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_keybind_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     closing: Rc<Cell<bool>>,
@@ -566,7 +566,7 @@ pub(crate) fn install_keybind_handlers(
         let Some(app) = nav_app.upgrade() else {
             return;
         };
-        let collect_rows = |app: &MementoApp| -> Vec<DictResult> {
+        let collect_rows = |app: &SubomiApp| -> Vec<DictResult> {
             let model = app.get_popup_results();
             (0..model.row_count())
                 .filter_map(|i| model.row_data(i))
@@ -825,7 +825,7 @@ pub(crate) fn install_keybind_handlers(
             } else if let Some(key_name) =
                 format_mpv_keypress(text.as_str(), control, shift, alt, meta)
             {
-                // H3.3: Forward Escape to mpv when no Memento modal/popup/OCR/fullscreen consumed it.
+                // H3.3: Forward Escape to mpv when no Subomi modal/popup/OCR/fullscreen consumed it.
                 if let Some(player) = &*key_mpv.borrow() {
                     let _ = player.command(&["keypress", &key_name]);
                     return true;
@@ -835,7 +835,7 @@ pub(crate) fn install_keybind_handlers(
                 return false;
             }
         } else {
-            // H3.3: Forward all non-Memento keys (including Space, f/F, q/Q, F13..F30,
+            // H3.3: Forward all non-Subomi keys (including Space, f/F, q/Q, F13..F30,
             // PAUSE, KP_*, modified Space, and non-ASCII graphic keys) directly to mpv.
             if let Some(key_name) = format_mpv_keypress(text.as_str(), control, shift, alt, meta) {
                 if let Some(player) = &*key_mpv.borrow() {
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(marks, AudioContextMarkState::Empty);
 
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = Rc::new(ConfigController::new());
         let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
         let closing = Rc::new(Cell::new(false));
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn bare_modifiers_and_popup_shortcuts_preserve_yomitan_popup_and_all_eight_keybinds_work() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
         subtitles.borrow_mut().load_cues(vec![

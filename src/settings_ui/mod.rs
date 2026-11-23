@@ -14,17 +14,17 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use memento_config::config::Config;
-use memento_config::{ArgbColor, QtFontSpec, Value};
-use memento_dict::normalize::Regex;
-use memento_dict::searchcontroller::TextReplacementRule;
-use memento_os::{
+use subomi_config::config::Config;
+use subomi_config::{ArgbColor, FontSpec, Value};
+use subomi_dict::normalize::Regex;
+use subomi_dict::searchcontroller::TextReplacementRule;
+use subomi_os::{
     decode_file_uri, detect_system_color_scheme, open_files_on_main_thread,
     open_folder_on_main_thread, FileDialogKind, FileDialogOptions, SystemColorScheme,
 };
-use memento_player::MpvInstance;
-use memento_setting::enums::ThemeMode;
-use memento_setting::keys as raw;
+use subomi_player::MpvInstance;
+use subomi_setting::enums::ThemeMode;
+use subomi_setting::keys as raw;
 use slint::winit_030::winit::event::WindowEvent;
 use slint::winit_030::winit::window::Theme as WinitTheme;
 use slint::winit_030::{EventResult, WinitWindowAccessor};
@@ -41,8 +41,8 @@ use crate::controller::player::{refresh_subtitle_list, LivePlayerCoordinator};
 use crate::controller::subtitles::SubtitleController;
 use crate::ui::{SettingsField, SettingsGroup, TextReplacementRow};
 use crate::{
-    apply_dictionary_order, memento_xdg_dir, refresh_player_preferences, setting_enabled,
-    AnkiHelpWindow, MementoApp, SettingsWindow, SubEntry,
+    apply_dictionary_order, subomi_xdg_dir, refresh_player_preferences, setting_enabled,
+    AnkiHelpWindow, SubomiApp, SettingsWindow, SubEntry,
 };
 
 pub(crate) use asr_models::clear_asr_for_settings;
@@ -452,7 +452,7 @@ impl Drop for SettingsSession {
 }
 
 pub(crate) struct SettingsContext {
-    pub(crate) app_weak: slint::Weak<MementoApp>,
+    pub(crate) app_weak: slint::Weak<SubomiApp>,
     pub(crate) config: Rc<ConfigController>,
     pub(crate) dict_ctrl: Rc<RefCell<DictController>>,
     pub(crate) dictionary_manager: Option<Rc<DictionaryManager>>,
@@ -610,8 +610,8 @@ pub(crate) fn sync_subtitle_preview(window: &SettingsWindow, config: &ConfigCont
         Some(Value::Text(s)) => s,
         _ => String::new(),
     };
-    let spec = QtFontSpec::parse(&font_raw)
-        .unwrap_or_else(|_| QtFontSpec::new("Noto Sans CJK JP", 24.0, false, false));
+    let spec = FontSpec::parse(&font_raw)
+        .unwrap_or_else(|_| FontSpec::new("Noto Sans CJK JP", 24.0, false, false));
 
     if window.get_preview_sub_font_family().as_str() != spec.family {
         window.set_preview_sub_font_family(spec.family.into());
@@ -898,7 +898,7 @@ fn revert_unsaved_drafts(window: &SettingsWindow, ctx: &SettingsContext) {
     window.set_settings_status("".into());
 }
 
-/// Formats a Slint `KeyEvent` payload into Memento's canonical shortcut chord
+/// Formats a Slint `KeyEvent` payload into Subomi's canonical shortcut chord
 /// string (e.g. `"Ctrl+Shift+C"`, `"F3"`, `"Ctrl+Down"`). Returns `None` for
 /// empty or standalone modifier events.
 pub(crate) fn format_key_chord(
@@ -1047,7 +1047,7 @@ fn groups_structure_matches(
 }
 
 /// Update `settings_groups` IN-PLACE via `VecModel::set_row_data` whenever the
-/// group/field structure is unchanged, preserving `MementoSwitch`'s 120ms slide
+/// group/field structure is unchanged, preserving `SubomiSwitch`'s 120ms slide
 /// animation and existing widget focus. Falls back to replacing `settings_groups`
 /// only on structural changes (category switch, profile change, add/remove entry).
 fn sync_groups_in_place(window: &SettingsWindow, next_groups: Vec<SettingsGroup>) {
@@ -1261,7 +1261,7 @@ fn apply_single_category(
         }
     }
     ctx.config
-        .apply_settings(category, &ctx.cache_dir, "memento.conf", &ctx.anki_json_path)?;
+        .apply_settings(category, &ctx.cache_dir, "subomi.conf", &ctx.anki_json_path)?;
     if let Some(cat) = SettingsCategory::from_i32(category) {
         ctx.clear_dirty(cat);
         ctx.clear_snapshot(cat);
@@ -1328,7 +1328,7 @@ fn apply_single_category(
                 asr_models::refresh_asr_model_status(win, &ctx.config, &ctx.cache_dir);
             }
             let config_dir =
-                memento_xdg_dir("XDG_CONFIG_HOME", ".config").unwrap_or_else(|| PathBuf::from("."));
+                subomi_xdg_dir("XDG_CONFIG_HOME", ".config").unwrap_or_else(|| PathBuf::from("."));
             let unchanged =
                 controller::asr::AsrSettings::from_config(config_dir, &ctx.config.store())
                     .is_ok_and(|settings| ctx.asr_session.borrow().matches_settings(&settings));
@@ -1350,7 +1350,7 @@ fn apply_single_category(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_settings_session(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     dict_ctrl: Rc<RefCell<DictController>>,
     dictionary_manager: Option<Rc<DictionaryManager>>,
@@ -1541,7 +1541,7 @@ pub(crate) fn create_settings_session(
         }
     });
 
-    // Setting edits (in-place row mutation preserves MementoSwitch 120ms animation)
+    // Setting edits (in-place row mutation preserves SubomiSwitch 120ms animation)
     let edited_window = settings.as_weak();
     let edited_ctx = ctx.clone();
     settings.on_setting_edited(move |key, value| {
@@ -2098,7 +2098,7 @@ pub(crate) fn create_settings_session(
         let result = reset_ctx.config.reset_settings(
             category,
             &reset_ctx.cache_dir,
-            "memento.conf",
+            "subomi.conf",
             &reset_ctx.anki_json_path,
         );
         if result.is_ok() {
@@ -2393,10 +2393,10 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
 
-    use memento_config::Value;
-    use memento_os::SystemColorScheme;
-    use memento_setting::enums::ThemeMode;
-    use memento_setting::keys as raw;
+    use subomi_config::Value;
+    use subomi_os::SystemColorScheme;
+    use subomi_setting::enums::ThemeMode;
+    use subomi_setting::keys as raw;
     use slint::{Model as _, VecModel};
 
     use super::{
@@ -2408,14 +2408,14 @@ mod tests {
     use crate::controller::config::ConfigController;
     use crate::controller::dict::DictController;
     use crate::controller::subtitles::SubtitleController;
-    use crate::{InstalledDictionaryRow, MementoApp, SettingsWindow, SubEntry};
+    use crate::{InstalledDictionaryRow, SubomiApp, SettingsWindow, SubEntry};
 
     fn make_headless_session(
         config: Rc<ConfigController>,
         dir: &Path,
-    ) -> (MementoApp, SettingsSession) {
+    ) -> (SubomiApp, SettingsSession) {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let dict_ctrl = Rc::new(RefCell::new(DictController::new()));
         let asr_session = Rc::new(RefCell::new(AsrController::new()));
         let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
@@ -2536,7 +2536,7 @@ mod tests {
         cfg.apply_settings(
             SettingsCategory::Interface.as_i32(),
             dir.path(),
-            "memento.conf",
+            "subomi.conf",
             &dir.path().join("anki_connect.json"),
         )
         .unwrap();
@@ -2903,13 +2903,13 @@ mod tests {
         assert_eq!(val, "4");
 
         cfg.edit_setting("search/max-recursion-depth", "8").unwrap();
-        cfg.apply_settings(9, dir.path(), "memento.conf", &anki)
+        cfg.apply_settings(9, dir.path(), "subomi.conf", &anki)
             .unwrap();
         refresh_category_settings(&win, &cfg, 9);
         assert_eq!(read_depth_field(&win).2, "8");
 
         cfg.edit_setting("search/max-recursion-depth", "1").unwrap();
-        cfg.reset_settings(9, dir.path(), "memento.conf", &anki)
+        cfg.reset_settings(9, dir.path(), "subomi.conf", &anki)
             .unwrap();
         refresh_category_settings(&win, &cfg, 9);
         assert_eq!(read_depth_field(&win).2, "8");

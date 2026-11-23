@@ -1,9 +1,9 @@
 //! Background media extraction shared by Anki and optional speech recognition.
 
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx", test))]
-use memento_asr::audio::wavreader::{read_pcm16_wav_bytes, SAMPLE_RATE_16K};
-use memento_player::mpv::ffi as mpv;
-use memento_player::EncodeContext;
+use subomi_asr::audio::wavreader::{read_pcm16_wav_bytes, SAMPLE_RATE_16K};
+use subomi_player::mpv::ffi as mpv;
+use subomi_player::EncodeContext;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;
 #[cfg(all(
@@ -52,7 +52,7 @@ impl MediaContext {
     }
 
     /// Resolve the effective media path/URL for off-thread encoding, preferring
-    /// `stream_open_filename` when non-empty and not an internal `memento-asr://`
+    /// `stream_open_filename` when non-empty and not an internal `subomi-asr://`
     /// stream URI.
     pub fn effective_media_path(&self) -> &str {
         EncodeContext::resolve_media_path(&self.stream_open_filename, &self.path)
@@ -60,7 +60,7 @@ impl MediaContext {
 
     /// Returns the trimmed external audio path/URL when configured for split
     /// DASH / external audio tracks (filtering out empty strings and internal
-    /// `memento-asr://` URIs).
+    /// `subomi-asr://` URIs).
     pub fn effective_external_audio(&self) -> Option<&str> {
         self.external_audio_filename
             .as_deref()
@@ -109,12 +109,12 @@ fn create_temp_media_path(
 }
 
 fn create_temp_wav_path() -> Result<TempMediaFile, String> {
-    create_temp_media_path("memento-audio-", "window.wav", "temporary audio directory")
+    create_temp_media_path("subomi-audio-", "window.wav", "temporary audio directory")
 }
 
 fn create_temp_aac_path() -> Result<TempMediaFile, String> {
     create_temp_media_path(
-        "memento-anki-audio-",
+        "subomi-anki-audio-",
         "clip.aac",
         "temporary Anki audio directory",
     )
@@ -122,7 +122,7 @@ fn create_temp_aac_path() -> Result<TempMediaFile, String> {
 
 fn create_temp_mp4_path() -> Result<TempMediaFile, String> {
     create_temp_media_path(
-        "memento-anki-video-",
+        "subomi-anki-video-",
         "clip.mp4",
         "temporary Anki video directory",
     )
@@ -840,7 +840,7 @@ pub fn extract_clip_mp4_with_cancel(
 ))]
 fn create_memfd_wav() -> Option<(fs::File, String)> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
-    let fd = unsafe { libc::memfd_create(c"memento-asr-pcm".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"subomi-asr-pcm".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return None;
     }
@@ -1150,7 +1150,7 @@ mod tests {
                 "   ".to_owned(),
             ],
             referrer: "https://www.youtube.com/".to_owned(),
-            user_agent: "Memento/2.0.2".to_owned(),
+            user_agent: "Subomi/2.0.2".to_owned(),
             cookies: true,
             cookies_file: "/tmp/cookies.txt".to_owned(),
             ytdl_raw_options: "cookies-from-browser=firefox".to_owned(),
@@ -1182,7 +1182,7 @@ mod tests {
         );
         assert_eq!(
             option_value(&audio_opts, "user-agent"),
-            Some("Memento/2.0.2")
+            Some("Subomi/2.0.2")
         );
         assert_eq!(option_value(&audio_opts, "cookies"), Some("yes"));
         assert_eq!(
@@ -1209,7 +1209,7 @@ mod tests {
         assert_eq!(option_value(&video_no_audio, "audio-files"), None);
         assert_eq!(
             option_value(&video_no_audio, "user-agent"),
-            Some("Memento/2.0.2")
+            Some("Subomi/2.0.2")
         );
 
         // Verify libmpv accepts every configured streaming option & list option on a real handle.
@@ -1228,8 +1228,8 @@ mod tests {
     #[test]
     fn internal_asr_uri_is_ignored_for_effective_media_path_and_external_audio() {
         let mut media = MediaContext::new("/tmp/local.mkv", 1);
-        media.stream_open_filename = "memento-asr://live.vtt".to_owned();
-        media.external_audio_filename = Some("memento-asr://live.vtt".to_owned());
+        media.stream_open_filename = "subomi-asr://live.vtt".to_owned();
+        media.external_audio_filename = Some("subomi-asr://live.vtt".to_owned());
         assert_eq!(media.effective_media_path(), "/tmp/local.mkv");
         assert_eq!(media.effective_external_audio(), None);
         assert_eq!(loadfile_audio_id(&media, true), Some(1));
@@ -1239,7 +1239,7 @@ mod tests {
     #[ignore = "requires ffmpeg and libmpv WAV encoding"]
     fn encodes_anki_sentence_audio_without_asr() {
         let path = std::env::temp_dir().join(format!(
-            "memento-anki-audio-test-{}.wav",
+            "subomi-anki-audio-test-{}.wav",
             std::process::id()
         ));
         let output = std::process::Command::new("ffmpeg")
@@ -1280,7 +1280,7 @@ mod tests {
     #[ignore = "requires ffmpeg and a libmpv build with MP4 encoding"]
     fn encodes_real_anki_video_clip() {
         let path = std::env::temp_dir().join(format!(
-            "memento-anki-video-test-{}.mp4",
+            "subomi-anki-video-test-{}.mp4",
             std::process::id()
         ));
         let output = std::process::Command::new("ffmpeg")

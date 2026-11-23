@@ -1,5 +1,5 @@
 import { Palette } from "std-widgets.slint";
-import { MementoPalette } from "palette.slint";
+import { SubomiPalette } from "palette.slint";
 import { ActionButton } from "components/buttons.slint";
 import {
     SettingsWindow,
@@ -27,7 +27,7 @@ import { SubtitleDrawerPanel } from "player/subtitle_drawer.slint";
 import { AboutModal, NoDictionariesModal, OpenUrlModal } from "player/modals.slint";
 
 export {
-    MementoPalette, SettingsWindow, AnkiHelpWindow,
+    SubomiPalette, SettingsWindow, AnkiHelpWindow,
     HelpArgument, HelpMarker, HelpSection,
     AnkiExcludedDictRow, AnkiAutocompleteItem, TextReplacementRow,
 }
@@ -44,16 +44,16 @@ export {
     AssLineHitbox, AssHighlightPatch, AssRubyItem,
 }
 
-// ── Main Memento Application Window ─────────────────────────────────────
-export component MementoApp inherits Window {
-    title: root.media-title != "" ? (root.media-title + " — Memento") : "Memento";
+// ── Main Subomi Application Window ─────────────────────────────────────
+export component SubomiApp inherits Window {
+    title: root.media-title != "" ? (root.media-title + " — Subomi") : "Subomi";
     min-width: 900px;
     min-height: 580px;
     preferred-width: 1200px;
     preferred-height: 720px;
     background: #000000;
 
-    in-out property <bool> is-light-theme <=> MementoPalette.light-mode;
+    in-out property <bool> is-light-theme <=> SubomiPalette.light-mode;
     in-out property <bool> drop-hover-active: false;
     in-out property <string> drop-hover-label: "Drop media or subtitle files to open";
     in-out property <string> status-toast-text: "";
@@ -142,7 +142,7 @@ export component MementoApp inherits Window {
     in-out property <bool> subtitle-furigana-pending: false;
     in-out property <bool> furigana-enabled: true;
     in-out property <bool> hide-mpv-subtitles: true;
-    in-out property <bool> hide-memento-while-playing: false;
+    in-out property <bool> hide-subomi-while-playing: false;
     in-out property <bool> hover-pause-enabled: false;
     in-out property <[string]> recent-files: [];
     in-out property <[string]> recent-file-labels: [];
@@ -230,7 +230,7 @@ export component MementoApp inherits Window {
     in-out property <string> update-dialog-title: "";
     in-out property <string> update-dialog-message: "";
     in-out property <string> update-dialog-release-tag: "";
-    in-out property <string> update-dialog-release-url: "https://github.com/ripose-jp/Memento/releases/latest";
+    in-out property <string> update-dialog-release-url: "https://github.com/eyalmazuz/Subomi/releases/latest";
     in-out property <string> copied-subtitle-text: "";
 
     // Subtitle Entries & Interactive Words
@@ -244,11 +244,11 @@ export component MementoApp inherits Window {
     in-out property <bool> sub-list-show-timestamps: false;
     in-out property <bool> subtitle-search-ignore-whitespace: false;
     in-out property <bool> subtitle-search-auto-seek: false;
-    in-out property <color> sub-list-bg-color: MementoPalette.surface-bg;
-    in-out property <color> sub-list-text-color: MementoPalette.text;
-    in-out property <color> sub-list-hover-color: MementoPalette.list-hover;
-    in-out property <color> sub-list-selected-color: MementoPalette.accent-muted;
-    in-out property <color> sub-list-selected-hover-color: MementoPalette.accent-muted-hover;
+    in-out property <color> sub-list-bg-color: SubomiPalette.surface-bg;
+    in-out property <color> sub-list-text-color: SubomiPalette.text;
+    in-out property <color> sub-list-hover-color: SubomiPalette.list-hover;
+    in-out property <color> sub-list-selected-color: SubomiPalette.accent-muted;
+    in-out property <color> sub-list-selected-hover-color: SubomiPalette.accent-muted-hover;
     in-out property <string> sub-list-primary-font-family: "";
     in-out property <length> sub-list-primary-font-size: 13px;
     in-out property <bool> sub-list-primary-font-bold: false;
@@ -434,7 +434,7 @@ export component MementoApp inherits Window {
         !root.ocr-mode
         && SubtitleOverlayBridge.ass-native-active
         && root.subtitles-visible
-        && !(root.hide-memento-while-playing && root.is-playing)
+        && !(root.hide-subomi-while-playing && root.is-playing)
         && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
     property <bool> primary-cursor-reveal:
         root.subtitle-cursor-show-enabled
@@ -878,21 +878,21 @@ export component MementoApp inherits Window {
                                 Image {
                                     width: 68px;
                                     height: 68px;
-                                    source: @image-url("../res/memento.svg");
+                                    source: @image-url("../res/subomi.svg");
                                     image-fit: contain;
                                 }
                             }
                             Text {
-                                text: "Memento";
+                                text: "Subomi";
                                 font-size: 26px;
                                 font-weight: 700;
-                                color: MementoPalette.osc-text;
+                                color: SubomiPalette.osc-text;
                                 horizontal-alignment: center;
                             }
                             Text {
                                 text: "Open a video file (Ctrl+O) or drag and drop media to start";
                                 font-size: 13.5px;
-                                color: MementoPalette.osc-text-secondary;
+                                color: SubomiPalette.osc-text-secondary;
                                 horizontal-alignment: center;
                             }
                             HorizontalLayout {
@@ -999,7 +999,7 @@ export component MementoApp inherits Window {
                                 width: max(ruby.width, ruby-txt.preferred-width + 6px);
                                 height: ruby-txt.preferred-height + 2px;
                                 border-radius: 3px;
-                                background: MementoPalette.video-scrim;
+                                background: SubomiPalette.video-scrim;
                                 ruby-txt := Text {
                                     x: (parent.width - self.preferred-width) / 2;
                                     y: 1px;
@@ -1007,7 +1007,7 @@ export component MementoApp inherits Window {
                                     font-size: ruby.font-size;
                                     font-weight: 700;
                                     font-family: SubtitleOverlayBridge.sub-font-family;
-                                    color: MementoPalette.osc-text;
+                                    color: SubomiPalette.osc-text;
                                     wrap: no-wrap;
                                 }
                             }
@@ -1085,7 +1085,7 @@ export component MementoApp inherits Window {
                         visible: !root.ocr-mode
                             && root.secondary-sub-text != ""
                             && root.subtitles-visible
-                            && !(root.hide-memento-while-playing && root.is-playing)
+                            && !(root.hide-subomi-while-playing && root.is-playing)
                             && (!root.secondary-subtitle-cursor-show-enabled || root.secondary-cursor-reveal);
                         x: (parent.width - self.width) / 2;
                         y: 12px;
@@ -1136,7 +1136,7 @@ export component MementoApp inherits Window {
                             && !SubtitleOverlayBridge.ass-native-active
                             && root.active-sub-text != ""
                             && root.subtitles-visible
-                            && !(root.hide-memento-while-playing && root.is-playing)
+                            && !(root.hide-subomi-while-playing && root.is-playing)
                             && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
                         x: (parent.width - self.width) / 2;
                         // Allow subtitles all the way down to 4px bottom margin (removed 62px clamp — H3.7)
@@ -1352,11 +1352,11 @@ export component MementoApp inherits Window {
                         width: min(parent.width - 28px, audio-ctx-row.preferred-width + 16px);
                         height: 28px;
                         border-radius: 14px;
-                        background: MementoPalette.osc-bg;
+                        background: SubomiPalette.osc-bg;
                         border-width: 1px;
-                        border-color: MementoPalette.cyan-accent;
+                        border-color: SubomiPalette.cyan-accent;
                         drop-shadow-blur: 12px;
-                        drop-shadow-color: MementoPalette.osc-shadow;
+                        drop-shadow-color: SubomiPalette.osc-shadow;
 
                         audio-ctx-row := HorizontalLayout {
                             x: 10px;
@@ -1371,13 +1371,13 @@ export component MementoApp inherits Window {
                                     width: 7px;
                                     height: 7px;
                                     border-radius: 3.5px;
-                                    background: MementoPalette.cyan-accent;
+                                    background: SubomiPalette.cyan-accent;
                                 }
                             }
 
                             Text {
                                 text: root.audio-context-hud-text;
-                                color: MementoPalette.osc-text;
+                                color: SubomiPalette.osc-text;
                                 font-size: 11.5px;
                                 font-weight: 600;
                                 vertical-alignment: center;
@@ -1389,10 +1389,10 @@ export component MementoApp inherits Window {
                                     width: 18px;
                                     height: 18px;
                                     border-radius: 9px;
-                                    background: clear-ctx-touch.has-hover ? MementoPalette.osc-btn-hover : transparent;
+                                    background: clear-ctx-touch.has-hover ? SubomiPalette.osc-btn-hover : transparent;
                                     Text {
                                         text: "×";
-                                        color: clear-ctx-touch.has-hover ? MementoPalette.osc-text : MementoPalette.osc-text-secondary;
+                                        color: clear-ctx-touch.has-hover ? SubomiPalette.osc-text : SubomiPalette.osc-text-secondary;
                                         font-size: 13px;
                                         font-weight: 700;
                                         horizontal-alignment: center;
@@ -1418,15 +1418,15 @@ export component MementoApp inherits Window {
                         x: (parent.width - self.width) / 2;
                         y: parent.height - (root.status-message != "" ? 156px : 112px);
                         background: root.status-toast-is-warning
-                            ? MementoPalette.warning-bg
-                            : MementoPalette.surface-elevated;
+                            ? SubomiPalette.warning-bg
+                            : SubomiPalette.surface-elevated;
                         border-radius: 17px;
                         border-width: 1px;
                         border-color: root.status-toast-is-warning
-                            ? MementoPalette.warning-border
-                            : MementoPalette.cyan-accent;
+                            ? SubomiPalette.warning-border
+                            : SubomiPalette.cyan-accent;
                         drop-shadow-blur: 14px;
-                        drop-shadow-color: MementoPalette.shadow;
+                        drop-shadow-color: SubomiPalette.shadow;
 
                         nb-toast-row := HorizontalLayout {
                             x: 12px;
@@ -1438,7 +1438,7 @@ export component MementoApp inherits Window {
 
                             if root.status-toast-is-warning : Text {
                                 text: "⚠";
-                                color: MementoPalette.warning-text;
+                                color: SubomiPalette.warning-text;
                                 font-size: 13px;
                                 font-weight: 700;
                                 vertical-alignment: center;
@@ -1448,8 +1448,8 @@ export component MementoApp inherits Window {
                                 horizontal-stretch: 1;
                                 text: root.status-toast-text;
                                 color: root.status-toast-is-warning
-                                    ? MementoPalette.warning-text
-                                    : MementoPalette.text;
+                                    ? SubomiPalette.warning-text
+                                    : SubomiPalette.text;
                                 font-size: 12px;
                                 font-weight: 600;
                                 vertical-alignment: center;
@@ -1462,12 +1462,12 @@ export component MementoApp inherits Window {
                                     width: 18px;
                                     height: 18px;
                                     border-radius: 9px;
-                                    background: dismiss-nb-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                                    background: dismiss-nb-touch.has-hover ? SubomiPalette.hover-bg : transparent;
                                     Text {
                                         text: "×";
                                         color: root.status-toast-is-warning
-                                            ? MementoPalette.warning-text
-                                            : MementoPalette.text-secondary;
+                                            ? SubomiPalette.warning-text
+                                            : SubomiPalette.text-secondary;
                                         font-size: 13px;
                                         font-weight: 700;
                                         horizontal-alignment: center;
@@ -1492,19 +1492,19 @@ export component MementoApp inherits Window {
                         height: max(36px, toast-lbl.preferred-height + 16px);
                         x: (parent.width - self.width) / 2;
                         y: parent.height - 112px;
-                        background: MementoPalette.surface-elevated;
+                        background: SubomiPalette.surface-elevated;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: MementoPalette.border-light;
+                        border-color: SubomiPalette.border-light;
                         drop-shadow-blur: 16px;
-                        drop-shadow-color: MementoPalette.shadow;
+                        drop-shadow-color: SubomiPalette.shadow;
 
                         toast-lbl := Text {
                             x: 16px;
                             width: parent.width - 32px;
                             height: parent.height;
                             text: root.status-message;
-                            color: MementoPalette.text;
+                            color: SubomiPalette.text;
                             font-size: 12.5px;
                             font-weight: 500;
                             horizontal-alignment: center;
@@ -1564,12 +1564,12 @@ export component MementoApp inherits Window {
                         height: preview-col.preferred-height + (osc.is-dragging ? 10px : 16px);
                         x: max(16px, min(parent.width - self.width - 16px, osc.x + osc.hover-x - self.width / 2));
                         y: max(10px, osc.y - self.height - 8px);
-                        background: MementoPalette.osc-bg;
+                        background: SubomiPalette.osc-bg;
                         border-width: 1px;
-                        border-color: osc.is-dragging ? MementoPalette.cyan-accent : MementoPalette.osc-border;
+                        border-color: osc.is-dragging ? SubomiPalette.cyan-accent : SubomiPalette.osc-border;
                         border-radius: osc.is-dragging ? 12px : 8px;
                         drop-shadow-blur: 14px;
-                        drop-shadow-color: MementoPalette.osc-shadow;
+                        drop-shadow-color: SubomiPalette.osc-shadow;
 
                         preview-col := VerticalLayout {
                             x: 10px;
@@ -1597,7 +1597,7 @@ export component MementoApp inherits Window {
                                 text: root.hover-chapter-title;
                                 font-size: 11px;
                                 font-weight: 600;
-                                color: MementoPalette.cyan-accent;
+                                color: SubomiPalette.cyan-accent;
                                 horizontal-alignment: center;
                                 overflow: elide;
                             }
@@ -1607,7 +1607,7 @@ export component MementoApp inherits Window {
                                 font-family: "monospace";
                                 font-size: 12px;
                                 font-weight: 700;
-                                color: MementoPalette.osc-text;
+                                color: SubomiPalette.osc-text;
                                 horizontal-alignment: center;
                             }
                         }
@@ -1625,12 +1625,12 @@ export component MementoApp inherits Window {
                             width: ocr-hint-lbl.preferred-width + 24px;
                             height: 28px;
                             border-radius: 14px;
-                            background: MementoPalette.osc-bg;
+                            background: SubomiPalette.osc-bg;
                             border-width: 1px;
-                            border-color: MementoPalette.cyan-accent;
+                            border-color: SubomiPalette.cyan-accent;
                             ocr-hint-lbl := Text {
                                 text: "Drag with left button to OCR region · Right-click or Esc to cancel";
-                                color: MementoPalette.osc-text;
+                                color: SubomiPalette.osc-text;
                                 font-size: 11.5px;
                                 font-weight: 600;
                                 horizontal-alignment: center;
@@ -1689,9 +1689,9 @@ export component MementoApp inherits Window {
                             y: min(ocr-touch.drag-start-y, ocr-touch.mouse-y);
                             width: max(1px, max(ocr-touch.drag-start-x, ocr-touch.mouse-x) - self.x);
                             height: max(1px, max(ocr-touch.drag-start-y, ocr-touch.mouse-y) - self.y);
-                            background: MementoPalette.accent-subtle;
+                            background: SubomiPalette.accent-subtle;
                             border-width: 2px;
-                            border-color: MementoPalette.cyan-accent;
+                            border-color: SubomiPalette.cyan-accent;
                         }
                     }
                 }
@@ -1700,7 +1700,7 @@ export component MementoApp inherits Window {
                 sidebar-container := Rectangle {
                     width: (root.dict-search-open || root.sub-drawer-open) ? root.sidebar-width : 0px;
                     visible: self.width > 0px;
-                    background: MementoPalette.surface-bg;
+                    background: SubomiPalette.surface-bg;
 
                     sidebar-bg-touch := TouchArea {
                         width: 100%;
@@ -1757,8 +1757,8 @@ export component MementoApp inherits Window {
                             width: parent.width;
                             height: 6px;
                             background: split-v-touch.pressed || split-v-touch.has-hover
-                                ? MementoPalette.cyan-accent
-                                : MementoPalette.border;
+                                ? SubomiPalette.cyan-accent
+                                : SubomiPalette.border;
                             animate background { duration: 100ms; }
                             split-v-touch := TouchArea {
                                 width: 100%;
@@ -1842,8 +1842,8 @@ export component MementoApp inherits Window {
                             width: 1px;
                             height: parent.height;
                             background: split-h-touch.pressed || split-h-touch.has-hover
-                                ? MementoPalette.cyan-accent
-                                : MementoPalette.border;
+                                ? SubomiPalette.cyan-accent
+                                : SubomiPalette.border;
                             animate background { duration: 100ms; }
                         }
 
@@ -1855,8 +1855,8 @@ export component MementoApp inherits Window {
                             height: 36px;
                             border-radius: 1.5px;
                             background: split-h-touch.pressed || split-h-touch.has-hover
-                                ? MementoPalette.cyan-accent
-                                : MementoPalette.border-light;
+                                ? SubomiPalette.cyan-accent
+                                : SubomiPalette.border-light;
                             opacity: split-h-touch.pressed || split-h-touch.has-hover ? 1.0 : 0.45;
                             animate opacity { duration: 120ms; }
                             animate background { duration: 100ms; }
@@ -1978,7 +1978,7 @@ export component MementoApp inherits Window {
             }
         }
 
-        // About Memento Modal (standardized onto ModalDialog, supports git hash in app-version-display)
+        // About Subomi Modal (standardized onto ModalDialog, supports git hash in app-version-display)
         if root.about-open : AboutModal {
             app-version: root.app-version;
             app-version-display: root.app-version-display;
@@ -2004,11 +2004,11 @@ export component MementoApp inherits Window {
         }
 
         // Update Check & First-Launch Auto-Update Opt-In Modal
-        // Matches ModalDialog tokens/geometry while keeping exact `MementoApp::update-*` test IDs.
+        // Matches ModalDialog tokens/geometry while keeping exact `SubomiApp::update-*` test IDs.
         if root.update-dialog-open : Rectangle {
             width: 100%;
             height: 100%;
-            background: MementoPalette.scrim;
+            background: SubomiPalette.scrim;
             TouchArea {
                 clicked => {
                     if root.update-dialog-opt-in {
@@ -2025,12 +2025,12 @@ export component MementoApp inherits Window {
                 height: min(update-col.preferred-height, parent.height - 48px);
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                background: MementoPalette.surface-elevated;
-                border-color: MementoPalette.border-light;
+                background: SubomiPalette.surface-elevated;
+                border-color: SubomiPalette.border-light;
                 border-width: 1px;
                 border-radius: 12px;
                 drop-shadow-blur: 28px;
-                drop-shadow-color: MementoPalette.shadow;
+                drop-shadow-color: SubomiPalette.shadow;
                 // Click-shield prevents clicks inside the dialog from dismissing it
                 TouchArea {}
                 // Subtle top accent highlight
@@ -2040,7 +2040,7 @@ export component MementoApp inherits Window {
                     width: parent.width - 32px;
                     height: 3px;
                     border-radius: 1.5px;
-                    background: MementoPalette.cyan-accent;
+                    background: SubomiPalette.cyan-accent;
                 }
                 update-col := VerticalLayout {
                     width: parent.width;
@@ -2059,12 +2059,12 @@ export component MementoApp inherits Window {
                                     width: 28px;
                                     height: 28px;
                                     border-radius: 7px;
-                                    background: MementoPalette.accent-subtle;
+                                    background: SubomiPalette.accent-subtle;
                                     border-width: 1px;
-                                    border-color: MementoPalette.cyan-accent;
+                                    border-color: SubomiPalette.cyan-accent;
                                     Text {
                                         text: "↻";
-                                        color: MementoPalette.cyan-accent;
+                                        color: SubomiPalette.cyan-accent;
                                         font-size: 15px;
                                         font-weight: 700;
                                         horizontal-alignment: center;
@@ -2074,7 +2074,7 @@ export component MementoApp inherits Window {
                             }
                             Text {
                                 text: root.update-dialog-title != "" ? root.update-dialog-title : "Updates";
-                                color: MementoPalette.text;
+                                color: SubomiPalette.text;
                                 font-size: 17px;
                                 font-weight: 700;
                                 vertical-alignment: center;
@@ -2086,12 +2086,12 @@ export component MementoApp inherits Window {
                                 height: 24px;
                                 width: tag-lbl.preferred-width + 16px;
                                 border-radius: 12px;
-                                background: MementoPalette.accent-muted;
+                                background: SubomiPalette.accent-muted;
                                 border-width: 1px;
-                                border-color: MementoPalette.cyan-accent;
+                                border-color: SubomiPalette.cyan-accent;
                                 tag-lbl := Text {
                                     text: root.update-dialog-release-tag;
-                                    color: MementoPalette.cyan-text;
+                                    color: SubomiPalette.cyan-text;
                                     font-size: 12px;
                                     font-weight: 700;
                                     horizontal-alignment: center;
@@ -2107,7 +2107,7 @@ export component MementoApp inherits Window {
                         update-message-text := Text {
                             width: parent.width;
                             text: root.update-dialog-message;
-                            color: MementoPalette.text-secondary;
+                            color: SubomiPalette.text-secondary;
                             font-size: 13px;
                             wrap: word-wrap;
                         }
@@ -2115,7 +2115,7 @@ export component MementoApp inherits Window {
 
                     Rectangle {
                         height: 1px;
-                        background: MementoPalette.border;
+                        background: SubomiPalette.border;
                     }
 
                     // Opt-in footer: [No] [Yes (primary)]
@@ -2173,9 +2173,9 @@ export component MementoApp inherits Window {
         if root.drop-hover-active : Rectangle {
             width: 100%;
             height: 100%;
-            background: MementoPalette.accent-subtle;
+            background: SubomiPalette.accent-subtle;
             border-width: 3px;
-            border-color: MementoPalette.cyan-accent;
+            border-color: SubomiPalette.cyan-accent;
 
             Rectangle {
                 x: (parent.width - self.width) / 2;
@@ -2183,17 +2183,17 @@ export component MementoApp inherits Window {
                 width: min(parent.width - 64px, main-drop-lbl.preferred-width + 44px);
                 height: 54px;
                 border-radius: 12px;
-                background: MementoPalette.surface-elevated;
+                background: SubomiPalette.surface-elevated;
                 border-width: 1.5px;
-                border-color: MementoPalette.cyan-accent;
+                border-color: SubomiPalette.cyan-accent;
                 drop-shadow-blur: 20px;
-                drop-shadow-color: MementoPalette.shadow;
+                drop-shadow-color: SubomiPalette.shadow;
 
                 main-drop-lbl := Text {
                     text: root.drop-hover-label != ""
                         ? root.drop-hover-label
                         : "Drop media or subtitle files to open";
-                    color: MementoPalette.text;
+                    color: SubomiPalette.text;
                     font-size: 14px;
                     font-weight: 700;
                     horizontal-alignment: center;

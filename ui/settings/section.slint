@@ -1,6 +1,6 @@
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton, FilterChip, IconButton } from "../components/buttons.slint";
-import { MementoCheckBox, MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { SubomiCheckBox, SubomiSwitch, SectionHeader } from "../components/controls.slint";
 import { AnkiAutocompleteItem, AnkiExcludedDictRow, SettingsField, SettingsGroup } from "types.slint";
 import { FieldRow } from "controls.slint";
 
@@ -71,16 +71,16 @@ export component SettingsSection inherits VerticalLayout {
 
     if root.group.category == 6 && root.group.title == "Keyboard Shortcuts" && root.keybind-conflict-count > 0 : Rectangle {
         height: 38px;
-        background: MementoPalette.warning-bg;
+        background: SubomiPalette.warning-bg;
         border-width: 1px;
-        border-color: MementoPalette.warning-border;
+        border-color: SubomiPalette.warning-border;
         border-radius: 8px;
         Text {
             x: 14px;
             width: parent.width - 28px;
             height: parent.height;
             text: "⚠ Duplicate shortcut conflict detected in this profile. Click any shortcut to reassign.";
-            color: MementoPalette.warning-text;
+            color: SubomiPalette.warning-text;
             font-size: 12px;
             font-weight: 600;
             vertical-alignment: center;
@@ -89,9 +89,9 @@ export component SettingsSection inherits VerticalLayout {
     }
 
     settings-card := Rectangle {
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         border-radius: 10px;
         height: card-col.preferred-height;
 
@@ -105,7 +105,7 @@ export component SettingsSection inherits VerticalLayout {
 
             for field[index] in root.group.fields : VerticalLayout {
                 spacing: 0px;
-                if index > 0 && field.visible : Rectangle { height: 1px; background: MementoPalette.border; }
+                if index > 0 && field.visible : Rectangle { height: 1px; background: SubomiPalette.border; }
                 field-row := FieldRow {
                     field: field;
                     group-category: root.group.category;
@@ -143,7 +143,7 @@ export component SettingsSection inherits VerticalLayout {
             // Excluded Glossary Dictionaries (`ex-glos`) checklist inside Anki Advanced section
             if root.group.category == 0 && root.group.title == "Advanced" && root.anki-excluded-dicts.length > 0 : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
                 VerticalLayout {
                     padding-top: 11px;
                     padding-bottom: 11px;
@@ -155,21 +155,21 @@ export component SettingsSection inherits VerticalLayout {
                             text: "Excluded Glossary Dictionaries";
                             font-size: 13px;
                             font-weight: 600;
-                            color: MementoPalette.text;
+                            color: SubomiPalette.text;
                         }
                         Text {
                             text: "Checked dictionaries are excluded from {glossary} exports for this Anki profile";
                             font-size: 11px;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             wrap: word-wrap;
                         }
                     }
 
                     Rectangle {
                         border-radius: 7px;
-                        background: MementoPalette.card-inset;
+                        background: SubomiPalette.card-inset;
                         border-width: 1px;
-                        border-color: MementoPalette.border;
+                        border-color: SubomiPalette.border;
 
                         VerticalLayout {
                             padding: 10px;
@@ -179,7 +179,7 @@ export component SettingsSection inherits VerticalLayout {
                                 spacing: 8px;
                                 alignment: space-between;
 
-                                MementoCheckBox {
+                                SubomiCheckBox {
                                     label: item.name;
                                     checked: item.excluded;
                                     toggled(val) => { root.anki-excluded-dict-toggled(item.name, val); }
@@ -191,14 +191,14 @@ export component SettingsSection inherits VerticalLayout {
                                         height: 18px;
                                         width: uninst-lbl.preferred-width + 10px;
                                         border-radius: 4px;
-                                        background: MementoPalette.warning-bg;
+                                        background: SubomiPalette.warning-bg;
                                         border-width: 1px;
-                                        border-color: MementoPalette.warning-border;
+                                        border-color: SubomiPalette.warning-border;
                                         uninst-lbl := Text {
                                             text: "Not installed";
                                             font-size: 10px;
                                             font-weight: 600;
-                                            color: MementoPalette.warning-text;
+                                            color: SubomiPalette.warning-text;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
                                         }
@@ -213,7 +213,7 @@ export component SettingsSection inherits VerticalLayout {
             // One-click presets (stacked header + wrapping FlexboxLayout chips — never overflows at 820px)
             if root.group.category == 0 && root.group.title == "Term Notes" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
                 VerticalLayout {
                     padding-top: 11px;
                     padding-bottom: 11px;
@@ -225,12 +225,12 @@ export component SettingsSection inherits VerticalLayout {
                             text: "One-click presets";
                             font-size: 13px;
                             font-weight: 600;
-                            color: MementoPalette.text;
+                            color: SubomiPalette.text;
                         }
                         Text {
                             text: "Pre-fill field markers for popular Anki note types";
                             font-size: 11px;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             wrap: word-wrap;
                         }
                     }
@@ -249,7 +249,7 @@ export component SettingsSection inherits VerticalLayout {
 
             if root.group.category == 0 && (root.group.title == "Term Notes" || root.group.title == "Kanji Notes") : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
                 HorizontalLayout {
                     padding-top: 10px;
                     padding-bottom: 10px;
@@ -259,7 +259,7 @@ export component SettingsSection inherits VerticalLayout {
                         text: root.group.fields.length <= 2
                             ? "No model fields loaded yet — connect to Anki or load fields to map them."
                             : "Refresh fields from the selected Anki note model";
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
                         font-size: 12px;
@@ -277,7 +277,7 @@ export component SettingsSection inherits VerticalLayout {
 
             if root.group.category == 0 && root.group.title == "General" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
                 HorizontalLayout {
                     padding-top: 10px;
                     padding-bottom: 10px;
@@ -291,18 +291,18 @@ export component SettingsSection inherits VerticalLayout {
                             text: "Show advanced settings";
                             font-size: 13px;
                             font-weight: 500;
-                            color: MementoPalette.text;
+                            color: SubomiPalette.text;
                         }
                         Text {
                             text: "Reveal duplicate-check, audio normalization, and media quality options";
                             font-size: 11px;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             overflow: elide;
                         }
                     }
                     VerticalLayout {
                         alignment: center;
-                        MementoSwitch {
+                        SubomiSwitch {
                             checked: root.show-advanced;
                             toggled(value) => {
                                 root.show-advanced = value;
@@ -315,7 +315,7 @@ export component SettingsSection inherits VerticalLayout {
 
             if root.group.category == 0 && root.group.title == "AnkiConnect" : VerticalLayout {
                 spacing: 0px;
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
                 HorizontalLayout {
                     padding-top: 10px;
                     padding-bottom: 10px;
@@ -324,7 +324,7 @@ export component SettingsSection inherits VerticalLayout {
                     Text {
                         text: "Verify AnkiConnect endpoint and load decks & note models";
                         font-size: 12px;
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                         overflow: elide;

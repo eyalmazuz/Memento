@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { PlayerTrack } from "types.slint";
 
 component MenuBarButton inherits Rectangle {
@@ -15,8 +15,8 @@ component MenuBarButton inherits Rectangle {
     height: 24px;
     border-radius: 5px;
     background: root.open-menu == root.menu-id
-        ? MementoPalette.active-bg
-        : (touch.has-hover ? MementoPalette.hover-bg : transparent);
+        ? SubomiPalette.active-bg
+        : (touch.has-hover ? SubomiPalette.hover-bg : transparent);
 
     animate background { duration: 100ms; }
 
@@ -26,7 +26,7 @@ component MenuBarButton inherits Rectangle {
         text: root.label;
         font-size: 12px;
         font-weight: root.open-menu == root.menu-id ? 600 : 500;
-        color: MementoPalette.text;
+        color: SubomiPalette.text;
     }
 
     touch := TouchArea {
@@ -56,9 +56,9 @@ export component TopMenuBar inherits Rectangle {
     callback interacted();
 
     height: 30px;
-    background: MementoPalette.surface-bg;
+    background: SubomiPalette.surface-bg;
     border-width: 1px;
-    border-color: MementoPalette.border;
+    border-color: SubomiPalette.border;
 
     top-touch := TouchArea {
         pointer-event(event) => {
@@ -151,8 +151,8 @@ component DropdownItem inherits Rectangle {
     background: root.is-disabled
         ? transparent
         : (root.submenu-active
-            ? MementoPalette.active-bg
-            : (touch.has-hover ? MementoPalette.hover-bg : transparent));
+            ? SubomiPalette.active-bg
+            : (touch.has-hover ? SubomiPalette.hover-bg : transparent));
 
     animate background { duration: 100ms; }
 
@@ -172,7 +172,7 @@ component DropdownItem inherits Rectangle {
                 text: (root.checkable && root.checked) ? "✓" : "";
                 font-size: 11px;
                 font-weight: 700;
-                color: MementoPalette.cyan-accent;
+                color: SubomiPalette.cyan-accent;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -180,7 +180,7 @@ component DropdownItem inherits Rectangle {
             Text {
                 text: root.text;
                 font-size: 12px;
-                color: root.is-disabled ? MementoPalette.text-muted : MementoPalette.text;
+                color: root.is-disabled ? SubomiPalette.text-muted : SubomiPalette.text;
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
@@ -194,7 +194,7 @@ component DropdownItem inherits Rectangle {
             if root.shortcut != "" : Text {
                 text: root.shortcut;
                 font-size: 11px;
-                color: MementoPalette.text-muted;
+                color: SubomiPalette.text-muted;
                 vertical-alignment: center;
             }
 
@@ -202,7 +202,7 @@ component DropdownItem inherits Rectangle {
                 text: "›";
                 font-size: 14px;
                 font-weight: 700;
-                color: MementoPalette.text-secondary;
+                color: SubomiPalette.text-secondary;
                 vertical-alignment: center;
             }
         }
@@ -223,7 +223,7 @@ component DropdownSeparator inherits Rectangle {
         y: 4px;
         width: parent.width - 12px;
         height: 1px;
-        background: MementoPalette.border;
+        background: SubomiPalette.border;
     }
 }
 
@@ -323,12 +323,12 @@ export component MenuDropdown inherits Rectangle {
            root.menu-index == 2 ? 236px :
            root.menu-index == 3 ? 196px : 210px;
     height: min(menu-content.preferred-height, max(120px, root.max-dropdown-height));
-    background: MementoPalette.surface-elevated;
+    background: SubomiPalette.surface-elevated;
     border-width: 1px;
-    border-color: MementoPalette.border-light;
+    border-color: SubomiPalette.border-light;
     border-radius: 8px;
     drop-shadow-blur: 18px;
-    drop-shadow-color: MementoPalette.shadow;
+    drop-shadow-color: SubomiPalette.shadow;
 
     menu-scroll := ScrollView {
         width: parent.width;
@@ -500,7 +500,7 @@ export component MenuDropdown inherits Rectangle {
                 }
                 DropdownSeparator {}
                 DropdownItem {
-                    text: "About Memento";
+                    text: "About Subomi";
                     clicked => { root.show-about(); root.close-menu(); }
                 }
             }
@@ -513,12 +513,12 @@ export component MenuDropdown inherits Rectangle {
         y: max(0px, min(root.submenu-anchor-y, max(0px, root.max-dropdown-height - self.height)));
         width: root.submenu-index == 0 ? 380px : 260px;
         height: min(sub-content.preferred-height, max(120px, min(360px, root.max-dropdown-height)));
-        background: MementoPalette.surface-elevated;
+        background: SubomiPalette.surface-elevated;
         border-width: 1px;
-        border-color: MementoPalette.border-light;
+        border-color: SubomiPalette.border-light;
         border-radius: 8px;
         drop-shadow-blur: 18px;
-        drop-shadow-color: MementoPalette.shadow;
+        drop-shadow-color: SubomiPalette.shadow;
 
         ScrollView {
             width: parent.width;

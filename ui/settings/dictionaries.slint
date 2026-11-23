@@ -1,6 +1,6 @@
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton, IconButton } from "../components/buttons.slint";
-import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { SubomiSwitch, SectionHeader } from "../components/controls.slint";
 import { InstalledDictionaryRow } from "types.slint";
 
 export component DictionariesPanel inherits VerticalLayout {
@@ -24,9 +24,9 @@ export component DictionariesPanel inherits VerticalLayout {
             height: 28px;
             width: min(busy-row.preferred-width, 260px);
             border-radius: 7px;
-            background: MementoPalette.teal-muted;
+            background: SubomiPalette.teal-muted;
             border-width: 1px;
-            border-color: MementoPalette.teal-border;
+            border-color: SubomiPalette.teal-border;
             clip: true;
 
             busy-row := HorizontalLayout {
@@ -41,14 +41,14 @@ export component DictionariesPanel inherits VerticalLayout {
                         width: 18px;
                         height: 6px;
                         border-radius: 3px;
-                        background: MementoPalette.border;
+                        background: SubomiPalette.border;
                         clip: true;
                         Rectangle {
                             x: (parent.width - self.width) * abs(sin(animation-tick() / 800ms * 180deg));
                             width: 8px;
                             height: parent.height;
                             border-radius: 3px;
-                            background: MementoPalette.teal-border;
+                            background: SubomiPalette.teal-border;
                         }
                     }
                 }
@@ -57,7 +57,7 @@ export component DictionariesPanel inherits VerticalLayout {
                     text: root.dictionary-progress-text != ""
                         ? root.dictionary-progress-text
                         : "Updating…";
-                    color: MementoPalette.teal-text;
+                    color: SubomiPalette.teal-text;
                     font-size: 11.5px;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -78,12 +78,12 @@ export component DictionariesPanel inherits VerticalLayout {
     if root.drop-hover-active : Rectangle {
         height: 48px;
         border-radius: 10px;
-        background: MementoPalette.accent-subtle;
+        background: SubomiPalette.accent-subtle;
         border-width: 2px;
-        border-color: MementoPalette.cyan-accent;
+        border-color: SubomiPalette.cyan-accent;
         Text {
             text: "Drop Yomitan .zip dictionary archive(s) here to import";
-            color: MementoPalette.cyan-text;
+            color: SubomiPalette.cyan-text;
             font-size: 13px;
             font-weight: 700;
             horizontal-alignment: center;
@@ -94,9 +94,9 @@ export component DictionariesPanel inherits VerticalLayout {
     if root.installed-dictionaries.length == 0 : Rectangle {
         height: 92px;
         border-radius: 10px;
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: root.drop-hover-active ? 2px : 1px;
-        border-color: root.drop-hover-active ? MementoPalette.cyan-accent : MementoPalette.card-border;
+        border-color: root.drop-hover-active ? SubomiPalette.cyan-accent : SubomiPalette.card-border;
         clip: true;
 
         if root.dictionary-busy : Rectangle {
@@ -104,18 +104,18 @@ export component DictionariesPanel inherits VerticalLayout {
             y: 0px;
             width: parent.width;
             height: 2px;
-            background: MementoPalette.border;
+            background: SubomiPalette.border;
             Rectangle {
                 x: (parent.width * 0.72) * abs(sin(animation-tick() / 900ms * 180deg));
                 width: parent.width * 0.28;
                 height: parent.height;
-                background: MementoPalette.teal-border;
+                background: SubomiPalette.teal-border;
             }
         }
 
         Text {
             text: "No dictionaries installed yet. Click \"+ Import ZIP…\" to add Yomitan dictionaries.";
-            color: MementoPalette.text-muted;
+            color: SubomiPalette.text-muted;
             font-size: 13px;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -123,9 +123,9 @@ export component DictionariesPanel inherits VerticalLayout {
     }
 
     if root.installed-dictionaries.length > 0 : Rectangle {
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         border-radius: 10px;
         clip: true;
 
@@ -138,14 +138,14 @@ export component DictionariesPanel inherits VerticalLayout {
 
             for dictionary[index] in root.installed-dictionaries : VerticalLayout {
                 spacing: 0px;
-                if index > 0 : Rectangle { height: 1px; background: MementoPalette.border; }
+                if index > 0 : Rectangle { height: 1px; background: SubomiPalette.border; }
                 HorizontalLayout {
                     height: 48px;
                     spacing: 14px;
 
                     VerticalLayout {
                         alignment: center;
-                        MementoSwitch {
+                        SubomiSwitch {
                             checked: !dictionary.disabled;
                             enabled: !root.dictionary-busy;
                             toggled(val) => {
@@ -156,7 +156,7 @@ export component DictionariesPanel inherits VerticalLayout {
 
                     Text {
                         text: dictionary.title;
-                        color: dictionary.disabled ? MementoPalette.text-muted : MementoPalette.text;
+                        color: dictionary.disabled ? SubomiPalette.text-muted : SubomiPalette.text;
                         font-size: 13px;
                         font-weight: 500;
                         horizontal-stretch: 1;
@@ -170,12 +170,12 @@ export component DictionariesPanel inherits VerticalLayout {
                             height: 20px;
                             width: id-lbl.preferred-width + 14px;
                             border-radius: 5px;
-                            background: MementoPalette.surface-bg;
+                            background: SubomiPalette.surface-bg;
                             border-width: 1px;
-                            border-color: MementoPalette.border;
+                            border-color: SubomiPalette.border;
                             id-lbl := Text {
                                 text: "ID " + dictionary.id;
-                                color: MementoPalette.text-muted;
+                                color: SubomiPalette.text-muted;
                                 font-family: "monospace";
                                 font-size: 10.5px;
                                 font-weight: 600;
@@ -223,12 +223,12 @@ export component DictionariesPanel inherits VerticalLayout {
             y: 0px;
             width: parent.width;
             height: 2px;
-            background: MementoPalette.border;
+            background: SubomiPalette.border;
             Rectangle {
                 x: (parent.width * 0.72) * abs(sin(animation-tick() / 900ms * 180deg));
                 width: parent.width * 0.28;
                 height: parent.height;
-                background: MementoPalette.teal-border;
+                background: SubomiPalette.teal-border;
             }
         }
     }

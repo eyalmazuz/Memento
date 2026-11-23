@@ -1,4 +1,4 @@
-//! Memento pure-Rust desktop application.
+//! Subomi pure-Rust desktop application.
 
 pub mod anki_help;
 pub mod app;
@@ -14,7 +14,7 @@ pub mod video_metal;
 pub use ui::*;
 
 // Crate-internal re-exports expected by `crate::settings_ui`.
-pub(crate) use app::paths::{memento_xdg_dir, open_directory_command, spawn_and_reap};
+pub(crate) use app::paths::{subomi_xdg_dir, open_directory_command, spawn_and_reap};
 pub(crate) use app::preferences::{
     apply_dictionary_order, refresh_player_preferences, setting_enabled,
 };

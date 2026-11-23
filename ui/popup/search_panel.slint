@@ -1,5 +1,5 @@
 import { LineEdit, ScrollView } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { IconButton, ToggleChip } from "../components/buttons.slint";
 import {
     DictResult,
@@ -66,9 +66,9 @@ export component DictionarySearchPanel inherits Rectangle {
     private property <length> audio-menu-x: 16px;
     private property <length> audio-menu-y: 84px;
 
-    background: MementoPalette.surface-bg;
+    background: SubomiPalette.surface-bg;
     border-width: 1px;
-    border-color: MementoPalette.border;
+    border-color: SubomiPalette.border;
     clip: true;
 
     VerticalLayout {
@@ -88,7 +88,7 @@ export component DictionarySearchPanel inherits Rectangle {
                     width: 15px;
                     height: 15px;
                     source: @image-url("../icons/search.svg");
-                    colorize: MementoPalette.icon-muted;
+                    colorize: SubomiPalette.icon-muted;
                 }
             }
 
@@ -96,7 +96,7 @@ export component DictionarySearchPanel inherits Rectangle {
                 text: "Search";
                 font-size: 14px;
                 font-weight: 700;
-                color: MementoPalette.text;
+                color: SubomiPalette.text;
                 vertical-alignment: center;
                 horizontal-stretch: 1;
             }
@@ -156,7 +156,7 @@ export component DictionarySearchPanel inherits Rectangle {
                     icon: @image-url("../icons/clear.svg");
                     size: 28px;
                     icon-size: 15px;
-                    tint: MementoPalette.icon-muted;
+                    tint: SubomiPalette.icon-muted;
                     tooltip: "Clear search";
                     tooltip-below: true;
                     tooltip-align-right: true;
@@ -177,9 +177,9 @@ export component DictionarySearchPanel inherits Rectangle {
         if root.active-query != "" : scan-strip := Rectangle {
             height: 24px;
             border-radius: 5px;
-            background: scan-touch.has-hover ? MementoPalette.hover-bg : MementoPalette.card-inset;
+            background: scan-touch.has-hover ? SubomiPalette.hover-bg : SubomiPalette.card-inset;
             border-width: 1px;
-            border-color: scan-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border;
+            border-color: scan-touch.has-hover ? SubomiPalette.cyan-accent : SubomiPalette.border;
             animate background { duration: 100ms; }
             animate border-color { duration: 100ms; }
 
@@ -193,7 +193,7 @@ export component DictionarySearchPanel inherits Rectangle {
                     text: "Scan:";
                     font-size: 10.5px;
                     font-weight: 700;
-                    color: MementoPalette.text-muted;
+                    color: SubomiPalette.text-muted;
                     vertical-alignment: center;
                 }
 
@@ -201,7 +201,7 @@ export component DictionarySearchPanel inherits Rectangle {
                     horizontal-stretch: 1;
                     text: root.active-query;
                     font-size: 12px;
-                    color: MementoPalette.text;
+                    color: SubomiPalette.text;
                     vertical-alignment: center;
                     overflow: elide;
                 }
@@ -249,14 +249,14 @@ export component DictionarySearchPanel inherits Rectangle {
                     width: 8px;
                     height: 8px;
                     border-radius: 4px;
-                    background: MementoPalette.cyan-accent;
+                    background: SubomiPalette.cyan-accent;
                 }
             }
 
             DictionaryText {
                 text: "Searching…";
                 font-size: 11px;
-                color: MementoPalette.text-secondary;
+                color: SubomiPalette.text-secondary;
                 vertical-alignment: center;
             }
         }
@@ -281,7 +281,7 @@ export component DictionarySearchPanel inherits Rectangle {
                         source: root.active-query == ""
                             ? @image-url("../icons/dictionary.svg")
                             : @image-url("../icons/search.svg");
-                        colorize: MementoPalette.text-muted;
+                        colorize: SubomiPalette.text-muted;
                         opacity: 0.65;
                     }
                 }
@@ -292,7 +292,7 @@ export component DictionarySearchPanel inherits Rectangle {
                         : ("No results for \"" + root.active-query + "\"");
                     font-size: 13px;
                     font-weight: 600;
-                    color: MementoPalette.text-secondary;
+                    color: SubomiPalette.text-secondary;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
@@ -302,7 +302,7 @@ export component DictionarySearchPanel inherits Rectangle {
                         ? "Type Japanese, kana, romaji, or use * / ? wildcards to look up terms and kanji."
                         : "Try checking the spelling, using * / ? wildcards, or toggling かな reading mode.";
                     font-size: 11.5px;
-                    color: MementoPalette.text-muted;
+                    color: SubomiPalette.text-muted;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
@@ -395,7 +395,7 @@ export component DictionarySearchPanel inherits Rectangle {
                         y: 0px;
                         width: parent.width;
                         height: panel-row.is-kanji-footer-start ? 2px : 1px;
-                        background: panel-row.is-kanji-footer-start ? MementoPalette.cyan-accent : PopupBridge.css-term-divider-color;
+                        background: panel-row.is-kanji-footer-start ? SubomiPalette.cyan-accent : PopupBridge.css-term-divider-color;
                     }
 
                     panel-card-col := VerticalLayout {
@@ -416,14 +416,14 @@ export component DictionarySearchPanel inherits Rectangle {
                                 height: 18px;
                                 width: kf-lbl.preferred-width + 12px;
                                 border-radius: 4px;
-                                background: MementoPalette.accent-muted;
+                                background: SubomiPalette.accent-muted;
                                 border-width: 1px;
-                                border-color: MementoPalette.cyan-accent;
+                                border-color: SubomiPalette.cyan-accent;
                                 kf-lbl := Text {
                                     text: "KANJI";
                                     font-size: 9.5px;
                                     font-weight: 700;
-                                    color: MementoPalette.cyan-text;
+                                    color: SubomiPalette.cyan-text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -433,7 +433,7 @@ export component DictionarySearchPanel inherits Rectangle {
                                 text: "Character Details";
                                 font-size: 11px;
                                 font-weight: 600;
-                                color: MementoPalette.text-muted;
+                                color: SubomiPalette.text-muted;
                                 vertical-alignment: center;
                             }
                         }

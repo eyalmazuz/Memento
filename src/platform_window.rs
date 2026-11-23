@@ -1,23 +1,3 @@
-////////////////////////////////////////////////////////////////////////////////
-//
-// Copyright (c) 2026 Ripose
-//
-// This file is part of Memento.
-//
-// Memento is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 2 of the License.
-//
-// Memento is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with Memento.  If not, see <https://www.gnu.org/licenses/>.
-//
-////////////////////////////////////////////////////////////////////////////////
-
 //! Cross-platform window fullscreen state machine & Windows OpenGL borderless
 //! `+1px` workaround (`Main.qml` parity, enhanced for multi-monitor layouts).
 //!
@@ -31,7 +11,7 @@
 //! 5. On exit, restoring window chrome first, clearing `bottom_margin_px = 0`,
 //!    restoring `saved_geometry`, and finally re-maximizing if `saved_maximized` was true.
 
-use memento_os::{
+use subomi_os::{
     compute_windows_borderless_fullscreen_rect, MonitorRect, WindowRect,
     WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX,
 };
@@ -315,13 +295,13 @@ pub fn compute_auto_fit_window_rect(
     ))
 }
 
-/// Apply a [`FullscreenAction`] to a Win32 `HWND` using `memento-os`'s Win32
+/// Apply a [`FullscreenAction`] to a Win32 `HWND` using `subomi-os`'s Win32
 /// borderless hooks (available when compiled for Windows).
 #[cfg(target_os = "windows")]
 pub fn apply_windows_fullscreen_action(
     hwnd: isize,
     action: &FullscreenAction,
-    win32_snapshot: &mut Option<memento_os::Win32WindowStyleSnapshot>,
+    win32_snapshot: &mut Option<subomi_os::Win32WindowStyleSnapshot>,
 ) -> Result<(), String> {
     match action {
         FullscreenAction::NoOp | FullscreenAction::SetNativeFullscreen { .. } => Ok(()),
@@ -336,7 +316,7 @@ pub fn apply_windows_fullscreen_action(
                 1.0,
             );
             let (snapshot, _applied) =
-                memento_os::enter_windows_borderless_fullscreen(hwnd, Some(monitor))?;
+                subomi_os::enter_windows_borderless_fullscreen(hwnd, Some(monitor))?;
             if win32_snapshot.is_none() {
                 *win32_snapshot = Some(snapshot);
             }
@@ -344,7 +324,7 @@ pub fn apply_windows_fullscreen_action(
         }
         FullscreenAction::ExitWindowsBorderless { .. } => {
             if let Some(snapshot) = win32_snapshot.take() {
-                memento_os::exit_windows_borderless_fullscreen(hwnd, &snapshot)?;
+                subomi_os::exit_windows_borderless_fullscreen(hwnd, &snapshot)?;
             }
             Ok(())
         }

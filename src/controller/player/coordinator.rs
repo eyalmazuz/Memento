@@ -1,11 +1,11 @@
 //! Event-driven `LivePlayerCoordinator` bridging `MpvInstance`, `AsrSubtitleTrack`,
-//! `AsrController`, `SubtitleController`, `AutoPauseState`, and Slint `MementoApp`.
+//! `AsrController`, `SubtitleController`, `AutoPauseState`, and Slint `SubomiApp`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use memento_player::{
+use subomi_player::{
     AsrCue, AsrSubtitleTrack, AutoPauseState, MpvEvent, MpvInstance, MpvPropertyValue, TrackType,
     VideoTrack, ASR_STREAM_URI,
 };
@@ -17,7 +17,7 @@ use crate::controller::subtitles::{
     create_cue, normalize_subtitle_text, ExternalSubtitleLoad, MemorySubtitleCue,
     SubtitleController, ASR_TRACK_ID,
 };
-use crate::{MementoApp, PlayerTrack, SubEntry};
+use crate::{SubomiApp, PlayerTrack, SubEntry};
 
 use super::format_time;
 use super::mouse::MouseInputForwarder;
@@ -40,15 +40,15 @@ struct EventBatchSummary {
 /// `AsrSubtitleTrack` (`sid > 0`), `AsrController`, `SubtitleController`, and
 /// `AutoPauseState`.
 pub struct LivePlayerCoordinator {
-    state: memento_player::mpv::PlaybackState,
+    state: subomi_player::mpv::PlaybackState,
     asr_track: AsrSubtitleTrack,
     auto_pause: AutoPauseState,
     pub mouse: MouseInputForwarder,
     subtitle_filter: CachedSubtitleFilter,
     subtitle_codecs: HashMap<i64, String>,
-    previous_audio: Vec<memento_player::AudioTrack>,
-    previous_tracks: Vec<memento_player::SubtitleTrack>,
-    previous_lines: Vec<memento_player::mpv::SubLine>,
+    previous_audio: Vec<subomi_player::AudioTrack>,
+    previous_tracks: Vec<subomi_player::SubtitleTrack>,
+    previous_lines: Vec<subomi_player::mpv::SubLine>,
     previous_audio_id: i64,
     previous_primary_sid: i64,
     previous_sub_delay: f64,
@@ -90,12 +90,12 @@ impl LivePlayerCoordinator {
 
     pub fn with_asr_track(asr_track: AsrSubtitleTrack) -> Self {
         Self {
-            state: memento_player::mpv::PlaybackState {
+            state: subomi_player::mpv::PlaybackState {
                 paused: true,
                 volume: 100.0,
                 volume_max: 100,
                 sub_speed: 1.0,
-                cursor_autohide: memento_player::mpv::CursorAutohide::Number(1000),
+                cursor_autohide: subomi_player::mpv::CursorAutohide::Number(1000),
                 ..Default::default()
             },
             asr_track,
@@ -179,7 +179,7 @@ impl LivePlayerCoordinator {
         self.previous_sub_speed = self.state.sub_speed;
     }
 
-    pub fn playback_state(&self) -> &memento_player::mpv::PlaybackState {
+    pub fn playback_state(&self) -> &subomi_player::mpv::PlaybackState {
         &self.state
     }
 
@@ -248,7 +248,7 @@ impl LivePlayerCoordinator {
 
     /// Returns true if the active primary subtitle track is ASS/SSA and native
     /// `libmpv`/`libass` rendering (`interface/sub-ass-native`) is enabled.
-    pub fn primary_is_native_ass(&self, app: &MementoApp) -> bool {
+    pub fn primary_is_native_ass(&self, app: &SubomiApp) -> bool {
         let primary_sid = self.state.primary_sid;
         primary_sid > 0
             && app.get_sub_ass_native()
@@ -273,7 +273,7 @@ impl LivePlayerCoordinator {
     }
 
     /// Synchronously update primary `sid` tracking when the user explicitly selects
-    /// a non-ASR subtitle track (or `"None"`) from Memento's UI menu.
+    /// a non-ASR subtitle track (or `"None"`) from Subomi's UI menu.
     pub fn on_manual_primary_sid(&mut self, sid: i64) {
         if self.asr_track.sid() != Some(sid) {
             self.asr_track.mark_deselected();
@@ -324,7 +324,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn toggle_or_start_asr(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         asr: &mut AsrController,
         subtitles: &mut SubtitleController,
@@ -501,7 +501,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     fn reset_for_new_media(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         asr: &mut AsrController,
         subtitles: &mut SubtitleController,
@@ -627,7 +627,7 @@ impl LivePlayerCoordinator {
     fn apply_mpv_events(
         &mut self,
         events: &[MpvEvent],
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -1266,7 +1266,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     fn sync_audio_track_asr(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -1336,7 +1336,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     fn sync_deferred_asr_restart(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -1448,7 +1448,7 @@ impl LivePlayerCoordinator {
 
     fn sync_title_and_media_path(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         current_media: &RefCell<Option<String>>,
         saw_title_or_path_event: bool,
     ) {
@@ -1468,7 +1468,7 @@ impl LivePlayerCoordinator {
     /// Stage 4: Change-gated Slint UI playback transport, time, and volume updates.
     fn sync_ui_state(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         pos: f64,
         duration: f64,
@@ -1523,7 +1523,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     fn sync_subtitles(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -1536,7 +1536,7 @@ impl LivePlayerCoordinator {
         paused: bool,
         raw_primary: f64,
         raw_secondary: f64,
-        on_publish_primary_subtitle: &mut impl FnMut(&MementoApp, &str),
+        on_publish_primary_subtitle: &mut impl FnMut(&SubomiApp, &str),
     ) -> Vec<ExternalSubtitleLoad> {
         let mut external_loads = Vec::new();
         let mut list_refreshed = false;
@@ -1584,7 +1584,7 @@ impl LivePlayerCoordinator {
                 .iter()
                 .map(|line| MemorySubtitleCue {
                     id: line.id,
-                    text: line.text.encode_utf16().collect(),
+                    text: line.text.clone(),
                     start: line.start,
                     end: line.end,
                 })
@@ -1722,7 +1722,7 @@ impl LivePlayerCoordinator {
     /// Stage 6: Synchronize hover-pause release and `libmpv` subtitle visibility.
     fn sync_visibility(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         hover_pause_owned: &Cell<bool>,
         paused: bool,
@@ -1748,7 +1748,7 @@ impl LivePlayerCoordinator {
         let (want_primary_vis, want_secondary_vis) = compute_mpv_subtitle_visibility_ex(
             app.get_hide_mpv_subtitles(),
             app.get_subtitles_visible(),
-            app.get_hide_memento_while_playing(),
+            app.get_hide_subomi_while_playing(),
             !paused,
             primary_is_image,
             secondary_is_image,
@@ -1783,7 +1783,7 @@ impl LivePlayerCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         sub_model: &VecModel<SubEntry>,
@@ -1793,7 +1793,7 @@ impl LivePlayerCoordinator {
         asr_restart_pending: &Cell<bool>,
         hover_pause_owned: &Cell<bool>,
         asr_settings_provider: impl Fn() -> Result<AsrSettings, String>,
-        mut on_publish_primary_subtitle: impl FnMut(&MementoApp, &str),
+        mut on_publish_primary_subtitle: impl FnMut(&SubomiApp, &str),
     ) -> Vec<ExternalSubtitleLoad> {
         let events = player.drain_events();
 
@@ -1889,7 +1889,7 @@ impl LivePlayerCoordinator {
     /// changed and should be refreshed when ASR is selected.
     pub fn handle_asr_event(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         subtitles: &mut SubtitleController,
         raw_primary: f64,
@@ -1914,7 +1914,7 @@ impl LivePlayerCoordinator {
                 );
                 let mem_cue = MemorySubtitleCue {
                     id: cue.id as i64,
-                    text: cue.text.encode_utf16().collect(),
+                    text: cue.text,
                     start: cue.start,
                     end: cue.end,
                 };
@@ -1948,7 +1948,7 @@ impl LivePlayerCoordinator {
                         .into_iter()
                         .map(|c| MemorySubtitleCue {
                             id: c.id as i64,
-                            text: c.text.encode_utf16().collect(),
+                            text: c.text,
                             start: c.start,
                             end: c.end,
                         })
@@ -1986,7 +1986,7 @@ impl LivePlayerCoordinator {
 mod tests {
     use super::*;
     use crate::controller::subtitles::create_cue;
-    use memento_player::{MpvInstance, Track};
+    use subomi_player::{MpvInstance, Track};
     use slint::Model;
 
     fn make_test_mpv() -> MpvInstance {
@@ -1997,7 +1997,7 @@ mod tests {
     #[test]
     fn shutdown_event_sets_and_consumes_shutdown_requested() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let player = make_test_mpv();
         let mut coord = LivePlayerCoordinator::new(&player);
         let mut subs = SubtitleController::new();
@@ -2030,7 +2030,7 @@ mod tests {
     #[test]
     fn mpv_fullscreen_property_surfaces_changes_and_suppresses_window_echoes() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let player = make_test_mpv();
         let mut coord = LivePlayerCoordinator::new(&player);
         let mut subs = SubtitleController::new();
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn video_tracks_and_selected_vid_update_from_track_list_and_vid_events() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let player = make_test_mpv();
         let mut coord = LivePlayerCoordinator::new(&player);
         let mut subs = SubtitleController::new();

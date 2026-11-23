@@ -1,10 +1,10 @@
 import { LineEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
-import { MementoCheckBox, MementoSlider } from "../components/controls.slint";
+import { SubomiPalette } from "../palette.slint";
+import { SubomiCheckBox, SubomiSlider } from "../components/controls.slint";
 import { ModalDialog } from "../components/modal.slint";
 
 component CheckerboardBackdrop inherits Rectangle {
-    background: MementoPalette.checker-dark;
+    background: SubomiPalette.checker-dark;
     clip: true;
 
     for row in [0, 1, 2, 3, 4, 5] : Rectangle {
@@ -18,7 +18,7 @@ component CheckerboardBackdrop inherits Rectangle {
             y: 0px;
             width: 8px;
             height: 8px;
-            background: mod(row + col, 2) == 0 ? MementoPalette.checker-light : transparent;
+            background: mod(row + col, 2) == 0 ? SubomiPalette.checker-light : transparent;
         }
     }
 }
@@ -38,7 +38,7 @@ component ColorChannelRow inherits Rectangle {
         height: parent.height;
         spacing: 10px;
         Text { width: 48px; text: root.label; color: root.label-color; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-        MementoSlider {
+        SubomiSlider {
             horizontal-stretch: 1;
             minimum: 0;
             maximum: 255;
@@ -46,7 +46,7 @@ component ColorChannelRow inherits Rectangle {
             value: root.channel-value;
             changed(val) => { root.channel-changed(Math.round(val)); }
         }
-        Text { width: 32px; text: root.channel-value + ""; color: MementoPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+        Text { width: 32px; text: root.channel-value + ""; color: SubomiPalette.text; font-family: "monospace"; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
     }
 }
 
@@ -102,7 +102,7 @@ export component ColorPickerModal inherits ModalDialog {
                 height: 46px;
                 border-radius: 8px;
                 border-width: 1px;
-                border-color: MementoPalette.border-light;
+                border-color: SubomiPalette.border-light;
                 clip: true;
 
                 CheckerboardBackdrop {
@@ -136,7 +136,7 @@ export component ColorPickerModal inherits ModalDialog {
                 alignment: start;
                 Text {
                     text: "Hex";
-                    color: MementoPalette.text-secondary;
+                    color: SubomiPalette.text-secondary;
                     font-size: 12px;
                     font-weight: 600;
                     vertical-alignment: center;
@@ -152,7 +152,7 @@ export component ColorPickerModal inherits ModalDialog {
 
             Text {
                 text: "RGBA (" + root.color-r + ", " + root.color-g + ", " + root.color-b + ", " + root.color-a + ")";
-                color: MementoPalette.text-muted;
+                color: SubomiPalette.text-muted;
                 font-family: "monospace";
                 font-size: 11.5px;
             }
@@ -195,8 +195,8 @@ export component ColorPickerModal inherits ModalDialog {
 
         ColorChannelRow {
             label: "Alpha";
-            accent: MementoPalette.cyan-accent;
-            label-color: MementoPalette.text-secondary;
+            accent: SubomiPalette.cyan-accent;
+            label-color: SubomiPalette.text-secondary;
             channel-value: root.color-a;
             channel-changed(val) => {
                 root.color-a = val;
@@ -210,7 +210,7 @@ export component ColorPickerModal inherits ModalDialog {
         spacing: 6px;
         Text {
             text: "Presets";
-            color: MementoPalette.text-muted;
+            color: SubomiPalette.text-muted;
             font-size: 11px;
             font-weight: 600;
         }
@@ -238,8 +238,8 @@ export component ColorPickerModal inherits ModalDialog {
                 border-radius: 6px;
                 border-width: is-selected ? 2px : 1px;
                 border-color: is-selected
-                    ? MementoPalette.cyan-accent
-                    : (sw-touch.has-hover ? MementoPalette.cyan-hover : MementoPalette.border-light);
+                    ? SubomiPalette.cyan-accent
+                    : (sw-touch.has-hover ? SubomiPalette.cyan-hover : SubomiPalette.border-light);
                 background: transparent;
                 clip: true;
 
@@ -280,8 +280,8 @@ export component AudioHelpModal inherits ModalDialog {
     primary-text: "OK";
 
     Text {
-        text: "Source Name: The name of the audio source as it will appear in Memento.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
-        color: MementoPalette.text-secondary;
+        text: "Source Name: The name of the audio source as it will appear in Subomi.\n\nURL: The URL of the audio source. Supports inserting {expression} and {reading} markers into the URL.\n\nMD5 Skip Hash: Audio that matches this MD5 hash will be ignored.";
+        color: SubomiPalette.text-secondary;
         font-size: 13px;
         wrap: word-wrap;
     }
@@ -292,14 +292,14 @@ export component AnkiConnectionModal inherits ModalDialog {
     in property <string> message: "";
 
     title: root.ok ? "✔ Connected to Anki" : "✖ Connection Failed";
-    title-color: root.ok ? MementoPalette.success-text : MementoPalette.danger-text;
-    accent-border: root.ok ? MementoPalette.success : MementoPalette.danger;
+    title-color: root.ok ? SubomiPalette.success-text : SubomiPalette.danger-text;
+    accent-border: root.ok ? SubomiPalette.success : SubomiPalette.danger;
     dialog-width: 420px;
     primary-text: "OK";
 
     Text {
         text: root.message;
-        color: MementoPalette.text-secondary;
+        color: SubomiPalette.text-secondary;
         font-size: 13px;
         wrap: word-wrap;
     }
@@ -310,8 +310,8 @@ export component ConfirmDeleteModal inherits ModalDialog {
     in property <string> detail-text: "";
 
     title: root.item-title;
-    title-color: MementoPalette.text;
-    accent-border: MementoPalette.danger;
+    title-color: SubomiPalette.text;
+    accent-border: SubomiPalette.danger;
     dialog-width: 420px;
     cancel-text: "Cancel";
     primary-text: "Delete";
@@ -319,7 +319,7 @@ export component ConfirmDeleteModal inherits ModalDialog {
 
     Text {
         text: root.detail-text;
-        color: MementoPalette.text-secondary;
+        color: SubomiPalette.text-secondary;
         font-size: 13px;
         wrap: word-wrap;
     }
@@ -361,7 +361,7 @@ export component ProfileModal inherits ModalDialog {
             text: root.is-rename
                 ? "Enter a new name for the active profile:"
                 : "Enter a name for the new profile:";
-            color: MementoPalette.text-secondary;
+            color: SubomiPalette.text-secondary;
             font-size: 12.5px;
             wrap: word-wrap;
         }
@@ -384,22 +384,22 @@ export component ProfileModal inherits ModalDialog {
         if root.profile-name-error != "" : Rectangle {
             height: err-lbl.preferred-height + 12px;
             border-radius: 6px;
-            background: MementoPalette.danger-bg;
+            background: SubomiPalette.danger-bg;
             border-width: 1px;
-            border-color: MementoPalette.danger;
+            border-color: SubomiPalette.danger;
             err-lbl := Text {
                 x: 10px;
                 y: 6px;
                 width: parent.width - 20px;
                 text: "⚠ " + root.profile-name-error;
-                color: MementoPalette.danger-text;
+                color: SubomiPalette.danger-text;
                 font-size: 12px;
                 font-weight: 600;
                 wrap: word-wrap;
             }
         }
 
-        if !root.is-rename : MementoCheckBox {
+        if !root.is-rename : SubomiCheckBox {
             label: "Copy current profile";
             checked <=> root.copy-current-profile;
         }

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 /// Returns true if an `mpv` subtitle track codec is bitmap/image-based rather
-/// than text-based (meaning Memento's text overlay cannot render it).
+/// than text-based (meaning Subomi's text overlay cannot render it).
 pub fn is_image_subtitle_codec(codec: &str) -> bool {
     matches!(
         codec.trim().to_ascii_lowercase().as_str(),
@@ -25,7 +25,7 @@ pub fn is_image_subtitle_codec(codec: &str) -> bool {
 /// 2. When cursor-show is enabled for a track and the cursor is outside its
 ///    reveal zone, mpv hides that track even when `hide_mpv_subtitles == false`.
 /// 3. Otherwise native ASS / bitmap image tracks render via mpv, and plain text
-///    tracks render via mpv whenever Memento's overlay does not own text.
+///    tracks render via mpv whenever Subomi's overlay does not own text.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_mpv_subtitle_visibility_ex(
     hide_mpv_subtitles: bool,
@@ -90,7 +90,7 @@ pub fn compute_mpv_subtitle_visibility(
     )
 }
 
-/// Apply Memento's configured `search/remove-regex`, `search/replace-lines`, and
+/// Apply Subomi's configured `search/remove-regex`, `search/replace-lines`, and
 /// `search/replace-with` text filters to subtitle text.
 pub fn filter_subtitle_text(
     text: &str,
@@ -98,7 +98,7 @@ pub fn filter_subtitle_text(
     replace_lines: bool,
     replace_with: &str,
 ) -> String {
-    memento_dict::normalize::preprocess_search_text(text, remove_regex, replace_lines, replace_with)
+    subomi_dict::normalize::preprocess_search_text(text, remove_regex, replace_lines, replace_with)
 }
 
 /// Compute the auto-fitted logical window size `(width, height)` for a newly loaded
@@ -159,7 +159,7 @@ pub fn subtitle_cursor_zones(pointer_y: f32, video_height: f32) -> (bool, bool) 
 /// Compute effective subtitle overlay visibility accounting for `subtitle-cursor-show`.
 ///
 /// Precedence: `subtitle-cursor-show` NEVER overrides explicit `Show Subtitles`
-/// off (`!subtitles_visible`) or `hide-memento-while-playing` while playing.
+/// off (`!subtitles_visible`) or `hide-subomi-while-playing` while playing.
 pub fn compute_subtitle_overlay_visibility(
     has_text: bool,
     subtitles_visible: bool,
@@ -175,7 +175,7 @@ pub fn compute_subtitle_overlay_visibility(
 }
 
 /// Compute effective visibility of the interactive ASS hover/selection overlay
-/// (`ass-overlay`), enforcing `subtitles_visible`, `hide-memento-while-playing`,
+/// (`ass-overlay`), enforcing `subtitles_visible`, `hide-subomi-while-playing`,
 /// and `subtitle-cursor-show` precedence.
 pub fn compute_ass_overlay_visibility(
     ass_native_active: bool,
@@ -194,13 +194,13 @@ pub fn compute_ass_overlay_visibility(
 /// Compute whether `mpv`'s `cursor-autohide` policy wants the video cursor hidden when
 /// `behavior/osc-mpv-cursor` is enabled.
 pub fn mpv_cursor_should_hide(
-    autohide: memento_player::mpv::CursorAutohide,
+    autohide: subomi_player::mpv::CursorAutohide,
     fs_only: bool,
     is_fullscreen: bool,
     idle_elapsed_ms: u64,
     overlay_interactive: bool,
 ) -> bool {
-    use memento_player::mpv::CursorAutohide;
+    use subomi_player::mpv::CursorAutohide;
     if overlay_interactive {
         return false;
     }
@@ -320,7 +320,7 @@ mod tests {
             true, false, false, false, true, true
         ));
 
-        // `hide-memento-while-playing` while playing wins even in zone (both plain & ASS overlay).
+        // `hide-subomi-while-playing` while playing wins even in zone (both plain & ASS overlay).
         assert!(!compute_subtitle_overlay_visibility(
             true, true, true, true, true, true
         ));
@@ -341,7 +341,7 @@ mod tests {
         assert!(!compute_ass_overlay_visibility(
             true, true, true, false, true, false
         ));
-        // Without cursor-show, ASS overlay still respects `hide-memento-while-playing`.
+        // Without cursor-show, ASS overlay still respects `hide-subomi-while-playing`.
         assert!(!compute_ass_overlay_visibility(
             true, true, true, true, false, false
         ));

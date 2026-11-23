@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use memento_dict::sqlite_db;
+use subomi_dict::sqlite_db;
 
 use super::{DictControllerError, DictTag};
 

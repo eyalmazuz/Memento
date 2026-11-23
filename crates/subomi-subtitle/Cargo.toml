@@ -1,0 +1,12 @@
+[package]
+name = "subomi-subtitle"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Subtitle parsing, history model, and secondary subtitle types"
+license = "GPL-2.0-only"
+
+[lib]
+name = "subomi_subtitle"
+path = "src/lib.rs"
+crate-type = ["lib"]

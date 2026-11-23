@@ -1,0 +1,569 @@
+//! Model-file downloader, replacing `downloadmanager.cpp`'s
+//! `QNetworkAccessManager` download flow.
+//!
+//! The downloader keeps the observable file behavior of the C++ path:
+//! existing targets short-circuit, each attempt truncates
+//! `path + ".download"`, successful downloads rename the staging file onto
+//! the target, and failures remove the partial. Progress speed and change
+//! decisions reuse the ported `subomi_setting` DownloadManager helpers.
+//!
+//! ## MD5 / hashing
+//!
+//! There is deliberately **no** MD5 hook here: the `md5` crate is not
+//! available to this crate, and hashing (including the `skipHash`
+//! reuse-of-cache shortcut used by `audiofiles.cpp`) belongs to the
+//! caller. The API stays byte-stream based on purpose: every decoded chunk
+//! is handed to the caller's callback (see [`DownloadEvent`]), which is
+//! what a future `subomi-audio`/`subomi-util` integration feeds its
+//! incremental hasher with.
+
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+use subomi_setting::models::download_progress_update;
+use subomi_setting::models::download_speed;
+
+use crate::error::HttpError;
+use crate::http::{HttpClient, HttpClientConfig, Request, Url};
+
+/// Default TCP/TLS connect timeout for model-file downloads.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default request/response-header timeout for model-file downloads.
+pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default total transfer timeout for model-file downloads: generous enough
+/// for multi-hundred-MB ASR models while never blocking unboundedly.
+pub const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// The per-chunk progress payload. `speed_bps` comes straight from the
+/// ported `subomi_setting::models::download_speed`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DownloadProgress
+{
+    /// Bytes of the current download received so far.
+    pub received: i64,
+    /// Total size in bytes when the server declared one; `0` when
+    /// unknown.
+    pub total: i64,
+    pub speed_bps: i64,
+    /// Received/total computed by the ported `download_progress_update`.
+    pub fraction: f64,
+}
+
+/// One decoded chunk plus the progress computed for it. Consumed by the
+/// caller's callback; a hashing caller feeds `data` incrementally here.
+#[derive(Debug)]
+pub struct DownloadEvent<'a>
+{
+    pub data: &'a [u8],
+    pub progress: DownloadProgress,
+}
+
+/// Running state for [`recompute_progress`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProgressState
+{
+    prev_progress: f64,
+    prev_received: i64,
+    prev_total: i64,
+    prev_speed: i64,
+}
+
+/// The bounce point between the byte stream and the ported
+/// `subomi_setting` DownloadManager arithmetic: computes bytes/sec
+/// (`download_speed`) and the fuzzy-compared progress fraction
+/// (`download_progress_update`). Returns `changed` the way
+/// `DownloadManager::setDownloadProgress` gates its signal.
+pub fn recompute_progress(
+    state: &mut ProgressState,
+    received: i64,
+    total: i64,
+    elapsed_ms: i64,
+) -> (i64, f64, bool)
+{
+    let speed = download_speed(received, elapsed_ms);
+    let (fraction, changed) = download_progress_update(
+        state.prev_progress,
+        state.prev_received,
+        state.prev_total,
+        state.prev_speed,
+        received,
+        total,
+        speed,
+    );
+    if changed
+    {
+        state.prev_progress = fraction;
+        state.prev_received = received;
+        state.prev_total = total;
+        state.prev_speed = speed;
+    }
+    (speed, fraction, changed)
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DownloadError
+{
+    /// A custom HTTP transport refused an HTTPS endpoint.
+    Tls,
+    /// URL composition, protocol violations, redirect bookkeeping.
+    Transport(HttpError),
+    /// Network read/write I/O (connect refused, resets, timeouts).
+    Network(io::Error),
+    /// Server answered with a non-2xx status.
+    Status
+    {
+        status: u16,
+        reason: String,
+    },
+    /// The body ended before the declared length was reached.
+    IncompleteBody
+    {
+        received: u64,
+        expected: u64,
+    },
+    /// Local I/O failure (staging, callback, rename, directory creation).
+    Io(io::Error),
+}
+
+impl From<HttpError> for DownloadError
+{
+    fn from(err: HttpError) -> Self
+    {
+        match err
+        {
+            HttpError::TlsUnsupported => Self::Tls,
+            HttpError::Io(io_err) => Self::Network(io_err),
+            other => Self::Transport(other),
+        }
+    }
+}
+
+impl std::fmt::Display for DownloadError
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        match self
+        {
+            Self::Tls => write!(
+                f,
+                "download endpoint requires TLS, but the transport does not provide it"
+            ),
+            Self::Transport(http_err) => write!(f, "{http_err}"),
+            Self::Network(err) => write!(f, "download stalled: {err}"),
+            Self::Status { status, reason } => {
+                write!(f, "download failed with status {status} {reason}")
+            }
+            Self::IncompleteBody { received, expected } => {
+                write!(f, "download was cut short at {received}/{expected} bytes")
+            }
+            Self::Io(err) => write!(f, "filesystem error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DownloadError
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)>
+    {
+        match self
+        {
+            Self::Network(err) | Self::Io(err) => Some(err),
+            Self::Transport(http_err) => Some(http_err),
+            _ => None,
+        }
+    }
+}
+
+pub type DownloadResult<T> = Result<T, DownloadError>;
+
+/// Summary of a finished download.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadOutcome
+{
+    pub target: PathBuf,
+    pub bytes: u64,
+}
+
+pub struct Downloader
+{
+    http: HttpClient,
+}
+
+impl Default for Downloader
+{
+    fn default() -> Self
+    {
+        let config = HttpClientConfig {
+            timeout: Some(DEFAULT_DOWNLOAD_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            ..HttpClientConfig::default()
+        };
+        Self::new(HttpClient::with_phase_timeouts(
+            config,
+            Some(DEFAULT_RESPONSE_TIMEOUT),
+            Some(DEFAULT_DOWNLOAD_TIMEOUT),
+        ))
+    }
+}
+
+impl Downloader
+{
+    pub fn new(http: HttpClient) -> Self
+    {
+        Self { http }
+    }
+
+    /// Downloads `url` onto `target`, byte-stream based. Every decoded
+    /// chunk is handed to `on_chunk` as a [`DownloadEvent`] (data +
+    /// progress); returning an `Err` aborts the download and removes the
+    /// staging file, matching the C++ failure cleanup.
+    pub fn download(
+        &self,
+        url: &str,
+        target: &Path,
+        mut on_chunk: impl FnMut(&DownloadEvent<'_>) -> io::Result<()>,
+    ) -> DownloadResult<DownloadOutcome>
+    {
+        let parsed = Url::parse(url)?;
+        if target.as_os_str().is_empty()
+        {
+            return Err(DownloadError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target path is empty",
+            )));
+        }
+
+        if target.exists()
+        {
+            let bytes = fs::metadata(target).map_err(DownloadError::Io)?.len();
+            return Ok(DownloadOutcome {
+                target: target.to_owned(),
+                bytes,
+            });
+        }
+
+        if let Some(parent) = target.parent()
+        {
+            if !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).map_err(DownloadError::Io)?;
+            }
+        }
+
+        let request = Request::get(parsed);
+        let mut response = self.http.send(&request)?;
+        if !(200..300).contains(&response.status())
+        {
+            return Err(DownloadError::Status {
+                status: response.status(),
+                reason: response.reason().to_owned(),
+            });
+        }
+
+        let (staging, mut staging_file) = create_unique_staging_file(target).map_err(DownloadError::Io)?;
+        let mut cleanup = StagingCleanup { path: Some(staging.clone()) };
+
+        let total = response.content_length().unwrap_or(0);
+        let started = Instant::now();
+        let mut state = ProgressState::default();
+        let mut received = 0u64;
+        let mut sink_error = None;
+        let stream_result = response.stream_chunks(&mut |chunk| {
+            received += chunk.len() as u64;
+            on_chunk(&DownloadEvent {
+                data: chunk,
+                progress: progress_for(&mut state, &started, received, total),
+            })
+            .or_else(|error| {
+                sink_error = Some(error);
+                Err(io::Error::other("download callback failed"))
+            })?;
+            staging_file.write_all(chunk).or_else(|error| {
+                sink_error = Some(error);
+                Err(io::Error::other("staging write failed"))
+            })?;
+            Ok(())
+        });
+        if let Some(error) = sink_error
+        {
+            return Err(DownloadError::Io(error));
+        }
+        if let Err(err) = stream_result
+        {
+            if err.kind() == io::ErrorKind::UnexpectedEof
+            {
+                if let Some(expected) = response.content_length()
+                {
+                    if received < expected
+                    {
+                        return Err(DownloadError::IncompleteBody {
+                            received,
+                            expected,
+                        });
+                    }
+                }
+            }
+            return Err(DownloadError::Network(err));
+        }
+
+        if let Some(expected) = response.content_length()
+        {
+            if received != expected
+            {
+                return Err(DownloadError::IncompleteBody {
+                    received,
+                    expected,
+                });
+            }
+        }
+
+        staging_file.flush().map_err(DownloadError::Io)?;
+        staging_file.sync_all().map_err(DownloadError::Io)?;
+        drop(staging_file);
+        fs::rename(&staging, target).map_err(DownloadError::Io)?;
+        cleanup.path = None;
+        let _ = fs::remove_file(staging_path(target));
+
+        Ok(DownloadOutcome {
+            target: target.to_owned(),
+            bytes: received,
+        })
+    }
+}
+
+struct StagingCleanup
+{
+    path: Option<PathBuf>,
+}
+
+impl Drop for StagingCleanup
+{
+    fn drop(&mut self)
+    {
+        if let Some(path) = self.path.take()
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn create_unique_staging_file(target: &Path) -> io::Result<(PathBuf, fs::File)>
+{
+    let pid = std::process::id();
+    for _ in 0..128
+    {
+        let seq = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+        let mut name = target.as_os_str().to_owned();
+        name.push(format!(".part.{pid}.{seq}"));
+        let candidate = PathBuf::from(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate unique download staging file",
+    ))
+}
+
+fn progress_for(
+    state: &mut ProgressState,
+    started: &Instant,
+    received: u64,
+    total: u64,
+) -> DownloadProgress
+{
+    let (speed, fraction, _) = recompute_progress(
+        state,
+        received as i64,
+        total as i64,
+        started.elapsed().as_millis() as i64,
+    );
+    DownloadProgress {
+        received: received as i64,
+        total: total as i64,
+        speed_bps: speed,
+        fraction,
+    }
+}
+
+/// `path + ".download"`, matching `downloadmanager.cpp` exactly.
+pub fn staging_path(target: &Path) -> PathBuf
+{
+    let mut name = target.as_os_str().to_owned();
+    name.push(".download");
+    PathBuf::from(name)
+}
+
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn staging_name_matches_downloadmanager()
+    {
+        assert_eq!(
+            staging_path(Path::new("/tmp/model.zip")),
+            PathBuf::from("/tmp/model.zip.download")
+        );
+    }
+
+    #[test]
+    fn progress_bounce_uses_ported_speed_math()
+    {
+        // elapsed 0 is clamped to 1ms by the ported helper
+        let mut state = ProgressState::default();
+        let (speed, fraction, changed) =
+            recompute_progress(&mut state, 1000, 1000, 1);
+        assert_eq!(speed, 1_000_000);
+        assert!((fraction - 1.0).abs() < f64::EPSILON);
+        assert!(changed);
+
+        // identical values (including elapsed time) are suppressed
+        // (setDownloadProgress's qFuzzyCompare gate)
+        let again = recompute_progress(&mut state, 1000, 1000, 1);
+        assert!(!again.2);
+
+        // a different speed (bytes moved, time passed) is reported
+        let moved = recompute_progress(&mut state, 2000, 2000, 4);
+        assert!(moved.2);
+        assert_eq!(moved.0, 500_000);
+    }
+
+    #[test]
+    fn empty_target_path_is_rejected_without_creating_a_staging_file()
+    {
+        let result = Downloader::default().download(
+            "http://127.0.0.1:8765/model.bin",
+            Path::new(""),
+            |_| Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(DownloadError::Io(error))
+                if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn non_2xx_300_or_304_status_is_rejected_without_creating_target()
+    {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        for status_line in [
+            "HTTP/1.1 300 Multiple Choices",
+            "HTTP/1.1 304 Not Modified",
+            "HTTP/1.1 500 Internal Server Error",
+        ]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let line = status_line.to_owned();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let resp = format!("{line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+            });
+
+            let dir = std::env::temp_dir().join(format!(
+                "subomi-dl-status-test-{}-{}",
+                std::process::id(),
+                NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("file.bin");
+            let url = format!("http://{}:{}/file.bin", addr.ip(), addr.port());
+            let err = Downloader::default()
+                .download(&url, &target, |_| Ok(()))
+                .unwrap_err();
+            assert!(
+                matches!(err, DownloadError::Status { status, .. } if !(200..300).contains(&status)),
+                "expected Status error for {status_line}, got {err:?}"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let _ = fs::remove_dir_all(&dir);
+            let _ = handle.join();
+        }
+    }
+
+    #[test]
+    fn default_downloader_sets_bounded_sensible_timeouts()
+    {
+        let dl = Downloader::default();
+        assert_eq!(dl.http.config().connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
+        assert_eq!(dl.http.config().timeout, Some(DEFAULT_DOWNLOAD_TIMEOUT));
+    }
+
+    #[test]
+    fn truncated_content_length_response_returns_incomplete_body()
+    {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        for (body_sent, expected_received) in [(&b""[..], 0u64), (&b"abcd"[..], 4u64)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let payload = body_sent.to_vec();
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+                resp.extend_from_slice(&payload);
+                let _ = stream.write_all(&resp);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            });
+
+            let dir = std::env::temp_dir().join(format!(
+                "subomi-dl-trunc-test-{}-{}",
+                std::process::id(),
+                NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("trunc.bin");
+            let url = format!("http://{}:{}/trunc.bin", addr.ip(), addr.port());
+            let err = Downloader::default()
+                .download(&url, &target, |_| Ok(()))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    DownloadError::IncompleteBody {
+                        received,
+                        expected: 10
+                    } if received == expected_received
+                ),
+                "expected IncompleteBody({expected_received}/10), got {err:?}"
+            );
+            assert!(!target.exists());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            let _ = fs::remove_dir_all(&dir);
+            let _ = handle.join();
+        }
+    }
+}

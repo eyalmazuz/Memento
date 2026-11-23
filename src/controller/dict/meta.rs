@@ -3,8 +3,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use memento_dict::databasemanager::{self, PitchPosition};
-use memento_dict::sqlite_db::{self, FrequencyMode};
+use subomi_dict::databasemanager::{self, PitchPosition};
+use subomi_dict::sqlite_db::{self, FrequencyMode};
 
 use super::db::DictionaryMetadataSnapshot;
 use super::{AnkiTermMetadata, TermFrequency, TermPitchDetail};
@@ -543,25 +543,14 @@ fn compute_harmonic_and_average(numbers: &[f64]) -> (Option<i64>, Option<i64>) {
 pub(super) fn compute_anki_frequency_summary(
     freq_items: &[SelectedFreqItem],
 ) -> AnkiFrequencySummary {
-    let owned_u16: Vec<(Vec<u16>, Vec<u16>)> = freq_items
+    let entries: Vec<_> = freq_items
         .iter()
-        .map(|item| {
-            (
-                item.dictionary.encode_utf16().collect(),
-                item.parsed.display.encode_utf16().collect(),
-            )
+        .map(|item| subomi_anki::note::FrequencyEntry {
+            dictionary: &item.dictionary,
+            freq: &item.parsed.display,
         })
         .collect();
-    let entries: Vec<_> = owned_u16
-        .iter()
-        .map(|(dict, freq)| memento_anki::note::FrequencyEntry {
-            dictionary: dict,
-            freq,
-        })
-        .collect();
-    let html = String::from_utf16_lossy(&memento_anki::note::build_frequencies_html(
-        &entries, false, false,
-    ));
+    let html = subomi_anki::note::build_frequencies_html(&entries, false, false);
 
     // Select first positive numeric value per dictionary (in caller priority order),
     // keeping `rank-based` and `occurrence-based` dictionaries strictly separate so they
@@ -653,8 +642,8 @@ pub(super) fn build_anki_term_metadata_from_parts(
 
     // Group pitches by `(dictionary, mora)` across ALL rows (not just adjacent) and
     // deduplicate identical pitch positions/patterns within each dictionary (Yomitan #2194).
-    let mut grouped_pitches: Vec<(Vec<u16>, Vec<OwnedPitchSpec>, Vec<Vec<u16>>)> = Vec::new();
-    let mut group_indices: HashMap<(Vec<u16>, Vec<Vec<u16>>), usize> = HashMap::new();
+    let mut grouped_pitches: Vec<(&str, Vec<OwnedPitchSpec>, &[String])> = Vec::new();
+    let mut group_indices: HashMap<(&str, &[String]), usize> = HashMap::new();
     let mut seen_specs_per_group: Vec<HashSet<OwnedPitchSpec>> = Vec::new();
 
     for detail in pitch_details {
@@ -673,13 +662,7 @@ pub(super) fn build_anki_term_metadata_from_parts(
             OwnedPitchSpec::Downstep(pos_u8)
         };
 
-        let dict_u16: Vec<u16> = detail.dictionary.encode_utf16().collect();
-        let mora_u16: Vec<Vec<u16>> = detail
-            .mora
-            .iter()
-            .map(|m| m.encode_utf16().collect())
-            .collect();
-        let group_key = (dict_u16, mora_u16);
+        let group_key = (detail.dictionary.as_str(), detail.mora.as_slice());
         if let Some(&group_idx) = group_indices.get(&group_key) {
             if seen_specs_per_group[group_idx].insert(spec.clone()) {
                 grouped_pitches[group_idx].1.push(spec);
@@ -689,24 +672,24 @@ pub(super) fn build_anki_term_metadata_from_parts(
             let mut seen = HashSet::new();
             seen.insert(spec.clone());
             seen_specs_per_group.push(seen);
-            group_indices.insert(group_key.clone(), group_idx);
+            group_indices.insert(group_key, group_idx);
             grouped_pitches.push((group_key.0, vec![spec], group_key.1));
         }
     }
 
-    let mora_refs: Vec<Vec<&[u16]>> = grouped_pitches
+    let mora_refs: Vec<Vec<&str>> = grouped_pitches
         .iter()
-        .map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect())
+        .map(|(_, _, mora)| mora.iter().map(String::as_str).collect())
         .collect();
-    let spec_refs: Vec<Vec<memento_anki::note::PitchSpec<'_>>> = grouped_pitches
+    let spec_refs: Vec<Vec<subomi_anki::note::PitchSpec<'_>>> = grouped_pitches
         .iter()
         .map(|(_, specs, _)| {
             specs
                 .iter()
                 .map(|s| match s {
-                    OwnedPitchSpec::Downstep(pos) => memento_anki::note::PitchSpec::Downstep(*pos),
+                    OwnedPitchSpec::Downstep(pos) => subomi_anki::note::PitchSpec::Downstep(*pos),
                     OwnedPitchSpec::Pattern(pat) => {
-                        memento_anki::note::PitchSpec::Pattern(pat.as_str())
+                        subomi_anki::note::PitchSpec::Pattern(pat.as_str())
                     }
                 })
                 .collect()
@@ -715,19 +698,15 @@ pub(super) fn build_anki_term_metadata_from_parts(
     let pitches: Vec<_> = grouped_pitches
         .iter()
         .enumerate()
-        .map(|(index, (name, _, _))| memento_anki::note::PitchEntryEx {
+        .map(|(index, (name, _, _))| subomi_anki::note::PitchEntryEx {
             dictionary_name: name,
             specs: &spec_refs[index],
             mora: &mora_refs[index],
         })
         .collect();
 
-    let rule_units: Vec<Vec<u16>> = rule_strings
-        .iter()
-        .map(|rule| rule.encode_utf16().collect())
-        .collect();
-    let rules: Vec<&[u16]> = rule_units.iter().map(Vec::as_slice).collect();
-    let can_be_kifuku = memento_anki::note::is_kifuku_applicable(&rules);
+    let rules: Vec<&str> = rule_strings.iter().map(String::as_str).collect();
+    let can_be_kifuku = subomi_anki::note::is_kifuku_applicable(&rules);
 
     let (
         frequency_harmonic_rank,
@@ -737,13 +716,9 @@ pub(super) fn build_anki_term_metadata_from_parts(
     ) = format_rank_and_occurrence(&freq_summary);
 
     AnkiTermMetadata {
-        pitch: String::from_utf16_lossy(&memento_anki::note::format_pitch_ex(&pitches)),
-        pitch_positions: String::from_utf16_lossy(&memento_anki::note::format_pitch_positions_ex(
-            &pitches,
-        )),
-        pitch_categories: String::from_utf16_lossy(
-            &memento_anki::note::format_pitch_categories_ex(&pitches, can_be_kifuku),
-        ),
+        pitch: subomi_anki::note::format_pitch_ex(&pitches),
+        pitch_positions: subomi_anki::note::format_pitch_positions_ex(&pitches),
+        pitch_categories: subomi_anki::note::format_pitch_categories_ex(&pitches, can_be_kifuku),
         frequencies: freq_summary.html,
         frequency_harmonic_rank,
         frequency_average_rank,

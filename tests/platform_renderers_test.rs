@@ -1,45 +1,25 @@
-////////////////////////////////////////////////////////////////////////////////
-//
-// Copyright (c) 2026 Ripose
-//
-// This file is part of Memento.
-//
-// Memento is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 2 of the License.
-//
-// Memento is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with Memento.  If not, see <https://www.gnu.org/licenses/>.
-//
-////////////////////////////////////////////////////////////////////////////////
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use memento_app::graphics_device::{
+use subomi_app::graphics_device::{
     configured_option_from_args, decoder_requests_direct_nvidia, detect_linux_display_server_with,
     is_nvidia_gl_renderer, is_software_gl_renderer, is_vaapi_capable_renderer,
     parse_mpv_conf_renderer_hints, plan_linux_graphics_device, LinuxDisplayServer,
     LinuxGlContextApi,
 };
-use memento_app::platform_renderer::{
+use subomi_app::platform_renderer::{
     DisplayServer, PlatformRendererConfig, PlatformRendererKind, RendererOverrides, TargetOs,
     VideoColorFormat, VideoRendererCapabilities,
 };
-use memento_app::platform_window::{
+use subomi_app::platform_window::{
     compute_auto_fit_window_rect, select_fullscreen_strategy, FullscreenAction, FullscreenStrategy,
     PlatformFullscreenController,
 };
-use memento_app::video_gl::{
+use subomi_app::video_gl::{
     clamp_fbo_dimensions, plan_video_fbo_formats, should_reallocate_fbo, validate_fbo_dimensions,
     VideoFboFormat,
 };
-use memento_app::video_metal::{
+use subomi_app::video_metal::{
     clamp_metal_drawable_size, plan_metal_mpv_options, resolve_macos_metal_hwdec,
     sanitize_contents_scale, select_metal_pixel_format, IoSurfaceDescriptor, MetalFrameSlot,
     MetalLayerGeometry, MetalPixelFormat, MetalPresentationMode, MetalSurfaceRing,
@@ -47,13 +27,13 @@ use memento_app::video_metal::{
     METAL_FRAME_SLOT_COUNT, MTL_MAX_TEXTURE_DIMENSION_2D, MTL_PIXEL_FORMAT_BGRA8_UNORM,
     MTL_PIXEL_FORMAT_RGBA16_FLOAT,
 };
-use memento_os::{
+use subomi_os::{
     compute_windows_borderless_fullscreen_rect, restore_win32_normal_window_style,
     strip_win32_window_frame_styles, MonitorRect, WindowRect, WIN32_BORDERLESS_STRIP_EX_STYLE_MASK,
     WIN32_BORDERLESS_STRIP_STYLE_MASK, WIN32_WS_MAXIMIZE,
     WINDOWS_OPENGL_FULLSCREEN_EXTRA_HEIGHT_PX,
 };
-use memento_player::mpv::{
+use subomi_player::mpv::{
     compatible_opengl_hwdec, compatible_opengl_hwdec_for_session, compatible_software_hwdec,
     GlDisplayBackend, MpvInstance,
 };
@@ -234,7 +214,7 @@ fn renderer_overrides_respect_env_cli_and_mpv_conf_precedence() {
     );
     let overrides = RendererOverrides::from_hints_args_and_env(
         hints,
-        ["memento", "--hwdec=nvdec-copy", "--{", "--hwdec=no", "--}", "video.mkv"],
+        ["subomi", "--hwdec=nvdec-copy", "--{", "--hwdec=no", "--}", "video.mkv"],
         env_from(&[("SLINT_BACKEND", "winit-software")]),
     );
     assert_eq!(
@@ -722,7 +702,7 @@ fn linux_display_server_and_graphics_device_planning_cover_wayland_x11_nvidia_an
 
     assert_eq!(
         configured_option_from_args(
-            ["memento", "--gpu-api=opengl", "--{", "--gpu-api=vulkan", "--}", "a.mkv"],
+            ["subomi", "--gpu-api=opengl", "--{", "--gpu-api=vulkan", "--}", "a.mkv"],
             "gpu-api"
         )
         .as_deref(),
@@ -831,7 +811,7 @@ fn mpv_hwdec_compatibility_and_render_context_lifecycle_guard_against_cuda_hazar
 #[test]
 fn live_egl_opengl_state_guard_fbo_resize_and_mpv_render_context_teardown() {
     use glow::HasContext;
-    use memento_app::video_gl::{
+    use subomi_app::video_gl::{
         create_video_fbo_texture, create_video_fbo_texture_with_preference, with_saved_state,
     };
     use std::ffi::{c_char, c_int, c_void, CStr};

@@ -12,7 +12,7 @@ use slint::{ComponentHandle, Model as _, VecModel};
 
 use crate::app::clipboard::{copy_text_to_clipboard, read_copied_text_or_clipboard};
 use crate::app::keybinds::AudioContextMarkState;
-use crate::app::paths::{memento_xdg_dir, resolve_config_file_open_dir};
+use crate::app::paths::{subomi_xdg_dir, resolve_config_file_open_dir};
 use crate::app::preferences::{
     clear_recent_titles, record_recent_media, refresh_recent_files, setting_enabled,
 };
@@ -28,9 +28,9 @@ use crate::controller::player::{
     clear_primary_subtitle, effective_media_title, is_subtitle_file, LivePlayerCoordinator,
 };
 use crate::controller::subtitles::SubtitleController;
-use crate::ui::{self, MementoApp, SubEntry};
-use memento_player::{MpvInstance, PlaylistLoad};
-use memento_setting::keys as raw;
+use crate::ui::{self, SubomiApp, SubEntry};
+use subomi_player::{MpvInstance, PlaylistLoad};
+use subomi_setting::keys as raw;
 
 pub(crate) const ASR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -64,7 +64,7 @@ pub(crate) fn is_dictionary_archive_path(path: &Path) -> bool {
 
 /// Persist `main-window/subtitle-list` and `main-window/search` open state across launches (M3).
 pub(crate) fn persist_window_panel_state(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: &ConfigController,
     config_dir: &Path,
 ) {
@@ -78,7 +78,7 @@ pub(crate) fn persist_window_panel_state(
             "false"
         },
         config_dir,
-        "memento.conf",
+        "subomi.conf",
     );
     let _ = config_ctrl.persist_single_setting(
         &search_key,
@@ -88,12 +88,12 @@ pub(crate) fn persist_window_panel_state(
             "false"
         },
         config_dir,
-        "memento.conf",
+        "subomi.conf",
     );
 }
 
 /// Restore `main-window/subtitle-list` and `main-window/search` open state on startup (M3).
-pub(crate) fn restore_window_panel_state(app: &MementoApp, config_ctrl: &ConfigController) {
+pub(crate) fn restore_window_panel_state(app: &SubomiApp, config_ctrl: &ConfigController) {
     let sub_list_open = setting_enabled(
         config_ctrl,
         raw::window::GROUP,
@@ -117,7 +117,7 @@ fn should_resume_on_subtitle_unhover(config_ctrl: &ConfigController) -> bool {
 /// Unconditionally load picked subtitle paths via `mpv` `sub-add`, NEVER falling
 /// back to `loadfile` regardless of filename extension (C5.3).
 fn add_subtitle_paths_unconditionally(
-    app: &MementoApp,
+    app: &SubomiApp,
     player: Option<&MpvInstance>,
     sub_ctrl: &RefCell<SubtitleController>,
     sub_model: &Rc<VecModel<SubEntry>>,
@@ -155,7 +155,7 @@ fn add_subtitle_paths_unconditionally(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_playlist_into(
-    app: &MementoApp,
+    app: &SubomiApp,
     player: &MpvInstance,
     loads: &[PlaylistLoad],
     media_generation: &Cell<u64>,
@@ -230,7 +230,7 @@ pub(crate) fn load_playlist_into(
 }
 
 pub(crate) fn load_media_into(
-    app: &MementoApp,
+    app: &SubomiApp,
     player: &MpvInstance,
     path: &str,
     media_generation: &Cell<u64>,
@@ -263,7 +263,7 @@ pub(crate) struct PlaybackHandles {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_playback_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
     sub_ctrl: Rc<RefCell<SubtitleController>>,
@@ -277,7 +277,7 @@ pub(crate) fn install_playback_handlers(
     asr_session: Rc<RefCell<AsrController>>,
     asr_restart_pending: Rc<Cell<bool>>,
     ass_ctrl: Rc<RefCell<AssOverlayController>>,
-    screensaver: Rc<RefCell<memento_os::Screensaver>>,
+    screensaver: Rc<RefCell<subomi_os::Screensaver>>,
     closing: Rc<Cell<bool>>,
     thumb_tx: ChannelSlot<ThumbRequest>,
     ui_relay: UiRelay,
@@ -632,8 +632,8 @@ pub(crate) fn install_playback_handlers(
     app.on_open_file(move || {
         let start_dir = resolve_config_file_open_dir(&open_file_config);
         let relay = open_file_relay.clone();
-        memento_os::open_files_on_main_thread(
-            memento_os::FileDialogOptions::media_and_subtitles(start_dir),
+        subomi_os::open_files_on_main_thread(
+            subomi_os::FileDialogOptions::media_and_subtitles(start_dir),
             |task| {
                 let _ = slint::invoke_from_event_loop(task);
             },
@@ -647,7 +647,7 @@ pub(crate) fn install_playback_handlers(
 
     let drop_single = handle_open_or_drop_paths.clone();
     app.on_file_dropped(move |uri_or_path| {
-        let paths = memento_os::parse_uri_list(uri_or_path.as_str());
+        let paths = subomi_os::parse_uri_list(uri_or_path.as_str());
         if !paths.is_empty() {
             drop_single(paths);
         }
@@ -658,7 +658,7 @@ pub(crate) fn install_playback_handlers(
         let mut paths = Vec::new();
         for i in 0..uris.row_count() {
             if let Some(entry) = uris.row_data(i) {
-                for parsed in memento_os::parse_uri_list(entry.as_str()) {
+                for parsed in subomi_os::parse_uri_list(entry.as_str()) {
                     if !paths.contains(&parsed) {
                         paths.push(parsed);
                     }
@@ -718,7 +718,7 @@ pub(crate) fn install_playback_handlers(
         clear_recent_titles();
         let result = clear_config
             .clear_recent_files()
-            .and_then(|_| clear_config.save(&clear_cache, "memento.conf"));
+            .and_then(|_| clear_config.save(&clear_cache, "subomi.conf"));
         if let Some(app) = clear_app.upgrade() {
             match result {
                 Ok(()) => refresh_recent_files(&app, &clear_config),
@@ -951,7 +951,7 @@ pub(crate) fn install_playback_handlers(
             &select_asr_sub_model,
             &select_asr_restart,
             || {
-                let cfg_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+                let cfg_dir = subomi_xdg_dir("XDG_CONFIG_HOME", ".config")
                     .unwrap_or_else(|| PathBuf::from("."));
                 AsrSettings::from_config(&cfg_dir, &*select_asr_config.store())
             },
@@ -1230,7 +1230,7 @@ pub(crate) fn install_playback_handlers(
             let _ = player.command_async(&["set", "pause", "yes"]);
         }
         if let Err(error) = slint::quit_event_loop() {
-            eprintln!("Could not close Memento: {error}");
+            eprintln!("Could not close Subomi: {error}");
         }
     });
 
@@ -1259,8 +1259,8 @@ pub(crate) fn install_playback_handlers(
     app.on_add_subtitle(move || {
         let start_dir = resolve_config_file_open_dir(&add_sub_config);
         let relay = add_sub_relay.clone();
-        memento_os::open_files_on_main_thread(
-            memento_os::FileDialogOptions::subtitles_only(start_dir),
+        subomi_os::open_files_on_main_thread(
+            subomi_os::FileDialogOptions::subtitles_only(start_dir),
             |task| {
                 let _ = slint::invoke_from_event_loop(task);
             },
@@ -1311,7 +1311,7 @@ pub(crate) fn install_playback_handlers(
     {
         use crate::controller::ocr::{OcrFrame, OcrRegion, OcrSettings, OcrViewport};
         use crate::ui::PopupBridge;
-        use memento_config::Value;
+        use subomi_config::Value;
 
         let ocr_region_app = app.as_weak();
         let ocr_region_mpv = mpv;
@@ -1499,7 +1499,7 @@ mod tests {
     #[test]
     fn add_subtitle_unconditional_never_replaces_media_even_for_unlisted_extension() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let custom_sub = dir.path().join("notes.customext");
         std::fs::write(&custom_sub, "1\n00:00:01,000 --> 00:00:03,000\nHello\n").unwrap();
@@ -1517,12 +1517,12 @@ mod tests {
         i_slint_backend_testing::init_no_event_loop();
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = ConfigController::new();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_sub_drawer_open(true);
         app.set_dict_search_open(true);
         persist_window_panel_state(&app, &cfg, dir.path());
 
-        let app2 = MementoApp::new().unwrap();
+        let app2 = SubomiApp::new().unwrap();
         assert!(!app2.get_sub_drawer_open());
         assert!(!app2.get_dict_search_open());
         restore_window_panel_state(&app2, &cfg);
@@ -1538,7 +1538,7 @@ mod tests {
     #[test]
     fn copy_subtitle_text_clear_audio_context_and_ocr_cancel_handlers_work() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = Rc::new(ConfigController::new());
         let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
@@ -1552,7 +1552,7 @@ mod tests {
         let asr = Rc::new(RefCell::new(AsrController::new()));
         let asr_restart = Rc::new(Cell::new(false));
         let ass = Rc::new(RefCell::new(AssOverlayController::new()));
-        let screensaver = Rc::new(RefCell::new(memento_os::Screensaver::new()));
+        let screensaver = Rc::new(RefCell::new(subomi_os::Screensaver::new()));
         let closing = Rc::new(Cell::new(false));
         let (tx, _rx) = std::sync::mpsc::channel();
         let thumb_tx = ChannelSlot::new(tx);

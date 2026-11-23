@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, Model as _, VecModel};
 
-use crate::app::paths::memento_xdg_dir;
+use crate::app::paths::subomi_xdg_dir;
 use crate::app::playback::persist_window_panel_state;
 use crate::app::preferences::{
     cached_furigana_ratio, record_recent_media, record_recent_media_title,
@@ -38,11 +38,11 @@ use crate::platform_renderer::DisplayServer;
 use crate::platform_window::compute_auto_fit_window_rect;
 use crate::ui::{
     active_subtitle_style_for_app, prewarm_subtitle_tokens, publish_active_subtitle,
-    subtitle_lines_for_app, MementoApp, PlayerTrack, SubEntry, SubtitleOverlayBridge,
+    subtitle_lines_for_app, SubomiApp, PlayerTrack, SubEntry, SubtitleOverlayBridge,
 };
-use memento_player::{MpvInstance, VideoTrack};
+use subomi_player::{MpvInstance, VideoTrack};
 
-fn update_subtitle_bounds_properties(app: &MementoApp, player: &MpvInstance) {
+fn update_subtitle_bounds_properties(app: &SubomiApp, player: &MpvInstance) {
     let ass_native = app
         .global::<SubtitleOverlayBridge>()
         .get_ass_native_active();
@@ -89,7 +89,7 @@ pub(crate) struct SyncLoopHandles {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_sync_loop(
-    app: &MementoApp,
+    app: &SubomiApp,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     coordinator: Rc<RefCell<Option<LivePlayerCoordinator>>>,
     sub_ctrl: Rc<RefCell<SubtitleController>>,
@@ -112,7 +112,7 @@ pub(crate) fn install_sync_loop(
     ext_sub_tx: ChannelSlot<(u64, ExternalSubtitleLoad)>,
     mkv_tx: ChannelSlot<MkvExtractRequest>,
     ass_ctrl: Rc<RefCell<AssOverlayController>>,
-    screensaver: Rc<RefCell<memento_os::Screensaver>>,
+    screensaver: Rc<RefCell<subomi_os::Screensaver>>,
     ui_relay: UiRelay,
     handle_open_or_drop_paths: Rc<dyn Fn(Vec<PathBuf>)>,
     handle_add_subtitle_paths: Rc<dyn Fn(Vec<PathBuf>)>,
@@ -221,7 +221,7 @@ pub(crate) fn install_sync_loop(
                 &sync_asr_restart,
                 &sync_hover_owned,
                 || {
-                    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+                    let config_dir = subomi_xdg_dir("XDG_CONFIG_HOME", ".config")
                         .unwrap_or_else(|| PathBuf::from("."));
                     AsrSettings::from_config(&config_dir, &*sync_asr_config.store())
                 },
@@ -505,7 +505,7 @@ pub(crate) fn install_sync_loop(
             }
             let subtitle_overlay_shown = app.get_subtitles_visible()
                 && !primary_is_native_ass
-                && !(app.get_hide_memento_while_playing() && !state.paused);
+                && !(app.get_hide_subomi_while_playing() && !state.paused);
             if subtitle_overlay_shown && app.get_video_height() > 0 {
                 if let Some(active_idx) = prim_active {
                     let prewarm_key = (
@@ -738,7 +738,7 @@ pub(crate) fn install_sync_loop(
                                     let lines: Vec<String> = cues
                                         .iter()
                                         .take(2048)
-                                        .map(|cue| String::from_utf16_lossy(&cue.text))
+                                        .map(|cue| cue.text.clone())
                                         .collect();
                                     prewarm_subtitle_furigana(lines);
                                 }
@@ -813,7 +813,7 @@ pub(crate) fn install_sync_loop(
                         {
                             false
                         } else {
-                            let entries: Vec<memento_subtitle::SubtitleEntry> = cues
+                            let entries: Vec<subomi_subtitle::SubtitleEntry> = cues
                                 .into_iter()
                                 .filter_map(|cue| {
                                     if cue.plain_text.trim().is_empty()
@@ -832,7 +832,7 @@ pub(crate) fn install_sync_loop(
                                 let lines: Vec<String> = entries
                                     .iter()
                                     .take(2048)
-                                    .map(|e| String::from_utf16_lossy(&e.text))
+                                    .map(|e| e.text.clone())
                                     .collect();
                                 prewarm_subtitle_furigana(lines);
                             }
@@ -905,7 +905,7 @@ pub(crate) fn install_sync_loop(
     let mut last_ui_flags = (
         app.get_subtitles_visible(),
         app.get_hide_mpv_subtitles(),
-        app.get_hide_memento_while_playing(),
+        app.get_hide_subomi_while_playing(),
         app.get_auto_pause(),
         app.get_furigana_visible(),
         app.get_video_width(),
@@ -946,7 +946,7 @@ pub(crate) fn install_sync_loop(
             let ui_flags = (
                 app.get_subtitles_visible(),
                 app.get_hide_mpv_subtitles(),
-                app.get_hide_memento_while_playing(),
+                app.get_hide_subomi_while_playing(),
                 app.get_auto_pause(),
                 app.get_furigana_visible(),
                 app.get_video_width(),

@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import {
     CompactFrequencyItem,
     DictResult,
@@ -73,13 +73,13 @@ export component PopupActionButton inherits Rectangle {
     in property <string> label: "";
     in property <length> label-font-size: 14px;
     in property <int> label-font-weight: 700;
-    in property <color> bg-normal: MementoPalette.button-bg;
-    in property <color> bg-hover: MementoPalette.button-hover;
-    in property <color> bg-pressed: MementoPalette.button-pressed;
-    in property <color> border-normal: MementoPalette.border;
-    in property <color> border-hover: MementoPalette.border-light;
-    in property <color> fg-color: MementoPalette.icon;
-    in property <color> fg-hover-color: MementoPalette.text;
+    in property <color> bg-normal: SubomiPalette.button-bg;
+    in property <color> bg-hover: SubomiPalette.button-hover;
+    in property <color> bg-pressed: SubomiPalette.button-pressed;
+    in property <color> border-normal: SubomiPalette.border;
+    in property <color> border-hover: SubomiPalette.border-light;
+    in property <color> fg-color: SubomiPalette.icon;
+    in property <color> fg-hover-color: SubomiPalette.text;
     in property <bool> enabled: true;
     in property <string> tooltip: "";
     in property <bool> tooltip-delayed: true;
@@ -258,13 +258,13 @@ export component TermLeadingActions inherits HorizontalLayout {
         label: root.reading-as-expression ? "か" : "漢";
         label-font-size: 13px;
         label-font-weight: 700;
-        bg-normal: root.reading-as-expression ? MementoPalette.teal-accent : MementoPalette.button-bg;
-        bg-hover: root.reading-as-expression ? MementoPalette.teal-hover : MementoPalette.button-hover;
-        bg-pressed: root.reading-as-expression ? MementoPalette.teal-pressed : MementoPalette.button-pressed;
-        border-normal: root.reading-as-expression ? MementoPalette.teal-border : MementoPalette.border;
-        border-hover: root.reading-as-expression ? MementoPalette.teal-border : MementoPalette.border-light;
-        fg-color: root.reading-as-expression ? #FFFFFF : MementoPalette.icon;
-        fg-hover-color: root.reading-as-expression ? #FFFFFF : MementoPalette.text;
+        bg-normal: root.reading-as-expression ? SubomiPalette.teal-accent : SubomiPalette.button-bg;
+        bg-hover: root.reading-as-expression ? SubomiPalette.teal-hover : SubomiPalette.button-hover;
+        bg-pressed: root.reading-as-expression ? SubomiPalette.teal-pressed : SubomiPalette.button-pressed;
+        border-normal: root.reading-as-expression ? SubomiPalette.teal-border : SubomiPalette.border;
+        border-hover: root.reading-as-expression ? SubomiPalette.teal-border : SubomiPalette.border-light;
+        fg-color: root.reading-as-expression ? #FFFFFF : SubomiPalette.icon;
+        fg-hover-color: root.reading-as-expression ? #FFFFFF : SubomiPalette.text;
         tooltip: root.reading-as-expression
             ? "Using kana reading as Anki expression (click for kanji)"
             : "Use kana reading as Anki expression";
@@ -279,13 +279,13 @@ export component TermLeadingActions inherits HorizontalLayout {
         has-icon: true;
         icon: @image-url("../icons/note-stack.svg");
         icon-size: root.icon-size;
-        bg-normal: MementoPalette.accent-muted;
-        bg-hover: MementoPalette.accent-muted-hover;
-        bg-pressed: MementoPalette.accent-muted;
-        border-normal: MementoPalette.accent-border-subtle;
-        border-hover: MementoPalette.cyan-accent;
-        fg-color: MementoPalette.cyan-text;
-        fg-hover-color: MementoPalette.cyan-hover;
+        bg-normal: SubomiPalette.accent-muted;
+        bg-hover: SubomiPalette.accent-muted-hover;
+        bg-pressed: SubomiPalette.accent-muted;
+        border-normal: SubomiPalette.accent-border-subtle;
+        border-hover: SubomiPalette.cyan-accent;
+        fg-color: SubomiPalette.cyan-text;
+        fg-hover-color: SubomiPalette.cyan-hover;
         tooltip: "Browse in Anki";
         clicked => { root.browse-clicked(); }
         request-tooltip(tip) => { root.request-tooltip(tip, 140px); }
@@ -309,12 +309,12 @@ export component AnkiAddButton inherits Rectangle {
         has-icon: true;
         icon: @image-url("../icons/add.svg");
         icon-size: 16px;
-        bg-normal: MementoPalette.success-bg;
-        bg-hover: MementoPalette.teal-accent;
-        bg-pressed: MementoPalette.teal-pressed;
-        border-normal: MementoPalette.success-border;
-        border-hover: MementoPalette.teal-border;
-        fg-color: MementoPalette.success-text;
+        bg-normal: SubomiPalette.success-bg;
+        bg-hover: SubomiPalette.teal-accent;
+        bg-pressed: SubomiPalette.teal-pressed;
+        border-normal: SubomiPalette.success-border;
+        border-hover: SubomiPalette.teal-border;
+        fg-color: SubomiPalette.success-text;
         fg-hover-color: #FFFFFF;
         tooltip: "Add to Anki (right-click to choose audio source)";
         clicked => { root.clicked(); }
@@ -398,7 +398,7 @@ component HeadwordCharCell inherits Rectangle {
 
     width: ch-text.preferred-width;
     height: ch-text.preferred-height;
-    background: root.hovered ? MementoPalette.hover-bg : transparent;
+    background: root.hovered ? SubomiPalette.hover-bg : transparent;
     border-radius: 3px;
 
     ch-text := DictionaryText {
@@ -482,8 +482,8 @@ component ClickableReadingText inherits HorizontalLayout {
         height: reading-label.preferred-height;
         border-radius: 3px;
         background: root.clickable && self.hovered
-            ? MementoPalette.hover-bg
-            : (root.clickable && root.active ? MementoPalette.accent-muted : transparent);
+            ? SubomiPalette.hover-bg
+            : (root.clickable && root.active ? SubomiPalette.accent-muted : transparent);
 
         reading-label := DictionaryText {
             x: root.clickable ? 2px : 0px;
@@ -496,7 +496,7 @@ component ClickableReadingText inherits HorizontalLayout {
             font-weight: root.font-weight;
             color: root.clickable && pill.hovered
                 ? PopupBridge.css-link-color
-                : (root.clickable && root.active ? MementoPalette.teal-accent : root.text-color);
+                : (root.clickable && root.active ? SubomiPalette.teal-accent : root.text-color);
         }
 
         if root.clickable : TouchArea {
@@ -641,8 +641,8 @@ export component TermDerivationRow inherits HorizontalLayout {
         height: max(20px, PopupBridge.css-conj-font-size + 8px);
         border-radius: 5px;
         border-width: 1px;
-        border-color: MementoPalette.pill-border;
-        background: MementoPalette.pill-surface;
+        border-color: SubomiPalette.pill-border;
+        background: SubomiPalette.pill-surface;
 
         deriv-inner := HorizontalLayout {
             padding-left: 7px;
@@ -654,7 +654,7 @@ export component TermDerivationRow inherits HorizontalLayout {
                 text: "«";
                 font-family: PopupBridge.css-conj-font-family;
                 font-size: PopupBridge.css-conj-font-size;
-                color: MementoPalette.pill-arrow;
+                color: SubomiPalette.pill-arrow;
                 vertical-alignment: center;
             }
 
@@ -670,7 +670,7 @@ export component TermDerivationRow inherits HorizontalLayout {
                         width: step-lbl.preferred-width + 8px;
                         height: max(16px, PopupBridge.css-conj-font-size + 4px);
                         border-radius: 3px;
-                        background: step-touch.has-hover ? MementoPalette.pill-surface-hover : transparent;
+                        background: step-touch.has-hover ? SubomiPalette.pill-surface-hover : transparent;
                         animate background { duration: 100ms; }
 
                         step-lbl := DictionaryText {
@@ -679,7 +679,7 @@ export component TermDerivationRow inherits HorizontalLayout {
                             text: step.label;
                             font-family: PopupBridge.css-conj-font-family;
                             font-size: PopupBridge.css-conj-font-size;
-                            color: step-touch.has-hover ? MementoPalette.pill-text-hover : MementoPalette.pill-text;
+                            color: step-touch.has-hover ? SubomiPalette.pill-text-hover : SubomiPalette.pill-text;
                             vertical-alignment: center;
                         }
                         step-touch := TouchArea {
@@ -717,7 +717,7 @@ export component TermDerivationRow inherits HorizontalLayout {
                     text: "←";
                     font-family: PopupBridge.css-conj-font-family;
                     font-size: PopupBridge.css-conj-font-size;
-                    color: MementoPalette.pill-arrow;
+                    color: SubomiPalette.pill-arrow;
                     vertical-alignment: center;
                 }
             }
@@ -729,9 +729,9 @@ export component TermDerivationRow inherits HorizontalLayout {
         width: 22px;
         height: 18px;
         border-radius: 4px;
-        background: compact-deriv-touch.has-hover ? MementoPalette.pill-surface-hover : MementoPalette.pill-surface;
+        background: compact-deriv-touch.has-hover ? SubomiPalette.pill-surface-hover : SubomiPalette.pill-surface;
         border-width: 1px;
-        border-color: MementoPalette.pill-border;
+        border-color: SubomiPalette.pill-border;
 
         DictionaryText {
             text: "ⓘ";
@@ -792,9 +792,9 @@ export component FrequencyBadgeList inherits VerticalLayout {
         width: parent.width;
         spacing: 6px;
         alignment: start;
-        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: MementoPalette.success-text; font-size: 11px; }
-        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: MementoPalette.success-text; font-size: 11px; }
-        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: MementoPalette.badge-purple-text; font-size: 11px; }
+        if root.jpdb-rank != "" : DictionaryText { text: "JPDB " + root.jpdb-rank; color: SubomiPalette.success-text; font-size: 11px; }
+        if root.freq-rank != "" : DictionaryText { text: root.freq-rank; color: SubomiPalette.success-text; font-size: 11px; }
+        if root.pitch-accent != "" : DictionaryText { text: root.pitch-accent; color: SubomiPalette.badge-purple-text; font-size: 11px; }
     }
 
     // Bridge-provided compact frequency items (explicit omit-dict-name per badge)
@@ -920,7 +920,7 @@ export component PitchGraphList inherits VerticalLayout {
                     height: root.badge-h;
                     y: (root.row-h - self.height) / 2;
                     width: entry-pos-lbl.preferred-width + 10px;
-                    background: MementoPalette.badge-purple;
+                    background: SubomiPalette.badge-purple;
                     border-radius: 3px;
                     entry-pos-lbl := DictionaryText {
                         x: 5px;
@@ -929,7 +929,7 @@ export component PitchGraphList inherits VerticalLayout {
                         text: "[" + (pitch.pattern-text != "" ? pitch.pattern-text : (pitch.position + "")) + "]";
                         font-size: 10px;
                         font-weight: 700;
-                        color: MementoPalette.badge-purple-text;
+                        color: SubomiPalette.badge-purple-text;
                         vertical-alignment: center;
                     }
                 }
@@ -969,7 +969,7 @@ export component PitchGraphList inherits VerticalLayout {
                             horizontal-alignment: center;
                             width: parent.width;
                             font-size: 11px;
-                            color: mora.devoice ? MementoPalette.danger-text : PopupBridge.css-text-color;
+                            color: mora.devoice ? SubomiPalette.danger-text : PopupBridge.css-text-color;
                         }
                         if mora.nasal : Rectangle {
                             x: parent.width - 6px;
@@ -978,7 +978,7 @@ export component PitchGraphList inherits VerticalLayout {
                             height: 5px;
                             border-radius: 2.5px;
                             border-width: 1.2px;
-                            border-color: MementoPalette.nasal-ring;
+                            border-color: SubomiPalette.nasal-ring;
                             background: PopupBridge.css-popup-bg;
                         }
                         if mora.nasal || mora.devoice : TouchArea {
@@ -1043,7 +1043,7 @@ export component PitchGraphList inherits VerticalLayout {
                     height: root.badge-h;
                     y: (root.row-h - self.height) / 2;
                     width: pitch-pos-lbl.preferred-width + 10px;
-                    background: MementoPalette.badge-purple;
+                    background: SubomiPalette.badge-purple;
                     border-radius: 3px;
                     pitch-pos-lbl := DictionaryText {
                         x: 5px;
@@ -1052,7 +1052,7 @@ export component PitchGraphList inherits VerticalLayout {
                         text: "[" + (exact-pat != "" ? exact-pat : (pitch.position + "")) + "]";
                         font-size: 10px;
                         font-weight: 700;
-                        color: MementoPalette.badge-purple-text;
+                        color: SubomiPalette.badge-purple-text;
                         vertical-alignment: center;
                     }
                 }
@@ -1092,7 +1092,7 @@ export component PitchGraphList inherits VerticalLayout {
                             horizontal-alignment: center;
                             width: parent.width;
                             font-size: 11px;
-                            color: mora.devoice ? MementoPalette.danger-text : PopupBridge.css-text-color;
+                            color: mora.devoice ? SubomiPalette.danger-text : PopupBridge.css-text-color;
                         }
                         if mora.nasal : Rectangle {
                             x: parent.width - 6px;
@@ -1101,7 +1101,7 @@ export component PitchGraphList inherits VerticalLayout {
                             height: 5px;
                             border-radius: 2.5px;
                             border-width: 1.2px;
-                            border-color: MementoPalette.nasal-ring;
+                            border-color: SubomiPalette.nasal-ring;
                             background: PopupBridge.css-popup-bg;
                         }
                         if mora.nasal || mora.devoice : TouchArea {
@@ -1144,7 +1144,7 @@ export component PitchGraphList inherits VerticalLayout {
                     width: min(self.preferred-width, parent.width * 0.34);
                     horizontal-stretch: 0;
                     font-size: 11px;
-                    color: MementoPalette.badge-purple-text;
+                    color: SubomiPalette.badge-purple-text;
                     vertical-alignment: center;
                     overflow: elide;
                 }
@@ -1152,7 +1152,7 @@ export component PitchGraphList inherits VerticalLayout {
                     height: 18px;
                     y: 5px;
                     width: fb-pos-lbl.preferred-width + 8px;
-                    background: MementoPalette.badge-purple;
+                    background: SubomiPalette.badge-purple;
                     border-radius: 3px;
                     fb-pos-lbl := DictionaryText {
                         x: 4px;
@@ -1161,7 +1161,7 @@ export component PitchGraphList inherits VerticalLayout {
                         text: "[" + pitch.position + "]";
                         font-size: 10px;
                         font-weight: 700;
-                        color: MementoPalette.badge-purple-text;
+                        color: SubomiPalette.badge-purple-text;
                         vertical-alignment: center;
                     }
                 }
@@ -1313,12 +1313,12 @@ export component FloatingTooltip inherits Rectangle {
     y: max(8px, min(root.container-height - self.tip-h - 8px, self.local-tip-y - self.tip-h - 6px));
     width: self.tip-w;
     height: self.tip-h;
-    background: MementoPalette.tooltip-bg;
+    background: SubomiPalette.tooltip-bg;
     border-width: 1px;
-    border-color: MementoPalette.border-light;
+    border-color: SubomiPalette.border-light;
     border-radius: 5px;
     drop-shadow-blur: 12px;
-    drop-shadow-color: MementoPalette.shadow;
+    drop-shadow-color: SubomiPalette.shadow;
 
     tip-label := DictionaryText {
         x: 8px;
@@ -1326,7 +1326,7 @@ export component FloatingTooltip inherits Rectangle {
         width: parent.width - 16px;
         text: PopupBridge.tooltip-text;
         font-size: 12px;
-        color: MementoPalette.tooltip-text;
+        color: SubomiPalette.tooltip-text;
         wrap: word-wrap;
     }
 }
@@ -1359,12 +1359,12 @@ export component AudioSourceMenu inherits Rectangle {
         y: max(36px, min(parent.height - self.height - 8px, root.menu-y));
         width: min(252px, max(172px, parent.width - 16px));
         height: min(source-items.preferred-height + 12px, max(60px, parent.height - 75px));
-        background: MementoPalette.surface-elevated;
+        background: SubomiPalette.surface-elevated;
         border-width: 1px;
-        border-color: MementoPalette.border-light;
+        border-color: SubomiPalette.border-light;
         border-radius: 7px;
         drop-shadow-blur: 16px;
-        drop-shadow-color: MementoPalette.shadow;
+        drop-shadow-color: SubomiPalette.shadow;
         clip: true;
 
         ScrollView {
@@ -1393,12 +1393,12 @@ export component AudioSourceMenu inherits Rectangle {
                             text: root.header-title;
                             font-size: 11px;
                             font-weight: 700;
-                            color: MementoPalette.text-secondary;
+                            color: SubomiPalette.text-secondary;
                             vertical-alignment: center;
                             overflow: elide;
                         }
                     }
-                    Rectangle { height: 1px; background: MementoPalette.border; }
+                    Rectangle { height: 1px; background: SubomiPalette.border; }
                 }
 
                 if root.loading : Rectangle {
@@ -1410,7 +1410,7 @@ export component AudioSourceMenu inherits Rectangle {
                         height: parent.height;
                         text: "Loading recordings…";
                         font-size: 12px;
-                        color: MementoPalette.text-secondary;
+                        color: SubomiPalette.text-secondary;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -1425,7 +1425,7 @@ export component AudioSourceMenu inherits Rectangle {
                         height: parent.height;
                         text: "No audio sources available";
                         font-size: 12px;
-                        color: MementoPalette.text-secondary;
+                        color: SubomiPalette.text-secondary;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -1442,8 +1442,8 @@ export component AudioSourceMenu inherits Rectangle {
                     border-radius: 4px;
                     opacity: self.is-failed ? 0.6 : 1.0;
                     background: source-touch.has-hover
-                        ? MementoPalette.hover-bg
-                        : (root.selected-source == source.index ? MementoPalette.accent-subtle : transparent);
+                        ? SubomiPalette.hover-bg
+                        : (root.selected-source == source.index ? SubomiPalette.accent-subtle : transparent);
 
                     HorizontalLayout {
                         padding-left: 8px;
@@ -1456,7 +1456,7 @@ export component AudioSourceMenu inherits Rectangle {
                             text: root.selected-source == source.index ? "✓" : "";
                             font-size: 11px;
                             font-weight: 700;
-                            color: MementoPalette.cyan-accent;
+                            color: SubomiPalette.cyan-accent;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
@@ -1470,10 +1470,10 @@ export component AudioSourceMenu inherits Rectangle {
                                     ? @image-url("../icons/volume-off.svg")
                                     : @image-url("../icons/volume-on.svg");
                                 colorize: src-row.is-failed
-                                    ? MementoPalette.danger-text
+                                    ? SubomiPalette.danger-text
                                     : (src-row.is-available
-                                        ? MementoPalette.success
-                                        : MementoPalette.icon-muted);
+                                        ? SubomiPalette.success
+                                        : SubomiPalette.icon-muted);
                             }
                         }
 
@@ -1483,8 +1483,8 @@ export component AudioSourceMenu inherits Rectangle {
                             font-size: 12px;
                             font-weight: root.selected-source == source.index ? 700 : 400;
                             color: src-row.is-failed
-                                ? MementoPalette.text-muted
-                                : (root.selected-source == source.index ? MementoPalette.cyan-text : MementoPalette.text);
+                                ? SubomiPalette.text-muted
+                                : (root.selected-source == source.index ? SubomiPalette.cyan-text : SubomiPalette.text);
                             vertical-alignment: center;
                             overflow: elide;
                         }
@@ -1492,7 +1492,7 @@ export component AudioSourceMenu inherits Rectangle {
                         if src-row.status == 3 : DictionaryText {
                             text: "…";
                             font-size: 11px;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             vertical-alignment: center;
                         }
                     }
@@ -1505,12 +1505,12 @@ export component AudioSourceMenu inherits Rectangle {
 
                 if root.allow-no-audio : VerticalLayout {
                     spacing: 2px;
-                    Rectangle { height: 1px; background: MementoPalette.border; }
+                    Rectangle { height: 1px; background: SubomiPalette.border; }
                     Rectangle {
                         width: parent.width;
                         height: 28px;
                         border-radius: 4px;
-                        background: no-aud-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                        background: no-aud-touch.has-hover ? SubomiPalette.hover-bg : transparent;
                         HorizontalLayout {
                             padding-left: 8px;
                             padding-right: 8px;
@@ -1523,14 +1523,14 @@ export component AudioSourceMenu inherits Rectangle {
                                     width: 14px;
                                     height: 14px;
                                     source: @image-url("../icons/volume-off.svg");
-                                    colorize: MementoPalette.icon-muted;
+                                    colorize: SubomiPalette.icon-muted;
                                 }
                             }
                             DictionaryText {
                                 horizontal-stretch: 1;
                                 text: "Add without audio";
                                 font-size: 12px;
-                                color: MementoPalette.text-secondary;
+                                color: SubomiPalette.text-secondary;
                                 vertical-alignment: center;
                                 overflow: elide;
                             }

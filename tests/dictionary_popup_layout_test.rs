@@ -1,5 +1,5 @@
 use i_slint_backend_testing::{init_no_event_loop, ElementQuery};
-use memento_app::{DictResult, MementoApp, PopupGlossaryBlock};
+use subomi_app::{DictResult, SubomiApp, PopupGlossaryBlock};
 use slint::{ComponentHandle, Model, VecModel};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -10,12 +10,12 @@ mod compact_popup;
 #[test]
 fn compact_header_keeps_all_frequencies_and_wraps_at_small_widths() {
     init_no_event_loop();
-    let app = MementoApp::new().unwrap();
-    memento_app::install_popup_navigation(&app);
+    let app = SubomiApp::new().unwrap();
+    subomi_app::install_popup_navigation(&app);
     let rows = compact_popup::definitions();
     let frequencies = rows[0].frequencies.clone();
     let normal = app
-        .global::<memento_app::PopupLayout>()
+        .global::<subomi_app::PopupLayout>()
         .invoke_frequency_lines(frequencies.clone(), 442.);
     assert_eq!(
         normal.row_count(),
@@ -23,7 +23,7 @@ fn compact_header_keeps_all_frequencies_and_wraps_at_small_widths() {
         "seven ranks should occupy two compact rows"
     );
     let narrow = app
-        .global::<memento_app::PopupLayout>()
+        .global::<subomi_app::PopupLayout>()
         .invoke_frequency_lines(frequencies.clone(), 240.);
     assert!(narrow.row_count() > normal.row_count());
     let flattened: Vec<_> = narrow
@@ -35,7 +35,7 @@ fn compact_header_keeps_all_frequencies_and_wraps_at_small_widths() {
         frequencies.iter().collect::<Vec<_>>(),
         "wrapping must retain every source and rank in order"
     );
-    memento_app::set_dictionary_rows(&app, rows);
+    subomi_app::set_dictionary_rows(&app, rows);
     app.set_anki_enabled(true);
     app.set_dict_open(true);
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
@@ -85,7 +85,7 @@ fn long_dictionary_entries_keep_their_full_height_and_collapse_without_blank_spa
         return;
     }
     init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     let long_glossary = "A long definition with enough text to wrap in the popup. ".repeat(28);
     let mut definitions = vec![
@@ -169,7 +169,7 @@ fn scrolling_the_first_term_requests_the_next_group() {
         return;
     }
     init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     let long_glossary = "A definition long enough to scroll in the popup. ".repeat(28);
     let mut first = definition("世界中", "せかいじゅう", &long_glossary, true, true);
@@ -204,7 +204,7 @@ fn short_initial_page_requests_more_definitions_without_scrolling() {
         return;
     }
     init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     let mut definitions = (0..8)
         .map(|index| {
@@ -220,7 +220,7 @@ fn short_initial_page_requests_more_definitions_without_scrolling() {
         })
         .collect::<Vec<_>>();
     let full: slint::ModelRc<DictResult> = Rc::new(VecModel::from(definitions.clone())).into();
-    let count = memento_app::next_popup_batch_end(&full, 0);
+    let count = subomi_app::next_popup_batch_end(&full, 0);
     assert!(
         count < definitions.len(),
         "initial page laid out every dictionary"
@@ -257,8 +257,8 @@ fn short_initial_page_requests_more_definitions_without_scrolling() {
 #[test]
 fn paging_and_collapse_preserve_every_dictionary_and_its_selection() {
     init_no_event_loop();
-    let app = MementoApp::new().unwrap();
-    memento_app::install_popup_navigation(&app);
+    let app = SubomiApp::new().unwrap();
+    subomi_app::install_popup_navigation(&app);
     let rows: Vec<_> = (0..12)
         .map(|index| {
             let same_term = index < 10;
@@ -277,7 +277,7 @@ fn paging_and_collapse_preserve_every_dictionary_and_its_selection() {
             row
         })
         .collect();
-    memento_app::set_dictionary_rows(&app, rows);
+    subomi_app::set_dictionary_rows(&app, rows);
     assert_eq!(app.get_popup_results().row_count(), 12);
     app.invoke_toggle_definition_selection(1);
     app.invoke_toggle_term_collapse(0);
@@ -295,18 +295,18 @@ fn paging_and_collapse_preserve_every_dictionary_and_its_selection() {
 
 mod rich_popup_phase4_tests {
     use super::*;
-    use memento_app::controller::config::ConfigController;
-    use memento_app::controller::dict::{
+    use subomi_app::controller::config::ConfigController;
+    use subomi_app::controller::dict::{
         resolve_dictionary_style_path, DictController, DictTag, TermPitchDetail,
     };
-    use memento_app::{
+    use subomi_app::{
         install_popup_navigation, install_rich_ui_bridges, load_dictionary_image_pixmap,
         parse_dictionary_css_str, render_structured_glossary_entry, rich_pitch_graphs_from_details,
         set_dictionary_rows, suppress_redundant_tags, tag_category_hex_color, GlossaryZoneAction,
         PopupAudioSource, PopupBridge,
     };
-    use memento_definition::LegacyGlossaryStyle;
-    use memento_dict::yomidbbuilder;
+    use subomi_definition::LegacyGlossaryStyle;
+    use subomi_dict::yomidbbuilder;
     use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
@@ -408,7 +408,7 @@ mod rich_popup_phase4_tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "memento-p4-rich-popup-{}-{seq}-{nanos}",
+            "subomi-p4-rich-popup-{}-{seq}-{nanos}",
             std::process::id()
         ));
         let config_dir = root.join("config");
@@ -664,9 +664,9 @@ mod rich_popup_phase4_tests {
             center_px
         );
 
-        // 3. Wire full `MementoApp` with `install_popup_navigation` + `install_rich_ui_bridges`.
-        let config = ConfigController::load(&fixture.config_dir, "memento.conf").unwrap();
-        let app = MementoApp::new().unwrap();
+        // 3. Wire full `SubomiApp` with `install_popup_navigation` + `install_rich_ui_bridges`.
+        let config = ConfigController::load(&fixture.config_dir, "subomi.conf").unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &config);
@@ -674,7 +674,7 @@ mod rich_popup_phase4_tests {
         let mut dict_ctrl = DictController::open(&fixture.db_path).unwrap();
         let hits = dict_ctrl.search("世界中").to_vec();
         assert_eq!(hits.len(), 2);
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("世界中".into());
         app.set_dict_reading("せかいじゅう".into());
@@ -882,8 +882,8 @@ mod rich_popup_phase4_tests {
     fn per_kanji_headword_kana_toggle_tags_pitch_derivations_audio_menu_and_isolated_panel() {
         init_no_event_loop();
         let fixture = build_rich_fixture();
-        let config = ConfigController::load(&fixture.config_dir, "memento.conf").unwrap();
-        let app = MementoApp::new().unwrap();
+        let config = ConfigController::load(&fixture.config_dir, "subomi.conf").unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &config);
@@ -915,7 +915,7 @@ mod rich_popup_phase4_tests {
         assert_eq!(dedup_def[0].name, "adv");
 
         // Load `"世界中"` into popup and verify bridge pills & per-kanji headword characters
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("世界中".into());
         app.set_dict_reading("せかいじゅう".into());
@@ -996,7 +996,7 @@ mod rich_popup_phase4_tests {
         let tabete_hits = dict_ctrl.search("食べて").to_vec();
         assert!(!tabete_hits.is_empty());
         assert!(!tabete_hits[0].derivation_descriptions.is_empty());
-        let tabete_rows = memento_app::dictionary_result_rows(&tabete_hits, &[]);
+        let tabete_rows = subomi_app::dictionary_result_rows(&tabete_hits, &[]);
         set_dictionary_rows(&app, tabete_rows);
         app.set_dict_query("食べる".into());
         app.set_dict_reading("たべる".into());
@@ -1059,7 +1059,7 @@ mod rich_popup_phase4_tests {
         app.set_dict_search_open(true);
         app.set_selected_token_index(0);
         let hashi_hits = dict_ctrl.search("橋").to_vec();
-        let hashi_rows = memento_app::dictionary_result_rows(&hashi_hits, &[]);
+        let hashi_rows = subomi_app::dictionary_result_rows(&hashi_hits, &[]);
         set_dictionary_rows(&app, hashi_rows);
         app.set_dict_query("橋".into());
         assert_eq!(pb.get_panel_query().as_str(), "世界");
@@ -1079,7 +1079,7 @@ mod rich_popup_phase4_tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "memento-p4-data-res-{}-{seq}-{nanos}",
+            "subomi-p4-data-res-{}-{seq}-{nanos}",
             std::process::id()
         ));
         let config_dir = root.join("config");
@@ -1150,10 +1150,10 @@ mod rich_popup_phase4_tests {
             .join("styles.css")
             .is_file());
 
-        let dirs = memento_app::collect_dictionary_resource_dirs(&config_dir, &db_path);
+        let dirs = subomi_app::collect_dictionary_resource_dirs(&config_dir, &db_path);
         assert_eq!(dirs, vec![config_dir.join("dict_resources"), data_res_dir.clone()]);
         assert!(
-            memento_app::resolve_dictionary_asset_path_in_dirs(
+            subomi_app::resolve_dictionary_asset_path_in_dirs(
                 &dirs,
                 dic_id,
                 "DataResDict",
@@ -1162,8 +1162,8 @@ mod rich_popup_phase4_tests {
             .is_some()
         );
 
-        let config = ConfigController::load(&config_dir, "memento.conf").unwrap();
-        let app = MementoApp::new().unwrap();
+        let config = ConfigController::load(&config_dir, "subomi.conf").unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &config);
@@ -1173,7 +1173,7 @@ mod rich_popup_phase4_tests {
             .search("寿限無寿限無五劫のすりきれ海砂利水魚の水行末")
             .to_vec();
         assert_eq!(hits.len(), 1);
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("寿限無寿限無五劫のすりきれ海砂利水魚の水行末".into());
         app.set_anki_added_note_id("12345".into());
@@ -1221,7 +1221,7 @@ mod rich_popup_phase4_tests {
             wide_render.height_px
         );
         // Obtain exact hit-zone coordinates at narrow 180px width and verify `PopupBridge` hits the 180px doc (not stale 460px)!
-        let narrow_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let narrow_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             &hits[0].raw_glossary,
             &hits[0].glossary,
             None,
@@ -1269,7 +1269,7 @@ mod rich_popup_phase4_tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "memento-rich-emoji-links-svg-{}-{nanos}",
+            "subomi-rich-emoji-links-svg-{}-{nanos}",
             std::process::id()
         ));
         let res_dir = root.join("res");
@@ -1296,7 +1296,7 @@ mod rich_popup_phase4_tests {
 
         // 1. Monochrome SVG mask badge must render BOTH opaque tinted pill pixels AND
         //    transparent interior cutout pixels for `運用` (never a solid white rectangle).
-        let pixmap = memento_app::load_dictionary_image_pixmap(
+        let pixmap = subomi_app::load_dictionary_image_pixmap(
             &svg_path,
             Some(30.0),
             Some(15.0),
@@ -1327,7 +1327,7 @@ mod rich_popup_phase4_tests {
         // 2. Multi-span link line (`⇨あんな・こんな・どんな：こそあど`) must NOT duplicate/overlap
         //    clusters across GlyphRuns sharing the same shaped Run.
         let multi_link_json = r#"[{"type":"structured-content","content":["⇨",{"tag":"span","content":{"tag":"a","href":"?query=あんな&wildcards=off","content":"あんな"}},"・",{"tag":"span","content":{"tag":"a","href":"?query=こんな&wildcards=off","content":"こんな"}},"・",{"tag":"span","content":{"tag":"a","href":"?query=どんな&wildcards=off","content":"どんな"}},"：",{"tag":"span","content":{"tag":"a","href":"?query=こそあど&wildcards=off","content":"こそあど"}}]}]"#;
-        let link_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let link_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             multi_link_json,
             "",
             None,
@@ -1363,7 +1363,7 @@ mod rich_popup_phase4_tests {
         // 3. JMdict flag emoji list markers (`'🇯🇵 '` and `'🇬🇧 '`) must render color emoji bitmaps
         //    (containing real red flag pixels when Noto Color Emoji is installed) rather than cyan `JP`/`GB`.
         let flag_json = r#"[{"type":"structured-content","content":[{"tag":"ul","style":{"listStyleType":"'🇯🇵 '"},"content":[{"tag":"li","content":"あなたが呼べば、彼は来るでしょう。"},{"tag":"li","style":{"listStyleType":"'🇬🇧 '"},"content":"He will come if you call him."}]}]}]"#;
-        let flag_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let flag_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             flag_json,
             "",
             None,
@@ -1395,7 +1395,7 @@ mod rich_popup_phase4_tests {
     fn custom_popup_css_applies_to_popup_bridge_and_hot_reloads() {
         init_no_event_loop();
         let fixture = build_rich_fixture();
-        let css_path = fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME);
+        let css_path = fixture.config_dir.join(subomi_app::CUSTOM_POPUP_CSS_FILENAME);
         fs::write(
             &css_path,
             r#"
@@ -1410,7 +1410,7 @@ mod rich_popup_phase4_tests {
         )
         .unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
 
@@ -1441,7 +1441,7 @@ mod rich_popup_phase4_tests {
             "#,
         )
         .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
 
         let bg2 = pb.get_css_popup_bg().to_argb_u8();
         assert_eq!((bg2.red, bg2.green, bg2.blue), (0xFA, 0xF9, 0xF6));
@@ -1455,7 +1455,7 @@ mod rich_popup_phase4_tests {
         // Write split popup-outer.css + 2-column inner popup.css and verify both reload together.
         let outer_path = fixture
             .config_dir
-            .join(memento_app::CUSTOM_POPUP_OUTER_CSS_FILENAME);
+            .join(subomi_app::CUSTOM_POPUP_OUTER_CSS_FILENAME);
         fs::write(
             &outer_path,
             r#"
@@ -1485,7 +1485,7 @@ mod rich_popup_phase4_tests {
             "#,
         )
         .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
 
         let bg3 = pb.get_css_popup_bg().to_argb_u8();
         assert_eq!((bg3.red, bg3.green, bg3.blue), (45, 45, 55));
@@ -1530,7 +1530,7 @@ mod rich_popup_phase4_tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "memento-v2-recursive-{}-{seq}-{nanos}",
+            "subomi-v2-recursive-{}-{seq}-{nanos}",
             std::process::id()
         ));
         let config_dir = root.join("config");
@@ -1660,7 +1660,7 @@ mod rich_popup_phase4_tests {
         }
     }
 
-    fn wait_for_nested_depth(app: &MementoApp, expected_depth: i32) {
+    fn wait_for_nested_depth(app: &SubomiApp, expected_depth: i32) {
         let pb = app.global::<PopupBridge>();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -1681,7 +1681,7 @@ mod rich_popup_phase4_tests {
     fn deliverable1_no_x_close_button_and_escape_closes_popup() {
         init_no_event_loop();
         let fixture = build_recursive_scan_fixture();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
@@ -1689,7 +1689,7 @@ mod rich_popup_phase4_tests {
 
         let mut dict = DictController::open(&fixture.db_path).unwrap();
         let hits = dict.search("大辞泉語").to_vec();
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("大辞泉語".into());
         app.set_dict_open(true);
@@ -1721,7 +1721,7 @@ mod rich_popup_phase4_tests {
     fn deliverable2_recursive_scan_hit_test_and_soft_wrap_substring_extraction() {
         init_no_event_loop();
         let raw = r#"[{"type":"structured-content","content":"世界の言葉を指す。English text here."}]"#;
-        let doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let doc = subomi_app::render_structured_glossary_entry_in_dirs(
             raw,
             "",
             None,
@@ -1736,9 +1736,9 @@ mod rich_popup_phase4_tests {
         .expect("doc should render");
 
         // Blank right-edge / negative margin must return None on strict hit test.
-        assert_eq!(memento_app::strict_char_index_at_point(&doc, -5.0, 5.0), None);
+        assert_eq!(subomi_app::strict_char_index_at_point(&doc, -5.0, 5.0), None);
         assert_eq!(
-            memento_app::strict_char_index_at_point(&doc, doc.width_px + 20.0, 5.0),
+            subomi_app::strict_char_index_at_point(&doc, doc.width_px + 20.0, 5.0),
             None
         );
 
@@ -1749,7 +1749,7 @@ mod rich_popup_phase4_tests {
             .position(|c| c.ch == '言')
             .expect("must contain 言");
         let cell = &doc.selectable_chars[k_idx];
-        let hit = memento_app::strict_char_index_at_point(
+        let hit = subomi_app::strict_char_index_at_point(
             &doc,
             cell.x + cell.w * 0.5,
             cell.y + cell.h * 0.5,
@@ -1757,7 +1757,7 @@ mod rich_popup_phase4_tests {
         assert_eq!(hit, Some(k_idx));
 
         let (sub, indices) =
-            memento_app::extract_glossary_scan_substring(&doc.selectable_chars, k_idx, 24)
+            subomi_app::extract_glossary_scan_substring(&doc.selectable_chars, k_idx, 24)
                 .expect("should extract Japanese scan substring");
         assert_eq!(sub, "言葉を指す");
         assert_eq!(indices.len(), sub.chars().count());
@@ -1769,14 +1769,14 @@ mod rich_popup_phase4_tests {
             .position(|c| c.ch == 'E')
             .expect("must contain E");
         assert_eq!(
-            memento_app::extract_glossary_scan_substring(&doc.selectable_chars, e_idx, 24),
+            subomi_app::extract_glossary_scan_substring(&doc.selectable_chars, e_idx, 24),
             None
         );
 
         // Narrow width forces soft line wrap inside a long Japanese phrase; extraction must bridge it.
         let wrapped_raw =
             r#"[{"type":"structured-content","content":"日本語辞書の解説文を続けて読む。"}]"#;
-        let narrow_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let narrow_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             wrapped_raw,
             "",
             None,
@@ -1800,7 +1800,7 @@ mod rich_popup_phase4_tests {
             .position(|c| c.ch == '日')
             .unwrap();
         let (bridged, bridged_indices) =
-            memento_app::extract_glossary_scan_substring(&narrow_doc.selectable_chars, first_ja, 24)
+            subomi_app::extract_glossary_scan_substring(&narrow_doc.selectable_chars, first_ja, 24)
                 .expect("should bridge soft line wrap");
         assert_eq!(bridged, "日本語辞書の解説文を続けて読む");
         assert_eq!(bridged_indices.len(), bridged.chars().count());
@@ -1810,7 +1810,7 @@ mod rich_popup_phase4_tests {
     fn deliverable2_recursive_nested_popup_hover_modifier_middle_click_drag_guard_stacking_and_2col() {
         init_no_event_loop();
         let fixture = build_recursive_scan_fixture();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         cfg.edit_setting("search/method", "0").unwrap(); // Hover
         cfg.edit_setting("search/delay", "120").unwrap();
@@ -1824,7 +1824,7 @@ mod rich_popup_phase4_tests {
 
         let mut dict = DictController::open(&fixture.db_path).unwrap();
         let hits = dict.search("大辞泉語").to_vec();
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("大辞泉語".into());
         app.set_dict_open(true);
@@ -1838,7 +1838,7 @@ mod rich_popup_phase4_tests {
 
         // Compute exact character coordinates for '言' in row 1's rendered doc.
         let hit0 = &hits[0];
-        let ref_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let ref_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             &hit0.raw_glossary,
             &hit0.glossary,
             None,
@@ -1946,7 +1946,7 @@ mod rich_popup_phase4_tests {
         );
         assert!(nrender.has_rich);
         let kotoba_hits = dict.search("言葉").to_vec();
-        let ref_doc_1 = memento_app::render_structured_glossary_entry_in_dirs(
+        let ref_doc_1 = subomi_app::render_structured_glossary_entry_in_dirs(
             &kotoba_hits[0].raw_glossary,
             &kotoba_hits[0].glossary,
             None,
@@ -2043,7 +2043,7 @@ mod rich_popup_phase4_tests {
 
         // 6. Modifier scan mode (search/method = 1, Shift): hover without Shift does nothing, Shift triggers!
         cfg.edit_setting("search/method", "1").unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         let _ = pb.invoke_render_glossary(
             1,
             360.0,
@@ -2082,7 +2082,7 @@ mod rich_popup_phase4_tests {
         );
         cfg.edit_setting("search/middle-mouse-scan", "true")
             .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         let _ = pb.invoke_render_glossary(
             1,
             360.0,
@@ -2101,13 +2101,13 @@ mod rich_popup_phase4_tests {
 
         // 8. 2-column mode (`--definition-columns: 2`): scanning row 2 (right column) works and highlights only row 2!
         fs::write(
-            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            fixture.config_dir.join(subomi_app::CUSTOM_POPUP_CSS_FILENAME),
             ":root { --definition-columns: 2; }",
         )
         .unwrap();
         cfg.edit_setting("search/method", "0").unwrap();
         cfg.edit_setting("search/delay", "0").unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         assert_eq!(pb.get_css_definition_columns(), 2);
         let _ = pb.invoke_render_glossary(
             1,
@@ -2125,7 +2125,7 @@ mod rich_popup_phase4_tests {
         );
         assert!(r2.has_rich, "second column row must render in 2-col layout");
         let hit1 = &hits[1];
-        let ref_doc_col2 = memento_app::render_structured_glossary_entry_in_dirs(
+        let ref_doc_col2 = subomi_app::render_structured_glossary_entry_in_dirs(
             &hit1.raw_glossary,
             &hit1.glossary,
             None,
@@ -2189,17 +2189,17 @@ mod rich_popup_phase4_tests {
     fn deliverable3_collapsible_definition_line_count_css_and_toggle_state() {
         init_no_event_loop();
         // Template documents --collapsible-definition-line-count and still parses as default theme.
-        let tmpl = memento_app::default_custom_popup_css_template();
+        let tmpl = subomi_app::default_custom_popup_css_template();
         assert!(
             tmpl.contains("--collapsible-definition-line-count"),
             "default popup.css template must document --collapsible-definition-line-count"
         );
         assert_eq!(
-            memento_app::parse_split_popup_css_theme(
+            subomi_app::parse_split_popup_css_theme(
                 tmpl,
-                memento_app::default_custom_popup_outer_css_template()
+                subomi_app::default_custom_popup_outer_css_template()
             ),
-            memento_app::PopupCssTheme::default()
+            subomi_app::PopupCssTheme::default()
         );
 
         // CSS parsing: :root default + exact/prefix/contains/suffix overrides + 0/none disable.
@@ -2220,7 +2220,7 @@ mod rich_popup_phase4_tests {
                 --collapsible-definition-line-count: 5;
             }
         "#;
-        let theme = memento_app::parse_popup_css_theme(css);
+        let theme = subomi_app::parse_popup_css_theme(css);
         assert_eq!(theme.resolve_dict_style("OtherDict").collapsible_line_count, 4);
         assert_eq!(theme.resolve_dict_style("大辞泉").collapsible_line_count, 2);
         assert_eq!(
@@ -2236,12 +2236,12 @@ mod rich_popup_phase4_tests {
         // End-to-end RichGlossaryRender collapse + toggle + reset on new lookup.
         let fixture = build_recursive_scan_fixture();
         fs::write(
-            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            fixture.config_dir.join(subomi_app::CUSTOM_POPUP_CSS_FILENAME),
             css,
         )
         .unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
@@ -2249,7 +2249,7 @@ mod rich_popup_phase4_tests {
 
         let mut dict = DictController::open(&fixture.db_path).unwrap();
         let hits = dict.search("大辞泉語").to_vec();
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("大辞泉語".into());
         app.set_dict_open(true);
@@ -2349,7 +2349,7 @@ mod rich_popup_phase4_tests {
 
         // Expand again, then run a fresh lookup -> expand state must reset to collapsed!
         pb.invoke_toggle_definition_expanded(0, 1);
-        let fresh_rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let fresh_rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, fresh_rows);
         let card1_reset = pb.invoke_render_glossary(
             1,
@@ -2365,7 +2365,7 @@ mod rich_popup_phase4_tests {
 
         // Edge cases in compute_collapsible_metrics: small height (< 18px), 0, negative, NaN/Inf must never panic.
         for bad_h in [12.0f32, 0.0, -5.0, f32::NAN, f32::INFINITY] {
-            let synthetic = memento_app::RenderedGlossaryDoc {
+            let synthetic = subomi_app::RenderedGlossaryDoc {
                 image: slint::Image::default(),
                 width_px: 200.0,
                 height_px: bad_h,
@@ -2375,7 +2375,7 @@ mod rich_popup_phase4_tests {
                 plain_text: String::new(),
             };
             let (collapsible, collapsed_h, lines) =
-                memento_app::compute_collapsible_metrics(&synthetic, 1);
+                subomi_app::compute_collapsible_metrics(&synthetic, 1);
             assert!(!collapsible, "bad/tiny height {bad_h} must never panic or report collapsible");
             assert!(collapsed_h.is_finite() && collapsed_h >= 0.0);
             assert_eq!(lines, 3);
@@ -2386,7 +2386,7 @@ mod rich_popup_phase4_tests {
     fn deliverable4_anki_update_hook_first_term_ready_font_fallbacks_and_subtitle_line_spacing() {
         init_no_event_loop();
         let fixture = build_recursive_scan_fixture();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
@@ -2406,7 +2406,7 @@ mod rich_popup_phase4_tests {
 
         let mut dict = DictController::open(&fixture.db_path).unwrap();
         let hits = dict.search("大辞泉語").to_vec();
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         assert_eq!(
             ready_events.borrow().as_slice(),
@@ -2432,7 +2432,7 @@ mod rich_popup_phase4_tests {
         );
 
         // History navigation Back restore must NOT re-emit first-term-ready.
-        let rows_for_nav = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows_for_nav = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows_for_nav);
         app.set_dict_query("大辞泉語".into());
         app.set_dict_open(true);
@@ -2447,7 +2447,7 @@ mod rich_popup_phase4_tests {
         );
 
         // Restore term rows for Anki update button test.
-        let rows = memento_app::dictionary_result_rows(&hits, &[]);
+        let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_anki_enabled(true);
         app.set_dict_query("大辞泉語".into());
@@ -2467,13 +2467,13 @@ mod rich_popup_phase4_tests {
             ));
         });
 
-        let profile = memento_app::controller::config::AnkiNoteConfig {
+        let profile = subomi_app::controller::config::AnkiNoteConfig {
             enabled: true,
-            endpoint: memento_net::anki::AnkiEndpoint::default(),
+            endpoint: subomi_net::anki::AnkiEndpoint::default(),
             deck: "Japanese".to_owned(),
             model: "Sentence".to_owned(),
             field_templates: HashMap::new(),
-            tags: vec!["memento".to_owned()],
+            tags: vec!["subomi".to_owned()],
             duplicate_policy: 1, // DifferentDeck -> marks duplicate
             screenshot_type: 0,
             audio_pad_start: 0.0,
@@ -2482,11 +2482,11 @@ mod rich_popup_phase4_tests {
             audio_db: -20.0,
             newline_replacer: "<br>".to_owned(),
         };
-        memento_app::mark_popup_term_anki_added(&app, 0, 123_456_789, &profile, false);
+        subomi_app::mark_popup_term_anki_added(&app, 0, 123_456_789, &profile, false);
         assert_eq!(pb.get_row_anki_duplicates().row_data(0), Some(true));
         assert_eq!(pb.get_row_anki_note_ids().row_data(0), Some(123_456_789));
         assert_eq!(
-            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            subomi_app::popup_row_anki_note_id_i64(&app, 0),
             Some(123_456_789)
         );
         app.show().unwrap();
@@ -2509,15 +2509,15 @@ mod rich_popup_phase4_tests {
         // refresh_rich_ui_bridges does not clear the manually marked duplicate state.
         cfg.edit_setting("search/method", "0").unwrap();
         cfg.edit_setting("search/delay", "0").unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
 
         // Large 13-digit AnkiConnect epoch-ms note ID must clamp positive (i32::MAX) in Slint
         // while staying lossless via popup_row_anki_note_id_i64!
         let large_nid: i64 = 1_732_000_000_123;
-        memento_app::mark_popup_term_anki_added(&app, 0, large_nid, &profile, false);
+        subomi_app::mark_popup_term_anki_added(&app, 0, large_nid, &profile, false);
         assert_eq!(pb.get_row_anki_note_ids().row_data(0), Some(i32::MAX));
         assert_eq!(
-            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            subomi_app::popup_row_anki_note_id_i64(&app, 0),
             Some(large_nid)
         );
 
@@ -2531,7 +2531,7 @@ mod rich_popup_phase4_tests {
             pb.get_rich_revision(),
             pb.get_selection_revision(),
         );
-        let ref_doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let ref_doc = subomi_app::render_structured_glossary_entry_in_dirs(
             &hits[0].raw_glossary,
             &hits[0].glossary,
             None,
@@ -2564,10 +2564,10 @@ mod rich_popup_phase4_tests {
         wait_for_nested_depth(&app, 1);
         let nested_large_nid: i64 = 1_732_999_000_777;
         pb.invoke_nested_add_anki_note(0);
-        memento_app::mark_popup_term_anki_added(&app, 0, nested_large_nid, &profile, false);
+        subomi_app::mark_popup_term_anki_added(&app, 0, nested_large_nid, &profile, false);
         assert_eq!(pb.get_nested_depth(), 1);
         assert_eq!(
-            memento_app::popup_row_anki_note_id_i64(&app, 0),
+            subomi_app::popup_row_anki_note_id_i64(&app, 0),
             Some(nested_large_nid),
             "popup_row_anki_note_id_i64 must return nested row's lossless 64-bit ID when nested_depth > 0"
         );
@@ -2584,7 +2584,7 @@ mod rich_popup_phase4_tests {
                     "clicking root Update must dismiss nested popup first"
                 );
                 resolved_cl.set(
-                    memento_app::popup_row_anki_note_id_i64(&a, row_idx.max(0) as usize)
+                    subomi_app::popup_row_anki_note_id_i64(&a, row_idx.max(0) as usize)
                         .unwrap_or(0),
                 );
             }
@@ -2599,7 +2599,7 @@ mod rich_popup_phase4_tests {
         } else {
             pb.invoke_dismiss_all_nested_popups();
             assert_eq!(
-                memento_app::popup_row_anki_note_id_i64(&app, 0),
+                subomi_app::popup_row_anki_note_id_i64(&app, 0),
                 Some(large_nid)
             );
         }
@@ -2635,7 +2635,7 @@ mod rich_popup_phase4_tests {
             "KanjiStrokeOrders,36,-1,5,50,0,0,0,0,0",
         )
         .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
 
         assert_eq!(pb.get_css_headword_font_family().as_str(), "IPAexMincho");
         assert!((pb.get_css_headword_size() - 28.0).abs() < 0.2);
@@ -2649,22 +2649,22 @@ mod rich_popup_phase4_tests {
 
         // Explicit popup.css overrides must beat interface font fallbacks.
         fs::write(
-            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            fixture.config_dir.join(subomi_app::CUSTOM_POPUP_CSS_FILENAME),
             r#"
             :root { --font-family: "OverrideGlobal"; --glossary-font-size: 18px; }
             .headword { font-family: "OverrideHeadword"; font-size: 31px; }
             "#,
         )
         .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         assert_eq!(pb.get_css_font_family().as_str(), "OverrideGlobal");
         assert!((pb.get_css_glossary_font_size() - 18.0).abs() < 0.1);
         assert_eq!(pb.get_css_headword_font_family().as_str(), "OverrideHeadword");
         assert!((pb.get_css_headword_size() - 31.0).abs() < 0.1);
 
         // 4. Subtitle line spacing (interface/sub-line-spacing) increases rendered subtitle token height.
-        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
-        let sample_word = memento_app::SubtitleWord {
+        let sb = app.global::<subomi_app::SubtitleOverlayBridge>();
+        let sample_word = subomi_app::SubtitleWord {
             index: 0,
             text: "世界".into(),
             reading: "せかい".into(),
@@ -2672,7 +2672,7 @@ mod rich_popup_phase4_tests {
         };
         cfg.edit_setting("interface/sub-line-spacing", "0.0")
             .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         let m0 = sb.invoke_render_token(
             sample_word.clone(),
             36.0,
@@ -2683,7 +2683,7 @@ mod rich_popup_phase4_tests {
         );
         cfg.edit_setting("interface/sub-line-spacing", "14.0")
             .unwrap();
-        memento_app::refresh_rich_ui_bridges(&app, &cfg);
+        subomi_app::refresh_rich_ui_bridges(&app, &cfg);
         let m14 = sb.invoke_render_token(
             sample_word,
             36.0,
@@ -2709,7 +2709,7 @@ mod rich_popup_phase4_tests {
     #[test]
     fn short_popup_and_nested_popup_entries_align_to_top_of_scroll_viewport() {
         init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         let single_row = DictResult {
             index: 1,
@@ -2727,7 +2727,7 @@ mod rich_popup_phase4_tests {
             .into(),
             ..Default::default()
         };
-        memento_app::set_dictionary_rows(&app, vec![single_row.clone()]);
+        subomi_app::set_dictionary_rows(&app, vec![single_row.clone()]);
         app.set_dict_query("鳥白島".into());
         app.set_dict_reading("とりしろじま".into());
         app.set_dict_open(true);
@@ -2818,7 +2818,7 @@ mod rich_popup_phase4_tests {
         fs::write(res_dir.join("badge.svg"), svg_bytes).unwrap();
 
         let raw_with_svg = r#"[{"type":"structured-content","content":[{"tag":"span","content":[{"tag":"img","path":"badge.svg","width":24,"height":14,"appearance":"monochrome"}," そこそこ・明鏡国語辞典の鮮明な高解像度テキスト表示。"]}]}]"#;
-        let doc = memento_app::render_structured_glossary_entry_in_dirs(
+        let doc = subomi_app::render_structured_glossary_entry_in_dirs(
             raw_with_svg,
             "",
             None,
@@ -2877,14 +2877,14 @@ mod rich_popup_phase4_tests {
 
         // Verify live window ScaleFactorChanged updates GlossaryDocCacheKey (scale_quarter) cleanly:
         // 1.0 -> 1.0x, 1.25 -> 1.25x, 2.0 -> 2.0x, 2.5 -> 2.5x, 3.5 -> clamped 3.0x, while logical metrics stay constant.
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &fixture.db_path, &fixture.config_dir, &cfg);
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         let mut dict = DictController::open(&fixture.db_path).unwrap();
         let hits = dict.search("大辞泉語").to_vec();
-        set_dictionary_rows(&app, memento_app::dictionary_result_rows(&hits, &[]));
+        set_dictionary_rows(&app, subomi_app::dictionary_result_rows(&hits, &[]));
         app.set_dict_open(true);
         let pb = app.global::<PopupBridge>();
 
@@ -2940,7 +2940,7 @@ mod rich_popup_phase4_tests {
 
         // Warm glyph-cache performance check across 10 fresh uncached widths/cards.
         let sample_json = r#"[{"type":"structured-content","content":"ある程度の状態であること。まずまず。ほどほど。日本語辞書の解説文を高速に描画する。"}]"#;
-        let _ = memento_app::render_structured_glossary_entry_in_dirs(
+        let _ = subomi_app::render_structured_glossary_entry_in_dirs(
             sample_json,
             "",
             None,
@@ -2954,7 +2954,7 @@ mod rich_popup_phase4_tests {
         );
         let t0 = Instant::now();
         for i in 0..10 {
-            let _ = memento_app::render_structured_glossary_entry_in_dirs(
+            let _ = subomi_app::render_structured_glossary_entry_in_dirs(
                 sample_json,
                 "",
                 None,
@@ -2984,21 +2984,21 @@ mod rich_popup_phase4_tests {
 
         // Write user's real 2-column CSS & 560x360 popup-outer.css.
         fs::write(
-            fixture.config_dir.join(memento_app::CUSTOM_POPUP_CSS_FILENAME),
+            fixture.config_dir.join(subomi_app::CUSTOM_POPUP_CSS_FILENAME),
             ":root { --definition-columns: 2; --definition-columns-min-width: 560px; }",
         )
         .unwrap();
         fs::write(
             fixture
                 .config_dir
-                .join(memento_app::CUSTOM_POPUP_OUTER_CSS_FILENAME),
+                .join(subomi_app::CUSTOM_POPUP_OUTER_CSS_FILENAME),
             "iframe.yomitan-popup { width: 560px; height: 360px; }",
         )
         .unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
-        // Exact user memento.conf search settings: Modifier (1), Shift (2), Delay 0, Middle-mouse true.
+        // Exact user subomi.conf search settings: Modifier (1), Shift (2), Delay 0, Middle-mouse true.
         cfg.edit_setting("search/method", "1").unwrap();
         cfg.edit_setting("search/modifier", "2").unwrap();
         cfg.edit_setting("search/delay", "0").unwrap();
@@ -3017,7 +3017,7 @@ mod rich_popup_phase4_tests {
         );
         // Seed a stale subtitle hover target before opening the popup to prove glossary hover clears it
         // and Shift prioritizes the glossary word over stale subtitle hover!
-        let sub_word = memento_app::SubtitleWord {
+        let sub_word = subomi_app::SubtitleWord {
             index: 0,
             text: "意味".into(),
             reading: "いみ".into(),
@@ -3025,16 +3025,16 @@ mod rich_popup_phase4_tests {
         };
         app.set_active_sub_words(Rc::new(VecModel::from(vec![sub_word.clone()])).into());
         app.set_active_sub_lines(
-            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+            Rc::new(VecModel::from(subomi_app::subtitle_lines_for_app(
                 &app,
                 vec![sub_word.clone()],
             )))
             .into(),
         );
-        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
+        let sb = app.global::<subomi_app::SubtitleOverlayBridge>();
         sb.invoke_pointer_hovered(sub_word, 36.0, false, 10.0, 18.0, false, false, false, false);
 
-        set_dictionary_rows(&app, memento_app::dictionary_result_rows(&hits, &[]));
+        set_dictionary_rows(&app, subomi_app::dictionary_result_rows(&hits, &[]));
         app.set_dict_query("大辞泉語".into());
         app.set_dict_open(true);
         app.show().unwrap();
@@ -3062,7 +3062,7 @@ mod rich_popup_phase4_tests {
             let pos2 = touch2.absolute_position();
             let sz2 = touch2.size();
 
-            let doc1 = memento_app::render_structured_glossary_entry_in_dirs(
+            let doc1 = subomi_app::render_structured_glossary_entry_in_dirs(
                 &hits[0].raw_glossary,
                 &hits[0].glossary,
                 None,
@@ -3085,7 +3085,7 @@ mod rich_popup_phase4_tests {
                 pos1.y + cell1.y + cell1.h * 0.5,
             );
 
-            let doc2 = memento_app::render_structured_glossary_entry_in_dirs(
+            let doc2 = subomi_app::render_structured_glossary_entry_in_dirs(
                 &hits[1].raw_glossary,
                 &hits[1].glossary,
                 None,
@@ -3190,7 +3190,7 @@ mod rich_popup_phase4_tests {
             let nt_pos = nested_touch.absolute_position();
             let nt_sz = nested_touch.size();
             let kotoba_hits = dict.search("言葉").to_vec();
-            let nested_doc = memento_app::render_structured_glossary_entry_in_dirs(
+            let nested_doc = subomi_app::render_structured_glossary_entry_in_dirs(
                 &kotoba_hits[0].raw_glossary,
                 &kotoba_hits[0].glossary,
                 None,
@@ -3274,7 +3274,7 @@ mod rich_popup_phase4_tests {
             // F. Configurable `search/max-recursion-depth`:
             // Setting 0 truncates open child popup AND disables recursive scanning completely!
             cfg.edit_setting("search/max-recursion-depth", "0").unwrap();
-            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            subomi_app::refresh_rich_ui_bridges(&app, &cfg);
             assert_eq!(pb.get_nested_max_depth(), 0);
             assert_eq!(
                 pb.get_nested_depth(),
@@ -3300,7 +3300,7 @@ mod rich_popup_phase4_tests {
 
             // Setting 1 allows depth 1, blocks depth 2!
             cfg.edit_setting("search/max-recursion-depth", "1").unwrap();
-            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            subomi_app::refresh_rich_ui_bridges(&app, &cfg);
             assert_eq!(pb.get_nested_max_depth(), 1);
             app.window()
                 .dispatch_event(slint::platform::WindowEvent::PointerMoved { position: win_pt1 });
@@ -3325,11 +3325,11 @@ mod rich_popup_phase4_tests {
 
             // Setting 6 updates nested-max-depth to 6 (clamped 0..=10).
             cfg.edit_setting("search/max-recursion-depth", "6").unwrap();
-            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            subomi_app::refresh_rich_ui_bridges(&app, &cfg);
             assert_eq!(pb.get_nested_max_depth(), 6);
             cfg.edit_setting("search/max-recursion-depth", "99")
                 .unwrap();
-            memento_app::refresh_rich_ui_bridges(&app, &cfg);
+            subomi_app::refresh_rich_ui_bridges(&app, &cfg);
             assert_eq!(pb.get_nested_max_depth(), 10);
         }
     }
@@ -3342,7 +3342,7 @@ mod rich_popup_phase4_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("memento-v3-iiwake-{seq}-{nanos}"));
+        let root = std::env::temp_dir().join(format!("subomi-v3-iiwake-{seq}-{nanos}"));
         let config_dir = root.join("config");
         fs::create_dir_all(&config_dir).unwrap();
         let db_path = root.join("dictionaries.sqlite");
@@ -3364,7 +3364,7 @@ mod rich_popup_phase4_tests {
         fs::create_dir_all(&dict_resources).unwrap();
         yomidbbuilder::process_dictionary(&zip_path, &db_path, &dict_resources).unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
@@ -3384,7 +3384,7 @@ mod rich_popup_phase4_tests {
         assert_eq!(dict.last_match_units(), 4);
 
         // 1. Regular subtitle scan: clicking char 0 of "いいわけあるか〜っ!!" must highlight UTF-16 range 0..4 ("いいわけ"), NOT 0..3 ("いいわ")!
-        let sub_word = memento_app::SubtitleWord {
+        let sub_word = subomi_app::SubtitleWord {
             index: 0,
             text: subtitle_line.into(),
             reading: "".into(),
@@ -3392,7 +3392,7 @@ mod rich_popup_phase4_tests {
         };
         app.set_active_sub_words(Rc::new(VecModel::from(vec![sub_word.clone()])).into());
         app.set_active_sub_lines(
-            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+            Rc::new(VecModel::from(subomi_app::subtitle_lines_for_app(
                 &app,
                 vec![sub_word.clone()],
             )))
@@ -3402,14 +3402,14 @@ mod rich_popup_phase4_tests {
         let app_weak = app.as_weak();
         app.on_lookup_word(move |_q| {
             if let Some(a) = app_weak.upgrade() {
-                set_dictionary_rows(&a, memento_app::dictionary_result_rows(&hits_for_cb, &[]));
+                set_dictionary_rows(&a, subomi_app::dictionary_result_rows(&hits_for_cb, &[]));
                 a.set_dict_open(true);
             }
         });
-        let sb = app.global::<memento_app::SubtitleOverlayBridge>();
+        let sb = app.global::<subomi_app::SubtitleOverlayBridge>();
         sb.invoke_token_left_clicked(sub_word, 36.0, false, 6.0, 18.0);
         assert_eq!(
-            memento_app::active_subtitle_scan_utf16_range(&app),
+            subomi_app::active_subtitle_scan_utf16_range(&app),
             Some((0, 4)),
             "kana subtitle 'いいわけあるか〜っ!!' matching 言い訳(いいわけ) must highlight 0..4 (いいわけ), not 0..3 (いいわ)"
         );
@@ -3429,10 +3429,10 @@ Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0
             "Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,{subtitle_line}\n"
         );
         let ass_ctrl = Rc::new(std::cell::RefCell::new(
-            memento_app::controller::ass::AssOverlayController::new(),
+            subomi_app::controller::ass::AssOverlayController::new(),
         ));
-        let ass_params = memento_ass::MpvAssParams::for_frame(1280, 720);
-        memento_app::bind_rich_bridge_ass_controller(&app, ass_ctrl.clone());
+        let ass_params = subomi_ass::MpvAssParams::for_frame(1280, 720);
+        subomi_app::bind_rich_bridge_ass_controller(&app, ass_ctrl.clone());
         ass_ctrl.borrow_mut().sync_from_playback(
             &app,
             true,
@@ -3450,7 +3450,7 @@ Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0
         );
         let hb = hitboxes.row_data(0).unwrap();
         sb.invoke_ass_left_clicked(hb.x + 8.0, hb.y + hb.height * 0.5);
-        let active_ass = memento_app::active_ass_lookup_for_app(&app)
+        let active_ass = subomi_app::active_ass_lookup_for_app(&app)
             .expect("ASS left-click scan must establish active ASS lookup highlight");
         assert_eq!(
             active_ass.utf16_offset_in_event, 0,
@@ -3467,7 +3467,7 @@ Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0
 
         // 3. Katakana variant "イイワケあるか〜っ!!" must also match 4 UTF-16 units ("イイワケ")!
         let kata_line = "イイワケあるか〜っ!!";
-        let kata_word = memento_app::SubtitleWord {
+        let kata_word = subomi_app::SubtitleWord {
             index: 0,
             text: kata_line.into(),
             reading: "".into(),
@@ -3475,7 +3475,7 @@ Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0
         };
         app.set_active_sub_words(Rc::new(VecModel::from(vec![kata_word.clone()])).into());
         app.set_active_sub_lines(
-            Rc::new(VecModel::from(memento_app::subtitle_lines_for_app(
+            Rc::new(VecModel::from(subomi_app::subtitle_lines_for_app(
                 &app,
                 vec![kata_word.clone()],
             )))
@@ -3483,7 +3483,7 @@ Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0
         );
         sb.invoke_token_left_clicked(kata_word, 36.0, false, 6.0, 18.0);
         assert_eq!(
-            memento_app::active_subtitle_scan_utf16_range(&app),
+            subomi_app::active_subtitle_scan_utf16_range(&app),
             Some((0, 4)),
             "katakana subtitle 'イイワケあるか〜っ!!' matching 言い訳(いいわけ) must highlight 0..4"
         );

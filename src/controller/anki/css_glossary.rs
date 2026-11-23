@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use memento_anki::note::{
+use subomi_anki::note::{
     format_kanji_glossary, format_term_glossary_selected, KanjiDefEntry, TermGlossaryDef,
     TermGlossaryVariant, TermGlossaryVariants,
 };
@@ -451,21 +451,13 @@ pub(crate) fn format_context_glossary_selected(
                 return GlossaryOutput::default();
             }
             // `format_kanji_glossary` HTML-escapes dictionary names, tags, and meanings internally.
-            let dict_u16: Vec<u16> = ctx.dictionary_name.encode_utf16().collect();
-            let tags_u16: Vec<Vec<u16>> =
-                ctx.tags.iter().map(|t| t.encode_utf16().collect()).collect();
-            let tag_refs: Vec<&[u16]> = tags_u16.iter().map(Vec::as_slice).collect();
-            let items_u16: Vec<Vec<u16>> = ctx
-                .glossary_items
-                .iter()
-                .map(|m| m.encode_utf16().collect())
-                .collect();
-            let item_refs: Vec<&[u16]> = items_u16.iter().map(Vec::as_slice).collect();
-            let html = String::from_utf16_lossy(&format_kanji_glossary(&[KanjiDefEntry {
-                dictionary_name: &dict_u16,
+            let tag_refs: Vec<&str> = ctx.tags.iter().map(String::as_str).collect();
+            let item_refs: Vec<&str> = ctx.glossary_items.iter().map(String::as_str).collect();
+            let html = format_kanji_glossary(&[KanjiDefEntry {
+                dictionary_name: &ctx.dictionary_name,
                 tags: &tag_refs,
                 glossary: &item_refs,
-            }]));
+            }]);
             return fill_shared_variants(html, variants);
         }
         let selected: Vec<_> = ctx
@@ -473,50 +465,34 @@ pub(crate) fn format_context_glossary_selected(
             .iter()
             .filter(|def| dictionary_id.is_none_or(|id| def.dictionary_id == id))
             .collect();
-        let names: Vec<Vec<u16>> = selected
+        let tag_refs: Vec<Vec<&str>> = selected
             .iter()
-            .map(|d| d.dictionary_name.encode_utf16().collect())
+            .map(|d| d.tags.iter().map(String::as_str).collect())
             .collect();
-        let tag_units: Vec<Vec<Vec<u16>>> = selected
-            .iter()
-            .map(|d| d.tags.iter().map(|tag| tag.encode_utf16().collect()).collect())
-            .collect();
-        let tag_refs: Vec<Vec<&[u16]>> = tag_units
-            .iter()
-            .map(|tags| tags.iter().map(Vec::as_slice).collect())
-            .collect();
-        let meaning_units: Vec<Vec<Vec<u16>>> = selected
+        let meaning_refs: Vec<Vec<&str>> = selected
             .iter()
             .map(|d| {
                 if !d.kanji_meanings.is_empty() {
-                    d.kanji_meanings
-                        .iter()
-                        .map(|m| m.encode_utf16().collect())
-                        .collect()
+                    d.kanji_meanings.iter().map(String::as_str).collect()
                 } else {
                     d.glossary
                         .lines()
                         .map(str::trim)
                         .filter(|line| !line.is_empty())
-                        .map(|m| m.encode_utf16().collect())
                         .collect()
                 }
             })
             .collect();
-        let meaning_refs: Vec<Vec<&[u16]>> = meaning_units
-            .iter()
-            .map(|items| items.iter().map(Vec::as_slice).collect())
-            .collect();
         let defs: Vec<KanjiDefEntry<'_>> = selected
             .iter()
             .enumerate()
-            .map(|(i, _)| KanjiDefEntry {
-                dictionary_name: &names[i],
+            .map(|(i, d)| KanjiDefEntry {
+                dictionary_name: &d.dictionary_name,
                 tags: &tag_refs[i],
                 glossary: &meaning_refs[i],
             })
             .collect();
-        let html = String::from_utf16_lossy(&format_kanji_glossary(&defs));
+        let html = format_kanji_glossary(&defs);
         return fill_shared_variants(html, variants);
     }
 
@@ -534,44 +510,30 @@ pub(crate) fn format_context_glossary_selected(
         return GlossaryOutput::default();
     }
     // `format_term_glossary_selected` HTML-escapes `dict_name` and `tags` internally.
-    let names: Vec<Vec<u16>> = selected
+    let fallback_html: Vec<Option<String>> = selected
         .iter()
-        .map(|d| d.dictionary_name.encode_utf16().collect())
+        .map(|d| d.rendered_items.is_empty().then(|| definition_html(d)))
         .collect();
-    let items: Vec<Vec<Vec<u16>>> = selected
+    let item_refs: Vec<Vec<&str>> = selected
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             if !d.rendered_items.is_empty() {
-                d.rendered_items
-                    .iter()
-                    .map(|item| item.encode_utf16().collect())
-                    .collect()
+                d.rendered_items.iter().map(String::as_str).collect()
             } else {
-                vec![definition_html(d).encode_utf16().collect()]
+                vec![fallback_html[i].as_deref().unwrap_or("")]
             }
         })
         .collect();
-    let item_refs: Vec<Vec<&[u16]>> = items
+    let tag_refs: Vec<Vec<&str>> = selected
         .iter()
-        .map(|list| list.iter().map(Vec::as_slice).collect())
-        .collect();
-    let tag_units: Vec<Vec<Vec<u16>>> = selected
-        .iter()
-        .map(|d| d.tags.iter().map(|tag| tag.encode_utf16().collect()).collect())
-        .collect();
-    let tag_refs: Vec<Vec<&[u16]>> = tag_units
-        .iter()
-        .map(|tags| tags.iter().map(Vec::as_slice).collect())
-        .collect();
-    let style_units: Vec<Vec<u16>> = selected
-        .iter()
-        .map(|d| d.stylesheet.encode_utf16().collect())
+        .map(|d| d.tags.iter().map(String::as_str).collect())
         .collect();
     let definitions: Vec<TermGlossaryDef<'_>> = selected
         .iter()
         .enumerate()
         .map(|(i, definition)| TermGlossaryDef {
-            dict_name: &names[i],
+            dict_name: &definition.dictionary_name,
             dict_id: if definition.dictionary_id != 0 {
                 definition.dictionary_id
             } else {
@@ -579,27 +541,15 @@ pub(crate) fn format_context_glossary_selected(
             },
             tags: &tag_refs[i],
             items: &item_refs[i],
-            has_styles: !style_units[i].is_empty(),
-            stylesheet: &style_units[i],
+            has_styles: !definition.stylesheet.is_empty(),
+            stylesheet: &definition.stylesheet,
         })
         .collect();
     let out = format_term_glossary_selected(&definitions, variants);
     GlossaryOutput {
-        glossary: if variants.full {
-            String::from_utf16_lossy(&out.glossary)
-        } else {
-            String::new()
-        },
-        glossary_brief: if variants.brief {
-            String::from_utf16_lossy(&out.glossary_brief)
-        } else {
-            String::new()
-        },
-        glossary_compact: if variants.compact {
-            String::from_utf16_lossy(&out.glossary_compact)
-        } else {
-            String::new()
-        },
+        glossary: out.glossary,
+        glossary_brief: out.glossary_brief,
+        glossary_compact: out.glossary_compact,
     }
 }
 
@@ -630,41 +580,23 @@ fn format_glossary_selected(
     if items.is_empty() || variants.is_empty() {
         return GlossaryOutput::default();
     }
-    let dict_name_u16: Vec<u16> = dict_name.encode_utf16().collect();
-    let tags_u16: Vec<Vec<u16>> = tags.iter().map(|t| t.encode_utf16().collect()).collect();
-    let tags_refs: Vec<&[u16]> = tags_u16.iter().map(Vec::as_slice).collect();
-    let items_u16: Vec<Vec<u16>> = items.iter().map(|it| it.encode_utf16().collect()).collect();
-    let items_refs: Vec<&[u16]> = items_u16.iter().map(Vec::as_slice).collect();
-
     let def = TermGlossaryDef {
-        dict_name: &dict_name_u16,
+        dict_name,
         dict_id: 1,
-        tags: &tags_refs,
-        items: &items_refs,
+        tags,
+        items,
         has_styles: false,
-        stylesheet: &[],
+        stylesheet: "",
     };
     let out = format_term_glossary_selected(&[def], variants);
     GlossaryOutput {
-        glossary: if variants.full {
-            String::from_utf16_lossy(&out.glossary)
-        } else {
-            String::new()
-        },
-        glossary_brief: if variants.brief {
-            String::from_utf16_lossy(&out.glossary_brief)
-        } else {
-            String::new()
-        },
-        glossary_compact: if variants.compact {
-            String::from_utf16_lossy(&out.glossary_compact)
-        } else {
-            String::new()
-        },
+        glossary: out.glossary,
+        glossary_brief: out.glossary_brief,
+        glossary_compact: out.glossary_compact,
     }
 }
 
-/// Formats glossary definition items into Memento's HTML representation.
+/// Formats glossary definition items into Subomi's HTML representation.
 pub fn format_glossary(items: &[&str], dict_name: &str, tags: &[&str]) -> GlossaryOutput {
     format_glossary_selected(items, dict_name, tags, TermGlossaryVariants::ALL)
 }

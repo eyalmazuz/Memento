@@ -1,7 +1,7 @@
 import { LineEdit, ListView } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { IconButton } from "../components/buttons.slint";
-import { MementoCheckBox } from "../components/controls.slint";
+import { SubomiCheckBox } from "../components/controls.slint";
 import { SubEntry } from "types.slint";
 
 // ── Subtitle Drawer Panel ───────────────────────────────────────────────
@@ -20,11 +20,11 @@ export component SubtitleDrawerPanel inherits Rectangle {
     in-out property <bool> show-timestamps: false;
     in-out property <bool> ignore-whitespace: false;
     in-out property <bool> auto-seek: false;
-    in property <color> bg-color: MementoPalette.surface-bg;
-    in property <color> text-color: MementoPalette.text;
-    in property <color> hover-color: MementoPalette.list-hover;
-    in property <color> selected-color: MementoPalette.accent-muted;
-    in property <color> selected-hover-color: MementoPalette.accent-muted-hover;
+    in property <color> bg-color: SubomiPalette.surface-bg;
+    in property <color> text-color: SubomiPalette.text;
+    in property <color> hover-color: SubomiPalette.list-hover;
+    in property <color> selected-color: SubomiPalette.accent-muted;
+    in property <color> selected-hover-color: SubomiPalette.accent-muted-hover;
     in property <string> primary-font-family: "";
     in property <length> primary-font-size: 13px;
     in property <bool> primary-font-bold: false;
@@ -96,7 +96,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
 
     background: root.bg-color;
     border-width: 1px;
-    border-color: MementoPalette.border;
+    border-color: SubomiPalette.border;
 
     drawer-bg-touch := TouchArea {
         width: 100%;
@@ -128,7 +128,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         ? root.selected-color
                         : (prim-tab-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
-                    border-color: root.active-tab == 0 ? MementoPalette.cyan-accent : MementoPalette.border;
+                    border-color: root.active-tab == 0 ? SubomiPalette.cyan-accent : SubomiPalette.border;
                     animate background { duration: 100ms; }
                     Text {
                         text: "Primary";
@@ -159,7 +159,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         ? root.selected-color
                         : (sec-tab-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
-                    border-color: root.active-tab == 1 ? MementoPalette.cyan-accent : MementoPalette.border;
+                    border-color: root.active-tab == 1 ? SubomiPalette.cyan-accent : SubomiPalette.border;
                     animate background { duration: 100ms; }
                     Text {
                         text: "Secondary";
@@ -191,7 +191,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         ? root.selected-color
                         : (time-toggle-touch.has-hover ? root.hover-color : transparent);
                     border-width: 1px;
-                    border-color: root.show-timestamps ? MementoPalette.cyan-accent : MementoPalette.border;
+                    border-color: root.show-timestamps ? SubomiPalette.cyan-accent : SubomiPalette.border;
                     accessible-role: checkbox;
                     accessible-label: "Show timestamps";
                     accessible-checked: root.show-timestamps;
@@ -208,8 +208,8 @@ export component SubtitleDrawerPanel inherits Rectangle {
                                 height: 6px;
                                 border-radius: 3px;
                                 background: root.show-timestamps
-                                    ? MementoPalette.cyan-accent
-                                    : MementoPalette.text-muted;
+                                    ? SubomiPalette.cyan-accent
+                                    : SubomiPalette.text-muted;
                             }
                         }
                         Text {
@@ -259,11 +259,11 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     height: max(24px, cue-text.preferred-height + 6px);
                     border-radius: 4px;
                     border-width: entry.search-match ? (idx == root.focused-match-row ? 2px : 1px) : 0px;
-                    border-color: idx == root.focused-match-row ? MementoPalette.cyan-accent : MementoPalette.warning-border;
+                    border-color: idx == root.focused-match-row ? SubomiPalette.cyan-accent : SubomiPalette.warning-border;
                     background: entry.selected
                         ? (d-touch.has-hover ? root.selected-hover-color : root.selected-color)
                         : (entry.is_active
-                            ? MementoPalette.success-bg
+                            ? SubomiPalette.success-bg
                             : (d-touch.has-hover ? root.hover-color : transparent));
 
                     // Subtle row separation hairline
@@ -272,7 +272,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         y: 0px;
                         width: parent.width - 16px;
                         height: 1px;
-                        background: MementoPalette.border;
+                        background: SubomiPalette.border;
                         opacity: 0.45;
                     }
 
@@ -282,7 +282,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         y: 3px;
                         width: 3px;
                         height: parent.height - 6px;
-                        background: MementoPalette.active-cue;
+                        background: SubomiPalette.active-cue;
                         border-radius: 1.5px;
                     }
 
@@ -304,7 +304,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                             font-family: "monospace";
                             font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
                             font-weight: 600;
-                            color: entry.selected ? MementoPalette.success-text : root.text-color;
+                            color: entry.selected ? SubomiPalette.success-text : root.text-color;
                             opacity: entry.selected ? 1.0 : 0.72;
                             text: entry.timestamp;
                         }
@@ -387,7 +387,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                 }
             }
 
-            // Bottom Search Bar + Clear + Match Counter + Prev/Next IconButtons + MementoCheckBox options
+            // Bottom Search Bar + Clear + Match Counter + Prev/Next IconButtons + SubomiCheckBox options
             VerticalLayout {
                 spacing: 6px;
 
@@ -428,7 +428,7 @@ export component SubtitleDrawerPanel inherits Rectangle {
                                 : "0 of 0";
                             font-family: "monospace";
                             font-size: 11px;
-                            color: root.total-matches > 0 ? MementoPalette.text-secondary : MementoPalette.text-muted;
+                            color: root.total-matches > 0 ? SubomiPalette.text-secondary : SubomiPalette.text-muted;
                             vertical-alignment: center;
                             min-width: 42px;
                             horizontal-alignment: center;
@@ -461,18 +461,18 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     }
                 }
 
-                // Ignore Whitespace & Auto Seek via shared MementoCheckBox (>= 24px hit targets)
+                // Ignore Whitespace & Auto Seek via shared SubomiCheckBox (>= 24px hit targets)
                 HorizontalLayout {
                     spacing: 14px;
                     alignment: start;
 
-                    MementoCheckBox {
+                    SubomiCheckBox {
                         label: "Ignore Whitespace";
                         checked <=> root.ignore-whitespace;
                         toggled(val) => { root.ignore-whitespace-changed(val); }
                     }
 
-                    MementoCheckBox {
+                    SubomiCheckBox {
                         label: "Auto Seek";
                         checked <=> root.auto-seek;
                         toggled(val) => { root.auto-seek-changed(val); }

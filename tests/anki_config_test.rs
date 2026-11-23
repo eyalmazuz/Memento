@@ -1,10 +1,10 @@
-//! Integration tests for AnkiController and ConfigController in memento-app.
+//! Integration tests for AnkiController and ConfigController in subomi-app.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use memento_app::controller::anki::{
+use subomi_app::controller::anki::{
     apply_subtitle_cloze, build_entry_find_query, build_note_payload_from_profile,
     create_cloze_sentence, default_note_fields, escape_anki_search_term, filter_subtitle_text,
     format_cloze, format_cloze_with_hint, format_expression_furigana, format_glossary,
@@ -14,14 +14,14 @@ use memento_app::controller::anki::{
     AnkiController, AnkiNoteContext, AnkiUpdateMode, EntryAnkiStatus, GlossaryDefinition,
     NoteFieldsContext, NotePayload,
 };
-use memento_app::controller::config::{
+use subomi_app::controller::config::{
     anki_note_preset_fields, AnkiNoteConfig, AnkiNotePreset, ConfigController,
 };
-use memento_config::{ArgbColor, QtFontSpec, Value};
-use memento_net::anki::AnkiEndpoint;
+use subomi_config::{ArgbColor, FontSpec, Value};
+use subomi_net::anki::AnkiEndpoint;
 
 fn temp_test_dir(sub: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("memento_app_test_{}_{}", sub, std::process::id()));
+    let dir = std::env::temp_dir().join(format!("subomi_app_test_{}_{}", sub, std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("failed to create temp test directory");
     dir
@@ -113,7 +113,7 @@ fn test_config_recent_files_cap_and_dedup() {
 #[test]
 fn test_recent_files_round_trip_preserves_commas_and_order() {
     let temp_dir = temp_test_dir("save_load");
-    let file_name = "memento.conf";
+    let file_name = "subomi.conf";
 
     let ctrl = ConfigController::new();
     ctrl.recent_files_add("/path/to/video_a.mp4").unwrap();
@@ -172,7 +172,7 @@ fn profile_note_uses_selection_and_context_with_empty_unavailable_fields() {
         deck: "Japanese".into(),
         model: "Vocabulary".into(),
         field_templates: fields,
-        tags: vec!["memento".into()],
+        tags: vec!["subomi".into()],
         duplicate_policy: 1,
         screenshot_type: 0,
         audio_pad_start: 0.0,
@@ -248,7 +248,7 @@ fn filtered_primary_glossary_keeps_other_dictionaries_available() {
 #[test]
 fn lapis_pitch_and_frequency_fields_use_dictionary_metadata() {
     let mut ctx = NoteFieldsContext::new("食べる", "たべる", "パンを食べる。");
-    ctx.pitch_positions = "<span class=\"memento-pitch-position\">[2]</span>".into();
+    ctx.pitch_positions = "<span class=\"subomi-pitch-position\">[2]</span>".into();
     ctx.pitch_categories = "kifuku".into();
     ctx.frequency_harmonic_rank = "144".into();
     let fields = HashMap::from([
@@ -338,14 +338,14 @@ fn test_anki_glossary_formatting() {
     let items = ["to eat", "to consume", "to live on"];
     let out = format_glossary(&items, "JMdict", &["v1", "trans"]);
 
-    // Matches Memento glossary open & close HTML structure
-    assert!(out.glossary.starts_with("<div class=\"yomitan-glossary memento-glossary\"><ol>"));
+    // Matches Subomi glossary open & close HTML structure
+    assert!(out.glossary.starts_with("<div class=\"yomitan-glossary subomi-glossary\"><ol>"));
     assert!(out.glossary.contains("<li data-dictionary=\"JMdict\">"));
     assert!(out.glossary.contains("v1, trans, JMdict"));
     assert!(out.glossary.contains("to eat"));
     assert!(out.glossary.contains("to consume"));
     assert!(out.glossary.contains("to live on"));
-    assert!(out.glossary.ends_with(".memento-glossary td {border-style: solid;padding: 0.25em;vertical-align: top;border-width: 1px;border-color: currentColor;}</style></ol></div>"));
+    assert!(out.glossary.ends_with(".subomi-glossary td {border-style: solid;padding: 0.25em;vertical-align: top;border-width: 1px;border-color: currentColor;}</style></ol></div>"));
 
     // Brief glossary formatting
     assert!(out.glossary_brief.contains("<li>to eat</li>"));
@@ -459,7 +459,7 @@ fn test_anki_note_field_mapping_and_payload_generation() {
     assert!(json_str.contains("\"fields\":{"));
     assert!(json_str.contains("\"tags\":[\"JLPT-N5\"]"));
 
-    // Payload metadata integration with memento-anki
+    // Payload metadata integration with subomi-anki
     let metadata = payload.to_anki_metadata();
     assert_eq!(metadata.len(), 5); // deckName, modelName, tags, options, fields
 }
@@ -515,7 +515,7 @@ fn selection_stays_empty_and_falls_through_clipboard_to_glossary() {
 
 #[test]
 fn multi_subtitle_cloze_and_secondary_context_match_active_cue() {
-    use memento_app::controller::subtitles::create_cue;
+    use subomi_app::controller::subtitles::create_cue;
 
     // Three marked cues, each containing "食べました"; active cue is index 1 (#173).
     let cues = vec![
@@ -633,7 +633,7 @@ fn invalid_glossary_dict_id_emits_error_string() {
 
 #[test]
 fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequencies() {
-    use memento_dict::yomidbbuilder::{dictionary_resource_dir, prepare_db};
+    use subomi_dict::yomidbbuilder::{dictionary_resource_dir, prepare_db};
     use std::io::Write;
     use std::net::TcpListener;
 
@@ -644,7 +644,7 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     prepare_db(&db_path).unwrap();
 
     // Populate SQLite directly using read-write connection
-    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
     conn.execute(
         "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (7, 'Jitendex', 3, '1', 1);",
         [],
@@ -767,7 +767,7 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
             ("AverageOcc".into(), "{frequency-average-occurrence}".into()),
             ("Clipboard".into(), "{clipboard}".into()),
         ]),
-        tags: vec!["memento".into()],
+        tags: vec!["subomi".into()],
         duplicate_policy: 1,
         screenshot_type: 0,
         audio_pad_start: 0.0,
@@ -793,7 +793,7 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     assert_eq!(payload.fields["Tags"], "<ul><li>P: Common word</li></ul>");
     assert_eq!(payload.fields["TagsBrief"], "<ul><li>P</li></ul>");
     assert_eq!(payload.fields["POS"], "v1");
-    assert!(payload.fields["PitchGraphs"].contains("<span class=\"memento-pitch-graph\"><svg"));
+    assert!(payload.fields["PitchGraphs"].contains("<span class=\"subomi-pitch-graph\"><svg"));
     assert_eq!(payload.fields["PitchCategories"], "kifuku");
     assert!(payload.fields["FreqAll"].contains("Jitendex: 100"));
     assert!(payload.fields["FreqAll"].contains("FreqDict2: 300"));
@@ -908,13 +908,13 @@ fn scope_dictionary_css_handles_media_queries_and_existing_data_dictionary_selec
 
 #[test]
 fn sqlite_selected_occurrences_orders_by_score_desc_and_isolates_rules_for_pitch_categories() {
-    use memento_dict::yomidbbuilder::prepare_db;
+    use subomi_dict::yomidbbuilder::prepare_db;
 
     let temp_dir = temp_test_dir("sqlite_anki_score_and_rules");
     let db_path = temp_dir.join("dictionaries.sqlite");
     prepare_db(&db_path).unwrap();
 
-    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
     conn.execute(
         "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES \
          (1, 'DictA', 3, '1', 1), \
@@ -1027,7 +1027,7 @@ fn one_click_anki_note_presets_populate_all_five_note_types() {
         }
     }
 
-    // Verify all required Memento markers are covered across the presets.
+    // Verify all required Subomi markers are covered across the presets.
     let all_markers: Vec<&str> = presets
         .iter()
         .flat_map(|(_, v)| anki_note_preset_fields(*v).into_iter().map(|(_, m)| m))
@@ -1097,7 +1097,7 @@ fn anki_show_tag_toggle_and_profile_switching_persist() {
     ctrl.edit_setting("anki/profile", "Default").unwrap();
     assert!(ctrl.anki_show_tag());
 
-    ctrl.apply_settings(0, &dir, "memento.conf", &anki_path)
+    ctrl.apply_settings(0, &dir, "subomi.conf", &anki_path)
         .unwrap();
     let reloaded = ConfigController::new();
     reloaded.load_anki_profiles(&anki_path).unwrap();
@@ -1124,16 +1124,16 @@ fn structured_interface_font_color_keybind_and_osc_limits_work_end_to_end() {
         .unwrap();
     ctrl.edit_setting("subtitle-list/auto-seek", "true").unwrap();
 
-    ctrl.apply_settings(3, &dir, "memento.conf", &anki_path).unwrap();
-    ctrl.apply_settings(5, &dir, "memento.conf", &anki_path).unwrap();
+    ctrl.apply_settings(3, &dir, "subomi.conf", &anki_path).unwrap();
+    ctrl.apply_settings(5, &dir, "subomi.conf", &anki_path).unwrap();
 
-    let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+    let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
     let font_val = match reloaded.effective_setting("interface", "sub-font") {
         Some(Value::Text(t)) => t,
         other => panic!("unexpected font value: {other:?}"),
     };
-    let parsed_font = QtFontSpec::parse(&font_val).unwrap();
-    assert_eq!(parsed_font, QtFontSpec::new("Noto Sans CJK JP", 26.0, true, true));
+    let parsed_font = FontSpec::parse(&font_val).unwrap();
+    assert_eq!(parsed_font, FontSpec::new("Noto Sans CJK JP", 26.0, true, true));
 
     let color_val = match reloaded.effective_setting("interface", "sub-text-color") {
         Some(Value::Text(t)) => t,
@@ -1191,7 +1191,7 @@ fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_po
             ("ExpressionReading".into(), "{reading}".into()),
             ("Glossary".into(), "{glossary}".into()),
         ]),
-        tags: vec!["memento".into()],
+        tags: vec!["subomi".into()],
         duplicate_policy: 1, // DifferentDeck
         screenshot_type: 0,
         audio_pad_start: 0.0,
@@ -1332,13 +1332,13 @@ fn check_entries_anki_status_batches_can_add_find_notes_and_notes_info_across_po
 
 #[test]
 fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
-    use memento_app::controller::dict::DictController;
-    use memento_app::{
+    use subomi_app::controller::dict::DictController;
+    use subomi_app::{
         bind_rich_bridge_lookup_epoch, dictionary_result_rows, install_popup_navigation,
         install_rich_ui_bridges, mark_popup_term_anki_added, refresh_rich_ui_bridges,
-        set_dictionary_rows, MementoApp, PopupBridge,
+        set_dictionary_rows, SubomiApp, PopupBridge,
     };
-    use memento_dict::yomidbbuilder::prepare_db;
+    use subomi_dict::yomidbbuilder::prepare_db;
     use slint::{ComponentHandle, Model};
     use std::io::Write;
     use std::net::TcpListener;
@@ -1355,7 +1355,7 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
     let db_path = dir.join("dictionaries.sqlite");
     prepare_db(&db_path).unwrap();
 
-    let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+    let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
     conn.execute(
         "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (1, 'Jitendex', 3, '1', 1);",
         [],
@@ -1488,10 +1488,10 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
         .set_anki_model_fields("kanji", &["Character".into(), "Meaning".into()])
         .unwrap();
     config
-        .apply_settings(0, &config_dir, "memento.conf", &config_dir.join("anki_connect.json"))
+        .apply_settings(0, &config_dir, "subomi.conf", &config_dir.join("anki_connect.json"))
         .unwrap();
 
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     app.set_anki_enabled(true);
     let lookup_epoch = Arc::new(AtomicU64::new(1));
@@ -1626,7 +1626,7 @@ fn entry_anki_status_primary_note_id_and_subtitle_filter_helpers() {
         can_add: false,
         is_duplicate: true,
         note_ids: vec![1669909161234, 1669909161239],
-        tags: vec!["memento".into()],
+        tags: vec!["subomi".into()],
         browse_query: "nid:1669909161234 or nid:1669909161239".into(),
     };
     assert_eq!(populated.primary_note_id(), Some(1669909161234));
@@ -1678,7 +1678,7 @@ fn entry_anki_status_primary_note_id_and_subtitle_filter_helpers() {
 
 #[test]
 fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
-    use memento_net::anki::AnkiNoteInfo;
+    use subomi_net::anki::AnkiNoteInfo;
 
     let profile = AnkiNoteConfig {
         enabled: true,
@@ -1694,7 +1694,7 @@ fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
             ("Notes".into(), "{clipboard}".into()),
             ("NotOnModel".into(), "{title}".into()),
         ]),
-        tags: vec!["memento".into(), "Mining".into(), "anime".into()],
+        tags: vec!["subomi".into(), "Mining".into(), "anime".into()],
         duplicate_policy: 1,
         screenshot_type: 0,
         audio_pad_start: 0.0,
@@ -1749,7 +1749,7 @@ fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
     assert_eq!(overwrite.fields["Picture"], "", "media-only field cleared so new picture replaces old");
     assert_eq!(overwrite.picture.len(), 1);
     assert_eq!(overwrite.audio.len(), 1);
-    assert_eq!(overwrite.new_tags, vec!["memento", "anime"]);
+    assert_eq!(overwrite.new_tags, vec!["subomi", "anime"]);
 
     // 2. FillEmptyOnly: only fills empty MainDefinition and empty SentenceAudio;
     //    leaves populated Sentence, Notes, and Picture untouched!
@@ -1761,7 +1761,7 @@ fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
     assert!(fill.fields["MainDefinition"].as_str().unwrap().contains("to eat"));
     assert!(fill.picture.is_empty(), "existing Picture must not receive new attachment in FillEmptyOnly");
     assert_eq!(fill.audio.len(), 1, "empty SentenceAudio must receive new attachment");
-    assert_eq!(fill.new_tags, vec!["memento", "anime"]);
+    assert_eq!(fill.new_tags, vec!["subomi", "anime"]);
 
     // 3. AppendOrFill: appends Sentence with `<br>`, fills empty MainDefinition,
     //    never appends to Expression sort field, and leaves Picture uncleared so Anki appends media!
@@ -1776,18 +1776,18 @@ fn merge_note_update_modes_preserve_sort_field_and_populated_fields() {
 
 #[test]
 fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_adds_tags() {
-    use memento_app::controller::anki_media::NoteMediaInput;
-    use memento_app::controller::config::AudioSourceEntry;
-    use memento_net::anki::MediaFilePayload;
-    use memento_player::RawFrame;
-    use memento_setting::enums::AudioSourceType;
+    use subomi_app::controller::anki_media::NoteMediaInput;
+    use subomi_app::controller::config::AudioSourceEntry;
+    use subomi_net::anki::MediaFilePayload;
+    use subomi_player::RawFrame;
+    use subomi_setting::enums::AudioSourceType;
     use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
 
     // Local word audio file for `{audio}` capture
     let audio_path = std::env::temp_dir().join(format!(
-        "memento-update-note-audio-{}.mp3",
+        "subomi-update-note-audio-{}.mp3",
         std::process::id()
     ));
     fs::write(&audio_path, b"ID3updated-word-audio").unwrap();
@@ -1850,7 +1850,7 @@ fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_ad
                 _ => {
                     assert_eq!(action, "addTags");
                     assert_eq!(body["params"]["notes"], serde_json::json!([1669909161234_i64]));
-                    assert_eq!(body["params"]["tags"], "memento");
+                    assert_eq!(body["params"]["tags"], "subomi");
                     serde_json::json!({ "error": null, "result": null }).to_string()
                 }
             };
@@ -1882,7 +1882,7 @@ fn update_existing_note_with_media_uploads_glossary_images_updates_fields_and_ad
             ("WordAudio".into(), "{audio}".into()),
             ("Notes".into(), "{clipboard}".into()),
         ]),
-        tags: vec!["existing".into(), "memento".into()],
+        tags: vec!["existing".into(), "subomi".into()],
         duplicate_policy: 1,
         screenshot_type: 1,
         audio_pad_start: 0.0,

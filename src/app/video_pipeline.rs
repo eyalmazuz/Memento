@@ -11,9 +11,9 @@ use slint::{ComponentHandle, Model as _, Rgba8Pixel, SharedPixelBuffer};
 use crate::app::window_chrome::native_window_display_pointers;
 use crate::controller::player::compute_video_render_size;
 use crate::platform_renderer::{PlatformRendererConfig, PlatformRendererKind};
-use crate::ui::MementoApp;
+use crate::ui::SubomiApp;
 use crate::video_gl::{self, GlCapabilities};
-use memento_player::MpvInstance;
+use subomi_player::MpvInstance;
 
 /// Non-blocking observer of `video-params/{primaries,gamma,pixelformat,hw-pixelformat}`
 /// backed by a weak libmpv client created before OpenGL activation.
@@ -22,7 +22,7 @@ use memento_player::MpvInstance;
 /// deadlocks with `MPV_RENDER_PARAM_ADVANCED_CONTROL`), and explicitly closed on
 /// shutdown before `MpvInstance::drop`.
 pub(crate) struct VideoParamsObserver {
-    handle: Option<*mut memento_player::mpv::ffi::mpv_handle>,
+    handle: Option<*mut subomi_player::mpv::ffi::mpv_handle>,
     primaries: Option<String>,
     gamma: Option<String>,
     pixelformat: Option<String>,
@@ -44,14 +44,14 @@ impl VideoParamsObserver {
 
     /// Attach a weak client to `player` before OpenGL rendering starts.
     pub(crate) fn attach(player: &MpvInstance) -> Self {
-        use memento_player::mpv::ffi;
+        use subomi_player::mpv::ffi;
 
         let raw_parent = player.raw_handle();
         if raw_parent.is_null() {
             return Self::disabled();
         }
         let weak =
-            unsafe { ffi::mpv_create_weak_client(raw_parent, c"memento-fbo-format".as_ptr()) };
+            unsafe { ffi::mpv_create_weak_client(raw_parent, c"subomi-fbo-format".as_ptr()) };
         if weak.is_null() {
             return Self::disabled();
         }
@@ -82,7 +82,7 @@ impl VideoParamsObserver {
 
     /// Drain any pending `video-params/*` property changes without blocking.
     pub(crate) fn poll(&mut self) {
-        use memento_player::mpv::ffi;
+        use subomi_player::mpv::ffi;
 
         let Some(handle) = self.handle else {
             return;
@@ -150,7 +150,7 @@ impl VideoParamsObserver {
     pub(crate) fn close(&mut self) {
         if let Some(handle) = self.handle.take() {
             unsafe {
-                memento_player::mpv::ffi::mpv_destroy(handle);
+                subomi_player::mpv::ffi::mpv_destroy(handle);
             }
         }
     }
@@ -212,7 +212,7 @@ impl VideoTimings {
 
     pub(crate) fn report(
         &mut self,
-        state: &memento_player::mpv::PlaybackState,
+        state: &subomi_player::mpv::PlaybackState,
         drops_changed: bool,
         verbose: bool,
         pending: Duration,
@@ -541,7 +541,7 @@ fn build_owned_gl_proc_resolver_macos(
     }
 }
 
-fn video_render_size(app: &MementoApp, player: &MpvInstance, opengl_active: bool) -> (u32, u32) {
+fn video_render_size(app: &SubomiApp, player: &MpvInstance, opengl_active: bool) -> (u32, u32) {
     compute_video_render_size(
         app.get_video_width(),
         app.get_video_height(),
@@ -553,7 +553,7 @@ fn video_render_size(app: &MementoApp, player: &MpvInstance, opengl_active: bool
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_video_pipeline(
-    app: &MementoApp,
+    app: &SubomiApp,
     mpv: Rc<RefCell<Option<MpvInstance>>>,
     video_timings: Rc<RefCell<VideoTimings>>,
     pending_playback_frame: Rc<Cell<Option<i32>>>,
@@ -791,7 +791,7 @@ pub(crate) fn install_video_pipeline(
                         let presented_at = Instant::now();
                         let timings = notifier_timings.clone();
                         // Only schedule the zero-delay presentation probe when verbose video
-                        // diagnostics (`MEMENTO_VIDEO_STATS`) are explicitly enabled.
+                        // diagnostics (`SUBOMI_VIDEO_STATS`) are explicitly enabled.
                         slint::Timer::single_shot(Duration::ZERO, move || {
                             let mut timings = timings.borrow_mut();
                             timings.present_max = timings.present_max.max(presented_at.elapsed());

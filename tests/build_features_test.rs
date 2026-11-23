@@ -1,6 +1,6 @@
 //! Feature combinations must work with settings saved by a different build.
-use memento_app::controller::asr::{AsrSettings, AVAILABLE};
-use memento_config::{
+use subomi_app::controller::asr::{AsrSettings, AVAILABLE};
+use subomi_config::{
     config::Config,
     keys::{raw, AsrField, Key},
 };
@@ -21,17 +21,17 @@ fn persisted_asr_settings_respect_compiled_backends() {
         }
         let settings = result.unwrap();
         let selected = match settings.backend {
-            memento_app::controller::asr::AsrBackend::Whisper => raw::asr::BACKEND_WHISPER,
-            memento_app::controller::asr::AsrBackend::Onnx => raw::asr::BACKEND_ONNX,
+            subomi_app::controller::asr::AsrBackend::Whisper => raw::asr::BACKEND_WHISPER,
+            subomi_app::controller::asr::AsrBackend::Onnx => raw::asr::BACKEND_ONNX,
         };
-        assert!(memento_app::controller::asr::backend_available(selected));
-        if memento_app::controller::asr::backend_available(saved) {
+        assert!(subomi_app::controller::asr::backend_available(selected));
+        if subomi_app::controller::asr::backend_available(saved) {
             assert_eq!(selected, saved);
         }
         // Falling back for this build must not overwrite the user's preference.
         assert_eq!(
             config.get_at(raw::asr::GROUP, raw::asr::BACKEND),
-            Some(memento_config::Value::Text(saved.into()))
+            Some(subomi_config::Value::Text(saved.into()))
         );
     }
 }
@@ -39,7 +39,7 @@ fn persisted_asr_settings_respect_compiled_backends() {
 #[cfg(feature = "asr-onnx")]
 #[test]
 fn downloaded_onnx_runtime_exposes_the_required_api() {
-    use memento_asr_onnx::ort_sys::OrtGetApiBase;
+    use subomi_asr_onnx::ort_sys::OrtGetApiBase;
     unsafe {
         let base = OrtGetApiBase();
         assert!(!base.is_null());
@@ -50,8 +50,8 @@ fn downloaded_onnx_runtime_exposes_the_required_api() {
 #[cfg(feature = "asr-onnx")]
 #[test]
 fn onnx_asr_feature_links_and_initializes_without_env_overrides() {
-    use memento_app::controller::asr::{backend_available, AsrController, AVAILABLE};
-    use memento_asr_onnx::{
+    use subomi_app::controller::asr::{backend_available, AsrController, AVAILABLE};
+    use subomi_asr_onnx::{
         engine::{Engine, Options},
         ort_sys::{OrtGetApiBase, OrtRunOptions},
     };
@@ -102,18 +102,18 @@ fn onnx_asr_feature_links_and_initializes_without_env_overrides() {
 #[test]
 fn compiled_whisper_library_exposes_the_required_api() {
     unsafe {
-        let version = memento_asr_whisper::whisper_sys::whisper_version();
+        let version = subomi_asr_whisper::whisper_sys::whisper_version();
         assert!(!version.is_null());
         // The upstream v1.9.4 tag reports "1.9.4-dev" in whisper_version().
         assert_eq!(std::ffi::CStr::from_ptr(version).to_str().unwrap().split('-').next(), Some("1.9.4"));
-        let _ = memento_asr_whisper::whisper_sys::whisper_vad_default_context_params();
+        let _ = subomi_asr_whisper::whisper_sys::whisper_vad_default_context_params();
     }
 }
 
 #[cfg(feature = "asr-whisper")]
 #[test]
 fn whisper_asr_feature_links_and_initializes_without_env_overrides() {
-    use memento_app::controller::asr::{
+    use subomi_app::controller::asr::{
         backend_available, whisper_gpu_device_count, AsrController, AVAILABLE,
     };
 
@@ -122,9 +122,9 @@ fn whisper_asr_feature_links_and_initializes_without_env_overrides() {
     let _gpu_count = whisper_gpu_device_count();
 
     unsafe {
-        let ctx_params = memento_asr_whisper::whisper_sys::whisper_context_default_params();
-        let full_params = memento_asr_whisper::whisper_sys::whisper_full_default_params(
-            memento_asr_whisper::whisper_sys::whisper_sampling_strategy_WHISPER_SAMPLING_GREEDY,
+        let ctx_params = subomi_asr_whisper::whisper_sys::whisper_context_default_params();
+        let full_params = subomi_asr_whisper::whisper_sys::whisper_full_default_params(
+            subomi_asr_whisper::whisper_sys::whisper_sampling_strategy_WHISPER_SAMPLING_GREEDY,
         );
         let _ = ctx_params.use_gpu;
         assert!(full_params.n_threads >= 0);
@@ -139,7 +139,7 @@ fn whisper_asr_feature_links_and_initializes_without_env_overrides() {
 #[cfg(feature = "ocr")]
 #[test]
 fn ocr_feature_links_and_initializes_cleanly() {
-    use memento_app::controller::ocr::{
+    use subomi_app::controller::ocr::{
         OcrController, OcrError, OcrFrame, OcrRegion, OcrSettings, OcrViewport,
     };
 

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use memento_setting::enums::ThemeMode;
+use subomi_setting::enums::ThemeMode;
 use slint::{ComponentHandle, VecModel};
 
 use crate::controller::asr::AsrController;
@@ -23,11 +23,11 @@ use crate::controller::subtitles::SubtitleController;
 use crate::settings_ui::{
     create_settings_session, refresh_category_settings, SettingsSession,
 };
-use crate::ui::{self, MementoApp, PopupBridge, SubEntry, SubtitleOverlayBridge};
-use memento_config::{ArgbColor, QtFontSpec, Value};
-use memento_os::SystemColorScheme;
-use memento_player::MpvInstance;
-use memento_setting::keys as raw;
+use crate::ui::{self, SubomiApp, PopupBridge, SubEntry, SubtitleOverlayBridge};
+use subomi_config::{ArgbColor, FontSpec, Value};
+use subomi_os::SystemColorScheme;
+use subomi_player::MpvInstance;
+use subomi_setting::keys as raw;
 
 const MAX_RECENT_TITLES: usize = 64;
 pub(crate) const SETTINGS_IDLE_TEARDOWN_DELAY: Duration = Duration::from_secs(75);
@@ -142,19 +142,19 @@ pub fn format_recent_file_label(media_title: &str, path: &str) -> String {
 }
 
 pub(crate) fn record_recent_media(
-    app: &MementoApp,
+    app: &SubomiApp,
     config: &ConfigController,
     cache_dir: &Path,
     path: &str,
 ) -> Result<(), String> {
     record_recent_media_title(path, app.get_media_title().as_str());
     config.add_recent_file(path)?;
-    config.save(cache_dir, "memento.conf")?;
+    config.save(cache_dir, "subomi.conf")?;
     refresh_recent_files(app, config);
     Ok(())
 }
 
-pub(crate) fn refresh_recent_files(app: &MementoApp, config: &ConfigController) {
+pub(crate) fn refresh_recent_files(app: &SubomiApp, config: &ConfigController) {
     let raw_files = config.recent_files();
     let titles = recent_titles_cache()
         .lock()
@@ -246,7 +246,7 @@ pub(crate) fn parse_font_attributes(
     max_size: f32,
 ) -> ParsedFontAttributes {
     let trimmed = raw_font.trim();
-    if let Ok(spec) = QtFontSpec::parse(trimmed) {
+    if let Ok(spec) = FontSpec::parse(trimmed) {
         let parts: Vec<&str> = trimmed.split(',').collect();
         let parse_flag = |idx: usize| -> bool {
             parts.get(idx).is_some_and(|s| {
@@ -326,7 +326,7 @@ pub(crate) fn resolve_theme_mode_is_light(mode: ThemeMode, system: SystemColorSc
 pub(crate) fn resolve_is_light_theme(config: &ConfigController) -> bool {
     let mode = config.theme_mode();
     let system = match mode {
-        ThemeMode::System => memento_os::detect_system_color_scheme(),
+        ThemeMode::System => subomi_os::detect_system_color_scheme(),
         ThemeMode::Light => SystemColorScheme::Light,
         ThemeMode::Dark => SystemColorScheme::Dark,
     };
@@ -387,7 +387,7 @@ pub(crate) fn sync_audio_preferences(config: &ConfigController) -> bool {
 }
 
 pub(crate) fn sync_subtitle_overlay_style_from_config(
-    app: &MementoApp,
+    app: &SubomiApp,
     config: &ConfigController,
 ) {
     let sub_font = setting_font_spec(
@@ -511,7 +511,7 @@ pub(crate) fn maybe_release_mecab_resources(
     }
     let cleared_cache = crate::controller::subtitles::clear_furigana_cache_and_cancel_prewarm();
     crate::ui::cancel_subtitle_token_prewarm();
-    let unloaded_mecab = memento_util::mecab::unload_mecab();
+    let unloaded_mecab = subomi_util::mecab::unload_mecab();
     if cleared_cache || unloaded_mecab {
         crate::app::trim_os_heap();
         true
@@ -520,7 +520,7 @@ pub(crate) fn maybe_release_mecab_resources(
     }
 }
 
-pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigController) {
+pub(crate) fn refresh_player_preferences(app: &SubomiApp, config: &ConfigController) {
     let is_light_theme = resolve_is_light_theme(config);
     app.set_is_light_theme(is_light_theme);
     app.set_compact_glossaries(config.compact_glossaries());
@@ -540,7 +540,7 @@ pub(crate) fn refresh_player_preferences(app: &MementoApp, config: &ConfigContro
         raw::search::HIDE_MPV_SUBS,
         raw::search::HIDE_MPV_SUBS_DEFAULT,
     ));
-    app.set_hide_memento_while_playing(setting_enabled(
+    app.set_hide_subomi_while_playing(setting_enabled(
         config,
         raw::search::GROUP,
         raw::search::HIDE_SUBS,
@@ -896,7 +896,7 @@ impl DebouncedSubtitlePrefSaver {
                 "interface/sub-scale",
                 &scale.to_string(),
                 &self.config_dir,
-                "memento.conf",
+                "subomi.conf",
             ) {
                 eprintln!("Cannot save subtitle size: {error}");
             }
@@ -906,7 +906,7 @@ impl DebouncedSubtitlePrefSaver {
                 "interface/sub-offset",
                 &offset.to_string(),
                 &self.config_dir,
-                "memento.conf",
+                "subomi.conf",
             ) {
                 eprintln!("Cannot save subtitle position: {error}");
             }
@@ -916,7 +916,7 @@ impl DebouncedSubtitlePrefSaver {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_settings_and_preference_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     dict_ctrl: Rc<RefCell<DictController>>,
     dictionary_manager: Option<Rc<DictionaryManager>>,
@@ -1035,7 +1035,7 @@ pub(crate) fn install_settings_and_preference_handlers(
                 selected_profile_config.apply_settings(
                     0,
                     &selected_profile_cache,
-                    "memento.conf",
+                    "subomi.conf",
                     &selected_profile_path,
                 )
             });
@@ -1056,7 +1056,7 @@ pub(crate) fn install_settings_and_preference_handlers(
             "behavior/subtitle-pause",
             if enabled { "true" } else { "false" },
             &auto_cache,
-            "memento.conf",
+            "subomi.conf",
         );
         match result {
             Ok(()) => {
@@ -1118,7 +1118,7 @@ pub(crate) fn install_settings_and_preference_handlers(
                         "interface/sub-scale",
                         &value.to_string(),
                         &dir,
-                        "memento.conf",
+                        "subomi.conf",
                     ) {
                         eprintln!("Cannot save subtitle size: {error}");
                     }
@@ -1171,7 +1171,7 @@ pub(crate) fn install_settings_and_preference_handlers(
                         "interface/sub-offset",
                         &value.to_string(),
                         &dir,
-                        "memento.conf",
+                        "subomi.conf",
                     ) {
                         eprintln!("Cannot save subtitle position: {error}");
                     }
@@ -1198,7 +1198,7 @@ pub(crate) fn install_settings_and_preference_handlers(
             "search/subtitle-furigana",
             if visible { "true" } else { "false" },
             &furigana_cache,
-            "memento.conf",
+            "subomi.conf",
         );
         match result {
             Ok(()) => refresh_player_preferences(&app, &furigana_config),
@@ -1224,7 +1224,7 @@ pub(crate) fn install_settings_and_preference_handlers(
             raw::interface::subtitle_list::TIMESTAMPS
         );
         let val = if show { "true" } else { "false" };
-        if let Err(error) = ts_config.persist_single_setting(&key, val, &ts_cache, "memento.conf") {
+        if let Err(error) = ts_config.persist_single_setting(&key, val, &ts_cache, "subomi.conf") {
             app.set_status_message(format!("Could not save timestamps preference: {error}").into());
         }
         if let Some(session) = ts_settings.borrow().as_ref() {
@@ -1249,7 +1249,7 @@ pub(crate) fn install_settings_and_preference_handlers(
             raw::subtitle_list::IGNORE_WHITESPACE
         );
         let val = if enabled { "true" } else { "false" };
-        if let Err(error) = ws_config.persist_single_setting(&key, val, &ws_cache, "memento.conf") {
+        if let Err(error) = ws_config.persist_single_setting(&key, val, &ws_cache, "subomi.conf") {
             app.set_status_message(
                 format!("Could not save ignore-whitespace preference: {error}").into(),
             );
@@ -1281,7 +1281,7 @@ pub(crate) fn install_settings_and_preference_handlers(
         );
         let val = if enabled { "true" } else { "false" };
         if let Err(error) =
-            seek_config.persist_single_setting(&key, val, &seek_cache, "memento.conf")
+            seek_config.persist_single_setting(&key, val, &seek_cache, "subomi.conf")
         {
             app.set_status_message(format!("Could not save auto-seek preference: {error}").into());
         }
@@ -1443,7 +1443,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_sub_drawer_open(true);
         refresh_player_preferences(&app, &cfg);
@@ -1499,7 +1499,7 @@ mod tests {
                     &key,
                     if show { "true" } else { "false" },
                     &ts_dir,
-                    "memento.conf",
+                    "subomi.conf",
                 )
                 .unwrap();
         });
@@ -1519,7 +1519,7 @@ mod tests {
             !app.get_sub_list_show_timestamps(),
             "clicking Time pill must toggle timestamps off"
         );
-        let reloaded = ConfigController::load(dir.path(), "memento.conf").unwrap();
+        let reloaded = ConfigController::load(dir.path(), "subomi.conf").unwrap();
         assert_eq!(
             reloaded.effective_setting(
                 raw::interface::GROUP,
@@ -1565,7 +1565,7 @@ mod tests {
     #[test]
     fn max_recursion_depth_syncs_to_popup_bridge_and_compact_row_estimate_matches_24px() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
 
         refresh_player_preferences(&app, &cfg);
@@ -1591,7 +1591,7 @@ mod tests {
     #[test]
     fn theme_compact_osc_subtitle_style_and_relaxed_popup_clamps_sync() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
 
         assert!(resolve_theme_mode_is_light(
@@ -1730,7 +1730,7 @@ mod tests {
     fn settings_idle_teardown_reopen_cancels_active_jobs_block_and_idle_drops_cleanly() {
         i_slint_backend_testing::init_no_event_loop();
         let dir = tempfile::tempdir().unwrap();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = Rc::new(ConfigController::new());
         let dict_ctrl = Rc::new(RefCell::new(DictController::new()));
         let asr_session = Rc::new(RefCell::new(AsrController::new()));
@@ -1920,9 +1920,9 @@ mod tests {
         };
 
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
-        let sample_key = "memento_pref_mecab_guard_line_7e6d5c";
+        let sample_key = "subomi_pref_mecab_guard_line_7e6d5c";
 
         // 1. Furigana enabled + matcher enabled -> keep cache & prewarm untouched.
         cfg.edit_setting("search/subtitle-furigana", "true")
@@ -1978,7 +1978,7 @@ mod tests {
             "disabling both features must clear the furigana LRU cache"
         );
         assert!(
-            !memento_util::mecab::is_mecab_loaded(),
+            !subomi_util::mecab::is_mecab_loaded(),
             "MeCab must be unloaded when both furigana and matcher are disabled"
         );
 

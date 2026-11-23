@@ -1,20 +1,20 @@
 [package]
-name = "memento"
+name = "subomi"
 version = "2.0.2"
 edition = "2021"
 publish = false
-default-run = "memento"
+default-run = "subomi"
 
 [features]
 default = ["software-renderer", "accessibility"]
 software-renderer = ["slint/renderer-software"]
 accessibility = ["slint/accessibility"]
 asr = ["asr-whisper"]
-asr-whisper = ["dep:memento-asr-whisper"]
-asr-onnx = ["dep:memento-asr-onnx"]
+asr-whisper = ["dep:subomi-asr-whisper"]
+asr-onnx = ["dep:subomi-asr-onnx"]
 ocr = ["dep:libloading"]
-whisper-cuda = ["asr-whisper", "memento-asr-whisper/cuda"]
-whisper-vulkan = ["asr-whisper", "memento-asr-whisper/vulkan"]
+whisper-cuda = ["asr-whisper", "subomi-asr-whisper/cuda"]
+whisper-vulkan = ["asr-whisper", "subomi-asr-whisper/vulkan"]
 
 [dependencies]
 slint = { version = "=1.16.1", default-features = false, features = [
@@ -43,21 +43,21 @@ swash = "=0.2.10"
 resvg = { version = "=0.47.0", default-features = false, features = ["text", "raster-images"] }
 webbrowser = "=1.2.4"
 
-memento-config = { path = "crates/memento-config" }
-memento-setting = { path = "crates/memento-setting" }
-memento-player = { path = "crates/memento-player" }
-memento-subtitle = { path = "crates/memento-subtitle" }
-memento-ass = { path = "crates/memento-ass" }
-memento-dict = { path = "crates/memento-dict" }
-memento-definition = { path = "crates/memento-definition" }
-memento-anki = { path = "crates/memento-anki" }
-memento-net = { path = "crates/memento-net" }
-memento-audio = { path = "crates/memento-audio" }
-memento-util = { path = "crates/memento-util" }
-memento-os = { path = "crates/memento-os" }
-memento-asr = { path = "crates/memento-asr" }
-memento-asr-onnx = { path = "crates/memento-asr-onnx", optional = true }
-memento-asr-whisper = { path = "crates/memento-asr-whisper", optional = true }
+subomi-config = { path = "crates/subomi-config" }
+subomi-setting = { path = "crates/subomi-setting" }
+subomi-player = { path = "crates/subomi-player" }
+subomi-subtitle = { path = "crates/subomi-subtitle" }
+subomi-ass = { path = "crates/subomi-ass" }
+subomi-dict = { path = "crates/subomi-dict" }
+subomi-definition = { path = "crates/subomi-definition" }
+subomi-anki = { path = "crates/subomi-anki" }
+subomi-net = { path = "crates/subomi-net" }
+subomi-audio = { path = "crates/subomi-audio" }
+subomi-util = { path = "crates/subomi-util" }
+subomi-os = { path = "crates/subomi-os" }
+subomi-asr = { path = "crates/subomi-asr" }
+subomi-asr-onnx = { path = "crates/subomi-asr-onnx", optional = true }
+subomi-asr-whisper = { path = "crates/subomi-asr-whisper", optional = true }
 
 [dev-dependencies]
 base64 = "=0.22.1"
@@ -69,11 +69,11 @@ i-slint-renderer-femtovg = { version = "=1.16.1", features = ["opengl"] }
 slint-build = "=1.16.1"
 
 [lib]
-name = "memento_app"
+name = "subomi_app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "memento"
+name = "subomi"
 path = "src/main.rs"
 
 [workspace]
@@ -119,22 +119,22 @@ opt-level = 3
 [profile.release.package.femtovg]
 opt-level = 3
 
-[profile.release.package.memento-dict]
+[profile.release.package.subomi-dict]
 opt-level = 3
 
-[profile.release.package.memento-definition]
+[profile.release.package.subomi-definition]
 opt-level = 3
 
-[profile.release.package.memento-ass]
+[profile.release.package.subomi-ass]
 opt-level = 3
 
-[profile.release.package.memento-asr]
+[profile.release.package.subomi-asr]
 opt-level = 3
 
-[profile.release.package.memento-asr-onnx]
+[profile.release.package.subomi-asr-onnx]
 opt-level = 3
 
-[profile.release.package.memento-asr-whisper]
+[profile.release.package.subomi-asr-whisper]
 opt-level = 3
 
 [profile.release.package.image]

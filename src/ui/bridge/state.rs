@@ -6,9 +6,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use memento_definition::{Color as DefColor, LegacyGlossaryStyle};
-use memento_dict::searchcontroller::TextReplacementOptions;
-use memento_setting::keys as raw;
+use subomi_definition::{parse_css_color, LegacyGlossaryStyle};
+use subomi_dict::searchcontroller::TextReplacementOptions;
+use subomi_setting::keys as raw;
 use slint::{ComponentHandle as _, Model as _, SharedString, VecModel};
 
 use crate::app::preferences::{parse_font_attributes, resolve_is_light_theme, ParsedFontAttributes};
@@ -30,7 +30,7 @@ use crate::ui::tags::{
 };
 use crate::ui::text_engine::SubtitleRenderStyle;
 use crate::ui::{
-    DictResult, MementoApp, PopupFrequency, RichDerivationStep, RichKanjiDetail, RichPitchEntry,
+    DictResult, SubomiApp, PopupFrequency, RichDerivationStep, RichKanjiDetail, RichPitchEntry,
     RichPitchGraph, RichPitchMora, RichTagPill, SubtitleLine, SubtitleOverlayBridge, SubtitleWord,
 };
 
@@ -338,7 +338,7 @@ pub(super) struct GlossaryPreRenderItem {
     pub(super) raw_glossary: String,
     pub(super) fallback_glossary: String,
     pub(super) parsed_glossary: Option<Arc<serde_json::Value>>,
-    pub(super) stylesheet: Option<Arc<memento_definition::ParsedStylesheet>>,
+    pub(super) stylesheet: Option<Arc<subomi_definition::ParsedStylesheet>>,
     pub(super) detail_states: HashMap<String, bool>,
     pub(super) legacy_style: LegacyGlossaryStyle,
     pub(super) dict_resource_dirs: Vec<PathBuf>,
@@ -621,7 +621,7 @@ impl CachedConfigSettings {
             anki_show_tag: false,
             anki_term_profile: None,
             anki_kanji_profile: None,
-            conf_mtime: std::fs::metadata(config_dir.join("memento.conf"))
+            conf_mtime: std::fs::metadata(config_dir.join("subomi.conf"))
                 .ok()
                 .and_then(|m| m.modified().ok()),
             anki_mtime: std::fs::metadata(config_dir.join("anki_connect.json"))
@@ -646,7 +646,7 @@ impl CachedConfigSettings {
     }
 
     pub(super) fn apply_controller(&mut self, config: &ConfigController) {
-        use memento_config::Value;
+        use subomi_config::Value;
         self.is_light_theme = resolve_is_light_theme(config);
         self.compact_glossaries = match config
             .effective_setting(raw::interface::GROUP, raw::interface::COMPACT_GLOSSARIES)
@@ -884,7 +884,7 @@ impl CachedConfigSettings {
     }
 
     pub(super) fn reload_if_changed_on_disk(&mut self, config_dir: &Path) -> bool {
-        let conf_mtime = std::fs::metadata(config_dir.join("memento.conf"))
+        let conf_mtime = std::fs::metadata(config_dir.join("subomi.conf"))
             .ok()
             .and_then(|m| m.modified().ok());
         let anki_mtime = std::fs::metadata(config_dir.join("anki_connect.json"))
@@ -895,7 +895,7 @@ impl CachedConfigSettings {
         }
         self.conf_mtime = conf_mtime;
         self.anki_mtime = anki_mtime;
-        if let Ok(reloaded) = ConfigController::load(config_dir, "memento.conf") {
+        if let Ok(reloaded) = ConfigController::load(config_dir, "subomi.conf") {
             let _ = reloaded.load_anki_profiles(config_dir.join("anki_connect.json"));
             self.apply_controller(&reloaded);
             return true;
@@ -1294,7 +1294,7 @@ impl RichUiMutable {
 }
 
 pub(super) fn sync_subtitle_overlay_style_to_bridge(
-    app: &MementoApp,
+    app: &SubomiApp,
     style: &SubtitleRenderStyle,
 ) {
     let sub = app.global::<SubtitleOverlayBridge>();
@@ -1415,15 +1415,7 @@ pub(super) fn encode_note_id_i32(nid: i64) -> i32 {
 }
 
 pub(super) fn parse_def_rgba(value: &str, fallback: [u8; 4]) -> [u8; 4] {
-    if let Some(c) = DefColor::from_string(value.trim()) {
-        let r = ((u32::from(c.red) + 128) / 257) as u8;
-        let g = ((u32::from(c.green) + 128) / 257) as u8;
-        let b = ((u32::from(c.blue) + 128) / 257) as u8;
-        let a = ((u32::from(c.alpha) + 128) / 257) as u8;
-        [r, g, b, a]
-    } else {
-        fallback
-    }
+    parse_css_color(value).unwrap_or(fallback)
 }
 
 pub(super) fn parse_interface_font_setting(
@@ -1434,17 +1426,17 @@ pub(super) fn parse_interface_font_setting(
     max_px: f32,
 ) -> Option<InterfaceFontFallback> {
     let raw_val = config.get_setting(raw::interface::GROUP, key)?;
-    let memento_config::Value::Text(ref raw_csv) = raw_val else {
+    let subomi_config::Value::Text(ref raw_csv) = raw_val else {
         return None;
     };
     // `ConfigController::get_setting` synthesizes legacy Qt defaults (e.g., 10pt glossary,
-    // 108pt Kanji Stroke Orders) when unset. Only override Memento's built-in Slint theme
+    // 108pt Kanji Stroke Orders) when unset. Only override Subomi's built-in Slint theme
     // defaults when the user actually customized the setting away from the stock Qt default.
     let stock_default = stock_config.effective_setting(raw::interface::GROUP, key);
     if stock_default.as_ref() == Some(&raw_val) {
         return None;
     }
-    let spec = memento_config::QtFontSpec::parse(raw_csv).ok()?;
+    let spec = subomi_config::FontSpec::parse(raw_csv).ok()?;
     let size_px = ((spec.point_size as f32) * (96.0 / 72.0)).clamp(min_px, max_px);
     Some(InterfaceFontFallback {
         family: spec.family,
@@ -1770,7 +1762,7 @@ pub(super) fn apply_kanji_freq_updates_to_rows(
 }
 
 pub(super) fn apply_kanji_freq_updates_to_app(
-    app: &MementoApp,
+    app: &SubomiApp,
     updates: Vec<(usize, Vec<TermFrequency>)>,
 ) {
     if updates.is_empty() {

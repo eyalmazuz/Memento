@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use memento_asr::asrcontroller::{adjust_segment, is_cue_valid};
+use subomi_asr::asrcontroller::{adjust_segment, is_cue_valid};
 
 use crate::controller::media::{extract_audio_samples, MediaContext as AsrMedia};
 

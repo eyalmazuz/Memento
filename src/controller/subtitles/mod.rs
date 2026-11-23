@@ -1,4 +1,4 @@
-//! Subtitle controller connecting memento-subtitle to Slint SubtitlePanel.
+//! Subtitle controller connecting subomi-subtitle to Slint SubtitlePanel.
 
 pub mod furigana;
 
@@ -11,10 +11,10 @@ pub use furigana::{
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
-use memento_subtitle::model::{
+use subomi_subtitle::model::{
     self, ActiveCueActionKind, SubtitleExternalPathInput, SubtitleTrackInput, TrackAction,
 };
-use memento_subtitle::SubtitleEntry;
+use subomi_subtitle::SubtitleEntry;
 
 /// Normalize subtitle cue text: converts CRLF (`\r\n`) and CR (`\r`) line
 /// endings to `\n`, collapses redundant empty blank lines inside multi-line
@@ -57,12 +57,12 @@ pub fn filter_and_sort_cues<C: AsRef<[SubtitleEntry]>>(cues: C) -> Vec<SubtitleE
         .iter()
         .filter(|c| c.start >= 0.0 && c.end > c.start && c.start.is_finite() && c.end.is_finite())
         .filter_map(|c| {
-            let norm = normalize_subtitle_text(&String::from_utf16_lossy(&c.text));
+            let norm = normalize_subtitle_text(&c.text);
             if norm.is_empty() {
                 return None;
             }
             Some(SubtitleEntry {
-                text: norm.encode_utf16().collect(),
+                text: norm,
                 start: c.start,
                 end: c.end,
             })
@@ -87,10 +87,10 @@ pub fn filter_and_sort_cues<C: AsRef<[SubtitleEntry]>>(cues: C) -> Vec<SubtitleE
     deduped
 }
 
-/// Helper to create a SubtitleEntry with text encoded as UTF-16 code units.
+/// Helper to create a `SubtitleEntry` from UTF-8 text and timing.
 pub fn create_cue(text: &str, start: f64, end: f64) -> SubtitleEntry {
     SubtitleEntry {
-        text: text.encode_utf16().collect(),
+        text: text.to_owned(),
         start,
         end,
     }
@@ -116,7 +116,7 @@ pub struct ExternalSubtitleLoad {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemorySubtitleCue {
     pub id: i64,
-    pub text: Vec<u16>,
+    pub text: String,
     pub start: f64,
     pub end: f64,
 }
@@ -392,7 +392,7 @@ impl SubtitleController {
         let filtered_tracks: Vec<&SubtitleTrackInfo> = tracks
             .iter()
             .filter(|track| {
-                track.external_path != memento_player::ASR_STREAM_URI
+                track.external_path != subomi_player::ASR_STREAM_URI
                     && Some(track.id) != self.asr_mpv_sid
                     && !self
                         .tracks
@@ -400,15 +400,10 @@ impl SubtitleController {
                         .any(|m| m.is_asr_track && m.id == track.id)
             })
             .collect();
-        let track_paths: Vec<Vec<u16>> = filtered_tracks
-            .iter()
-            .map(|track| track.external_path.encode_utf16().collect())
-            .collect();
         let track_inputs: Vec<SubtitleTrackInput<'_>> = filtered_tracks
             .iter()
-            .zip(&track_paths)
-            .map(|(track, path)| {
-                SubtitleTrackInput::new(false, track.id, track.external, path.as_slice())
+            .map(|track| {
+                SubtitleTrackInput::new(false, track.id, track.external, track.external_path.as_str())
             })
             .collect();
         // The ASR track (whether still at ASR_TRACK_ID or bound to a positive
@@ -420,20 +415,16 @@ impl SubtitleController {
             .filter(|track| !track.is_asr_track && track.id > 0)
             .map(|track| track.id)
             .collect();
-        let external_path_units: Vec<(i64, Vec<u16>)> = self
+        let external_paths: Vec<SubtitleExternalPathInput<'_>> = self
             .tracks
             .iter()
             .filter(|track| !track.is_asr_track)
             .filter_map(|track| {
                 track
                     .external_path
-                    .as_ref()
-                    .map(|path| (track.id, path.encode_utf16().collect()))
+                    .as_deref()
+                    .map(|path| SubtitleExternalPathInput::new(track.id, path))
             })
-            .collect();
-        let external_paths: Vec<SubtitleExternalPathInput<'_>> = external_path_units
-            .iter()
-            .map(|(track_id, path)| SubtitleExternalPathInput::new(*track_id, path))
             .collect();
         let plan = model::plan_track_changes(&track_inputs, &model_ids, &external_paths);
         let mut reloads = Vec::new();
@@ -449,9 +440,8 @@ impl SubtitleController {
                     read_file,
                 } => {
                     if let Some(track) = self.track_mut(track_id) {
-                        let path = String::from_utf16_lossy(path);
                         track.external = true;
-                        track.external_path = Some(path.clone());
+                        track.external_path = Some(path.to_owned());
                         track.clear_entries();
                         track.is_memory_track = false;
                         track.loaded_complete = false;
@@ -949,7 +939,7 @@ impl SubtitleController {
         let candidates: Vec<_> = cues
             .iter()
             .enumerate()
-            .map(|(original_index, cue)| model::MementoSubtitleCandidateCueC {
+            .map(|(original_index, cue)| model::CandidateCue {
                 original_index,
                 id_valid: true,
                 cue_id: cue.id,
@@ -965,12 +955,12 @@ impl SubtitleController {
             .into_iter()
             .filter_map(|cue_index| {
                 let cue = &cues[cue_index];
-                let norm = normalize_subtitle_text(&String::from_utf16_lossy(&cue.text));
+                let norm = normalize_subtitle_text(&cue.text);
                 if norm.is_empty() {
                     return None;
                 }
                 Some(SubtitleEntry {
-                    text: norm.encode_utf16().collect(),
+                    text: norm,
                     start: cue.start,
                     end: cue.end,
                 })
@@ -1011,10 +1001,7 @@ impl SubtitleController {
         }
         let action = model::plan_active_cue(true, true, !cue.text.is_empty(), raw_position);
         if action.action == ActiveCueActionKind::AddAndSelect {
-            let norm_text: Vec<u16> =
-                normalize_subtitle_text(&String::from_utf16_lossy(&cue.text))
-                    .encode_utf16()
-                    .collect();
+            let norm_text = normalize_subtitle_text(&cue.text);
             if norm_text.is_empty() {
                 track.active_indices.clear();
                 return true;
@@ -1059,7 +1046,7 @@ impl SubtitleController {
     }
 
     /// Update both subtitle lists using mpv's raw subtitle clocks. Boundaries
-    /// use Memento's TIME_DELTA and strict interval semantics; overlapping cues
+    /// use Subomi's TIME_DELTA and strict interval semantics; overlapping cues
     /// remain active together rather than selecting only the first one.
     ///
     /// Reuses each track's `active_indices` buffer in place for zero steady-state
@@ -1251,24 +1238,22 @@ impl SubtitleController {
     }
 
     pub fn active_cue_text(&self) -> Option<String> {
-        self.active_cue()
-            .map(|entry| String::from_utf16_lossy(&entry.text))
+        self.active_cue().map(|entry| entry.text.clone())
     }
 
     pub fn cue_text(&self, index: usize) -> Option<String> {
         self.primary_entries()
             .get(index)
-            .map(|entry| String::from_utf16_lossy(&entry.text))
+            .map(|entry| entry.text.clone())
     }
 
     pub fn search(&self, query: &str, ignore_whitespace: bool) -> Vec<usize> {
-        let query_utf16: Vec<u16> = query.encode_utf16().collect();
-        let candidates: Vec<&[u16]> = self
+        let candidates: Vec<&str> = self
             .primary_entries()
             .iter()
-            .map(|entry| entry.text.as_slice())
+            .map(|entry| entry.text.as_str())
             .collect();
-        memento_subtitle::model::find_matching_rows(&candidates, &query_utf16, ignore_whitespace)
+        subomi_subtitle::model::find_matching_rows(&candidates, query, ignore_whitespace)
     }
 
     fn track_index(&self, sid: i64) -> Option<usize> {
@@ -1295,7 +1280,7 @@ impl SubtitleController {
         self.active_indices(sid)
             .iter()
             .filter_map(|&index| self.entries_for_sid(sid).get(index))
-            .map(|entry| String::from_utf16_lossy(&entry.text))
+            .map(|entry| entry.text.as_str())
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
@@ -1336,7 +1321,7 @@ mod tests {
     use super::{
         create_cue, MemorySubtitleCue, SubtitleController, SubtitleTrackModel, ASR_TRACK_ID,
     };
-    use memento_subtitle::model;
+    use subomi_subtitle::model;
 
     fn linear_active_indices(track: &SubtitleTrackModel, raw_time: f64) -> Vec<usize> {
         if !raw_time.is_finite() {
@@ -1354,7 +1339,7 @@ mod tests {
     fn mem_cue(id: i64, text: &str, start: f64, end: f64) -> MemorySubtitleCue {
         MemorySubtitleCue {
             id,
-            text: text.encode_utf16().collect(),
+            text: text.to_owned(),
             start,
             end,
         }

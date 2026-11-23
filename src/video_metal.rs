@@ -1,23 +1,3 @@
-////////////////////////////////////////////////////////////////////////////////
-//
-// Copyright (c) 2026 Ripose
-//
-// This file is part of Memento.
-//
-// Memento is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 2 of the License.
-//
-// Memento is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with Memento.  If not, see <https://www.gnu.org/licenses/>.
-//
-////////////////////////////////////////////////////////////////////////////////
-
 //! macOS Metal video renderer bridge, IOSurface triple-buffered frame ring,
 //! `CAMetalLayer` HiDPI geometry planning, and `mpv` Metal/MoltenVK options.
 //!
@@ -95,7 +75,7 @@ pub const MIN_METAL_CONTENTS_SCALE: f64 = 0.5;
 /// Maximum allowed HiDPI `contentsScale`.
 pub const MAX_METAL_CONTENTS_SCALE: f64 = 8.0;
 
-/// Metal / IOSurface pixel formats supported by Memento's macOS bridge.
+/// Metal / IOSurface pixel formats supported by Subomi's macOS bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetalPixelFormat {
     /// Standard 8-bit sRGB/SDR BGRA (`kCVPixelFormatType_32BGRA` / `MTLPixelFormatBGRA8Unorm`).
@@ -341,7 +321,7 @@ impl IoSurfaceDescriptor {
 /// How macOS presents `libmpv` video into a Metal-backed UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetalPresentationMode {
-    /// Upstream Memento's `MpvMetalRenderer` architecture: `vo=libmpv` renders
+    /// Upstream Subomi's `MpvMetalRenderer` architecture: `vo=libmpv` renders
     /// on a dedicated CGL 4.1 Core Profile worker into 3x `IOSurface` targets,
     /// which are wrapped zero-copy as `MTLTexture`s for the UI scene graph.
     IoSurfaceOpenGlBridge,
@@ -448,7 +428,7 @@ struct RetiredGeneration<S> {
     slots: Vec<MetalFrameSlot<S>>,
 }
 
-/// Platform-independent state machine for upstream Memento's triple-buffered
+/// Platform-independent state machine for upstream Subomi's triple-buffered
 /// IOSurface producer ring (`MpvMetalRenderer::Impl`).
 ///
 /// Guarantees:

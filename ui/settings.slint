@@ -1,7 +1,7 @@
 import { ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
-import { MementoPalette } from "palette.slint";
+import { SubomiPalette } from "palette.slint";
 import { ActionButton, IconButton } from "components/buttons.slint";
-import { MementoSwitch } from "components/controls.slint";
+import { SubomiSwitch } from "components/controls.slint";
 import {
     AnkiAutocompleteItem,
     AnkiExcludedDictRow,
@@ -39,15 +39,15 @@ export {
 // Apply/Reset/Defaults operate on the selected category.
 // The owner refreshes settings-groups after reset/default/profile/list/category actions.
 export component SettingsWindow inherits Window {
-    title: "Options — Memento";
+    title: "Options — Subomi";
     preferred-width: 1040px;
     preferred-height: 720px;
     min-width: 820px;
     min-height: 560px;
-    background: MementoPalette.window-bg;
+    background: SubomiPalette.window-bg;
     default-font-family: "Noto Sans, sans-serif";
 
-    in-out property <bool> is-light-theme <=> MementoPalette.light-mode;
+    in-out property <bool> is-light-theme <=> SubomiPalette.light-mode;
     in-out property <bool> drop-hover-active: false;
     in-out property <int> active-category: 0;
     in property <[SettingsGroup]> settings-groups;
@@ -227,7 +227,7 @@ export component SettingsWindow inherits Window {
         root.confirm-delete-id = "";
         root.confirm-delete-dict-id = dict-id;
         root.confirm-delete-title = "Delete Dictionary?";
-        root.confirm-delete-message = "Permanently remove \"" + dict-title + "\" (ID " + dict-id + ") from Memento's dictionary database? You will need to re-import its ZIP archive to restore it.";
+        root.confirm-delete-message = "Permanently remove \"" + dict-title + "\" (ID " + dict-id + ") from Subomi's dictionary database? You will need to re-import its ZIP archive to restore it.";
         root.confirm-delete-open = true;
     }
 
@@ -302,7 +302,7 @@ export component SettingsWindow inherits Window {
                 }
             }
 
-            Rectangle { width: 1px; background: MementoPalette.border; }
+            Rectangle { width: 1px; background: SubomiPalette.border; }
 
             // ── Main Content Area ─────────────────────────────────────────
             VerticalLayout {
@@ -311,7 +311,7 @@ export component SettingsWindow inherits Window {
                 // Contextual Category Header Bar (strictly vertically centered)
                 Rectangle {
                     height: 60px;
-                    background: MementoPalette.surface-bg;
+                    background: SubomiPalette.surface-bg;
 
                     HorizontalLayout {
                         padding-left: 24px;
@@ -336,7 +336,7 @@ export component SettingsWindow inherits Window {
                                     : root.active-category == 7 ? "Manga OCR"
                                     : root.active-category == 8 ? "Speech Recognition (ASR)"
                                     : "Dictionary Search";
-                                color: MementoPalette.text;
+                                color: SubomiPalette.text;
                                 font-size: 17px;
                                 font-weight: 700;
                             }
@@ -353,7 +353,7 @@ export component SettingsWindow inherits Window {
                                     : root.active-category == 7 ? "Configure Manga OCR model and GPU acceleration"
                                     : root.active-category == 8 ? "Select Whisper or ONNX speech models and manage local downloads"
                                     : "Configure hover/modifier lookup triggers, MeCab matching, and glossary layout";
-                                color: MementoPalette.text-muted;
+                                color: SubomiPalette.text-muted;
                                 font-size: 11.5px;
                                 overflow: elide;
                             }
@@ -372,7 +372,7 @@ export component SettingsWindow inherits Window {
                                     alignment: end;
                                     Text {
                                         text: "Profile";
-                                        color: MementoPalette.text-muted;
+                                        color: SubomiPalette.text-muted;
                                         font-size: 12px;
                                         vertical-alignment: center;
                                     }
@@ -391,9 +391,9 @@ export component SettingsWindow inherits Window {
                                             height: 30px;
                                             width: tag-row.preferred-width;
                                             border-radius: 7px;
-                                            background: MementoPalette.card-bg;
+                                            background: SubomiPalette.card-bg;
                                             border-width: 1px;
-                                            border-color: MementoPalette.card-border;
+                                            border-color: SubomiPalette.card-border;
                                             tag-row := HorizontalLayout {
                                                 padding-left: 10px;
                                                 padding-right: 10px;
@@ -401,14 +401,14 @@ export component SettingsWindow inherits Window {
                                                 alignment: center;
                                                 Text {
                                                     text: "Show tag";
-                                                    color: MementoPalette.text-secondary;
+                                                    color: SubomiPalette.text-secondary;
                                                     font-size: 11.5px;
                                                     font-weight: 600;
                                                     vertical-alignment: center;
                                                 }
                                                 VerticalLayout {
                                                     alignment: center;
-                                                    MementoSwitch {
+                                                    SubomiSwitch {
                                                         checked: root.anki-show-tag;
                                                         toggled(value) => {
                                                             root.setting-edited("anki/profile/show-tag", value ? "true" : "false");
@@ -474,7 +474,7 @@ export component SettingsWindow inherits Window {
                                     alignment: center;
                                     IconButton {
                                         icon: @image-url("icons/add.svg");
-                                        tint: MementoPalette.cyan-accent;
+                                        tint: SubomiPalette.cyan-accent;
                                         tooltip: root.active-category == 0 ? "Add Anki profile" : "Add keybind profile";
                                         tooltip-below: true;
                                         clicked => {
@@ -543,7 +543,7 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
 
                 // Scrollable Settings Body (scrollbar width reserved so cards never overlap scrollbar)
                 body-scroll := ScrollView {
@@ -560,16 +560,16 @@ export component SettingsWindow inherits Window {
 
                         if !root.searching && root.active-category == 7 && !root.ocr-available : Rectangle {
                             height: 40px;
-                            background: MementoPalette.warning-bg;
+                            background: SubomiPalette.warning-bg;
                             border-width: 1px;
-                            border-color: MementoPalette.warning-border;
+                            border-color: SubomiPalette.warning-border;
                             border-radius: 8px;
                             Text {
                                 x: 14px;
                                 width: parent.width - 28px;
                                 height: parent.height;
                                 text: "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable.";
-                                color: MementoPalette.warning-text;
+                                color: SubomiPalette.warning-text;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -578,16 +578,16 @@ export component SettingsWindow inherits Window {
 
                         if !root.searching && root.active-category == 8 && !root.asr-available : Rectangle {
                             height: 40px;
-                            background: MementoPalette.warning-bg;
+                            background: SubomiPalette.warning-bg;
                             border-width: 1px;
-                            border-color: MementoPalette.warning-border;
+                            border-color: SubomiPalette.warning-border;
                             border-radius: 8px;
                             Text {
                                 x: 14px;
                                 width: parent.width - 28px;
                                 height: parent.height;
                                 text: "⚠ ASR runtime unavailable; preferences remain editable.";
-                                color: MementoPalette.warning-text;
+                                color: SubomiPalette.warning-text;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 overflow: elide;
@@ -597,12 +597,12 @@ export component SettingsWindow inherits Window {
                         if root.searching && root.settings-groups.length == 0 : Rectangle {
                             height: 92px;
                             border-radius: 10px;
-                            background: MementoPalette.card-bg;
+                            background: SubomiPalette.card-bg;
                             border-width: 1px;
-                            border-color: MementoPalette.card-border;
+                            border-color: SubomiPalette.card-border;
                             Text {
                                 text: "No settings match \"" + root.settings-search-query + "\".";
-                                color: MementoPalette.text-muted;
+                                color: SubomiPalette.text-muted;
                                 font-size: 13px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
@@ -739,12 +739,12 @@ export component SettingsWindow inherits Window {
                     }
                 }
 
-                Rectangle { height: 1px; background: MementoPalette.border; }
+                Rectangle { height: 1px; background: SubomiPalette.border; }
 
                 // ── Footer Bar (strictly vertically centered, category-aware) ──
                 Rectangle {
                     height: 54px;
-                    background: MementoPalette.surface-bg;
+                    background: SubomiPalette.surface-bg;
 
                     HorizontalLayout {
                         padding-left: 20px;
@@ -777,7 +777,7 @@ export component SettingsWindow inherits Window {
                                     : (!root.searching && root.active-category == 4
                                         ? "Dictionary changes apply immediately"
                                         : "");
-                                color: MementoPalette.text-secondary;
+                                color: SubomiPalette.text-secondary;
                                 font-size: 12px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -898,9 +898,9 @@ export component SettingsWindow inherits Window {
         if root.drop-hover-active : Rectangle {
             width: 100%;
             height: 100%;
-            background: MementoPalette.accent-subtle;
+            background: SubomiPalette.accent-subtle;
             border-width: 3px;
-            border-color: MementoPalette.cyan-accent;
+            border-color: SubomiPalette.cyan-accent;
 
             Rectangle {
                 x: (parent.width - self.width) / 2;
@@ -908,15 +908,15 @@ export component SettingsWindow inherits Window {
                 width: min(parent.width - 64px, drop-lbl.preferred-width + 44px);
                 height: 54px;
                 border-radius: 12px;
-                background: MementoPalette.surface-elevated;
+                background: SubomiPalette.surface-elevated;
                 border-width: 1.5px;
-                border-color: MementoPalette.cyan-accent;
+                border-color: SubomiPalette.cyan-accent;
                 drop-shadow-blur: 20px;
-                drop-shadow-color: MementoPalette.shadow;
+                drop-shadow-color: SubomiPalette.shadow;
 
                 drop-lbl := Text {
                     text: "Drop Yomitan .zip dictionary archive to import";
-                    color: MementoPalette.text;
+                    color: SubomiPalette.text;
                     font-size: 14px;
                     font-weight: 700;
                     horizontal-alignment: center;

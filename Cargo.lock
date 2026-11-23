@@ -2805,172 +2805,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memento"
-version = "2.0.2"
-dependencies = [
- "base64 0.22.1",
- "copypasta",
- "glow",
- "i-slint-backend-testing",
- "i-slint-renderer-femtovg",
- "image",
- "libc",
- "libloading",
- "log",
- "memento-anki",
- "memento-asr",
- "memento-asr-onnx",
- "memento-asr-whisper",
- "memento-ass",
- "memento-audio",
- "memento-config",
- "memento-definition",
- "memento-dict",
- "memento-net",
- "memento-os",
- "memento-player",
- "memento-setting",
- "memento-subtitle",
- "memento-util",
- "parley",
- "raw-window-handle",
- "resvg",
- "serde_json",
- "slint",
- "slint-build",
- "swash",
- "tempfile",
- "url",
- "webbrowser",
-]
-
-[[package]]
-name = "memento-anki"
-version = "2.0.2"
-
-[[package]]
-name = "memento-asr"
-version = "2.0.2"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "memento-asr-onnx"
-version = "2.0.2"
-dependencies = [
- "flate2",
- "memento-asr",
- "sha2",
- "tar",
- "ureq",
- "zip",
-]
-
-[[package]]
-name = "memento-asr-whisper"
-version = "2.0.2"
-dependencies = [
- "bindgen 0.73.2",
- "cmake",
- "flate2",
- "memento-asr",
- "regex",
- "sha2",
- "tar",
- "ureq",
-]
-
-[[package]]
-name = "memento-ass"
-version = "2.0.2"
-dependencies = [
- "cc",
- "flate2",
- "image",
- "libc",
- "pkg-config",
-]
-
-[[package]]
-name = "memento-audio"
-version = "2.0.2"
-
-[[package]]
-name = "memento-config"
-version = "2.0.2"
-dependencies = [
- "memento-setting",
-]
-
-[[package]]
-name = "memento-definition"
-version = "2.0.2"
-dependencies = [
- "serde_json",
- "unicode-general-category",
-]
-
-[[package]]
-name = "memento-dict"
-version = "2.0.2"
-dependencies = [
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "unicode-normalization",
- "zip",
-]
-
-[[package]]
-name = "memento-net"
-version = "2.0.2"
-dependencies = [
- "memento-anki",
- "memento-setting",
- "serde_json",
- "ureq",
- "url",
-]
-
-[[package]]
-name = "memento-os"
-version = "2.0.2"
-dependencies = [
- "zbus",
-]
-
-[[package]]
-name = "memento-player"
-version = "2.0.2"
-dependencies = [
- "bindgen 0.73.2",
- "pkg-config",
-]
-
-[[package]]
-name = "memento-setting"
-version = "2.0.2"
-
-[[package]]
-name = "memento-subtitle"
-version = "2.0.2"
-
-[[package]]
-name = "memento-util"
-version = "2.0.2"
-dependencies = [
- "base64 0.22.1",
- "libloading",
- "md-5",
- "unicode-normalization",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "memmap2"
 version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4854,6 +4688,178 @@ dependencies = [
 ]
 
 [[package]]
+name = "subomi"
+version = "2.0.2"
+dependencies = [
+ "base64 0.22.1",
+ "copypasta",
+ "glow",
+ "i-slint-backend-testing",
+ "i-slint-renderer-femtovg",
+ "image",
+ "libc",
+ "libloading",
+ "log",
+ "parley",
+ "raw-window-handle",
+ "resvg",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "subomi-anki",
+ "subomi-asr",
+ "subomi-asr-onnx",
+ "subomi-asr-whisper",
+ "subomi-ass",
+ "subomi-audio",
+ "subomi-config",
+ "subomi-definition",
+ "subomi-dict",
+ "subomi-net",
+ "subomi-os",
+ "subomi-player",
+ "subomi-setting",
+ "subomi-subtitle",
+ "subomi-util",
+ "swash",
+ "tempfile",
+ "url",
+ "webbrowser",
+]
+
+[[package]]
+name = "subomi-anki"
+version = "2.0.2"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "subomi-asr"
+version = "2.0.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "subomi-asr-onnx"
+version = "2.0.2"
+dependencies = [
+ "flate2",
+ "sha2",
+ "subomi-asr",
+ "tar",
+ "ureq",
+ "zip",
+]
+
+[[package]]
+name = "subomi-asr-whisper"
+version = "2.0.2"
+dependencies = [
+ "bindgen 0.73.2",
+ "cmake",
+ "flate2",
+ "regex",
+ "sha2",
+ "subomi-asr",
+ "tar",
+ "ureq",
+]
+
+[[package]]
+name = "subomi-ass"
+version = "2.0.2"
+dependencies = [
+ "cc",
+ "flate2",
+ "image",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
+name = "subomi-audio"
+version = "2.0.2"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "subomi-config"
+version = "2.0.2"
+dependencies = [
+ "subomi-setting",
+]
+
+[[package]]
+name = "subomi-definition"
+version = "2.0.2"
+dependencies = [
+ "serde_json",
+ "svgtypes",
+]
+
+[[package]]
+name = "subomi-dict"
+version = "2.0.2"
+dependencies = [
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "unicode-normalization",
+ "zip",
+]
+
+[[package]]
+name = "subomi-net"
+version = "2.0.2"
+dependencies = [
+ "serde_json",
+ "subomi-anki",
+ "subomi-setting",
+ "ureq",
+ "url",
+]
+
+[[package]]
+name = "subomi-os"
+version = "2.0.2"
+dependencies = [
+ "zbus",
+]
+
+[[package]]
+name = "subomi-player"
+version = "2.0.2"
+dependencies = [
+ "bindgen 0.73.2",
+ "pkg-config",
+]
+
+[[package]]
+name = "subomi-setting"
+version = "2.0.2"
+
+[[package]]
+name = "subomi-subtitle"
+version = "2.0.2"
+
+[[package]]
+name = "subomi-util"
+version = "2.0.2"
+dependencies = [
+ "base64 0.22.1",
+ "libloading",
+ "md-5",
+ "unicode-normalization",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5275,12 +5281,6 @@ name = "unicode-ccc"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce61d488bcdc9bc8b5d1772c404828b17fc481c0a582b5581e95fb233aef503e"
-
-[[package]]
-name = "unicode-general-category"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"

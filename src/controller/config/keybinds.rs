@@ -3,19 +3,19 @@
 
 use std::collections::HashMap;
 
-use memento_config::config::Config;
-use memento_config::Value;
-use memento_setting::keys as raw;
+use subomi_config::config::Config;
+use subomi_config::Value;
+use subomi_setting::keys as raw;
 
 use super::anki_profiles::{validate_profile_name, ANKI_PROFILE_DEFAULT};
 use super::schema::{effective_text, value_text};
 
 /// Config key inside `[keybind/profiles/<name>]` for marking/toggling A-B
-/// audio context timestamps for manual/OCR lookup (Memento `#136`).
+/// audio context timestamps for manual/OCR lookup (Subomi `#136`).
 pub const KEYBIND_MARK_AUDIO_CONTEXT: &str = "mark-audio-context";
 
 /// Config key inside `[keybind/profiles/<name>]` for clearing marked A-B
-/// audio context timestamps (Memento `#136`).
+/// audio context timestamps (Subomi `#136`).
 pub const KEYBIND_CLEAR_AUDIO_CONTEXT: &str = "clear-audio-context";
 
 /// Reserved platform Settings shortcut strings.
@@ -23,7 +23,7 @@ pub const SETTINGS_SHORTCUT_MACOS: &str = "Cmd+,";
 pub const SETTINGS_SHORTCUT_DEFAULT: &str = "Ctrl+,";
 pub const QUIT_SHORTCUT_MACOS: &str = "Cmd+Q";
 
-/// A-B audio context keybind actions (Memento `#136`).
+/// A-B audio context keybind actions (Subomi `#136`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AudioContextKeybindAction {
     MarkAudioContext,
@@ -218,7 +218,7 @@ pub(crate) fn keybind_profile_names(config: &Config) -> Vec<String> {
         .filter_map(|group| group.strip_prefix(&prefix).map(str::to_owned))
         .filter(|name| !name.contains('/'))
         .collect::<Vec<_>>();
-    names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+    names.sort();
     names.dedup();
     names
 }
@@ -323,7 +323,7 @@ pub(crate) fn remove_keybind_profile(config: &mut Config, name: &str) -> Result<
             .as_ref()
             .is_some_and(|current| names.iter().any(|profile| profile == current))
     {
-        names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+        names.sort();
         config
             .put_at(
                 raw::keybind::GROUP,

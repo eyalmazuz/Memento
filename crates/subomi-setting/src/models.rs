@@ -1,0 +1,171 @@
+//! Pure model calculation logic and model registries shared across
+//! `subomi-config`, `subomi-net`, and `src/`.
+
+/// Relative floating-point equality check (`|a - b| <= 1e-12 * min(|a|, |b|)`).
+#[inline]
+pub fn approx_eq_f64(a: f64, b: f64) -> bool {
+    (a - b).abs() * 1_000_000_000_000.0 <= a.abs().min(b.abs())
+}
+
+/// Computes download speed in bytes/second from bytes received and elapsed milliseconds.
+#[inline]
+pub fn download_speed(received: i64, elapsed_ms: i64) -> i64 {
+    let elapsed = elapsed_ms.max(1);
+    (received.saturating_mul(1000)) / elapsed
+}
+
+/// Evaluates whether download progress state has changed and computes the new progress fraction.
+pub fn download_progress_update(
+    prev_progress: f64,
+    prev_received: i64,
+    prev_total: i64,
+    prev_speed: i64,
+    received: i64,
+    total: i64,
+    speed: i64,
+) -> (f64, bool) {
+    let progress = if total > 0 {
+        (received as f64) / (total as f64)
+    } else {
+        0.0
+    };
+    let changed = !approx_eq_f64(prev_progress, progress)
+        || prev_received != received
+        || prev_total != total
+        || prev_speed != speed;
+    (progress, changed)
+}
+
+/// Valid Whisper models accepted by `Settings::setWhisperModel`.
+pub const WHISPER_MODELS: &[&str] = &[
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3",
+    "large-v3-turbo",
+    "custom",
+];
+
+/// Valid ONNX models accepted by `Settings::setOnnxModel`.
+pub const ONNX_MODELS: &[&str] = &[
+    "kitsune-transcribe-t0.6b-ja",
+    "kitsune-transcribe-p0.3b-ja",
+    "custom",
+];
+
+/// Valid UI theme values accepted by `interface/theme` (`#357`).
+pub const THEME_MODES: &[&str] = &["system", "dark", "light"];
+
+/// Maximum capacity for the recent files list.
+/// Matches `MAX_SIZE` in `Settings::recentFilesAdd`.
+pub const RECENT_FILES_MAX_SIZE: usize = 10;
+
+/// Plans updating a recent files list when prepending `new_val`.
+///
+/// 1. Filters out any existing items that equal `new_val`.
+/// 2. Truncates the surviving items so the resulting list (`1 + surviving.len()`)
+///    never exceeds `max_size`.
+///
+/// Returns the surviving original indices from `items` that should follow `new_val`.
+pub fn plan_recent_files_add_with_limit<T: AsRef<str>>(
+    items: &[T],
+    new_val: &str,
+    max_size: usize,
+) -> Vec<usize> {
+    let limit = max_size.saturating_sub(1);
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.as_ref() != new_val)
+        .map(|(idx, _)| idx)
+        .take(limit)
+        .collect()
+}
+
+/// Plans updating a recent files list when prepending `new_val` with default max size of 10.
+pub fn plan_recent_files_add<T: AsRef<str>>(items: &[T], new_val: &str) -> Vec<usize> {
+    plan_recent_files_add_with_limit(items, new_val, RECENT_FILES_MAX_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_approx_eq_f64() {
+        assert!(approx_eq_f64(0.0, 0.0));
+        assert!(approx_eq_f64(1.0, 1.0));
+        assert!(approx_eq_f64(1.0, 1.0 + 1e-13));
+        assert!(!approx_eq_f64(1.0, 1.01));
+        assert!(!approx_eq_f64(0.0, 0.0001));
+    }
+
+    #[test]
+    fn test_download_speed() {
+        assert_eq!(download_speed(1000, 1000), 1000);
+        assert_eq!(download_speed(1000, 500), 2000);
+        assert_eq!(download_speed(1000, 0), 1_000_000);
+        assert_eq!(download_speed(1000, -10), 1_000_000);
+    }
+
+    #[test]
+    fn test_download_progress_update() {
+        let (p, changed) = download_progress_update(0.0, 0, 0, 0, 0, 0, 0);
+        assert_eq!(p, 0.0);
+        assert!(!changed);
+
+        let (p, changed) = download_progress_update(0.0, 0, 0, 0, 50, 100, 1000);
+        assert_eq!(p, 0.5);
+        assert!(changed);
+
+        let (p2, changed2) = download_progress_update(0.5, 50, 100, 1000, 50, 100, 1000);
+        assert_eq!(p2, 0.5);
+        assert!(!changed2);
+
+        let (p3, changed3) = download_progress_update(0.5, 50, 100, 1000, 50, 100, 1200);
+        assert_eq!(p3, 0.5);
+        assert!(changed3);
+    }
+
+    #[test]
+    fn test_plan_recent_files_add() {
+        let empty: Vec<&str> = vec![];
+        assert_eq!(plan_recent_files_add(&empty, "file1"), Vec::<usize>::new());
+
+        let items = vec!["file1", "file2"];
+        assert_eq!(plan_recent_files_add(&items, "file0"), vec![0, 1]);
+        assert_eq!(plan_recent_files_add(&items, "file1"), vec![1]);
+
+        let items3 = vec!["a", "b", "c"];
+        assert_eq!(plan_recent_files_add(&items3, "b"), vec![0, 2]);
+        assert_eq!(plan_recent_files_add(&items3, "c"), vec![0, 1]);
+
+        let items_dups = vec!["a", "b", "a", "c"];
+        assert_eq!(plan_recent_files_add(&items_dups, "a"), vec![1, 3]);
+
+        let ten_items: Vec<String> = (1..=10).map(|i| format!("file{i}")).collect();
+        assert_eq!(
+            plan_recent_files_add(&ten_items, "file0"),
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            plan_recent_files_add(&ten_items, "file5"),
+            vec![0, 1, 2, 3, 5, 6, 7, 8, 9]
+        );
+
+        // Oversized list (> max_size) is truncated down to max_size - 1 surviving entries.
+        let twelve_items: Vec<String> = (1..=12).map(|i| format!("file{i}")).collect();
+        let plan12 = plan_recent_files_add(&twelve_items, "file0");
+        assert_eq!(plan12, (0..9).collect::<Vec<usize>>());
+
+        // Limit of 0 or 1 leaves no surviving tail.
+        assert!(plan_recent_files_add_with_limit(&items, "file0", 1).is_empty());
+        assert!(plan_recent_files_add_with_limit(&items, "file0", 0).is_empty());
+    }
+
+    #[test]
+    fn test_theme_modes_registry() {
+        assert_eq!(THEME_MODES, &["system", "dark", "light"]);
+    }
+}

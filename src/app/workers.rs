@@ -23,10 +23,10 @@ use crate::app::subtitle_io::parse_external_subtitles;
 use crate::controller::config::ConfigController;
 use crate::controller::dict::{self, DictController, SearchHit, TermFrequency, TermPitchGraph};
 use crate::controller::subtitles::{self, ExternalSubtitleLoad};
-use crate::ui::{self, dictionary_result_rows, set_dictionary_rows, MementoApp, PopupBridge};
-use memento_config::Value;
-use memento_player::MpvInstance;
-use memento_setting::keys as raw;
+use crate::ui::{self, dictionary_result_rows, set_dictionary_rows, SubomiApp, PopupBridge};
+use subomi_config::Value;
+use subomi_player::MpvInstance;
+use subomi_setting::keys as raw;
 
 /// Thread-safe, closeable wrapper around `mpsc::Sender<T>` so UI callbacks holding
 /// clones never keep worker channels open past `WorkerPool::shutdown()`.
@@ -74,7 +74,7 @@ impl<T> ChannelSlot<T> {
 pub(crate) enum UiEvent {
     OpenPaths(Vec<PathBuf>),
     AddSubtitles(Vec<PathBuf>),
-    SystemThemeChanged(memento_os::SystemColorScheme),
+    SystemThemeChanged(subomi_os::SystemColorScheme),
     DictionariesImported {
         imported: usize,
         errors: Vec<String>,
@@ -84,16 +84,16 @@ pub(crate) enum UiEvent {
         generation: u64,
         track_id: i64,
         path: String,
-        result: Result<Vec<memento_subtitle::SubtitleEntry>, String>,
+        result: Result<Vec<subomi_subtitle::SubtitleEntry>, String>,
     },
     MkvFonts {
         generation: u64,
-        fonts: Vec<memento_ass::MkvFontAttachment>,
+        fonts: Vec<subomi_ass::MkvFontAttachment>,
     },
     MkvTrack {
         generation: u64,
         sid: i64,
-        cues: Vec<memento_ass::MkvSubtitleCue>,
+        cues: Vec<subomi_ass::MkvSubtitleCue>,
     },
 }
 
@@ -209,7 +209,7 @@ const DEFAULT_THUMB_WIDTH: u32 = 192;
 const DEFAULT_THUMB_HEIGHT: u32 = 108;
 
 /// Fast-decode, low-RAM `libmpv` options for the timeline hover thumbnail worker.
-pub(crate) fn thumb_mpv_cli_options() -> Vec<memento_player::CliOption> {
+pub(crate) fn thumb_mpv_cli_options() -> Vec<subomi_player::CliOption> {
     [
         ("config", "no"),
         ("aid", "no"),
@@ -231,7 +231,7 @@ pub(crate) fn thumb_mpv_cli_options() -> Vec<memento_player::CliOption> {
         ("demuxer-readahead-secs", "1"),
     ]
     .into_iter()
-    .map(|(name, value)| memento_player::CliOption {
+    .map(|(name, value)| subomi_player::CliOption {
         name: name.into(),
         value: value.into(),
     })
@@ -323,7 +323,7 @@ pub(crate) fn resolve_thumbnail_media_path(path: &str) -> Option<PathBuf> {
         return None;
     }
     if trimmed.starts_with("file://") {
-        let decoded = memento_os::decode_file_uri(trimmed)?;
+        let decoded = subomi_os::decode_file_uri(trimmed)?;
         return decoded.is_file().then_some(decoded);
     }
     let candidate = PathBuf::from(trimmed);
@@ -343,7 +343,7 @@ pub(crate) fn compute_thumbnail_dimensions(video_w: u32, video_h: u32) -> (u32, 
 
 struct ThumbMpvState {
     // Declared before `inst` so the software renderer handle drops before `MpvInstance`.
-    renderer: memento_player::mpv::MpvSoftwareRenderer,
+    renderer: subomi_player::mpv::MpvSoftwareRenderer,
     inst: MpvInstance,
     wake_signal: Arc<(Mutex<bool>, Condvar)>,
 }
@@ -541,7 +541,7 @@ pub(crate) enum MkvExtractRequest {
 }
 
 pub(crate) fn display_word_lookup(
-    app: &MementoApp,
+    app: &SubomiApp,
     result: WordLookupResult,
     query: &str,
     excluded: &[String],
@@ -642,7 +642,7 @@ pub(crate) struct WorkerPool {
 
 impl WorkerPool {
     pub(crate) fn spawn(
-        app: &MementoApp,
+        app: &SubomiApp,
         dictionary_database_path: PathBuf,
         shared_media_generation: Arc<AtomicU64>,
         lookup_epoch: Arc<AtomicU64>,
@@ -1139,7 +1139,7 @@ impl WorkerPool {
                         if mkv_worker_gen.load(Ordering::Acquire) != generation {
                             continue;
                         }
-                        if let Ok(fonts) = memento_ass::extract_mkv_fonts(&path) {
+                        if let Ok(fonts) = subomi_ass::extract_mkv_fonts(&path) {
                             if mkv_worker_gen.load(Ordering::Acquire) == generation
                                 && !fonts.is_empty()
                             {
@@ -1157,7 +1157,7 @@ impl WorkerPool {
                             continue;
                         }
                         if let Ok(extracted) =
-                            memento_ass::extract_mkv_subtitle_track(&path, track_number)
+                            subomi_ass::extract_mkv_subtitle_track(&path, track_number)
                         {
                             if mkv_worker_gen.load(Ordering::Acquire) == generation
                                 && !extracted.cues.is_empty()
@@ -1232,7 +1232,7 @@ impl WorkerPool {
 /// Wire dictionary lookup, hover debounce, glossary links, search panel, and kanji lookup.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_dictionary_lookup_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     dict_ctrl: Rc<RefCell<DictController>>,
     popup_audio_cache: Arc<Mutex<PopupAudioState>>,
@@ -1507,7 +1507,7 @@ mod tests {
     #[test]
     fn resolve_thumbnail_media_path_accepts_file_uri() {
         let dir = std::env::temp_dir().join(format!(
-            "memento-thumb-uri-{}",
+            "subomi-thumb-uri-{}",
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&dir);

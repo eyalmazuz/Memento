@@ -1,4 +1,4 @@
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import {
     DictResult,
     PopupDictStyle,
@@ -111,12 +111,12 @@ export component DefinitionEntryBody inherits Rectangle {
                         height: 16px;
                         border-width: 1.5px;
                         border-color: root.res.selected
-                            ? MementoPalette.teal-border
-                            : (select-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.text-secondary);
+                            ? SubomiPalette.teal-border
+                            : (select-touch.has-hover ? SubomiPalette.cyan-accent : SubomiPalette.text-secondary);
                         border-radius: 4px;
                         background: root.res.selected
-                            ? MementoPalette.teal-accent
-                            : (select-touch.has-hover ? MementoPalette.hover-bg : transparent);
+                            ? SubomiPalette.teal-accent
+                            : (select-touch.has-hover ? SubomiPalette.hover-bg : transparent);
 
                         animate background { duration: 100ms; }
                         animate border-color { duration: 100ms; }
@@ -181,7 +181,7 @@ export component DefinitionEntryBody inherits Rectangle {
                 alignment: center;
                 Rectangle {
                     height: max(18px, PopupBridge.css-tag-font-size + 7px);
-                    background: MementoPalette.surface-elevated;
+                    background: SubomiPalette.surface-elevated;
                     border-radius: 3px;
                     HorizontalLayout {
                         padding-left: 6px;
@@ -191,7 +191,7 @@ export component DefinitionEntryBody inherits Rectangle {
                             font-family: PopupBridge.css-tag-font-family;
                             font-size: PopupBridge.css-tag-font-size;
                             font-weight: 600;
-                            color: MementoPalette.icon;
+                            color: SubomiPalette.icon;
                             vertical-alignment: center;
                         }
                     }
@@ -480,7 +480,7 @@ export component DefinitionEntryBody inherits Rectangle {
                     width: parent.width;
                     height: 22px;
                     border-radius: 3px;
-                    background: expand-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                    background: expand-touch.has-hover ? SubomiPalette.hover-bg : transparent;
                     animate background { duration: 100ms; }
 
                     Rectangle {
@@ -553,7 +553,7 @@ export component DefinitionEntryBody inherits Rectangle {
                         wrap: word-wrap;
                         font-size: block.kind == 1 ? max(11px, PopupBridge.css-glossary-font-size - 1.5px) : PopupBridge.css-glossary-font-size;
                         font-weight: block.kind == 1 ? 700 : 400;
-                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? MementoPalette.glossary-heading : PopupBridge.css-text-color;
+                        color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? SubomiPalette.glossary-heading : PopupBridge.css-text-color;
                     }
                     if block.href != "" : TouchArea {
                         mouse-cursor: pointer;

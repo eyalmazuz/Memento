@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use memento_anki::note::TermGlossaryVariants;
-use memento_net::anki::AnkiNoteInfo;
+use subomi_anki::note::TermGlossaryVariants;
+use subomi_net::anki::AnkiNoteInfo;
 
 use crate::controller::config::AnkiNoteConfig;
 
@@ -16,7 +16,7 @@ use super::markers::{
 };
 use super::query::select_primary_key_field;
 
-/// Duplicate behavior supported by the Memento Anki profile schema.
+/// Duplicate behavior supported by the Subomi Anki profile schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnkiDuplicatePolicy {
     None,
@@ -262,30 +262,24 @@ impl NotePayload {
         }
     }
 
-    /// Builds a `memento_anki::json::JsonObject` metadata representation.
-    pub fn to_anki_metadata(&self) -> memento_anki::json::JsonObject {
-        let deck: Vec<u16> = self.deck_name.encode_utf16().collect();
-        let model: Vec<u16> = self.model_name.encode_utf16().collect();
-        let tags: Vec<Vec<u16>> = self.tags.iter().map(|t| t.encode_utf16().collect()).collect();
-        let mut fields_obj = memento_anki::json::JsonObject::new();
+    /// Builds a JSON metadata object matching AnkiConnect's note envelope.
+    pub fn to_anki_metadata(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields_obj = serde_json::Map::with_capacity(self.fields.len());
         for (k, v) in &self.fields {
-            fields_obj.insert(
-                k.encode_utf16().collect(),
-                memento_anki::json::JsonValue::String(v.encode_utf16().collect()),
-            );
+            fields_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
         let policy = if self.options.duplicate_scope.as_deref() == Some("deck") {
-            memento_anki::note::DuplicatePolicy::DifferentDeck
+            subomi_anki::note::DuplicatePolicy::DifferentDeck
         } else if self.options.allow_duplicate {
-            memento_anki::note::DuplicatePolicy::SameDeck
+            subomi_anki::note::DuplicatePolicy::SameDeck
         } else {
-            memento_anki::note::DuplicatePolicy::None
+            subomi_anki::note::DuplicatePolicy::None
         };
-        memento_anki::note::build_note_metadata(
-            deck,
-            model,
-            tags,
-            memento_anki::json::JsonValue::Object(fields_obj),
+        subomi_anki::note::build_note_metadata(
+            self.deck_name.clone(),
+            self.model_name.clone(),
+            self.tags.clone(),
+            serde_json::Value::Object(fields_obj),
             policy,
         )
     }

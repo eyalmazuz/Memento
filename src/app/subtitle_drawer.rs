@@ -15,8 +15,8 @@ use crate::controller::player::{
     refresh_subtitle_marks,
 };
 use crate::controller::subtitles::SubtitleController;
-use crate::ui::{self, MementoApp, PopupBridge, SubEntry};
-use memento_player::subtitle_to_media_time;
+use crate::ui::{self, SubomiApp, PopupBridge, SubEntry};
+use subomi_player::subtitle_to_media_time;
 
 pub(crate) fn estimate_drawer_row_height(
     text: &str,
@@ -255,7 +255,7 @@ fn ensure_prefix_heights<'a>(
     &cache.prefix
 }
 
-pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
+pub fn scroll_drawer_to_row_accurate(app: &SubomiApp, row_idx: usize) {
     let is_secondary = app.get_subtitle_drawer_tab() == 1;
     let entries = if is_secondary {
         app.get_secondary_subtitle_entries()
@@ -294,7 +294,7 @@ pub fn scroll_drawer_to_row_accurate(app: &MementoApp, row_idx: usize) {
     app.invoke_scroll_subtitle_drawer_to_offset(row_y, target_h, total_h);
 }
 
-pub fn auto_scroll_subtitle_drawer_if_needed(app: &MementoApp, subtitles: &SubtitleController) {
+pub fn auto_scroll_subtitle_drawer_if_needed(app: &SubomiApp, subtitles: &SubtitleController) {
     if !app.get_sub_drawer_open() || app.get_subtitle_drawer_user_scrolling() {
         return;
     }
@@ -333,7 +333,7 @@ fn apply_secondary_selection_marks<M: slint::Model<Data = SubEntry>>(
 
 /// Re-run the currently active subtitle search without seeking playback (used
 /// when live ASR or newly parsed embedded cues arrive in `sync_loop.rs`, M1).
-pub(crate) fn rerun_active_subtitle_search_silently(app: &MementoApp) {
+pub(crate) fn rerun_active_subtitle_search_silently(app: &SubomiApp) {
     let query = app.get_subtitle_search_query();
     if query.trim().is_empty() {
         return;
@@ -428,7 +428,7 @@ pub(crate) fn sync_sub_entries_model(
 }
 
 pub fn refresh_subtitle_list_with_timing(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
     sub_speed: f64,
@@ -440,7 +440,7 @@ pub fn refresh_subtitle_list_with_timing(
 }
 
 pub fn refresh_subtitle_list(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
 ) {
@@ -448,7 +448,7 @@ pub fn refresh_subtitle_list(
 }
 
 pub fn refresh_secondary_subtitle_list_with_timing(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
     sub_speed: f64,
@@ -458,7 +458,7 @@ pub fn refresh_secondary_subtitle_list_with_timing(
     let active_tab = app.get_subtitle_drawer_tab();
     let ignore_whitespace = app.get_subtitle_search_ignore_whitespace();
     let remove_regex = app.get_search_remove_regex();
-    let compiled_regex = memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+    let compiled_regex = subomi_dict::normalize::compile_remove_regex(remove_regex.as_str());
     let entries = subtitles.secondary_entries();
     let sid = subtitles.secondary_sid();
     app.set_has_secondary_subtitles(sid > 0 || !entries.is_empty());
@@ -529,9 +529,8 @@ pub fn refresh_secondary_subtitle_list_with_timing(
                 match_cursor += 1;
             }
             let is_match = matching.get(match_cursor) == Some(&index);
-            let raw = String::from_utf16_lossy(&cue.text);
-            let display = memento_dict::normalize::apply_compiled_remove_regex(
-                &raw,
+            let display = subomi_dict::normalize::apply_compiled_remove_regex(
+                &cue.text,
                 compiled_regex.as_ref(),
             );
             if compiled_regex.is_some() && display.trim().is_empty() {
@@ -573,7 +572,7 @@ pub fn refresh_secondary_subtitle_list_with_timing(
 }
 
 pub fn refresh_secondary_subtitle_list(
-    app: &MementoApp,
+    app: &SubomiApp,
     model: &VecModel<SubEntry>,
     subtitles: &SubtitleController,
 ) {
@@ -592,10 +591,10 @@ fn normalize_search_text(text: &str, ignore_whitespace: bool) -> String {
 }
 
 fn search_entries(
-    entries: &[memento_subtitle::SubtitleEntry],
+    entries: &[subomi_subtitle::SubtitleEntry],
     query: &str,
     ignore_whitespace: bool,
-    remove_regex: Option<&memento_dict::normalize::Regex>,
+    remove_regex: Option<&subomi_dict::normalize::Regex>,
 ) -> Vec<usize> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -609,8 +608,8 @@ fn search_entries(
         .iter()
         .enumerate()
         .filter_map(|(idx, cue)| {
-            let raw = String::from_utf16_lossy(&cue.text);
-            let text = memento_dict::normalize::apply_compiled_remove_regex(&raw, remove_regex);
+            let text =
+                subomi_dict::normalize::apply_compiled_remove_regex(&cue.text, remove_regex);
             let haystack = normalize_search_text(&text, ignore_whitespace);
             haystack.contains(&normalized_query).then_some(idx)
         })
@@ -659,7 +658,7 @@ fn apply_sorted_search_highlights<M: slint::Model<Data = SubEntry>>(model: &M, m
     }
 }
 
-pub(crate) fn auto_seek_to_matched_row(app: &MementoApp, row: usize) {
+pub(crate) fn auto_seek_to_matched_row(app: &SubomiApp, row: usize) {
     if !app.get_subtitle_search_auto_seek() {
         return;
     }
@@ -720,7 +719,7 @@ fn apply_primary_click_selection(
 }
 
 pub(crate) fn install_subtitle_selection(
-    app: &MementoApp,
+    app: &SubomiApp,
     subtitles: Rc<RefCell<SubtitleController>>,
     rows: Rc<VecModel<SubEntry>>,
 ) {
@@ -990,7 +989,7 @@ pub(crate) fn install_subtitle_selection(
             } else {
                 let remove_regex = app.get_search_remove_regex();
                 let compiled_regex =
-                    memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+                    subomi_dict::normalize::compile_remove_regex(remove_regex.as_str());
                 let subs = search_subs.borrow();
                 search_entries(
                     subs.secondary_entries(),
@@ -1004,7 +1003,7 @@ pub(crate) fn install_subtitle_selection(
         } else {
             let remove_regex = app.get_search_remove_regex();
             let compiled_regex =
-                memento_dict::normalize::compile_remove_regex(remove_regex.as_str());
+                subomi_dict::normalize::compile_remove_regex(remove_regex.as_str());
             let subs = search_subs.borrow();
             search_entries(
                 subs.primary_entries(),
@@ -1149,10 +1148,7 @@ pub(crate) fn install_subtitle_selection(
                 selected
                     .iter()
                     .filter_map(|&idx| sec_entries.get(idx))
-                    .map(|c| {
-                        let raw = String::from_utf16_lossy(&c.text);
-                        dict::apply_remove_regex(&raw, remove_regex.as_str())
-                    })
+                    .map(|c| dict::apply_remove_regex(&c.text, remove_regex.as_str()))
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -1172,10 +1168,7 @@ pub(crate) fn install_subtitle_selection(
             if !selected_cues.is_empty() {
                 selected_cues
                     .iter()
-                    .map(|c| {
-                        let raw = String::from_utf16_lossy(&c.text);
-                        dict::apply_remove_regex(&raw, remove_regex.as_str())
-                    })
+                    .map(|c| dict::apply_remove_regex(&c.text, remove_regex.as_str()))
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -1217,7 +1210,7 @@ mod tests {
     #[test]
     fn context_marks_clear_when_playback_reaches_the_next_subtitle() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let rows = VecModel::<SubEntry>::default();
         let mut subtitles = SubtitleController::new();
         let mut previous = None;
@@ -1256,7 +1249,7 @@ mod tests {
         subtitles.start_asr_track();
         let cue = |id, start| MemorySubtitleCue {
             id,
-            text: "ASR".encode_utf16().collect(),
+            text: "ASR".to_owned(),
             start,
             end: start + 1.,
         };
@@ -1277,7 +1270,7 @@ mod tests {
     #[test]
     fn drawer_marks_multiple_cues_without_search_or_playback_overwriting_them() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_duration(120.);
         app.set_sub_drawer_open(true);
@@ -1447,7 +1440,7 @@ mod tests {
     #[test]
     fn mpv_track_sync_preserves_asr_and_settings_reset_only_clears_its_cache() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_asr_enabled(true);
         let asr = Rc::new(RefCell::new(AsrController::new()));
         let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
@@ -1461,7 +1454,7 @@ mod tests {
             subtitles.add_asr_cue(
                 MemorySubtitleCue {
                     id: 1,
-                    text: "ASR".encode_utf16().collect(),
+                    text: "ASR".to_owned(),
                     start: 1.0,
                     end: 3.0,
                 },
@@ -1470,7 +1463,7 @@ mod tests {
         }
         app.set_asr_track_selected(true);
         app.set_asr_running(true);
-        let mut state = memento_player::mpv::PlaybackState::default();
+        let mut state = subomi_player::mpv::PlaybackState::default();
         state.position = 2.0;
         let mut audio = Vec::new();
         let mut tracks = Vec::new();
@@ -1572,7 +1565,7 @@ mod tests {
     #[test]
     fn subtitle_drawer_search_match_counter_navigation_tabs_copy_and_resizable_split() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_sub_drawer_open(true);
         app.set_dict_search_open(true);
@@ -1635,7 +1628,7 @@ mod tests {
     fn subtitle_drawer_auto_scrolls_on_active_cue_advance_and_respects_user_scrolling_and_hover_pause_release(
     ) {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_sub_drawer_open(true);
         let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
@@ -1740,7 +1733,7 @@ mod tests {
     #[test]
     fn subtitle_drawer_m1_secondary_selection_copy_lookup_unicode_whitespace_and_h37_delay_seek() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let subtitles = Rc::new(RefCell::new(SubtitleController::new()));
         subtitles.borrow_mut().load_cues(vec![
             create_cue("世界\u{3000}旅行", 10.0, 12.0),
@@ -1922,7 +1915,7 @@ mod tests {
         assert_eq!(model.row_count(), 1);
 
         // Verify `refresh_secondary_subtitle_list_with_timing` patches secondary-sub-delay in-place!
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let mut subs = SubtitleController::new();
         subs.ensure_track(2);
         subs.set_secondary_sid(2);

@@ -5,18 +5,18 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use memento_anki::glossary::build_glossary;
-use memento_anki::note::{
+use subomi_anki::glossary::build_glossary;
+use subomi_anki::note::{
     build_frequencies_html, find_stroke_count, format_kanji_readings, format_pitch_categories_ex,
     format_pitch_ex, format_pitch_graphs_ex, format_pitch_positions_ex, frequency_average,
     frequency_harmonic, is_kifuku_applicable, parse_frequency_value, FrequencyEntry, PitchEntryEx,
     PitchSpec, StrokeCountStat,
 };
-use memento_dict::databasemanager::{self, PitchPosition};
-use memento_dict::searchcontroller::{self, TagSortItem};
-use memento_dict::sqlite_db::{self, rusqlite::types::ValueRef, FrequencyMode};
-use memento_dict::yomidbbuilder;
-use memento_net::anki::{to_qjson, MediaFilePayload};
+use subomi_dict::databasemanager::{self, PitchPosition};
+use subomi_dict::searchcontroller::{self, TagSortItem};
+use subomi_dict::sqlite_db::{self, rusqlite::types::ValueRef, FrequencyMode};
+use subomi_dict::yomidbbuilder;
+use subomi_net::anki::MediaFilePayload;
 
 use crate::controller::audio::sanitize_anki_filename;
 use crate::controller::dict::{shared_readonly_db, DictTag};
@@ -232,35 +232,25 @@ fn apply_frequency_entries_with_mode(
         .map(|row| (row.dictionary_title.clone(), row.display.clone()))
         .collect();
 
-    let dict_u16: Vec<Vec<u16>> = ctx
+    let entries: Vec<FrequencyEntry<'_>> = ctx
         .frequency_entries
         .iter()
-        .map(|(d, _)| d.encode_utf16().collect())
-        .collect();
-    let freq_u16: Vec<Vec<u16>> = ctx
-        .frequency_entries
-        .iter()
-        .map(|(_, f)| f.encode_utf16().collect())
-        .collect();
-    let entries: Vec<FrequencyEntry<'_>> = dict_u16
-        .iter()
-        .zip(&freq_u16)
         .map(|(d, f)| FrequencyEntry {
             dictionary: d,
             freq: f,
         })
         .collect();
-    ctx.frequencies = String::from_utf16_lossy(&build_frequencies_html(&entries, false, false));
+    ctx.frequencies = build_frequencies_html(&entries, false, false);
 
     let mut seen_rank_dics: HashSet<i64> = HashSet::new();
     let mut seen_occ_dics: HashSet<i64> = HashSet::new();
     let mut rank_numbers: Vec<f64> = Vec::new();
     let mut occ_numbers: Vec<f64> = Vec::new();
 
-    for (row, display_u16) in frequency_rows.iter().zip(&freq_u16) {
+    for row in &frequency_rows {
         let Some(val) = row
             .numeric
-            .or_else(|| parse_frequency_value(display_u16))
+            .or_else(|| parse_frequency_value(&row.display))
             .filter(|&v| v.is_finite() && v > 0.0)
         else {
             continue;
@@ -362,7 +352,7 @@ fn match_selection_order(
 
 /// Enriches `ctx` directly from the Yomitan SQLite database (`term_bank` / `kanji_bank` /
 /// `tag_bank` / `term_meta_bank` / `kanji_meta_bank`) and dictionary `styles.css` + media
-/// resources using `memento_anki::glossary::build_glossary`.
+/// resources using `subomi_anki::glossary::build_glossary`.
 ///
 /// Reuses the shared read-only SQLite connection and cached metadata snapshot from
 /// `crate::controller::dict::shared_readonly_db`, honors `ctx.dictionary_order` when
@@ -537,8 +527,8 @@ pub fn populate_note_context_from_sqlite_with_hints(
 
         let mut occ_counts: HashMap<String, usize> = HashMap::new();
         let mut matched_defs: Vec<(usize, GlossaryDefinition)> = Vec::new();
-        let mut onyomi_parts: Vec<Vec<u16>> = Vec::new();
-        let mut kunyomi_parts: Vec<Vec<u16>> = Vec::new();
+        let mut onyomi_parts: Vec<String> = Vec::new();
+        let mut kunyomi_parts: Vec<String> = Vec::new();
         let mut stroke_found: Option<String> = None;
         let mut accumulated_tags: Vec<NoteTag> = Vec::new();
         let mut seen_tag_names: HashSet<String> = HashSet::new();
@@ -568,12 +558,12 @@ pub fn populate_note_context_from_sqlite_with_hints(
 
             for part in row.onyomi.split_whitespace() {
                 if !part.is_empty() {
-                    onyomi_parts.push(part.encode_utf16().collect());
+                    onyomi_parts.push(part.to_owned());
                 }
             }
             for part in row.kunyomi.split_whitespace() {
                 if !part.is_empty() {
-                    kunyomi_parts.push(part.encode_utf16().collect());
+                    kunyomi_parts.push(part.to_owned());
                 }
             }
 
@@ -588,7 +578,7 @@ pub fn populate_note_context_from_sqlite_with_hints(
                 if let Ok(serde_json::Value::Object(stats_map)) =
                     serde_json::from_str::<serde_json::Value>(&row.stats)
                 {
-                    let stat_pairs: Vec<(Vec<u16>, Vec<u16>)> = stats_map
+                    let stat_pairs: Vec<(String, String)> = stats_map
                         .iter()
                         .filter_map(|(stat_key, val)| {
                             let tag_info = tag_bank.get(&(row.dic_id, stat_key.clone()))?;
@@ -597,18 +587,15 @@ pub fn populate_note_context_from_sqlite_with_hints(
                                 serde_json::Value::Number(n) => n.to_string(),
                                 _ => return None,
                             };
-                            Some((
-                                tag_info.notes.encode_utf16().collect(),
-                                val_s.encode_utf16().collect(),
-                            ))
+                            Some((tag_info.notes.clone(), val_s))
                         })
                         .collect();
                     let refs: Vec<StrokeCountStat<'_>> = stat_pairs
                         .iter()
                         .map(|(notes, value)| StrokeCountStat { notes, value })
                         .collect();
-                    if let Some(stroke_u16) = find_stroke_count(&refs) {
-                        stroke_found = Some(String::from_utf16_lossy(stroke_u16));
+                    if let Some(stroke) = find_stroke_count(&refs) {
+                        stroke_found = Some(stroke.to_owned());
                     }
                 }
             }
@@ -630,10 +617,10 @@ pub fn populate_note_context_from_sqlite_with_hints(
         if !matched_defs.is_empty() {
             matched_defs.sort_by_key(|(pos, _)| *pos);
             ctx.glossary_definitions = matched_defs.into_iter().map(|(_, def)| def).collect();
-            let on_refs: Vec<&[u16]> = onyomi_parts.iter().map(Vec::as_slice).collect();
-            let kun_refs: Vec<&[u16]> = kunyomi_parts.iter().map(Vec::as_slice).collect();
-            ctx.onyomi = String::from_utf16_lossy(&format_kanji_readings(&on_refs));
-            ctx.kunyomi = String::from_utf16_lossy(&format_kanji_readings(&kun_refs));
+            let on_refs: Vec<&str> = onyomi_parts.iter().map(String::as_str).collect();
+            let kun_refs: Vec<&str> = kunyomi_parts.iter().map(String::as_str).collect();
+            ctx.onyomi = format_kanji_readings(&on_refs);
+            ctx.kunyomi = format_kanji_readings(&kun_refs);
             if let Some(strokes) = stroke_found.filter(|s| !s.is_empty()) {
                 ctx.stroke_count = strokes;
             }
@@ -849,52 +836,36 @@ pub fn populate_note_context_from_sqlite_with_hints(
             .or(res_dir_opt.as_ref())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let basepath_u16: Vec<u16> = basepath_str.encode_utf16().collect();
-
-        let qjson_defs: Vec<memento_anki::json::JsonValue> =
-            filtered_items.iter().map(to_qjson).collect();
 
         let mut verified_files: HashMap<String, Vec<u8>> = HashMap::new();
-        let (rendered_u16, file_map) =
-            build_glossary(&qjson_defs, &basepath_u16, |full_path_u16| {
+        let (rendered_items, file_map) =
+            build_glossary(&filtered_items, &basepath_str, |full_path| {
                 let base = canon_base.as_ref()?;
-                let candidate = PathBuf::from(String::from_utf16(full_path_u16).ok()?);
-                let canon_file = fs::canonicalize(&candidate).ok()?;
+                let canon_file = fs::canonicalize(Path::new(full_path)).ok()?;
                 if !canon_file.starts_with(base) || !canon_file.is_file() {
                     return None;
                 }
                 let bytes = fs::read(&canon_file).ok()?;
-                let md5 = memento_util::fileutils::calculate_md5(bytes.as_slice()).ok()?;
+                let md5 = subomi_util::fileutils::calculate_md5(bytes.as_slice()).ok()?;
                 let hex = format!("{:032x}", u128::from_be_bytes(md5));
-                let mut hex_u16 = [0u16; 32];
-                for (dst, b) in hex_u16.iter_mut().zip(hex.bytes()) {
-                    *dst = u16::from(b);
-                }
-                verified_files.insert(String::from_utf16_lossy(full_path_u16), bytes);
-                Some(hex_u16)
+                verified_files.insert(full_path.to_owned(), bytes);
+                Some(hex)
             });
 
         let mut media_files = Vec::new();
-        for (full_path_u16, hash_name_u16) in file_map {
-            let key = String::from_utf16_lossy(&full_path_u16);
-            let Some(bytes) = verified_files.remove(&key) else {
+        for (full_path, hash_name) in file_map {
+            let Some(bytes) = verified_files.remove(&full_path) else {
                 continue;
             };
             let Ok(data_base64) = encode_base64(&bytes) else {
                 continue;
             };
-            let raw_name = String::from_utf16_lossy(&hash_name_u16);
-            let safe_name = sanitize_anki_filename(&raw_name, ".bin");
+            let safe_name = sanitize_anki_filename(&hash_name, ".bin");
             media_files.push(MediaFilePayload {
                 filename: safe_name,
                 data_base64,
             });
         }
-
-        let rendered_items: Vec<String> = rendered_u16
-            .into_iter()
-            .map(|item| String::from_utf16_lossy(&item))
-            .collect();
 
         matched_defs.push((
             order_pos,
@@ -984,28 +955,25 @@ pub fn populate_note_context_from_sqlite_with_hints(
     // Reuse cached `term_meta_bank` rows from the shared read-only DB for pitch accent export,
     // preserving exact `H`/`L` string patterns (`PitchEntryDetail.pattern`, Yomitan PR #2055).
     let raw_meta_rows = db.term_meta_rows_for(&ctx.expression);
-    let expr_u16: Vec<u16> = ctx.expression.encode_utf16().collect();
-    let read_u16: Vec<u16> = ctx.reading.encode_utf16().collect();
-    let mut pitch_rows: Vec<sqlite_db::PitchRow> = raw_meta_rows
-        .iter()
-        .filter(|row| row.mode == "pitch" && !meta.disabled.contains(&row.dic_id))
-        .filter_map(|row| {
-            let null_pos = row.data.iter().position(|&b| b == 0).unwrap_or(row.data.len());
-            let blob_slice = row.data.get(..null_pos).unwrap_or(&row.data);
-            let parsed = databasemanager::parse_pitch_blob(blob_slice, &expr_u16, &read_u16);
-            parsed.matched.then(|| sqlite_db::PitchRow {
-                dic_id: row.dic_id,
-                mora: parsed.mora,
-                positions: parsed.positions,
-                nasal: parsed.nasal,
-                devoice: parsed.devoice,
-                tags: parsed.tags,
-                entries: parsed.entries,
+    let mut pitch_rows: Vec<(i64, Vec<String>, Vec<databasemanager::PitchEntryDetail>)> =
+        raw_meta_rows
+            .iter()
+            .filter(|row| row.mode == "pitch" && !meta.disabled.contains(&row.dic_id))
+            .filter_map(|row| {
+                let null_pos = row.data.iter().position(|&b| b == 0).unwrap_or(row.data.len());
+                let blob_slice = row.data.get(..null_pos).unwrap_or(&row.data);
+                let parsed = databasemanager::parse_pitch_blob_utf8(
+                    blob_slice,
+                    &ctx.expression,
+                    &ctx.reading,
+                );
+                parsed
+                    .matched
+                    .then_some((row.dic_id, parsed.mora, parsed.entries))
             })
-        })
-        .collect();
+            .collect();
 
-    pitch_rows.sort_by_key(|row| dict_sort_key(dictionary_order, row.dic_id));
+    pitch_rows.sort_by_key(|(dic_id, _, _)| dict_sort_key(dictionary_order, *dic_id));
 
     enum OwnedPitchSpec {
         Downstep(u8),
@@ -1021,31 +989,21 @@ pub fn populate_note_context_from_sqlite_with_hints(
         }
     }
 
-    let pitches_owned: Vec<(Vec<u16>, Vec<OwnedPitchSpec>, Vec<Vec<u16>>)> = pitch_rows
-        .iter()
-        .filter_map(|row| {
-            let specs: Vec<OwnedPitchSpec> = if !row.entries.is_empty() {
-                row.entries
-                    .iter()
-                    .filter_map(|detail| match detail.pitch_position()? {
-                        PitchPosition::Pattern(pat) => Some(OwnedPitchSpec::Pattern(pat)),
-                        PitchPosition::Downstep(pos) => {
-                            u8::try_from(pos).ok().map(OwnedPitchSpec::Downstep)
-                        }
-                    })
-                    .collect()
-            } else {
-                row.positions
-                    .iter()
-                    .filter_map(|p| u8::try_from(*p).ok().map(OwnedPitchSpec::Downstep))
-                    .collect()
-            };
-            (!specs.is_empty() && !row.mora.is_empty()).then(|| {
-                let dict_u16 = titles
-                    .get(&row.dic_id)
-                    .map(|s| s.encode_utf16().collect())
-                    .unwrap_or_default();
-                (dict_u16, specs, row.mora.clone())
+    let pitches_owned: Vec<(String, Vec<OwnedPitchSpec>, Vec<String>)> = pitch_rows
+        .into_iter()
+        .filter_map(|(dic_id, mora, entries)| {
+            let specs: Vec<OwnedPitchSpec> = entries
+                .iter()
+                .filter_map(|detail| match detail.pitch_position()? {
+                    PitchPosition::Pattern(pat) => Some(OwnedPitchSpec::Pattern(pat)),
+                    PitchPosition::Downstep(pos) => {
+                        u8::try_from(pos).ok().map(OwnedPitchSpec::Downstep)
+                    }
+                })
+                .collect();
+            (!specs.is_empty() && !mora.is_empty()).then(|| {
+                let dict_name = titles.get(&dic_id).cloned().unwrap_or_default();
+                (dict_name, specs, mora)
             })
         })
         .collect();
@@ -1054,9 +1012,9 @@ pub fn populate_note_context_from_sqlite_with_hints(
         .iter()
         .map(|(_, specs, _)| specs.iter().map(OwnedPitchSpec::as_spec).collect())
         .collect();
-    let mora_refs: Vec<Vec<&[u16]>> = pitches_owned
+    let mora_refs: Vec<Vec<&str>> = pitches_owned
         .iter()
-        .map(|(_, _, mora)| mora.iter().map(Vec::as_slice).collect())
+        .map(|(_, _, mora)| mora.iter().map(String::as_str).collect())
         .collect();
     let pitch_entries: Vec<PitchEntryEx<'_>> = pitches_owned
         .iter()
@@ -1068,24 +1026,17 @@ pub fn populate_note_context_from_sqlite_with_hints(
         })
         .collect();
 
-    let rule_u16: Vec<Vec<u16>> = if !all_rules.is_empty() {
-        all_rules
-            .iter()
-            .map(|r| r.encode_utf16().collect())
-            .collect()
+    let rule_refs: Vec<&str> = if !all_rules.is_empty() {
+        all_rules.iter().map(String::as_str).collect()
     } else {
-        ctx.tags.iter().map(|t| t.encode_utf16().collect()).collect()
+        ctx.tags.iter().map(String::as_str).collect()
     };
-    let rule_refs: Vec<&[u16]> = rule_u16.iter().map(Vec::as_slice).collect();
     let can_be_kifuku = is_kifuku_applicable(&rule_refs);
 
-    ctx.pitch = String::from_utf16_lossy(&format_pitch_ex(&pitch_entries));
-    ctx.pitch_positions = String::from_utf16_lossy(&format_pitch_positions_ex(&pitch_entries));
-    ctx.pitch_graphs = String::from_utf16_lossy(&format_pitch_graphs_ex(&pitch_entries));
-    ctx.pitch_categories = String::from_utf16_lossy(&format_pitch_categories_ex(
-        &pitch_entries,
-        can_be_kifuku,
-    ));
+    ctx.pitch = format_pitch_ex(&pitch_entries);
+    ctx.pitch_positions = format_pitch_positions_ex(&pitch_entries);
+    ctx.pitch_graphs = format_pitch_graphs_ex(&pitch_entries);
+    ctx.pitch_categories = format_pitch_categories_ex(&pitch_entries, can_be_kifuku);
 
     Ok(())
 }

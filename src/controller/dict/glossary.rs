@@ -109,7 +109,7 @@ pub(super) fn cache_parsed_glossary(raw: &str, value: Arc<serde_json::Value>) {
 
 /// Parses a raw glossary JSON string into a shared `Arc<serde_json::Value>`,
 /// reusing cached parses populated during dictionary search so UI rendering can
-/// feed `memento_definition`'s `*_value` APIs without re-parsing JSON.
+/// feed `subomi_definition`'s `*_value` APIs without re-parsing JSON.
 pub fn parse_glossary_json_cached(raw: &str) -> Option<Arc<serde_json::Value>> {
     if raw.is_empty() {
         return None;

@@ -1,0 +1,15 @@
+[package]
+name = "subomi-audio"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Pronunciation audio source expansion, payload validation, and LRU cache"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde_json = "=1.0.154"
+
+[lib]
+name = "subomi_audio"
+path = "src/lib.rs"
+crate-type = ["lib"]

@@ -1,7 +1,7 @@
 import { ComboBox, LineEdit, ScrollView, TextEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton, ToggleChip } from "../components/buttons.slint";
-import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { SubomiSwitch, SectionHeader } from "../components/controls.slint";
 import { AnkiAutocompleteItem, SettingsField } from "types.slint";
 
 export component FontPickerControl inherits VerticalLayout {
@@ -211,16 +211,16 @@ export component ColorSwatchControl inherits HorizontalLayout {
             height: 28px;
             border-radius: 6px;
             border-width: 1px;
-            border-color: swatch-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light;
-            background: MementoPalette.checker-dark;
+            border-color: swatch-touch.has-hover ? SubomiPalette.cyan-accent : SubomiPalette.border-light;
+            background: SubomiPalette.checker-dark;
             clip: true;
 
-            Rectangle { x: 0px;  y: 0px;  width: 10px; height: 10px; background: MementoPalette.checker-light; }
-            Rectangle { x: 20px; y: 0px;  width: 10px; height: 10px; background: MementoPalette.checker-light; }
-            Rectangle { x: 10px; y: 10px; width: 10px; height: 10px; background: MementoPalette.checker-light; }
-            Rectangle { x: 30px; y: 10px; width: 10px; height: 10px; background: MementoPalette.checker-light; }
-            Rectangle { x: 0px;  y: 20px; width: 10px; height: 10px; background: MementoPalette.checker-light; }
-            Rectangle { x: 20px; y: 20px; width: 10px; height: 10px; background: MementoPalette.checker-light; }
+            Rectangle { x: 0px;  y: 0px;  width: 10px; height: 10px; background: SubomiPalette.checker-light; }
+            Rectangle { x: 20px; y: 0px;  width: 10px; height: 10px; background: SubomiPalette.checker-light; }
+            Rectangle { x: 10px; y: 10px; width: 10px; height: 10px; background: SubomiPalette.checker-light; }
+            Rectangle { x: 30px; y: 10px; width: 10px; height: 10px; background: SubomiPalette.checker-light; }
+            Rectangle { x: 0px;  y: 20px; width: 10px; height: 10px; background: SubomiPalette.checker-light; }
+            Rectangle { x: 20px; y: 20px; width: 10px; height: 10px; background: SubomiPalette.checker-light; }
 
             Rectangle {
                 x: 1px;
@@ -465,11 +465,11 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
         width: min(parent.width, 290px);
         height: min(176px, ac-list-col.preferred-height + 8px);
         border-radius: 7px;
-        background: MementoPalette.surface-elevated;
+        background: SubomiPalette.surface-elevated;
         border-width: 1px;
-        border-color: MementoPalette.cyan-accent;
+        border-color: SubomiPalette.cyan-accent;
         drop-shadow-blur: 14px;
-        drop-shadow-color: MementoPalette.shadow;
+        drop-shadow-color: SubomiPalette.shadow;
         clip: true;
 
         ScrollView {
@@ -489,10 +489,10 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                     height: max(26px, ac-row-inner.preferred-height + 6px);
                     border-radius: 5px;
                     background: self.selected
-                        ? MementoPalette.accent-muted
-                        : (ac-touch.has-hover ? MementoPalette.hover-bg : transparent);
+                        ? SubomiPalette.accent-muted
+                        : (ac-touch.has-hover ? SubomiPalette.hover-bg : transparent);
                     border-width: self.selected ? 1px : 0px;
-                    border-color: self.selected ? MementoPalette.cyan-accent : transparent;
+                    border-color: self.selected ? SubomiPalette.cyan-accent : transparent;
 
                     ac-row-inner := HorizontalLayout {
                         padding-left: 8px;
@@ -507,7 +507,7 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                             font-family: "monospace";
                             font-size: 11.5px;
                             font-weight: 700;
-                            color: ac-row.selected ? MementoPalette.cyan-text : MementoPalette.text;
+                            color: ac-row.selected ? SubomiPalette.cyan-text : SubomiPalette.text;
                             vertical-alignment: center;
                         }
 
@@ -517,12 +517,12 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                                 height: 15px;
                                 width: kind-lbl.preferred-width + 8px;
                                 border-radius: 3px;
-                                background: item.kind == "argument" ? MementoPalette.teal-muted : MementoPalette.badge-blue;
+                                background: item.kind == "argument" ? SubomiPalette.teal-muted : SubomiPalette.badge-blue;
                                 kind-lbl := Text {
                                     text: item.kind;
                                     font-size: 9px;
                                     font-weight: 700;
-                                    color: item.kind == "argument" ? MementoPalette.teal-text : MementoPalette.badge-blue-text;
+                                    color: item.kind == "argument" ? SubomiPalette.teal-text : SubomiPalette.badge-blue-text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -533,7 +533,7 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
                             horizontal-stretch: 1;
                             text: item.detail;
                             font-size: 10.5px;
-                            color: MementoPalette.text-muted;
+                            color: SubomiPalette.text-muted;
                             vertical-alignment: center;
                             overflow: elide;
                         }
@@ -641,7 +641,7 @@ export component SubtitlePreviewCard inherits VerticalLayout {
         height: max(108px, sub-pill.preferred-height + 36px);
         border-radius: 10px;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         background: @linear-gradient(180deg, #16202E 0%, #0D1117 65%, #07090D 100%);
         clip: true;
 
@@ -784,13 +784,13 @@ export component KeybindCaptureControl inherits VerticalLayout {
                     border-radius: 6px;
                     border-width: root.recording || root.field.conflict != "" ? 1.5px : 1px;
                     border-color: root.recording
-                        ? MementoPalette.cyan-accent
+                        ? SubomiPalette.cyan-accent
                         : (root.field.conflict != ""
-                            ? MementoPalette.warning
-                            : (cap-touch.has-hover ? MementoPalette.cyan-accent : MementoPalette.border-light));
+                            ? SubomiPalette.warning
+                            : (cap-touch.has-hover ? SubomiPalette.cyan-accent : SubomiPalette.border-light));
                     background: root.recording
-                        ? MementoPalette.accent-muted
-                        : (cap-touch.has-hover ? MementoPalette.button-hover : MementoPalette.surface-bg);
+                        ? SubomiPalette.accent-muted
+                        : (cap-touch.has-hover ? SubomiPalette.button-hover : SubomiPalette.surface-bg);
 
                     animate background { duration: 100ms; }
                     animate border-color { duration: 100ms; }
@@ -803,8 +803,8 @@ export component KeybindCaptureControl inherits VerticalLayout {
                             ? "Press shortcut… (Esc)"
                             : (root.field.value == "" ? "Unassigned" : root.field.value);
                         color: root.recording
-                            ? MementoPalette.cyan-text
-                            : (root.field.value == "" ? MementoPalette.text-muted : MementoPalette.text);
+                            ? SubomiPalette.cyan-text
+                            : (root.field.value == "" ? SubomiPalette.text-muted : SubomiPalette.text);
                         font-family: root.recording || root.field.value == "" ? "Noto Sans, sans-serif" : "monospace";
                         font-size: 12px;
                         font-weight: root.recording ? 700 : 600;
@@ -841,7 +841,7 @@ export component KeybindCaptureControl inherits VerticalLayout {
 
     if root.field.conflict != "" : Text {
         text: "⚠ " + root.field.conflict;
-        color: MementoPalette.warning-text;
+        color: SubomiPalette.warning-text;
         font-size: 11px;
         horizontal-alignment: right;
         overflow: elide;
@@ -937,7 +937,7 @@ export component FieldRow inherits Rectangle {
                 text: root.field.label;
                 font-size: 13px;
                 font-weight: 500;
-                color: root.field.enabled ? MementoPalette.text : MementoPalette.text-muted;
+                color: root.field.enabled ? SubomiPalette.text : SubomiPalette.text-muted;
                 vertical-alignment: center;
                 overflow: elide;
             }
@@ -945,7 +945,7 @@ export component FieldRow inherits Rectangle {
                 width: root.label-col-width;
                 text: root.field.description;
                 font-size: 11px;
-                color: MementoPalette.text-muted;
+                color: SubomiPalette.text-muted;
                 wrap: word-wrap;
             }
         }
@@ -954,7 +954,7 @@ export component FieldRow inherits Rectangle {
             horizontal-stretch: 0;
             alignment: center;
 
-            if root.field.kind == "switch" : MementoSwitch {
+            if root.field.kind == "switch" : SubomiSwitch {
                 checked: root.field.value == "true";
                 enabled: root.field.enabled;
                 toggled(value) => { root.edited(root.field.key, value ? "true" : "false"); }

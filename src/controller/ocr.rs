@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use memento_util::ocrutils::{map_ocr_region, resolve_venv_python_str, OcrRegionStatus};
+use subomi_util::ocrutils::{map_ocr_region, resolve_venv_python_str, OcrRegionStatus};
 
 const MOCR_MODE_RGBA: c_int = 4;
 const OCR_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -70,7 +70,7 @@ const WINDOWS_MOCR_DLL_NAMES: &[&str] = &["libmocr.dll", "mocr.dll"];
 
 /// Build ordered Windows `libmocr.dll` discovery candidates (#135):
 /// 1. Executable directory (`<exe_dir>/libmocr.dll`, `<exe_dir>/mocr.dll`, `<exe_dir>/mocr/...`)
-/// 2. `%LOCALAPPDATA%\memento` (and `%LOCALAPPDATA%\memento\ocr`)
+/// 2. `%LOCALAPPDATA%\subomi` (and `%LOCALAPPDATA%\subomi\ocr`)
 /// 3. Existing `libmocr.dll` / `mocr.dll` matches on `PATH` (when present)
 /// 4. Bare DLL names so Windows `LoadLibraryW` default search order still runs.
 pub fn windows_mocr_library_candidates(
@@ -97,11 +97,11 @@ pub fn windows_mocr_library_candidates(
     }
 
     if let Some(local) = local_app_data.filter(|d| !d.as_os_str().is_empty()) {
-        let memento_dir = local.join("memento");
+        let subomi_dir = local.join("subomi");
         for name in WINDOWS_MOCR_DLL_NAMES {
-            push_unique(memento_dir.join(name));
+            push_unique(subomi_dir.join(name));
         }
-        let ocr_dir = memento_dir.join("ocr");
+        let ocr_dir = subomi_dir.join("ocr");
         for name in WINDOWS_MOCR_DLL_NAMES {
             push_unique(ocr_dir.join(name));
         }
@@ -148,7 +148,7 @@ fn format_library_unavailable_message(
             )
         } else {
             format!(
-                "libmocr.dll was not found. Install libmocr (manga-ocr) and place libmocr.dll next to memento.exe, in %LOCALAPPDATA%\\memento, or on PATH. Details: {detail}"
+                "libmocr.dll was not found. Install libmocr (manga-ocr) and place libmocr.dll next to subomi.exe, in %LOCALAPPDATA%\\subomi, or on PATH. Details: {detail}"
             )
         }
     } else {
@@ -616,7 +616,7 @@ impl OcrController {
         let queue = Arc::clone(&self.inner.queue);
         let idle_timeout = self.inner.idle_unload_timeout;
         let handle = thread::Builder::new()
-            .name("memento-ocr-test".to_owned())
+            .name("subomi-ocr-test".to_owned())
             .spawn(move || worker_loop_with(queue, idle_timeout, make_worker(), deliver))
             .expect("spawn test OCR worker");
         *handle_slot = Some(handle);
@@ -635,7 +635,7 @@ impl OcrController {
         let idle_timeout = self.inner.idle_unload_timeout;
         OCR_WORKER_STARTED.store(true, Ordering::Release);
         let handle = thread::Builder::new()
-            .name("memento-ocr".to_owned())
+            .name("subomi-ocr".to_owned())
             // libmocr's model initialization needs a larger stack on macOS.
             .stack_size(OCR_WORKER_STACK_SIZE)
             .spawn(move || worker_loop(queue, idle_timeout))
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn windows_libmocr_discovery_checks_exe_dir_localappdata_path_and_explains_missing_dll() {
-        let exe_dir = Path::new("/win/ProgramFiles/Memento");
+        let exe_dir = Path::new("/win/ProgramFiles/Subomi");
         let local_app_data = Path::new("/win/Users/Alice/AppData/Local");
         let path_env = OsStr::new("/win/tools/ocr;/win/empty");
         let candidates = windows_mocr_library_candidates(
@@ -1382,7 +1382,7 @@ mod tests {
 
         assert_eq!(candidates[0], exe_dir.join("libmocr.dll"));
         assert_eq!(candidates[1], exe_dir.join("mocr.dll"));
-        assert!(candidates.contains(&local_app_data.join("memento").join("libmocr.dll")));
+        assert!(candidates.contains(&local_app_data.join("subomi").join("libmocr.dll")));
         assert!(candidates.contains(&PathBuf::from("/win/tools/ocr/libmocr.dll")));
         assert!(!candidates.contains(&PathBuf::from("/win/empty/libmocr.dll")));
         assert_eq!(
@@ -1390,14 +1390,14 @@ mod tests {
             Some(Path::new("mocr.dll"))
         );
 
-        // Priority order: exe dir -> %LOCALAPPDATA%\memento -> PATH -> bare DLL fallback.
+        // Priority order: exe dir -> %LOCALAPPDATA%\subomi -> PATH -> bare DLL fallback.
         let idx_exe = candidates
             .iter()
             .position(|p| p == &exe_dir.join("libmocr.dll"))
             .unwrap();
         let idx_local = candidates
             .iter()
-            .position(|p| p == &local_app_data.join("memento").join("libmocr.dll"))
+            .position(|p| p == &local_app_data.join("subomi").join("libmocr.dll"))
             .unwrap();
         let idx_path = candidates
             .iter()
@@ -1415,15 +1415,15 @@ mod tests {
             &["libmocr.dll: not found".to_owned()],
         );
         assert!(missing_msg.contains("libmocr.dll"));
-        assert!(missing_msg.contains("%LOCALAPPDATA%\\memento"));
+        assert!(missing_msg.contains("%LOCALAPPDATA%\\subomi"));
         assert!(missing_msg.contains("PATH"));
 
         let broken_deps_msg = format_library_unavailable_message(
             true,
-            &["C:\\Memento\\libmocr.dll".to_owned()],
+            &["C:\\Subomi\\libmocr.dll".to_owned()],
             &["missing python312.dll".to_owned()],
         );
-        assert!(broken_deps_msg.contains("found at C:\\Memento\\libmocr.dll"));
+        assert!(broken_deps_msg.contains("found at C:\\Subomi\\libmocr.dll"));
         assert!(broken_deps_msg.contains("Python 3"));
     }
 

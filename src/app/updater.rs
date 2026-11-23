@@ -6,25 +6,25 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 
-use crate::app::paths::{memento_xdg_dir, open_directory_command, spawn_and_reap};
+use crate::app::paths::{subomi_xdg_dir, open_directory_command, spawn_and_reap};
 use crate::app::preferences::setting_enabled;
 use crate::controller::config::ConfigController;
 use crate::settings_ui::{refresh_category_settings, SettingsSession};
-use crate::ui::MementoApp;
-use memento_setting::keys as raw;
+use crate::ui::SubomiApp;
+use subomi_setting::keys as raw;
 
-pub(crate) const MEMENTO_RELEASES_URL: &str =
-    "https://github.com/ripose-jp/Memento/releases/latest";
+pub(crate) const SUBOMI_RELEASES_URL: &str =
+    "https://github.com/eyalmazuz/Subomi/releases/latest";
 
-/// Query the same release endpoint as the original Memento update dialog.
+/// Query the GitHub releases endpoint for the latest Subomi release.
 pub(crate) fn latest_release() -> Result<String, String> {
-    use memento_net::http::{HttpClient, Request, Url};
-    let url = Url::parse("https://api.github.com/repos/ripose-jp/memento/releases/latest")
+    use subomi_net::http::{HttpClient, Request, Url};
+    let url = Url::parse("https://api.github.com/repos/eyalmazuz/Subomi/releases/latest")
         .map_err(|error| error.to_string())?;
     let request = Request::get(url)
         .header(
             "User-Agent",
-            format!("Memento/{}", env!("CARGO_PKG_VERSION")),
+            format!("Subomi/{}", env!("CARGO_PKG_VERSION")),
         )
         .header("Accept", "application/vnd.github+json");
     let mut response = HttpClient::default()
@@ -77,23 +77,23 @@ pub(crate) fn determine_startup_update_action(config: &ConfigController) -> Star
 
 pub(crate) fn update_opt_in_message(is_macos: bool) -> &'static str {
     if is_macos {
-        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Cmd+,) → Application.\nThis will query GitHub's releases API when Memento starts."
+        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Cmd+,) → Application.\nThis will query GitHub's releases API when Subomi starts."
     } else {
-        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Ctrl+,) → Application.\nThis will query GitHub's releases API when Memento starts."
+        "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options (Ctrl+,) → Application.\nThis will query GitHub's releases API when Subomi starts."
     }
 }
 
-pub(crate) fn open_update_opt_in_dialog(app: &MementoApp) {
+pub(crate) fn open_update_opt_in_dialog(app: &SubomiApp) {
     app.set_update_dialog_opt_in(true);
     app.set_update_dialog_title("Auto Update".into());
     app.set_update_dialog_message(update_opt_in_message(cfg!(target_os = "macos")).into());
     app.set_update_dialog_release_tag("".into());
-    app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+    app.set_update_dialog_release_url(SUBOMI_RELEASES_URL.into());
     app.set_update_dialog_open(true);
 }
 
 pub(crate) fn apply_update_check_outcome(
-    app: &MementoApp,
+    app: &SubomiApp,
     current_version: &str,
     outcome: Result<String, String>,
     silent: bool,
@@ -110,7 +110,7 @@ pub(crate) fn apply_update_check_outcome(
                         format!("You're on the latest version ({current_tag}).").into(),
                     );
                     app.set_update_dialog_release_tag("".into());
-                    app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                    app.set_update_dialog_release_url(SUBOMI_RELEASES_URL.into());
                     app.set_update_dialog_open(true);
                     app.set_status_message("You are on the latest version.".into());
                 }
@@ -119,14 +119,14 @@ pub(crate) fn apply_update_check_outcome(
                 app.set_update_dialog_title("New Version Available".into());
                 app.set_update_dialog_message(
                     format!(
-                        "Memento {trimmed} is available on GitHub Releases (currently installed: {current_tag})."
+                        "Subomi {trimmed} is available on GitHub Releases (currently installed: {current_tag})."
                     )
                     .into(),
                 );
                 app.set_update_dialog_release_tag(trimmed.into());
-                app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                app.set_update_dialog_release_url(SUBOMI_RELEASES_URL.into());
                 app.set_update_dialog_open(true);
-                app.set_status_message(format!("New Memento release available: {trimmed}").into());
+                app.set_status_message(format!("New Subomi release available: {trimmed}").into());
             }
         }
         Err(error) => {
@@ -140,7 +140,7 @@ pub(crate) fn apply_update_check_outcome(
                     .into(),
                 );
                 app.set_update_dialog_release_tag("".into());
-                app.set_update_dialog_release_url(MEMENTO_RELEASES_URL.into());
+                app.set_update_dialog_release_url(SUBOMI_RELEASES_URL.into());
                 app.set_update_dialog_open(true);
                 app.set_status_message(format!("Could not check for updates: {error}").into());
             }
@@ -148,7 +148,7 @@ pub(crate) fn apply_update_check_outcome(
     }
 }
 
-pub(crate) fn spawn_update_check(response_app: slint::Weak<MementoApp>, silent: bool) {
+pub(crate) fn spawn_update_check(response_app: slint::Weak<SubomiApp>, silent: bool) {
     if !silent {
         if let Some(app) = response_app.upgrade() {
             app.set_status_message("Checking for updates…".into());
@@ -163,7 +163,7 @@ pub(crate) fn spawn_update_check(response_app: slint::Weak<MementoApp>, silent: 
 }
 
 pub(crate) fn install_update_and_link_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     config_dir: PathBuf,
     settings_session: Rc<RefCell<Option<SettingsSession>>>,
@@ -195,13 +195,13 @@ pub(crate) fn install_update_and_link_handlers(
         );
         let auto_val = if accepted { "true" } else { "false" };
         if let Err(error) = opt_in_config
-            .persist_single_setting(&opt_in_key, "true", &opt_in_cache, "memento.conf")
+            .persist_single_setting(&opt_in_key, "true", &opt_in_cache, "subomi.conf")
             .and_then(|()| {
                 opt_in_config.persist_single_setting(
                     &auto_check_key,
                     auto_val,
                     &opt_in_cache,
-                    "memento.conf",
+                    "subomi.conf",
                 )
             })
         {
@@ -227,7 +227,7 @@ pub(crate) fn install_update_and_link_handlers(
 
     let config_dir_app = app.as_weak();
     app.on_open_config(move || {
-        if let Some(path) = memento_xdg_dir("XDG_CONFIG_HOME", ".config") {
+        if let Some(path) = subomi_xdg_dir("XDG_CONFIG_HOME", ".config") {
             if let Err(error) = std::fs::create_dir_all(&path)
                 .and_then(|()| spawn_and_reap(open_directory_command(&path)).map(|_| ()))
             {
@@ -282,7 +282,7 @@ mod tests {
         );
 
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         open_update_opt_in_dialog(&app);
         assert!(app.get_update_dialog_open());
         assert!(app.get_update_dialog_opt_in());

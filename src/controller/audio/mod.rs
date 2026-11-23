@@ -27,8 +27,8 @@ mod tests {
         resolve_word_audio, set_download_timeout_ms, Md5Hasher, SourceLocation,
     };
     use super::worker::{AudioController, AudioWorker, PlaybackBackend};
-    use memento_net::http::{HttpClient, HttpClientConfig};
-    use memento_setting::enums::AudioSourceType;
+    use subomi_net::http::{HttpClient, HttpClientConfig};
+    use subomi_setting::enums::AudioSourceType;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -116,7 +116,7 @@ mod tests {
         // Cross-check boundary lengths (55, 56, 63, 64, 65, 128, 1000) and chunked updates.
         for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 127, 128, 129, 1025] {
             let payload: Vec<u8> = (0..len).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
-            let reference = memento_util::fileutils::calculate_md5(payload.as_slice()).unwrap();
+            let reference = subomi_util::fileutils::calculate_md5(payload.as_slice()).unwrap();
             assert_eq!(Md5Hasher::digest(&payload), reference, "len={len}");
 
             let mut chunked = Md5Hasher::new();
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn classify_url_reports_accurate_missing_file_and_directory_errors() {
         let missing = std::env::temp_dir().join(format!(
-            "memento-audio-definitely-missing-{}.mp3",
+            "subomi-audio-definitely-missing-{}.mp3",
             std::process::id()
         ));
         let err = classify_url(&missing.to_string_lossy()).unwrap_err();
@@ -159,7 +159,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "memento-magic-local-{}-{now}.bin",
+            "subomi-magic-local-{}-{now}.bin",
             std::process::id()
         ));
         let mut opus = vec![0u8; 80];
@@ -196,11 +196,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let missing_audio = std::env::temp_dir().join(format!(
-            "memento-last-err-audio-{}-{now}.mp3",
+            "subomi-last-err-audio-{}-{now}.mp3",
             std::process::id()
         ));
         let missing_json = std::env::temp_dir().join(format!(
-            "memento-last-err-json-{}-{now}.json",
+            "subomi-last-err-json-{}-{now}.json",
             std::process::id()
         ));
         let sources = vec![
@@ -233,7 +233,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let audio_path = std::env::temp_dir().join(format!(
-            "memento-async-init-{}-{now}.mp3",
+            "subomi-async-init-{}-{now}.mp3",
             std::process::id()
         ));
         std::fs::write(&audio_path, b"ID3async-init-payload").unwrap();
@@ -289,7 +289,7 @@ mod tests {
         );
         assert!(
             !temp_dir.exists(),
-            "Drop must clean up memento-audio-* temporary directory"
+            "Drop must clean up subomi-audio-* temporary directory"
         );
         let _ = std::fs::remove_file(&audio_path);
     }
@@ -330,7 +330,7 @@ mod tests {
             "https://audio.example.test/%E8%BF%8E%E3%81%88%E3%81%AB%E8%A1%8C%E3%81%8F/%E3%82%80%E3%81%8B%E3%81%88%E3%81%AB%E3%81%84%E3%81%8F.mp3"
         );
         assert!(url.is_ascii());
-        assert!(filename.starts_with("memento_Japanese_Audio_"));
+        assert!(filename.starts_with("subomi_Japanese_Audio_"));
         assert_eq!(skip_hash, "deadbeef");
     }
 
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn source_menu_expands_every_named_recording_and_falls_back_missing_names() {
         let path = std::env::temp_dir().join(format!(
-            "memento-audio-menu-{}-{}.json",
+            "subomi-audio-menu-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -504,7 +504,7 @@ mod tests {
             resolved_url,
             format!("http://{}:{}/clips/%E7%8C%AB.ogg", addr.ip(), addr.port())
         );
-        assert!(filename.starts_with("memento_Local_Audio_Server_"));
+        assert!(filename.starts_with("subomi_Local_Audio_Server_"));
         assert!(filename.ends_with(".ogg"));
 
         let listed = enumerate_word_audio_sources("猫", "ねこ", &sources);
@@ -587,11 +587,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let skipped_path = std::env::temp_dir().join(format!(
-            "memento-audio-skip-{}-{now}.mp3",
+            "subomi-audio-skip-{}-{now}.mp3",
             std::process::id()
         ));
         let valid_path = std::env::temp_dir().join(format!(
-            "memento-audio-valid-{}-{now}.mp3",
+            "subomi-audio-valid-{}-{now}.mp3",
             std::process::id()
         ));
         let skipped_bytes = b"missing-audio-placeholder";
@@ -599,11 +599,11 @@ mod tests {
         std::fs::write(&skipped_path, skipped_bytes).unwrap();
         std::fs::write(&valid_path, valid_bytes).unwrap();
 
-        let skip_digest = memento_util::fileutils::calculate_md5(&skipped_bytes[..]).unwrap();
+        let skip_digest = subomi_util::fileutils::calculate_md5(&skipped_bytes[..]).unwrap();
         let skip_upper = md5_hex(skip_digest).to_ascii_uppercase();
 
         let missing_path = std::env::temp_dir().join(format!(
-            "memento-audio-nonexistent-{}-{now}.mp3",
+            "subomi-audio-nonexistent-{}-{now}.mp3",
             std::process::id()
         ));
 
@@ -634,7 +634,7 @@ mod tests {
 
         let (payload, filename) = result.expect("must fall through to third valid source");
         assert_eq!(payload, valid_bytes);
-        assert!(filename.starts_with("memento_Forvo_"));
+        assert!(filename.starts_with("subomi_Forvo_"));
         assert!(filename.ends_with(".mp3"));
         assert!(
             filename
@@ -658,7 +658,7 @@ mod tests {
             url,
             "https://audio.example.test/%E8%BF%8E%E3%81%88%E3%81%AB%E8%A1%8C%E3%81%8F/%E3%82%80%E3%81%8B%E3%81%88%E3%81%AB%E3%81%84%E3%81%8F.mp3"
         );
-        assert!(filename.starts_with("memento_Jisho_Audio_"));
+        assert!(filename.starts_with("subomi_Jisho_Audio_"));
         assert!(
             filename
                 .chars()
@@ -755,7 +755,7 @@ mod tests {
             fetch_word_audio_with_client(&fast_http_client(), "A&B#1", "", &sources)
                 .expect("must skip HTML/empty/timeout and succeed on valid OGG");
         assert_eq!(bytes, b"OggS\x00\x02valid-ogg-audio");
-        assert!(filename.starts_with("memento_Valid_OGG_"));
+        assert!(filename.starts_with("subomi_Valid_OGG_"));
         assert!(filename.ends_with(".ogg"));
 
         let _ = server.join();
@@ -773,7 +773,7 @@ mod tests {
 
         let placeholder_bytes = b"ID3jpod-placeholder-audio";
         let placeholder_md5 =
-            md5_hex(memento_util::fileutils::calculate_md5(&placeholder_bytes[..]).unwrap())
+            md5_hex(subomi_util::fileutils::calculate_md5(&placeholder_bytes[..]).unwrap())
                 .to_ascii_uppercase();
 
         let server = std::thread::spawn(move || {
@@ -954,7 +954,7 @@ mod tests {
         let mut paths = Vec::new();
         for idx in 0..4 {
             let p = std::env::temp_dir().join(format!(
-                "memento-rapid-{}-{now}-{idx}.mp3",
+                "subomi-rapid-{}-{now}-{idx}.mp3",
                 std::process::id()
             ));
             std::fs::write(&p, format!("ID3track-{idx}").as_bytes()).unwrap();
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn download_timeout_uses_bounded_config_and_enforces_per_request_timeout() {
         // Default is 8_000 ms; bounds clamp strictly to 1_000..=30_000 ms.
-        set_download_timeout_ms(memento_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+        set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
         assert_eq!(download_timeout_ms(), 8_000);
         assert_eq!(download_timeout_config().timeout(), Duration::from_secs(8));
 
@@ -1036,7 +1036,7 @@ mod tests {
         set_download_timeout_ms(120_000);
         assert_eq!(download_timeout_ms(), 30_000);
         // Restore default so other tests see the 8 s default.
-        set_download_timeout_ms(memento_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+        set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
 
         // Verify `send_with_request_timeout` overrides a long-timeout client cleanly.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

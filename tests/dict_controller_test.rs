@@ -1,6 +1,6 @@
-//! Integration tests for Dictionary Search and Definition Controller in memento-app.
+//! Integration tests for Dictionary Search and Definition Controller in subomi-app.
 
-use memento_app::controller::dict::{
+use subomi_app::controller::dict::{
     apply_remove_regex, apply_replace_lines, format_cloze_for_term, format_cloze_spans,
     format_tags, format_tags_with_notes, generate_prefix_queries, normalize_nfkc_query,
     normalize_reading, parse_rich_glossary, preprocess_search_text, rank_hits,
@@ -8,7 +8,7 @@ use memento_app::controller::dict::{
     SearchHit,
 };
 
-use memento_dict::sqlite_db;
+use subomi_dict::sqlite_db;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -62,7 +62,7 @@ fn temporary_dictionary_path() -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     for _ in 0..100 {
         let path = std::env::temp_dir().join(format!(
-            "memento-dict-controller-{}-{}.sqlite",
+            "subomi-dict-controller-{}-{}.sqlite",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed),
         ));
@@ -256,7 +256,7 @@ fn anki_term_metadata_fills_frequency_and_pitch_markers() {
     assert_eq!(metadata.frequency_average_occurrence, "150");
     assert_eq!(
         metadata.pitch_positions,
-        "<span class=\"memento-pitch-position\">[2]</span>"
+        "<span class=\"subomi-pitch-position\">[2]</span>"
     );
     assert_eq!(metadata.pitch_categories, "kifuku");
     let graphs = dictionary.get_pitch_graphs("食べる", "たべる");
@@ -527,8 +527,8 @@ fn test_cloze_span_generation_and_formatting() {
 
 #[test]
 fn open_dict_controller_refreshes_names_and_tags_across_wal_commits() {
-    use memento_app::controller::dict::db_file_fingerprint;
-    use memento_dict::yomidbbuilder;
+    use subomi_app::controller::dict::db_file_fingerprint;
+    use subomi_dict::yomidbbuilder;
     use std::io::Write;
 
     fn crc32(data: &[u8]) -> u32 {
@@ -605,7 +605,7 @@ fn open_dict_controller_refreshes_names_and_tags_across_wal_commits() {
 
     let db = TemporaryDictionaryDatabase(temporary_dictionary_path());
     let work_dir = std::env::temp_dir().join(format!(
-        "memento-dict-wal-test-{}-{}",
+        "subomi-dict-wal-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1251,7 +1251,7 @@ fn mecab_enabled_live_unidic_compounds_lemmas_particle_safety_and_ipadic_fallbac
 て\t助詞,接続助詞,*,*,*,*,て,テ,テ\n\
 しまっ\t動詞,非自立,*,*,五段・ワ行促音便,連用タ接続,しまう,シマッ,シマッ\n\
 た\t助動詞,*,*,*,特殊・タ,基本形,た,タ,タ\nEOS\n";
-        Ok(memento_util::mecab::parse_mecab_lookup_tokens(text, out))
+        Ok(subomi_util::mecab::parse_mecab_lookup_tokens(text, out))
     });
     let ipadic_hits = controller.search("食べてしまった");
     assert_eq!(ipadic_hits[0].expression, "食べる");

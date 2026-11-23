@@ -13,7 +13,7 @@ use crate::ui::popup_model::{
     active_rich_bridge_for_app, build_dictionary_result_rows_grouped_with_options, is_kanji_char,
     popup_pitch_graphs,
 };
-use crate::ui::{DictResult, MementoApp, PopupBridge, PopupFrequency};
+use crate::ui::{DictResult, SubomiApp, PopupBridge, PopupFrequency};
 
 use super::state::{
     apply_kanji_freq_updates_to_rows, build_row_extras_for_grouped, encode_note_id_i32,
@@ -28,7 +28,7 @@ use super::RichUiBridge;
 /// RAII guard that deterministically restores `app.dict_results` after temporarily exposing
 /// nested popup rows to `app.invoke_add_anki_note(...)`, even on early return or panic.
 struct RestoreDictResultsGuard<'a> {
-    app: &'a MementoApp,
+    app: &'a SubomiApp,
     swapped: slint::ModelRc<DictResult>,
     parent: slint::ModelRc<DictResult>,
 }
@@ -41,7 +41,7 @@ impl Drop for RestoreDictResultsGuard<'_> {
     }
 }
 
-pub(super) fn drain_nested_scan_results_for_app(app: &MementoApp) -> bool {
+pub(super) fn drain_nested_scan_results_for_app(app: &SubomiApp) -> bool {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.drain_nested_scan_results(app)
     } else {
@@ -50,7 +50,7 @@ pub(super) fn drain_nested_scan_results_for_app(app: &MementoApp) -> bool {
 }
 
 impl RichUiBridge {
-    pub(super) fn sync_nested_popup_to_bridge(&self, app: &MementoApp, nav_changed: bool) {
+    pub(super) fn sync_nested_popup_to_bridge(&self, app: &SubomiApp, nav_changed: bool) {
         let (
             depth,
             max_depth,
@@ -165,7 +165,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn pop_nested_popup(&self, app: &MementoApp) {
+    pub(super) fn pop_nested_popup(&self, app: &SubomiApp) {
         self.nested_epoch.fetch_add(1, Ordering::AcqRel);
         let (popped, popped_depth) = {
             let mut st = self.state.borrow_mut();
@@ -199,7 +199,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn dismiss_all_nested_popups(&self, app: &MementoApp) {
+    pub(super) fn dismiss_all_nested_popups(&self, app: &SubomiApp) {
         self.nested_epoch.fetch_add(1, Ordering::AcqRel);
         let (had_any, old_depth) = {
             let mut st = self.state.borrow_mut();
@@ -290,7 +290,7 @@ impl RichUiBridge {
 
     pub(super) fn dispatch_nested_scan(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         target: HoveredGlossaryTarget,
         locked: bool,
     ) {
@@ -330,7 +330,7 @@ impl RichUiBridge {
         self.kick_no_event_loop_pump();
     }
 
-    pub(super) fn drain_nested_scan_results(&self, app: &MementoApp) -> bool {
+    pub(super) fn drain_nested_scan_results(&self, app: &SubomiApp) -> bool {
         let mut latest: Option<NestedScanResponse> = None;
         if let Ok(guard) = self.nested_res_rx.lock() {
             while let Ok(item) = guard.try_recv() {
@@ -465,7 +465,7 @@ impl RichUiBridge {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_glossary_scan_hover(
         self: &Rc<Self>,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,
@@ -630,7 +630,7 @@ impl RichUiBridge {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_glossary_scan_middle_click(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         row_idx: i32,
         x: f32,
@@ -691,7 +691,7 @@ impl RichUiBridge {
         self.schedule_unlocked_nested_dismiss();
     }
 
-    pub(super) fn navigate_nested_query(&self, app: &MementoApp, from_depth: i32, query: &str) {
+    pub(super) fn navigate_nested_query(&self, app: &SubomiApp, from_depth: i32, query: &str) {
         let trimmed = query.trim();
         if trimmed.is_empty() {
             return;
@@ -729,7 +729,7 @@ impl RichUiBridge {
 
     pub(super) fn navigate_nested_kanji(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         from_depth: i32,
         expression: &str,
         clicked_kanji: &str,
@@ -772,7 +772,7 @@ impl RichUiBridge {
 
     pub(super) fn apply_nested_nav_lookup_response(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         resp: NavLookupResponse,
     ) {
         app.global::<PopupBridge>().set_nested_searching(false);
@@ -903,7 +903,7 @@ impl RichUiBridge {
 
     pub(super) fn toggle_nested_select_definition(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         zero_based_idx: i32,
     ) {
@@ -928,7 +928,7 @@ impl RichUiBridge {
 
     pub(super) fn toggle_nested_term_collapse(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         depth: i32,
         term_start_zero_idx: i32,
     ) {
@@ -959,13 +959,13 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn add_nested_anki_note(&self, app: &MementoApp, row_zero_idx: i32) {
+    pub(super) fn add_nested_anki_note(&self, app: &SubomiApp, row_zero_idx: i32) {
         self.add_nested_anki_note_with_audio(app, row_zero_idx, None);
     }
 
     pub(super) fn add_nested_anki_note_with_audio(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         row_zero_idx: i32,
         audio_source_override: Option<i32>,
     ) {
@@ -1024,7 +1024,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn sync_panel_popup_to_bridge(&self, app: &MementoApp, sync_results: bool) {
+    pub(super) fn sync_panel_popup_to_bridge(&self, app: &SubomiApp, sync_results: bool) {
         let (rows, dups, note_ids, queries, tags, addable, reading_as_expr, hit_meta) = {
             let st = self.state.borrow();
             let panel = &st.panel;
@@ -1068,7 +1068,7 @@ impl RichUiBridge {
         pb.set_panel_revision(pb.get_panel_revision().wrapping_add(1));
     }
 
-    pub(super) fn toggle_panel_select_definition(&self, app: &MementoApp, zero_based_idx: i32) {
+    pub(super) fn toggle_panel_select_definition(&self, app: &SubomiApp, zero_based_idx: i32) {
         if zero_based_idx < 0 {
             return;
         }
@@ -1086,7 +1086,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn toggle_panel_term_collapse(&self, app: &MementoApp, term_start_zero_idx: i32) {
+    pub(super) fn toggle_panel_term_collapse(&self, app: &SubomiApp, term_start_zero_idx: i32) {
         if term_start_zero_idx < 0 {
             return;
         }
@@ -1114,7 +1114,7 @@ impl RichUiBridge {
 
     pub(super) fn add_panel_anki_note(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         row_zero_idx: i32,
         audio_source_override: Option<i32>,
     ) {

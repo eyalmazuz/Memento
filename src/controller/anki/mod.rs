@@ -1,4 +1,4 @@
-//! Anki controller connecting memento-anki and memento-net.
+//! Anki controller connecting subomi-anki and subomi-net.
 
 mod cloze;
 mod context;
@@ -11,7 +11,7 @@ mod sqlite_enrich;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use memento_net::anki::{AnkiClient, AnkiEndpoint, MediaFilePayload};
+use subomi_net::anki::{AnkiClient, AnkiEndpoint, MediaFilePayload};
 
 use crate::controller::config::AnkiNoteConfig;
 
@@ -675,7 +675,7 @@ impl AnkiController {
         profile: &AnkiNoteConfig,
         ctx: &NoteFieldsContext,
         rendered: &RenderedTemplateData,
-        infos: Vec<memento_net::anki::AnkiNoteInfo>,
+        infos: Vec<subomi_net::anki::AnkiNoteInfo>,
         mode: AnkiUpdateMode,
     ) -> Result<i64, String> {
         let payload =
@@ -1007,13 +1007,13 @@ mod tests {
     #[test]
     fn sqlite_enrichment_honors_dictionary_order_and_exact_rowid_matching() {
         let dir = tempfile::Builder::new()
-            .prefix("memento-anki-order-")
+            .prefix("subomi-anki-order-")
             .tempdir()
             .unwrap();
         let db_path = dir.path().join("dictionaries.sqlite");
-        memento_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
+        subomi_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
 
-        let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+        let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
         conn.execute(
             "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES \
              (1, 'AlphaDict', 3, '1', 1), \
@@ -1096,7 +1096,7 @@ mod tests {
     fn note_payload_into_value_and_to_json_string_match_to_value() {
         let mut payload = NotePayload::new("Japanese", "Lapis")
             .with_field("Expression", "食べる")
-            .with_tag("memento")
+            .with_tag("subomi")
             .with_options(false, Some("deck".into()));
         payload.audio.push(serde_json::json!({
             "data": "QUFB",
@@ -1159,7 +1159,7 @@ mod tests {
             deck: "Japanese".into(),
             model: "Lapis".into(),
             field_templates: fields,
-            tags: vec!["memento".into()],
+            tags: vec!["subomi".into()],
             duplicate_policy: 1,
             screenshot_type: 0,
             audio_pad_start: 0.0,
@@ -1309,14 +1309,14 @@ mod tests {
     #[test]
     fn sqlite_enrichment_separates_rank_based_and_occurrence_based_frequency_modes() {
         let dir = tempfile::Builder::new()
-            .prefix("memento-anki-freqmode-")
+            .prefix("subomi-anki-freqmode-")
             .tempdir()
             .unwrap();
         let db_path = dir.path().join("dictionaries.sqlite");
-        memento_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
+        subomi_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
 
-        let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
-        memento_dict::sqlite_db::ensure_frequency_mode_column_conn(&conn).unwrap();
+        let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+        subomi_dict::sqlite_db::ensure_frequency_mode_column_conn(&conn).unwrap();
         conn.execute(
             "INSERT INTO directory (dic_id, title, format, revision, sequenced, frequency_mode) VALUES \
              (1, 'RankDictA', 3, '1', 0, 'rank-based'), \
@@ -1426,13 +1426,13 @@ mod tests {
     #[test]
     fn sqlite_enrichment_exports_string_based_exact_pitch_patterns() {
         let dir = tempfile::Builder::new()
-            .prefix("memento-anki-pitch-pat-")
+            .prefix("subomi-anki-pitch-pat-")
             .tempdir()
             .unwrap();
         let db_path = dir.path().join("dictionaries.sqlite");
-        memento_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
+        subomi_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
 
-        let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+        let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
         conn.execute(
             "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (1, 'KanjiumPat', 3, '1', 0);",
             [],
@@ -1452,7 +1452,7 @@ mod tests {
         populate_note_context_from_sqlite(&mut hanabi, &db_path, &[], &[]).unwrap();
         assert_eq!(
             hanabi.pitch_positions,
-            "<span class=\"memento-pitch-position\">[HLL]</span>"
+            "<span class=\"subomi-pitch-position\">[HLL]</span>"
         );
         assert_eq!(hanabi.pitch_categories, "atamadaka");
         assert!(hanabi.pitch.contains("border-right: solid;\">は</span>なび"));
@@ -1463,7 +1463,7 @@ mod tests {
         populate_note_context_from_sqlite(&mut sakura, &db_path, &[], &[]).unwrap();
         assert_eq!(
             sakura.pitch_positions,
-            "<span class=\"memento-pitch-position\">[LHH]</span>"
+            "<span class=\"subomi-pitch-position\">[LHH]</span>"
         );
         assert_eq!(sakura.pitch_categories, "heiban");
         assert!(sakura.pitch.contains("さ<span style=\"border-top: solid;\">くら</span>"));
@@ -1472,7 +1472,7 @@ mod tests {
         populate_note_context_from_sqlite(&mut otoko, &db_path, &[], &[]).unwrap();
         assert_eq!(
             otoko.pitch_positions,
-            "<span class=\"memento-pitch-position\">[LHHL]</span>"
+            "<span class=\"subomi-pitch-position\">[LHHL]</span>"
         );
         assert_eq!(otoko.pitch_categories, "odaka");
         assert!(otoko.pitch.contains("border-right: solid;\">とこ</span>"));
@@ -1664,13 +1664,13 @@ mod tests {
     #[test]
     fn regression_988_jitendex_part_of_speech_and_692_sentence_preserved() {
         let dir = tempfile::Builder::new()
-            .prefix("memento-anki-reg988-692-")
+            .prefix("subomi-anki-reg988-692-")
             .tempdir()
             .unwrap();
         let db_path = dir.path().join("dictionaries.sqlite");
-        memento_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
+        subomi_dict::yomidbbuilder::prepare_db(&db_path).unwrap();
 
-        let conn = memento_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
+        let conn = subomi_dict::sqlite_db::open_read_write_connection(&db_path).unwrap();
         conn.execute(
             "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES (1, 'Jitendex', 3, '1', 1);",
             [],

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use memento_net::anki::AnkiEndpoint;
+use subomi_net::anki::AnkiEndpoint;
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::ui::{SettingsField, SettingsGroup};
@@ -221,7 +221,7 @@ impl AnkiNotePreset {
     }
 }
 
-/// Returns the ordered `(field_name, memento_marker_template)` mapping for a
+/// Returns the ordered `(field_name, subomi_marker_template)` mapping for a
 /// popular Japanese Anki note type preset.
 pub fn anki_note_preset_fields(preset: AnkiNotePreset) -> Vec<(&'static str, &'static str)> {
     match preset {
@@ -442,7 +442,7 @@ impl Default for AnkiProfile {
             audio_pad_end: 0.0,
             audio_normalize: false,
             audio_db: -20.0,
-            tags: vec!["memento".to_owned()],
+            tags: vec!["subomi".to_owned()],
             show_tag: false,
             ex_glos: Vec::new(),
             term: AnkiNoteSection::default(),
@@ -1198,7 +1198,7 @@ fn edit_anki_profile_field(
 }
 
 fn sort_profiles_slice(profiles: &mut [AnkiProfile]) {
-    profiles.sort_by(|left, right| left.name.encode_utf16().cmp(right.name.encode_utf16()));
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
 }
 
 fn parse_json_port(value: Option<&JsonValue>) -> Option<String> {

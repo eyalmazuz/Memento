@@ -19,10 +19,10 @@ use crate::controller::player::filter_subtitle_text;
 use crate::controller::subtitles::SubtitleController;
 use crate::controller::{anki, anki_media, audio, media};
 use crate::ui::{
-    self, popup_pitch_graphs, DictResult, MementoApp, PopupAudioSource, PopupBridge, PopupFrequency,
+    self, popup_pitch_graphs, DictResult, SubomiApp, PopupAudioSource, PopupBridge, PopupFrequency,
 };
-use memento_player::{subtitle_raw_time, subtitle_to_media_time, MpvInstance};
-use memento_setting::enums::AudioSourceType;
+use subomi_player::{subtitle_raw_time, subtitle_to_media_time, MpvInstance};
+use subomi_setting::enums::AudioSourceType;
 
 pub(crate) const AUDIO_STATUS_DEFAULT: i32 = 0;
 pub(crate) const AUDIO_STATUS_AVAILABLE: i32 = 1;
@@ -200,7 +200,7 @@ thread_local! {
 }
 
 struct AudioInvalidationTarget {
-    app: slint::Weak<MementoApp>,
+    app: slint::Weak<SubomiApp>,
     cache: Arc<Mutex<PopupAudioState>>,
     player: Rc<RefCell<Option<audio::AudioController>>>,
 }
@@ -234,7 +234,7 @@ fn current_anki_add_override() -> Option<AnkiAddOverrideState> {
 }
 
 pub(crate) fn register_audio_invalidation_target(
-    app: slint::Weak<MementoApp>,
+    app: slint::Weak<SubomiApp>,
     cache: Arc<Mutex<PopupAudioState>>,
     player: Rc<RefCell<Option<audio::AudioController>>>,
 ) {
@@ -276,9 +276,9 @@ pub(crate) fn invalidate_audio_caches_for_config_change(timeout_ms: u64) {
     });
 }
 
-/// Displays a non-blocking warning toast on `MementoApp` for non-fatal Anki media warnings
+/// Displays a non-blocking warning toast on `SubomiApp` for non-fatal Anki media warnings
 /// and auto-clears it cleanly after ~2 seconds (C3.2).
-pub(crate) fn show_warning_toast(app: &MementoApp, warnings: &[String]) {
+pub(crate) fn show_warning_toast(app: &SubomiApp, warnings: &[String]) {
     let mut unique = Vec::new();
     for warning in warnings {
         let trimmed = warning.trim();
@@ -337,7 +337,7 @@ fn parse_hud_timestamp(raw: &str) -> Option<f64> {
     }
 }
 
-/// Parses Memento's manual A/B Audio Context HUD pill text (e.g.
+/// Parses Subomi's manual A/B Audio Context HUD pill text (e.g.
 /// `"Audio Context: 01:23.45 → 01:28.90"`, `"Audio Context: 1:02:03.45 → 1:02:08.90"`,
 /// or open-ended `"Audio Context: 01:23.45 → ..."` using `current_pos`) into `(start, end)`
 /// in media playback seconds (H5.2 / `#136`).
@@ -403,7 +403,7 @@ fn convert_subtitle_range_to_media(
 
 /// Computes effective media-timeline `(subtitle_start, subtitle_end, context_start, context_end)`
 /// for `{audio-media}`, `{audio-context}`, and `{video}`:
-/// - Applies `memento_player::subtitle_to_media_time(cue_t, sub_speed, sub_delay)` to subtitle
+/// - Applies `subomi_player::subtitle_to_media_time(cue_t, sub_speed, sub_delay)` to subtitle
 ///   cues and multi-subtitle selection ranges (C3.1).
 /// - Attaches manual A/B Audio Context HUD timestamps (already in media time) when mining from
 ///   Manual Search / OCR or when no active subtitle cue timing exists (H5.2 / `#136`).
@@ -445,7 +445,7 @@ pub(crate) fn resolve_anki_media_timings(
 }
 
 pub(crate) fn set_popup_term_metadata(
-    app: &MementoApp,
+    app: &SubomiApp,
     expression: &str,
     reading: &str,
     graphs: Vec<TermPitchGraph>,
@@ -487,7 +487,7 @@ pub(crate) fn set_popup_term_metadata(
 }
 
 fn push_popup_audio_models(
-    app: &MementoApp,
+    app: &SubomiApp,
     entries: &[AudioSourceEntry],
     statuses: &[i32],
 ) {
@@ -507,7 +507,7 @@ fn push_popup_audio_models(
 }
 
 pub(crate) fn set_popup_audio_sources_with_statuses(
-    app: &MementoApp,
+    app: &SubomiApp,
     cache: &Arc<Mutex<PopupAudioState>>,
     expression: &str,
     reading: &str,
@@ -537,7 +537,7 @@ pub(crate) fn set_popup_audio_sources_with_statuses(
 }
 
 pub(crate) fn set_popup_audio_sources(
-    app: &MementoApp,
+    app: &SubomiApp,
     cache: &Arc<Mutex<PopupAudioState>>,
     expression: &str,
     reading: &str,
@@ -570,7 +570,7 @@ pub(crate) fn set_popup_audio_sources(
 }
 
 fn update_popup_audio_source_status(
-    app: &MementoApp,
+    app: &SubomiApp,
     cache: &Arc<Mutex<PopupAudioState>>,
     expression: &str,
     reading: &str,
@@ -660,13 +660,13 @@ fn probe_word_audio_sources_with_statuses(
     (resolved, statuses)
 }
 
-fn maybe_auto_play_first_term_audio(app: &MementoApp, expression: &str, reading: &str) {
+fn maybe_auto_play_first_term_audio(app: &SubomiApp, expression: &str, reading: &str) {
     if app.get_auto_play_audio_enabled() && !expression.is_empty() {
         app.invoke_play_audio_for_word(expression.into(), reading.into());
     }
 }
 
-pub(crate) fn install_auto_play_first_term_audio(app: &MementoApp) {
+pub(crate) fn install_auto_play_first_term_audio(app: &SubomiApp) {
     let auto_audio_app = app.as_weak();
     app.global::<PopupBridge>()
         .on_first_term_ready(move |expression, reading| {
@@ -698,7 +698,7 @@ fn active_hit_meta_to_hints(meta: Vec<ActiveRowHitMeta>) -> Vec<anki::SelectedHi
 }
 
 pub(crate) fn prepare_anki_note_request(
-    app: &MementoApp,
+    app: &SubomiApp,
     definitions: &slint::ModelRc<DictResult>,
     row_idx: usize,
     config: &ConfigController,
@@ -844,8 +844,7 @@ pub(crate) fn prepare_anki_note_request(
             .selected_cues()
             .iter()
             .map(|cue| {
-                let raw = String::from_utf16_lossy(&cue.text);
-                filter_subtitle_text(&raw, &remove_regex, replace_lines, &replace_with)
+                filter_subtitle_text(&cue.text, &remove_regex, replace_lines, &replace_with)
             })
             .collect::<Vec<_>>();
         let active = subs.active_cue();
@@ -1134,7 +1133,7 @@ pub(crate) fn prepare_anki_note_request(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_update_anki_note_handler(
-    app: &MementoApp,
+    app: &SubomiApp,
     config: Rc<ConfigController>,
     audio_cache: Arc<Mutex<PopupAudioState>>,
     subtitles: Rc<RefCell<SubtitleController>>,
@@ -1282,7 +1281,7 @@ pub(crate) fn install_update_anki_note_handler(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn install_anki_and_audio_handlers(
-    app: &MementoApp,
+    app: &SubomiApp,
     config_ctrl: Rc<ConfigController>,
     popup_audio_cache: Arc<Mutex<PopupAudioState>>,
     sub_ctrl: Rc<RefCell<SubtitleController>>,
@@ -1737,7 +1736,7 @@ mod tests {
     #[test]
     fn auto_play_audio_triggers_on_first_term_result_when_enabled() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_auto_play_first_term_audio(&app);
         let cfg = ConfigController::new();
         cfg.edit_setting("search/auto-play-audio", "true").unwrap();
@@ -1922,11 +1921,11 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        cfg.edit_setting("anki/profile/tags", "memento-updated")
+        cfg.edit_setting("anki/profile/tags", "subomi-updated")
             .unwrap();
         let config_ctrl = Rc::new(cfg);
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.set_dict_open(true);
         app.set_active_sub_text("今日ご飯を食べる。".into());
         let hit = SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
@@ -1983,7 +1982,7 @@ mod tests {
         );
         assert_eq!(actions[2]["action"], "addTags");
         assert_eq!(actions[2]["params"]["notes"][0], target_note_id);
-        assert_eq!(actions[2]["params"]["tags"], "memento-updated");
+        assert_eq!(actions[2]["params"]["tags"], "subomi-updated");
     }
 
     #[test]
@@ -2054,14 +2053,14 @@ mod tests {
 
     #[test]
     fn encode_context_to_media_context_preserves_full_streaming_fields() {
-        let enc = memento_player::EncodeContext {
+        let enc = subomi_player::EncodeContext {
             path: "https://example.com/watch?v=123".into(),
             audio_id: 2,
             stream_open_filename: "https://cdn.example.com/video.m3u8".into(),
             script_opts: "ytdl_hook-ytdl_path=yt-dlp".into(),
             http_header_fields: vec!["Authorization: Bearer secret".into()],
             referrer: "https://example.com/".into(),
-            user_agent: "MementoTest/1.0".into(),
+            user_agent: "SubomiTest/1.0".into(),
             cookies: true,
             cookies_file: "/tmp/cookies.txt".into(),
             ytdl_raw_options: "cookies-from-browser=firefox".into(),
@@ -2084,7 +2083,7 @@ mod tests {
     #[test]
     fn show_warning_toast_deduplicates_and_sets_warning_state() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         show_warning_toast(
             &app,
             &[
@@ -2104,7 +2103,7 @@ mod tests {
     #[test]
     fn prepare_anki_note_request_wires_multi_selections_reading_as_expr_and_manual_hud() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();
         cfg.edit_setting("anki/enabled", "true").unwrap();
         cfg.edit_setting("anki/profile/term/deck", "Mining")
@@ -2155,7 +2154,7 @@ mod tests {
     #[test]
     fn audio_cache_invalidation_clears_popup_state_and_updates_timeout() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         let cache = Arc::new(Mutex::new(PopupAudioState::default()));
         let player: Rc<RefCell<Option<audio::AudioController>>> = Rc::new(RefCell::new(None));
         register_audio_invalidation_target(app.as_weak(), cache.clone(), player);

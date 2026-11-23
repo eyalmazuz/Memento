@@ -11,7 +11,7 @@ use super::popup_model::{
 use super::text_engine::{
     cancel_subtitle_token_prewarm, with_shared_text_engine, SubtitleRenderStyle,
 };
-use super::{MementoApp, SubtitleLine, SubtitleOverlayBridge, SubtitleWord};
+use super::{SubomiApp, SubtitleLine, SubtitleOverlayBridge, SubtitleWord};
 
 thread_local! {
     static FALLBACK_SUBTITLE_STYLE: RefCell<SubtitleRenderStyle> =
@@ -98,11 +98,11 @@ pub(super) fn active_subtitle_render_style() -> SubtitleRenderStyle {
     FALLBACK_SUBTITLE_STYLE.with(|slot| slot.borrow().clone())
 }
 
-pub fn active_subtitle_style_for_app(app: &MementoApp) -> SubtitleRenderStyle {
+pub fn active_subtitle_style_for_app(app: &SubomiApp) -> SubtitleRenderStyle {
     subtitle_style_for_app(app)
 }
 
-fn subtitle_style_for_app(app: &MementoApp) -> SubtitleRenderStyle {
+fn subtitle_style_for_app(app: &SubomiApp) -> SubtitleRenderStyle {
     if let Some(bridge) = active_rich_bridge_for_app(app) {
         if let Some(style) = bridge.subtitle_style() {
             return style;
@@ -198,7 +198,7 @@ pub fn subtitle_lines_from_words(
     subtitle_lines_from_words_with_style(all_words, max_width_px, font_px, furigana, &style)
 }
 
-pub fn subtitle_lines_for_app(app: &MementoApp, words: Vec<SubtitleWord>) -> Vec<SubtitleLine> {
+pub fn subtitle_lines_for_app(app: &SubomiApp, words: Vec<SubtitleWord>) -> Vec<SubtitleLine> {
     let max_width_px = (app.get_video_width() as f32 - 72.0).max(120.0);
     let font_px = (app.get_video_height() as f32 * app.get_subtitle_scale()).max(8.0);
     let style = subtitle_style_for_app(app);
@@ -212,7 +212,7 @@ pub fn subtitle_lines_for_app(app: &MementoApp, words: Vec<SubtitleWord>) -> Vec
 }
 
 pub fn publish_active_subtitle(
-    app: &MementoApp,
+    app: &SubomiApp,
     text: &str,
     furigana_sender: &std::sync::mpsc::Sender<(u64, String)>,
     furigana_epoch: &std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -238,7 +238,7 @@ pub fn publish_active_subtitle(
 }
 
 /// Apply a worker result while preserving the selected base-text span.
-pub fn apply_subtitle_furigana(app: &MementoApp, text: &str, parts: Vec<(String, String)>) {
+pub fn apply_subtitle_furigana(app: &SubomiApp, text: &str, parts: Vec<(String, String)>) {
     let words = subtitle_words_from_parts(text, parts);
     let previous_query = app
         .get_active_sub_words()

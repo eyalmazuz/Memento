@@ -1,4 +1,4 @@
-use memento_app::{apply_subtitle_furigana, publish_active_subtitle, MementoApp};
+use subomi_app::{apply_subtitle_furigana, publish_active_subtitle, SubomiApp};
 use slint::{ComponentHandle, Model};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -10,7 +10,7 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     use std::{cell::Cell, rc::Rc};
     use slint::platform::{PointerEventButton, WindowEvent};
     i_slint_backend_testing::init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     app.set_duration(120.);
     app.show().unwrap();
@@ -48,7 +48,7 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     let (requests, _worker) = mpsc::channel();
     let epoch = Arc::new(AtomicU64::new(0));
     publish_active_subtitle(&app, "世界中", &requests, &epoch);
-    memento_app::set_dictionary_rows(&app, vec![memento_app::DictResult {
+    subomi_app::set_dictionary_rows(&app, vec![subomi_app::DictResult {
         expression: "世界中".into(), reading: "せかいじゅう".into(),
         term_start: true, term_end: true, selected: true,
         ..Default::default()
@@ -85,7 +85,7 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
 #[test]
 fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_work() {
     i_slint_backend_testing::init_no_event_loop();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::LogicalSize::new(1280., 720.));
     app.set_furigana_visible(true);
     let (requests, worker) = mpsc::channel();
@@ -154,14 +154,14 @@ fn startup_furigana_preserves_base_text_selection_and_toggle_invalidates_old_wor
 
 mod rich_subtitle_phase4_tests {
     use super::*;
-    use memento_app::controller::config::ConfigController;
-    use memento_app::controller::dict::SearchHit;
-    use memento_app::{
+    use subomi_app::controller::config::ConfigController;
+    use subomi_app::controller::dict::SearchHit;
+    use subomi_app::{
         dictionary_result_rows, install_popup_navigation, install_rich_ui_bridges,
         set_dictionary_rows, subtitle_cluster_at_point, subtitle_lines_from_words,
         subtitle_words_from_parts, SubtitleOverlayBridge, SubtitleWord,
     };
-    use memento_setting::keys as raw;
+    use subomi_setting::keys as raw;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::cell::RefCell;
     use std::fs;
@@ -184,7 +184,7 @@ mod rich_subtitle_phase4_tests {
                 .unwrap()
                 .as_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "memento-p4-rich-sub-{}-{seq}-{nanos}",
+                "subomi-p4-rich-sub-{}-{seq}-{nanos}",
                 std::process::id()
             ));
             fs::create_dir_all(dir.join("dict_resources")).unwrap();
@@ -202,10 +202,10 @@ mod rich_subtitle_phase4_tests {
     fn vector_stroked_subtitles_render_and_hit_test_exact_per_glyph_clusters() {
         i_slint_backend_testing::init_no_event_loop();
         let fixture = TempSubConfig::new();
-        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        let config = ConfigController::load(&fixture.dir, "subomi.conf").unwrap();
         let db_path = fixture.dir.join("dictionaries.sqlite");
 
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_duration(120.);
         install_popup_navigation(&app);
@@ -391,7 +391,7 @@ mod rich_subtitle_phase4_tests {
     fn stationary_shift_modifier_and_middle_mouse_scan_trigger_cluster_lookup() {
         i_slint_backend_testing::init_no_event_loop();
         let fixture = TempSubConfig::new();
-        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        let config = ConfigController::load(&fixture.dir, "subomi.conf").unwrap();
         // Configure `search/method = 1` (Modifier), `search/modifier = 2` (Shift), `search/middle_mouse = true`
         config
             .edit_setting(&format!("{}/{}", raw::search::GROUP, raw::search::METHOD), "1")
@@ -408,10 +408,10 @@ mod rich_subtitle_phase4_tests {
                 "true",
             )
             .unwrap();
-        config.save(&fixture.dir, "memento.conf").unwrap();
+        config.save(&fixture.dir, "subomi.conf").unwrap();
 
         let db_path = fixture.dir.join("dictionaries.sqlite");
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_duration(120.);
         install_popup_navigation(&app);
@@ -542,7 +542,7 @@ mod rich_subtitle_phase4_tests {
     fn custom_subtitle_style_rewraps_lines_and_preserves_focus_and_single_key_dispatch() {
         i_slint_backend_testing::init_no_event_loop();
         let fixture = TempSubConfig::new();
-        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        let config = ConfigController::load(&fixture.dir, "subomi.conf").unwrap();
         // Configure heavy stroke (`24.0`),Modifier mode (`Shift`), and save
         config
             .edit_setting(
@@ -559,10 +559,10 @@ mod rich_subtitle_phase4_tests {
                 "2",
             )
             .unwrap();
-        config.save(&fixture.dir, "memento.conf").unwrap();
+        config.save(&fixture.dir, "subomi.conf").unwrap();
 
         let db_path = fixture.dir.join("dictionaries.sqlite");
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(360., 720.));
         app.set_duration(120.);
         install_popup_navigation(&app);
@@ -570,7 +570,7 @@ mod rich_subtitle_phase4_tests {
         app.show().unwrap();
 
         let sb = app.global::<SubtitleOverlayBridge>();
-        let pb = app.global::<memento_app::PopupBridge>();
+        let pb = app.global::<subomi_app::PopupBridge>();
 
         let text = "世界中を旅行する物語";
         let (requests, _worker) = mpsc::channel();
@@ -581,7 +581,7 @@ mod rich_subtitle_phase4_tests {
         let font_px = app.get_video_height() as f32 * app.get_subtitle_scale();
         let word0 = app.get_active_sub_words().row_data(0).unwrap();
         let rendered0 = sb.invoke_render_token(word0.clone(), font_px, false, false, 0, 0);
-        let measured0 = memento_app::subtitle_token_width(&word0, font_px, false);
+        let measured0 = subomi_app::subtitle_token_width(&word0, font_px, false);
         assert!(
             (rendered0.width_px - measured0).abs() < 0.01,
             "subtitle_token_width ({measured0}) must use active custom SubtitleRenderStyle ({})",
@@ -653,7 +653,7 @@ mod rich_subtitle_phase4_tests {
     fn subtitle_stroke_does_not_inflate_spacing_and_popup_anchor_does_not_chase_mouse() {
         i_slint_backend_testing::init_no_event_loop();
         let fixture = TempSubConfig::new();
-        let config = ConfigController::load(&fixture.dir, "memento.conf").unwrap();
+        let config = ConfigController::load(&fixture.dir, "subomi.conf").unwrap();
         // Match heavy stroke (`15.0`), transparent bg, Modifier mode (`Shift`)
         config
             .edit_setting(
@@ -676,27 +676,27 @@ mod rich_subtitle_phase4_tests {
                 "2",
             )
             .unwrap();
-        config.save(&fixture.dir, "memento.conf").unwrap();
+        config.save(&fixture.dir, "subomi.conf").unwrap();
 
-        let word = memento_app::SubtitleWord {
+        let word = subomi_app::SubtitleWord {
             text: "私".into(),
             reading: "".into(),
             query: "私は違う".into(),
             index: 0,
         };
-        let mut no_stroke = memento_app::SubtitleRenderStyle::default();
+        let mut no_stroke = subomi_app::SubtitleRenderStyle::default();
         no_stroke.stroke_size = 0.0;
-        let mut heavy_stroke = memento_app::SubtitleRenderStyle::default();
+        let mut heavy_stroke = subomi_app::SubtitleRenderStyle::default();
         heavy_stroke.stroke_size = 15.0;
-        let w_no = memento_app::subtitle_token_width_with_style(&word, 40.0, false, &no_stroke);
-        let w_heavy = memento_app::subtitle_token_width_with_style(&word, 40.0, false, &heavy_stroke);
+        let w_no = subomi_app::subtitle_token_width_with_style(&word, 40.0, false, &no_stroke);
+        let w_heavy = subomi_app::subtitle_token_width_with_style(&word, 40.0, false, &heavy_stroke);
         assert!(
             (w_no - w_heavy).abs() < 0.01,
             "heavy subtitle stroke must bleed visually instead of adding gaps between characters (no_stroke={w_no}, heavy_stroke={w_heavy})"
         );
 
         let db_path = fixture.dir.join("dictionaries.sqlite");
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         app.set_duration(120.);
         app.set_subtitle_scale(0.04);
@@ -766,13 +766,13 @@ mod rich_subtitle_phase4_tests {
 
     #[test]
     fn native_ass_overlay_anchors_popup_passes_outside_clicks_and_switches_tracks_cleanly() {
-        use memento_app::controller::ass::AssOverlayController;
-        use memento_ass::MpvAssParams;
+        use subomi_app::controller::ass::AssOverlayController;
+        use subomi_ass::MpvAssParams;
         use slint::platform::{PointerEventButton, WindowEvent};
         use std::cell::Cell;
 
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 750.0));
         app.set_duration(120.0);
         app.set_osc_visible(false);
@@ -885,8 +885,8 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,660)\\an2}鳥白島
 mod ui_dialogs_settings_and_modifier_tests {
     use super::*;
     use i_slint_backend_testing::ElementQuery;
-    use memento_app::controller::config::ConfigController;
-    use memento_app::{PopupBridge, SettingsField, SettingsGroup, SettingsWindow, SubEntry};
+    use subomi_app::controller::config::ConfigController;
+    use subomi_app::{PopupBridge, SettingsField, SettingsGroup, SettingsWindow, SubEntry};
     use slint::platform::{Key, WindowEvent};
     use slint::VecModel;
     use std::cell::RefCell;
@@ -895,7 +895,7 @@ mod ui_dialogs_settings_and_modifier_tests {
     #[test]
     fn update_dialog_buttons_stay_strictly_inside_card_with_generous_bottom_margin() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.show().unwrap();
 
@@ -903,16 +903,16 @@ mod ui_dialogs_settings_and_modifier_tests {
         app.set_update_dialog_opt_in(true);
         app.set_update_dialog_title("Auto Update".into());
         app.set_update_dialog_message(
-            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts."
+            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Subomi starts."
                 .into(),
         );
         app.set_update_dialog_release_tag("".into());
-        app.set_update_dialog_release_url("https://github.com/ripose-jp/Memento/releases".into());
+        app.set_update_dialog_release_url("https://github.com/eyalmazuz/Subomi/releases".into());
         app.set_update_dialog_open(true);
 
         let assert_buttons_inside_card = |label: &str, button_ids: &[&str]| {
             let card = ElementQuery::from_root(&app)
-                .match_id("MementoApp::update-card")
+                .match_id("SubomiApp::update-card")
                 .find_first()
                 .unwrap_or_else(|| panic!("{label}: update-card must exist (run with SLINT_EMIT_DEBUG_INFO=1)"));
             let card_pos = card.absolute_position();
@@ -922,7 +922,7 @@ mod ui_dialogs_settings_and_modifier_tests {
             let card_bottom = card_pos.y + card_size.height;
 
             let msg = ElementQuery::from_root(&app)
-                .match_id("MementoApp::update-message-text")
+                .match_id("SubomiApp::update-message-text")
                 .find_first()
                 .unwrap_or_else(|| panic!("{label}: update-message-text must exist"));
             let msg_pos = msg.absolute_position();
@@ -975,17 +975,17 @@ mod ui_dialogs_settings_and_modifier_tests {
 
         assert_buttons_inside_card(
             "opt-in",
-            &["MementoApp::update-btn-no", "MementoApp::update-btn-yes"],
+            &["SubomiApp::update-btn-no", "SubomiApp::update-btn-yes"],
         );
 
         // Even with a very long multi-paragraph message, update-card must expand cleanly.
         app.set_update_dialog_message(
-            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Memento starts and notify you whenever a newer release tag is published on GitHub Releases."
+            "Do you want to check for updates on launch?\n\nThis can be changed at any time in Settings → Options → Application.\nThis will query GitHub's releases API when Subomi starts and notify you whenever a newer release tag is published on GitHub Releases."
                 .into(),
         );
         assert_buttons_inside_card(
             "opt-in-long",
-            &["MementoApp::update-btn-no", "MementoApp::update-btn-yes"],
+            &["SubomiApp::update-btn-no", "SubomiApp::update-btn-yes"],
         );
 
         // 2. Release-available dialog (`Open GitHub Releases` / `Dismiss`)
@@ -993,14 +993,14 @@ mod ui_dialogs_settings_and_modifier_tests {
         app.set_update_dialog_title("New Version Available".into());
         app.set_update_dialog_release_tag("v2.1.0".into());
         app.set_update_dialog_message(
-            "Memento v2.1.0 is available on GitHub Releases (currently installed: v2.0.0). Visit GitHub Releases to download the latest build and review the changelog."
+            "Subomi v2.1.0 is available on GitHub Releases (currently installed: v2.0.0). Visit GitHub Releases to download the latest build and review the changelog."
                 .into(),
         );
         assert_buttons_inside_card(
             "release-available",
             &[
-                "MementoApp::update-btn-releases",
-                "MementoApp::update-btn-dismiss",
+                "SubomiApp::update-btn-releases",
+                "SubomiApp::update-btn-dismiss",
             ],
         );
 
@@ -1228,7 +1228,7 @@ mod ui_dialogs_settings_and_modifier_tests {
     #[test]
     fn subtitle_drawer_rows_are_compact_and_do_not_overlap() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.set_sub_drawer_open(true);
         let rows: Vec<SubEntry> = (0..25)
@@ -1238,7 +1238,7 @@ mod ui_dialogs_settings_and_modifier_tests {
                     id: i,
                     start,
                     end: (i * 2 + 1) as f32,
-                    timestamp: memento_app::controller::player::format_time(start as f64).into(),
+                    timestamp: subomi_app::controller::player::format_time(start as f64).into(),
                     text: format!("短い字幕行 #{i}").into(),
                     selected: false,
                     is_active: i == 3,
@@ -1282,7 +1282,7 @@ mod ui_dialogs_settings_and_modifier_tests {
     #[test]
     fn subtitle_drawer_timestamps_render_from_sub_entry_without_rust_callback() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.set_sub_drawer_open(true);
         app.set_sub_list_show_timestamps(true);
@@ -1301,7 +1301,7 @@ mod ui_dialogs_settings_and_modifier_tests {
                     id: i + 1,
                     start,
                     end: start + 2.0,
-                    timestamp: memento_app::controller::player::format_time(start as f64).into(),
+                    timestamp: subomi_app::controller::player::format_time(start as f64).into(),
                     text: format!("字幕行 #{i}").into(),
                     selected: false,
                     is_active: i == 0,
@@ -1328,7 +1328,7 @@ mod ui_dialogs_settings_and_modifier_tests {
     #[test]
     fn global_bare_modifier_capture_reaches_popup_bridge_when_dict_open() {
         i_slint_backend_testing::init_no_event_loop();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.show().unwrap();
 

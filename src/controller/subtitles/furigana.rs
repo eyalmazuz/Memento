@@ -157,7 +157,7 @@ fn prewarm_worker() -> &'static Arc<PrewarmWorker> {
         });
         let bg = Arc::clone(&worker);
         let _ = std::thread::Builder::new()
-            .name("memento-furigana-prewarm".into())
+            .name("subomi-furigana-prewarm".into())
             .spawn(move || prewarm_worker_loop(bg));
         worker
     })
@@ -312,7 +312,7 @@ pub fn prewarm_subtitle_furigana_window(lines: &[String], center: usize, radius:
 /// process-wide furigana LRU cache.
 ///
 /// Advances `PREWARM_EPOCH` before clearing the cache so the shared
-/// `memento-furigana-prewarm` background thread stops immediately without
+/// `subomi-furigana-prewarm` background thread stops immediately without
 /// re-invoking MeCab. Returns `true` iff cached entries were freed.
 pub fn clear_furigana_cache_and_cancel_prewarm() -> bool {
     let epoch = PREWARM_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
@@ -377,7 +377,7 @@ pub fn subtitle_furigana_parts(text: &str) -> Result<Vec<(String, String)>, Stri
         Cow::Borrowed(text)
     };
 
-    let output = memento_util::mecab::parse_mecab(&query_ref)?;
+    let output = subomi_util::mecab::parse_mecab(&query_ref)?;
     let parts = parse_mecab_furigana(text, &output)?;
 
     if let Ok(mut guard) = furigana_cache().lock() {
@@ -386,8 +386,8 @@ pub fn subtitle_furigana_parts(text: &str) -> Result<Vec<(String, String)>, Stri
     Ok(parts)
 }
 
-// Note: `memento_util::mecab::find_mecab_surface_in_remaining` is currently
-// private in `crates/memento-util/src/mecab.rs`, so we keep a local zero-alloc
+// Note: `subomi_util::mecab::find_mecab_surface_in_remaining` is currently
+// private in `crates/subomi-util/src/mecab.rs`, so we keep a local zero-alloc
 // matcher here for multi-line `EOS`-spanning furigana alignment.
 fn find_mecab_surface_in_remaining(remaining: &str, raw_surface: &str) -> Option<(usize, usize)> {
     if !raw_surface.contains('叱') || !remaining.contains('𠮟') {
@@ -468,17 +468,17 @@ fn parse_mecab_furigana(text: &str, output: &str) -> Result<Vec<(String, String)
             offset += gap;
         }
         let surface = &text[offset..offset + matched_len];
-        if memento_util::furiganautils::contains_kanji(surface) {
-            let fields = memento_util::furiganaparser::split_csv_row(features);
+        if subomi_util::furiganautils::contains_kanji(surface) {
+            let fields = subomi_util::furiganaparser::split_csv_row(features);
             let raw_reading =
-                memento_util::furiganaparser::extract_surface_reading_from_fields(surface, &fields);
+                subomi_util::furiganaparser::extract_surface_reading_from_fields(surface, &fields);
             let mut reading = if !raw_reading.is_empty() && raw_reading != "*" {
-                memento_util::furiganaparser::katakana_to_hiragana_str(&raw_reading)
+                subomi_util::furiganaparser::katakana_to_hiragana_str(&raw_reading)
             } else {
                 String::new()
             };
             apply_kinship_context_override(text, offset, surface, &mut reading);
-            parts.extend(memento_util::furiganautils::distribute_furigana_str(
+            parts.extend(subomi_util::furiganautils::distribute_furigana_str(
                 surface, &reading,
             ));
         } else {
@@ -518,7 +518,7 @@ pub fn segment_subtitle_text(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
 
-    let is_kanji = memento_util::furiganautils::is_kanji_char;
+    let is_kanji = subomi_util::furiganautils::is_kanji_char;
     let is_hiragana = |c: char| matches!(c, '\u{3040}'..='\u{309F}');
     let is_katakana = |c: char| matches!(c, '\u{30A0}'..='\u{30FF}');
 
@@ -845,7 +845,7 @@ mod furigana_tests {
     #[test]
     fn cached_subtitle_furigana_parts_is_non_blocking_on_miss_and_hits_after_parse() {
         assert_eq!(cached_subtitle_furigana_parts(""), Some(Vec::new()));
-        let uncached_marker = "memento_uncached_probe_9f8e7d6c5b4a";
+        let uncached_marker = "subomi_uncached_probe_9f8e7d6c5b4a";
         assert_eq!(cached_subtitle_furigana_parts(uncached_marker), None);
     }
 
@@ -871,7 +871,7 @@ mod furigana_tests {
         let _global_guard = FURIGANA_GLOBAL_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let key = "memento_clear_test_line_a1b2c3";
+        let key = "subomi_clear_test_line_a1b2c3";
         super::insert_cached_furigana_for_test(key, vec![(key.into(), "てすと".into())]);
         assert!(cached_subtitle_furigana_parts(key).is_some());
 

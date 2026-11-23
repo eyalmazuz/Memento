@@ -1,0 +1,15 @@
+[package]
+name = "subomi-anki"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "AnkiConnect note-building, glossary formatting, and marker tokenization"
+license = "GPL-2.0-only"
+
+[dependencies]
+serde_json = "=1.0.154"
+
+[lib]
+name = "subomi_anki"
+path = "src/lib.rs"
+crate-type = ["lib"]

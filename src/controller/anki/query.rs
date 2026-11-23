@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use memento_net::anki::{AnkiAction, AnkiClient};
+use subomi_net::anki::{AnkiAction, AnkiClient};
 
 use crate::controller::config::AnkiNoteConfig;
 

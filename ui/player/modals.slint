@@ -1,5 +1,5 @@
 import { LineEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ModalDialog } from "../components/modal.slint";
 
 export component OpenUrlModal inherits ModalDialog {
@@ -52,7 +52,7 @@ export component AboutModal inherits ModalDialog {
                 Image {
                     width: 56px;
                     height: 56px;
-                    source: @image-url("../../res/memento.svg");
+                    source: @image-url("../../res/subomi.svg");
                     image-fit: contain;
                 }
             }
@@ -60,14 +60,14 @@ export component AboutModal inherits ModalDialog {
                 alignment: center;
                 spacing: 2px;
                 Text {
-                    text: "Memento";
-                    color: MementoPalette.text;
+                    text: "Subomi";
+                    color: SubomiPalette.text;
                     font-size: 26px;
                     font-weight: 700;
                 }
                 Text {
                     text: root.app-version-display != "" ? root.app-version-display : ("Version " + root.app-version);
-                    color: MementoPalette.text-secondary;
+                    color: SubomiPalette.text-secondary;
                     font-size: 13px;
                 }
             }
@@ -75,15 +75,15 @@ export component AboutModal inherits ModalDialog {
 
         Text {
             text: "An mpv-based video player for studying Japanese";
-            color: MementoPalette.text;
+            color: SubomiPalette.text;
             font-size: 13px;
             horizontal-alignment: center;
             wrap: word-wrap;
         }
 
         Text {
-            text: "Copyright © Ripose · GPLv2-Only";
-            color: MementoPalette.text-muted;
+            text: "Originally forked from ripose-jp/Memento";
+            color: SubomiPalette.text-muted;
             horizontal-alignment: center;
             font-size: 12px;
         }
@@ -96,11 +96,11 @@ export component AboutModal inherits ModalDialog {
                 width: site-lbl.preferred-width + 18px;
                 height: 28px;
                 border-radius: 6px;
-                background: site-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                background: site-touch.has-hover ? SubomiPalette.hover-bg : transparent;
                 animate background { duration: 100ms; }
                 site-lbl := Text {
-                    text: "Project Site";
-                    color: MementoPalette.cyan-accent;
+                    text: "Releases";
+                    color: SubomiPalette.cyan-accent;
                     font-size: 13px;
                     font-weight: 600;
                     horizontal-alignment: center;
@@ -108,7 +108,7 @@ export component AboutModal inherits ModalDialog {
                 }
                 site-touch := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { root.open-link("https://ripose-jp.github.io/Memento/"); }
+                    clicked => { root.open-link("https://github.com/eyalmazuz/Subomi/releases"); }
                 }
             }
 
@@ -116,11 +116,11 @@ export component AboutModal inherits ModalDialog {
                 width: gh-lbl.preferred-width + 18px;
                 height: 28px;
                 border-radius: 6px;
-                background: gh-touch.has-hover ? MementoPalette.hover-bg : transparent;
+                background: gh-touch.has-hover ? SubomiPalette.hover-bg : transparent;
                 animate background { duration: 100ms; }
                 gh-lbl := Text {
                     text: "GitHub";
-                    color: MementoPalette.cyan-accent;
+                    color: SubomiPalette.cyan-accent;
                     font-size: 13px;
                     font-weight: 600;
                     horizontal-alignment: center;
@@ -128,7 +128,7 @@ export component AboutModal inherits ModalDialog {
                 }
                 gh-touch := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { root.open-link("https://github.com/ripose-jp/Memento"); }
+                    clicked => { root.open-link("https://github.com/eyalmazuz/Subomi"); }
                 }
             }
         }
@@ -145,15 +145,15 @@ export component NoDictionariesModal inherits ModalDialog {
         spacing: 10px;
 
         Text {
-            text: "Memento needs at least one Yomitan dictionary (.zip) installed before hovering or searching words can display definitions.";
-            color: MementoPalette.text;
+            text: "Subomi needs at least one Yomitan dictionary (.zip) installed before hovering or searching words can display definitions.";
+            color: SubomiPalette.text;
             font-size: 13px;
             wrap: word-wrap;
         }
 
         Text {
             text: "Open Options → Dictionaries to import Yomitan dictionary archives, or drag and drop .zip dictionary files into the Settings window at any time.";
-            color: MementoPalette.text-secondary;
+            color: SubomiPalette.text-secondary;
             font-size: 12px;
             wrap: word-wrap;
         }

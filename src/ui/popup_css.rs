@@ -1,18 +1,18 @@
 //! Popup theme CSS parser, custom CSS cascade preprocessor, and per-dictionary
-//! `StylesheetCache` backed directly by `memento_definition::parse_stylesheet`.
+//! `StylesheetCache` backed directly by `subomi_definition::parse_stylesheet`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use memento_definition::{self as mdef, Color as DefColor, ParsedStylesheet};
-pub use memento_definition::CssTheme;
+use subomi_definition::{self as mdef, ParsedStylesheet};
+pub use subomi_definition::CssTheme;
 use slint::ComponentHandle;
 
-use super::{MementoApp, PopupBridge};
+use super::{SubomiApp, PopupBridge};
 
-/// Parse raw UTF-8 CSS text into a `memento_definition::ParsedStylesheet`.
+/// Parse raw UTF-8 CSS text into a `subomi_definition::ParsedStylesheet`.
 pub fn parse_dictionary_css_str(css: &str) -> Arc<ParsedStylesheet> {
     Arc::new(mdef::parse_stylesheet(css))
 }
@@ -21,7 +21,7 @@ pub const CUSTOM_POPUP_CSS_FILENAME: &str = "popup.css";
 pub const CUSTOM_POPUP_OUTER_CSS_FILENAME: &str = "popup-outer.css";
 
 pub fn default_custom_popup_css_template() -> &'static str {
-    r#"/* Memento Popup CSS (~/.config/memento/popup.css)
+    r#"/* Subomi Popup CSS (~/.config/subomi/popup.css)
  *
  * Customize inner typography, pitch headword colors, 2-column card layout,
  * per-dictionary badge/tint colors, hover-to-reveal dictionaries, frequency
@@ -103,7 +103,7 @@ a { text-decoration: none; }
 }
 
 pub fn default_custom_popup_outer_css_template() -> &'static str {
-    r#"/* Memento Popup Outer CSS (~/.config/memento/popup-outer.css)
+    r#"/* Subomi Popup Outer CSS (~/.config/subomi/popup-outer.css)
  *
  * Controls the floating popup card container: translucent RGBA background,
  * border, corner radius, drop shadow, padding, and optional width/height.
@@ -663,7 +663,7 @@ fn strip_css_comments(css: &str) -> String {
             }
             continue;
         }
-        // Strip JS-style `// ...` comments while preserving URLs like `https://` / `memento://`.
+        // Strip JS-style `// ...` comments while preserving URLs like `https://` / `subomi://`.
         if b == b'/'
             && i + 1 < bytes.len()
             && bytes[i + 1] == b'/'
@@ -694,33 +694,7 @@ pub(super) fn clean_css_font_family(raw: &str) -> String {
 }
 
 pub(super) fn parse_css_theme_color(value: &str) -> Option<[u8; 4]> {
-    let v = value.trim();
-    if v.is_empty() {
-        return None;
-    }
-    if v.eq_ignore_ascii_case("transparent") {
-        return Some([0, 0, 0, 0]);
-    }
-    // Standard CSS #RGBA and #RRGGBBAA (DefColor::from_string uses Qt #AARRGGBB for 8-digit hex).
-    if let Some(hex) = v.strip_prefix('#') {
-        if hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let nibble =
-                |idx: usize| u8::from_str_radix(&hex[idx..idx + 1], 16).ok().map(|n| n * 17);
-            return Some([nibble(0)?, nibble(1)?, nibble(2)?, nibble(3)?]);
-        }
-        if hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let byte = |idx: usize| u8::from_str_radix(&hex[idx..idx + 2], 16).ok();
-            return Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]);
-        }
-    }
-    DefColor::from_string(v).map(|c| {
-        [
-            ((u32::from(c.red) + 128) / 257) as u8,
-            ((u32::from(c.green) + 128) / 257) as u8,
-            ((u32::from(c.blue) + 128) / 257) as u8,
-            ((u32::from(c.alpha) + 128) / 257) as u8,
-        ]
-    })
+    mdef::parse_css_color(value)
 }
 
 fn parse_css_length_px(value: &str, base_px: f32) -> Option<f32> {
@@ -943,7 +917,7 @@ fn resolve_css_var_refs_inner(
                 preserve_unknown_fallbacks,
             ));
         } else if preserve_unknown_fallbacks {
-            // Preserve `var(--dict-var, fallback)` so `memento_definition::Renderer`
+            // Preserve `var(--dict-var, fallback)` so `subomi_definition::Renderer`
             // can resolve dictionary-scoped `:root` / `:root[data-theme="..."]` variables.
             out.push_str(&rest[pos..pos + 4 + end + 1]);
         } else if let Some(fb) = fallback {
@@ -2339,7 +2313,7 @@ fn preprocess_user_glossary_css(
             if classify_root_theme_selector(trimmed).is_none() {
                 is_root_only = false;
             }
-            // Normalize Yomitan dictionary container selectors onto our virtual `<memento-dict>` wrapper
+            // Normalize Yomitan dictionary container selectors onto our virtual `<subomi-dict>` wrapper
             let norm = trimmed
                 .replace("li.definition-item[data-dictionary", "[data-dictionary")
                 .replace(".definition-item[data-dictionary", "[data-dictionary")
@@ -2356,7 +2330,7 @@ fn preprocess_user_glossary_css(
         let mut decl_str = String::new();
         for (prop, raw_val) in decls {
             // Preserve element-scoped custom properties (e.g. `[data-dictionary="..."] { --accent: ... }`)
-            // so per-dictionary custom properties cascade cleanly inside `memento_definition`
+            // so per-dictionary custom properties cascade cleanly inside `subomi_definition`
             // without leaking across dictionaries.
             let val = resolve_css_var_refs_for_glossary(raw_val, vars, 0);
             decl_str.push_str(prop);
@@ -2388,7 +2362,7 @@ pub(super) fn rgba_to_slint_color(rgba: [u8; 4]) -> slint::Color {
 }
 
 #[allow(dead_code)]
-pub(super) fn apply_popup_css_theme_to_bridge(app: &MementoApp, theme: &PopupCssTheme) {
+pub(super) fn apply_popup_css_theme_to_bridge(app: &SubomiApp, theme: &PopupCssTheme) {
     let pb = app.global::<PopupBridge>();
     pb.set_css_popup_bg(rgba_to_slint_color(theme.popup_bg));
     pb.set_css_popup_border(rgba_to_slint_color(theme.popup_border));
@@ -2675,7 +2649,7 @@ impl StylesheetCache {
             };
 
         let style_path = dict_resource_dirs.iter().find_map(|dir| {
-            memento_dict::databasemanager::resolve_dictionary_style_path(dir, dic_id, dict_name)
+            subomi_dict::databasemanager::resolve_dictionary_style_path(dir, dic_id, dict_name)
         });
         let Some(style_path) = style_path else {
             return user_only;
@@ -2709,7 +2683,7 @@ impl StylesheetCache {
 mod tests {
     use super::*;
     use crate::ui::glossary_render::render_structured_glossary_entry_with_theme;
-    use memento_definition::LegacyGlossaryStyle;
+    use subomi_definition::LegacyGlossaryStyle;
 
     #[test]
     fn quote_and_url_aware_declaration_splitting_preserves_embedded_semicolons() {

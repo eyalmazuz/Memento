@@ -1,0 +1,22 @@
+[package]
+name = "subomi-asr-onnx"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "ONNX Runtime speech-to-text inference backend"
+license = "GPL-2.0-only"
+links = "onnxruntime"
+
+[dependencies]
+subomi-asr = { path = "../subomi-asr" }
+
+[build-dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[lib]
+name = "subomi_asr_onnx"
+crate-type = ["lib"]

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use memento_setting::keys as raw;
+use subomi_setting::keys as raw;
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontStyle, FontWeight, Layout,
     LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty,
@@ -1525,7 +1525,7 @@ fn subtitle_prewarm_worker() -> &'static Arc<SubtitlePrewarmWorker> {
         });
         let bg = Arc::clone(&worker);
         let _ = std::thread::Builder::new()
-            .name("memento-sub-preraster".into())
+            .name("subomi-sub-preraster".into())
             .spawn(move || subtitle_prewarm_worker_loop(bg));
         worker
     })

@@ -1,6 +1,6 @@
 // Shared types, layout helpers, and global bridges for the Yomitan dictionary popup and search panel.
 
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 
 export struct PitchMora { text: string, high: bool, rises_after: bool, falls_after: bool }
 export struct PitchGraph { dictionary: string, position: int, mora: [PitchMora] }
@@ -163,23 +163,23 @@ export global PopupBridge {
     in-out property <bool> compact-freq-badges: true;
     in-out property <bool> hide-pitch-dict-name: false;
 
-    // Custom Popup Outer CSS properties (~/.config/memento/popup-outer.css)
-    in-out property <color> css-popup-bg: MementoPalette.is-light ? #FFFFFF : #1C2024;
-    in-out property <color> css-popup-border: MementoPalette.is-light ? #CBD5E1 : #384046;
+    // Custom Popup Outer CSS properties (~/.config/subomi/popup-outer.css)
+    in-out property <color> css-popup-bg: SubomiPalette.is-light ? #FFFFFF : #1C2024;
+    in-out property <color> css-popup-border: SubomiPalette.is-light ? #CBD5E1 : #384046;
     in-out property <length> css-popup-border-width: 1px;
     in-out property <length> css-popup-radius: 8px;
     in-out property <length> css-popup-padding: 12px;
     in-out property <length> css-popup-shadow-blur: 24px;
-    in-out property <color> css-popup-shadow-color: MementoPalette.is-light ? #0F172A33 : #000000DD;
+    in-out property <color> css-popup-shadow-color: SubomiPalette.is-light ? #0F172A33 : #000000DD;
     in-out property <length> css-popup-width: 0px;
     in-out property <length> css-popup-height: 0px;
 
-    // Custom Popup Inner CSS properties (~/.config/memento/popup.css)
-    in-out property <color> css-text-color: MementoPalette.is-light ? #0F172A : #F8FAFC;
-    in-out property <color> css-muted-color: MementoPalette.is-light ? #64748B : #94A3B8;
-    in-out property <color> css-headword-color: MementoPalette.is-light ? #0F172A : #FFFFFF;
+    // Custom Popup Inner CSS properties (~/.config/subomi/popup.css)
+    in-out property <color> css-text-color: SubomiPalette.is-light ? #0F172A : #F8FAFC;
+    in-out property <color> css-muted-color: SubomiPalette.is-light ? #64748B : #94A3B8;
+    in-out property <color> css-headword-color: SubomiPalette.is-light ? #0F172A : #FFFFFF;
     in-out property <length> css-headword-size: 23px;
-    in-out property <color> css-reading-color: MementoPalette.is-light ? #475569 : #94A3B8;
+    in-out property <color> css-reading-color: SubomiPalette.is-light ? #475569 : #94A3B8;
     in-out property <length> css-reading-size: 12px;
     in-out property <string> css-font-family: "Noto Sans CJK JP";
     in-out property <string> css-headword-font-family: "Noto Sans CJK JP";
@@ -191,19 +191,19 @@ export global PopupBridge {
     in-out property <string> css-kanji-font-family: "Noto Sans CJK JP";
     in-out property <length> css-kanji-font-size: 0px;
     in-out property <length> css-glossary-font-size: 14.5px;
-    in-out property <color> css-link-color: MementoPalette.is-light ? #0284C7 : #93C5FD;
-    in-out property <color> css-divider-color: MementoPalette.is-light ? #E2E8F0 : #30373D;
-    in-out property <color> css-term-divider-color: MementoPalette.is-light ? #CBD5E1 : #52616B;
-    in-out property <color> css-freq-bg: MementoPalette.is-light ? #DCFCE7 : #07513E;
-    in-out property <color> css-freq-color: MementoPalette.is-light ? #065F46 : #9CE5C7;
+    in-out property <color> css-link-color: SubomiPalette.is-light ? #0284C7 : #93C5FD;
+    in-out property <color> css-divider-color: SubomiPalette.is-light ? #E2E8F0 : #30373D;
+    in-out property <color> css-term-divider-color: SubomiPalette.is-light ? #CBD5E1 : #52616B;
+    in-out property <color> css-freq-bg: SubomiPalette.is-light ? #DCFCE7 : #07513E;
+    in-out property <color> css-freq-color: SubomiPalette.is-light ? #065F46 : #9CE5C7;
     in-out property <length> css-freq-font-size: 10px;
-    in-out property <color> css-pitch-color: MementoPalette.is-light ? #6D28D9 : #B9A1E8;
-    in-out property <color> css-pitch-dict-bg: MementoPalette.is-light ? #6D28D9 : #6640BE;
+    in-out property <color> css-pitch-color: SubomiPalette.is-light ? #6D28D9 : #B9A1E8;
+    in-out property <color> css-pitch-dict-bg: SubomiPalette.is-light ? #6D28D9 : #6640BE;
     in-out property <color> css-dict-badge-bg: #6D28D9;
-    in-out property <color> css-dict-badge-color: MementoPalette.is-light ? #FFFFFF : #EDE9FE;
-    in-out property <color> css-anki-tag-bg: MementoPalette.is-light ? #E0F2FE : #162B3D;
-    in-out property <color> css-anki-tag-border: MementoPalette.is-light ? #0284C766 : #38BDF888;
-    in-out property <color> css-anki-tag-color: MementoPalette.is-light ? #0369A1 : #BAE6FD;
+    in-out property <color> css-dict-badge-color: SubomiPalette.is-light ? #FFFFFF : #EDE9FE;
+    in-out property <color> css-anki-tag-bg: SubomiPalette.is-light ? #E0F2FE : #162B3D;
+    in-out property <color> css-anki-tag-border: SubomiPalette.is-light ? #0284C766 : #38BDF888;
+    in-out property <color> css-anki-tag-color: SubomiPalette.is-light ? #0369A1 : #BAE6FD;
     in-out property <int> css-definition-columns: 1;
     in-out property <length> css-definition-columns-min-width: 560px;
     in-out property <length> css-definition-gap: 8px;
@@ -226,7 +226,7 @@ export global PopupBridge {
     in-out property <float> tooltip-y: 0.0;
     in-out property <bool> tooltip-is-ruby: false;
     in-out property <int> tooltip-hover-delay-ms: 500;
-    // Deferred hover tooltip queue (driven by single top-level Timer in MementoApp)
+    // Deferred hover tooltip queue (driven by single top-level Timer in SubomiApp)
     in-out property <string> pending-tooltip-text: "";
     in-out property <float> pending-tooltip-x: 0.0;
     in-out property <float> pending-tooltip-y: 0.0;

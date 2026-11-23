@@ -1,0 +1,19 @@
+[package]
+name = "subomi-util"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Japanese furigana, MeCab integration, pitch SVG, OCR mapping, and file utilities"
+license = "GPL-2.0-only"
+
+[dependencies]
+unicode-segmentation = "=1.13.3"
+unicode-normalization = "=0.1.25"
+md-5 = "=0.10.6"
+base64 = "=0.22.1"
+libloading = "=0.8.9"
+
+[lib]
+name = "subomi_util"
+path = "src/lib.rs"
+crate-type = ["lib"]

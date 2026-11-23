@@ -3,15 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use memento_dict::deconjugationquerygenerator;
-use memento_dict::exactquerygenerator;
-use memento_dict::mecabquerygenerator;
-use memento_dict::normalize;
-use memento_dict::searchcontroller::{
+use subomi_dict::deconjugationquerygenerator;
+use subomi_dict::exactquerygenerator;
+use subomi_dict::mecabquerygenerator;
+use subomi_dict::normalize;
+use subomi_dict::searchcontroller::{
     self, CandidateSearchQuery, QuerySource, TagSortItem, TextReplacementOptions,
 };
-use memento_dict::sqlite_db;
-use memento_util::mecab::MecabLookupToken;
+use subomi_dict::sqlite_db;
+use subomi_util::mecab::MecabLookupToken;
 
 use super::db::{DictionaryMetadataSnapshot, ReadOnlyDictionaryDb};
 use super::glossary::{
@@ -33,17 +33,15 @@ pub fn normalize_nfkc_query(text: &str) -> String {
     normalize::normalize_nfkc(text)
 }
 
-/// Generates prefix queries from text using `memento_dict::exactquerygenerator::generate_queries`.
+/// Generates prefix queries from text using `subomi_dict::exactquerygenerator::generate_queries`.
 pub fn generate_prefix_queries(text: &str) -> Vec<String> {
-    let u16_text: Vec<u16> = text.encode_utf16().collect();
-    let queries = exactquerygenerator::generate_queries(&u16_text);
-    queries
+    exactquerygenerator::generate_queries(text)
         .into_iter()
-        .map(|q| String::from_utf16_lossy(&q.deconj))
+        .map(|q| q.deconj)
         .collect()
 }
 
-/// Formats tags by sorting them with `memento_dict::searchcontroller::sort_tags`
+/// Formats tags by sorting them with `subomi_dict::searchcontroller::sort_tags`
 /// and joining their names with comma separation.
 pub fn format_tags(tags: &[DictTag]) -> String {
     if tags.is_empty() {
@@ -95,51 +93,44 @@ pub fn format_tags_with_notes(tags: &[DictTag]) -> String {
         .join("; ")
 }
 
-/// Slices a sentence into cloze spans matching `memento_dict::searchcontroller::cloze_spans`.
+/// Slices a sentence into cloze spans by character index via `subomi_dict::searchcontroller::cloze_spans`.
 pub fn format_cloze_spans(sentence: &str, index: i64, surface_len: u64) -> ClozeSentence {
-    let u16_sentence: Vec<u16> = sentence.encode_utf16().collect();
-    let text_len = u16_sentence.len() as u64;
+    let char_offsets: Vec<usize> = sentence
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(sentence.len()))
+        .collect();
+    let text_len = (char_offsets.len() - 1) as u64;
     let spans = searchcontroller::cloze_spans(text_len, index, surface_len);
 
-    let p_start = spans.prefix_start as usize;
-    let p_end = (spans.prefix_start + spans.prefix_len) as usize;
-    let b_start = spans.body_start as usize;
-    let b_end = (spans.body_start + spans.body_len) as usize;
-    let s_start = spans.suffix_start as usize;
-    let s_end = (spans.suffix_start + spans.suffix_len) as usize;
+    let slice = |start: u64, len: u64| -> String {
+        let s = start as usize;
+        let e = s.saturating_add(len as usize);
+        match (char_offsets.get(s), char_offsets.get(e)) {
+            (Some(&b0), Some(&b1)) => sentence[b0..b1].to_owned(),
+            _ => String::new(),
+        }
+    };
 
-    let prefix = u16_sentence
-        .get(p_start..p_end)
-        .map(String::from_utf16_lossy)
-        .unwrap_or_default();
-    let body = u16_sentence
-        .get(b_start..b_end)
-        .map(String::from_utf16_lossy)
-        .unwrap_or_default();
-    let suffix = u16_sentence
-        .get(s_start..s_end)
-        .map(String::from_utf16_lossy)
-        .unwrap_or_default();
-
-    ClozeSentence::new(prefix, body, suffix)
+    ClozeSentence::new(
+        slice(spans.prefix_start, spans.prefix_len),
+        slice(spans.body_start, spans.body_len),
+        slice(spans.suffix_start, spans.suffix_len),
+    )
 }
 
 /// Formats a cloze sentence for a selected term in a sentence.
 pub fn format_cloze_for_term(sentence: &str, term: &str) -> Option<ClozeSentence> {
-    let u16_sentence: Vec<u16> = sentence.encode_utf16().collect();
-    let u16_term: Vec<u16> = term.encode_utf16().collect();
-    if u16_term.is_empty() {
+    if term.is_empty() {
         return None;
     }
-
-    let pos = u16_sentence
-        .windows(u16_term.len())
-        .position(|w| w == u16_term.as_slice())?;
-
+    let byte_pos = sentence.find(term)?;
+    let char_pos = sentence[..byte_pos].chars().count();
+    let term_chars = term.chars().count();
     Some(format_cloze_spans(
         sentence,
-        pos as i64,
-        u16_term.len() as u64,
+        char_pos as i64,
+        term_chars as u64,
     ))
 }
 
@@ -152,7 +143,7 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
     }
     let trimmed = query.trim();
     let norm_query = normalize_reading(trimmed);
-    let u16_query: Vec<u16> = trimmed.encode_utf16().collect();
+    let query_chars = trimmed.chars().count();
 
     let mut group_scores: HashMap<(&str, &str, bool), i64> = HashMap::with_capacity(hits.len());
     for h in hits.iter() {
@@ -171,20 +162,16 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
                 || normalized_expression == norm_query
                 || (!norm_reading.is_empty() && norm_reading == norm_query);
 
-            let u16_expr: Vec<u16> = h.expression.encode_utf16().collect();
-            let (prefix_len, expr_equals_cloze) = if u16_query.starts_with(&u16_expr) {
-                (u16_expr.len(), true)
-            } else if u16_expr.starts_with(&u16_query) {
-                (u16_query.len(), h.expression == trimmed)
+            let (prefix_len, expr_equals_cloze) = if trimmed.starts_with(&h.expression) {
+                (h.expression.chars().count(), true)
+            } else if h.expression.starts_with(trimmed) {
+                (query_chars, h.expression == trimmed)
+            } else if trimmed.starts_with(&h.reading) {
+                (h.reading.chars().count(), false)
+            } else if h.reading.starts_with(trimmed) {
+                (query_chars, false)
             } else {
-                let u16_read: Vec<u16> = h.reading.encode_utf16().collect();
-                if u16_query.starts_with(&u16_read) {
-                    (u16_read.len(), false)
-                } else if u16_read.starts_with(&u16_query) {
-                    (u16_query.len(), false)
-                } else {
-                    (0, h.expression == trimmed)
-                }
+                (0, h.expression == trimmed)
             };
 
             let group_score = group_scores
@@ -231,11 +218,10 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
     }
 }
 
-/// One candidate lookup key together with its matched UTF-16 surface length,
+/// One candidate lookup key together with its matched surface length,
 /// required Yomitan `rule_mask` (`0` for exact uninflected queries), and derivation chain.
 pub(super) struct LookupQuery {
     pub key: String,
-    pub deconj_u16: Vec<u16>,
     pub surface_len: usize,
     pub rule_mask: u8,
     pub source: QuerySource,
@@ -372,14 +358,8 @@ pub(super) fn build_lookup_queries_with_replacements(
 
                 if exact_enabled {
                     for variant in normalize::expand_query_variants(prefix) {
-                        let deconj_u16 = if mecab_enabled {
-                            variant.encode_utf16().collect()
-                        } else {
-                            Vec::new()
-                        };
                         raw_lookups.push(LookupQuery {
                             key: variant,
-                            deconj_u16,
                             surface_len: orig_u16_len,
                             rule_mask: 0,
                             source: QuerySource::Exact,
@@ -395,14 +375,8 @@ pub(super) fn build_lookup_queries_with_replacements(
                         let no_ws: String =
                             prefix.chars().filter(|&c| !is_ascii_regex_ws(c)).collect();
                         for variant in normalize::expand_query_variants(&no_ws) {
-                            let deconj_u16 = if mecab_enabled {
-                                variant.encode_utf16().collect()
-                            } else {
-                                Vec::new()
-                            };
                             raw_lookups.push(LookupQuery {
                                 key: variant,
-                                deconj_u16,
                                 surface_len: orig_u16_len,
                                 rule_mask: 0,
                                 source: QuerySource::Exact,
@@ -471,18 +445,10 @@ pub(super) fn build_lookup_queries_with_replacements(
                     }
 
                     for deconj_input in deconj_inputs {
-                        let input_u16: Vec<u16> = deconj_input.encode_utf16().collect();
-                        for dq in deconjugationquerygenerator::generate_queries_single(&input_u16) {
-                            let base = String::from_utf16_lossy(&dq.deconj);
-                            for base_variant in normalize::expand_query_variants(&base) {
-                                let deconj_u16 = if mecab_enabled {
-                                    base_variant.encode_utf16().collect()
-                                } else {
-                                    Vec::new()
-                                };
+                        for dq in deconjugationquerygenerator::generate_queries_single(&deconj_input) {
+                            for base_variant in normalize::expand_query_variants(&dq.deconj) {
                                 raw_lookups.push(LookupQuery {
                                     key: base_variant,
-                                    deconj_u16,
                                     surface_len: orig_u16_len,
                                     rule_mask: dq.rule_mask,
                                     source: QuerySource::Deconj,
@@ -527,7 +493,6 @@ pub(super) fn build_lookup_queries_with_replacements(
                             cand.surface_u16_len.min(full_orig_u16_len)
                         };
                         for variant in normalize::expand_query_variants(&cand.deconj) {
-                            let deconj_u16: Vec<u16> = variant.encode_utf16().collect();
                             let covered_by_deconj = raw_lookups.iter().any(|d| {
                                 d.source == QuerySource::Deconj
                                     && d.key == variant
@@ -537,7 +502,6 @@ pub(super) fn build_lookup_queries_with_replacements(
                             });
                             let lq = LookupQuery {
                                 key: variant.clone(),
-                                deconj_u16: deconj_u16.clone(),
                                 surface_len: surface_u16,
                                 rule_mask: cand.rule_mask,
                                 source: QuerySource::Mecab,
@@ -552,7 +516,6 @@ pub(super) fn build_lookup_queries_with_replacements(
                             {
                                 distinct_mecab_fallbacks.push(LookupQuery {
                                     key: variant,
-                                    deconj_u16,
                                     surface_len: surface_u16,
                                     rule_mask: cand.rule_mask,
                                     source: QuerySource::Mecab,
@@ -575,7 +538,7 @@ pub(super) fn build_lookup_queries_with_replacements(
                 .enumerate()
                 .map(|(idx, lq)| CandidateSearchQuery {
                     original_index: idx,
-                    deconj: lq.deconj_u16.as_slice(),
+                    deconj: lq.key.as_str(),
                     surface_len: lq.surface_len as u64,
                     rule_mask: lq.rule_mask,
                     source: lq.source,
@@ -657,7 +620,7 @@ pub(super) fn wildcard_pattern_matches(pattern: &str, candidate: &str) -> bool {
 }
 
 /// Executes a bounded wildcard SQLite query (`*`/`?`/`＊`/`？`) via Wave 1's
-/// `memento_dict::sqlite_db::search_terms_wildcard`.
+/// `subomi_dict::sqlite_db::search_terms_wildcard`.
 pub(super) fn database_wildcard_candidates(
     database: &ReadOnlyDictionaryDb,
     snapshot: &DictionaryMetadataSnapshot,

@@ -10,7 +10,7 @@ use crate::controller::dict::{PitchPosition, SearchHit, TermFrequency, TermPitch
 use super::bridge::RichUiBridge;
 use super::tags::compact_tag_names_across_senses;
 use super::{
-    DictResult, MementoApp, PitchGraph, PitchMora, PopupBridge, PopupFrequency, PopupFrequencyLine,
+    DictResult, SubomiApp, PitchGraph, PitchMora, PopupBridge, PopupFrequency, PopupFrequencyLine,
     PopupGlossaryBlock, PopupLayout, RichPitchGraph, RichPitchMora,
 };
 
@@ -97,7 +97,7 @@ pub(super) fn register_active_rich_bridge(bridge: Rc<RichUiBridge>) {
     });
 }
 
-pub(super) fn active_rich_bridges_for_app(app: &MementoApp) -> Vec<Rc<RichUiBridge>> {
+pub(super) fn active_rich_bridges_for_app(app: &SubomiApp) -> Vec<Rc<RichUiBridge>> {
     let app_bridge_id = app.global::<PopupBridge>().get_bridge_instance_id();
     if app_bridge_id <= 0 {
         return Vec::new();
@@ -123,7 +123,7 @@ pub(super) fn active_rich_bridges_for_app(app: &MementoApp) -> Vec<Rc<RichUiBrid
     })
 }
 
-pub(super) fn active_rich_bridge_for_app(app: &MementoApp) -> Option<Rc<RichUiBridge>> {
+pub(super) fn active_rich_bridge_for_app(app: &SubomiApp) -> Option<Rc<RichUiBridge>> {
     let app_bridge_id = app.global::<PopupBridge>().get_bridge_instance_id();
     if app_bridge_id <= 0 {
         return None;
@@ -152,7 +152,7 @@ pub(super) fn latest_active_rich_bridge() -> Option<Rc<RichUiBridge>> {
 /// covering Extension H `U+31350..=U+323AF` and Extension J `U+323B0..=U+3347F`,
 /// Yomitan PR #2504).
 pub fn is_kanji_char(character: char) -> bool {
-    memento_dict::normalize::is_cjk_ideograph(character)
+    subomi_dict::normalize::is_cjk_ideograph(character)
 }
 
 #[allow(dead_code)]
@@ -161,7 +161,7 @@ fn is_headword_kanji_char(character: char) -> bool {
 }
 
 /// Formats a plain multi-line glossary string into compact inline ` | `-separated text
-/// (H5.3 / Memento `#220`).
+/// (H5.3 / Subomi `#220`).
 pub fn compact_glossary_inline_text(glossary: &str) -> String {
     let parts: Vec<&str> = glossary
         .lines()
@@ -377,7 +377,7 @@ pub(super) fn popup_rows_through(
         .collect()
 }
 
-pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
+pub fn set_dictionary_rows(app: &SubomiApp, rows: Vec<DictResult>) {
     let full = Rc::new(VecModel::from(rows.clone()));
     app.set_dict_results(full.into());
     let full = app.get_dict_results();
@@ -418,7 +418,7 @@ pub fn set_dictionary_rows(app: &MementoApp, rows: Vec<DictResult>) {
     }
 }
 
-fn refresh_popup_rows(app: &MementoApp) {
+fn refresh_popup_rows(app: &SubomiApp) {
     let full = app.get_dict_results();
     let visible = popup_rows_through(&full, app.get_popup_loaded_count().max(0) as usize);
     let popup = app.get_popup_results();
@@ -531,12 +531,12 @@ pub fn pitch_graph_svg_for_detail(
         return None;
     }
     let spec = if let Some(ref pat) = detail.pattern {
-        memento_anki::note::PitchSpec::Pattern(pat.as_str())
+        subomi_anki::note::PitchSpec::Pattern(pat.as_str())
     } else {
         let pos = u8::try_from(detail.position).ok()?;
-        memento_anki::note::PitchSpec::Downstep(pos)
+        subomi_anki::note::PitchSpec::Downstep(pos)
     };
-    memento_anki::note::generate_pitch_graph_svg(detail.mora.len(), spec, fill, stroke)
+    subomi_anki::note::generate_pitch_graph_svg(detail.mora.len(), spec, fill, stroke)
 }
 
 /// Formats a single `TermPitchDetail` into compact inline notation (e.g. `たべ↓る [2]` or
@@ -603,8 +603,8 @@ pub fn popup_pitch_pattern_data(detail: &TermPitchDetail) -> PopupPitchPatternDa
     let badge_text = popup_pitch_badge_text(detail.position, detail.pattern.as_deref());
     let svg = pitch_graph_svg_for_detail(
         detail,
-        memento_anki::note::DEFAULT_PITCH_GRAPH_FILL,
-        memento_anki::note::DEFAULT_PITCH_GRAPH_STROKE,
+        subomi_anki::note::DEFAULT_PITCH_GRAPH_FILL,
+        subomi_anki::note::DEFAULT_PITCH_GRAPH_STROKE,
     );
     let compact_notation = format_single_compact_pitch(detail);
     PopupPitchPatternData {
@@ -620,7 +620,7 @@ pub fn popup_pitch_pattern_data(detail: &TermPitchDetail) -> PopupPitchPatternDa
     }
 }
 
-/// Compact per-dictionary pitch group joining multiple accents with ` | ` (H5.3 / Memento `#220`).
+/// Compact per-dictionary pitch group joining multiple accents with ` | ` (H5.3 / Subomi `#220`).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactPitchGroup {
@@ -921,7 +921,7 @@ fn peel_headword_kana_affixes(
     let read_chars: Vec<char> = reading.chars().collect();
     let fold = |c: char| -> char {
         let s = c.to_string();
-        memento_dict::normalize::normalize_reading_str(&s)
+        subomi_dict::normalize::normalize_reading_str(&s)
             .chars()
             .next()
             .unwrap_or(c)
@@ -1018,8 +1018,8 @@ pub fn align_headword_furigana(expression: &str, reading: &str) -> HeadwordFurig
         };
     }
 
-    let norm_expr = memento_dict::normalize::normalize_reading_str(expression);
-    let norm_read = memento_dict::normalize::normalize_reading_str(reading_trimmed);
+    let norm_expr = subomi_dict::normalize::normalize_reading_str(expression);
+    let norm_read = subomi_dict::normalize::normalize_reading_str(reading_trimmed);
     if norm_expr == norm_read {
         return HeadwordFurigana {
             segments: vec![HeadwordFuriganaSegment {
@@ -1056,12 +1056,12 @@ pub fn align_headword_furigana(expression: &str, reading: &str) -> HeadwordFurig
         };
     }
 
-    let spans = memento_util::furiganautils::simplify_surface_str(expression, reading_trimmed);
+    let spans = subomi_util::furiganautils::simplify_surface_str(expression, reading_trimmed);
     let fell_back_whole = spans.len() == 1
         && spans[0].surface_start == 0
-        && spans[0].surface_end == expression.len() as u64
+        && spans[0].surface_end == expression.len()
         && spans[0].reading_start == 0
-        && spans[0].reading_end == reading_trimmed.len() as u64;
+        && spans[0].reading_end == reading_trimmed.len();
 
     if fell_back_whole {
         if let Some((segments, aligned)) = peel_headword_kana_affixes(expression, reading_trimmed) {
@@ -1085,19 +1085,19 @@ pub fn align_headword_furigana(expression: &str, reading: &str) -> HeadwordFurig
 
     let mut segments = Vec::with_capacity(spans.len());
     for span in spans {
-        let s_start = span.surface_start as usize;
-        let s_end = span.surface_end as usize;
-        let surf = expression.get(s_start..s_end).unwrap_or_default();
+        let surf = expression
+            .get(span.surface_start..span.surface_end)
+            .unwrap_or_default();
         if surf.is_empty() {
             continue;
         }
         let seg_reading =
             if span.reading_start < span.reading_end && surf.chars().any(is_headword_kanji_char) {
-                let r_start = span.reading_start as usize;
-                let r_end = span.reading_end as usize;
-                let r = reading_trimmed.get(r_start..r_end).unwrap_or_default();
-                if memento_dict::normalize::normalize_reading_str(surf)
-                    == memento_dict::normalize::normalize_reading_str(r)
+                let r = reading_trimmed
+                    .get(span.reading_start..span.reading_end)
+                    .unwrap_or_default();
+                if subomi_dict::normalize::normalize_reading_str(surf)
+                    == subomi_dict::normalize::normalize_reading_str(r)
                 {
                     String::new()
                 } else {
@@ -1133,7 +1133,7 @@ pub fn split_anki_tags_str(raw: &str) -> Vec<SharedString> {
 }
 
 /// Shared popup actions used by the desktop window and the GL interaction test.
-pub fn install_popup_navigation(app: &MementoApp) {
+pub fn install_popup_navigation(app: &SubomiApp) {
     app.global::<PopupBridge>()
         .on_split_anki_tags(|raw| Rc::new(VecModel::from(split_anki_tags_str(raw.as_str()))).into());
     app.global::<PopupLayout>()

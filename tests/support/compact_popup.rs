@@ -1,4 +1,4 @@
-use memento_app::{
+use subomi_app::{
     controller::dict::TermPitchGraph, popup_pitch_graphs, DictResult, PopupFrequency,
     PopupGlossaryBlock,
 };

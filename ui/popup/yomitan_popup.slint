@@ -1,5 +1,5 @@
 import { ScrollView } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import {
     DictResult,
     PopupAudioSource,
@@ -139,7 +139,7 @@ export component NestedYomitanPopup inherits Rectangle {
     height: self.card-h;
     background: PopupBridge.css-popup-bg;
     border-width: max(1.5px, PopupBridge.css-popup-border-width);
-    border-color: PopupBridge.nested-locked ? MementoPalette.cyan-accent : MementoPalette.text-muted;
+    border-color: PopupBridge.nested-locked ? SubomiPalette.cyan-accent : SubomiPalette.text-muted;
     border-radius: PopupBridge.css-popup-radius;
     drop-shadow-blur: max(18px, PopupBridge.css-popup-shadow-blur);
     drop-shadow-color: PopupBridge.css-popup-shadow-color;
@@ -200,10 +200,10 @@ export component NestedYomitanPopup inherits Rectangle {
                     height: 24px;
                     border-radius: 5px;
                     border-width: 1px;
-                    border-color: nested-back-touch.has-hover ? MementoPalette.border-light : MementoPalette.border;
+                    border-color: nested-back-touch.has-hover ? SubomiPalette.border-light : SubomiPalette.border;
                     background: nested-back-touch.pressed
-                        ? MementoPalette.button-pressed
-                        : (nested-back-touch.has-hover ? MementoPalette.button-hover : MementoPalette.button-bg);
+                        ? SubomiPalette.button-pressed
+                        : (nested-back-touch.has-hover ? SubomiPalette.button-hover : SubomiPalette.button-bg);
                     animate background { duration: 100ms; }
                     animate border-color { duration: 100ms; }
 
@@ -219,7 +219,7 @@ export component NestedYomitanPopup inherits Rectangle {
                                 width: 13px;
                                 height: 13px;
                                 source: @image-url("../icons/arrow-back.svg");
-                                colorize: MementoPalette.icon;
+                                colorize: SubomiPalette.icon;
                             }
                         }
 
@@ -227,7 +227,7 @@ export component NestedYomitanPopup inherits Rectangle {
                             text: "Back";
                             font-size: 11px;
                             font-weight: 700;
-                            color: MementoPalette.text;
+                            color: SubomiPalette.text;
                             vertical-alignment: center;
                         }
                     }
@@ -257,16 +257,16 @@ export component NestedYomitanPopup inherits Rectangle {
                     width: depth-badge-lbl.preferred-width + 10px;
                     height: 20px;
                     border-radius: 4px;
-                    background: PopupBridge.nested-locked ? MementoPalette.accent-muted : MementoPalette.card-bg;
+                    background: PopupBridge.nested-locked ? SubomiPalette.accent-muted : SubomiPalette.card-bg;
                     border-width: 1px;
-                    border-color: PopupBridge.nested-locked ? MementoPalette.cyan-accent : MementoPalette.border-light;
+                    border-color: PopupBridge.nested-locked ? SubomiPalette.cyan-accent : SubomiPalette.border-light;
                     depth-badge-lbl := DictionaryText {
                         x: 5px;
                         height: parent.height;
                         text: PopupBridge.nested-depth + "/" + PopupBridge.nested-max-depth;
                         font-size: 10px;
                         font-weight: 700;
-                        color: PopupBridge.nested-locked ? MementoPalette.cyan-text : MementoPalette.text-secondary;
+                        color: PopupBridge.nested-locked ? SubomiPalette.cyan-text : SubomiPalette.text-secondary;
                         vertical-alignment: center;
                     }
                 }
@@ -289,13 +289,13 @@ export component NestedYomitanPopup inherits Rectangle {
                     has-icon: true;
                     icon: @image-url("../icons/close.svg");
                     icon-size: 13px;
-                    bg-normal: MementoPalette.button-bg;
-                    bg-hover: MementoPalette.danger-bg;
-                    bg-pressed: MementoPalette.danger-pressed;
-                    border-normal: MementoPalette.border;
-                    border-hover: MementoPalette.danger;
-                    fg-color: MementoPalette.icon-muted;
-                    fg-hover-color: MementoPalette.danger-text;
+                    bg-normal: SubomiPalette.button-bg;
+                    bg-hover: SubomiPalette.danger-bg;
+                    bg-pressed: SubomiPalette.danger-pressed;
+                    border-normal: SubomiPalette.border;
+                    border-hover: SubomiPalette.danger;
+                    fg-color: SubomiPalette.icon-muted;
+                    fg-hover-color: SubomiPalette.danger-text;
                     tooltip: "Close all nested popups";
                     clicked => { PopupBridge.dismiss-all-nested-popups(); }
                     request-tooltip(tip) => {
@@ -518,13 +518,13 @@ export component NestedYomitanPopup inherits Rectangle {
                                             btn-height: root.action-btn-size;
                                             label: "↻";
                                             label-font-size: 15px;
-                                            bg-normal: MementoPalette.warning-bg;
-                                            bg-hover: MementoPalette.warning-hover;
-                                            bg-pressed: MementoPalette.warning-bg;
-                                            border-normal: MementoPalette.warning-border;
-                                            border-hover: MementoPalette.warning;
-                                            fg-color: MementoPalette.warning-text;
-                                            fg-hover-color: MementoPalette.warning-text-hover;
+                                            bg-normal: SubomiPalette.warning-bg;
+                                            bg-hover: SubomiPalette.warning-hover;
+                                            bg-pressed: SubomiPalette.warning-bg;
+                                            border-normal: SubomiPalette.warning-border;
+                                            border-hover: SubomiPalette.warning;
+                                            fg-color: SubomiPalette.warning-text;
+                                            fg-hover-color: SubomiPalette.warning-text-hover;
                                             tooltip: "Update existing Anki note";
                                             clicked => {
                                                 PopupBridge.lock-nested-popup();
@@ -911,13 +911,13 @@ export component YomitanPopup inherits Rectangle {
                     border-width: 1px;
                     opacity: PopupBridge.can-go-forward ? 1.0 : 0.45;
                     border-color: PopupBridge.can-go-forward && nav-fwd-touch.has-hover
-                        ? MementoPalette.border-light
-                        : MementoPalette.border;
+                        ? SubomiPalette.border-light
+                        : SubomiPalette.border;
                     background: !PopupBridge.can-go-forward
-                        ? MementoPalette.button-bg
+                        ? SubomiPalette.button-bg
                         : (nav-fwd-touch.pressed
-                            ? MementoPalette.button-pressed
-                            : (nav-fwd-touch.has-hover ? MementoPalette.button-hover : MementoPalette.button-bg));
+                            ? SubomiPalette.button-pressed
+                            : (nav-fwd-touch.has-hover ? SubomiPalette.button-hover : SubomiPalette.button-bg));
                     animate background { duration: 100ms; }
                     animate border-color { duration: 100ms; }
 
@@ -930,7 +930,7 @@ export component YomitanPopup inherits Rectangle {
                         viewbox-y: 0;
                         viewbox-width: 14;
                         viewbox-height: 14;
-                        stroke: PopupBridge.can-go-forward ? MementoPalette.icon : MementoPalette.text-muted;
+                        stroke: PopupBridge.can-go-forward ? SubomiPalette.icon : SubomiPalette.text-muted;
                         stroke-width: 1.7px;
                         stroke-line-cap: round;
                         stroke-line-join: round;
@@ -964,7 +964,7 @@ export component YomitanPopup inherits Rectangle {
             DictionaryText {
                 text: PopupBridge.nav-breadcrumb;
                 font-size: 11px;
-                color: MementoPalette.text-secondary;
+                color: SubomiPalette.text-secondary;
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
@@ -1178,16 +1178,16 @@ export component YomitanPopup inherits Rectangle {
                                             height: 28px;
                                             border-radius: 5px;
                                             border-width: 1px;
-                                            border-color: update-anki-touch.has-hover ? MementoPalette.warning : MementoPalette.warning-border;
+                                            border-color: update-anki-touch.has-hover ? SubomiPalette.warning : SubomiPalette.warning-border;
                                             background: update-anki-touch.pressed
-                                                ? MementoPalette.warning-bg
-                                                : (update-anki-touch.has-hover ? MementoPalette.warning-hover : MementoPalette.warning-bg);
+                                                ? SubomiPalette.warning-bg
+                                                : (update-anki-touch.has-hover ? SubomiPalette.warning-hover : SubomiPalette.warning-bg);
                                             animate background { duration: 100ms; }
                                             animate border-color { duration: 100ms; }
 
                                             DictionaryText {
                                                 text: "↻";
-                                                color: update-anki-touch.has-hover ? MementoPalette.warning-text-hover : MementoPalette.warning-text;
+                                                color: update-anki-touch.has-hover ? SubomiPalette.warning-text-hover : SubomiPalette.warning-text;
                                                 font-size: 15px;
                                                 font-weight: 700;
                                                 horizontal-alignment: center;
@@ -1251,10 +1251,10 @@ export component YomitanPopup inherits Rectangle {
                                             height: 28px;
                                             border-radius: 5px;
                                             border-width: 1px;
-                                            border-color: collapse-touch.has-hover ? MementoPalette.border-light : MementoPalette.border;
+                                            border-color: collapse-touch.has-hover ? SubomiPalette.border-light : SubomiPalette.border;
                                             background: collapse-touch.pressed
-                                                ? MementoPalette.button-pressed
-                                                : (collapse-touch.has-hover ? MementoPalette.button-hover : MementoPalette.button-bg);
+                                                ? SubomiPalette.button-pressed
+                                                : (collapse-touch.has-hover ? SubomiPalette.button-hover : SubomiPalette.button-bg);
                                             animate background { duration: 100ms; }
                                             animate border-color { duration: 100ms; }
 
@@ -1266,7 +1266,7 @@ export component YomitanPopup inherits Rectangle {
                                                 source: res.collapsed
                                                     ? @image-url("../icons/arrow-drop-down.svg")
                                                     : @image-url("../icons/arrow-drop-up.svg");
-                                                colorize: collapse-touch.has-hover ? MementoPalette.text : MementoPalette.icon;
+                                                colorize: collapse-touch.has-hover ? SubomiPalette.text : SubomiPalette.icon;
                                             }
 
                                             collapse-touch := TouchArea {

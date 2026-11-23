@@ -1,13 +1,13 @@
 //! Interaction stress driver using the application's models and popup actions.
-use memento_app::{
+use subomi_app::{
     controller::{
         dict::{DictController, SearchHit, TermFrequency, TermPitchGraph},
         subtitles::subtitle_furigana_parts,
     },
     dictionary_result_rows, install_popup_navigation, popup_pitch_graphs, set_dictionary_rows,
-    subtitle_lines_for_app, subtitle_words, subtitle_words_from_parts, MementoApp, PopupFrequency,
+    subtitle_lines_for_app, subtitle_words, subtitle_words_from_parts, SubomiApp, PopupFrequency,
 };
-use memento_player::mpv::MpvInstance;
+use subomi_player::mpv::MpvInstance;
 use slint::{ComponentHandle, Model, VecModel};
 use std::{
     cell::Cell,
@@ -46,13 +46,13 @@ pub struct PlaybackActions {
 }
 
 impl PlaybackActions {
-    pub fn new(app: &MementoApp) -> Self {
+    pub fn new(app: &SubomiApp) -> Self {
         install_popup_navigation(app);
         let (results_tx, results) = mpsc::channel();
         let (search_tx, search_rx) = mpsc::channel::<String>();
         let search_results = results_tx.clone();
-        let path = std::env::var_os("MEMENTO_VIDEO_TEST_DICTIONARY")
-            .expect("interaction test requires MEMENTO_VIDEO_TEST_DICTIONARY");
+        let path = std::env::var_os("SUBOMI_VIDEO_TEST_DICTIONARY")
+            .expect("interaction test requires SUBOMI_VIDEO_TEST_DICTIONARY");
         thread::spawn(move || {
             let mut dictionary = DictController::open(path).expect("read-only dictionary database");
             for term in search_rx {
@@ -131,7 +131,7 @@ impl PlaybackActions {
         }
     }
 
-    pub fn subtitle_changed(&self, app: &MementoApp) {
+    pub fn subtitle_changed(&self, app: &SubomiApp) {
         if app.get_furigana_visible() {
             self.ruby_requests
                 .send(app.get_active_sub_text().to_string())
@@ -141,7 +141,7 @@ impl PlaybackActions {
 
     pub fn tick(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         player: &MpvInstance,
         elapsed: Duration,
     ) -> Vec<String> {

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use memento_net::anki::MediaFilePayload;
+use subomi_net::anki::MediaFilePayload;
 
 use super::cloze::{format_expression_furigana, split_cloze};
 
@@ -26,7 +26,7 @@ pub struct GlossaryDefinition {
     pub notes: String,
     pub example_ja: String,
     pub example_en: String,
-    /// Pre-rendered HTML items produced by `memento_anki::glossary::build_glossary`.
+    /// Pre-rendered HTML items produced by `subomi_anki::glossary::build_glossary`.
     pub rendered_items: Vec<String>,
     /// Individual kanji meanings when building a kanji `{glossary}` card.
     pub kanji_meanings: Vec<String>,
@@ -36,7 +36,7 @@ pub struct GlossaryDefinition {
     pub media_files: Vec<MediaFilePayload>,
 }
 
-/// Applies Memento's `search/remove-regex` and `search/replace-lines` (`search/replace-with`)
+/// Applies Subomi's `search/remove-regex` and `search/replace-lines` (`search/replace-with`)
 /// filters to subtitle text. Empty or invalid regex patterns are safely ignored.
 pub fn filter_subtitle_text(
     text: &str,
@@ -44,7 +44,7 @@ pub fn filter_subtitle_text(
     replace_lines: bool,
     replace_with: &str,
 ) -> String {
-    memento_dict::normalize::preprocess_search_text(
+    subomi_dict::normalize::preprocess_search_text(
         text,
         remove_regex.unwrap_or(""),
         replace_lines,
@@ -66,10 +66,10 @@ pub fn read_clipboard_text() -> String {
 
 /// Shared base64 encoder used by Anki media capture and dictionary media enrichment.
 pub(crate) fn encode_base64(bytes: &[u8]) -> Result<String, String> {
-    let len = memento_util::fileutils::base64_len(bytes.len())
+    let len = subomi_util::fileutils::base64_len(bytes.len())
         .ok_or_else(|| "Anki media is too large to encode".to_owned())?;
     let mut encoded = vec![0u8; len];
-    memento_util::fileutils::to_base64(bytes, &mut encoded)
+    subomi_util::fileutils::to_base64(bytes, &mut encoded)
         .ok_or_else(|| "Could not encode Anki media".to_owned())?;
     String::from_utf8(encoded).map_err(|error| error.to_string())
 }
@@ -77,7 +77,7 @@ pub(crate) fn encode_base64(bytes: &[u8]) -> Result<String, String> {
 /// Convenience alias for [`NoteFieldsContext`].
 pub type AnkiNoteContext = NoteFieldsContext;
 
-/// Source data for populating Memento Anki note fields.
+/// Source data for populating Subomi Anki note fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NoteFieldsContext {
     pub expression: String,
@@ -255,18 +255,18 @@ impl NoteFieldsContext {
     }
 
     /// Formats `{selection}` from `self.selections` (or single `self.selection` for
-    /// backwards compatibility) via `memento_anki::note::format_selection`, rendering
+    /// backwards compatibility) via `subomi_anki::note::format_selection`, rendering
     /// multi-definition selections as `<ul><li>...</li></ul>` without double `<br>`.
     pub fn formatted_selection(&self) -> String {
         if !self.selections.is_empty() {
             let refs: Vec<&str> = self.selections.iter().map(String::as_str).collect();
-            let formatted = memento_anki::note::format_selection(&refs);
+            let formatted = subomi_anki::note::format_selection(&refs);
             if !formatted.is_empty() {
                 return formatted;
             }
         }
         if !self.selection.is_empty() {
-            return memento_anki::note::format_selection(&[self.selection.as_str()]);
+            return subomi_anki::note::format_selection(&[self.selection.as_str()]);
         }
         String::new()
     }

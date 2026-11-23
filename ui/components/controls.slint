@@ -1,6 +1,6 @@
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 
-export component MementoSwitch inherits Rectangle {
+export component SubomiSwitch inherits Rectangle {
     in-out property <bool> checked: false;
     in property <bool> enabled: true;
     callback toggled(bool);
@@ -11,11 +11,11 @@ export component MementoSwitch inherits Rectangle {
     opacity: root.enabled ? 1.0 : 0.45;
     border-width: 1px;
     border-color: root.checked
-        ? MementoPalette.teal-border
-        : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+        ? SubomiPalette.teal-border
+        : (touch.has-hover && root.enabled ? SubomiPalette.cyan-accent : SubomiPalette.border-light);
     background: root.checked
-        ? (touch.has-hover && root.enabled ? MementoPalette.teal-hover : MementoPalette.teal-accent)
-        : MementoPalette.track-bg;
+        ? (touch.has-hover && root.enabled ? SubomiPalette.teal-hover : SubomiPalette.teal-accent)
+        : SubomiPalette.track-bg;
 
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
@@ -44,7 +44,7 @@ export component MementoSwitch inherits Rectangle {
     }
 }
 
-export component MementoCheckBox inherits Rectangle {
+export component SubomiCheckBox inherits Rectangle {
     in-out property <bool> checked: false;
     in property <string> label: "";
     in property <bool> enabled: true;
@@ -67,11 +67,11 @@ export component MementoCheckBox inherits Rectangle {
                 border-radius: 5px;
                 border-width: 1.5px;
                 border-color: root.checked
-                    ? MementoPalette.teal-border
-                    : (touch.has-hover && root.enabled ? MementoPalette.cyan-accent : MementoPalette.border-light);
+                    ? SubomiPalette.teal-border
+                    : (touch.has-hover && root.enabled ? SubomiPalette.cyan-accent : SubomiPalette.border-light);
                 background: root.checked
-                    ? MementoPalette.teal-accent
-                    : (touch.has-hover && root.enabled ? MementoPalette.hover-bg : MementoPalette.surface-bg);
+                    ? SubomiPalette.teal-accent
+                    : (touch.has-hover && root.enabled ? SubomiPalette.hover-bg : SubomiPalette.surface-bg);
 
                 animate background { duration: 100ms; }
                 animate border-color { duration: 100ms; }
@@ -98,7 +98,7 @@ export component MementoCheckBox inherits Rectangle {
 
         if root.label != "" : Text {
             text: root.label;
-            color: MementoPalette.text;
+            color: SubomiPalette.text;
             font-size: 13px;
             font-weight: 500;
             vertical-alignment: center;
@@ -117,13 +117,13 @@ export component MementoCheckBox inherits Rectangle {
     }
 }
 
-export component MementoSlider inherits Rectangle {
+export component SubomiSlider inherits Rectangle {
     in-out property <float> value: 0;
     in property <float> minimum: 0;
     in property <float> maximum: 100;
     in property <bool> enabled: true;
-    in property <color> accent: MementoPalette.cyan-accent;
-    in property <color> track-color: MementoPalette.track-bg;
+    in property <color> accent: SubomiPalette.cyan-accent;
+    in property <color> track-color: SubomiPalette.track-bg;
     callback changed(float);
 
     private property <float> span: max(0.0001, root.maximum - root.minimum);
@@ -197,7 +197,7 @@ export component MementoSlider inherits Rectangle {
 export component SectionHeader inherits HorizontalLayout {
     in property <string> title;
     in property <string> subtitle: "";
-    in property <color> accent: MementoPalette.cyan-accent;
+    in property <color> accent: SubomiPalette.cyan-accent;
 
     padding-left: 2px;
     padding-right: 2px;
@@ -224,14 +224,14 @@ export component SectionHeader inherits HorizontalLayout {
             text: root.title;
             font-size: 13.5px;
             font-weight: 700;
-            color: MementoPalette.text;
+            color: SubomiPalette.text;
             vertical-alignment: center;
         }
 
         if root.subtitle != "" : Text {
             text: "· " + root.subtitle;
             font-size: 12px;
-            color: MementoPalette.text-muted;
+            color: SubomiPalette.text-muted;
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;

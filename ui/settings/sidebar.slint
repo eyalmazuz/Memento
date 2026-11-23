@@ -1,9 +1,9 @@
 import { LineEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { IconButton } from "../components/buttons.slint";
 
 component SidebarGroupLabel inherits Text {
-    color: MementoPalette.text-muted;
+    color: SubomiPalette.text-muted;
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.8px;
@@ -21,10 +21,10 @@ component SidebarItem inherits Rectangle {
     height: 34px;
     border-radius: 7px;
     background: root.selected
-        ? MementoPalette.accent-muted
+        ? SubomiPalette.accent-muted
         : (touch.pressed
-            ? MementoPalette.active-bg
-            : (touch.has-hover ? MementoPalette.hover-bg : transparent));
+            ? SubomiPalette.active-bg
+            : (touch.has-hover ? SubomiPalette.hover-bg : transparent));
 
     animate background { duration: 100ms; }
 
@@ -36,7 +36,7 @@ component SidebarItem inherits Rectangle {
         width: 3px;
         height: parent.height - 14px;
         border-radius: 2px;
-        background: MementoPalette.cyan-accent;
+        background: SubomiPalette.cyan-accent;
     }
 
     Image {
@@ -45,7 +45,7 @@ component SidebarItem inherits Rectangle {
         width: 16px;
         height: 16px;
         source: root.icon;
-        colorize: root.selected ? MementoPalette.cyan-text : MementoPalette.icon-muted;
+        colorize: root.selected ? SubomiPalette.cyan-text : SubomiPalette.icon-muted;
     }
 
     Text {
@@ -54,7 +54,7 @@ component SidebarItem inherits Rectangle {
         width: parent.width - (root.dirty ? 58px : 48px);
         height: parent.height;
         text: root.label;
-        color: root.selected ? MementoPalette.text : MementoPalette.text-secondary;
+        color: root.selected ? SubomiPalette.text : SubomiPalette.text-secondary;
         font-size: 13px;
         font-weight: root.selected ? 700 : 500;
         vertical-alignment: center;
@@ -69,7 +69,7 @@ component SidebarItem inherits Rectangle {
         width: 6px;
         height: 6px;
         border-radius: 3px;
-        background: MementoPalette.warning;
+        background: SubomiPalette.warning;
     }
 
     touch := TouchArea {
@@ -92,7 +92,7 @@ export component SettingsSidebar inherits Rectangle {
     }
 
     width: 232px;
-    background: MementoPalette.sidebar-bg;
+    background: SubomiPalette.sidebar-bg;
 
     VerticalLayout {
         padding-top: 14px;
@@ -113,7 +113,7 @@ export component SettingsSidebar inherits Rectangle {
                 Image {
                     width: 26px;
                     height: 26px;
-                    source: @image-url("../../res/memento.svg");
+                    source: @image-url("../../res/subomi.svg");
                 }
             }
             VerticalLayout {
@@ -121,13 +121,13 @@ export component SettingsSidebar inherits Rectangle {
                 spacing: 0px;
                 Text {
                     text: "Options";
-                    color: MementoPalette.text;
+                    color: SubomiPalette.text;
                     font-size: 15px;
                     font-weight: 700;
                 }
                 Text {
-                    text: "Memento Preferences";
-                    color: MementoPalette.text-muted;
+                    text: "Subomi Preferences";
+                    color: SubomiPalette.text-muted;
                     font-size: 10.5px;
                 }
             }
@@ -167,7 +167,7 @@ export component SettingsSidebar inherits Rectangle {
             }
         }
 
-        Rectangle { height: 1px; background: MementoPalette.border; }
+        Rectangle { height: 1px; background: SubomiPalette.border; }
 
         HorizontalLayout { padding-left: 10px; padding-top: 6px; SidebarGroupLabel { text: "STUDY & MINING"; } }
         for item in [

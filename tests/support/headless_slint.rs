@@ -2,7 +2,7 @@ use i_slint_renderer_femtovg::{
     opengl::{OpenGLBackend, OpenGLInterface},
     FemtoVGRenderer,
 };
-use memento_app::MementoApp;
+use subomi_app::SubomiApp;
 use slint::{
     platform::{Platform, PlatformError, Renderer, WindowAdapter, WindowEvent},
     ComponentHandle,
@@ -64,7 +64,7 @@ impl Platform for HeadlessPlatform {
     }
 }
 
-pub fn create_window(gl: impl OpenGLInterface + 'static) -> (MementoApp, Rc<HeadlessWindow>) {
+pub fn create_window(gl: impl OpenGLInterface + 'static) -> (SubomiApp, Rc<HeadlessWindow>) {
     let window = Rc::new(RefCell::new(Weak::new()));
     slint::platform::set_platform(Box::new(HeadlessPlatform {
         renderer: RefCell::new(Some(FemtoVGRenderer::new(gl).unwrap())),
@@ -72,7 +72,7 @@ pub fn create_window(gl: impl OpenGLInterface + 'static) -> (MementoApp, Rc<Head
         started: Instant::now(),
     }))
     .unwrap();
-    let app = MementoApp::new().unwrap();
+    let app = SubomiApp::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1280, 720));
     app.show().unwrap();
     let adapter = window.borrow().upgrade().unwrap();

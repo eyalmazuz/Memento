@@ -511,28 +511,28 @@ mod tests {
     #[test]
     fn cli_hwdec_parser_ignores_grouped_options() {
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--{", "--hwdec=nvdec", "--}", "a.mkv"]),
+            configured_hwdec_from_args(["subomi", "--{", "--hwdec=nvdec", "--}", "a.mkv"]),
             None
         );
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--hwdec=nvdec", "a.mkv"]).as_deref(),
+            configured_hwdec_from_args(["subomi", "--hwdec=nvdec", "a.mkv"]).as_deref(),
             Some("nvdec")
         );
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--hwdec=nvdec", "--no-hwdec"]).as_deref(),
+            configured_hwdec_from_args(["subomi", "--hwdec=nvdec", "--no-hwdec"]).as_deref(),
             Some("no")
         );
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--hwdec", "a.mkv"]).as_deref(),
+            configured_hwdec_from_args(["subomi", "--hwdec", "a.mkv"]).as_deref(),
             Some("yes")
         );
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--hwdec=vaapi", "--", "--hwdec=nvdec"])
+            configured_hwdec_from_args(["subomi", "--hwdec=vaapi", "--", "--hwdec=nvdec"])
                 .as_deref(),
             Some("vaapi")
         );
         assert_eq!(
-            configured_hwdec_from_args(["memento", "--", "--hwdec=nvdec"]),
+            configured_hwdec_from_args(["subomi", "--", "--hwdec=nvdec"]),
             None
         );
     }

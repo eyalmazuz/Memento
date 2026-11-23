@@ -1,4 +1,4 @@
-//! Player controller connecting `memento-player` to Slint `VideoSurface`.
+//! Player controller connecting `subomi-player` to Slint `VideoSurface`.
 
 mod coordinator;
 mod mouse;
@@ -6,12 +6,11 @@ mod subtitle_sync;
 mod visibility;
 
 pub use coordinator::LivePlayerCoordinator;
-pub use memento_player::controller::{
-    format_keypress, QT_ALT_MODIFIER, QT_CONTROL_MODIFIER, QT_KEYPAD_MODIFIER, QT_KEY_0, QT_KEY_9,
-    QT_KEY_ALT, QT_KEY_BACKSPACE, QT_KEY_CLEAR, QT_KEY_CONTROL, QT_KEY_DELETE, QT_KEY_DOWN,
-    QT_KEY_END, QT_KEY_ENTER, QT_KEY_ESCAPE, QT_KEY_F1, QT_KEY_F30, QT_KEY_HOME, QT_KEY_INSERT,
-    QT_KEY_LEFT, QT_KEY_META, QT_KEY_PAGE_DOWN, QT_KEY_PAGE_UP, QT_KEY_PAUSE, QT_KEY_RETURN,
-    QT_KEY_RIGHT, QT_KEY_SHIFT, QT_KEY_UP, QT_META_MODIFIER, QT_NO_MODIFIER, QT_SHIFT_MODIFIER,
+pub use subomi_player::controller::{
+    format_keypress, KEY_0, KEY_9, KEY_ALT, KEY_BACKSPACE, KEY_CLEAR, KEY_CONTROL, KEY_DELETE,
+    KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESCAPE, KEY_F1, KEY_F30, KEY_HOME, KEY_INSERT, KEY_LEFT,
+    KEY_META, KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_PAUSE, KEY_RETURN, KEY_RIGHT, KEY_SHIFT, KEY_UP,
+    MOD_ALT, MOD_CONTROL, MOD_KEYPAD, MOD_META, MOD_NONE, MOD_SHIFT,
 };
 pub use mouse::MouseInputForwarder;
 pub use subtitle_sync::{
@@ -34,74 +33,38 @@ pub trait SubtitlePath {
 
 impl SubtitlePath for str {
     fn is_subtitle_file(&self) -> bool {
-        let u16_vec: Vec<u16> = self.encode_utf16().collect();
-        memento_player::controller::is_subtitle_file(&u16_vec)
+        subomi_player::controller::is_subtitle_file(self)
     }
 }
 
 impl SubtitlePath for &str {
     fn is_subtitle_file(&self) -> bool {
-        let u16_vec: Vec<u16> = self.encode_utf16().collect();
-        memento_player::controller::is_subtitle_file(&u16_vec)
+        subomi_player::controller::is_subtitle_file(self)
     }
 }
 
 impl SubtitlePath for String {
     fn is_subtitle_file(&self) -> bool {
-        let u16_vec: Vec<u16> = self.encode_utf16().collect();
-        memento_player::controller::is_subtitle_file(&u16_vec)
-    }
-}
-
-impl SubtitlePath for [u16] {
-    fn is_subtitle_file(&self) -> bool {
-        memento_player::controller::is_subtitle_file(self)
-    }
-}
-
-impl SubtitlePath for &[u16] {
-    fn is_subtitle_file(&self) -> bool {
-        memento_player::controller::is_subtitle_file(self)
-    }
-}
-
-impl<const N: usize> SubtitlePath for [u16; N] {
-    fn is_subtitle_file(&self) -> bool {
-        memento_player::controller::is_subtitle_file(self)
-    }
-}
-
-impl<const N: usize> SubtitlePath for &[u16; N] {
-    fn is_subtitle_file(&self) -> bool {
-        memento_player::controller::is_subtitle_file(*self)
-    }
-}
-
-impl SubtitlePath for Vec<u16> {
-    fn is_subtitle_file(&self) -> bool {
-        memento_player::controller::is_subtitle_file(self.as_slice())
+        subomi_player::controller::is_subtitle_file(self)
     }
 }
 
 impl SubtitlePath for std::path::Path {
     fn is_subtitle_file(&self) -> bool {
-        if let Some(s) = self.to_str() {
-            let u16_vec: Vec<u16> = s.encode_utf16().collect();
-            memento_player::controller::is_subtitle_file(&u16_vec)
-        } else {
-            false
-        }
+        self.to_str()
+            .is_some_and(subomi_player::controller::is_subtitle_file)
+    }
+}
+
+impl SubtitlePath for std::path::PathBuf {
+    fn is_subtitle_file(&self) -> bool {
+        self.as_path().is_subtitle_file()
     }
 }
 
 /// Checks whether a given path has a supported subtitle file extension.
 pub fn is_subtitle_file<P: SubtitlePath + ?Sized>(path: &P) -> bool {
     path.is_subtitle_file()
-}
-
-/// Checks whether a UTF-16 code unit slice has a supported subtitle file extension.
-pub fn is_subtitle_file_utf16(path: &[u16]) -> bool {
-    memento_player::controller::is_subtitle_file(path)
 }
 
 /// Formats seconds into a `"MM:SS"` or `"HH:MM:SS"` string.
@@ -238,7 +201,7 @@ impl PlayerController {
         is_macos: bool,
         fallback: &str,
     ) -> Option<String> {
-        memento_player::controller::format_keypress(key, modifiers, is_macos, fallback)
+        subomi_player::controller::format_keypress(key, modifiers, is_macos, fallback)
     }
 
     pub fn is_subtitle_file<P: SubtitlePath + ?Sized>(path: &P) -> bool {

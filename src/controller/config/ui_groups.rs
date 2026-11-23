@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use memento_config::config::Config;
-use memento_config::{ArgbColor, QtFontSpec};
-use memento_setting::enums::Directory;
-use memento_setting::keys as raw;
-use memento_setting::models::{ONNX_MODELS, WHISPER_MODELS};
+use subomi_config::config::Config;
+use subomi_config::{ArgbColor, FontSpec};
+use subomi_setting::enums::Directory;
+use subomi_setting::keys as raw;
+use subomi_setting::models::{ONNX_MODELS, WHISPER_MODELS};
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::ui::{SettingsField, SettingsGroup};
@@ -72,8 +72,8 @@ pub(crate) fn field(
 }
 
 pub(crate) fn font_field(key: &str, label: &str, value: String) -> SettingsField {
-    let spec = QtFontSpec::parse(&value)
-        .unwrap_or_else(|_| QtFontSpec::new("Noto Sans CJK JP", 12.0, false, false));
+    let spec = FontSpec::parse(&value)
+        .unwrap_or_else(|_| FontSpec::new("Noto Sans CJK JP", 12.0, false, false));
     let mut item = field(key, label, "font", value, &[], true, true);
     item.font_family = spec.family.clone().into();
     item.font_size = spec.formatted_size().into();
@@ -532,7 +532,7 @@ pub(crate) fn interface_settings_groups(config: &Config) -> Vec<SettingsGroup> {
                         "Render ASS/SSA subtitles natively (mpv/libass)",
                         effective_bool(config, group_name, raw::interface::subtitle::ASS_NATIVE),
                     ),
-                    "Preserve full ASS positioning, styling, typesetting, and embedded fonts via libmpv/libass with interactive dictionary lookup and highlighting. Disable to fall back to Memento's plain subtitle bar.",
+                    "Preserve full ASS positioning, styling, typesetting, and embedded fonts via libmpv/libass with interactive dictionary lookup and highlighting. Disable to fall back to Subomi's plain subtitle bar.",
                 ),
             ],
         ),
@@ -1120,12 +1120,12 @@ pub(crate) fn search_settings_groups(config: &Config) -> Vec<SettingsGroup> {
             vec![
                 switch_field(
                     "search/hide-subs",
-                    "Hide mpv subtitles while Memento subtitles are visible",
+                    "Hide mpv subtitles while Subomi subtitles are visible",
                     effective_bool(config, group_name, raw::search::HIDE_MPV_SUBS),
                 ),
                 switch_field(
                     "search/hide-bar",
-                    "Hide Memento subtitles while playing media",
+                    "Hide Subomi subtitles while playing media",
                     effective_bool(config, group_name, raw::search::HIDE_SUBS),
                 ),
                 switch_field(

@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use memento_asr::onnx::onnxcontroller;
-use memento_asr::whisper::whispercontroller;
-use memento_config::Value;
-use memento_net::download::Downloader;
-use memento_player::MpvInstance;
-use memento_setting::keys as raw;
+use subomi_asr::onnx::onnxcontroller;
+use subomi_asr::whisper::whispercontroller;
+use subomi_config::Value;
+use subomi_net::download::Downloader;
+use subomi_player::MpvInstance;
+use subomi_setting::keys as raw;
 use slint::{ComponentHandle, VecModel};
 
 use crate::controller;
@@ -23,7 +23,7 @@ use crate::controller::player::{
 };
 use crate::controller::subtitles::SubtitleController;
 use crate::ui::AsrModelStatusRow;
-use crate::{MementoApp, SettingsWindow, SubEntry};
+use crate::{SubomiApp, SettingsWindow, SubEntry};
 
 use super::SettingsContext;
 
@@ -143,7 +143,7 @@ pub(crate) fn refresh_asr_model_status(
 }
 
 pub(crate) fn clear_asr_for_settings(
-    app: &MementoApp,
+    app: &SubomiApp,
     asr: &Rc<RefCell<controller::asr::AsrController>>,
     subtitles: &Rc<RefCell<SubtitleController>>,
     subtitle_model: &Rc<VecModel<SubEntry>>,

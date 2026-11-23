@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use memento_definition::CssTheme;
-use memento_dict::searchcontroller::has_wildcard_chars;
+use subomi_definition::CssTheme;
+use subomi_dict::searchcontroller::has_wildcard_chars;
 use slint::{ComponentHandle, Model as _, SharedString, VecModel};
 
 use crate::controller::anki::EntryAnkiLookup;
@@ -27,7 +27,7 @@ use crate::ui::text_engine::{
     TextEngine,
 };
 use crate::ui::{
-    CompactFrequencyItem, CompactFrequencyLine, DefinitionGridRow, DictResult, MementoApp,
+    CompactFrequencyItem, CompactFrequencyLine, DefinitionGridRow, DictResult, SubomiApp,
     PopupBridge, PopupDictStyle, PopupFreqStyle, PopupFrequency, PopupLayout, RichHeadwordChar,
     RichHeadwordLine, SubtitleOverlayBridge,
 };
@@ -52,7 +52,7 @@ fn spawn_panel_worker(
     panel_rx: mpsc::Receiver<PanelSearchRequest>,
     panel_res_tx: mpsc::Sender<PanelSearchResponse>,
     worker_epoch: Arc<AtomicU64>,
-    worker_app: slint::Weak<MementoApp>,
+    worker_app: slint::Weak<SubomiApp>,
 ) {
     std::thread::spawn(move || {
         let mut sig = crate::controller::dict::db_file_fingerprint(&dictionary_db_path);
@@ -156,7 +156,7 @@ fn spawn_nested_worker(
     nav_res_tx: mpsc::Sender<NavLookupResponse>,
     worker_nested_epoch: Arc<AtomicU64>,
     worker_nav_epoch: Arc<AtomicU64>,
-    worker_app: slint::Weak<MementoApp>,
+    worker_app: slint::Weak<SubomiApp>,
 ) {
     std::thread::spawn(move || {
         let mut sig = crate::controller::dict::db_file_fingerprint(&dictionary_db_path);
@@ -293,12 +293,12 @@ fn spawn_glossary_render_worker(
     rx: mpsc::Receiver<GlossaryPreRenderBatch>,
     res_tx: mpsc::Sender<GlossaryPreRenderDone>,
     worker_epoch: Arc<AtomicU64>,
-    worker_app: slint::Weak<MementoApp>,
+    worker_app: slint::Weak<SubomiApp>,
     shared_font_collection: Option<slint::fontique_08::fontique::Collection>,
 ) {
     const WORKER_IDLE_ENGINE_DROP: Duration = Duration::from_secs(60);
     let _ = std::thread::Builder::new()
-        .name("memento-glossary-prerender".into())
+        .name("subomi-glossary-prerender".into())
         .spawn(move || {
             let mut engine: Option<TextEngine> = None;
             loop {
@@ -383,7 +383,7 @@ fn spawn_anki_worker(
     nested_in_flight: Arc<AtomicU64>,
     panel_in_flight: Arc<AtomicU64>,
     worker_anki_ext: Arc<Mutex<Option<Arc<AtomicU64>>>>,
-    worker_anki_app: slint::Weak<MementoApp>,
+    worker_anki_app: slint::Weak<SubomiApp>,
 ) {
     std::thread::spawn(move || {
         while let Ok(first_req) = anki_rx.recv() {
@@ -518,7 +518,7 @@ fn spawn_anki_worker(
     });
 }
 
-fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
+fn wire_popup_bridge(app: &SubomiApp, bridge: &Rc<RichUiBridge>) {
     app.global::<PopupLayout>()
         .on_compact_frequency_lines(|items, available_width| {
             let available_width = available_width.max(1.0);
@@ -1722,7 +1722,7 @@ fn wire_popup_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
     });
 }
 
-fn wire_subtitle_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
+fn wire_subtitle_bridge(app: &SubomiApp, bridge: &Rc<RichUiBridge>) {
     let sb = app.global::<SubtitleOverlayBridge>();
 
     let b_sub_render = bridge.clone();
@@ -1996,7 +1996,7 @@ fn wire_subtitle_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
         if same_char && app.get_dict_open() {
             return;
         }
-        if !memento_ass::is_japanese_or_alnum_lookup_char(target.ch) && !mod_held {
+        if !subomi_ass::is_japanese_or_alnum_lookup_char(target.ch) && !mod_held {
             return;
         }
 
@@ -2113,7 +2113,7 @@ fn wire_subtitle_bridge(app: &MementoApp, bridge: &Rc<RichUiBridge>) {
 
 /// Extension hook for rich definition/subtitle UI bridges.
 pub fn install_rich_ui_bridges(
-    app: &MementoApp,
+    app: &SubomiApp,
     dictionary_db_path: &Path,
     config_dir: &Path,
     config: &ConfigController,

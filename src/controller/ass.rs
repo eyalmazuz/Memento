@@ -1,21 +1,21 @@
-//! Runtime controller bridging `memento-ass` (`libass` layout probing, tight
+//! Runtime controller bridging `subomi-ass` (`libass` layout probing, tight
 //! highlight-patch rendering, and MKV EBML extraction) with Slint's
-//! `SubtitleOverlayBridge` and `MementoApp`.
+//! `SubtitleOverlayBridge` and `SubomiApp`.
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use memento_ass::{
+use subomi_ass::{
     AssCharBox, AssFrameLayout, AssHighlightRect, AssHinting, AssLayoutEngine, AssOverrideMode,
     AssShapingLevel, MkvFontAttachment, MpvAssParams, RgbaPatch, ViewportTransform,
 };
-use memento_player::mpv::PlaybackState;
+use subomi_player::mpv::PlaybackState;
 use slint::{ComponentHandle, Model, Rgba8Pixel, SharedPixelBuffer, VecModel};
 
 use crate::controller::subtitles::{cached_subtitle_furigana_parts, prewarm_subtitle_furigana};
-use crate::ui::{AssHighlightPatch, AssLineHitbox, AssRubyItem, MementoApp, SubtitleOverlayBridge};
+use crate::ui::{AssHighlightPatch, AssLineHitbox, AssRubyItem, SubomiApp, SubtitleOverlayBridge};
 
 /// Minimum interval between animated-geometry (`\move` / geometry `\t`) layout re-probes (~15 Hz).
 const ANIMATED_PROBE_INTERVAL: Duration = Duration::from_millis(66);
@@ -306,7 +306,7 @@ impl AssOverlayController {
     }
 
     fn log_error_once(&mut self, context: &str, err: &str) {
-        let msg = format!("[memento-ass] {context}: {err}");
+        let msg = format!("[subomi-ass] {context}: {err}");
         if self.last_logged_error.as_deref() != Some(msg.as_str()) {
             eprintln!("{msg}");
             self.last_logged_error = Some(msg);
@@ -328,13 +328,13 @@ impl AssOverlayController {
     }
 
     /// Reset all state when switching or closing media files.
-    pub fn clear_for_new_media(&mut self, app: &MementoApp) {
+    pub fn clear_for_new_media(&mut self, app: &SubomiApp) {
         self.loaded_fonts.clear();
         self.loaded_fonts.shrink_to_fit();
         self.font_generation = self.font_generation.wrapping_add(1);
         if let Some(engine) = self.engine.as_mut() {
             if let Err(err) = engine.load_memory_fonts(&[]) {
-                eprintln!("[memento-ass] failed to release libass memory fonts: {err}");
+                eprintln!("[subomi-ass] failed to release libass memory fonts: {err}");
             }
             self.applied_font_generation = self.font_generation;
         }
@@ -357,7 +357,7 @@ impl AssOverlayController {
     #[allow(clippy::too_many_arguments)]
     pub fn sync_from_playback(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         native_ass_active: bool,
         extradata: &str,
         ass_full: &str,
@@ -567,7 +567,7 @@ impl AssOverlayController {
         Ok(engine)
     }
 
-    fn push_hitboxes(&self, app: &MementoApp, transform: &ViewportTransform) {
+    fn push_hitboxes(&self, app: &SubomiApp, transform: &ViewportTransform) {
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -598,7 +598,7 @@ impl AssOverlayController {
     /// directly between two simultaneous ASS lines never flickers `ass-hovered`.
     pub fn on_line_hover_changed(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         event_idx: i32,
         line_idx: i32,
         hovering: bool,
@@ -616,7 +616,7 @@ impl AssOverlayController {
     }
 
     /// Hit-test a pointer coordinate in `video-area` logical pixels against the active ASS layout.
-    pub fn hit_test_logical(&self, app: &MementoApp, lx: f32, ly: f32) -> Option<AssHoveredTarget> {
+    pub fn hit_test_logical(&self, app: &SubomiApp, lx: f32, ly: f32) -> Option<AssHoveredTarget> {
         let layout = self.layout.as_ref()?;
         let transform = self.last_viewport.unwrap_or_else(|| {
             ViewportTransform::contain(
@@ -654,7 +654,7 @@ impl AssOverlayController {
     /// matched dictionary scan on `target`, and anchor `YomitanPopup` & `hover-bridge` to it.
     pub fn apply_lookup_highlight(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         target: &AssHoveredTarget,
         matched_utf16_len: usize,
     ) {
@@ -694,7 +694,7 @@ impl AssOverlayController {
 
     fn rebuild_highlight_for_lookup(
         &mut self,
-        app: &MementoApp,
+        app: &SubomiApp,
         lookup: &AssActiveLookup,
         transform: &ViewportTransform,
     ) {
@@ -778,7 +778,7 @@ impl AssOverlayController {
     }
 
     /// Clear active ASS highlight bars, popup anchor, and stored lookup state.
-    pub fn clear_lookup_highlight(&mut self, app: &MementoApp) {
+    pub fn clear_lookup_highlight(&mut self, app: &SubomiApp) {
         self.active_lookup = None;
         let sb = app.global::<SubtitleOverlayBridge>();
         if sb.get_ass_highlight_patches().row_count() > 0 {
@@ -831,7 +831,7 @@ mod tests {
         let mut st = PlaybackState::default();
         st.video_width = 1920;
         st.video_height = 1080;
-        st.osd_dimensions = memento_player::OsdDimensions {
+        st.osd_dimensions = subomi_player::OsdDimensions {
             w: 1920,
             h: 1080,
             mt: 0,

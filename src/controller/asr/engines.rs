@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[cfg(feature = "asr-onnx")]
-use memento_asr::onnx::{onnxcontroller, onnxmodelconfig::OnnxModelConfig};
+use subomi_asr::onnx::{onnxcontroller, onnxmodelconfig::OnnxModelConfig};
 #[cfg(feature = "asr-whisper")]
-use memento_asr::whisper::whispercontroller;
+use subomi_asr::whisper::whispercontroller;
 #[cfg(feature = "asr-onnx")]
-use memento_asr_onnx::engine as onnx_engine;
+use subomi_asr_onnx::engine as onnx_engine;
 #[cfg(feature = "asr-whisper")]
-use memento_asr_whisper::{engine as whisper_engine, whisper_sys};
+use subomi_asr_whisper::{engine as whisper_engine, whisper_sys};
 
 use super::cue_book::Window;
 #[cfg(feature = "asr-whisper")]
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn resolve_onnx_custom_model_trims_whitespace() {
         let mut settings =
-            AsrSettings::from_config("/unused", &memento_config::config::Config::default_empty())
+            AsrSettings::from_config("/unused", &subomi_config::config::Config::default_empty())
                 .unwrap();
         settings.backend = AsrBackend::Onnx;
         settings.onnx.model = format!("  {}  ", onnxcontroller::MODEL_CUSTOM);

@@ -1,7 +1,7 @@
 import { LineEdit } from "std-widgets.slint";
-import { MementoPalette } from "../palette.slint";
+import { SubomiPalette } from "../palette.slint";
 import { ActionButton, IconButton, ToggleChip } from "../components/buttons.slint";
-import { MementoSwitch, SectionHeader } from "../components/controls.slint";
+import { SubomiSwitch, SectionHeader } from "../components/controls.slint";
 import { TextReplacementRow } from "types.slint";
 
 // ── Custom Text Replacements Rule Editor (H6.5 — Settings → Search) ─────────
@@ -29,9 +29,9 @@ export component TextReplacementsPanel inherits VerticalLayout {
     }
 
     Rectangle {
-        background: MementoPalette.card-bg;
+        background: SubomiPalette.card-bg;
         border-width: 1px;
-        border-color: MementoPalette.card-border;
+        border-color: SubomiPalette.card-border;
         border-radius: 10px;
 
         VerticalLayout {
@@ -55,36 +55,36 @@ export component TextReplacementsPanel inherits VerticalLayout {
                         text: "Also search original unmodified text";
                         font-size: 13px;
                         font-weight: 500;
-                        color: MementoPalette.text;
+                        color: SubomiPalette.text;
                     }
                     Text {
                         text: "Keep original lookup candidates alongside regex-replaced variants";
                         font-size: 11px;
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                         wrap: word-wrap;
                     }
                 }
 
                 VerticalLayout {
                     alignment: center;
-                    MementoSwitch {
+                    SubomiSwitch {
                         checked <=> root.search-original;
                         toggled(val) => { root.search-original-changed(val); }
                     }
                 }
             }
 
-            Rectangle { height: 1px; background: MementoPalette.border; }
+            Rectangle { height: 1px; background: SubomiPalette.border; }
 
             if root.rows.length == 0 : Rectangle {
                 height: 54px;
                 border-radius: 7px;
-                background: MementoPalette.card-inset;
+                background: SubomiPalette.card-inset;
                 border-width: 1px;
-                border-color: MementoPalette.border;
+                border-color: SubomiPalette.border;
                 Text {
                     text: "No custom text replacement rules yet. Click \"+ Add Rule\" to add a regex transformation.";
-                    color: MementoPalette.text-muted;
+                    color: SubomiPalette.text-muted;
                     font-size: 12px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
@@ -104,7 +104,7 @@ export component TextReplacementsPanel inherits VerticalLayout {
                         text: "Pattern (regex)";
                         font-size: 11px;
                         font-weight: 600;
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                     }
                     Rectangle { width: 14px; background: transparent; }
                     Text {
@@ -112,7 +112,7 @@ export component TextReplacementsPanel inherits VerticalLayout {
                         text: "Replacement";
                         font-size: 11px;
                         font-weight: 600;
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                     }
                     Rectangle { width: 132px; background: transparent; }
                 }
@@ -123,7 +123,7 @@ export component TextReplacementsPanel inherits VerticalLayout {
 
                     VerticalLayout {
                         alignment: center;
-                        MementoSwitch {
+                        SubomiSwitch {
                             checked: rule.enabled;
                             toggled(val) => {
                                 root.update-rule(idx, rule.pattern, rule.replacement, rule.ignore-case, val);
@@ -148,7 +148,7 @@ export component TextReplacementsPanel inherits VerticalLayout {
                         width: 14px;
                         text: "→";
                         font-size: 13px;
-                        color: MementoPalette.text-muted;
+                        color: SubomiPalette.text-muted;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }

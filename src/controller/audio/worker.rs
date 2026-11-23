@@ -8,15 +8,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use memento_audio::audiofiles::md5_matches_skip_hash;
-use memento_audio::audioplayer::{
+use subomi_audio::audiofiles::md5_matches_skip_hash;
+use subomi_audio::audioplayer::{
     detect_audio_extension, validate_audio_bytes, validate_audio_content_type, AudioCache,
     AUDIO_CACHE_CAPACITY, MAX_AUDIO_PAYLOAD_BYTES,
 };
-use memento_net::http::HttpClient;
+use subomi_net::http::HttpClient;
 #[cfg(test)]
-use memento_net::http::HttpClientConfig;
-use memento_player::AudioInstance;
+use subomi_net::http::HttpClientConfig;
+use subomi_player::AudioInstance;
 use tempfile::TempDir;
 
 use super::super::config::AudioSourceEntry;
@@ -104,7 +104,7 @@ impl AudioController {
     /// the caller. The audio-only mpv instance is initialized asynchronously
     /// on the worker before queued requests are drained.
     pub fn new() -> Result<Self, String> {
-        Self::spawn_worker("memento-audio", AudioInstance::new, WorkerHttp::Shared)
+        Self::spawn_worker("subomi-audio", AudioInstance::new, WorkerHttp::Shared)
     }
 
     #[cfg(test)]
@@ -125,7 +125,7 @@ impl AudioController {
         F: FnOnce() -> Result<P, String> + Send + 'static,
     {
         Self::spawn_worker(
-            "memento-audio-test",
+            "subomi-audio-test",
             factory,
             WorkerHttp::Custom(HttpClient::new(http_config)),
         )
@@ -291,7 +291,7 @@ enum DownloadedAudio {
 }
 
 // Field order is deliberate: mpv (`player`) is terminated before its cached or
-// active temporary files and the owning `memento-audio-*` temp directory are
+// active temporary files and the owning `subomi-audio-*` temp directory are
 // removed when the worker exits.
 pub(super) struct AudioWorker<P: PlaybackBackend = AudioInstance> {
     player: P,
@@ -779,7 +779,7 @@ fn share_temp_audio_file(url: &str, path: &Path, md5: &str) {
 fn ensure_temp_dir(slot: &mut Option<TempDir>) -> Result<&Path, String> {
     if slot.as_ref().is_none_or(|dir| !dir.path().is_dir()) {
         let dir = tempfile::Builder::new()
-            .prefix("memento-audio-")
+            .prefix("subomi-audio-")
             .tempdir()
             .map_err(|error| format!("could not create temporary audio directory: {error}"))?;
         *slot = Some(dir);
@@ -835,7 +835,7 @@ impl TemporaryAudioFile {
         for _ in 0..128 {
             let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let path = directory.join(format!(
-                "memento-audio-{}-{id}.{suffix}",
+                "subomi-audio-{}-{id}.{suffix}",
                 std::process::id()
             ));
             let mut options = OpenOptions::new();

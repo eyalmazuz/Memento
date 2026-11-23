@@ -48,12 +48,12 @@ fn emit_git_hash(manifest_dir: &Path) {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
         .unwrap_or_default();
-    println!("cargo:rustc-env=MEMENTO_GIT_HASH={hash}");
+    println!("cargo:rustc-env=SUBOMI_GIT_HASH={hash}");
 }
 
 fn try_compile_windows_icon(manifest_dir: &Path, out_dir: &Path) {
     let res_dir = manifest_dir.join("res");
-    let ico_path = res_dir.join("memento.ico");
+    let ico_path = res_dir.join("subomi.ico");
     let rc_path = res_dir.join("appicon.rc");
 
     if ico_path.is_file() {
@@ -64,14 +64,14 @@ fn try_compile_windows_icon(manifest_dir: &Path, out_dir: &Path) {
     }
     if !ico_path.is_file() {
         println!(
-            "cargo:warning=res/memento.ico not found; skipping Windows application icon embedding"
+            "cargo:warning=res/subomi.ico not found; skipping Windows application icon embedding"
         );
         return;
     }
 
-    // Generate a self-contained .rc file pointing directly at res/memento.ico so
+    // Generate a self-contained .rc file pointing directly at res/subomi.ico so
     // rc.exe, llvm-rc, and windres resolve the icon regardless of working dir.
-    let generated_rc = out_dir.join("memento_appicon.rc");
+    let generated_rc = out_dir.join("subomi_appicon.rc");
     let escaped_ico = ico_path.to_string_lossy().replace('\\', "\\\\");
     let rc_contents = format!("MAINICON ICON \"{escaped_ico}\"\n");
     if let Err(err) = std::fs::write(&generated_rc, rc_contents) {
@@ -83,8 +83,8 @@ fn try_compile_windows_icon(manifest_dir: &Path, out_dir: &Path) {
 
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let out_res = out_dir.join("memento_appicon.res");
-    let out_obj = out_dir.join("memento_appicon.o");
+    let out_res = out_dir.join("subomi_appicon.res");
+    let out_obj = out_dir.join("subomi_appicon.o");
 
     let run_rc = |tool: &str, out_flag: &str| -> bool {
         Command::new(tool)
@@ -135,7 +135,7 @@ fn try_compile_windows_icon(manifest_dir: &Path, out_dir: &Path) {
         }
         None => {
             println!(
-                "cargo:warning=Could not embed res/memento.ico (none of rc.exe, llvm-rc, or windres succeeded); continuing without Windows icon resource"
+                "cargo:warning=Could not embed res/subomi.ico (none of rc.exe, llvm-rc, or windres succeeded); continuing without Windows icon resource"
             );
         }
     }
@@ -159,7 +159,7 @@ fn main() {
     }
 
     // Cargo supplies this metadata only when the optional ONNX crate is built.
-    // Keep directly running target/debug/memento working as well as cargo run.
+    // Keep directly running target/debug/subomi working as well as cargo run.
     if let Ok(directory) = std::env::var("DEP_ONNXRUNTIME_LIB_DIR") {
         if target == "linux" || target == "macos" {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{directory}");

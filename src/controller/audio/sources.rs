@@ -8,23 +8,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use memento_audio::audiofiles::{
+use subomi_audio::audiofiles::{
     expand_url_template, expand_url_template_encoded, md5_matches_skip_hash,
     parse_audio_source_list,
 };
-use memento_audio::audioplayer::{
+use subomi_audio::audioplayer::{
     detect_audio_extension, validate_audio_bytes, validate_audio_content_type,
     MAX_AUDIO_PAYLOAD_BYTES,
 };
-use memento_audio::{AudioDownloadConfig, DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS};
-use memento_net::http::{HttpClient, HttpClientConfig, Request, Response, Url as HttpUrl};
-use memento_setting::enums::AudioSourceType;
+use subomi_audio::{AudioDownloadConfig, DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS};
+use subomi_net::http::{HttpClient, HttpClientConfig, Request, Response, Url as HttpUrl};
+use subomi_setting::enums::AudioSourceType;
 use url::Url;
 
 use super::super::config::AudioSourceEntry;
 
 const MAX_JSON_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
-const AUDIO_USER_AGENT: &str = "Memento";
+const AUDIO_USER_AGENT: &str = "Subomi";
 const MAX_CACHED_JSON_EXPANSIONS: usize = 64;
 const MAX_CACHED_AUDIO_ENTRIES: usize = 32;
 const MAX_CACHED_AUDIO_TOTAL_BYTES: usize = 8 * 1024 * 1024;
@@ -351,7 +351,7 @@ pub(crate) fn sanitize_anki_filename(raw: &str, default_ext: &str) -> String {
     let sanitized = sanitized.trim_matches('.').to_owned();
     if sanitized.is_empty() {
         let ext = default_ext.trim_start_matches('.');
-        return format!("memento_media.{ext}");
+        return format!("subomi_media.{ext}");
     }
     sanitized
 }
@@ -394,9 +394,9 @@ fn ascii_safe_audio_filename_with_ext(
     };
 
     let raw = if safe_source.is_empty() {
-        format!("memento_{hash_hex}.{ext}")
+        format!("subomi_{hash_hex}.{ext}")
     } else {
-        format!("memento_{safe_source}_{hash_hex}.{ext}")
+        format!("subomi_{safe_source}_{hash_hex}.{ext}")
     };
     sanitize_anki_filename(&raw, &format!(".{ext}"))
 }

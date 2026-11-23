@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use memento_definition::structured_content_text_value;
+use subomi_definition::structured_content_text_value;
 
 use crate::controller::dict::DictTag;
 
@@ -149,7 +149,7 @@ pub fn suppress_redundant_tags(
     suppress_redundant_tags_with_inline(term_tags, def_tags, &inline_tags)
 }
 
-/// Yomitan-aligned `compactTags` sense filter (H5.3 / Memento `#220`).
+/// Yomitan-aligned `compactTags` sense filter (H5.3 / Subomi `#220`).
 ///
 /// Always deduplicates `term_tags` and removes `def_tags` already shown in `term_tags` or
 /// inline inside `structured-content`. When `compact_tags` is `true`, also tracks tags

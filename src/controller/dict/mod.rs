@@ -1,4 +1,4 @@
-//! Dictionary controller connecting memento-dict and memento-util.
+//! Dictionary controller connecting subomi-dict and subomi-util.
 
 mod db;
 mod glossary;
@@ -10,21 +10,19 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use memento_dict::deconjugationquerygenerator;
-use memento_dict::normalize::{self, Regex};
-use memento_dict::searchcontroller::{self, QuerySource};
-use memento_dict::sqlite_db;
+use subomi_dict::deconjugationquerygenerator;
+use subomi_dict::normalize::{self, Regex};
+use subomi_dict::searchcontroller::{self, QuerySource};
+use subomi_dict::sqlite_db;
 
-pub use memento_dict::databasemanager::{
-    build_dict_id_style_path, build_style_path, resolve_dictionary_style_path, PitchPosition,
-};
-pub use memento_dict::normalize::{
+pub use subomi_dict::databasemanager::{resolve_dictionary_style_path, PitchPosition};
+pub use subomi_dict::normalize::{
     apply_remove_regex, apply_replace_lines, is_cjk_ideograph, preprocess_search_text,
 };
-pub use memento_dict::searchcontroller::{
+pub use subomi_dict::searchcontroller::{
     has_wildcard_chars, ClozeSpans, TextReplacementOptions, TextReplacementRule,
 };
-pub use memento_dict::sqlite_db::{
+pub use subomi_dict::sqlite_db::{
     db_file_fingerprint, DbFileFingerprint, FileMetaStamp, FrequencyMode, TermFrequencyWithMode,
 };
 
@@ -264,7 +262,7 @@ impl SearchHit {
     }
 
     /// Returns a cached parsed `serde_json::Value` for `self.raw_glossary` so UI callers
-    /// can use `memento_definition`'s `*_value` APIs without re-parsing JSON.
+    /// can use `subomi_definition`'s `*_value` APIs without re-parsing JSON.
     pub fn parsed_glossary(&self) -> Option<Arc<serde_json::Value>> {
         parse_glossary_json_cached(&self.raw_glossary)
     }
@@ -457,11 +455,11 @@ impl DictController {
             exact_enabled: true,
             deconj_enabled: true,
             mecab_enabled: false,
-            mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
+            mecab_tokenizer: subomi_util::mecab::mecab_tokenize_for_lookup,
         }
     }
 
-    /// Open Memento's persisted Yomitan database read-only, sharing a single
+    /// Open Subomi's persisted Yomitan database read-only, sharing a single
     /// `Arc<ReadOnlyDictionaryDb>` connection + LRU metadata cache per database path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DictControllerError> {
         let database = shared_readonly_db(path.as_ref())?;
@@ -481,7 +479,7 @@ impl DictController {
             exact_enabled: true,
             deconj_enabled: true,
             mecab_enabled: false,
-            mecab_tokenizer: memento_util::mecab::mecab_tokenize_for_lookup,
+            mecab_tokenizer: subomi_util::mecab::mecab_tokenize_for_lookup,
         })
     }
 
@@ -533,7 +531,7 @@ impl DictController {
     }
 
     /// Overrides the MeCab lookup tokenizer function (defaults to
-    /// [`memento_util::mecab::mecab_tokenize_for_lookup`]).
+    /// [`subomi_util::mecab::mecab_tokenize_for_lookup`]).
     pub fn set_mecab_tokenizer(&mut self, tokenizer: MecabTokenizerFn) {
         self.mecab_tokenizer = tokenizer;
     }
@@ -698,7 +696,7 @@ impl DictController {
         format_cloze_spans(sentence, index, surface_len)
     }
 
-    /// Computes raw cloze spans using `memento_dict::searchcontroller::cloze_spans`.
+    /// Computes raw cloze spans using `subomi_dict::searchcontroller::cloze_spans`.
     pub fn cloze_spans(&self, text_len: u64, index: i64, surface_len: u64) -> ClozeSpans {
         searchcontroller::cloze_spans(text_len, index, surface_len)
     }

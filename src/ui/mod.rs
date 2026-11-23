@@ -1,4 +1,4 @@
-//! Generated Slint UI bindings and rich dictionary/subtitle bridges for Memento.
+//! Generated Slint UI bindings and rich dictionary/subtitle bridges for Subomi.
 
 slint::include_modules!();
 

@@ -1,23 +1,3 @@
-////////////////////////////////////////////////////////////////////////////////
-//
-// Copyright (c) 2026 Ripose
-//
-// This file is part of Memento.
-//
-// Memento is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, version 2 of the License.
-//
-// Memento is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with Memento.  If not, see <https://www.gnu.org/licenses/>.
-//
-////////////////////////////////////////////////////////////////////////////////
-
 //! Unified cross-platform video renderer selection and capability planning.
 //!
 //! Coordinates backend selection across macOS (OpenGL 4.1 Core +
@@ -36,7 +16,7 @@ use crate::graphics_device::{
     MpvConfRendererHints,
 };
 use crate::video_metal::{is_metal_device_available, MetalPresentationMode};
-use memento_player::mpv::{compatible_opengl_hwdec_for_session, compatible_software_hwdec};
+use subomi_player::mpv::{compatible_opengl_hwdec_for_session, compatible_software_hwdec};
 
 /// Supported operating system families for platform renderer selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -252,7 +232,7 @@ impl VideoRendererCapabilities {
 /// User/environment/CLI/`mpv.conf` overrides that influence backend selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RendererOverrides {
-    /// Explicit renderer request (e.g., `MEMENTO_RENDERER=metal|opengl|software`
+    /// Explicit renderer request (e.g., `SUBOMI_RENDERER=metal|opengl|software`
     /// or `SLINT_BACKEND=winit-software`).
     pub explicit_renderer: Option<PlatformRendererKind>,
     /// Global `--hwdec=...` CLI override.
@@ -293,7 +273,7 @@ impl RendererOverrides {
         let vo = cli_vo.or(hints.vo);
         let gpu_context = cli_gpu_context.or(hints.gpu_context);
 
-        let env_renderer = env("MEMENTO_RENDERER").and_then(|v| PlatformRendererKind::parse(&v));
+        let env_renderer = env("SUBOMI_RENDERER").and_then(|v| PlatformRendererKind::parse(&v));
         let slint_software =
             env("SLINT_BACKEND").is_some_and(|v| v.to_ascii_lowercase().contains("software"));
         let vo_software = vo
@@ -308,10 +288,10 @@ impl RendererOverrides {
         let libgl_always_software =
             env("LIBGL_ALWAYS_SOFTWARE").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let force_rgba8 =
-            env("MEMENTO_GL_FORCE_RGBA8").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+            env("SUBOMI_GL_FORCE_RGBA8").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let prefer_hdr =
-            env("MEMENTO_PREFER_HDR").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-        let disable_windows_borderless_workaround = env("MEMENTO_DISABLE_WIN_BORDERLESS_FS")
+            env("SUBOMI_PREFER_HDR").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let disable_windows_borderless_workaround = env("SUBOMI_DISABLE_WIN_BORDERLESS_FS")
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
 
         Self {
@@ -369,7 +349,7 @@ impl PlatformRendererConfig {
         if overrides.explicit_renderer == Some(PlatformRendererKind::Software) {
             return Self::software_config(
                 requested_hwdec,
-                "explicit software renderer override (SLINT_BACKEND / MEMENTO_RENDERER / vo=sw)",
+                "explicit software renderer override (SLINT_BACKEND / SUBOMI_RENDERER / vo=sw)",
             );
         }
 

@@ -1,9 +1,9 @@
 //! Real mpv subtitle notifications with furigana left enabled from startup.
-use memento_app::{
+use subomi_app::{
     apply_subtitle_furigana, controller::subtitles::subtitle_furigana_parts,
-    publish_active_subtitle, MementoApp,
+    publish_active_subtitle, SubomiApp,
 };
-use memento_player::mpv::PlaybackState;
+use subomi_player::mpv::PlaybackState;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc, Arc,
@@ -51,7 +51,7 @@ impl StartupSubtitles {
         }
     }
 
-    pub fn tick(&mut self, app: &MementoApp, state: &PlaybackState) -> Vec<String> {
+    pub fn tick(&mut self, app: &SubomiApp, state: &PlaybackState) -> Vec<String> {
         let mut updates = Vec::new();
         // Use the same cadence and notification condition as the desktop timer.
         if self.last_poll.elapsed() >= Duration::from_millis(100) {

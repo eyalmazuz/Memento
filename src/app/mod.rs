@@ -1,4 +1,4 @@
-//! Main application orchestration module for pure-Rust Memento.
+//! Main application orchestration module for pure-Rust Subomi.
 
 pub mod anki_actions;
 pub mod clipboard;
@@ -43,13 +43,13 @@ use crate::platform_renderer::{
     PlatformRendererConfig, PlatformRendererKind, RendererOverrides, VideoRendererCapabilities,
 };
 use crate::settings_ui::SettingsSession;
-use crate::ui::{self, MementoApp, SubEntry};
-use memento_player::MpvInstance;
-use memento_setting::keys as raw;
+use crate::ui::{self, SubomiApp, SubEntry};
+use subomi_player::MpvInstance;
+use subomi_setting::keys as raw;
 
 use self::anki_actions::{install_anki_and_audio_handlers, PopupAudioState};
 use self::keybinds::{install_keybind_handlers, AudioContextMarkState};
-use self::paths::{format_time, memento_xdg_dir, migrate_xdg_config_if_needed};
+use self::paths::{format_time, subomi_xdg_dir, migrate_xdg_config_if_needed};
 use self::playback::{
     install_playback_handlers, persist_window_panel_state, restore_window_panel_state,
     ASR_SHUTDOWN_TIMEOUT,
@@ -84,7 +84,7 @@ fn terminate_process_bypassing_atexit(code: i32) -> ! {
     std::process::exit(code);
 }
 
-/// Format the About-modal / menu version string from `CARGO_PKG_VERSION` + optional `MEMENTO_GIT_HASH` (H1.6).
+/// Format the About-modal / menu version string from `CARGO_PKG_VERSION` + optional `SUBOMI_GIT_HASH` (H1.6).
 pub(crate) fn format_app_version_display(pkg_version: &str, git_hash: Option<&str>) -> String {
     match git_hash.map(str::trim).filter(|hash| !hash.is_empty()) {
         Some(hash) => format!("{pkg_version}-{hash}"),
@@ -147,7 +147,7 @@ fn detach_external_open_relay() {
 
 /// On macOS, hook `application:openURLs:` and `application:openFile:` on winit's
 /// `NSApplicationDelegate` so Finder "Open With" and Dock drops route cleanly into
-/// Memento's `files_dropped` pipeline without extra Objective-C crates (H1.2).
+/// Subomi's `files_dropped` pipeline without extra Objective-C crates (H1.2).
 #[cfg(target_os = "macos")]
 fn install_macos_open_urls_hook() {
     use std::ffi::{c_char, c_void, CStr};
@@ -292,9 +292,9 @@ fn install_macos_open_urls_hook() {
     });
 }
 
-struct MementoWinitAppHandler;
+struct SubomiWinitAppHandler;
 
-impl CustomApplicationHandler for MementoWinitAppHandler {
+impl CustomApplicationHandler for SubomiWinitAppHandler {
     fn resumed(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) -> EventResult {
         #[cfg(target_os = "macos")]
         install_macos_open_urls_hook();
@@ -326,7 +326,7 @@ impl log::Log for AppLogger {
 }
 static APP_LOGGER: AppLogger = AppLogger;
 
-/// Launch the Memento desktop application.
+/// Launch the Subomi desktop application.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // libmpv requires the C numeric locale (`.` decimal separator) before initialization.
     // SAFETY: invoked on the main thread before any worker threads or GUI/libmpv init.
@@ -334,28 +334,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
     }
     let raw_args: Vec<String> = std::env::args().collect();
-    let parsed_args = memento_player::parse_args(&raw_args)
+    let parsed_args = subomi_player::parse_args(&raw_args)
         .map_err(|err| format!("invalid command-line arguments: {err:?}"))?;
     if parsed_args.show_help {
-        print!("{}", memento_player::help_text());
+        print!("{}", subomi_player::help_text());
         return Ok(());
     }
     if parsed_args.show_version {
         println!(
             "{}",
-            memento_player::version_text(env!("CARGO_PKG_VERSION"))
+            subomi_player::version_text(env!("CARGO_PKG_VERSION"))
         );
         return Ok(());
     }
     // H1.4: Augment macOS `.app` bundle `PATH` (Homebrew / MacPorts / local tools)
     // BEFORE OCR/Python probing or `MpvInstance` creation.
-    memento_os::augment_macos_bundle_path();
+    subomi_os::augment_macos_bundle_path();
     #[cfg(feature = "ocr")]
     crate::controller::ocr::prepare_python_executable();
     let _ = log::set_logger(&APP_LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
 
-    let config_dir = memento_xdg_dir("XDG_CONFIG_HOME", ".config")
+    let config_dir = subomi_xdg_dir("XDG_CONFIG_HOME", ".config")
         .ok_or("HOME, XDG_CONFIG_HOME, APPDATA, or USERPROFILE must be set to load settings")?;
     // Pre-select matching GPU offload env vars from CLI `--hwdec=...` / `mpv.conf`
     // BEFORE creating Slint's OpenGL context or initializing libmpv.
@@ -380,29 +380,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // An explicitly selected Slint backend (including software) still wins.
     if std::env::var_os("SLINT_BACKEND").is_none() {
         let mut selector = slint::BackendSelector::new()
-            .with_winit_custom_application_handler(MementoWinitAppHandler);
+            .with_winit_custom_application_handler(SubomiWinitAppHandler);
         if renderer_plan.primary != PlatformRendererKind::Software {
             selector = selector.require_opengl();
         }
         selector.select()?;
     }
-    let _ = slint::set_xdg_app_id(memento_os::WAYLAND_APP_ID);
-    let app = MementoApp::new()?;
+    let _ = slint::set_xdg_app_id(subomi_os::WAYLAND_APP_ID);
+    let app = SubomiApp::new()?;
     ui::prepare_text_fonts();
 
-    if let Some(cache_dir) = memento_xdg_dir("XDG_CACHE_HOME", ".cache") {
-        if let Err(error) = migrate_xdg_config_if_needed(&cache_dir, &config_dir, "memento.conf") {
+    if let Some(cache_dir) = subomi_xdg_dir("XDG_CACHE_HOME", ".cache") {
+        if let Err(error) = migrate_xdg_config_if_needed(&cache_dir, &config_dir, "subomi.conf") {
             eprintln!(
                 "Could not migrate player settings from {}: {error}",
                 cache_dir.display()
             );
         }
     }
-    let data_dir = memento_xdg_dir("XDG_DATA_HOME", ".local/share").ok_or(
+    let data_dir = subomi_xdg_dir("XDG_DATA_HOME", ".local/share").ok_or(
         "HOME, XDG_DATA_HOME, LOCALAPPDATA, or USERPROFILE must be set to load dictionaries",
     )?;
     let anki_json_path = config_dir.join("anki_connect.json");
-    let config = ConfigController::load(&config_dir, "memento.conf")
+    let config = ConfigController::load(&config_dir, "subomi.conf")
         .map_err(|error| format!("could not load player settings: {error}"))?;
     config.load_anki_profiles(&anki_json_path)?;
     let config_ctrl = Rc::new(config);
@@ -430,7 +430,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // H1.1: Propagate `renderer_plan.effective_hwdec()` (e.g. `videotoolbox-copy` on macOS).
     let mut mpv_options = parsed_args.global_options.clone();
     if !renderer_plan.effective_hwdec().is_empty() {
-        mpv_options.push(memento_player::CliOption {
+        mpv_options.push(subomi_player::CliOption {
             name: "hwdec".into(),
             value: renderer_plan.effective_hwdec().to_owned(),
         });
@@ -448,7 +448,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             (Rc::new(RefCell::new(None)), Rc::new(RefCell::new(None)))
         }
     };
-    let screensaver = Rc::new(RefCell::new(memento_os::Screensaver::new()));
+    let screensaver = Rc::new(RefCell::new(subomi_os::Screensaver::new()));
     let video_timings = Rc::new(RefCell::new(VideoTimings::default()));
     let pending_playback_frame = Rc::new(Cell::new(None::<i32>));
     let current_render_size = Rc::new(Cell::new((0u32, 0u32)));
@@ -468,7 +468,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             VideoParamsObserver::disabled()
         },
     ));
-    let verbose_video_timings = std::env::var_os("MEMENTO_VIDEO_STATS").is_some();
+    let verbose_video_timings = std::env::var_os("SUBOMI_VIDEO_STATS").is_some();
 
     let start_player = mpv.clone();
     let start_app = app.as_weak();
@@ -502,7 +502,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     app.set_duration_time("00:00".into());
     app.set_app_version(env!("CARGO_PKG_VERSION").into());
     app.set_app_version_display(
-        format_app_version_display(env!("CARGO_PKG_VERSION"), option_env!("MEMENTO_GIT_HASH"))
+        format_app_version_display(env!("CARGO_PKG_VERSION"), option_env!("SUBOMI_GIT_HASH"))
             .into(),
     );
     #[cfg(target_os = "macos")]
@@ -626,7 +626,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // H2 & #331: Live OS color-scheme watcher (Linux xdg-desktop-portal / Windows registry).
     {
         let theme_relay = ui_relay.clone();
-        memento_os::spawn_color_scheme_watcher(move |scheme| {
+        subomi_os::spawn_color_scheme_watcher(move |scheme| {
             theme_relay.send_event(UiEvent::SystemThemeChanged(scheme));
         });
     }
@@ -802,7 +802,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Join software render thread before `mpv` can drop.
     drop(render_worker);
     // Release libmecab / piped MeCab daemon cleanly on shutdown.
-    memento_util::mecab::unload_mecab();
+    subomi_util::mecab::unload_mecab();
 
     // Bounded ASR teardown after the window is already hidden so closing feels
     // instant while giving an active inference step time to abort and release

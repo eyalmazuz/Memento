@@ -30,7 +30,7 @@ use crate::ui::popup_model::{
 use crate::ui::subtitle_layout::{set_active_subtitle_render_style, subtitle_lines_for_app};
 use crate::ui::text_engine::SubtitleRenderStyle;
 use crate::ui::{
-    DictResult, MementoApp, PopupBridge, PopupFrequency, SubtitleOverlayBridge, SubtitleWord,
+    DictResult, SubomiApp, PopupBridge, PopupFrequency, SubtitleOverlayBridge, SubtitleWord,
 };
 
 use state::{
@@ -59,7 +59,7 @@ enum PendingAssHighlightAction {
 
 pub(in crate::ui) struct RichUiBridge {
     pub(in crate::ui) instance_id: i32,
-    pub(in crate::ui) app_weak: slint::Weak<MementoApp>,
+    pub(in crate::ui) app_weak: slint::Weak<SubomiApp>,
     db_path: PathBuf,
     state: RefCell<RichUiMutable>,
     panel_tx: mpsc::Sender<PanelSearchRequest>,
@@ -88,7 +88,7 @@ pub(in crate::ui) struct RichUiBridge {
     no_event_loop_pump: Option<slint::Timer>,
 }
 
-pub(super) fn drain_panel_results_for_app(app: &MementoApp) -> bool {
+pub(super) fn drain_panel_results_for_app(app: &SubomiApp) -> bool {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.drain_panel_results(app)
     } else {
@@ -96,7 +96,7 @@ pub(super) fn drain_panel_results_for_app(app: &MementoApp) -> bool {
     }
 }
 
-pub(super) fn drain_nav_lookup_results_for_app(app: &MementoApp) -> bool {
+pub(super) fn drain_nav_lookup_results_for_app(app: &SubomiApp) -> bool {
     if let Some(br) = active_rich_bridge_for_app(app) {
         br.drain_nav_lookup_results(app)
     } else {
@@ -118,7 +118,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn schedule_idle_memory_shrink_if_closed(&self, app: &MementoApp) {
+    pub(super) fn schedule_idle_memory_shrink_if_closed(&self, app: &SubomiApp) {
         if app.get_dict_open() {
             self.cancel_idle_memory_shrink();
             return;
@@ -182,7 +182,7 @@ impl RichUiBridge {
         crate::ui::release_os_memory();
     }
 
-    pub(super) fn drain_nav_lookup_results(&self, app: &MementoApp) -> bool {
+    pub(super) fn drain_nav_lookup_results(&self, app: &SubomiApp) -> bool {
         let mut latest_root: Option<NavLookupResponse> = None;
         let mut latest_nested: Option<NavLookupResponse> = None;
         if let Ok(guard) = self.nav_res_rx.lock() {
@@ -248,7 +248,7 @@ impl RichUiBridge {
         );
     }
 
-    pub(super) fn drain_panel_results(&self, app: &MementoApp) -> bool {
+    pub(super) fn drain_panel_results(&self, app: &SubomiApp) -> bool {
         let mut latest: Option<PanelSearchResponse> = None;
         if let Ok(guard) = self.panel_res_rx.lock() {
             while let Ok(item) = guard.try_recv() {
@@ -334,7 +334,7 @@ impl RichUiBridge {
         true
     }
 
-    pub(super) fn rebuild_row_extras_for_compact_tags(&self, app: &MementoApp) {
+    pub(super) fn rebuild_row_extras_for_compact_tags(&self, app: &SubomiApp) {
         let root_model = app.get_dict_results();
         let root_rows: Vec<DictResult> = (0..root_model.row_count())
             .filter_map(|i| root_model.row_data(i))
@@ -384,7 +384,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(super) fn ensure_fresh_db_and_config(&self, app: &MementoApp, force: bool) {
+    pub(super) fn ensure_fresh_db_and_config(&self, app: &SubomiApp, force: bool) {
         let mut sub_style_update: Option<(bool, SubtitleRenderStyle)> = None;
         let mut reloaded_css_theme: Option<Arc<PopupCssTheme>> = None;
         let mut reloaded_max_depth: Option<usize> = None;
@@ -522,7 +522,7 @@ impl RichUiBridge {
         }
     }
 
-    pub(in crate::ui) fn on_dictionary_rows_updated(&self, app: &MementoApp, rows: &[DictResult]) {
+    pub(in crate::ui) fn on_dictionary_rows_updated(&self, app: &SubomiApp, rows: &[DictResult]) {
         if rows.is_empty() {
             self.schedule_idle_memory_shrink_if_closed(app);
         } else {
@@ -743,7 +743,7 @@ impl RichUiBridge {
         self.dispatch_anki_check_for_rows(app, rows, AnkiCheckTarget::Root);
     }
 
-    fn snapshot_current_popup(&self, app: &MementoApp) -> Option<PopupHistoryEntry> {
+    fn snapshot_current_popup(&self, app: &SubomiApp) -> Option<PopupHistoryEntry> {
         let full = app.get_dict_results();
         if full.row_count() == 0 {
             return None;
@@ -775,7 +775,7 @@ impl RichUiBridge {
         })
     }
 
-    fn restore_history_entry(&self, app: &MementoApp, entry: PopupHistoryEntry) {
+    fn restore_history_entry(&self, app: &SubomiApp, entry: PopupHistoryEntry) {
         self.cancel_idle_memory_shrink();
         set_last_grouped_hits(entry.hits);
         let _history_guard = SuppressHistoryResetGuard::enter(&self.state);
@@ -805,7 +805,7 @@ impl RichUiBridge {
 
     pub(super) fn navigate_to_term_query(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         query: &str,
         kana_mode: Option<&str>,
     ) {
@@ -845,7 +845,7 @@ impl RichUiBridge {
 
     pub(super) fn navigate_to_kanji(
         &self,
-        app: &MementoApp,
+        app: &SubomiApp,
         expression: &str,
         clicked_kanji: &str,
     ) {
@@ -885,7 +885,7 @@ impl RichUiBridge {
         }
     }
 
-    fn apply_root_nav_lookup_response(&self, app: &MementoApp, resp: NavLookupResponse) {
+    fn apply_root_nav_lookup_response(&self, app: &SubomiApp, resp: NavLookupResponse) {
         match resp.kind {
             NavQueryKind::RootTerm { query, kana_mode } => {
                 if resp.hits.is_empty() {
@@ -1010,7 +1010,7 @@ impl RichUiBridge {
 }
 
 /// Immediately propagate updated settings from `ConfigController` into the active rich UI bridge.
-pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
+pub fn refresh_rich_ui_bridges(app: &SubomiApp, config: &ConfigController) {
     let Some(bridge) = active_rich_bridge_for_app(app) else {
         return;
     };
@@ -1150,7 +1150,7 @@ pub fn refresh_rich_ui_bridges(app: &MementoApp, config: &ConfigController) {
 
 /// Binds `main.rs`'s `lookup_epoch` onto the active `RichUiBridge` so background Anki
 /// duplicate/tag checks are cancelled immediately when a subtitle lookup is superseded or dismissed.
-pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU64>) {
+pub fn bind_rich_bridge_lookup_epoch(app: &SubomiApp, lookup_epoch: Arc<AtomicU64>) {
     if let Some(bridge) = active_rich_bridge_for_app(app) {
         if let Ok(mut guard) = bridge.external_lookup_epoch.lock() {
             *guard = Some(lookup_epoch);
@@ -1163,7 +1163,7 @@ pub fn bind_rich_bridge_lookup_epoch(app: &MementoApp, lookup_epoch: Arc<AtomicU
 /// trigger dictionary scanning, continuous `#38a6d6` highlight bars + crisp `libass` glyph
 /// patches, and per-speaker popup anchoring.
 pub fn bind_rich_bridge_ass_controller(
-    app: &MementoApp,
+    app: &SubomiApp,
     ass_controller: Rc<RefCell<crate::controller::ass::AssOverlayController>>,
 ) {
     if let Some(bridge) = active_rich_bridge_for_app(app) {
@@ -1172,7 +1172,7 @@ pub fn bind_rich_bridge_ass_controller(
 }
 
 /// Immediately clears any active ASS lookup highlight / anchor on the bound `AssOverlayController`.
-pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
+pub fn clear_rich_bridge_ass_lookup(app: &SubomiApp) {
     let bridge = active_rich_bridge_for_app(app);
     let ass_ctrl = bridge.as_ref().and_then(|bridge| {
         let mut st = bridge.state.borrow_mut();
@@ -1190,7 +1190,7 @@ pub fn clear_rich_bridge_ass_lookup(app: &MementoApp) {
 }
 
 /// Returns the active regular-subtitle highlight UTF-16 range `(start, end)` for the open popup, if any.
-pub fn active_subtitle_scan_utf16_range(app: &MementoApp) -> Option<(usize, usize)> {
+pub fn active_subtitle_scan_utf16_range(app: &SubomiApp) -> Option<(usize, usize)> {
     active_rich_bridge_for_app(app)
         .and_then(|bridge| bridge.state.borrow().active_scan_utf16_range)
 }
@@ -1198,7 +1198,7 @@ pub fn active_subtitle_scan_utf16_range(app: &MementoApp) -> Option<(usize, usiz
 /// Returns the active ASS per-speaker lookup context (if the open popup came from
 /// hovering/clicking a native ASS line) for accurate `{subtitle}`, `{cloze-*}`, and `{audio-media}`.
 pub fn active_ass_lookup_for_app(
-    app: &MementoApp,
+    app: &SubomiApp,
 ) -> Option<crate::controller::ass::AssActiveLookup> {
     if !app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
         return None;
@@ -1218,15 +1218,15 @@ mod tests {
     use crate::ui::popup_css::CUSTOM_POPUP_CSS_FILENAME;
     use crate::ui::popup_model::{dictionary_result_rows, install_popup_navigation};
     use crate::ui::PopupLayout;
-    use memento_dict::yomidbbuilder::prepare_db;
-    use memento_setting::keys as raw;
+    use subomi_dict::yomidbbuilder::prepare_db;
+    use subomi_setting::keys as raw;
     use state::{
         build_rich_pitch_entries_from_details, classify_pitch_category, CachedConfigSettings,
     };
 
     fn create_test_dict_db(path: &std::path::Path) {
         prepare_db(path).unwrap();
-        let conn = memento_dict::sqlite_db::open_read_write_connection(path).unwrap();
+        let conn = subomi_dict::sqlite_db::open_read_write_connection(path).unwrap();
         conn.execute(
             "INSERT INTO directory (dic_id, title, format, revision, sequenced) VALUES \
              (1, 'Jitendex', 3, '1', 1), \
@@ -1261,7 +1261,7 @@ mod tests {
         create_test_dict_db(&db_path);
 
         let cfg = ConfigController::new();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
 
@@ -1323,7 +1323,7 @@ mod tests {
 
         let cfg = ConfigController::new();
         cfg.edit_setting("interface/theme", "dark").unwrap();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
 
         let pb = app.global::<PopupBridge>();
@@ -1358,7 +1358,7 @@ mod tests {
 
         let cfg = ConfigController::new();
         cfg.edit_setting("interface/compact-tags", "true").unwrap();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
 
@@ -1448,7 +1448,7 @@ mod tests {
         create_test_dict_db(&db_path);
 
         let cfg = ConfigController::new();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
 
@@ -1552,7 +1552,7 @@ mod tests {
         create_test_dict_db(&db_path);
 
         let cfg = ConfigController::new();
-        let app = MementoApp::new().unwrap();
+        let app = SubomiApp::new().unwrap();
         install_popup_navigation(&app);
         install_rich_ui_bridges(&app, &db_path, &config_dir, &cfg);
         app.show().unwrap();

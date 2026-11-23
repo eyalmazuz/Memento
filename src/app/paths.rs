@@ -7,8 +7,8 @@ use std::process::Command;
 
 use crate::app::preferences::setting_text;
 use crate::controller::config::ConfigController;
-use memento_config::Value;
-use memento_setting::keys as raw;
+use subomi_config::Value;
+use subomi_setting::keys as raw;
 
 /// Platform family used to resolve OS-native config/data/cache directories.
 #[allow(dead_code)] // Non-host variants are constructed on their target OS and in cross-platform tests.
@@ -42,17 +42,17 @@ pub(crate) struct AppDirs {
     pub(crate) config_dir: PathBuf,
     pub(crate) data_dir: PathBuf,
     pub(crate) cache_dir: PathBuf,
-    /// Legacy config directory checked automatically on read when `config_dir/memento.conf`
-    /// does not exist yet (macOS `~/.config/memento`, Windows `%APPDATA%\memento`).
+    /// Legacy config directory checked automatically on read when `config_dir/subomi.conf`
+    /// does not exist yet (macOS `~/.config/subomi`, Windows `%APPDATA%\subomi`).
     pub(crate) legacy_config_fallback_dir: Option<PathBuf>,
     /// True on Linux when volatile keys (`recent/files`, `dictionary/order`, `main-window/*`)
-    /// split into `~/.cache/memento/memento.conf` (Memento `#337`).
+    /// split into `~/.cache/subomi/subomi.conf` (Subomi `#337`).
     pub(crate) use_cache_config_split: bool,
 }
 
-/// Resolve a Memento platform directory (`config`, `data`, or `cache`)
+/// Resolve a Subomi platform directory (`config`, `data`, or `cache`)
 /// using an explicit [`PathPlatform`] and injectable environment lookup.
-pub(crate) fn memento_platform_dir_with(
+pub(crate) fn subomi_platform_dir_with(
     variable: &str,
     home_suffix: &str,
     platform: PathPlatform,
@@ -61,28 +61,28 @@ pub(crate) fn memento_platform_dir_with(
     let non_empty = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
 
     if let Some(explicit) = non_empty(variable) {
-        return Some(explicit.join("memento"));
+        return Some(explicit.join("subomi"));
     }
 
     match platform {
         PathPlatform::Windows => {
-            // Align config, data, and cache under %LOCALAPPDATA%\memento (with
+            // Align config, data, and cache under %LOCALAPPDATA%\subomi (with
             // %APPDATA% fallback if LOCALAPPDATA is absent).
             if let Some(root) = non_empty("LOCALAPPDATA").or_else(|| non_empty("APPDATA")) {
-                return Some(root.join("memento"));
+                return Some(root.join("subomi"));
             }
             if let Some(profile) = non_empty("USERPROFILE") {
-                return Some(profile.join(home_suffix).join("memento"));
+                return Some(profile.join(home_suffix).join("subomi"));
             }
         }
         PathPlatform::MacOs => {
             if let Some(home) = non_empty("HOME") {
                 return Some(match variable {
-                    "XDG_CACHE_HOME" => home.join("Library").join("Caches").join("memento"),
+                    "XDG_CACHE_HOME" => home.join("Library").join("Caches").join("subomi"),
                     _ => home
                         .join("Library")
                         .join("Application Support")
-                        .join("memento"),
+                        .join("subomi"),
                 });
             }
         }
@@ -91,13 +91,13 @@ pub(crate) fn memento_platform_dir_with(
 
     non_empty("HOME")
         .or_else(|| non_empty("USERPROFILE"))
-        .map(|home| home.join(home_suffix).join("memento"))
+        .map(|home| home.join(home_suffix).join("subomi"))
 }
 
-/// Resolve a Memento XDG/platform directory (`config`, `data`, or `cache`)
+/// Resolve a Subomi XDG/platform directory (`config`, `data`, or `cache`)
 /// using an injectable environment lookup (fully deterministic for tests).
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn memento_xdg_dir_with(
+pub(crate) fn subomi_xdg_dir_with(
     variable: &str,
     home_suffix: &str,
     is_windows: bool,
@@ -108,22 +108,22 @@ pub(crate) fn memento_xdg_dir_with(
     } else {
         PathPlatform::Linux
     };
-    memento_platform_dir_with(variable, home_suffix, platform, env)
+    subomi_platform_dir_with(variable, home_suffix, platform, env)
 }
 
 /// Match OS-native config/data/cache locations across Linux (XDG), macOS
-/// (`~/Library/Application Support/memento` & `~/Library/Caches/memento`), and
-/// Windows (`%LOCALAPPDATA%\memento`).
-pub(crate) fn memento_xdg_dir(variable: &str, home_suffix: &str) -> Option<PathBuf> {
-    memento_platform_dir_with(variable, home_suffix, PathPlatform::current(), |key| {
+/// (`~/Library/Application Support/subomi` & `~/Library/Caches/subomi`), and
+/// Windows (`%LOCALAPPDATA%\subomi`).
+pub(crate) fn subomi_xdg_dir(variable: &str, home_suffix: &str) -> Option<PathBuf> {
+    subomi_platform_dir_with(variable, home_suffix, PathPlatform::current(), |key| {
         std::env::var_os(key)
     })
 }
 
 /// Return the legacy config fallback directory for existing Rust users whose
 /// settings predate OS-native path alignment:
-/// - macOS: `~/.config/memento`
-/// - Windows: `%APPDATA%\memento` (when distinct from `%LOCALAPPDATA%\memento`)
+/// - macOS: `~/.config/subomi`
+/// - Windows: `%APPDATA%\subomi` (when distinct from `%LOCALAPPDATA%\subomi`)
 /// - Linux: `None`
 pub(crate) fn legacy_config_fallback_dir_for(
     platform: PathPlatform,
@@ -131,10 +131,10 @@ pub(crate) fn legacy_config_fallback_dir_for(
 ) -> Option<PathBuf> {
     let non_empty = |key: &str| env(key).filter(|v| !v.is_empty()).map(PathBuf::from);
     match platform {
-        PathPlatform::MacOs => non_empty("HOME").map(|home| home.join(".config").join("memento")),
+        PathPlatform::MacOs => non_empty("HOME").map(|home| home.join(".config").join("subomi")),
         PathPlatform::Windows => {
-            let roaming = non_empty("APPDATA")?.join("memento");
-            let local = non_empty("LOCALAPPDATA").map(|p| p.join("memento"));
+            let roaming = non_empty("APPDATA")?.join("subomi");
+            let local = non_empty("LOCALAPPDATA").map(|p| p.join("subomi"));
             if local.as_deref() == Some(roaming.as_path()) {
                 None
             } else {
@@ -156,9 +156,9 @@ pub(crate) fn resolve_app_dirs_for(
     platform: PathPlatform,
     env: impl Fn(&str) -> Option<OsString>,
 ) -> Option<AppDirs> {
-    let config_dir = memento_platform_dir_with("XDG_CONFIG_HOME", ".config", platform, &env)?;
-    let data_dir = memento_platform_dir_with("XDG_DATA_HOME", ".local/share", platform, &env)?;
-    let cache_dir = memento_platform_dir_with("XDG_CACHE_HOME", ".cache", platform, &env)?;
+    let config_dir = subomi_platform_dir_with("XDG_CONFIG_HOME", ".config", platform, &env)?;
+    let data_dir = subomi_platform_dir_with("XDG_DATA_HOME", ".local/share", platform, &env)?;
+    let cache_dir = subomi_platform_dir_with("XDG_CACHE_HOME", ".cache", platform, &env)?;
     let legacy_config_fallback_dir =
         legacy_config_fallback_dir_for(platform, &env).filter(|fb| fb != &config_dir);
     let use_cache_config_split = platform == PathPlatform::Linux && cache_dir != config_dir;
@@ -202,8 +202,8 @@ pub(crate) fn resolve_config_read_path(
     primary
 }
 
-/// Migrate a legacy config file from `legacy_dir` (`~/.cache/memento`) into
-/// `config_dir` (`~/.config/memento`) if the destination does not exist yet.
+/// Migrate a legacy config file from `legacy_dir` (`~/.cache/subomi`) into
+/// `config_dir` (`~/.config/subomi`) if the destination does not exist yet.
 pub(crate) fn migrate_xdg_config_if_needed(
     legacy_dir: &Path,
     config_dir: &Path,
@@ -291,7 +291,7 @@ pub(crate) fn decode_custom_open_dir(custom: &str, home_dir: Option<&Path>) -> O
         return None;
     }
     if trimmed.starts_with("file://") {
-        return memento_os::decode_file_uri(trimmed);
+        return subomi_os::decode_file_uri(trimmed);
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
         return home_dir.map(|home| home.join(rest));
@@ -394,27 +394,27 @@ mod tests {
     #[test]
     fn migrates_legacy_cache_config_only_when_config_missing() {
         let root = tempfile::TempDir::new().unwrap();
-        let legacy_dir = root.path().join("cache/memento");
-        let config_dir = root.path().join("config/memento");
+        let legacy_dir = root.path().join("cache/subomi");
+        let config_dir = root.path().join("config/subomi");
         std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("memento.conf"), "legacy=1\n").unwrap();
+        std::fs::write(legacy_dir.join("subomi.conf"), "legacy=1\n").unwrap();
 
-        assert!(migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "memento.conf").unwrap());
+        assert!(migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "subomi.conf").unwrap());
         assert_eq!(
-            std::fs::read_to_string(config_dir.join("memento.conf")).unwrap(),
+            std::fs::read_to_string(config_dir.join("subomi.conf")).unwrap(),
             "legacy=1\n"
         );
 
-        std::fs::write(config_dir.join("memento.conf"), "existing=2\n").unwrap();
-        assert!(!migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "memento.conf").unwrap());
+        std::fs::write(config_dir.join("subomi.conf"), "existing=2\n").unwrap();
+        assert!(!migrate_xdg_config_if_needed(&legacy_dir, &config_dir, "subomi.conf").unwrap());
         assert_eq!(
-            std::fs::read_to_string(config_dir.join("memento.conf")).unwrap(),
+            std::fs::read_to_string(config_dir.join("subomi.conf")).unwrap(),
             "existing=2\n"
         );
     }
 
     #[test]
-    fn memento_xdg_dir_supports_windows_macos_and_linux_native_paths_with_fallbacks() {
+    fn subomi_xdg_dir_supports_windows_macos_and_linux_native_paths_with_fallbacks() {
         let env_from = |pairs: &[(&str, &str)]| {
             let map: HashMap<String, OsString> = pairs
                 .iter()
@@ -423,7 +423,7 @@ mod tests {
             move |key: &str| map.get(key).cloned()
         };
 
-        // Windows: config, data, and cache align under %LOCALAPPDATA%\memento with %APPDATA%\memento fallback.
+        // Windows: config, data, and cache align under %LOCALAPPDATA%\subomi with %APPDATA%\subomi fallback.
         let win_env = env_from(&[
             ("APPDATA", "C:\\Users\\Alice\\AppData\\Roaming"),
             ("LOCALAPPDATA", "C:\\Users\\Alice\\AppData\\Local"),
@@ -432,34 +432,34 @@ mod tests {
         let win_dirs = resolve_app_dirs_for(PathPlatform::Windows, &win_env).unwrap();
         assert_eq!(
             win_dirs.config_dir,
-            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("subomi")
         );
         assert_eq!(
             win_dirs.data_dir,
-            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("subomi")
         );
         assert_eq!(
             win_dirs.cache_dir,
-            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento")
+            PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("subomi")
         );
         assert_eq!(
             win_dirs.legacy_config_fallback_dir,
-            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming").join("memento"))
+            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming").join("subomi"))
         );
         assert!(!win_dirs.use_cache_config_split);
         assert_eq!(
-            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &win_env),
-            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("memento"))
+            subomi_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &win_env),
+            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Local").join("subomi"))
         );
 
         // Fallback to USERPROFILE when APPDATA/LOCALAPPDATA are absent.
         let profile_only = env_from(&[("USERPROFILE", "C:\\Users\\Bob")]);
         assert_eq!(
-            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &profile_only),
+            subomi_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &profile_only),
             Some(
                 PathBuf::from("C:\\Users\\Bob")
                     .join(".config")
-                    .join("memento")
+                    .join("subomi")
             )
         );
 
@@ -470,29 +470,29 @@ mod tests {
             ("LOCALAPPDATA", "C:\\Users\\Alice\\AppData\\Local"),
         ]);
         assert_eq!(
-            memento_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &xdg_override),
-            Some(PathBuf::from("/custom/cfg/memento"))
+            subomi_xdg_dir_with("XDG_CONFIG_HOME", ".config", true, &xdg_override),
+            Some(PathBuf::from("/custom/cfg/subomi"))
         );
 
-        // macOS: ~/Library/Application Support/memento for config/data, ~/Library/Caches/memento
-        // for cache, and ~/.config/memento as automatic fallback read directory.
+        // macOS: ~/Library/Application Support/subomi for config/data, ~/Library/Caches/subomi
+        // for cache, and ~/.config/subomi as automatic fallback read directory.
         let mac_env = env_from(&[("HOME", "/Users/alice")]);
         let mac_dirs = resolve_app_dirs_for(PathPlatform::MacOs, &mac_env).unwrap();
         assert_eq!(
             mac_dirs.config_dir,
-            PathBuf::from("/Users/alice/Library/Application Support/memento")
+            PathBuf::from("/Users/alice/Library/Application Support/subomi")
         );
         assert_eq!(
             mac_dirs.data_dir,
-            PathBuf::from("/Users/alice/Library/Application Support/memento")
+            PathBuf::from("/Users/alice/Library/Application Support/subomi")
         );
         assert_eq!(
             mac_dirs.cache_dir,
-            PathBuf::from("/Users/alice/Library/Caches/memento")
+            PathBuf::from("/Users/alice/Library/Caches/subomi")
         );
         assert_eq!(
             mac_dirs.legacy_config_fallback_dir,
-            Some(PathBuf::from("/Users/alice/.config/memento"))
+            Some(PathBuf::from("/Users/alice/.config/subomi"))
         );
         assert!(!mac_dirs.use_cache_config_split);
 
@@ -501,35 +501,35 @@ mod tests {
         let linux_dirs = resolve_app_dirs_for(PathPlatform::Linux, &linux_env).unwrap();
         assert_eq!(
             linux_dirs.config_dir,
-            PathBuf::from("/home/alice/.config/memento")
+            PathBuf::from("/home/alice/.config/subomi")
         );
         assert_eq!(
             linux_dirs.data_dir,
-            PathBuf::from("/home/alice/.local/share/memento")
+            PathBuf::from("/home/alice/.local/share/subomi")
         );
         assert_eq!(
             linux_dirs.cache_dir,
-            PathBuf::from("/home/alice/.cache/memento")
+            PathBuf::from("/home/alice/.cache/subomi")
         );
         assert_eq!(linux_dirs.legacy_config_fallback_dir, None);
         assert!(linux_dirs.use_cache_config_split);
 
         // Fallback read prefers primary file, otherwise reads existing legacy file.
         let root = tempfile::TempDir::new().unwrap();
-        let primary_dir = root.path().join("Library/Application Support/memento");
-        let legacy_dir = root.path().join(".config/memento");
+        let primary_dir = root.path().join("Library/Application Support/subomi");
+        let legacy_dir = root.path().join(".config/subomi");
         std::fs::create_dir_all(&legacy_dir).unwrap();
-        std::fs::write(legacy_dir.join("memento.conf"), "legacy=1\n").unwrap();
+        std::fs::write(legacy_dir.join("subomi.conf"), "legacy=1\n").unwrap();
 
         assert_eq!(
-            resolve_config_read_path(&primary_dir, "memento.conf", Some(&legacy_dir)),
-            legacy_dir.join("memento.conf")
+            resolve_config_read_path(&primary_dir, "subomi.conf", Some(&legacy_dir)),
+            legacy_dir.join("subomi.conf")
         );
         std::fs::create_dir_all(&primary_dir).unwrap();
-        std::fs::write(primary_dir.join("memento.conf"), "primary=1\n").unwrap();
+        std::fs::write(primary_dir.join("subomi.conf"), "primary=1\n").unwrap();
         assert_eq!(
-            resolve_config_read_path(&primary_dir, "memento.conf", Some(&legacy_dir)),
-            primary_dir.join("memento.conf")
+            resolve_config_read_path(&primary_dir, "subomi.conf", Some(&legacy_dir)),
+            primary_dir.join("subomi.conf")
         );
     }
 
@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(
             resolve_file_open_dir(
                 4,
-                "/nonexistent/memento/dir/xyz",
+                "/nonexistent/subomi/dir/xyz",
                 Some(&home),
                 Some(&current),
                 Some(&videos),
@@ -652,7 +652,7 @@ mod tests {
             }
         }
 
-        let cmd = open_directory_command(Path::new("/tmp/memento-cfg"));
+        let cmd = open_directory_command(Path::new("/tmp/subomi-cfg"));
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(cmd.get_program(), "xdg-open");
 

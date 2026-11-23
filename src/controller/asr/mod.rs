@@ -9,8 +9,8 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-use memento_config::{config::Config, Value};
-use memento_setting::keys::{asr, onnx, whisper};
+use subomi_config::{config::Config, Value};
+use subomi_setting::keys::{asr, onnx, whisper};
 
 mod controller;
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx"))]
@@ -102,7 +102,7 @@ pub struct AsrSettings {
 
 impl AsrSettings {
     /// Read the selected backend and model/runtime options from the canonical
-    /// config groups. Missing values use the defaults from `memento-setting`.
+    /// config groups. Missing values use the defaults from `subomi-setting`.
     pub fn from_config(config_dir: impl Into<PathBuf>, config: &Config) -> Result<Self, String> {
         if !AVAILABLE {
             return Err("Speech recognition is not included in this build.".into());
@@ -349,13 +349,13 @@ mod tests {
         let mut custom = Config::default_empty();
         custom
             .set_value(
-                &memento_config::Key::Whisper(memento_config::WhisperField::Threads),
+                &subomi_config::Key::Whisper(subomi_config::WhisperField::Threads),
                 Value::Int(7),
             )
             .unwrap();
         custom
             .set_value(
-                &memento_config::Key::Onnx(memento_config::OnnxField::Threads),
+                &subomi_config::Key::Onnx(subomi_config::OnnxField::Threads),
                 Value::Int(3),
             )
             .unwrap();

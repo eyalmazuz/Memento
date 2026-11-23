@@ -3,12 +3,12 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use memento_anki::note::{
+use subomi_anki::note::{
     build_frequencies_html, format_tags, substitute_markers, FrequencyEntry, MarkerResult,
     TagEntry, TermGlossaryVariant, TermGlossaryVariants,
 };
-use memento_anki::tokenizer::{tokenize, Marker};
-use memento_net::anki::MediaFilePayload;
+use subomi_anki::tokenizer::{tokenize, Marker};
+use subomi_net::anki::MediaFilePayload;
 
 use crate::controller::config::AnkiNoteConfig;
 
@@ -109,29 +109,15 @@ fn marker_result(value: &str) -> MarkerResult {
     MarkerResult {
         handled: true,
         media: false,
-        text: value.encode_utf16().collect(),
+        text: value.to_owned(),
     }
-}
-
-fn marker_arg<'a>(marker: &'a Marker, key: &str) -> Option<&'a [u16]> {
-    marker.args.iter().find_map(|(arg_key, value)| {
-        arg_key
-            .iter()
-            .copied()
-            .eq(key.encode_utf16())
-            .then_some(value.as_slice())
-    })
 }
 
 fn marker_bool_arg(marker: &Marker, key: &str, default: bool) -> bool {
-    let Some(value) = marker_arg(marker, key) else {
+    let Some(value) = marker.arg(key) else {
         return default;
     };
-    if value.is_empty() {
-        return false;
-    }
-    let text = String::from_utf16_lossy(value);
-    let trimmed = text.trim();
+    let trimmed = value.trim();
     !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
 }
 
@@ -143,13 +129,10 @@ enum GlossaryDictFilter {
 }
 
 fn parse_glossary_dict_filter(marker: &Marker) -> GlossaryDictFilter {
-    let Some(raw_val) = marker_arg(marker, "dict") else {
+    let Some(raw_val) = marker.arg("dict") else {
         return GlossaryDictFilter::Unfiltered;
     };
-    let Ok(text) = String::from_utf16(raw_val) else {
-        return GlossaryDictFilter::Invalid;
-    };
-    let trimmed = text.trim();
+    let trimmed = raw_val.trim();
     if trimmed.is_empty() {
         return GlossaryDictFilter::Invalid;
     }
@@ -164,10 +147,9 @@ pub(crate) fn template_references_any_marker(template: &str, marker_names: &[&st
         if is_literal_cloze_opener {
             continue;
         }
-        for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+        for token in tokenize(segment) {
             for marker in &token.markers {
-                let name = String::from_utf16_lossy(&marker.name);
-                if marker_names.iter().any(|expected| *expected == name) {
+                if marker_names.contains(&marker.name.as_str()) {
                     return true;
                 }
             }
@@ -196,58 +178,41 @@ fn resolve_context_tags_selected(
     if !need_full && !need_brief {
         return (String::new(), String::new());
     }
-    // `memento_anki::note::format_tags` HTML-escapes tag names and notes internally.
+    // `subomi_anki::note::format_tags` HTML-escapes tag names and notes internally.
     if !ctx.tag_entries.is_empty() {
-        let names_u16: Vec<Vec<u16>> = ctx
+        let entries: Vec<TagEntry<'_>> = ctx
             .tag_entries
             .iter()
-            .map(|t| t.name.encode_utf16().collect())
-            .collect();
-        let notes_u16: Vec<Vec<u16>> = if need_full {
-            ctx.tag_entries
-                .iter()
-                .map(|t| t.notes.encode_utf16().collect())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let entries: Vec<TagEntry<'_>> = names_u16
-            .iter()
-            .enumerate()
-            .map(|(i, name)| TagEntry {
-                name,
-                notes: notes_u16.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            .map(|t| TagEntry {
+                name: &t.name,
+                notes: if need_full { &t.notes } else { "" },
             })
             .collect();
         let full = if need_full {
-            String::from_utf16_lossy(&format_tags(&entries, false))
+            format_tags(&entries, false)
         } else {
             String::new()
         };
         let brief = if need_brief {
-            String::from_utf16_lossy(&format_tags(&entries, true))
+            format_tags(&entries, true)
         } else {
             String::new()
         };
         return (full, brief);
     }
     if !ctx.tags.is_empty() {
-        let names_u16: Vec<Vec<u16>> = ctx
+        let entries: Vec<TagEntry<'_>> = ctx
             .tags
             .iter()
-            .map(|t| t.encode_utf16().collect())
-            .collect();
-        let entries: Vec<TagEntry<'_>> = names_u16
-            .iter()
-            .map(|name| TagEntry { name, notes: &[] })
+            .map(|name| TagEntry { name, notes: "" })
             .collect();
         let full = if need_full {
-            String::from_utf16_lossy(&format_tags(&entries, false))
+            format_tags(&entries, false)
         } else {
             String::new()
         };
         let brief = if need_brief {
-            String::from_utf16_lossy(&format_tags(&entries, true))
+            format_tags(&entries, true)
         } else {
             String::new()
         };
@@ -419,12 +384,11 @@ impl RenderedTemplateData {
                 if is_literal_cloze_opener {
                     continue;
                 }
-                for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+                for token in tokenize(segment) {
                     for marker in &token.markers {
-                        let name = String::from_utf16_lossy(&marker.name);
-                        match name.as_str() {
+                        match marker.name.as_str() {
                             "glossary" | "glossary-brief" | "glossary-compact" => {
-                                if let Some(variant) = glossary_variant_for_marker(&name) {
+                                if let Some(variant) = glossary_variant_for_marker(&marker.name) {
                                     match parse_glossary_dict_filter(marker) {
                                         GlossaryDictFilter::Unfiltered => {
                                             set_variant_flag(&mut unfiltered_variants, variant);
@@ -488,25 +452,15 @@ fn render_frequencies_marker(marker: &Marker, ctx: &NoteFieldsContext) -> String
     let value_only = marker_bool_arg(marker, "value-only", false);
     let min_value = marker_bool_arg(marker, "min-value", false);
     if !ctx.frequency_entries.is_empty() {
-        let dict_u16: Vec<Vec<u16>> = ctx
+        let entries: Vec<FrequencyEntry<'_>> = ctx
             .frequency_entries
             .iter()
-            .map(|(d, _)| d.encode_utf16().collect())
-            .collect();
-        let freq_u16: Vec<Vec<u16>> = ctx
-            .frequency_entries
-            .iter()
-            .map(|(_, f)| f.encode_utf16().collect())
-            .collect();
-        let entries: Vec<FrequencyEntry<'_>> = dict_u16
-            .iter()
-            .zip(&freq_u16)
             .map(|(d, f)| FrequencyEntry {
                 dictionary: d,
                 freq: f,
             })
             .collect();
-        return String::from_utf16_lossy(&build_frequencies_html(&entries, value_only, min_value));
+        return build_frequencies_html(&entries, value_only, min_value);
     }
     ctx.frequencies.clone()
 }
@@ -622,7 +576,7 @@ fn evaluate_specific_marker_named(
         return MarkerResult {
             handled: true,
             media: media_marker_has_attachment(name, field, ctx),
-            text: Vec::new(),
+            text: String::new(),
         };
     }
 
@@ -665,22 +619,22 @@ pub(crate) fn evaluate_template_marker_kind(
     ctx: &NoteFieldsContext,
     rendered: &RenderedTemplateData,
 ) -> MarkerEvalKind {
-    let name = String::from_utf16_lossy(&marker.name);
-    if is_media_marker(&name) {
+    let name = marker.name.as_str();
+    if is_media_marker(name) {
         return MarkerEvalKind::Media;
     }
-    if !is_known_marker(&name) {
+    if !is_known_marker(name) {
         return MarkerEvalKind::Unknown;
     }
     let text_fields = CommonTextFields::raw(ctx, &rendered.clipboard);
-    if let Some(value) = common_marker_value(&name, &text_fields) {
+    if let Some(value) = common_marker_value(name, &text_fields) {
         return if value.is_empty() {
             MarkerEvalKind::EmptyText
         } else {
             MarkerEvalKind::NonEmptyText
         };
     }
-    let res = evaluate_specific_marker_named("", &name, marker, ctx, rendered);
+    let res = evaluate_specific_marker_named("", name, marker, ctx, rendered);
     if !res.handled {
         MarkerEvalKind::Unknown
     } else if res.text.is_empty() {
@@ -702,8 +656,8 @@ pub fn map_note_fields(
 }
 
 /// Splits a template around literal Anki cloze deletion openers (`{{c1::`, `{{c2::`, …)
-/// so `{.*?}` tokenization inside `memento_anki::note::substitute_markers` preserves the
-/// `{{cN::` prefix verbatim while still substituting any known Memento markers inside it
+/// so `{.*?}` tokenization inside `subomi_anki::note::substitute_markers` preserves the
+/// `{{cN::` prefix verbatim while still substituting any known Subomi markers inside it
 /// (e.g. `{{c1::{cloze-body}}}` -> `{{c1::食べる}}`, while `{{c1::literal}}` stays verbatim).
 fn split_anki_cloze_openers(template: &str) -> Vec<(&str, bool)> {
     if !template.contains("{{c") {
@@ -751,21 +705,18 @@ pub(crate) fn map_note_fields_with_data(
                 rendered_field.push_str(segment);
                 continue;
             }
-            let input: Vec<u16> = segment.encode_utf16().collect();
             let output = substitute_markers(
-                &input,
+                segment,
                 |marker| {
-                    let name = String::from_utf16_lossy(&marker.name);
-                    common_marker_value(&name, text_fields)
+                    common_marker_value(&marker.name, text_fields)
                         .map(marker_result)
                         .unwrap_or_default()
                 },
                 |marker| {
-                    let name = String::from_utf16_lossy(&marker.name);
-                    evaluate_specific_marker_named(field_name, &name, marker, ctx, rendered)
+                    evaluate_specific_marker_named(field_name, &marker.name, marker, ctx, rendered)
                 },
             );
-            rendered_field.push_str(&String::from_utf16_lossy(&output));
+            rendered_field.push_str(&output);
         }
         result.insert(field_name.clone(), rendered_field);
     }
@@ -784,11 +735,10 @@ pub(crate) fn validate_template_markers(
     text_fields: &CommonTextFields<'_>,
     rendered: &RenderedTemplateData,
 ) -> Result<(), NoteBuildError> {
-    let input: Vec<u16> = template.encode_utf16().collect();
-    for token in tokenize(&input) {
+    for token in tokenize(template) {
         for marker in &token.markers {
-            let name = String::from_utf16_lossy(&marker.name);
-            if let Some(value) = common_marker_value(&name, text_fields) {
+            let name = marker.name.as_str();
+            if let Some(value) = common_marker_value(name, text_fields) {
                 if !value.is_empty() {
                     break;
                 }
@@ -796,10 +746,10 @@ pub(crate) fn validate_template_markers(
             }
             // Leave unknown `{...}` tokens (including Anki cloze `{{c1::...}}` and
             // literal braces/CSS) verbatim instead of failing note creation.
-            if !is_known_marker(&name) {
+            if !is_known_marker(name) {
                 continue;
             }
-            let eval = evaluate_specific_marker_named(field, &name, marker, ctx, rendered);
+            let eval = evaluate_specific_marker_named(field, name, marker, ctx, rendered);
             if eval.media || !eval.text.is_empty() {
                 break;
             }
@@ -841,16 +791,16 @@ pub(crate) fn referenced_dictionary_media_files_with_data(
             if is_literal_cloze_opener {
                 continue;
             }
-            for token in tokenize(&segment.encode_utf16().collect::<Vec<_>>()) {
+            for token in tokenize(segment) {
                 for marker in &token.markers {
-                    let name = String::from_utf16_lossy(&marker.name);
-                    if let Some(value) = common_marker_value(&name, &text_fields) {
+                    let name = marker.name.as_str();
+                    if let Some(value) = common_marker_value(name, &text_fields) {
                         if !value.is_empty() {
                             break;
                         }
                         continue;
                     }
-                    if glossary_variant_for_marker(&name).is_some() {
+                    if glossary_variant_for_marker(name).is_some() {
                         let filter = parse_glossary_dict_filter(marker);
                         for def in ctx.glossary_definitions.iter().filter(|def| match filter {
                             GlossaryDictFilter::Unfiltered => true,
@@ -864,7 +814,7 @@ pub(crate) fn referenced_dictionary_media_files_with_data(
                             }
                         }
                     }
-                    let eval = evaluate_specific_marker_named(field, &name, marker, ctx, rendered);
+                    let eval = evaluate_specific_marker_named(field, name, marker, ctx, rendered);
                     if eval.media || !eval.text.is_empty() {
                         break;
                     }

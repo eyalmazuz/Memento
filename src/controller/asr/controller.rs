@@ -213,7 +213,7 @@ mod imp {
             let session = (settings.clone(), media.clone());
             self.worker = Some(
                 thread::Builder::new()
-                    .name("memento-asr".into())
+                    .name("subomi-asr".into())
                     .spawn(move || {
                         run_session(
                             shared,
@@ -518,7 +518,7 @@ mod imp {
         use std::sync::atomic::AtomicUsize;
         use std::time::Duration;
 
-        use memento_config::config::Config;
+        use subomi_config::config::Config;
 
         use super::super::super::cue_book::{CueBook, Window, WindowPlan};
         use super::super::super::engines::Transcription;
@@ -892,12 +892,12 @@ mod imp {
 
         #[cfg(feature = "asr-whisper")]
         #[test]
-        #[ignore = "requires MEMENTO_ASR_TEST_MODEL pointing to a local Whisper model"]
+        #[ignore = "requires SUBOMI_ASR_TEST_MODEL pointing to a local Whisper model"]
         fn shutdown_during_native_whisper_inference_releases_model() {
             use std::ffi::c_void;
             use std::path::Path;
 
-            use memento_asr_whisper::whisper_sys;
+            use subomi_asr_whisper::whisper_sys;
 
             use super::super::super::engines::{path_to_cstring, WhisperModel};
 
@@ -915,9 +915,9 @@ mod imp {
                 context.abort.load(Ordering::Acquire)
             }
             let path =
-                std::env::var_os("MEMENTO_ASR_TEST_MODEL").expect("set MEMENTO_ASR_TEST_MODEL");
+                std::env::var_os("SUBOMI_ASR_TEST_MODEL").expect("set SUBOMI_ASR_TEST_MODEL");
             let path = path_to_cstring(Path::new(&path)).unwrap();
-            let use_gpu = std::env::var_os("MEMENTO_ASR_TEST_GPU").is_some();
+            let use_gpu = std::env::var_os("SUBOMI_ASR_TEST_GPU").is_some();
             let mut controller = AsrController::new();
             let abort = Arc::new(AtomicBool::new(false));
             {

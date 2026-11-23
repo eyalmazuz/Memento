@@ -1,0 +1,30 @@
+[package]
+name = "subomi-asr-whisper"
+version = "2.0.2"
+edition = "2021"
+rust-version = "1.77"
+description = "Whisper speech-to-text inference backend"
+license = "GPL-2.0-only"
+# Cargo builds the pinned whisper.cpp backend only when this crate is enabled.
+build = "build.rs"
+
+[features]
+default = []
+cuda = []
+vulkan = []
+
+[dependencies]
+subomi-asr = { path = "../subomi-asr" }
+regex = "1"
+
+[build-dependencies]
+bindgen = "0.73"
+cmake = "0.1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+
+[lib]
+name = "subomi_asr_whisper"
+crate-type = ["lib"]

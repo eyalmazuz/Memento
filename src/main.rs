@@ -1,5 +1,5 @@
-//! Main binary entrypoint for pure-Rust Memento.
+//! Main binary entrypoint for pure-Rust Subomi.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    memento_app::app::run()
+    subomi_app::app::run()
 }

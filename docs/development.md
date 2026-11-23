@@ -2,14 +2,14 @@
 
 ## Build overrides
 
-Normal builds use `cargo build`; see the [README](../README.md#build-and-run).
+Normal builds use `cargo build`; see the [README](../README.md#quick-start).
 These overrides are only for custom native installations:
 
 * `MPV_SDK`: prefix with `include/mpv` and `lib` (or `lib64`). Alternatively,
   set `MPV_INCLUDE_DIR` and `MPV_LIB_DIR` separately.
 * `ORT_LIB_LOCATION`: an ONNX Runtime 1.22.0 installation or its library directory,
   instead of downloading the official CPU runtime with `--features asr-onnx`.
-* `MEMENTO_WHISPER_BUILD_DIR`: a prepared build containing
+* `SUBOMI_WHISPER_BUILD_DIR`: a prepared build containing
   `_deps/whispercpp-build`, instead of Cargo building Whisper 1.9.4.
   Select matching `whisper-cuda`/`whisper-vulkan` features for GPU libraries.
 * `WHISPER_INCLUDE_DIR` and `GGML_INCLUDE_DIR`: matching headers when using a
@@ -29,7 +29,7 @@ These settings do not select a CPU/GPU architecture or rebuild the native Whispe
 backend. System fallback font metadata is cached before playback starts, avoiding
 Fontconfig scans when dictionary entries introduce unfamiliar symbols.
 
-For playback diagnostics, run `MEMENTO_VIDEO_STATS=1 cargo run`. Every five
+For playback diagnostics, run `SUBOMI_VIDEO_STATS=1 cargo run`. Every five
 seconds during rendering, `[video]` reports frame drops, the active hardware decoder,
 pause state, frame delivery delay, mpv render time and total UI drawing time.
 `draw-popup-rows` counts the dictionary entries open during the slowest draw;
@@ -52,7 +52,7 @@ furigana to be drawn before starting the playback clock.
 
 Run the test suite:
 ```bash
-cargo test
+cargo test --workspace
 ```
 
 To include the popup geometry checks, run:
@@ -61,22 +61,20 @@ To include the popup geometry checks, run:
 SLINT_EMIT_DEBUG_INFO=1 cargo test --test dictionary_popup_layout_test
 ```
 
-Rust build and test commands currently run locally through Cargo. This branch
-has no GitHub Actions workflows or legacy Windows/Gentoo packaging. The original
-C++ build and packaging files remain in the `cpp` branch.
+Rust build and test commands currently run locally through Cargo.
 
 The optional Linux playback timing test renders the actual Slint window through
 surfaceless EGL, including the video image, controls and changing furigana subtitles:
 
 ```bash
-MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
+SUBOMI_VIDEO_TEST_MEDIA=/path/to/video.mkv SUBOMI_VIDEO_TEST_SECONDS=30 \
   cargo test --test video_render_timing_test -- --ignored --nocapture
 ```
 
 It measures video and UI rendering together, but does not test a desktop
 compositor or physical display. Without a media path it generates a 1080p test
 pattern through libavfilter.
-Set `MEMENTO_VIDEO_TEST_POPUP=1` to also open a dictionary popup during playback.
+Set `SUBOMI_VIDEO_TEST_POPUP=1` to also open a dictionary popup during playback.
 First-use shader compilation by the software GL driver can affect this test;
 `MESA_SHADER_CACHE_DIR` can point to a writable directory when the default
 Mesa cache is inaccessible.
@@ -85,9 +83,9 @@ For the interaction stress run, use a finite video at least 30 seconds long and
 an existing dictionary database (opened read-only):
 
 ```bash
-MEMENTO_VIDEO_TEST_MEDIA=/path/to/video.mkv MEMENTO_VIDEO_TEST_SECONDS=30 \
-MEMENTO_VIDEO_TEST_INTERACTIONS=1 \
-MEMENTO_VIDEO_TEST_DICTIONARY=/path/to/dictionaries.sqlite \
+SUBOMI_VIDEO_TEST_MEDIA=/path/to/video.mkv SUBOMI_VIDEO_TEST_SECONDS=30 \
+SUBOMI_VIDEO_TEST_INTERACTIONS=1 \
+SUBOMI_VIDEO_TEST_DICTIONARY=/path/to/dictionaries.sqlite \
   cargo test --test video_render_timing_test -- --ignored --nocapture
 ```
 
@@ -100,8 +98,8 @@ headless window; desktop fullscreen, input delivery and presentation still need
 a desktop session.
 
 To check a cold subtitle start without searches or furigana toggles, use a video
-with embedded Japanese subtitles and `MEMENTO_VIDEO_TEST_STARTUP_FURIGANA=1`
-instead of `MEMENTO_VIDEO_TEST_INTERACTIONS`. This uses mpv's actual subtitle
+with embedded Japanese subtitles and `SUBOMI_VIDEO_TEST_STARTUP_FURIGANA=1`
+instead of `SUBOMI_VIDEO_TEST_INTERACTIONS`. This uses mpv's actual subtitle
 notifications and the desktop's subtitle model publication functions, leaving
-furigana enabled throughout the run. `MEMENTO_VIDEO_TEST_START=335` starts at a
+furigana enabled throughout the run. `SUBOMI_VIDEO_TEST_START=335` starts at a
 chosen timestamp, which also checks loading a video in the middle of a subtitle.

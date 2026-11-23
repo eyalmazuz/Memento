@@ -1,11 +1,11 @@
-//! ASS/SSA visibility, config, and live 1920×1080 Memento Rust vs. stock `mpv`
+//! ASS/SSA visibility, config, and live 1920×1080 Subomi Rust vs. stock `mpv`
 //! visual parity & interactive screenshot verification harness.
 
 use std::path::{Path, PathBuf};
 
-use memento_app::controller::config::ConfigController;
-use memento_app::controller::player::compute_mpv_subtitle_visibility_ex;
-use memento_setting::keys as raw;
+use subomi_app::controller::config::ConfigController;
+use subomi_app::controller::player::compute_mpv_subtitle_visibility_ex;
+use subomi_setting::keys as raw;
 
 #[test]
 fn mpv_visibility_matrix_handles_native_ass_ctrl0_and_cursor_reveal() {
@@ -68,18 +68,18 @@ fn mpv_visibility_matrix_handles_native_ass_ctrl0_and_cursor_reveal() {
 #[test]
 fn interface_sub_ass_native_setting_defaults_true_and_roundtrips() {
     let dir = std::env::temp_dir().join(format!(
-        "memento_ass_cfg_test_{}",
+        "subomi_ass_cfg_test_{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let anki_path = dir.join("anki.json");
 
-    let ctrl = ConfigController::load(&dir, "memento.conf").unwrap();
+    let ctrl = ConfigController::load(&dir, "subomi.conf").unwrap();
     // Default must be `true`.
     assert_eq!(
         ctrl.effective_setting(raw::interface::GROUP, raw::interface::subtitle::ASS_NATIVE),
-        Some(memento_config::Value::Bool(true))
+        Some(subomi_config::Value::Bool(true))
     );
     // Must appear in Options -> Interface (category 5) -> "Subtitle" group.
     use slint::Model as _;
@@ -99,17 +99,17 @@ fn interface_sub_ass_native_setting_defaults_true_and_roundtrips() {
     // Toggle to false, apply, and reload from disk.
     ctrl.edit_setting("interface/sub-ass-native", "false")
         .unwrap();
-    ctrl.apply_settings(5, &dir, "memento.conf", &anki_path)
+    ctrl.apply_settings(5, &dir, "subomi.conf", &anki_path)
         .unwrap();
     assert_eq!(
         ctrl.effective_setting(raw::interface::GROUP, raw::interface::subtitle::ASS_NATIVE),
-        Some(memento_config::Value::Bool(false))
+        Some(subomi_config::Value::Bool(false))
     );
 
-    let reloaded = ConfigController::load(&dir, "memento.conf").unwrap();
+    let reloaded = ConfigController::load(&dir, "subomi.conf").unwrap();
     assert_eq!(
         reloaded.effective_setting(raw::interface::GROUP, raw::interface::subtitle::ASS_NATIVE),
-        Some(memento_config::Value::Bool(false))
+        Some(subomi_config::Value::Bool(false))
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -124,14 +124,14 @@ mod live_visual_parity {
     use super::*;
     use glow::HasContext;
     use image::{imageops, RgbImage, RgbaImage};
-    use memento_app::controller::ass::{
+    use subomi_app::controller::ass::{
         build_ass_ruby_items, mpv_ass_params_from_playback, AssOverlayController,
     };
-    use memento_app::video_gl;
-    use memento_app::{
+    use subomi_app::video_gl;
+    use subomi_app::{
         set_dictionary_rows, DictResult, PopupGlossaryBlock, SubtitleOverlayBridge,
     };
-    use memento_player::mpv::MpvInstance;
+    use subomi_player::mpv::MpvInstance;
     use slint::{ComponentHandle, Model};
     use std::ffi::{c_char, c_int, c_void, CStr};
     use std::process::Command;
@@ -188,7 +188,7 @@ mod live_visual_parity {
     ) -> std::collections::HashMap<String, RgbImage> {
         let mut results = std::collections::HashMap::new();
         let tmp_dir = std::env::temp_dir().join(format!(
-            "memento_mpv_ref_seq_{}",
+            "subomi_mpv_ref_seq_{}",
             std::process::id()
         ));
         let vo_dir = tmp_dir.join("vo");
@@ -307,10 +307,10 @@ end)
     }
 
     /// Build a side-by-side comparison PNG:
-    /// - Top row (`1920x540`): left `960x540` = stock `mpv`, right `960x540` = Memento Rust
+    /// - Top row (`1920x540`): left `960x540` = stock `mpv`, right `960x540` = Subomi Rust
     /// - Bottom rows (`1920x880`): 1:1 native-resolution subtitle region (`y=640..1080`,
     ///   capturing up to 3 stacked simultaneous subtitle lines cleanly unclipped):
-    ///   upper `1920x440` = stock `mpv`, lower `1920x440` = Memento Rust.
+    ///   upper `1920x440` = stock `mpv`, lower `1920x440` = Subomi Rust.
     fn build_side_by_side_comparison(mpv_img: &RgbImage, mem_img: &RgbImage) -> RgbImage {
         let half_mpv = imageops::resize(mpv_img, 960, 540, imageops::FilterType::Triangle);
         let half_mem = imageops::resize(mem_img, 960, 540, imageops::FilterType::Triangle);
@@ -327,7 +327,7 @@ end)
             canvas.put_pixel(959, y, image::Rgb([56, 166, 214]));
             canvas.put_pixel(960, y, image::Rgb([56, 166, 214]));
         }
-        // Horizontal cyan dividers + 1:1 native subtitle strips (top=mpv, bottom=Memento).
+        // Horizontal cyan dividers + 1:1 native subtitle strips (top=mpv, bottom=Subomi).
         for x in 0..1920 {
             for dy in 0..4 {
                 canvas.put_pixel(x, 540 + dy, image::Rgb([56, 166, 214]));
@@ -388,7 +388,7 @@ end)
     }
 
     #[test]
-    fn live_memento_vs_stock_mpv_8_timestamps_and_interactive_captures() {
+    fn live_subomi_vs_stock_mpv_8_timestamps_and_interactive_captures() {
         let mkv_path = Path::new(SUMMER_POCKETS_MKV);
         if !mkv_path.is_file() {
             eprintln!("[SKIP] Summer Pockets MKV not found at {}", mkv_path.display());
@@ -528,7 +528,7 @@ end)
         app.set_duration(1440.0);
         app.set_sub_ass_native(true);
         app.set_subtitles_visible(true);
-        memento_app::prepare_text_fonts();
+        subomi_app::prepare_text_fonts();
         let video_tex = unsafe {
             slint::BorrowedOpenGLTextureBuilder::new_gl_2d_rgba_texture(
                 texture.0,
@@ -543,7 +543,7 @@ end)
         assert_eq!(app.get_video_height(), 1080);
 
         let mpv_dir = std::env::temp_dir().join(format!(
-            "memento_ass_parity_mpv_{}",
+            "subomi_ass_parity_mpv_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&mpv_dir);
@@ -605,7 +605,7 @@ end)
                 let _ = wake_rx.recv_timeout(Duration::from_millis(15));
                 while wake_rx.try_recv().is_ok() {}
                 for ev in player.drain_events() {
-                    if matches!(ev, memento_player::MpvEvent::PlaybackRestart) {
+                    if matches!(ev, subomi_player::MpvEvent::PlaybackRestart) {
                         saw_restart = true;
                     }
                 }
@@ -658,7 +658,7 @@ end)
             }
         };
 
-        // 1. All 8 verification timestamps: live Memento Rust vs. stock `mpv`!
+        // 1. All 8 verification timestamps: live Subomi Rust vs. stock `mpv`!
         let timestamps: &[(&str, f64, usize)] = &[
             ("01_12s", 12.0, 1),
             ("02_20s", 20.0, 2),
@@ -673,12 +673,12 @@ end)
         let mpv_refs = capture_stock_mpv_frames_sequential(mkv_path, timestamps, &out_dir);
 
         eprintln!(
-            "\n=== Live 1920x1080 Visual Parity: Memento Rust (libmpv GL + FemtoVG) vs Stock mpv ==="
+            "\n=== Live 1920x1080 Visual Parity: Subomi Rust (libmpv GL + FemtoVG) vs Stock mpv ==="
         );
         for &(tag, ts_secs, expected_events) in timestamps {
             let mem_img = seek_and_render(ts_secs, true, &mut ass);
-            let mem_path = out_dir.join(format!("memento_{tag}.png"));
-            mem_img.save(&mem_path).expect("save memento PNG");
+            let mem_path = out_dir.join(format!("subomi_{tag}.png"));
+            mem_img.save(&mem_path).expect("save subomi PNG");
 
             let layout = ass.layout().expect("active ASS layout");
             assert_eq!(
@@ -713,7 +713,7 @@ end)
                     stats.sub_band_pct_gt_8
                 );
             } else {
-                eprintln!("[WARN] stock `mpv` CLI unavailable; saved Memento capture only for {tag}");
+                eprintln!("[WARN] stock `mpv` CLI unavailable; saved Subomi capture only for {tag}");
             }
         }
 
@@ -761,7 +761,7 @@ end)
         window.renderer.render().unwrap();
         let hover_20s_img = read_gl_video_area_rgb(&gl, 1920, 1080);
         hover_20s_img
-            .save(out_dir.join("memento_hover_20s_torishirojima.png"))
+            .save(out_dir.join("subomi_hover_20s_torishirojima.png"))
             .expect("save hover 20s PNG");
 
         let sb = app.global::<SubtitleOverlayBridge>();
@@ -803,7 +803,7 @@ end)
             let layout = ass.layout().unwrap();
             let vt = ass.viewport().unwrap();
             let mut items = build_ass_ruby_items(layout, &vt, 0.4, |text| {
-                memento_app::controller::subtitles::subtitle_furigana_parts(text).ok()
+                subomi_app::controller::subtitles::subtitle_furigana_parts(text).ok()
             });
             if items.is_empty() {
                 // Fallback deterministic readings if MeCab dictionary is unavailable in CI env.
@@ -830,7 +830,7 @@ end)
         window.renderer.render().unwrap();
         let furi_20s_img = read_gl_video_area_rgb(&gl, 1920, 1080);
         furi_20s_img
-            .save(out_dir.join("memento_furigana_20s.png"))
+            .save(out_dir.join("subomi_furigana_20s.png"))
             .expect("save furigana 20s PNG");
         app.set_furigana_visible(false);
         sb.set_ass_ruby_items(Rc::new(slint::VecModel::from(Vec::new())).into());
@@ -868,10 +868,10 @@ end)
         assert_eq!(anki_sub_shot.dimensions(), (1920, 1080));
         assert_eq!(anki_vid_shot.dimensions(), (1920, 1080));
         anki_sub_shot
-            .save(out_dir.join("memento_anki_screenshot_20s.png"))
+            .save(out_dir.join("subomi_anki_screenshot_20s.png"))
             .expect("save anki {screenshot}");
         anki_vid_shot
-            .save(out_dir.join("memento_anki_screenshot_video_20s.png"))
+            .save(out_dir.join("subomi_anki_screenshot_video_20s.png"))
             .expect("save anki {screenshot-video}");
 
         let (mut sub_band_diff_px, mut upper_diff_px) = (0usize, 0usize);
@@ -950,7 +950,7 @@ end)
         window.renderer.render().unwrap();
         let sp1_popup_y = app.get_popup_y();
         read_gl_video_area_rgb(&gl, 1920, 1080)
-            .save(out_dir.join("memento_hover_29s_speaker1_zaseki.png"))
+            .save(out_dir.join("subomi_hover_29s_speaker1_zaseki.png"))
             .expect("save 29s speaker 1 PNG");
 
         // Speaker 2 capture
@@ -983,7 +983,7 @@ end)
         window.renderer.render().unwrap();
         let sp2_popup_y = app.get_popup_y();
         read_gl_video_area_rgb(&gl, 1920, 1080)
-            .save(out_dir.join("memento_hover_29s_speaker2_hairi.png"))
+            .save(out_dir.join("subomi_hover_29s_speaker2_hairi.png"))
             .expect("save 29s speaker 2 PNG");
 
         assert!(
