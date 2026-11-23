@@ -6,12 +6,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::GlossaryBlock;
 
 const PARSED_GLOSSARY_CACHE_CAPACITY: usize = 384;
-const PARSED_GLOSSARY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+const PARSED_GLOSSARY_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB raw JSON equivalent
 const PARSED_GLOSSARY_EVICT_BATCH: usize = 96;
 
+type GlossaryCacheKey = ([u8; 16], usize);
+
+#[inline]
+fn glossary_cache_key(raw: &str) -> Option<GlossaryCacheKey> {
+    if raw.is_empty() {
+        return None;
+    }
+    let digest = subomi_util::fileutils::calculate_md5(raw.as_bytes()).ok()?;
+    Some((digest, raw.len()))
+}
+
 struct ParsedGlossaryCache {
-    entries: HashMap<String, (u64, Arc<serde_json::Value>)>,
-    total_key_bytes: usize,
+    entries: HashMap<GlossaryCacheKey, (u64, usize, Arc<serde_json::Value>)>,
+    total_raw_bytes: usize,
     clock: u64,
 }
 
@@ -19,15 +30,15 @@ impl ParsedGlossaryCache {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            total_key_bytes: 0,
+            total_raw_bytes: 0,
             clock: 0,
         }
     }
 
-    fn get(&mut self, raw: &str) -> Option<Arc<serde_json::Value>> {
+    fn get(&mut self, key: &GlossaryCacheKey) -> Option<Arc<serde_json::Value>> {
         self.clock = self.clock.wrapping_add(1);
         let stamp = self.clock;
-        if let Some((last_used, value)) = self.entries.get_mut(raw) {
+        if let Some((last_used, _, value)) = self.entries.get_mut(key) {
             *last_used = stamp;
             Some(Arc::clone(value))
         } else {
@@ -36,43 +47,50 @@ impl ParsedGlossaryCache {
     }
 
     fn evict_oldest(&mut self, evict_target: usize) {
-        let mut stamps: Vec<(u64, String)> = self
-            .entries
-            .iter()
-            .map(|(k, (s, _))| (*s, k.clone()))
-            .collect();
-        let evict = evict_target.min(stamps.len());
+        let evict = evict_target.min(self.entries.len());
         if evict == 0 {
             return;
         }
-        stamps.select_nth_unstable_by_key(evict - 1, |(s, _)| *s);
-        for (_, key) in stamps.into_iter().take(evict) {
-            if self.entries.remove(&key).is_some() {
-                self.total_key_bytes = self.total_key_bytes.saturating_sub(key.len());
-            }
+        if evict >= self.entries.len() {
+            self.entries.clear();
+            self.total_raw_bytes = 0;
+            return;
         }
+        let mut stamps: Vec<u64> = self.entries.values().map(|(s, _, _)| *s).collect();
+        let (_, threshold, _) = stamps.select_nth_unstable(evict - 1);
+        let cutoff = *threshold;
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|_, (s, raw_bytes, _)| {
+            if *s > cutoff {
+                true
+            } else {
+                removed_bytes = removed_bytes.saturating_add(*raw_bytes);
+                false
+            }
+        });
+        self.total_raw_bytes = self.total_raw_bytes.saturating_sub(removed_bytes);
     }
 
-    fn insert(&mut self, raw: String, value: Arc<serde_json::Value>) {
-        let key_bytes = raw.len();
-        if key_bytes > PARSED_GLOSSARY_CACHE_MAX_BYTES {
+    fn insert(&mut self, key: GlossaryCacheKey, value: Arc<serde_json::Value>) {
+        let raw_bytes = key.1;
+        if raw_bytes > PARSED_GLOSSARY_CACHE_MAX_BYTES {
             return;
         }
         self.clock = self.clock.wrapping_add(1);
         let stamp = self.clock;
-        if let Some(existing) = self.entries.get_mut(&raw) {
+        if let Some(existing) = self.entries.get_mut(&key) {
             existing.0 = stamp;
-            existing.1 = value;
+            existing.2 = value;
             return;
         }
         while (self.entries.len() >= PARSED_GLOSSARY_CACHE_CAPACITY
-            || self.total_key_bytes.saturating_add(key_bytes) > PARSED_GLOSSARY_CACHE_MAX_BYTES)
+            || self.total_raw_bytes.saturating_add(raw_bytes) > PARSED_GLOSSARY_CACHE_MAX_BYTES)
             && !self.entries.is_empty()
         {
             self.evict_oldest(PARSED_GLOSSARY_EVICT_BATCH.max(1));
         }
-        self.total_key_bytes = self.total_key_bytes.saturating_add(key_bytes);
-        self.entries.insert(raw, (stamp, value));
+        self.total_raw_bytes = self.total_raw_bytes.saturating_add(raw_bytes);
+        self.entries.insert(key, (stamp, raw_bytes, value));
     }
 
     fn shrink_to(&mut self, max_entries: usize) {
@@ -98,39 +116,53 @@ pub fn shrink_parsed_glossary_cache(max_entries: usize) {
 }
 
 pub(super) fn cache_parsed_glossary(raw: &str, value: Arc<serde_json::Value>) {
-    if raw.is_empty() {
+    let Some(key) = glossary_cache_key(raw) else {
         return;
-    }
+    };
     let mut cache = parsed_glossary_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(raw.to_owned(), value);
+    cache.insert(key, value);
 }
 
 /// Parses a raw glossary JSON string into a shared `Arc<serde_json::Value>`,
 /// reusing cached parses populated during dictionary search so UI rendering can
 /// feed `subomi_definition`'s `*_value` APIs without re-parsing JSON.
 pub fn parse_glossary_json_cached(raw: &str) -> Option<Arc<serde_json::Value>> {
-    if raw.is_empty() {
-        return None;
-    }
+    let key = glossary_cache_key(raw)?;
     {
         let mut cache = parsed_glossary_cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = cache.get(raw) {
+        if let Some(hit) = cache.get(&key) {
             return Some(hit);
         }
     }
     let parsed = Arc::new(serde_json::from_str::<serde_json::Value>(raw).ok()?);
-    cache_parsed_glossary(raw, Arc::clone(&parsed));
+    let mut cache = parsed_glossary_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(key, Arc::clone(&parsed));
     Some(parsed)
 }
 
 /// Strips legacy Yomichan nested-array deinflection entries (`[["base", ["rule"]]]`)
-/// from a `term_bank.glossary` JSON payload. Returns `None` if no real glossary items remain.
-pub(super) fn clean_raw_glossary(raw_glossary: &str) -> Option<(String, Option<Arc<serde_json::Value>>)> {
-    match serde_json::from_str::<serde_json::Value>(raw_glossary) {
+/// from a `term_bank.glossary` JSON payload, checking and populating the shared
+/// parsed-glossary cache so warm dictionary lookups skip `serde_json::from_str`
+/// and move `raw_glossary` without cloning. Returns `None` if no real items remain.
+pub(super) fn clean_raw_glossary_cached(
+    raw_glossary: String,
+) -> Option<(String, Option<Arc<serde_json::Value>>)> {
+    let key = glossary_cache_key(&raw_glossary);
+    if let Some(key) = key {
+        let mut cache = parsed_glossary_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = cache.get(&key) {
+            return Some((raw_glossary, Some(hit)));
+        }
+    }
+    match serde_json::from_str::<serde_json::Value>(&raw_glossary) {
         Ok(serde_json::Value::Array(items)) => {
             let has_nested_array = items.iter().any(serde_json::Value::is_array);
             if !has_nested_array {
@@ -138,7 +170,13 @@ pub(super) fn clean_raw_glossary(raw_glossary: &str) -> Option<(String, Option<A
                     return None;
                 }
                 let arc = Arc::new(serde_json::Value::Array(items));
-                return Some((raw_glossary.to_owned(), Some(arc)));
+                if let Some(key) = key {
+                    let mut cache = parsed_glossary_cache()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cache.insert(key, Arc::clone(&arc));
+                }
+                return Some((raw_glossary, Some(arc)));
             }
             let filtered: Vec<serde_json::Value> = items
                 .into_iter()
@@ -149,10 +187,21 @@ pub(super) fn clean_raw_glossary(raw_glossary: &str) -> Option<(String, Option<A
             }
             let cleaned_val = serde_json::Value::Array(filtered);
             let cleaned_json = serde_json::to_string(&cleaned_val).unwrap_or_default();
-            Some((cleaned_json, Some(Arc::new(cleaned_val))))
+            let arc = Arc::new(cleaned_val);
+            cache_parsed_glossary(&cleaned_json, Arc::clone(&arc));
+            Some((cleaned_json, Some(arc)))
         }
-        Ok(other) => Some((raw_glossary.to_owned(), Some(Arc::new(other)))),
-        Err(_) => Some((raw_glossary.to_owned(), None)),
+        Ok(other) => {
+            let arc = Arc::new(other);
+            if let Some(key) = key {
+                let mut cache = parsed_glossary_cache()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.insert(key, Arc::clone(&arc));
+            }
+            Some((raw_glossary, Some(arc)))
+        }
+        Err(_) => Some((raw_glossary, None)),
     }
 }
 

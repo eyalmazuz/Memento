@@ -19,7 +19,7 @@ use subomi_dict::yomidbbuilder;
 use subomi_net::anki::MediaFilePayload;
 
 use crate::controller::audio::sanitize_anki_filename;
-use crate::controller::dict::{shared_readonly_db, DictTag};
+use crate::controller::dict::{shared_readonly_db, DictionaryTagMap};
 
 use super::context::{encode_base64, GlossaryDefinition, NoteFieldsContext, NoteTag};
 use super::css_glossary::scope_dictionary_css_cached;
@@ -93,17 +93,18 @@ fn resolve_dictionary_resources(
 }
 
 fn resolve_sorted_tags(
-    tag_bank: &HashMap<(i64, String), DictTag>,
+    tag_bank: &DictionaryTagMap,
     dic_id: i64,
     raw_space_separated: &str,
 ) -> Vec<(NoteTag, i64, i64)> {
+    let dict_tags = tag_bank.get(&dic_id);
     let mut seen = HashSet::new();
     let mut collected = Vec::new();
     for token in raw_space_separated.split_whitespace() {
         if token.is_empty() || !seen.insert(token) {
             continue;
         }
-        if let Some(info) = tag_bank.get(&(dic_id, token.to_owned())) {
+        if let Some(info) = dict_tags.and_then(|m| m.get(token)) {
             collected.push((
                 NoteTag {
                     name: token.to_owned(),
@@ -578,10 +579,11 @@ pub fn populate_note_context_from_sqlite_with_hints(
                 if let Ok(serde_json::Value::Object(stats_map)) =
                     serde_json::from_str::<serde_json::Value>(&row.stats)
                 {
+                    let dict_tags = tag_bank.get(&row.dic_id);
                     let stat_pairs: Vec<(String, String)> = stats_map
                         .iter()
                         .filter_map(|(stat_key, val)| {
-                            let tag_info = tag_bank.get(&(row.dic_id, stat_key.clone()))?;
+                            let tag_info = dict_tags.and_then(|m| m.get(stat_key.as_str()))?;
                             let val_s = match val {
                                 serde_json::Value::String(s) => s.clone(),
                                 serde_json::Value::Number(n) => n.to_string(),

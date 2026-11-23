@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use subomi_dict::deconjugationquerygenerator;
+use subomi_dict::deconjugator::{format_derivation_chain, DerivationChain};
 use subomi_dict::exactquerygenerator;
 use subomi_dict::mecabquerygenerator;
 use subomi_dict::normalize;
@@ -13,9 +14,9 @@ use subomi_dict::searchcontroller::{
 use subomi_dict::sqlite_db;
 use subomi_util::mecab::MecabLookupToken;
 
-use super::db::{DictionaryMetadataSnapshot, ReadOnlyDictionaryDb};
+use super::db::{DictionaryMetadataSnapshot, DictionaryTagMap, ReadOnlyDictionaryDb};
 use super::glossary::{
-    cache_parsed_glossary, clean_raw_glossary, parse_glossary_entry_value, strip_glossary_markup,
+    clean_raw_glossary_cached, parse_glossary_entry_value, strip_glossary_markup,
 };
 use super::meta::select_term_frequencies;
 use super::{ClozeSentence, DictControllerError, DictTag, SearchHit};
@@ -142,7 +143,6 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
         return;
     }
     let trimmed = query.trim();
-    let norm_query = normalize_reading(trimmed);
     let query_chars = trimmed.chars().count();
 
     let mut group_scores: HashMap<(&str, &str, bool), i64> = HashMap::with_capacity(hits.len());
@@ -156,11 +156,10 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
         .iter()
         .enumerate()
         .map(|(i, h)| {
-            let norm_reading = normalize_reading(&h.reading);
-            let normalized_expression = normalize_reading(&h.expression);
             let is_exact = h.expression == trimmed
-                || normalized_expression == norm_query
-                || (!norm_reading.is_empty() && norm_reading == norm_query);
+                || normalize::normalized_readings_eq(&h.expression, trimmed)
+                || (!h.reading.is_empty()
+                    && normalize::normalized_readings_eq(&h.reading, trimmed));
 
             let (prefix_len, expr_equals_cloze) = if trimmed.starts_with(&h.expression) {
                 (h.expression.chars().count(), true)
@@ -219,15 +218,15 @@ pub fn rank_hits(query: &str, hits: &mut [SearchHit]) {
 }
 
 /// One candidate lookup key together with its matched surface length,
-/// required Yomitan `rule_mask` (`0` for exact uninflected queries), and derivation chain.
+/// required Yomitan `rule_mask` (`0` for exact uninflected queries), and compact
+/// derivation chains formatted lazily only when a SQLite entry matches.
 pub(super) struct LookupQuery {
     pub key: String,
     pub surface_len: usize,
     pub rule_mask: u8,
     pub source: QuerySource,
-    pub derivation: String,
-    pub derivation_descriptions: Vec<(String, String)>,
-    pub rule_derivations: Vec<(u8, String, Vec<(String, String)>)>,
+    pub primary_derivation: DerivationChain,
+    pub rule_derivations: Vec<(u8, DerivationChain)>,
     pub seq: usize,
 }
 
@@ -237,13 +236,13 @@ impl LookupQuery {
         entry_rule_mask: u8,
     ) -> (String, Vec<(String, String)>) {
         if entry_rule_mask != 0 {
-            for (mask, chain, descs) in &self.rule_derivations {
-                if (*mask & entry_rule_mask) != 0 {
-                    return (chain.clone(), descs.clone());
+            for &(mask, chain) in &self.rule_derivations {
+                if (mask & entry_rule_mask) != 0 {
+                    return format_derivation_chain(chain.as_slice());
                 }
             }
         }
-        (self.derivation.clone(), self.derivation_descriptions.clone())
+        format_derivation_chain(self.primary_derivation.as_slice())
     }
 }
 
@@ -356,15 +355,19 @@ pub(super) fn build_lookup_queries_with_replacements(
                     seed_u16_len.min(full_orig_u16_len)
                 };
 
+                let want_deconj = deconj_enabled
+                    && (chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == seed.len());
+                let (exact_variants, deconj_inputs) =
+                    normalize::expand_prefix_variants(prefix, exact_enabled, want_deconj);
+
                 if exact_enabled {
-                    for variant in normalize::expand_query_variants(prefix) {
+                    for variant in exact_variants {
                         raw_lookups.push(LookupQuery {
                             key: variant,
                             surface_len: orig_u16_len,
                             rule_mask: 0,
                             source: QuerySource::Exact,
-                            derivation: String::new(),
-                            derivation_descriptions: Vec::new(),
+                            primary_derivation: DerivationChain::EMPTY,
                             rule_derivations: Vec::new(),
                             seq,
                         });
@@ -380,8 +383,7 @@ pub(super) fn build_lookup_queries_with_replacements(
                                 surface_len: orig_u16_len,
                                 rule_mask: 0,
                                 source: QuerySource::Exact,
-                                derivation: String::new(),
-                                derivation_descriptions: Vec::new(),
+                                primary_derivation: DerivationChain::EMPTY,
                                 rule_derivations: Vec::new(),
                                 seq,
                             });
@@ -390,71 +392,26 @@ pub(super) fn build_lookup_queries_with_replacements(
                     }
                 }
 
-                if deconj_enabled && (chars_len <= MAX_DECONJ_PREFIX_CHARS || byte_end == seed.len())
-                {
-                    let mut deconj_inputs: Vec<String> = Vec::new();
-                    let push_deconj_in = |inputs: &mut Vec<String>, s: String| {
-                        if !s.is_empty() && !inputs.contains(&s) {
-                            inputs.push(s);
-                        }
-                    };
-                    let nfkc = normalize::normalize_nfkc(prefix);
-                    push_deconj_in(&mut deconj_inputs, prefix.to_owned());
-                    push_deconj_in(&mut deconj_inputs, nfkc.clone());
-                    push_deconj_in(&mut deconj_inputs, normalize::kata_to_hira_str(&nfkc));
-
-                    // Wire Wave 1 Japanese text preprocessors into deconjugation input generation:
-                    // radical normalization, kyūjitai -> shinjitai standardization, emphatic
-                    // sequence collapsing (preserving Yomitan #1411 guard), alphanumeric width
-                    // variants, and romaji -> hiragana conversion.
-                    let rad = normalize::normalize_radical_characters(&nfkc);
-                    if rad != nfkc {
-                        push_deconj_in(&mut deconj_inputs, rad.clone());
-                    }
-                    let std_kanji = normalize::standardize_kanji(&rad);
-                    if std_kanji != rad {
-                        push_deconj_in(&mut deconj_inputs, std_kanji.clone());
-                    }
-                    if nfkc.chars().any(|c| c.is_ascii_alphabetic()) {
-                        let romaji_hira = normalize::alphabetic_to_hiragana(&nfkc);
-                        if romaji_hira != nfkc {
-                            push_deconj_in(&mut deconj_inputs, romaji_hira);
-                        }
-                    }
-                    for width_var in normalize::alphanumeric_width_variants(&nfkc) {
-                        if width_var != nfkc {
-                            push_deconj_in(&mut deconj_inputs, width_var);
-                        }
-                    }
-                    let pre_emph_len = deconj_inputs.len();
-                    for idx in 0..pre_emph_len {
-                        let base_in = deconj_inputs[idx].clone();
-                        if base_in.chars().any(|c| matches!(c, 'っ' | 'ッ' | 'ー')) {
-                            for emph in normalize::collapse_emphatic_sequences_variants(&base_in) {
-                                push_deconj_in(&mut deconj_inputs, emph.text);
-                            }
-                        }
-                    }
-                    for iter_var in normalize::expand_iteration_marks(&std_kanji) {
-                        push_deconj_in(&mut deconj_inputs, iter_var.clone());
-                        if iter_var.contains('ー') {
-                            for pv in normalize::expand_prolonged_vowels(&iter_var) {
-                                push_deconj_in(&mut deconj_inputs, pv);
-                            }
-                        }
-                    }
-
+                if want_deconj {
                     for deconj_input in deconj_inputs {
-                        for dq in deconjugationquerygenerator::generate_queries_single(&deconj_input) {
-                            for base_variant in normalize::expand_query_variants(&dq.deconj) {
+                        for mut dq in deconjugationquerygenerator::generate_lazy_queries_single(
+                            &deconj_input,
+                        ) {
+                            let variants = normalize::expand_query_variants(&dq.deconj);
+                            let mut iter = variants.into_iter().peekable();
+                            while let Some(base_variant) = iter.next() {
+                                let rule_derivs = if iter.peek().is_none() {
+                                    std::mem::take(&mut dq.rule_derivations)
+                                } else {
+                                    dq.rule_derivations.clone()
+                                };
                                 raw_lookups.push(LookupQuery {
                                     key: base_variant,
                                     surface_len: orig_u16_len,
                                     rule_mask: dq.rule_mask,
                                     source: QuerySource::Deconj,
-                                    derivation: dq.derivation.clone(),
-                                    derivation_descriptions: dq.derivation_descriptions.clone(),
-                                    rule_derivations: dq.rule_derivations.clone(),
+                                    primary_derivation: dq.primary,
+                                    rule_derivations: rule_derivs,
                                     seq,
                                 });
                                 seq += 1;
@@ -505,8 +462,7 @@ pub(super) fn build_lookup_queries_with_replacements(
                                 surface_len: surface_u16,
                                 rule_mask: cand.rule_mask,
                                 source: QuerySource::Mecab,
-                                derivation: String::new(),
-                                derivation_descriptions: Vec::new(),
+                                primary_derivation: DerivationChain::EMPTY,
                                 rule_derivations: Vec::new(),
                                 seq,
                             };
@@ -519,8 +475,7 @@ pub(super) fn build_lookup_queries_with_replacements(
                                     surface_len: surface_u16,
                                     rule_mask: cand.rule_mask,
                                     source: QuerySource::Mecab,
-                                    derivation: String::new(),
-                                    derivation_descriptions: Vec::new(),
+                                    primary_derivation: DerivationChain::EMPTY,
                                     rule_derivations: Vec::new(),
                                     seq,
                                 });
@@ -566,8 +521,16 @@ pub(super) fn build_lookup_queries_with_replacements(
             .then_with(|| a.seq.cmp(&b.seq))
     });
 
-    let mut seen_lookups: HashSet<(String, u8)> = HashSet::with_capacity(raw_lookups.len());
-    raw_lookups.retain(|lookup| seen_lookups.insert((lookup.key.clone(), lookup.rule_mask)));
+    // Deduplicate `(key, rule_mask)` borrowing `&str` without cloning every key string.
+    let keep: Vec<bool> = {
+        let mut seen_lookups: HashSet<(&str, u8)> = HashSet::with_capacity(raw_lookups.len());
+        raw_lookups
+            .iter()
+            .map(|lookup| seen_lookups.insert((lookup.key.as_str(), lookup.rule_mask)))
+            .collect()
+    };
+    let mut keep_iter = keep.into_iter();
+    raw_lookups.retain(|_| keep_iter.next().unwrap_or(false));
     raw_lookups
 }
 
@@ -644,7 +607,7 @@ pub(super) fn database_wildcard_candidates(
         if !seen_rows.insert((row.dic_id, row.rowid)) {
             continue;
         }
-        let Some((cleaned_raw, parsed_val)) = clean_raw_glossary(&row.glossary) else {
+        let Some((cleaned_raw, parsed_val)) = clean_raw_glossary_cached(row.glossary) else {
             continue;
         };
         let (glossary, example_ja, example_en) = match parsed_val.as_deref() {
@@ -655,9 +618,6 @@ pub(super) fn database_wildcard_candidates(
                 String::new(),
             ),
         };
-        if let Some(ref arc_val) = parsed_val {
-            cache_parsed_glossary(&cleaned_raw, Arc::clone(arc_val));
-        }
         let formatted_tags =
             format_dictionary_tags(&snapshot.tags, row.dic_id, &row.def_tags, &row.term_tags);
         results.push(DatabaseCandidate {
@@ -698,11 +658,11 @@ pub(super) fn database_search_candidates(
     full_u16_len: usize,
     lookups: &[LookupQuery],
 ) -> Result<Vec<DatabaseCandidate>, DictControllerError> {
-    let mut unique_keys: Vec<String> = Vec::with_capacity(lookups.len());
+    let mut unique_keys: Vec<&str> = Vec::with_capacity(lookups.len());
     let mut seen_keys: HashSet<&str> = HashSet::with_capacity(lookups.len());
     for lookup in lookups {
         if !lookup.key.is_empty() && seen_keys.insert(lookup.key.as_str()) {
-            unique_keys.push(lookup.key.clone());
+            unique_keys.push(lookup.key.as_str());
         }
     }
     if unique_keys.is_empty() {
@@ -710,7 +670,7 @@ pub(super) fn database_search_candidates(
     }
 
     let batch_rows = database
-        .with_conn(|conn| sqlite_db::query_term_details_batch_conn(conn, &unique_keys))
+        .with_conn(|conn| sqlite_db::query_term_details_batch_strs_conn(conn, &unique_keys))
         .map_err(DictControllerError::Sqlite)?;
     if batch_rows.is_empty() {
         return Ok(Vec::new());
@@ -720,95 +680,108 @@ pub(super) fn database_search_candidates(
         .iter()
         .map(|row| deconjugationquerygenerator::parse_rule_mask(&row.rules))
         .collect();
-    let mut by_key: HashMap<&str, Vec<usize>> = HashMap::with_capacity(batch_rows.len() * 2);
-    for (idx, row) in batch_rows.iter().enumerate() {
-        by_key.entry(row.expression.as_str()).or_default().push(idx);
-        if !row.reading.is_empty() && row.reading != row.expression {
-            by_key.entry(row.reading.as_str()).or_default().push(idx);
+
+    // Collect matched `(row_idx, lookup_idx)` pairs while borrowing `batch_rows`, then move
+    // each matched row's strings out once with zero `String` clones.
+    let mut matched_pairs: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut by_key: HashMap<&str, Vec<usize>> = HashMap::with_capacity(batch_rows.len() * 2);
+        for (idx, row) in batch_rows.iter().enumerate() {
+            by_key.entry(row.expression.as_str()).or_default().push(idx);
+            if !row.reading.is_empty() && row.reading != row.expression {
+                by_key.entry(row.reading.as_str()).or_default().push(idx);
+            }
+        }
+        let mut seen_rows: HashSet<(i64, i64)> = HashSet::with_capacity(batch_rows.len());
+        for (lookup_idx, lookup) in lookups.iter().enumerate() {
+            let Some(row_indices) = by_key.get(lookup.key.as_str()) else {
+                continue;
+            };
+            for &row_idx in row_indices {
+                let entry_mask = row_masks[row_idx];
+                if !deconjugationquerygenerator::rule_matches_entry(lookup.rule_mask, entry_mask) {
+                    continue;
+                }
+                let row = &batch_rows[row_idx];
+                if !snapshot.names.contains_key(&row.dic_id) {
+                    continue;
+                }
+                if seen_rows.insert((row.dic_id, row.rowid)) {
+                    matched_pairs.push((row_idx, lookup_idx));
+                }
+            }
         }
     }
 
-    // Deduplicate `(dic_id, rowid)` BEFORE JSON parsing or cloning, outside any mutex lock.
-    let mut results = Vec::new();
-    let mut seen_rows: HashSet<(i64, i64)> = HashSet::with_capacity(batch_rows.len());
+    let mut row_slots: Vec<Option<sqlite_db::BatchTermRow>> =
+        batch_rows.into_iter().map(Some).collect();
+    let mut results = Vec::with_capacity(matched_pairs.len());
 
-    for lookup in lookups {
-        let Some(row_indices) = by_key.get(lookup.key.as_str()) else {
+    for (row_idx, lookup_idx) in matched_pairs {
+        let Some(row) = row_slots[row_idx].take() else {
             continue;
         };
-        for &row_idx in row_indices {
-            let entry_mask = row_masks[row_idx];
-            if !deconjugationquerygenerator::rule_matches_entry(lookup.rule_mask, entry_mask) {
-                continue;
-            }
-            let row = &batch_rows[row_idx];
-            let Some(dictionary_name) = snapshot.names.get(&row.dic_id) else {
-                continue;
-            };
-            if !seen_rows.insert((row.dic_id, row.rowid)) {
-                continue;
-            }
+        let lookup = &lookups[lookup_idx];
+        let entry_mask = row_masks[row_idx];
+        let Some(dictionary_name) = snapshot.names.get(&row.dic_id) else {
+            continue;
+        };
 
-            let Some((cleaned_raw, parsed_val)) = clean_raw_glossary(&row.glossary) else {
-                continue;
-            };
-            let (glossary, example_ja, example_en) = match parsed_val.as_deref() {
-                Some(value) => parse_glossary_entry_value(value),
-                None => (
-                    strip_glossary_markup(&cleaned_raw),
-                    String::new(),
-                    String::new(),
-                ),
-            };
-            if let Some(ref arc_val) = parsed_val {
-                cache_parsed_glossary(&cleaned_raw, Arc::clone(arc_val));
-            }
+        let Some((cleaned_raw, parsed_val)) = clean_raw_glossary_cached(row.glossary) else {
+            continue;
+        };
+        let (glossary, example_ja, example_en) = match parsed_val.as_deref() {
+            Some(value) => parse_glossary_entry_value(value),
+            None => (
+                strip_glossary_markup(&cleaned_raw),
+                String::new(),
+                String::new(),
+            ),
+        };
 
-            let norm_expression = normalize_reading(&row.expression);
-            let norm_reading = normalize_reading(&row.reading);
-            let formatted_tags =
-                format_dictionary_tags(&snapshot.tags, row.dic_id, &row.def_tags, &row.term_tags);
-            let is_exact = (lookup.source == QuerySource::Exact
-                && lookup.rule_mask == 0
-                && lookup.surface_len == full_u16_len)
-                || (lookup.rule_mask == 0
-                    && (row.expression == query
-                        || norm_expression == normalized_query
-                        || (!norm_reading.is_empty() && norm_reading == normalized_query)));
+        let formatted_tags =
+            format_dictionary_tags(&snapshot.tags, row.dic_id, &row.def_tags, &row.term_tags);
+        let is_exact = (lookup.source == QuerySource::Exact
+            && lookup.rule_mask == 0
+            && lookup.surface_len == full_u16_len)
+            || (lookup.rule_mask == 0
+                && (row.expression == query
+                    || normalize::normalized_readings_eq(&row.expression, normalized_query)
+                    || (!row.reading.is_empty()
+                        && normalize::normalized_readings_eq(&row.reading, normalized_query))));
 
-            let (derivation, derivation_descriptions) = if lookup.rule_mask != 0 {
-                lookup.derivation_for_entry(entry_mask)
-            } else {
-                (String::new(), Vec::new())
-            };
+        let (derivation, derivation_descriptions) = if lookup.rule_mask != 0 {
+            lookup.derivation_for_entry(entry_mask)
+        } else {
+            (String::new(), Vec::new())
+        };
 
-            results.push(DatabaseCandidate {
-                hit: SearchHit {
-                    expression: row.expression.clone(),
-                    reading: row.reading.clone(),
-                    glossary,
-                    tags: formatted_tags,
-                    score: row.score,
-                    is_kanji: false,
-                    notes: String::new(),
-                    example_ja,
-                    example_en,
-                    dict_name: dictionary_name.clone(),
-                    rich_glossary: Vec::new(),
-                    derivation,
-                    derivation_descriptions,
-                    dictionary_id: row.dic_id,
-                    rules: row.rules.clone(),
-                    raw_glossary: cleaned_raw,
-                    term_tags: row.term_tags.clone(),
-                    def_tags: row.def_tags.clone(),
-                },
-                parsed_glossary: parsed_val,
-                is_exact,
-                prefix_len: lookup.surface_len,
-                dic_id: row.dic_id,
-            });
-        }
+        results.push(DatabaseCandidate {
+            hit: SearchHit {
+                expression: row.expression,
+                reading: row.reading,
+                glossary,
+                tags: formatted_tags,
+                score: row.score,
+                is_kanji: false,
+                notes: String::new(),
+                example_ja,
+                example_en,
+                dict_name: dictionary_name.clone(),
+                rich_glossary: Vec::new(),
+                derivation,
+                derivation_descriptions,
+                dictionary_id: row.dic_id,
+                rules: row.rules,
+                raw_glossary: cleaned_raw,
+                term_tags: row.term_tags,
+                def_tags: row.def_tags,
+            },
+            parsed_glossary: parsed_val,
+            is_exact,
+            prefix_len: lookup.surface_len,
+            dic_id: row.dic_id,
+        });
     }
 
     Ok(results)
@@ -901,10 +874,13 @@ fn format_kanji_reading(onyomi: &str, kunyomi: &str) -> String {
 /// Formats `kanji_bank.stats` using `tag.notes` (falling back to `tag.name` when `notes` is empty),
 /// sorted deterministically by `(tag.order ASC, tag.score DESC, tag.name ASC)`.
 fn format_kanji_stats(
-    tags: &HashMap<(i64, String), DictTag>,
+    tags: &DictionaryTagMap,
     dictionary_id: i64,
     raw_stats: &str,
 ) -> String {
+    let Some(dict_tags) = tags.get(&dictionary_id) else {
+        return String::new();
+    };
     let Ok(serde_json::Value::Object(stats)) = serde_json::from_str::<serde_json::Value>(raw_stats)
     else {
         return String::new();
@@ -912,7 +888,7 @@ fn format_kanji_stats(
     let mut entries: Vec<(&DictTag, String)> = stats
         .iter()
         .filter_map(|(name, value)| {
-            let tag = tags.get(&(dictionary_id, name.clone()))?;
+            let tag = dict_tags.get(name.as_str())?;
             if !matches!(tag.category.as_str(), "index" | "misc" | "class" | "code") {
                 return None;
             }
@@ -950,23 +926,31 @@ fn format_kanji_stats(
 }
 
 fn format_dictionary_tags(
-    tags: &HashMap<(i64, String), DictTag>,
+    tags: &DictionaryTagMap,
     dictionary_id: i64,
     definition_tags: &str,
     term_tags: &str,
 ) -> String {
-    let mut seen = HashSet::new();
-    let mut selected = Vec::new();
+    if definition_tags.is_empty() && term_tags.is_empty() {
+        return String::new();
+    }
+    let Some(dict_tags) = tags.get(&dictionary_id) else {
+        return String::new();
+    };
+    let mut selected: Vec<&DictTag> = Vec::new();
     for name in definition_tags
         .split_whitespace()
         .chain(term_tags.split_whitespace())
     {
-        if name.is_empty() || !seen.insert(name) {
+        if name.is_empty() || selected.iter().any(|t| t.name == name) {
             continue;
         }
-        if let Some(tag) = tags.get(&(dictionary_id, name.to_owned())) {
-            selected.push(tag.clone());
+        if let Some(tag) = dict_tags.get(name) {
+            selected.push(tag);
         }
+    }
+    if selected.is_empty() {
+        return String::new();
     }
     selected.sort_by(|a, b| {
         a.order
@@ -974,9 +958,14 @@ fn format_dictionary_tags(
             .then_with(|| b.score.cmp(&a.score))
             .then_with(|| a.name.cmp(&b.name))
     });
-    selected
-        .into_iter()
-        .map(|t| t.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    let total_len = selected.iter().map(|t| t.name.len()).sum::<usize>()
+        + selected.len().saturating_sub(1) * 2;
+    let mut out = String::with_capacity(total_len);
+    for (idx, tag) in selected.into_iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&tag.name);
+    }
+    out
 }

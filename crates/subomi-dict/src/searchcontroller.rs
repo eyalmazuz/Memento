@@ -2,11 +2,42 @@
 //! custom text replacement patterns (H6.5), wildcard detection/escaping (H6.2), and
 //! candidate explosion capping (#2153).
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+
+const MAX_REGEX_CACHE_ENTRIES: usize = 64;
+
+fn cached_replacement_regex(pattern: &str, ignore_case: bool) -> Option<Arc<Regex>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, bool), Option<Arc<Regex>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (pattern.to_owned(), ignore_case);
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = guard.get(&key) {
+            return hit.clone();
+        }
+    }
+    let compiled = RegexBuilder::new(pattern)
+        .case_insensitive(ignore_case)
+        .build()
+        .ok()
+        .map(Arc::new);
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() >= MAX_REGEX_CACHE_ENTRIES && !guard.contains_key(&key) {
+        guard.clear();
+    }
+    guard.insert(key, compiled.clone());
+    compiled
+}
 
 /// Default hard cap on deduplicated search query candidates to prevent candidate explosion
 /// on high-frequency hiragana inputs (Yomitan #2153).
@@ -150,31 +181,27 @@ pub fn apply_text_replacements(text: &str, options: &TextReplacementOptions) -> 
         return Vec::new();
     }
 
-    let mut current = text.to_owned();
+    let mut current: Cow<'_, str> = Cow::Borrowed(text);
     for rule in &options.rules {
         if !rule.enabled || rule.pattern.is_empty() {
             continue;
         }
-        let Ok(re) = RegexBuilder::new(&rule.pattern)
-            .case_insensitive(rule.ignore_case)
-            .build()
-        else {
+        let Some(re) = cached_replacement_regex(&rule.pattern, rule.ignore_case) else {
             continue;
         };
-        if let std::borrow::Cow::Owned(replaced) = re.replace_all(&current, rule.replacement.as_str())
-        {
-            current = replaced;
+        if let Cow::Owned(replaced) = re.replace_all(current.as_ref(), rule.replacement.as_str()) {
+            current = Cow::Owned(replaced);
         }
     }
 
     let mut out = Vec::with_capacity(2);
     if options.search_original {
         out.push(text.to_owned());
-        if !current.is_empty() && current != text {
-            out.push(current);
+        if !current.is_empty() && current.as_ref() != text {
+            out.push(current.into_owned());
         }
     } else if !current.is_empty() {
-        out.push(current);
+        out.push(current.into_owned());
     }
     out
 }

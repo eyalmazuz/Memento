@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use slint::{SharedString, VecModel};
 
-use crate::controller::dict::{shared_readonly_db, DictTag, ReadOnlyDictionaryDb};
+use crate::controller::dict::{shared_readonly_db, DictTag, DictionaryTagMap, ReadOnlyDictionaryDb};
 
 use super::{RichKanjiDetail, RichKanjiStat};
 
@@ -17,7 +17,7 @@ const RICH_DB_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 pub(super) struct RichDbHelper {
     path: PathBuf,
     db: Option<Arc<ReadOnlyDictionaryDb>>,
-    tags: Arc<HashMap<(i64, String), DictTag>>,
+    tags: Arc<DictionaryTagMap>,
     last_refresh_at: Option<Instant>,
 }
 
@@ -65,13 +65,14 @@ impl RichDbHelper {
     }
 
     pub(super) fn resolve_tag_list(&self, dic_id: i64, space_sep: &str) -> Vec<DictTag> {
+        let dict_tags = self.tags.get(&dic_id);
         let mut seen = HashSet::new();
         let mut list = Vec::new();
         for tok in space_sep.split_whitespace() {
             if tok.is_empty() || !seen.insert(tok) {
                 continue;
             }
-            if let Some(tag) = self.tags.get(&(dic_id, tok.to_owned())) {
+            if let Some(tag) = dict_tags.and_then(|m| m.get(tok)) {
                 list.push(tag.clone());
             } else {
                 list.push(DictTag::with_details(tok, "", "", 0, 0));
@@ -126,10 +127,11 @@ impl RichDbHelper {
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(&row.stats)
         {
+            let dict_tags = self.tags.get(&row.dic_id);
             let mut entries: Vec<(&DictTag, String)> = map
                 .iter()
                 .filter_map(|(k, v)| {
-                    let tag = self.tags.get(&(row.dic_id, k.clone()))?;
+                    let tag = dict_tags?.get(k.as_str())?;
                     let val = match v {
                         serde_json::Value::String(s) => s.clone(),
                         serde_json::Value::Number(n) => n.to_string(),

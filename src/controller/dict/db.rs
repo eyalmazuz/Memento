@@ -12,13 +12,17 @@ use super::{DictControllerError, DictTag};
 const REFRESH_THROTTLE: Duration = Duration::from_millis(50);
 const TERM_META_LRU_CAPACITY: usize = 2048;
 const TERM_META_LRU_EVICT_BATCH: usize = 256;
+const IDLE_TERM_META_LRU_CAPACITY: usize = 256;
+
+/// Dictionary tags indexed by `dic_id` -> `tag_name` -> [`DictTag`] for zero-allocation `&str` lookups.
+pub type DictionaryTagMap = HashMap<i64, HashMap<String, DictTag>>;
 
 /// Cheaply cloneable, lock-free snapshot of cached dictionary names, tags, disabled flags,
 /// and `frequencyMode` (`rank-based` vs `occurrence-based`).
 #[derive(Debug, Clone)]
 pub struct DictionaryMetadataSnapshot {
     pub names: Arc<HashMap<i64, String>>,
-    pub tags: Arc<HashMap<(i64, String), DictTag>>,
+    pub tags: Arc<DictionaryTagMap>,
     pub disabled: Arc<HashSet<i64>>,
     pub frequency_modes: Arc<HashMap<i64, sqlite_db::FrequencyMode>>,
 }
@@ -76,19 +80,30 @@ impl TermMetaLru {
     }
 
     fn evict_oldest(&mut self) {
-        let mut stamps: Vec<(u64, String)> = self
-            .entries
-            .iter()
-            .map(|(k, (stamp, _))| (*stamp, k.clone()))
-            .collect();
-        let evict_count = TERM_META_LRU_EVICT_BATCH.min(stamps.len());
+        self.evict_n(TERM_META_LRU_EVICT_BATCH);
+    }
+
+    fn evict_n(&mut self, evict_target: usize) {
+        let evict_count = evict_target.min(self.entries.len());
         if evict_count == 0 {
             return;
         }
-        stamps.select_nth_unstable_by_key(evict_count - 1, |(stamp, _)| *stamp);
-        for (_, key) in stamps.into_iter().take(evict_count) {
-            self.entries.remove(&key);
+        if evict_count >= self.entries.len() {
+            self.entries.clear();
+            return;
         }
+        let mut stamps: Vec<u64> = self.entries.values().map(|(stamp, _)| *stamp).collect();
+        let (_, threshold, _) = stamps.select_nth_unstable(evict_count - 1);
+        let cutoff = *threshold;
+        self.entries.retain(|_, (stamp, _)| *stamp > cutoff);
+    }
+
+    fn shrink_to(&mut self, max_entries: usize) {
+        if self.entries.len() > max_entries {
+            let excess = self.entries.len() - max_entries;
+            self.evict_n(excess);
+        }
+        self.entries.shrink_to(max_entries.max(16));
     }
 }
 
@@ -97,7 +112,7 @@ struct DictionaryMetadataCache {
     fingerprint: sqlite_db::DbFileFingerprint,
     last_checked: Instant,
     force_refresh: bool,
-    tags: Arc<HashMap<(i64, String), DictTag>>,
+    tags: Arc<DictionaryTagMap>,
     names: Arc<HashMap<i64, String>>,
     disabled: Arc<HashSet<i64>>,
     frequency_modes: Arc<HashMap<i64, sqlite_db::FrequencyMode>>,
@@ -175,9 +190,16 @@ impl ReadOnlyDictionaryDb {
         f(&conn)
     }
 
-    /// Releases idle SQLite page-cache and scratch memory via `PRAGMA shrink_memory;`
+    /// Releases idle SQLite page-cache, scratch memory, and cold `term_meta` LRU entries
     /// without clearing cached dictionary metadata snapshots.
     pub fn shrink_memory(&self) -> Result<(), sqlite_db::DictError> {
+        {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.recent_term_meta.shrink_to(IDLE_TERM_META_LRU_CAPACITY);
+        }
         self.with_conn(sqlite_db::shrink_memory_conn)
     }
 
@@ -456,12 +478,12 @@ fn load_dictionary_names_and_disabled_conn(
 
 fn load_dictionary_tags_conn(
     conn: &sqlite_db::rusqlite::Connection,
-) -> Result<HashMap<(i64, String), DictTag>, sqlite_db::DictError> {
+) -> Result<DictionaryTagMap, sqlite_db::DictError> {
     let mut stmt = conn.prepare_cached(
         "SELECT dic_id, category, name, ord, notes, score FROM tag_bank \
          ORDER BY dic_id ASC, ord ASC, score DESC;",
     )?;
-    let mut tags = HashMap::new();
+    let mut tags: DictionaryTagMap = HashMap::new();
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let dictionary_id: i64 = row.get(0)?;
@@ -470,8 +492,8 @@ fn load_dictionary_tags_conn(
         let order: i64 = row.get(3)?;
         let notes: String = row.get(4)?;
         let score: i64 = row.get(5)?;
-        tags.insert(
-            (dictionary_id, name.clone()),
+        tags.entry(dictionary_id).or_default().insert(
+            name.clone(),
             DictTag::with_details(name, category, notes, order, score),
         );
     }

@@ -12,6 +12,7 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 
 const READ_ONLY_PRAGMAS: &str = "\
+    PRAGMA query_only = ON;\
     PRAGMA cache_size = -12288;\
     PRAGMA mmap_size = 33554432;\
     PRAGMA temp_store = MEMORY;\
@@ -53,9 +54,11 @@ pub fn open_read_only_connection(path: &Path) -> Result<Connection, DictError> {
     if path.as_os_str().is_empty() {
         return Err(DictError::Other("Database path is empty".to_owned()));
     }
+    // `rusqlite::Connection` is `!Sync` and always externally synchronized by callers, so
+    // `SQLITE_OPEN_NO_MUTEX` avoids per-statement internal SQLite mutex overhead safely.
     let conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     configure_read_only_connection(&conn)?;
     Ok(conn)

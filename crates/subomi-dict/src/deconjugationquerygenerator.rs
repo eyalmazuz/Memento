@@ -1,8 +1,9 @@
 //! Deconjugation search-query deduplication and Yomitan rule bitmask helpers.
 
-use std::collections::HashMap;
-
-use crate::deconjugator::{deconjugate_str, format_derivation_chain, ConjugationInfo, WordForm};
+use crate::deconjugator::{
+    deconjugate_str, deconjugate_str_raw, derivation_displays_eq, format_derivation_chain,
+    ConjugationInfo, DerivationChain, WordForm,
+};
 
 pub const RULE_V5: u8 = 1;
 pub const RULE_V1: u8 = 2;
@@ -42,11 +43,37 @@ impl DeconjugationQuery {
     }
 }
 
-fn rule_for_info(info: &ConjugationInfo) -> u8 {
-    match info.derivations.first().copied() {
+/// Lightweight deconjugation query keeping inline `Copy` derivation chains and
+/// deferring human-readable string formatting until an entry actually matches SQLite.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LazyDeconjugationQuery {
+    pub deconj: String,
+    pub rule_mask: u8,
+    pub primary: DerivationChain,
+    pub rule_derivations: Vec<(u8, DerivationChain)>,
+}
+
+impl LazyDeconjugationQuery {
+    /// Formats the derivation chain and grammar hover descriptions matching
+    /// `entry_rule_mask`, falling back to the primary derivation when `entry_rule_mask == 0`.
+    #[must_use]
+    pub fn format_derivation_for_entry(&self, entry_rule_mask: u8) -> (String, Vec<(String, String)>) {
+        if entry_rule_mask != 0 {
+            for &(mask, chain) in &self.rule_derivations {
+                if (mask & entry_rule_mask) != 0 {
+                    return format_derivation_chain(chain.as_slice());
+                }
+            }
+        }
+        format_derivation_chain(self.primary.as_slice())
+    }
+}
+
+fn rule_for_base_and_form(base: &str, first_form: Option<WordForm>) -> u8 {
+    match first_form {
         Some(WordForm::GodanVerb) => RULE_V5,
         Some(WordForm::IchidanVerb) => {
-            if info.base.ends_with("ずる") {
+            if base.ends_with("ずる") {
                 RULE_V1 | RULE_VZ
             } else {
                 RULE_V1
@@ -58,6 +85,10 @@ fn rule_for_info(info: &ConjugationInfo) -> u8 {
         Some(WordForm::ZuruVerb | WordForm::IrregularVerb) => RULE_VZ,
         _ => RULE_EMPTY,
     }
+}
+
+fn rule_for_info(info: &ConjugationInfo) -> u8 {
+    rule_for_base_and_form(&info.base, info.derivations.first().copied())
 }
 
 /// Parses a `term_bank.rules` whitespace-delimited string into a `u8` bitmask
@@ -89,15 +120,12 @@ pub const fn rule_matches_entry(query_rule_mask: u8, entry_rule_mask: u8) -> boo
 
 pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<DeconjugationQuery> {
     let mut result: Vec<DeconjugationQuery> = Vec::with_capacity(infos.len());
-    let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
     for info in infos {
         let filter = rule_for_info(&info);
-        let existing_idx = by_base.get(&info.base).and_then(|indices| {
-            indices.iter().copied().find(|&idx| {
-                let query = &result[idx];
-                (query.rule_mask & filter != 0)
-                    || query.derivation_display == info.derivation_display
-            })
+        let existing_idx = result.iter().position(|query| {
+            query.deconj == info.base
+                && ((query.rule_mask & filter != 0)
+                    || query.derivation_display == info.derivation_display)
         });
         if let Some(idx) = existing_idx {
             let existing = &mut result[idx];
@@ -118,8 +146,6 @@ pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<Deconjuga
                 format_derivation_chain(&info.derivations);
             let rule_derivations =
                 vec![(filter, derivation.clone(), derivation_descriptions.clone())];
-            let idx = result.len();
-            let base_key = info.base.clone();
             result.push(DeconjugationQuery {
                 deconj: info.base,
                 rule_mask: filter,
@@ -129,7 +155,6 @@ pub fn generate_queries_from_infos(infos: Vec<ConjugationInfo>) -> Vec<Deconjuga
                 derivation_descriptions,
                 rule_derivations,
             });
-            by_base.entry(base_key).or_default().push(idx);
         }
     }
     result
@@ -141,6 +166,44 @@ pub fn generate_queries_single(text: &str) -> Vec<DeconjugationQuery> {
         return Vec::new();
     }
     generate_queries_from_infos(deconjugate_str(text, false))
+}
+
+/// Generates lightweight deconjugated query rows for a single UTF-8 prefix without
+/// formatting human-readable derivation strings or hover descriptions up front.
+#[must_use]
+pub fn generate_lazy_queries_single(text: &str) -> Vec<LazyDeconjugationQuery> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let raw_hits = deconjugate_str_raw(text, false);
+    let mut result: Vec<LazyDeconjugationQuery> = Vec::with_capacity(raw_hits.len());
+    for raw in raw_hits {
+        let filter = rule_for_base_and_form(&raw.base, raw.derivations.first());
+        let existing_idx = result.iter().position(|query| {
+            query.deconj == raw.base
+                && ((query.rule_mask & filter != 0)
+                    || derivation_displays_eq(query.primary.as_slice(), raw.derivations.as_slice()))
+        });
+        if let Some(idx) = existing_idx {
+            let existing = &mut result[idx];
+            existing.rule_mask |= filter;
+            if !existing
+                .rule_derivations
+                .iter()
+                .any(|(m, _)| (*m & filter) == filter)
+            {
+                existing.rule_derivations.push((filter, raw.derivations));
+            }
+        } else {
+            result.push(LazyDeconjugationQuery {
+                deconj: raw.base,
+                rule_mask: filter,
+                primary: raw.derivations,
+                rule_derivations: vec![(filter, raw.derivations)],
+            });
+        }
+    }
+    result
 }
 
 #[cfg(test)]

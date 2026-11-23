@@ -19,9 +19,9 @@ pub use self::connection::{
 pub use self::freq::{format_g, parse_freq_blob_utf8, parse_freq_blob_with_mode_utf8, ParsedFreqUtf8};
 pub use self::queries::{
     query_dictionary_frequency_modes_conn, query_kanji_meta_freq_utf8_conn, query_kanji_utf8_conn,
-    query_term_details_batch_conn, query_term_frequencies_with_mode_conn,
-    query_term_meta_batch_conn, query_term_rules_conn, search_terms_wildcard,
-    search_terms_wildcard_conn, DEFAULT_WILDCARD_LIMIT, MAX_WILDCARD_LIMIT,
+    query_term_details_batch_conn, query_term_details_batch_strs_conn,
+    query_term_frequencies_with_mode_conn, query_term_meta_batch_conn, query_term_rules_conn,
+    search_terms_wildcard, search_terms_wildcard_conn, DEFAULT_WILDCARD_LIMIT, MAX_WILDCARD_LIMIT,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

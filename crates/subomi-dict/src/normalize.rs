@@ -4,7 +4,8 @@
 //! and `search/remove-regex` / `search/replace-lines` text filters.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
@@ -82,11 +83,49 @@ pub fn trim_leading_whitespace(text: &str) -> &str {
     text.trim_start()
 }
 
+#[inline]
+fn is_nfkc_invariant_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0020}'..='\u{007E}'
+            | '\u{3041}'..='\u{3096}'
+            | '\u{30A1}'..='\u{30FA}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '々'
+            | 'ー'
+            | '、'
+            | '。'
+    )
+}
+
+#[inline]
+fn is_hiragana_char(ch: char) -> bool {
+    let code = ch as u32;
+    (u32::from(HIRAGANA_LOW)..=u32::from(HIRAGANA_HIGH)).contains(&code)
+}
+
+#[inline]
+fn is_katakana_char(ch: char) -> bool {
+    let code = ch as u32;
+    (u32::from(KATAKANA_LOW)..=u32::from(KATAKANA_HIGH)).contains(&code)
+}
+
+/// Applies full Unicode NFKC normalization, borrowing `text` directly when every
+/// character is already NFKC-invariant with canonical combining class 0.
+#[must_use]
+pub fn normalize_nfkc_cow(text: &str) -> Cow<'_, str> {
+    if text.chars().all(is_nfkc_invariant_char) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.nfkc().collect())
+    }
+}
+
 /// Applies full Unicode NFKC normalization (e.g. `ＡＢＣ１２３` -> `ABC123`,
 /// `ﾃﾚﾋﾞ` -> `テレビ`, `ｶﾞ` -> `ガ`, combining dakuten composition).
 #[must_use]
 pub fn normalize_nfkc(text: &str) -> String {
-    text.nfkc().collect()
+    normalize_nfkc_cow(text).into_owned()
 }
 
 #[inline]
@@ -124,15 +163,28 @@ pub fn hira_to_kata_str(text: &str) -> String {
 /// Normalizes text with NFKC followed by katakana-to-hiragana folding in a single pass.
 #[must_use]
 pub fn normalize_reading_str(text: &str) -> String {
-    text.nfkc().map(kata_to_hira_char).collect()
+    if text.chars().all(is_nfkc_invariant_char) {
+        text.chars().map(kata_to_hira_char).collect()
+    } else {
+        text.nfkc().map(kata_to_hira_char).collect()
+    }
 }
 
 /// Compares two readings after NFKC + katakana-to-hiragana folding with zero heap allocations.
 #[must_use]
-pub(crate) fn normalized_readings_eq(a: &str, b: &str) -> bool {
-    a.nfkc()
-        .map(kata_to_hira_char)
-        .eq(b.nfkc().map(kata_to_hira_char))
+pub fn normalized_readings_eq(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.chars().all(is_nfkc_invariant_char) && b.chars().all(is_nfkc_invariant_char) {
+        a.chars()
+            .map(kata_to_hira_char)
+            .eq(b.chars().map(kata_to_hira_char))
+    } else {
+        a.nfkc()
+            .map(kata_to_hira_char)
+            .eq(b.nfkc().map(kata_to_hira_char))
+    }
 }
 
 /// Returns `true` if `ch` is a CJK Unified, Extension A–J (including Extension H
@@ -569,24 +621,36 @@ pub const fn standardize_kanji_char(ch: char) -> char {
     }
 }
 
+/// Converts kyūjitai (traditional kanji) characters in `text` to their shinjitai equivalents,
+/// borrowing `text` directly when no character needs conversion.
+#[must_use]
+pub fn standardize_kanji_cow(text: &str) -> Cow<'_, str> {
+    if text.chars().any(|ch| standardize_kanji_char(ch) != ch) {
+        Cow::Owned(text.chars().map(standardize_kanji_char).collect())
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Converts kyūjitai (traditional kanji) characters in `text` to their shinjitai equivalents.
 ///
 /// Callers performing dictionary lookups should keep BOTH the original query and the
 /// standardized form so distinct words like `罐` vs `缶` still match cleanly.
 #[must_use]
 pub fn standardize_kanji(text: &str) -> String {
-    text.chars().map(standardize_kanji_char).collect()
+    standardize_kanji_cow(text).into_owned()
 }
 
 /// Normalizes Kangxi Radicals (`U+2F00..=U+2FD5`) and CJK Radicals Supplement
-/// (`U+2E80..=U+2EFF`) characters to their corresponding standard CJK ideographs.
+/// (`U+2E80..=U+2EFF`) characters to their corresponding standard CJK ideographs,
+/// borrowing `text` directly when no radical codepoints are present.
 #[must_use]
-pub fn normalize_radical_characters(text: &str) -> String {
+pub fn normalize_radical_characters_cow(text: &str) -> Cow<'_, str> {
     let has_radical = text
         .chars()
         .any(|ch| matches!(ch, '\u{2E80}'..='\u{2EFF}' | '\u{2F00}'..='\u{2FD5}'));
     if !has_radical {
-        return text.to_owned();
+        return Cow::Borrowed(text);
     }
 
     let mut out = String::with_capacity(text.len());
@@ -605,7 +669,14 @@ pub fn normalize_radical_characters(text: &str) -> String {
             out.push(ch);
         }
     }
-    out
+    Cow::Owned(out)
+}
+
+/// Normalizes Kangxi Radicals (`U+2F00..=U+2FD5`) and CJK Radicals Supplement
+/// (`U+2E80..=U+2EFF`) characters to their corresponding standard CJK ideographs.
+#[must_use]
+pub fn normalize_radical_characters(text: &str) -> String {
+    normalize_radical_characters_cow(text).into_owned()
 }
 
 const fn map_cjk_radical_supplement(ch: char) -> char {
@@ -1256,26 +1327,49 @@ pub fn expand_prolonged_vowels(text: &str) -> Vec<String> {
     }
 
     let mut out = Vec::with_capacity(partials.len() + 1);
-    let mut seen = HashSet::with_capacity(partials.len() + 1);
-    if seen.insert(text.to_owned()) {
-        out.push(text.to_owned());
-    }
+    out.push(text.to_owned());
     for p in partials {
-        if seen.insert(p.clone()) {
+        if !out.contains(&p) {
             out.push(p);
         }
     }
     out
 }
 
+#[inline]
+fn has_width_alphanumeric(text: &str) -> bool {
+    text.chars().any(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '\u{FF10}'..='\u{FF19}' | '\u{FF21}'..='\u{FF3A}' | '\u{FF41}'..='\u{FF5A}'
+            )
+    })
+}
+
+#[inline]
+fn has_iteration_mark_candidate(text: &str) -> bool {
+    let mut prev: Option<char> = None;
+    for ch in text.chars() {
+        if ch == '々' {
+            return prev.is_some();
+        }
+        if prev == Some(ch) && is_cjk_ideograph(ch) {
+            return true;
+        }
+        prev = Some(ch);
+    }
+    false
+}
+
 /// Expands CJK iteration mark `々` bidirectionally (`人々` <-> `人人`).
 #[must_use]
 pub fn expand_iteration_marks(text: &str) -> Vec<String> {
     let mut out = vec![text.to_owned()];
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() < 2 {
+    if !has_iteration_mark_candidate(text) {
         return out;
     }
+    let chars: Vec<char> = text.chars().collect();
 
     // 1. `X々` -> `XX`
     if chars.contains(&'々') {
@@ -1325,6 +1419,42 @@ pub fn expand_iteration_marks(text: &str) -> Vec<String> {
     out
 }
 
+#[inline]
+fn push_unique_capped(out: &mut Vec<String>, s: String, cap: usize) {
+    if !s.is_empty() && out.len() < cap && !out.iter().any(|existing| existing == &s) {
+        out.push(s);
+    }
+}
+
+#[inline]
+fn push_kana_variants(out: &mut Vec<String>, seed: &str, cap: usize) {
+    if out.len() >= cap {
+        return;
+    }
+    if !out.iter().any(|existing| existing == seed) {
+        out.push(seed.to_owned());
+    }
+    if out.len() < cap && seed.chars().any(is_katakana_char) {
+        push_unique_capped(out, kata_to_hira_str(seed), cap);
+    }
+    if out.len() < cap && seed.chars().any(is_hiragana_char) {
+        push_unique_capped(out, hira_to_kata_str(seed), cap);
+    }
+    if out.len() < cap && seed.contains('ー') {
+        for expanded in expand_prolonged_vowels(seed) {
+            if out.len() >= cap {
+                break;
+            }
+            let has_hira = expanded.chars().any(is_hiragana_char);
+            let exp_kata = has_hira.then(|| hira_to_kata_str(&expanded));
+            push_unique_capped(out, expanded, cap);
+            if let Some(kata) = exp_kata {
+                push_unique_capped(out, kata, cap);
+            }
+        }
+    }
+}
+
 /// Expands a query or prefix into all Yomitan-equivalent lookup forms:
 /// raw, NFKC, radical-normalized, kyūjitai -> shinjitai standardized kanji (always keeping
 /// original too), emphatic sequence collapsing (with Yomitan #1411 guard), bidirectional
@@ -1332,95 +1462,154 @@ pub fn expand_iteration_marks(text: &str) -> Vec<String> {
 /// and romaji -> hiragana. Capped to prevent candidate explosion (#2153).
 #[must_use]
 pub fn expand_query_variants(text: &str) -> Vec<String> {
+    expand_prefix_variants(text, true, false).0
+}
+
+/// Computes deduplicated exact-lookup variants and/or deconjugation input variants for
+/// `text` in a single normalization pass (avoiding duplicate NFKC, radical, kyūjitai,
+/// emphatic, width, romaji, and iteration-mark work when both modes are enabled).
+#[must_use]
+pub fn expand_prefix_variants(
+    text: &str,
+    want_exact: bool,
+    want_deconj: bool,
+) -> (Vec<String>, Vec<String>) {
     let trimmed = trim_leading_whitespace(text);
-    if trimmed.is_empty() {
-        return Vec::new();
+    if trimmed.is_empty() || (!want_exact && !want_deconj) {
+        return (Vec::new(), Vec::new());
     }
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let push_variant = |out: &mut Vec<String>, seen: &mut HashSet<String>, s: String| -> bool {
-        if !s.is_empty() && out.len() < MAX_QUERY_VARIANTS && seen.insert(s.clone()) {
-            out.push(s);
+
+    let nfkc = normalize_nfkc_cow(trimmed);
+    let rad = normalize_radical_characters_cow(&nfkc);
+    let std_kanji = standardize_kanji_cow(&rad);
+
+    let mut exact = if want_exact {
+        let mut v = Vec::with_capacity(4);
+        v.push(trimmed.to_owned());
+        if nfkc.as_ref() != trimmed {
+            v.push(nfkc.as_ref().to_owned());
         }
-        out.len() < MAX_QUERY_VARIANTS
+        v
+    } else {
+        Vec::new()
     };
 
-    let nfkc = normalize_nfkc(trimmed);
-    push_variant(&mut out, &mut seen, trimmed.to_owned());
-    push_variant(&mut out, &mut seen, nfkc.clone());
-
-    let mut base_seeds: Vec<String> = Vec::new();
-    let push_seed = |seeds: &mut Vec<String>, s: String| {
-        if !s.is_empty() && !seeds.contains(&s) {
-            seeds.push(s);
+    let mut deconj = if want_deconj {
+        let mut v = Vec::with_capacity(4);
+        v.push(trimmed.to_owned());
+        if nfkc.as_ref() != trimmed {
+            v.push(nfkc.as_ref().to_owned());
         }
+        if nfkc.chars().any(is_katakana_char) {
+            push_unique_capped(&mut v, kata_to_hira_str(&nfkc), MAX_QUERY_VARIANTS);
+        }
+        v
+    } else {
+        Vec::new()
     };
-    push_seed(&mut base_seeds, nfkc.clone());
 
-    let rad = normalize_radical_characters(&nfkc);
-    if rad != nfkc {
-        push_seed(&mut base_seeds, rad.clone());
+    let mut base_seeds: Vec<Cow<'_, str>> = Vec::with_capacity(3);
+    base_seeds.push(Cow::Borrowed(nfkc.as_ref()));
+    if rad.as_ref() != nfkc.as_ref() {
+        if want_deconj {
+            push_unique_capped(&mut deconj, rad.as_ref().to_owned(), MAX_QUERY_VARIANTS);
+        }
+        base_seeds.push(Cow::Borrowed(rad.as_ref()));
     }
-    let std_kanji = standardize_kanji(&rad);
-    if std_kanji != rad {
-        push_seed(&mut base_seeds, std_kanji);
+    if std_kanji.as_ref() != rad.as_ref() {
+        if want_deconj {
+            push_unique_capped(&mut deconj, std_kanji.as_ref().to_owned(), MAX_QUERY_VARIANTS);
+        }
+        base_seeds.push(Cow::Borrowed(std_kanji.as_ref()));
     }
 
-    // Add emphatic-collapsed variants (both repeat-collapse and full-collapse with #1411 guard).
-    let pre_emph_len = base_seeds.len();
-    for idx in 0..pre_emph_len {
-        let seed = base_seeds[idx].clone();
-        if seed.chars().any(is_emphatic_char) {
-            for emph in collapse_emphatic_sequences_variants(&seed) {
-                push_seed(&mut base_seeds, emph.text);
+    if has_width_alphanumeric(&nfkc) {
+        for width_var in alphanumeric_width_variants(&nfkc) {
+            if want_exact {
+                push_unique_capped(&mut exact, width_var.clone(), MAX_QUERY_VARIANTS);
+            }
+            if want_deconj && width_var != nfkc.as_ref() {
+                push_unique_capped(&mut deconj, width_var, MAX_QUERY_VARIANTS);
             }
         }
     }
 
-    // Alphanumeric width variants (halfwidth <-> fullwidth)
-    for width_var in alphanumeric_width_variants(&nfkc) {
-        push_variant(&mut out, &mut seen, width_var);
-    }
-
-    // Romaji -> hiragana (and katakana) when ASCII letters are present
     if nfkc.chars().any(|ch| ch.is_ascii_alphabetic()) {
         let romaji_hira = alphabetic_to_hiragana(&nfkc);
-        if romaji_hira != nfkc {
-            let romaji_kata = hira_to_kata_str(&romaji_hira);
-            push_variant(&mut out, &mut seen, romaji_hira);
-            push_variant(&mut out, &mut seen, romaji_kata);
+        if romaji_hira != nfkc.as_ref() {
+            if want_deconj {
+                push_unique_capped(&mut deconj, romaji_hira.clone(), MAX_QUERY_VARIANTS);
+            }
+            if want_exact {
+                let romaji_kata = hira_to_kata_str(&romaji_hira);
+                push_unique_capped(&mut exact, romaji_hira, MAX_QUERY_VARIANTS);
+                push_unique_capped(&mut exact, romaji_kata, MAX_QUERY_VARIANTS);
+            }
         }
     }
 
-    for base_seed in base_seeds {
-        if out.len() >= MAX_QUERY_VARIANTS {
-            break;
-        }
-        let seeds: Vec<String> = expand_iteration_marks(&base_seed);
-        for seed in seeds {
-            if out.len() >= MAX_QUERY_VARIANTS {
-                break;
-            }
-            let hira = kata_to_hira_str(&seed);
-            let kata = hira_to_kata_str(&seed);
-            push_variant(&mut out, &mut seen, seed.clone());
-            push_variant(&mut out, &mut seen, hira);
-            push_variant(&mut out, &mut seen, kata);
-
-            if seed.contains('ー') {
-                for expanded in expand_prolonged_vowels(&seed) {
-                    if out.len() >= MAX_QUERY_VARIANTS {
-                        break;
+    if want_exact {
+        let pre_emph_len = base_seeds.len();
+        for idx in 0..pre_emph_len {
+            if base_seeds[idx].chars().any(is_emphatic_char) {
+                let seed_owned = base_seeds[idx].as_ref().to_owned();
+                for emph in collapse_emphatic_sequences_variants(&seed_owned) {
+                    if !emph.text.is_empty()
+                        && !base_seeds.iter().any(|s| s.as_ref() == emph.text.as_str())
+                    {
+                        base_seeds.push(Cow::Owned(emph.text));
                     }
-                    let exp_kata = hira_to_kata_str(&expanded);
-                    push_variant(&mut out, &mut seen, expanded);
-                    push_variant(&mut out, &mut seen, exp_kata);
                 }
             }
         }
+
+        for base_seed in &base_seeds {
+            if exact.len() >= MAX_QUERY_VARIANTS {
+                break;
+            }
+            if has_iteration_mark_candidate(base_seed) {
+                for seed in expand_iteration_marks(base_seed) {
+                    if exact.len() >= MAX_QUERY_VARIANTS {
+                        break;
+                    }
+                    push_kana_variants(&mut exact, &seed, MAX_QUERY_VARIANTS);
+                }
+            } else {
+                push_kana_variants(&mut exact, base_seed, MAX_QUERY_VARIANTS);
+            }
+        }
     }
 
-    out
+    if want_deconj {
+        let pre_emph_len = deconj.len();
+        for idx in 0..pre_emph_len {
+            if deconj[idx].chars().any(is_emphatic_char) {
+                let base_in = deconj[idx].clone();
+                for emph in collapse_emphatic_sequences_variants(&base_in) {
+                    push_unique_capped(&mut deconj, emph.text, MAX_QUERY_VARIANTS);
+                }
+            }
+        }
+
+        if has_iteration_mark_candidate(&std_kanji) {
+            for iter_var in expand_iteration_marks(&std_kanji) {
+                let has_prolonged = iter_var.contains('ー');
+                let prolonged = has_prolonged.then(|| expand_prolonged_vowels(&iter_var));
+                push_unique_capped(&mut deconj, iter_var, MAX_QUERY_VARIANTS);
+                if let Some(pvs) = prolonged {
+                    for pv in pvs {
+                        push_unique_capped(&mut deconj, pv, MAX_QUERY_VARIANTS);
+                    }
+                }
+            }
+        } else if std_kanji.contains('ー') {
+            for pv in expand_prolonged_vowels(&std_kanji) {
+                push_unique_capped(&mut deconj, pv, MAX_QUERY_VARIANTS);
+            }
+        }
+    }
+
+    (exact, deconj)
 }
 
 /// Compiles a config `search/remove-regex` pattern, returning `None` for empty or invalid regexes.
@@ -1430,6 +1619,31 @@ pub fn compile_remove_regex(pattern: &str) -> Option<Regex> {
         return None;
     }
     Regex::new(pattern).ok()
+}
+
+fn cached_remove_regex(pattern: &str) -> Option<Arc<Regex>> {
+    if pattern.is_empty() {
+        return None;
+    }
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = guard.get(pattern) {
+            return hit.clone();
+        }
+    }
+    let compiled = Regex::new(pattern).ok().map(Arc::new);
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() >= 32 && !guard.contains_key(pattern) {
+        guard.clear();
+    }
+    guard.insert(pattern.to_owned(), compiled.clone());
+    compiled
 }
 
 /// Applies a compiled `search/remove-regex` filter to `text`.
@@ -1445,7 +1659,7 @@ pub fn apply_compiled_remove_regex<'a>(text: &'a str, regex: Option<&Regex>) -> 
 /// Invalid or empty regex patterns safely return `text` unchanged.
 #[must_use]
 pub fn apply_remove_regex(text: &str, pattern: &str) -> String {
-    match compile_remove_regex(pattern) {
+    match cached_remove_regex(pattern) {
         Some(re) => re.replace_all(text, "").into_owned(),
         None => text.to_owned(),
     }

@@ -130,6 +130,15 @@ pub fn query_term_details_batch_conn(
     conn: &Connection,
     keys: &[String],
 ) -> Result<Vec<BatchTermRow>, DictError> {
+    query_term_details_batch_strs_conn(conn, keys)
+}
+
+/// Generic variant of [`query_term_details_batch_conn`] accepting `&[&str]` or `&[String]`
+/// without cloning lookup keys.
+pub fn query_term_details_batch_strs_conn<S: AsRef<str>>(
+    conn: &Connection,
+    keys: &[S],
+) -> Result<Vec<BatchTermRow>, DictError> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -138,9 +147,9 @@ pub fn query_term_details_batch_conn(
 
     for chunk in keys.chunks(64) {
         let (bucket, sql, _) = select_batch_bucket(chunk.len());
-        let last = &chunk[chunk.len() - 1];
+        let last = chunk[chunk.len() - 1].as_ref();
         let mut stmt = conn.prepare_cached(sql)?;
-        let iter_params = (0..bucket).map(|i| chunk.get(i).unwrap_or(last).as_str());
+        let iter_params = (0..bucket).map(|i| chunk.get(i).map_or(last, AsRef::as_ref));
         let mut rows = stmt.query(params_from_iter(iter_params))?;
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
