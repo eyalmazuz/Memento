@@ -83,7 +83,7 @@ members = [
 ]
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
@@ -125,6 +125,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.subomi-ass]
+opt-level = 3
+
+[profile.release.package.subomi-subtitle]
 opt-level = 3
 
 [profile.release.package.subomi-asr]

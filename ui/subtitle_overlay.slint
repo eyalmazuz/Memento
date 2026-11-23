@@ -143,7 +143,8 @@ export component SubtitleTokenSelectionSlice inherits Rectangle {
     min-height: root.preferred-height;
     background: transparent;
 
-    if root.use-rich && root.rich-metrics.has-selection && root.word.query != "" : Rectangle {
+    Rectangle {
+        visible: root.use-rich && root.rich-metrics.has-selection && root.word.query != "";
         x: root.rich-metrics.sel-x-px * 1px;
         y: root.rich-metrics.glyph-y-px * 1px;
         width: root.rich-metrics.sel-width-px * 1px;
@@ -192,7 +193,8 @@ export component SubtitleTokenStrokeSlice inherits Rectangle {
     min-height: root.preferred-height;
     background: transparent;
 
-    if root.use-rich && root.rich-metrics.has-stroke : Image {
+    Image {
+        visible: root.use-rich && root.rich-metrics.has-stroke;
         x: -root.rich-metrics.bleed-x-px * 1px;
         y: 0px;
         width: (root.rich-metrics.width-px + root.rich-metrics.bleed-x-px * 2.0) * 1px;
@@ -249,7 +251,8 @@ export component InteractiveSubtitleToken inherits Rectangle {
     background: transparent;
 
     // Plain fallback selection highlight (rich mode renders selection in SubtitleTokenSelectionSlice)
-    if !root.use-rich && root.selected && root.word.query != "" : Rectangle {
+    Rectangle {
+        visible: !root.use-rich && root.selected && root.word.query != "";
         x: glyph.x;
         y: glyph.y;
         width: glyph.width;
@@ -258,7 +261,8 @@ export component InteractiveSubtitleToken inherits Rectangle {
         background: #38a6d6;
     }
 
-    if root.use-rich : Image {
+    Image {
+        visible: root.use-rich;
         x: -root.rich-metrics.bleed-x-px * 1px;
         y: 0px;
         width: (root.rich-metrics.width-px + root.rich-metrics.bleed-x-px * 2.0) * 1px;

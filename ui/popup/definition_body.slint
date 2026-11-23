@@ -121,7 +121,8 @@ export component DefinitionEntryBody inherits Rectangle {
                         animate background { duration: 100ms; }
                         animate border-color { duration: 100ms; }
 
-                        if root.res.selected : Path {
+                        Path {
+                            visible: root.res.selected;
                             width: 10px;
                             height: 10px;
                             x: (parent.width - self.width) / 2;
@@ -306,7 +307,7 @@ export component DefinitionEntryBody inherits Rectangle {
                         border-radius: 2px;
                     }
 
-                    if rich-container.rich-doc.has-rich : Image {
+                    Image {
                         x: 0px;
                         y: 0px;
                         width: rich-container.rich-doc.width-px * 1px;
@@ -316,7 +317,8 @@ export component DefinitionEntryBody inherits Rectangle {
                         image-rendering: pixelated;
                     }
 
-                    if rich-container.is-collapsed : Rectangle {
+                    Rectangle {
+                        visible: rich-container.is-collapsed;
                         x: 0px;
                         y: max(0px, parent.height - 22px);
                         width: parent.width;
@@ -324,7 +326,7 @@ export component DefinitionEntryBody inherits Rectangle {
                         background: @linear-gradient(180deg, #00000000 0%, PopupBridge.css-popup-bg 100%);
                     }
 
-                    if rich-container.rich-doc.has-rich : rich-touch := TouchArea {
+                    rich-touch := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         mouse-cursor: root.pointer-over-link ? pointer : text;
@@ -555,10 +557,11 @@ export component DefinitionEntryBody inherits Rectangle {
                         font-weight: block.kind == 1 ? 700 : 400;
                         color: !root.res.selected ? PopupBridge.css-muted-color : block.kind == 3 ? PopupBridge.css-link-color : block.kind == 1 ? SubomiPalette.glossary-heading : PopupBridge.css-text-color;
                     }
-                    if block.href != "" : TouchArea {
-                        mouse-cursor: pointer;
+                    TouchArea {
+                        enabled: block.href != "";
+                        mouse-cursor: block.href != "" ? pointer : default;
                         clicked => {
-                            if !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
+                            if block.href != "" && !(PopupBridge.rich-enabled && PopupBridge.activate-glossary-link(block.href)) {
                                 root.open-rich-link(block.href);
                             }
                         }
@@ -663,39 +666,20 @@ export component DefinitionCardGrid inherits VerticalLayout {
         spacing: self.col-gap;
         alignment: start;
 
-        DefinitionEntryBody {
-            width: grid-row.is-solo ? floor(root.width / 1px) * 1px : grid-row-box.col-w;
-            res: grid-row.left;
+        for cell-idx in (grid-row.has-right ? 2 : 1) : DefinitionEntryBody {
+            width: (cell-idx == 0 && grid-row.is-solo) ? floor(root.width / 1px) * 1px : grid-row-box.col-w;
+            res: cell-idx == 0 ? grid-row.left : grid-row.right;
             scan-depth: root.scan-depth;
             bridge-rev: root.bridge-rev;
-            is-solo: grid-row.is-solo;
+            is-solo: cell-idx == 0 && grid-row.is-solo;
             show-anki-checkbox: root.show-anki-checkbox;
             anki-enabled: root.anki-enabled;
             term-addable: root.term-addable;
             compact-glossaries: root.compact-glossaries;
             compact-tags: root.compact-tags;
-            tooltip-base-x: round(root.base-x / 1px) * 1px;
-            content-base-y: root.content-base-y + grid-row-box.y;
-            scan-offset-x: root.scan-offset-x;
-            scan-offset-y: root.scan-offset-y;
-            read-scroll-y => { root.read-scroll-y() }
-            toggle-select-definition(i) => { root.toggle-select-definition(i); }
-            open-rich-link(href) => { root.open-rich-link(href); }
-            focus-glossary => { root.focus-glossary(); }
-        }
-
-        if grid-row.has-right : DefinitionEntryBody {
-            width: grid-row-box.col-w;
-            res: grid-row.right;
-            scan-depth: root.scan-depth;
-            bridge-rev: root.bridge-rev;
-            is-solo: false;
-            show-anki-checkbox: root.show-anki-checkbox;
-            anki-enabled: root.anki-enabled;
-            term-addable: root.term-addable;
-            compact-glossaries: root.compact-glossaries;
-            compact-tags: root.compact-tags;
-            tooltip-base-x: round((root.base-x + grid-row-box.col-w + grid-row-box.col-gap) / 1px) * 1px;
+            tooltip-base-x: cell-idx == 0
+                ? round(root.base-x / 1px) * 1px
+                : round((root.base-x + grid-row-box.col-w + grid-row-box.col-gap) / 1px) * 1px;
             content-base-y: root.content-base-y + grid-row-box.y;
             scan-offset-x: root.scan-offset-x;
             scan-offset-y: root.scan-offset-y;

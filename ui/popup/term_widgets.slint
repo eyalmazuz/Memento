@@ -11,6 +11,7 @@ import {
     RichKanjiDetail,
     RichPitchEntry,
     RichPitchGraph,
+    RichPitchMora,
     RichTagPill,
     DictionaryText,
     PopupBridge,
@@ -104,7 +105,8 @@ export component PopupActionButton inherits Rectangle {
     animate background { duration: 100ms; }
     animate border-color { duration: 100ms; }
 
-    if root.has-icon : Image {
+    Image {
+        visible: root.has-icon;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: root.icon-size;
@@ -113,7 +115,8 @@ export component PopupActionButton inherits Rectangle {
         colorize: btn-touch.has-hover && root.enabled ? root.fg-hover-color : root.fg-color;
     }
 
-    if !root.has-icon && root.label != "" : DictionaryText {
+    DictionaryText {
+        visible: !root.has-icon && root.label != "";
         text: root.label;
         color: btn-touch.has-hover && root.enabled ? root.fg-hover-color : root.fg-color;
         font-size: root.label-font-size;
@@ -172,8 +175,9 @@ export component RichTagPillBadge inherits Rectangle {
         vertical-alignment: center;
     }
 
-    if root.pill.notes != "" : pill-touch := TouchArea {
-        mouse-cursor: help;
+    pill-touch := TouchArea {
+        enabled: root.pill.notes != "";
+        mouse-cursor: root.pill.notes != "" ? help : default;
         clicked => {
             if root.tooltip-pinned && PopupBridge.tooltip-visible && PopupBridge.tooltip-text == root.pill.notes {
                 root.tooltip-pinned = false;
@@ -713,8 +717,10 @@ export component TermDerivationRow inherits HorizontalLayout {
                     }
                 }
 
-                if step.has-arrow : DictionaryText {
-                    text: "←";
+                DictionaryText {
+                    visible: step.has-arrow;
+                    width: step.has-arrow ? self.preferred-width : 0px;
+                    text: step.has-arrow ? "←" : "";
                     font-family: PopupBridge.css-conj-font-family;
                     font-size: PopupBridge.css-conj-font-size;
                     color: SubomiPalette.pill-arrow;
@@ -861,6 +867,77 @@ export component FrequencyBadgeList inherits VerticalLayout {
     }
 }
 
+component RichPitchMoraCell inherits Rectangle {
+    in property <RichPitchMora> mora;
+    in property <length> row-h: 30px;
+    in property <bool> compact: false;
+    callback request-tooltip(string);
+
+    private property <image> empty-image;
+    width: max(root.compact ? 18px : 20px, mora-lbl.preferred-width + (root.compact ? 5px : 6px));
+    height: root.row-h;
+
+    Rectangle {
+        x: 0px;
+        y: root.mora.high ? 3px : 11px;
+        width: parent.width;
+        height: 1.5px;
+        background: PopupBridge.css-pitch-color;
+    }
+    Rectangle {
+        visible: root.mora.rises-after || root.mora.falls-after;
+        x: parent.width - 1.5px;
+        y: 3px;
+        width: 1.5px;
+        height: 9.5px;
+        background: PopupBridge.css-pitch-color;
+    }
+    Image {
+        visible: root.mora.devoice;
+        x: (parent.width - 18px) / 2;
+        y: root.compact ? 10px : 11px;
+        width: 18px;
+        height: 18px;
+        source: root.mora.devoice ? PopupBridge.devoice-circle-image() : root.empty-image;
+    }
+    mora-lbl := DictionaryText {
+        text: root.mora.text;
+        y: root.compact ? 12px : 13px;
+        horizontal-alignment: center;
+        width: parent.width;
+        font-size: 11px;
+        color: root.mora.devoice ? SubomiPalette.danger-text : PopupBridge.css-text-color;
+    }
+    Rectangle {
+        visible: root.mora.nasal;
+        x: parent.width - 6px;
+        y: root.compact ? 10px : 11px;
+        width: 5px;
+        height: 5px;
+        border-radius: 2.5px;
+        border-width: 1.2px;
+        border-color: SubomiPalette.nasal-ring;
+        background: PopupBridge.css-popup-bg;
+    }
+    TouchArea {
+        enabled: root.mora.nasal || root.mora.devoice;
+        mouse-cursor: (root.mora.nasal || root.mora.devoice) ? help : default;
+        changed has-hover => {
+            if self.has-hover {
+                PopupBridge.tooltip-next-immediate = false;
+                root.request-tooltip(
+                    root.mora.nasal && root.mora.devoice
+                        ? "Nasalized & devoiced mora (鼻濁音・母音無声化)"
+                        : (root.mora.nasal ? "Nasalized mora (鼻濁音 ゜)" : "Devoiced mora (母音無声化)")
+                );
+            } else {
+                PopupBridge.cancel-pending-tooltip();
+                PopupBridge.hide-tooltip();
+            }
+        }
+    }
+}
+
 // ── Pitch Accent Graph List (Decoupled `[position]` / `[pattern]` badge outside `.pitch-dict`) ─
 export component PitchGraphList inherits VerticalLayout {
     in property <[RichPitchEntry]> rich-pitch-entries: [];
@@ -939,64 +1016,11 @@ export component PitchGraphList inherits VerticalLayout {
                     height: root.row-h;
                     horizontal-stretch: 0;
                     spacing: 0px;
-                    for mora in pitch.mora : Rectangle {
-                        width: max(root.compact ? 18px : 20px, entry-mora-lbl.preferred-width + (root.compact ? 5px : 6px));
-                        height: root.row-h;
-                        Rectangle {
-                            x: 0px;
-                            y: mora.high ? 3px : 11px;
-                            width: parent.width;
-                            height: 1.5px;
-                            background: PopupBridge.css-pitch-color;
-                        }
-                        if mora.rises-after || mora.falls-after : Rectangle {
-                            x: parent.width - 1.5px;
-                            y: 3px;
-                            width: 1.5px;
-                            height: 9.5px;
-                            background: PopupBridge.css-pitch-color;
-                        }
-                        if mora.devoice : Image {
-                            x: (parent.width - 18px) / 2;
-                            y: root.compact ? 10px : 11px;
-                            width: 18px;
-                            height: 18px;
-                            source: PopupBridge.devoice-circle-image();
-                        }
-                        entry-mora-lbl := DictionaryText {
-                            text: mora.text;
-                            y: root.compact ? 12px : 13px;
-                            horizontal-alignment: center;
-                            width: parent.width;
-                            font-size: 11px;
-                            color: mora.devoice ? SubomiPalette.danger-text : PopupBridge.css-text-color;
-                        }
-                        if mora.nasal : Rectangle {
-                            x: parent.width - 6px;
-                            y: root.compact ? 10px : 11px;
-                            width: 5px;
-                            height: 5px;
-                            border-radius: 2.5px;
-                            border-width: 1.2px;
-                            border-color: SubomiPalette.nasal-ring;
-                            background: PopupBridge.css-popup-bg;
-                        }
-                        if mora.nasal || mora.devoice : TouchArea {
-                            mouse-cursor: help;
-                            changed has-hover => {
-                                if self.has-hover {
-                                    PopupBridge.tooltip-next-immediate = false;
-                                    root.request-tooltip(
-                                        mora.nasal && mora.devoice
-                                            ? "Nasalized & devoiced mora (鼻濁音・母音無声化)"
-                                            : (mora.nasal ? "Nasalized mora (鼻濁音 ゜)" : "Devoiced mora (母音無声化)")
-                                    );
-                                } else {
-                                    PopupBridge.cancel-pending-tooltip();
-                                    PopupBridge.hide-tooltip();
-                                }
-                            }
-                        }
+                    for mora in pitch.mora : RichPitchMoraCell {
+                        mora: mora;
+                        row-h: root.row-h;
+                        compact: root.compact;
+                        request-tooltip(tip) => { root.request-tooltip(tip); }
                     }
                 }
             }
@@ -1062,64 +1086,11 @@ export component PitchGraphList inherits VerticalLayout {
                     height: root.row-h;
                     horizontal-stretch: 0;
                     spacing: 0px;
-                    for mora in pitch.mora : Rectangle {
-                        width: max(root.compact ? 18px : 20px, rich-mora-lbl.preferred-width + (root.compact ? 5px : 6px));
-                        height: root.row-h;
-                        Rectangle {
-                            x: 0px;
-                            y: mora.high ? 3px : 11px;
-                            width: parent.width;
-                            height: 1.5px;
-                            background: PopupBridge.css-pitch-color;
-                        }
-                        if mora.rises-after || mora.falls-after : Rectangle {
-                            x: parent.width - 1.5px;
-                            y: 3px;
-                            width: 1.5px;
-                            height: 9.5px;
-                            background: PopupBridge.css-pitch-color;
-                        }
-                        if mora.devoice : Image {
-                            x: (parent.width - 18px) / 2;
-                            y: root.compact ? 10px : 11px;
-                            width: 18px;
-                            height: 18px;
-                            source: PopupBridge.devoice-circle-image();
-                        }
-                        rich-mora-lbl := DictionaryText {
-                            text: mora.text;
-                            y: root.compact ? 12px : 13px;
-                            horizontal-alignment: center;
-                            width: parent.width;
-                            font-size: 11px;
-                            color: mora.devoice ? SubomiPalette.danger-text : PopupBridge.css-text-color;
-                        }
-                        if mora.nasal : Rectangle {
-                            x: parent.width - 6px;
-                            y: root.compact ? 10px : 11px;
-                            width: 5px;
-                            height: 5px;
-                            border-radius: 2.5px;
-                            border-width: 1.2px;
-                            border-color: SubomiPalette.nasal-ring;
-                            background: PopupBridge.css-popup-bg;
-                        }
-                        if mora.nasal || mora.devoice : TouchArea {
-                            mouse-cursor: help;
-                            changed has-hover => {
-                                if self.has-hover {
-                                    PopupBridge.tooltip-next-immediate = false;
-                                    root.request-tooltip(
-                                        mora.nasal && mora.devoice
-                                            ? "Nasalized & devoiced mora (鼻濁音・母音無声化)"
-                                            : (mora.nasal ? "Nasalized mora (鼻濁音 ゜)" : "Devoiced mora (母音無声化)")
-                                    );
-                                } else {
-                                    PopupBridge.cancel-pending-tooltip();
-                                    PopupBridge.hide-tooltip();
-                                }
-                            }
-                        }
+                    for mora in pitch.mora : RichPitchMoraCell {
+                        mora: mora;
+                        row-h: root.row-h;
+                        compact: root.compact;
+                        request-tooltip(tip) => { root.request-tooltip(tip); }
                     }
                 }
             }
@@ -1174,7 +1145,7 @@ export component PitchGraphList inherits VerticalLayout {
                         width: max(18px, mora-label.preferred-width + 3px);
                         height: 28px;
                         Rectangle { x: 0px; y: mora.high ? 3px : 11px; width: parent.width; height: 1px; background: PopupBridge.css-pitch-color; }
-                        if mora.rises-after || mora.falls-after : Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: PopupBridge.css-pitch-color; }
+                        Rectangle { visible: mora.rises-after || mora.falls-after; x: parent.width - 1px; y: 3px; width: 1px; height: 9px; background: PopupBridge.css-pitch-color; }
                         mora-label := DictionaryText {
                             text: mora.text;
                             y: 13px;
@@ -1489,8 +1460,10 @@ export component AudioSourceMenu inherits Rectangle {
                             overflow: elide;
                         }
 
-                        if src-row.status == 3 : DictionaryText {
-                            text: "…";
+                        DictionaryText {
+                            visible: src-row.status == 3;
+                            width: src-row.status == 3 ? self.preferred-width : 0px;
+                            text: src-row.status == 3 ? "…" : "";
                             font-size: 11px;
                             color: SubomiPalette.text-muted;
                             vertical-alignment: center;

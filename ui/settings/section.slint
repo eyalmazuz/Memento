@@ -105,7 +105,11 @@ export component SettingsSection inherits VerticalLayout {
 
             for field[index] in root.group.fields : VerticalLayout {
                 spacing: 0px;
-                if index > 0 && field.visible : Rectangle { height: 1px; background: SubomiPalette.border; }
+                Rectangle {
+                    visible: index > 0 && field.visible;
+                    height: (index > 0 && field.visible) ? 1px : 0px;
+                    background: SubomiPalette.border;
+                }
                 field-row := FieldRow {
                     field: field;
                     group-category: root.group.category;

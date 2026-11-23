@@ -3,12 +3,16 @@
 //! Portal on Unix).
 
 use std::collections::HashSet;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::path::PathBuf;
 
-use crate::{FileDialogFilter, FileDialogOptions};
+use crate::FileDialogFilter;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use crate::FileDialogOptions;
 
 /// Convert glob patterns (e.g. `["*.mkv", "*.srt"]` or `["*"]`) into the bare
 /// extension list expected by `rfd::FileDialog::add_filter`.
+#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
 pub(crate) fn extract_rfd_filter_extensions(filter: &FileDialogFilter) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut extensions = Vec::new();
@@ -39,6 +43,7 @@ pub(crate) fn extract_rfd_filter_extensions(filter: &FileDialogFilter) -> Vec<St
 }
 
 /// Build an `rfd::FileDialog` configured from [`FileDialogOptions`].
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn build_rfd_dialog(options: &FileDialogOptions) -> rfd::FileDialog {
     let mut dialog = rfd::FileDialog::new();
     if !options.title.is_empty() {
@@ -63,7 +68,7 @@ pub(crate) fn build_rfd_dialog(options: &FileDialogOptions) -> rfd::FileDialog {
 }
 
 /// Blocking native file or folder chooser backed by `rfd`.
-#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn open_files_rfd(options: &FileDialogOptions) -> Vec<PathBuf> {
     let dialog = build_rfd_dialog(options);
     if options.is_folder() {
@@ -82,6 +87,7 @@ pub(crate) fn open_files_rfd(options: &FileDialogOptions) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileDialogOptions;
     use std::path::PathBuf;
 
     #[test]
@@ -108,8 +114,11 @@ mod tests {
         assert_eq!(unique.len(), sub_exts.len());
         assert!(!sub_exts.iter().any(|e| e.contains('*')));
 
-        // Building the dialog itself must succeed without touching any OS UI.
-        let _ = build_rfd_dialog(&subs);
-        let _ = build_rfd_dialog(&folder);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            // Building the dialog itself must succeed without touching any OS UI.
+            let _ = build_rfd_dialog(&subs);
+            let _ = build_rfd_dialog(&folder);
+        }
     }
 }

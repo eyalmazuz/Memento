@@ -98,11 +98,12 @@ component SyntaxCard inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            if root.badge != "" : VerticalLayout {
+            VerticalLayout {
                 alignment: center;
                 Rectangle {
-                    height: 20px;
-                    width: b-lbl.preferred-width + 14px;
+                    visible: root.badge != "";
+                    height: root.badge != "" ? 20px : 0px;
+                    width: root.badge != "" ? (b-lbl.preferred-width + 14px) : 0px;
                     border-radius: 10px;
                     background: SubomiPalette.teal-muted;
                     border-width: 1px;
@@ -126,7 +127,7 @@ component SyntaxCard inherits Rectangle {
             wrap: word-wrap;
         }
 
-        if root.examples.length > 0 : VerticalLayout {
+        VerticalLayout {
             spacing: 6px;
             for ex in root.examples : HorizontalLayout {
                 alignment: start;
@@ -470,9 +471,12 @@ export component AnkiHelpWindow inherits Window {
                         }
                     }
 
-                    // Category Sub-filter Strip (Term Markers — wraps onto 2 rows at narrow widths without layout loops)
-                    if root.active-tab == 1 : Rectangle {
-                        property <bool> compact-wrap: root.width < 680px;
+                    // Category Sub-filter Strip (shared across Term & Kanji tabs; wraps onto 2 rows at narrow widths)
+                    if root.active-tab == 1 || root.active-tab == 2 : sub-filter := Rectangle {
+                        property <bool> is-term: root.active-tab == 1;
+                        property <int> active-sec: self.is-term ? root.active-term-section : root.active-kanji-section;
+                        property <[string]> sec-names: self.is-term ? root.term-section-names : root.kanji-section-names;
+                        property <bool> compact-wrap: root.width < (self.is-term ? 680px : 660px);
                         height: compact-wrap ? 58px : 26px;
 
                         if !compact-wrap : HorizontalLayout {
@@ -485,17 +489,19 @@ export component AnkiHelpWindow inherits Window {
 
                             FilterChip {
                                 label: "All Sections";
-                                active: root.active-term-section == -1;
+                                active: sub-filter.active-sec == -1;
                                 clicked => {
-                                    root.active-term-section = -1;
+                                    if root.active-tab == 1 { root.active-term-section = -1; }
+                                    else { root.active-kanji-section = -1; }
                                     help-scroll.viewport-y = 0px;
                                 }
                             }
-                            for name[idx] in root.term-section-names : FilterChip {
+                            for name[idx] in sub-filter.sec-names : FilterChip {
                                 label: name;
-                                active: root.active-term-section == idx;
+                                active: sub-filter.active-sec == idx;
                                 clicked => {
-                                    root.active-term-section = idx;
+                                    if root.active-tab == 1 { root.active-term-section = idx; }
+                                    else { root.active-kanji-section = idx; }
                                     help-scroll.viewport-y = 0px;
                                 }
                             }
@@ -515,20 +521,22 @@ export component AnkiHelpWindow inherits Window {
                                     padding-right: 6px;
                                     FilterChip {
                                         label: "All Sections";
-                                        active: root.active-term-section == -1;
+                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == -1;
                                         clicked => {
-                                            root.active-term-section = -1;
+                                            if root.active-tab == 1 { root.active-term-section = -1; }
+                                            else { root.active-kanji-section = -1; }
                                             help-scroll.viewport-y = 0px;
                                         }
                                     }
                                 }
-                                for name[idx] in root.term-section-names : HorizontalLayout {
+                                for name[idx] in (root.active-tab == 1 ? root.term-section-names : root.kanji-section-names) : HorizontalLayout {
                                     padding-right: idx < 2 ? 6px : 0px;
                                     if idx < 2 : FilterChip {
                                         label: name;
-                                        active: root.active-term-section == idx;
+                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == idx;
                                         clicked => {
-                                            root.active-term-section = idx;
+                                            if root.active-tab == 1 { root.active-term-section = idx; }
+                                            else { root.active-kanji-section = idx; }
                                             help-scroll.viewport-y = 0px;
                                         }
                                     }
@@ -537,95 +545,14 @@ export component AnkiHelpWindow inherits Window {
                             HorizontalLayout {
                                 spacing: 0px;
                                 alignment: start;
-                                for name[idx] in root.term-section-names : HorizontalLayout {
+                                for name[idx] in (root.active-tab == 1 ? root.term-section-names : root.kanji-section-names) : HorizontalLayout {
                                     padding-right: idx >= 2 ? 6px : 0px;
                                     if idx >= 2 : FilterChip {
                                         label: name;
-                                        active: root.active-term-section == idx;
+                                        active: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == idx;
                                         clicked => {
-                                            root.active-term-section = idx;
-                                            help-scroll.viewport-y = 0px;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Category Sub-filter Strip (Kanji Markers — wraps onto 2 rows at narrow widths without layout loops)
-                    if root.active-tab == 2 : Rectangle {
-                        property <bool> compact-wrap: root.width < 660px;
-                        height: compact-wrap ? 58px : 26px;
-
-                        if !compact-wrap : HorizontalLayout {
-                            x: 0px;
-                            y: 0px;
-                            width: parent.width;
-                            height: 26px;
-                            spacing: 6px;
-                            alignment: start;
-
-                            FilterChip {
-                                label: "All Sections";
-                                active: root.active-kanji-section == -1;
-                                clicked => {
-                                    root.active-kanji-section = -1;
-                                    help-scroll.viewport-y = 0px;
-                                }
-                            }
-                            for name[idx] in root.kanji-section-names : FilterChip {
-                                label: name;
-                                active: root.active-kanji-section == idx;
-                                clicked => {
-                                    root.active-kanji-section = idx;
-                                    help-scroll.viewport-y = 0px;
-                                }
-                            }
-                        }
-
-                        if compact-wrap : VerticalLayout {
-                            x: 0px;
-                            y: 0px;
-                            width: parent.width;
-                            height: 58px;
-                            spacing: 6px;
-
-                            HorizontalLayout {
-                                spacing: 0px;
-                                alignment: start;
-                                HorizontalLayout {
-                                    padding-right: 6px;
-                                    FilterChip {
-                                        label: "All Sections";
-                                        active: root.active-kanji-section == -1;
-                                        clicked => {
-                                            root.active-kanji-section = -1;
-                                            help-scroll.viewport-y = 0px;
-                                        }
-                                    }
-                                }
-                                for name[idx] in root.kanji-section-names : HorizontalLayout {
-                                    padding-right: idx < 2 ? 6px : 0px;
-                                    if idx < 2 : FilterChip {
-                                        label: name;
-                                        active: root.active-kanji-section == idx;
-                                        clicked => {
-                                            root.active-kanji-section = idx;
-                                            help-scroll.viewport-y = 0px;
-                                        }
-                                    }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 0px;
-                                alignment: start;
-                                for name[idx] in root.kanji-section-names : HorizontalLayout {
-                                    padding-right: idx >= 2 ? 6px : 0px;
-                                    if idx >= 2 : FilterChip {
-                                        label: name;
-                                        active: root.active-kanji-section == idx;
-                                        clicked => {
-                                            root.active-kanji-section = idx;
+                                            if root.active-tab == 1 { root.active-term-section = idx; }
+                                            else { root.active-kanji-section = idx; }
                                             help-scroll.viewport-y = 0px;
                                         }
                                     }
@@ -660,68 +587,73 @@ export component AnkiHelpWindow inherits Window {
                         if root.active-tab == 0 : VerticalLayout {
                             spacing: 14px;
 
-                            SyntaxCard {
-                                title: "Basic Markers";
-                                badge: "{name}";
-                                body: "Wrap a marker name in curly braces inside any Anki field mapping. When Subomi exports a card, each marker is replaced with live data from the active subtitle, lookup popup, or video frame.";
-                                examples: [
-                                    "{expression}",
-                                    "{furigana}",
-                                    "{subtitle}",
-                                    "{glossary}",
-                                ];
-                                copy-snippet(s) => { root.copy-marker(s); }
-                            }
-
-                            SyntaxCard {
-                                title: "Marker Arguments";
-                                badge: ": key = value";
-                                body: "Some markers accept arguments after a colon (:). Separate multiple arguments with commas (,). For example, you can target a single dictionary ID (shown in Options → Dictionary) or cap screenshot dimensions.";
-                                examples: [
-                                    "{glossary : dict = 1}",
-                                    "{frequencies : min-value = true, value-only = true}",
-                                    "{screenshot : max-width = 1280, max-height = 720}",
-                                    "{video : source = context, subtitles = false}",
-                                ];
-                                copy-snippet(s) => { root.copy-marker(s); }
-                            }
-
-                            SyntaxCard {
-                                title: "Fallback Chains";
-                                badge: "a | b";
-                                body: "Separate alternatives with a pipe (|) to fall back gracefully when earlier values are empty. Evaluation stops at the first non-empty result — ideal for preferring selected glossary text or your clipboard before falling back to full definitions.";
-                                examples: [
-                                    "{selection | clipboard}",
-                                    "{selection | clipboard | glossary : dict = 1}",
-                                    "{audio | audio-media}",
-                                ];
-                                copy-snippet(s) => { root.copy-marker(s); }
-                            }
-
-                            SyntaxCard {
-                                title: "Context Selection & One-Click Presets";
-                                badge: "Tips";
-                                body: "Click or drag across rows in the Subtitle List drawer (or Shift-click a range) to mark multi-line context for {context}, {context-2}, {audio-context}, {video}, and {cloze-prefix}/{cloze-suffix}. Need a fast starting point? Use the one-click Lapis, Kiku, Senren, Animecards, or JPMN preset buttons right under Term Notes in Options → Anki Integration.";
-                                examples: [
-                                    "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
-                                    "{audio-context}",
-                                ];
+                            for card in [
+                                {
+                                    title: "Basic Markers",
+                                    badge: "{name}",
+                                    body: "Wrap a marker name in curly braces inside any Anki field mapping. When Subomi exports a card, each marker is replaced with live data from the active subtitle, lookup popup, or video frame.",
+                                    examples: [
+                                        "{expression}",
+                                        "{furigana}",
+                                        "{subtitle}",
+                                        "{glossary}",
+                                    ],
+                                },
+                                {
+                                    title: "Marker Arguments",
+                                    badge: ": key = value",
+                                    body: "Some markers accept arguments after a colon (:). Separate multiple arguments with commas (,). For example, you can target a single dictionary ID (shown in Options → Dictionary) or cap screenshot dimensions.",
+                                    examples: [
+                                        "{glossary : dict = 1}",
+                                        "{frequencies : min-value = true, value-only = true}",
+                                        "{screenshot : max-width = 1280, max-height = 720}",
+                                        "{video : source = context, subtitles = false}",
+                                    ],
+                                },
+                                {
+                                    title: "Fallback Chains",
+                                    badge: "a | b",
+                                    body: "Separate alternatives with a pipe (|) to fall back gracefully when earlier values are empty. Evaluation stops at the first non-empty result — ideal for preferring selected glossary text or your clipboard before falling back to full definitions.",
+                                    examples: [
+                                        "{selection | clipboard}",
+                                        "{selection | clipboard | glossary : dict = 1}",
+                                        "{audio | audio-media}",
+                                    ],
+                                },
+                                {
+                                    title: "Context Selection & One-Click Presets",
+                                    badge: "Tips",
+                                    body: "Click or drag across rows in the Subtitle List drawer (or Shift-click a range) to mark multi-line context for {context}, {context-2}, {audio-context}, {video}, and {cloze-prefix}/{cloze-suffix}. Need a fast starting point? Use the one-click Lapis, Kiku, Senren, Animecards, or JPMN preset buttons right under Term Notes in Options → Anki Integration.",
+                                    examples: [
+                                        "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}",
+                                        "{audio-context}",
+                                    ],
+                                },
+                            ] : SyntaxCard {
+                                title: card.title;
+                                badge: card.badge;
+                                body: card.body;
+                                examples: card.examples;
                                 copy-snippet(s) => { root.copy-marker(s); }
                             }
                         }
 
-                        // ── Tab 1: Term Markers ────────────────────────────────────
-                        if root.active-tab == 1 : VerticalLayout {
+                        // ── Tab 1 & Tab 2: Term & Kanji Markers (shared layout) ─
+                        if root.active-tab == 1 || root.active-tab == 2 : VerticalLayout {
+                            property <bool> is-term: root.active-tab == 1;
+                            property <[HelpSection]> shown-sections: self.is-term ? root.term-sections : root.kanji-sections;
+                            property <int> shown-sec-idx: self.is-term ? root.active-term-section : root.active-kanji-section;
                             spacing: 18px;
 
-                            if root.term-sections.length == 0 : Rectangle {
+                            if self.shown-sections.length == 0 : Rectangle {
                                 height: 80px;
                                 border-radius: 10px;
                                 background: SubomiPalette.card-bg;
                                 border-width: 1px;
                                 border-color: SubomiPalette.card-border;
                                 Text {
-                                    text: "No term markers match \"" + root.search-query + "\".";
+                                    text: (root.active-tab == 1 ? "No term markers match \"" : "No kanji markers match \"")
+                                        + root.search-query + "\".";
                                     color: SubomiPalette.text-muted;
                                     font-size: 13px;
                                     horizontal-alignment: center;
@@ -729,57 +661,19 @@ export component AnkiHelpWindow inherits Window {
                                 }
                             }
 
-                            for section[s-idx] in root.term-sections : VerticalLayout {
+                            for section[s-idx] in self.shown-sections : VerticalLayout {
+                                property <bool> sec-visible: (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == -1
+                                    || (root.active-tab == 1 ? root.active-term-section : root.active-kanji-section) == s-idx;
                                 spacing: 10px;
-                                visible: root.active-term-section == -1 || root.active-term-section == s-idx;
+                                visible: self.sec-visible;
 
-                                if (root.active-term-section == -1 || root.active-term-section == s-idx) && section.markers.length > 0 : VerticalLayout {
+                                if self.sec-visible && section.markers.length > 0 : VerticalLayout {
                                     spacing: 10px;
 
                                     SectionHeader {
                                         title: section.title;
                                         subtitle: section.subtitle;
-                                        accent: SubomiPalette.cyan-accent;
-                                    }
-
-                                    for marker in section.markers : MarkerCard {
-                                        marker: marker;
-                                        copy-marker(s) => { root.copy-marker(s); }
-                                    }
-                                }
-                            }
-                        }
-
-                        // ── Tab 2: Kanji Markers ───────────────────────────────────
-                        if root.active-tab == 2 : VerticalLayout {
-                            spacing: 18px;
-
-                            if root.kanji-sections.length == 0 : Rectangle {
-                                height: 80px;
-                                border-radius: 10px;
-                                background: SubomiPalette.card-bg;
-                                border-width: 1px;
-                                border-color: SubomiPalette.card-border;
-                                Text {
-                                    text: "No kanji markers match \"" + root.search-query + "\".";
-                                    color: SubomiPalette.text-muted;
-                                    font-size: 13px;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-
-                            for section[s-idx] in root.kanji-sections : VerticalLayout {
-                                spacing: 10px;
-                                visible: root.active-kanji-section == -1 || root.active-kanji-section == s-idx;
-
-                                if (root.active-kanji-section == -1 || root.active-kanji-section == s-idx) && section.markers.length > 0 : VerticalLayout {
-                                    spacing: 10px;
-
-                                    SectionHeader {
-                                        title: section.title;
-                                        subtitle: section.subtitle;
-                                        accent: SubomiPalette.teal-border;
+                                        accent: root.active-tab == 1 ? SubomiPalette.cyan-accent : SubomiPalette.teal-border;
                                     }
 
                                     for marker in section.markers : MarkerCard {

@@ -267,7 +267,8 @@ export component SubtitleDrawerPanel inherits Rectangle {
                             : (d-touch.has-hover ? root.hover-color : transparent));
 
                     // Subtle row separation hairline
-                    if idx > 0 && !entry.selected && !entry.is_active && !entry.search-match : Rectangle {
+                    Rectangle {
+                        visible: idx > 0 && !entry.selected && !entry.is_active && !entry.search-match;
                         x: 8px;
                         y: 0px;
                         width: parent.width - 16px;
@@ -277,7 +278,8 @@ export component SubtitleDrawerPanel inherits Rectangle {
                     }
 
                     // Emerald indicator for active playing cue
-                    if entry.is_active : Rectangle {
+                    Rectangle {
+                        visible: entry.is_active;
                         x: 2px;
                         y: 3px;
                         width: 3px;
@@ -293,20 +295,29 @@ export component SubtitleDrawerPanel inherits Rectangle {
                         padding-right: 8px;
                         padding-top: 3px;
                         padding-bottom: 3px;
-                        spacing: 8px;
+                        spacing: 0px;
                         alignment: start;
 
                         // Timecode (omitted completely when `show-timestamps` is false so cue text gets full width)
-                        if root.show-timestamps : Text {
-                            width: 50px;
-                            horizontal-alignment: left;
-                            vertical-alignment: center;
-                            font-family: "monospace";
-                            font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
-                            font-weight: 600;
-                            color: entry.selected ? SubomiPalette.success-text : root.text-color;
-                            opacity: entry.selected ? 1.0 : 0.72;
-                            text: entry.timestamp;
+                        Rectangle {
+                            visible: root.show-timestamps;
+                            width: root.show-timestamps ? 58px : 0px;
+                            clip: true;
+                            background: transparent;
+
+                            Text {
+                                x: 0px;
+                                width: 50px;
+                                height: parent.height;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                font-family: "monospace";
+                                font-size: max(10px, (root.active-tab == 1 ? root.secondary-font-size : root.primary-font-size) - 2px);
+                                font-weight: 600;
+                                color: entry.selected ? SubomiPalette.success-text : root.text-color;
+                                opacity: entry.selected ? 1.0 : 0.72;
+                                text: entry.timestamp;
+                            }
                         }
 
                         // Wrapped Multi-Line Cue Text

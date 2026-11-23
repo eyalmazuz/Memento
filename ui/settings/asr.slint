@@ -112,7 +112,11 @@ export component AsrModelsPanel inherits VerticalLayout {
 
             for model[index] in root.asr-model-rows : VerticalLayout {
                 spacing: 0px;
-                if index > 0 : Rectangle { height: 1px; background: SubomiPalette.border; }
+                Rectangle {
+                    visible: index > 0;
+                    height: index > 0 ? 1px : 0px;
+                    background: SubomiPalette.border;
+                }
                 HorizontalLayout {
                     min-height: 48px;
                     padding-top: 8px;

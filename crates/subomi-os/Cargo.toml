@@ -6,8 +6,8 @@ rust-version = "1.77"
 description = "Cross-platform OS integration (screensaver, native dialogs, system theme, fullscreen)"
 license = "GPL-2.0-only"
 
-[dependencies]
-rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+rfd = { version = "0.18", default-features = false }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

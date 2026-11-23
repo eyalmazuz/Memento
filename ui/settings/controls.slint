@@ -1,6 +1,6 @@
 import { ComboBox, LineEdit, ScrollView, TextEdit } from "std-widgets.slint";
 import { SubomiPalette } from "../palette.slint";
-import { ActionButton, ToggleChip } from "../components/buttons.slint";
+import { ActionButton, ToggleChip, TooltipActionButton } from "../components/buttons.slint";
 import { SubomiSwitch, SectionHeader } from "../components/controls.slint";
 import { AnkiAutocompleteItem, SettingsField } from "types.slint";
 
@@ -90,7 +90,7 @@ export component FontPickerControl inherits VerticalLayout {
 
             VerticalLayout {
                 alignment: center;
-                ActionButton {
+                TooltipActionButton {
                     text: "−";
                     compact: true;
                     enabled: root.field.enabled;
@@ -128,7 +128,7 @@ export component FontPickerControl inherits VerticalLayout {
 
             VerticalLayout {
                 alignment: center;
-                ActionButton {
+                TooltipActionButton {
                     text: "+";
                     compact: true;
                     enabled: root.field.enabled;
@@ -286,7 +286,7 @@ export component FolderBrowseControl inherits HorizontalLayout {
 
     VerticalLayout {
         alignment: center;
-        ActionButton {
+        TooltipActionButton {
             text: "Browse…";
             compact: true;
             enabled: root.field.enabled;
@@ -324,7 +324,7 @@ export component NumericStepperControl inherits HorizontalLayout {
 
     VerticalLayout {
         alignment: center;
-        ActionButton {
+        TooltipActionButton {
             text: "−";
             compact: true;
             enabled: root.field.enabled && num-edit.text.to-float() > root.min-val;
@@ -346,7 +346,7 @@ export component NumericStepperControl inherits HorizontalLayout {
 
     VerticalLayout {
         alignment: center;
-        ActionButton {
+        TooltipActionButton {
             text: "+";
             compact: true;
             enabled: root.field.enabled && num-edit.text.to-float() < root.max-val;
@@ -442,7 +442,7 @@ export component AnkiFieldEditorControl inherits VerticalLayout {
 
         VerticalLayout {
             alignment: start;
-            ActionButton {
+            TooltipActionButton {
                 text: "{…}";
                 compact: true;
                 enabled: root.field.enabled;
@@ -588,14 +588,14 @@ component PreviewRubyWord inherits VerticalLayout {
         height: main-glyph.preferred-height;
         background: transparent;
 
-        if root.stroke-width > 0.0 : Text { x: -root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: 0px; y: -root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: 0px; y: root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: -root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: -root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
-        if root.stroke-width > 0.0 : Text { x: root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: -root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: root.sw; y: 0px; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: 0px; y: -root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: 0px; y: root.sw; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: -root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: root.sd; y: -root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: -root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
+        Text { visible: root.stroke-width > 0.0; x: root.sd; y: root.sd; text: root.base-text; font-family: root.font-family; font-size: root.font-size; font-weight: root.font-bold ? 700 : 400; font-italic: root.font-italic; color: root.stroke-color; }
 
         main-glyph := Text {
             x: 0px;

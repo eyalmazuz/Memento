@@ -55,7 +55,9 @@ export component DictionarySearchPanel inherits Rectangle {
     callback open-rich-link(string);
     callback scan-input(string, int, length, length);
 
-    private property <[DictResult]> active-results: PopupBridge.rich-enabled ? PopupBridge.panel-results : root.results;
+    private property <[DictResult]> active-results: !root.visible
+        ? []
+        : (PopupBridge.rich-enabled ? PopupBridge.panel-results : root.results);
     private property <string> active-query: PopupBridge.rich-enabled ? PopupBridge.panel-query : root.query;
     private property <bool> is-searching: PopupBridge.rich-enabled && PopupBridge.panel-searching;
     private property <bool> audio-menu-open: false;
@@ -133,20 +135,21 @@ export component DictionarySearchPanel inherits Rectangle {
         HorizontalLayout {
             spacing: 4px;
 
-            if PopupBridge.rich-enabled : LineEdit {
+            LineEdit {
                 horizontal-stretch: 1;
-                placeholder-text: PopupBridge.panel-kana-only
+                placeholder-text: PopupBridge.rich-enabled && PopupBridge.panel-kana-only
                     ? "Search reading (* / ? wildcards)…"
                     : "Search Japanese (* / ? wildcards)…";
-                text <=> PopupBridge.panel-query;
-                edited(value) => { PopupBridge.panel-search-requested(value); }
-            }
-
-            if !PopupBridge.rich-enabled : LineEdit {
-                horizontal-stretch: 1;
-                placeholder-text: "Search Japanese (* / ? wildcards)…";
-                text <=> root.query;
-                edited(value) => { root.search-changed(value); }
+                text: root.active-query;
+                edited(value) => {
+                    if PopupBridge.rich-enabled {
+                        PopupBridge.panel-query = value;
+                        PopupBridge.panel-search-requested(value);
+                    } else {
+                        root.query = value;
+                        root.search-changed(value);
+                    }
+                }
             }
 
             if root.active-query != "" : VerticalLayout {

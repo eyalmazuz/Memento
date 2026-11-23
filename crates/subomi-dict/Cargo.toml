@@ -12,7 +12,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"
 unicode-normalization = "=0.1.25"
-regex = "=1.13.1"
+regex = { version = "=1.13.1", default-features = false, features = [
+    "std",
+    "perf-cache",
+    "perf-inline",
+    "unicode-case",
+    "unicode-gencat",
+    "unicode-perl",
+    "unicode-script",
+] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [lib]

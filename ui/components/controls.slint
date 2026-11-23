@@ -76,7 +76,8 @@ export component SubomiCheckBox inherits Rectangle {
                 animate background { duration: 100ms; }
                 animate border-color { duration: 100ms; }
 
-                if root.checked : Path {
+                Path {
+                    visible: root.checked;
                     width: 12px;
                     height: 12px;
                     x: (parent.width - self.width) / 2;
@@ -96,7 +97,9 @@ export component SubomiCheckBox inherits Rectangle {
             }
         }
 
-        if root.label != "" : Text {
+        Text {
+            visible: root.label != "";
+            width: root.label != "" ? self.preferred-width : 0px;
             text: root.label;
             color: SubomiPalette.text;
             font-size: 13px;
@@ -228,13 +231,15 @@ export component SectionHeader inherits HorizontalLayout {
             vertical-alignment: center;
         }
 
-        if root.subtitle != "" : Text {
-            text: "· " + root.subtitle;
+        Text {
+            visible: root.subtitle != "";
+            width: root.subtitle != "" ? self.preferred-width : 0px;
+            text: root.subtitle != "" ? ("· " + root.subtitle) : "";
             font-size: 12px;
             color: SubomiPalette.text-muted;
             vertical-alignment: center;
             overflow: elide;
-            horizontal-stretch: 1;
+            horizontal-stretch: root.subtitle != "" ? 1 : 0;
         }
     }
 

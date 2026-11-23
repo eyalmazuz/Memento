@@ -146,6 +146,14 @@ component DropdownItem inherits Rectangle {
     in property <bool> is-disabled: false;
     callback clicked();
 
+    property <bool> show-gutter: root.checkable || root.reserve-check-gutter;
+    property <length> left-pad: self.show-gutter ? 30px : 10px;
+    property <length> arrow-w: root.has-submenu ? 12px : 0px;
+    property <length> shortcut-w: root.shortcut != "" ? shortcut-lbl.preferred-width : 0px;
+    property <length> right-reserve: 10px
+        + self.arrow-w
+        + (root.shortcut != "" ? (self.shortcut-w + (root.has-submenu ? 6px : 0px) + 8px) : (root.has-submenu ? 8px : 0px));
+
     height: 30px;
     border-radius: 5px;
     background: root.is-disabled
@@ -156,56 +164,53 @@ component DropdownItem inherits Rectangle {
 
     animate background { duration: 100ms; }
 
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 8px;
-        alignment: space-between;
+    Text {
+        visible: root.show-gutter;
+        x: 10px;
+        y: 0px;
+        width: 14px;
+        height: parent.height;
+        text: (root.checkable && root.checked) ? "✓" : "";
+        font-size: 11px;
+        font-weight: 700;
+        color: SubomiPalette.cyan-accent;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
 
-        HorizontalLayout {
-            spacing: 6px;
-            alignment: start;
-            horizontal-stretch: 1;
+    Text {
+        x: root.left-pad;
+        y: 0px;
+        width: max(0px, parent.width - root.left-pad - root.right-reserve);
+        height: parent.height;
+        text: root.text;
+        font-size: 12px;
+        color: root.is-disabled ? SubomiPalette.text-muted : SubomiPalette.text;
+        vertical-alignment: center;
+        overflow: elide;
+    }
 
-            if root.checkable || root.reserve-check-gutter : Text {
-                width: 14px;
-                text: (root.checkable && root.checked) ? "✓" : "";
-                font-size: 11px;
-                font-weight: 700;
-                color: SubomiPalette.cyan-accent;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+    shortcut-lbl := Text {
+        visible: root.shortcut != "";
+        x: parent.width - 10px - root.arrow-w - (root.has-submenu ? 6px : 0px) - self.preferred-width;
+        y: 0px;
+        height: parent.height;
+        text: root.shortcut;
+        font-size: 11px;
+        color: SubomiPalette.text-muted;
+        vertical-alignment: center;
+    }
 
-            Text {
-                text: root.text;
-                font-size: 12px;
-                color: root.is-disabled ? SubomiPalette.text-muted : SubomiPalette.text;
-                vertical-alignment: center;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-        }
-
-        HorizontalLayout {
-            spacing: 6px;
-            alignment: end;
-
-            if root.shortcut != "" : Text {
-                text: root.shortcut;
-                font-size: 11px;
-                color: SubomiPalette.text-muted;
-                vertical-alignment: center;
-            }
-
-            if root.has-submenu : Text {
-                text: "›";
-                font-size: 14px;
-                font-weight: 700;
-                color: SubomiPalette.text-secondary;
-                vertical-alignment: center;
-            }
-        }
+    Text {
+        visible: root.has-submenu;
+        x: parent.width - 10px - self.preferred-width;
+        y: 0px;
+        height: parent.height;
+        text: root.has-submenu ? "›" : "";
+        font-size: 14px;
+        font-weight: 700;
+        color: SubomiPalette.text-secondary;
+        vertical-alignment: center;
     }
 
     touch := TouchArea {
@@ -225,6 +230,20 @@ component DropdownSeparator inherits Rectangle {
         height: 1px;
         background: SubomiPalette.border;
     }
+}
+
+struct MenuActionRow {
+    id: int,
+    text: string,
+    shortcut: string,
+    checkable: bool,
+    reserve-gutter: bool,
+    checked: bool,
+    has-submenu: bool,
+    submenu-active: bool,
+    is-disabled: bool,
+    is-separator: bool,
+    shown: bool,
 }
 
 // ── Dropdown Menus Overlay ──────────────────────────────────────────────
@@ -313,6 +332,75 @@ export component MenuDropdown inherits Rectangle {
         }
     }
 
+    function dispatch-action(action-id: int, item-y: length) {
+        if action-id == 1 { root.open-file(); root.close-menu(); }
+        else if action-id == 2 { root.open-url(); root.close-menu(); }
+        else if action-id == 3 { root.toggle-submenu(0, item-y); }
+        else if action-id == 4 { root.toggle-submenu(5, item-y); }
+        else if action-id == 5 { root.close-menu(); root.quit-app(); }
+        else if action-id == 10 { root.auto-pause-changed(!root.auto-pause); root.close-menu(); }
+        else if action-id == 11 { root.toggle-submenu(1, item-y); }
+        else if action-id == 12 { root.subtitles-visible-changed(!root.subtitles-visible); root.close-menu(); }
+        else if action-id == 13 { root.furigana-visible-changed(!root.furigana-visible); root.close-menu(); }
+        else if action-id == 14 { root.add-subtitle(); root.close-menu(); }
+        else if action-id == 15 { root.toggle-submenu(3, item-y); }
+        else if action-id == 16 { root.toggle-submenu(2, item-y); }
+        else if action-id == 20 { root.toggle-search(); root.close-menu(); }
+        else if action-id == 21 { root.toggle-sub-drawer(); root.close-menu(); }
+        else if action-id == 22 { root.start-ocr(); root.close-menu(); }
+        else if action-id == 30 { root.toggle-submenu(4, item-y); }
+        else if action-id == 31 { root.open-options(); root.close-menu(); }
+        else if action-id == 32 { root.open-config(); root.close-menu(); }
+        else if action-id == 33 { root.check-updates(); root.close-menu(); }
+        else if action-id == 34 { root.show-about(); root.close-menu(); }
+        else if action-id == 40 { root.adjust-subtitle-scale(0.005); root.close-menu(); }
+        else if action-id == 41 { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
+        else if action-id == 42 { root.adjust-subtitle-offset(0.005); root.close-menu(); }
+        else if action-id == 43 { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
+    }
+
+    property <[MenuActionRow]> media-menu-rows: [
+        { id: 1, text: "Open File…", shortcut: root.key-open-file, shown: true },
+        { id: 2, text: "Open URL…", shortcut: root.key-open-url, shown: true },
+        { id: 3, text: "Recent", has-submenu: true, submenu-active: root.submenu-index == 0, is-disabled: root.recent-files.length == 0, shown: true },
+        { id: 0, is-separator: true, shown: true },
+        { id: 4, text: "Video Track", has-submenu: true, submenu-active: root.submenu-index == 5, is-disabled: root.video-tracks.length == 0, shown: true },
+        { id: 0, is-separator: true, shown: true },
+        { id: 5, text: "Quit", shortcut: root.key-quit, shown: true },
+    ];
+    property <[MenuActionRow]> subtitle-menu-rows: [
+        { id: 10, text: "Auto Pause", shortcut: root.key-sub-auto-pause, checkable: true, reserve-gutter: true, checked: root.auto-pause, shown: true },
+        { id: 11, text: "Size and Position", reserve-gutter: true, has-submenu: true, submenu-active: root.submenu-index == 1, shown: true },
+        { id: 0, is-separator: true, shown: true },
+        { id: 12, text: "Show Subtitles", shortcut: root.key-sub-show, checkable: true, reserve-gutter: true, checked: root.subtitles-visible, shown: true },
+        { id: 13, text: "Show Furigana", shortcut: root.key-sub-furigana, checkable: true, reserve-gutter: true, checked: root.furigana-visible, shown: root.furigana-enabled },
+        { id: 0, is-separator: true, shown: true },
+        { id: 14, text: "Add Subtitle…", reserve-gutter: true, shown: true },
+        { id: 15, text: "Primary Track", reserve-gutter: true, has-submenu: true, submenu-active: root.submenu-index == 3, shown: true },
+        { id: 16, text: "Second Track", reserve-gutter: true, has-submenu: true, submenu-active: root.submenu-index == 2, shown: true },
+    ];
+    property <[MenuActionRow]> tools-menu-rows: [
+        { id: 20, text: "Show Search", shortcut: root.key-show-search, checkable: true, reserve-gutter: true, checked: root.dict-search-open, shown: true },
+        { id: 21, text: "Show Subtitle List", shortcut: root.key-show-sub-list, checkable: true, reserve-gutter: true, checked: root.sub-drawer-open, shown: true },
+        { id: 22, text: "Start OCR", shortcut: root.key-start-ocr, reserve-gutter: true, shown: root.ocr-enabled },
+    ];
+    property <[MenuActionRow]> settings-menu-rows: [
+        { id: 30, text: "Anki Profile", has-submenu: true, submenu-active: root.submenu-index == 4, shown: root.anki-enabled },
+        { id: 31, text: "Options…", shortcut: "Ctrl+,", shown: true },
+        { id: 32, text: "Open Config", shown: true },
+        { id: 33, text: "Check for Updates", shown: true },
+        { id: 0, is-separator: true, shown: true },
+        { id: 34, text: "About Subomi", shown: true },
+    ];
+    property <[MenuActionRow]> active-menu-rows:
+        root.menu-index == 0 ? root.media-menu-rows :
+        root.menu-index == 2 ? root.subtitle-menu-rows :
+        root.menu-index == 3 ? root.tools-menu-rows :
+        root.menu-index == 4 ? root.settings-menu-rows : [];
+
+    property <[PlayerTrack]> active-submenu-tracks:
+        root.submenu-index == 5 ? root.video-tracks : root.subtitle-tracks;
+
     visible: root.menu-index >= 0;
     x: root.menu-index == 0 ? 8px :
        root.menu-index == 1 ? 66px :
@@ -337,41 +425,41 @@ export component MenuDropdown inherits Rectangle {
         menu-content := VerticalLayout {
             width: parent.width;
             padding: 6px;
-            spacing: 2px;
+            spacing: 0px;
 
-            // Media
-            if root.menu-index == 0 : VerticalLayout {
-                spacing: 2px;
-                DropdownItem {
-                    text: "Open File…";
-                    shortcut: root.key-open-file;
-                    clicked => { root.open-file(); root.close-menu(); }
-                }
-                DropdownItem {
-                    text: "Open URL…";
-                    shortcut: root.key-open-url;
-                    clicked => { root.open-url(); root.close-menu(); }
-                }
-                recent-item := DropdownItem {
-                    text: "Recent";
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 0;
-                    is-disabled: root.recent-files.length == 0;
-                    clicked => { root.toggle-submenu(0, self.y); }
-                }
-                DropdownSeparator {}
-                video-track-item := DropdownItem {
-                    text: "Video Track";
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 5;
-                    is-disabled: root.video-tracks.length == 0;
-                    clicked => { root.toggle-submenu(5, self.y); }
-                }
-                DropdownSeparator {}
-                DropdownItem {
-                    text: "Quit";
-                    shortcut: root.key-quit;
-                    clicked => { root.close-menu(); root.quit-app(); }
+            // Static menus (Media, Subtitle, Tools, Settings) via unified data-driven repeater
+            if root.menu-index != 1 : VerticalLayout {
+                spacing: 0px;
+                for item in root.active-menu-rows : Rectangle {
+                    visible: item.shown;
+                    height: !item.shown ? 0px : (item.is-separator ? 11px : 32px);
+                    background: transparent;
+
+                    Rectangle {
+                        visible: item.shown && item.is-separator;
+                        x: 6px;
+                        y: 5px;
+                        width: parent.width - 12px;
+                        height: 1px;
+                        background: SubomiPalette.border;
+                    }
+
+                    DropdownItem {
+                        visible: item.shown && !item.is-separator;
+                        x: 0px;
+                        y: 1px;
+                        width: parent.width;
+                        height: 30px;
+                        text: item.text;
+                        shortcut: item.shortcut;
+                        checkable: item.checkable;
+                        reserve-check-gutter: item.reserve-gutter;
+                        checked: item.checked;
+                        has-submenu: item.has-submenu;
+                        submenu-active: item.submenu-active;
+                        is-disabled: item.is-disabled;
+                        clicked => { root.dispatch-action(item.id, parent.y); }
+                    }
                 }
             }
 
@@ -389,119 +477,6 @@ export component MenuDropdown inherits Rectangle {
                     checkable: true;
                     checked: track.id == root.audio-id;
                     clicked => { root.select-audio-track(track.id); root.close-menu(); }
-                }
-            }
-
-            // Subtitle controls — uniform leading check gutter + Primary Track ABOVE Second Track
-            if root.menu-index == 2 : VerticalLayout {
-                spacing: 2px;
-                DropdownItem {
-                    text: "Auto Pause";
-                    shortcut: root.key-sub-auto-pause;
-                    checkable: true;
-                    reserve-check-gutter: true;
-                    checked: root.auto-pause;
-                    clicked => { root.auto-pause-changed(!root.auto-pause); root.close-menu(); }
-                }
-                size-pos-item := DropdownItem {
-                    text: "Size and Position";
-                    reserve-check-gutter: true;
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 1;
-                    clicked => { root.toggle-submenu(1, self.y); }
-                }
-                DropdownSeparator {}
-                DropdownItem {
-                    text: "Show Subtitles";
-                    shortcut: root.key-sub-show;
-                    checkable: true;
-                    reserve-check-gutter: true;
-                    checked: root.subtitles-visible;
-                    clicked => { root.subtitles-visible-changed(!root.subtitles-visible); root.close-menu(); }
-                }
-                if root.furigana-enabled : DropdownItem {
-                    text: "Show Furigana";
-                    shortcut: root.key-sub-furigana;
-                    checkable: true;
-                    reserve-check-gutter: true;
-                    checked: root.furigana-visible;
-                    clicked => { root.furigana-visible-changed(!root.furigana-visible); root.close-menu(); }
-                }
-                DropdownSeparator {}
-                DropdownItem {
-                    text: "Add Subtitle…";
-                    reserve-check-gutter: true;
-                    clicked => { root.add-subtitle(); root.close-menu(); }
-                }
-                primary-track-item := DropdownItem {
-                    text: "Primary Track";
-                    reserve-check-gutter: true;
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 3;
-                    clicked => { root.toggle-submenu(3, self.y); }
-                }
-                second-track-item := DropdownItem {
-                    text: "Second Track";
-                    reserve-check-gutter: true;
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 2;
-                    clicked => { root.toggle-submenu(2, self.y); }
-                }
-            }
-
-            // Tools
-            if root.menu-index == 3 : VerticalLayout {
-                spacing: 2px;
-                DropdownItem {
-                    text: "Show Search";
-                    shortcut: root.key-show-search;
-                    checkable: true;
-                    reserve-check-gutter: true;
-                    checked: root.dict-search-open;
-                    clicked => { root.toggle-search(); root.close-menu(); }
-                }
-                DropdownItem {
-                    text: "Show Subtitle List";
-                    shortcut: root.key-show-sub-list;
-                    checkable: true;
-                    reserve-check-gutter: true;
-                    checked: root.sub-drawer-open;
-                    clicked => { root.toggle-sub-drawer(); root.close-menu(); }
-                }
-                if root.ocr-enabled : DropdownItem {
-                    text: "Start OCR";
-                    shortcut: root.key-start-ocr;
-                    reserve-check-gutter: true;
-                    clicked => { root.start-ocr(); root.close-menu(); }
-                }
-            }
-
-            // Settings
-            if root.menu-index == 4 : VerticalLayout {
-                spacing: 2px;
-                if root.anki-enabled : anki-prof-item := DropdownItem {
-                    text: "Anki Profile";
-                    has-submenu: true;
-                    submenu-active: root.submenu-index == 4;
-                    clicked => { root.toggle-submenu(4, self.y); }
-                }
-                DropdownItem {
-                    text: "Options…";
-                    shortcut: "Ctrl+,";
-                    clicked => { root.open-options(); root.close-menu(); }
-                }
-                DropdownItem {
-                    text: "Open Config";
-                    clicked => { root.open-config(); root.close-menu(); }
-                }
-                DropdownItem {
-                    text: "Check for Updates";
-                    clicked => { root.check-updates(); root.close-menu(); }
-                }
-                DropdownSeparator {}
-                DropdownItem {
-                    text: "About Subomi";
-                    clicked => { root.show-about(); root.close-menu(); }
                 }
             }
         }
@@ -529,126 +504,98 @@ export component MenuDropdown inherits Rectangle {
                 padding: 6px;
                 spacing: 2px;
 
-                if root.submenu-index == 0 : VerticalLayout {
+                // Recent Files (0) & Anki Profiles (4)
+                if root.submenu-index == 0 || root.submenu-index == 4 : VerticalLayout {
                     spacing: 2px;
-                    if root.recent-files.length == 0 : DropdownItem {
+                    DropdownItem {
+                        visible: root.submenu-index == 0 && root.recent-files.length == 0;
+                        height: (root.submenu-index == 0 && root.recent-files.length == 0) ? 30px : 0px;
                         text: "No recent files";
                         is-disabled: true;
                     }
-                    for file[index] in root.recent-files : DropdownItem {
-                        text: index < root.recent-file-labels.length && root.recent-file-labels[index] != ""
-                            ? root.recent-file-labels[index]
-                            : file;
-                        clicked => { root.open-recent(file); root.close-menu(); }
+                    for entry[index] in (root.submenu-index == 0 ? root.recent-files : root.anki-profiles) : DropdownItem {
+                        text: root.submenu-index == 0
+                            ? (index < root.recent-file-labels.length && root.recent-file-labels[index] != ""
+                                ? root.recent-file-labels[index]
+                                : entry)
+                            : entry;
+                        checkable: root.submenu-index == 4;
+                        checked: root.submenu-index == 4 && entry == root.anki-profile;
+                        clicked => {
+                            if root.submenu-index == 0 {
+                                root.open-recent(entry);
+                            } else {
+                                root.select-anki-profile(entry);
+                            }
+                            root.close-menu();
+                        }
                     }
-                    DropdownSeparator {}
-                    DropdownItem {
+                    if root.submenu-index == 0 : DropdownSeparator {}
+                    if root.submenu-index == 0 : DropdownItem {
                         text: "Clear Recents";
                         clicked => { root.clear-recent(); root.close-menu(); }
                     }
                 }
 
+                // Subtitle Size and Position (1)
                 if root.submenu-index == 1 : VerticalLayout {
                     spacing: 2px;
-                    DropdownItem {
-                        text: "Increase Size";
-                        shortcut: root.key-sub-increase-size;
-                        is-disabled: !root.can-increase-sub-size;
-                        clicked => { root.adjust-subtitle-scale(0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Decrease Size";
-                        shortcut: root.key-sub-decrease-size;
-                        is-disabled: !root.can-decrease-sub-size;
-                        clicked => { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Move Up";
-                        shortcut: root.key-sub-move-up;
-                        is-disabled: !root.can-move-sub-up;
-                        clicked => { root.adjust-subtitle-offset(0.005); root.close-menu(); }
-                    }
-                    DropdownItem {
-                        text: "Move Down";
-                        shortcut: root.key-sub-move-down;
-                        is-disabled: !root.can-move-sub-down;
-                        clicked => { root.adjust-subtitle-offset(-0.005); root.close-menu(); }
+                    for item in [
+                        { id: 40, text: "Increase Size", shortcut: root.key-sub-increase-size, is-disabled: !root.can-increase-sub-size },
+                        { id: 41, text: "Decrease Size", shortcut: root.key-sub-decrease-size, is-disabled: !root.can-decrease-sub-size },
+                        { id: 42, text: "Move Up", shortcut: root.key-sub-move-up, is-disabled: !root.can-move-sub-up },
+                        { id: 43, text: "Move Down", shortcut: root.key-sub-move-down, is-disabled: !root.can-move-sub-down },
+                    ] : DropdownItem {
+                        text: item.text;
+                        shortcut: item.shortcut;
+                        is-disabled: item.is-disabled;
+                        clicked => { root.dispatch-action(item.id, 0px); }
                     }
                 }
 
-                if root.submenu-index == 2 : VerticalLayout {
+                // Shared Track Selector (2: Secondary Sub, 3: Primary Sub, 5: Video Track)
+                if root.submenu-index == 2 || root.submenu-index == 3 || root.submenu-index == 5 : VerticalLayout {
                     spacing: 2px;
                     DropdownItem {
                         text: "None";
                         checkable: true;
-                        checked: root.secondary-sid == 0;
-                        clicked => { root.select-secondary-subtitle-track(0); root.close-menu(); }
-                    }
-                    for track[index] in root.subtitle-tracks : DropdownItem {
-                        text: track.label;
-                        checkable: true;
-                        checked: track.id == root.secondary-sid;
-                        is-disabled: track.id == root.primary-sid;
+                        checked: root.submenu-index == 2
+                            ? root.secondary-sid == 0
+                            : (root.submenu-index == 3
+                                ? (root.primary-sid == 0 && !root.asr-track-selected)
+                                : root.video-id == 0);
                         clicked => {
-                            if (track.id != root.primary-sid) {
-                                root.select-secondary-subtitle-track(track.id);
-                                root.close-menu();
-                            }
+                            if root.submenu-index == 2 { root.select-secondary-subtitle-track(0); }
+                            else if root.submenu-index == 3 { root.select-subtitle-track(0); }
+                            else { root.select-video-track(0); }
+                            root.close-menu();
                         }
                     }
-                }
-
-                if root.submenu-index == 3 : VerticalLayout {
-                    spacing: 2px;
-                    DropdownItem {
-                        text: "None";
-                        checkable: true;
-                        checked: root.primary-sid == 0 && !root.asr-track-selected;
-                        clicked => { root.select-subtitle-track(0); root.close-menu(); }
-                    }
-                    if root.asr-enabled : DropdownItem {
+                    if root.submenu-index == 3 && root.asr-enabled : DropdownItem {
                         text: root.asr-running ? "ASR subtitles…" : "ASR subtitles";
                         checkable: true;
                         checked: root.asr-track-selected;
                         clicked => { root.select-asr(); root.close-menu(); }
                     }
-                    for track[index] in root.subtitle-tracks : DropdownItem {
+                    for track[index] in root.active-submenu-tracks : DropdownItem {
+                        property <bool> track-disabled: (root.submenu-index == 2 && track.id == root.primary-sid)
+                            || (root.submenu-index == 3 && track.id == root.secondary-sid);
                         text: track.label;
                         checkable: true;
-                        checked: track.id == root.primary-sid && !root.asr-track-selected;
-                        is-disabled: track.id == root.secondary-sid;
+                        checked: root.submenu-index == 2
+                            ? track.id == root.secondary-sid
+                            : (root.submenu-index == 3
+                                ? (track.id == root.primary-sid && !root.asr-track-selected)
+                                : track.id == root.video-id);
+                        is-disabled: self.track-disabled;
                         clicked => {
-                            if (track.id != root.secondary-sid) {
-                                root.select-subtitle-track(track.id);
+                            if !self.track-disabled {
+                                if root.submenu-index == 2 { root.select-secondary-subtitle-track(track.id); }
+                                else if root.submenu-index == 3 { root.select-subtitle-track(track.id); }
+                                else { root.select-video-track(track.id); }
                                 root.close-menu();
                             }
                         }
-                    }
-                }
-
-                if root.submenu-index == 4 : VerticalLayout {
-                    spacing: 2px;
-                    for profile[index] in root.anki-profiles : DropdownItem {
-                        text: profile;
-                        checkable: true;
-                        checked: profile == root.anki-profile;
-                        clicked => { root.select-anki-profile(profile); root.close-menu(); }
-                    }
-                }
-
-                if root.submenu-index == 5 : VerticalLayout {
-                    spacing: 2px;
-                    DropdownItem {
-                        text: "None";
-                        checkable: true;
-                        checked: root.video-id == 0;
-                        clicked => { root.select-video-track(0); root.close-menu(); }
-                    }
-                    for track[index] in root.video-tracks : DropdownItem {
-                        text: track.label;
-                        checkable: true;
-                        checked: track.id == root.video-id;
-                        clicked => { root.select-video-track(track.id); root.close-menu(); }
                     }
                 }
             }

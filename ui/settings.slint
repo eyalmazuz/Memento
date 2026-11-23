@@ -1,6 +1,6 @@
 import { ComboBox, LineEdit, Palette, ScrollView } from "std-widgets.slint";
 import { SubomiPalette } from "palette.slint";
-import { ActionButton, IconButton } from "components/buttons.slint";
+import { ActionButton, IconButton, TooltipActionButton } from "components/buttons.slint";
 import { SubomiSwitch } from "components/controls.slint";
 import {
     AnkiAutocompleteItem,
@@ -470,70 +470,75 @@ export component SettingsWindow inherits Window {
                                 }
 
                                 // Profile actions: [+ Add] [Rename] LEFT of destructive [Delete]
-                                if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : VerticalLayout {
-                                    alignment: center;
-                                    IconButton {
-                                        icon: @image-url("icons/add.svg");
-                                        tint: SubomiPalette.cyan-accent;
-                                        tooltip: root.active-category == 0 ? "Add Anki profile" : "Add keybind profile";
-                                        tooltip-below: true;
-                                        clicked => {
-                                            root.new-entry-name = "";
-                                            root.profile-name-error = "";
-                                            root.copy-current-profile = true;
-                                            root.profile-modal-is-rename = false;
-                                            root.profile-modal-open = true;
+                                if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: end;
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        IconButton {
+                                            icon: @image-url("icons/add.svg");
+                                            tint: SubomiPalette.cyan-accent;
+                                            tooltip: root.active-category == 0 ? "Add Anki profile" : "Add keybind profile";
+                                            tooltip-below: true;
+                                            clicked => {
+                                                root.new-entry-name = "";
+                                                root.profile-name-error = "";
+                                                root.copy-current-profile = true;
+                                                root.profile-modal-is-rename = false;
+                                                root.profile-modal-open = true;
+                                            }
                                         }
                                     }
-                                }
-                                if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : VerticalLayout {
-                                    alignment: center;
-                                    ActionButton {
-                                        text: "Rename";
-                                        compact: true;
-                                        ghost: true;
-                                        tooltip: root.active-category == 0 ? "Rename Anki profile" : "Rename keybind profile";
-                                        clicked => {
-                                            root.new-entry-name = root.active-category == 0
-                                                ? root.current-anki-profile
-                                                : root.current-keybind-profile;
-                                            root.profile-name-error = "";
-                                            root.profile-modal-is-rename = true;
-                                            root.profile-modal-open = true;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        TooltipActionButton {
+                                            text: "Rename";
+                                            compact: true;
+                                            ghost: true;
+                                            tooltip: root.active-category == 0 ? "Rename Anki profile" : "Rename keybind profile";
+                                            clicked => {
+                                                root.new-entry-name = root.active-category == 0
+                                                    ? root.current-anki-profile
+                                                    : root.current-keybind-profile;
+                                                root.profile-name-error = "";
+                                                root.profile-modal-is-rename = true;
+                                                root.profile-modal-open = true;
+                                            }
                                         }
                                     }
-                                }
-                                if (root.active-category == 0 || root.active-category == 6) && !root.adding-entry : VerticalLayout {
-                                    alignment: center;
-                                    IconButton {
-                                        icon: @image-url("icons/delete.svg");
-                                        danger: true;
-                                        // Allow deleting even the last/Default profile (resets cleanly to "Default")
-                                        enabled: true;
-                                        tooltip: root.active-category == 0
-                                            ? (root.anki-profile-list.length <= 1 ? "Reset Default profile" : "Delete current profile")
-                                            : (root.current-keybind-profile == "Default" ? "Reset Default profile" : "Delete keybind profile");
-                                        tooltip-below: true;
-                                        tooltip-align-right: true;
-                                        clicked => {
-                                            if root.active-category == 0 {
-                                                root.open-confirm-entry-delete(
-                                                    0,
-                                                    root.current-anki-profile,
-                                                    root.anki-profile-list.length <= 1 ? "Reset Default Anki Profile?" : "Delete Anki Profile?",
-                                                    root.anki-profile-list.length <= 1
-                                                        ? "Reset \"" + root.current-anki-profile + "\" back to factory defaults as \"Default\"? Click Apply afterward to persist."
-                                                        : "Delete Anki profile \"" + root.current-anki-profile + "\" and its note field mappings? Click Apply afterward to persist.",
-                                                );
-                                            } else {
-                                                root.open-confirm-entry-delete(
-                                                    6,
-                                                    root.current-keybind-profile,
-                                                    root.current-keybind-profile == "Default" ? "Reset Default Keybind Profile?" : "Delete Keybind Profile?",
-                                                    root.current-keybind-profile == "Default"
-                                                        ? "Reset the \"Default\" keybind profile back to factory default shortcuts?"
-                                                        : "Delete keybind profile \"" + root.current-keybind-profile + "\" and all of its shortcut bindings?",
-                                                );
+                                    VerticalLayout {
+                                        alignment: center;
+                                        IconButton {
+                                            icon: @image-url("icons/delete.svg");
+                                            danger: true;
+                                            // Allow deleting even the last/Default profile (resets cleanly to "Default")
+                                            enabled: true;
+                                            tooltip: root.active-category == 0
+                                                ? (root.anki-profile-list.length <= 1 ? "Reset Default profile" : "Delete current profile")
+                                                : (root.current-keybind-profile == "Default" ? "Reset Default profile" : "Delete keybind profile");
+                                            tooltip-below: true;
+                                            tooltip-align-right: true;
+                                            clicked => {
+                                                if root.active-category == 0 {
+                                                    root.open-confirm-entry-delete(
+                                                        0,
+                                                        root.current-anki-profile,
+                                                        root.anki-profile-list.length <= 1 ? "Reset Default Anki Profile?" : "Delete Anki Profile?",
+                                                        root.anki-profile-list.length <= 1
+                                                            ? "Reset \"" + root.current-anki-profile + "\" back to factory defaults as \"Default\"? Click Apply afterward to persist."
+                                                            : "Delete Anki profile \"" + root.current-anki-profile + "\" and its note field mappings? Click Apply afterward to persist.",
+                                                    );
+                                                } else {
+                                                    root.open-confirm-entry-delete(
+                                                        6,
+                                                        root.current-keybind-profile,
+                                                        root.current-keybind-profile == "Default" ? "Reset Default Keybind Profile?" : "Delete Keybind Profile?",
+                                                        root.current-keybind-profile == "Default"
+                                                            ? "Reset the \"Default\" keybind profile back to factory default shortcuts?"
+                                                            : "Delete keybind profile \"" + root.current-keybind-profile + "\" and all of its shortcut bindings?",
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -558,7 +563,7 @@ export component SettingsWindow inherits Window {
                         spacing: 18px;
                         alignment: start;
 
-                        if !root.searching && root.active-category == 7 && !root.ocr-available : Rectangle {
+                        if !root.searching && ((root.active-category == 7 && !root.ocr-available) || (root.active-category == 8 && !root.asr-available)) : Rectangle {
                             height: 40px;
                             background: SubomiPalette.warning-bg;
                             border-width: 1px;
@@ -568,25 +573,9 @@ export component SettingsWindow inherits Window {
                                 x: 14px;
                                 width: parent.width - 28px;
                                 height: parent.height;
-                                text: "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable.";
-                                color: SubomiPalette.warning-text;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                        }
-
-                        if !root.searching && root.active-category == 8 && !root.asr-available : Rectangle {
-                            height: 40px;
-                            background: SubomiPalette.warning-bg;
-                            border-width: 1px;
-                            border-color: SubomiPalette.warning-border;
-                            border-radius: 8px;
-                            Text {
-                                x: 14px;
-                                width: parent.width - 28px;
-                                height: parent.height;
-                                text: "⚠ ASR runtime unavailable; preferences remain editable.";
+                                text: root.active-category == 7
+                                    ? "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable."
+                                    : "⚠ ASR runtime unavailable; preferences remain editable.";
                                 color: SubomiPalette.warning-text;
                                 font-size: 12px;
                                 vertical-alignment: center;
@@ -757,18 +746,17 @@ export component SettingsWindow inherits Window {
                             alignment: start;
                             horizontal-stretch: 1;
 
-                            if !root.searching && root.active-category == 0 : VerticalLayout {
+                            if !root.searching && (root.active-category == 0 || root.active-category == 2) : VerticalLayout {
                                 alignment: center;
                                 ActionButton {
-                                    text: "Marker Help";
-                                    clicked => { root.anki-help-requested(); }
-                                }
-                            }
-                            if !root.searching && root.active-category == 2 : VerticalLayout {
-                                alignment: center;
-                                ActionButton {
-                                    text: "Audio Help";
-                                    clicked => { root.showing-audio-help = true; }
+                                    text: root.active-category == 0 ? "Marker Help" : "Audio Help";
+                                    clicked => {
+                                        if root.active-category == 0 {
+                                            root.anki-help-requested();
+                                        } else {
+                                            root.showing-audio-help = true;
+                                        }
+                                    }
                                 }
                             }
                             Text {
@@ -792,19 +780,22 @@ export component SettingsWindow inherits Window {
                                 alignment: end;
 
                                 // Dictionaries instant-save; hide Reset / Defaults / Apply there
-                                if root.searching || root.active-category != 4 : ActionButton {
-                                    text: "Reset";
-                                    ghost: true;
-                                    clicked => { root.reset-settings(root.active-category); }
-                                }
-                                if root.searching || root.active-category != 4 : ActionButton {
-                                    text: "Defaults";
-                                    clicked => { root.defaults-settings(root.active-category); }
-                                }
-                                if root.searching || root.active-category != 4 : ActionButton {
-                                    text: "Apply";
-                                    primary: true;
-                                    clicked => { root.apply-settings(root.active-category); }
+                                if root.searching || root.active-category != 4 : HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionButton {
+                                        text: "Reset";
+                                        ghost: true;
+                                        clicked => { root.reset-settings(root.active-category); }
+                                    }
+                                    ActionButton {
+                                        text: "Defaults";
+                                        clicked => { root.defaults-settings(root.active-category); }
+                                    }
+                                    ActionButton {
+                                        text: "Apply";
+                                        primary: true;
+                                        clicked => { root.apply-settings(root.active-category); }
+                                    }
                                 }
 
                                 ActionButton {

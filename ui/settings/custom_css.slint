@@ -80,22 +80,22 @@ export component CustomPopupCssPanel inherits VerticalLayout {
                 wrap: word-wrap;
             }
 
-            if root.custom-css-tab == 0 : TextEdit {
+            TextEdit {
                 height: 240px;
-                text <=> root.custom-popup-css;
+                text: root.custom-css-tab == 0 ? root.custom-popup-css : root.custom-popup-outer-css;
                 font-family: "monospace";
                 font-size: 12px;
                 wrap: word-wrap;
-                placeholder-text: "/* Add inner Popup CSS or click Insert Starter Template… */";
-            }
-
-            if root.custom-css-tab == 1 : TextEdit {
-                height: 240px;
-                text <=> root.custom-popup-outer-css;
-                font-family: "monospace";
-                font-size: 12px;
-                wrap: word-wrap;
-                placeholder-text: "/* Add Popup Outer CSS (background, border, radius, shadow, width) or click Insert Starter Template… */";
+                placeholder-text: root.custom-css-tab == 0
+                    ? "/* Add inner Popup CSS or click Insert Starter Template… */"
+                    : "/* Add Popup Outer CSS (background, border, radius, shadow, width) or click Insert Starter Template… */";
+                edited(value) => {
+                    if root.custom-css-tab == 0 {
+                        root.custom-popup-css = value;
+                    } else {
+                        root.custom-popup-outer-css = value;
+                    }
+                }
             }
 
             HorizontalLayout {

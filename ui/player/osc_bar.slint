@@ -53,7 +53,8 @@ component OscIconButton inherits Rectangle {
         clicked => { root.clicked(); }
     }
 
-    if root.tooltip != "" && touch.has-hover : Rectangle {
+    Rectangle {
+        visible: root.tooltip != "" && touch.has-hover;
         x: root.tooltip-align-right
             ? parent.width - self.width
             : (parent.width - self.width) / 2;
@@ -274,7 +275,8 @@ export component PlayerOscBar inherits Rectangle {
                     }
 
                     // Scrubber Knob with subtle hover/drag scale & accent ring
-                    if root.duration > 0.0 : Rectangle {
+                    Rectangle {
+                        visible: root.duration > 0.0;
                         property <length> knob-sz: (slider-touch.has-hover || slider-touch.pressed) ? 14px : 11px;
                         width: self.knob-sz;
                         height: self.knob-sz;

@@ -8,7 +8,7 @@ export component ActionButton inherits Rectangle {
     in property <bool> compact: false;
     in property <bool> enabled: true;
     in property <bool> loading: false;
-    in property <string> tooltip: "";
+    out property <bool> hovered: touch.has-hover;
     callback clicked();
 
     private property <bool> interactive: root.enabled && !root.loading;
@@ -62,8 +62,13 @@ export component ActionButton inherits Rectangle {
             }
         }
     }
+}
 
-    if root.tooltip != "" && touch.has-hover : Rectangle {
+export component TooltipActionButton inherits ActionButton {
+    in property <string> tooltip: "";
+
+    Rectangle {
+        visible: root.tooltip != "" && root.hovered;
         x: (parent.width - self.width) / 2;
         y: -self.height - 6px;
         width: tip-lbl.preferred-width + 14px;
@@ -141,7 +146,8 @@ export component IconButton inherits Rectangle {
         }
     }
 
-    if root.tooltip != "" && touch.has-hover : Rectangle {
+    Rectangle {
+        visible: root.tooltip != "" && touch.has-hover;
         x: root.tooltip-align-right
             ? parent.width - self.width
             : (parent.width - self.width) / 2;
@@ -210,7 +216,8 @@ export component ToggleChip inherits Rectangle {
         }
     }
 
-    if root.tooltip != "" && chip-touch.has-hover : Rectangle {
+    Rectangle {
+        visible: root.tooltip != "" && chip-touch.has-hover;
         x: (parent.width - self.width) / 2;
         y: root.tooltip-below ? parent.height + 6px : -self.height - 6px;
         width: tip-lbl.preferred-width + 14px;
@@ -298,7 +305,7 @@ export component TabPill inherits Rectangle {
     pill-row := HorizontalLayout {
         padding-left: root.compact ? 12px : 14px;
         padding-right: root.compact ? 12px : 14px;
-        spacing: 7px;
+        spacing: root.badge != "" ? 7px : 0px;
         alignment: center;
 
         Text {
@@ -309,11 +316,12 @@ export component TabPill inherits Rectangle {
             vertical-alignment: center;
         }
 
-        if root.badge != "" : VerticalLayout {
+        VerticalLayout {
             alignment: center;
             Rectangle {
-                height: 18px;
-                width: max(22px, badge-lbl.preferred-width + 10px);
+                visible: root.badge != "";
+                height: root.badge != "" ? 18px : 0px;
+                width: root.badge != "" ? max(22px, badge-lbl.preferred-width + 10px) : 0px;
                 border-radius: 9px;
                 background: root.active ? SubomiPalette.accent-subtle : SubomiPalette.track-bg;
                 badge-lbl := Text {
