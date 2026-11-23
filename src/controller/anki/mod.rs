@@ -39,9 +39,9 @@ pub use self::payload::{
 pub use self::query::{
     build_duplicate_browse_query, build_duplicate_browse_query_with_field, build_entry_find_query,
     build_entry_find_query_with_options, cached_model_field_names, escape_anki_search_term,
-    format_nid_browse_query, invalidate_model_field_names_cache, lookup_cached_model_field_names,
-    normalize_anki_browse_target, resolve_model_first_field, EntryAnkiLookup, EntryAnkiStatus,
-    TermAddableStatus,
+    format_nid_browse_query, invalidate_entry_status_cache, invalidate_model_field_names_cache,
+    lookup_cached_model_field_names, normalize_anki_browse_target, resolve_model_first_field,
+    EntryAnkiLookup, EntryAnkiStatus, TermAddableStatus,
 };
 pub use self::sqlite_enrich::{
     populate_note_context_from_sqlite, populate_note_context_from_sqlite_ordered,
@@ -56,7 +56,9 @@ pub(crate) use self::markers::{
 use self::markers::referenced_dictionary_media_files_with_data;
 use self::payload::{build_note_payload_from_profile_with_data, merge_note_update_with_attachments};
 use self::query::{
-    batch_find_note_ids, build_entry_probe_and_query_with_options, ProbeProfileMeta,
+    batch_find_note_ids, build_entry_probe_and_query_with_options,
+    invalidate_entry_status_cache_for_endpoint, lookup_cached_entry_statuses,
+    store_cached_entry_statuses, EntryStatusCacheKey, ProbeProfileMeta,
 };
 
 /// Result of creating or updating an Anki note alongside any non-fatal media warnings
@@ -118,18 +120,24 @@ impl AnkiController {
     /// cannot create a misleading empty card.
     pub fn add_note(&self, payload: &NotePayload) -> Result<i64, String> {
         payload.validate()?;
-        self.client
+        let id = self
+            .client
             .add_note(payload.to_value())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
+        Ok(id)
     }
 
     /// Owned variant of [`Self::add_note`] that moves media attachments into the
     /// AnkiConnect JSON payload without cloning.
     pub fn add_note_owned(&self, payload: NotePayload) -> Result<i64, String> {
         payload.validate()?;
-        self.client
+        let id = self
+            .client
             .add_note(payload.into_value())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
+        Ok(id)
     }
 
     /// Builds a note from the current profile's configured field templates.
@@ -306,15 +314,42 @@ impl AnkiController {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let cached_first =
-            lookup_cached_model_field_names(&self.client.endpoint_url(), &profile.model)
-                .and_then(|fields| fields.into_iter().find(|f| !f.trim().is_empty()));
+        let endpoint_url = self.client.endpoint_url();
+        let cached_first = lookup_cached_model_field_names(&endpoint_url, &profile.model)
+            .and_then(|fields| fields.into_iter().find(|f| !f.trim().is_empty()));
         let used_cached_first = cached_first.is_some();
         let meta = ProbeProfileMeta::from_profile_with_key_field(profile, cached_first)?;
         let policy = meta.policy;
-        let mut probes = Vec::with_capacity(entries.len());
-        let mut find_queries = Vec::with_capacity(entries.len());
-        for entry in entries {
+
+        let key_field_name = meta.key_field.as_deref().unwrap_or("");
+        let cache_keys: Vec<EntryStatusCacheKey> = entries
+            .iter()
+            .map(|entry| EntryStatusCacheKey {
+                endpoint_url: endpoint_url.clone(),
+                deck: profile.deck.clone(),
+                model: profile.model.clone(),
+                duplicate_policy: profile.duplicate_policy,
+                key_field: key_field_name.to_owned(),
+                expression: entry.expression.clone(),
+                reading: entry.reading.clone(),
+                reading_as_expression: entry.reading_as_expression,
+            })
+            .collect();
+        let mut cached_results = lookup_cached_entry_statuses(&cache_keys, show_tags);
+        let miss_indices: Vec<usize> = cached_results
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, hit)| hit.is_none().then_some(idx))
+            .collect();
+        if miss_indices.is_empty() {
+            return Ok(cached_results.into_iter().flatten().collect());
+        }
+
+        let miss_count = miss_indices.len();
+        let mut probes = Vec::with_capacity(miss_count);
+        let mut find_queries = Vec::with_capacity(miss_count);
+        for &orig_idx in &miss_indices {
+            let entry = &entries[orig_idx];
             let (probe, query) = build_entry_probe_and_query_with_options(
                 profile,
                 &meta,
@@ -331,11 +366,11 @@ impl AnkiController {
             .can_add_notes(&probes)
             .map_err(|error| error.to_string())?;
 
-        let mut can_add_vec = Vec::with_capacity(entries.len());
+        let mut can_add_vec = Vec::with_capacity(miss_count);
         let mut unique_queries: Vec<String> = Vec::new();
         let mut unique_query_set: HashSet<&str> = HashSet::new();
 
-        for idx in 0..entries.len() {
+        for idx in 0..miss_count {
             let can_add = if policy == AnkiDuplicatePolicy::SameDeck {
                 true
             } else {
@@ -358,8 +393,8 @@ impl AnkiController {
             query_cache.insert(query, ids);
         }
 
-        let mut note_ids_vec: Vec<Vec<i64>> = vec![Vec::new(); entries.len()];
-        for idx in 0..entries.len() {
+        let mut note_ids_vec: Vec<Vec<i64>> = vec![Vec::new(); miss_count];
+        for idx in 0..miss_count {
             let can_add = can_add_vec[idx];
             if !can_add || (show_tags && policy == AnkiDuplicatePolicy::SameDeck) {
                 if let Some(ids) = query_cache.get(&find_queries[idx]) {
@@ -372,7 +407,7 @@ impl AnkiController {
         // query & cache `modelFieldNames(model)` to obtain the exact first/sort field (and
         // include `OR reading` when `expression != reading`) so duplicate resolution and
         // `guiBrowse` queries never rely solely on field-name heuristics.
-        let unresolved_dup_indices: Vec<usize> = (0..entries.len())
+        let unresolved_dup_indices: Vec<usize> = (0..miss_count)
             .filter(|&idx| !can_add_vec[idx] && note_ids_vec[idx].is_empty())
             .collect();
         if !unresolved_dup_indices.is_empty() {
@@ -389,11 +424,12 @@ impl AnkiController {
                 let mut retry_set: HashSet<String> = HashSet::new();
                 let mut per_idx_retry: Vec<(usize, String)> = Vec::new();
                 for idx in unresolved_dup_indices {
+                    let orig = &entries[miss_indices[idx]];
                     if let Ok(q) = build_duplicate_browse_query_with_field(
                         profile,
                         &first_field,
-                        &entries[idx].expression,
-                        &entries[idx].reading,
+                        &orig.expression,
+                        &orig.reading,
                     ) {
                         if q != find_queries[idx] {
                             find_queries[idx] = q.clone();
@@ -443,8 +479,8 @@ impl AnkiController {
             }
         }
 
-        let mut statuses = Vec::with_capacity(entries.len());
-        for idx in 0..entries.len() {
+        let mut to_cache = Vec::with_capacity(miss_count);
+        for (idx, &orig_idx) in miss_indices.iter().enumerate() {
             let can_add = can_add_vec[idx];
             let is_duplicate = !can_add;
             let note_ids = std::mem::take(&mut note_ids_vec[idx]);
@@ -470,15 +506,19 @@ impl AnkiController {
             } else {
                 String::new()
             };
-            statuses.push(EntryAnkiStatus {
+            let status = EntryAnkiStatus {
                 can_add,
                 is_duplicate,
                 note_ids,
                 tags,
                 browse_query,
-            });
+            };
+            let tags_loaded = show_tags || (!is_duplicate && policy != AnkiDuplicatePolicy::SameDeck);
+            to_cache.push((cache_keys[orig_idx].clone(), status.clone(), tags_loaded));
+            cached_results[orig_idx] = Some(status);
         }
-        Ok(statuses)
+        store_cached_entry_statuses(to_cache);
+        Ok(cached_results.into_iter().flatten().collect())
     }
 
     fn store_uncached_dict_media(&self, dict_files: Vec<MediaFilePayload>) -> Result<(), String> {
@@ -532,9 +572,12 @@ impl AnkiController {
         let dict_files =
             referenced_dictionary_media_files_with_data(&profile.field_templates, ctx, &rendered);
         self.store_uncached_dict_media(dict_files)?;
-        self.client
+        let note_id = self
+            .client
             .add_note(payload.into_value())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
+        Ok(note_id)
     }
 
     /// Owned variant of [`Self::add_note_from_profile`] that moves multi-MB media
@@ -554,9 +597,12 @@ impl AnkiController {
         payload.audio = std::mem::take(&mut ctx.audio_attachments);
         payload.picture = std::mem::take(&mut ctx.picture_attachments);
         payload.video = std::mem::take(&mut ctx.video_attachments);
-        self.client
+        let note_id = self
+            .client
             .add_note(payload.into_value())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
+        Ok(note_id)
     }
 
     /// Builds and sends a profile-backed note, returning the created note ID together
@@ -602,6 +648,7 @@ impl AnkiController {
             .client
             .add_note(payload.into_value())
             .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
         Ok(AddNoteOutcome {
             note_id,
             warnings: ctx.media_warnings.clone(),
@@ -639,6 +686,7 @@ impl AnkiController {
             .client
             .add_note(payload.into_value())
             .map_err(|error| error.to_string())?;
+        invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
         Ok(AddNoteOutcome {
             note_id,
             warnings: ctx.media_warnings,
@@ -714,6 +762,7 @@ impl AnkiController {
             self.store_uncached_dict_media(dict_files)?;
         }
 
+        let did_update = merged.has_field_or_media_changes() || !merged.new_tags.is_empty();
         if merged.has_field_or_media_changes() {
             self.client
                 .update_note_fields(
@@ -730,6 +779,10 @@ impl AnkiController {
             self.client
                 .add_tags(&[note_id], &merged.new_tags.join(" "))
                 .map_err(|error| error.to_string())?;
+        }
+
+        if did_update {
+            invalidate_entry_status_cache_for_endpoint(&self.client.endpoint_url());
         }
 
         Ok(note_id)

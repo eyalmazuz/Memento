@@ -8,7 +8,7 @@ license = "GPL-2.0-only"
 
 [dependencies]
 serde_json = "=1.0.154"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 url = "=2.5.8"
 # Workspace-internal, std-only siblings reused per the port plan (these are not
 # external crates.io dependencies):

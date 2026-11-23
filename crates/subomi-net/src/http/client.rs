@@ -94,7 +94,7 @@ impl HttpClient
             .max_response_header_size(config.max_header_bytes)
             .max_idle_connections(8)
             .max_idle_connections_per_host(4)
-            .accept_encoding("identity")
+            .accept_encoding(ureq::config::AutoHeaderValue::None)
             .user_agent(ureq::config::AutoHeaderValue::None)
             .accept(ureq::config::AutoHeaderValue::None)
             .timeout_connect(connect_timeout)
@@ -207,6 +207,19 @@ impl HttpClient
                 }
             }
             builder = builder.header(name, value);
+        }
+
+        if !request.headers.contains("accept-encoding")
+        {
+            let encoding = if request.headers.contains("range")
+            {
+                "identity"
+            }
+            else
+            {
+                "gzip"
+            };
+            builder = builder.header("Accept-Encoding", encoding);
         }
 
         if !request.headers.contains("connection")

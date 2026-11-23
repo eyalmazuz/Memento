@@ -46,10 +46,10 @@ fn plain_success_round_trip_captures_the_request_canonical_form()
     server.spawn(move |_, request: CapturedRequest| {
         assert_eq!(request.method, "GET");
         assert_eq!(request.target, "/");
-        // The canonical client contract: host header, explicit identity
-        // encoding, keep-alive default.
+        // The canonical client contract: host header, gzip default encoding,
+        // keep-alive default.
         assert_eq!(request.header("host").unwrap(), format!("127.0.0.1:{port}"));
-        assert_eq!(request.header("accept-encoding").unwrap(), "identity");
+        assert_eq!(request.header("accept-encoding").unwrap(), "gzip");
         assert_eq!(request.header("connection").unwrap(), "keep-alive");
         Action::Respond(ok_200(b"payload"))
     });
@@ -61,6 +61,60 @@ fn plain_success_round_trip_captures_the_request_canonical_form()
     assert_eq!(response.reason(), "OK");
     assert_eq!(response.read_all(1024).unwrap(), b"payload");
     assert_eq!(response.header("content-length").unwrap(), "7");
+}
+
+#[test]
+fn gzip_response_is_transparently_decompressed_and_range_uses_identity()
+{
+    // 811-byte JSON payload compressed to 94 bytes with RFC 1952 gzip.
+    const GZ_PAYLOAD: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 42, 73, 76, 143, 207, 75, 204, 77, 85, 178,
+        82, 42, 51, 210, 51, 208, 51, 82, 210, 81, 74, 202, 79, 169, 4, 242, 131, 75, 147, 242,
+        115, 51, 21, 138, 82, 115, 82, 19, 139, 83, 21, 242, 242, 75, 82, 139, 129, 188, 130, 212,
+        196, 146, 212, 20, 133, 130, 196, 202, 156, 252, 196, 20, 61, 133, 81, 101, 163, 202, 134,
+        189, 50, 165, 90, 0, 103, 170, 40, 111, 43, 3, 0, 0,
+    ];
+    let expected = format!(
+        "{{\"tag_name\":\"v2.0.2\",\"body\":\"{}\"}}",
+        "Subomi release notes repeated payload. ".repeat(20)
+    );
+
+    let server = TestServer::start();
+    server.spawn(move |index, request: CapturedRequest| {
+        if index == 0
+        {
+            assert_eq!(request.header("accept-encoding").unwrap(), "gzip");
+            let mut wire = response_head(
+                "HTTP/1.1 200 OK",
+                &format!(
+                    "Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close",
+                    GZ_PAYLOAD.len()
+                ),
+            )
+            .into_bytes();
+            wire.extend_from_slice(GZ_PAYLOAD);
+            Action::Respond(wire)
+        }
+        else
+        {
+            assert_eq!(request.header("accept-encoding").unwrap(), "identity");
+            Action::Respond(ok_200(b"part"))
+        }
+    });
+
+    let url = server.url("/release");
+    let mut response = client()
+        .send(&Request::get(Url::parse(&url).unwrap()))
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.content_length(), None);
+    let body = response.read_all(4096).unwrap();
+    assert_eq!(body, expected.as_bytes());
+
+    let range_req = Request::get(Url::parse(&server.url("/chunk")).unwrap())
+        .header("Range", "bytes=0-3");
+    let mut range_resp = client().send(&range_req).unwrap();
+    assert_eq!(range_resp.read_all(64).unwrap(), b"part");
 }
 
 #[test]

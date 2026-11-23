@@ -16,16 +16,48 @@ use subomi_setting::keys as raw;
 pub(crate) const SUBOMI_RELEASES_URL: &str =
     "https://github.com/eyalmazuz/Subomi/releases/latest";
 
+/// Extracts the release tag segment from a GitHub `/releases/tag/<tag>` redirect `Location`.
+pub(crate) fn parse_release_tag_from_location(location: &str) -> Option<String> {
+    let (_, after_marker) = location.split_once("/releases/tag/")?;
+    let trimmed = after_marker
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('/');
+    (!trimmed.is_empty() && !trimmed.contains('/')).then(|| trimmed.to_owned())
+}
+
 /// Query the GitHub releases endpoint for the latest Subomi release.
+///
+/// Prefers a no-redirect `HEAD` request to `/releases/latest` (~400 bytes, no REST API
+/// rate limit) to read the `Location: .../releases/tag/<tag>` header, falling back to
+/// the gzipped GitHub REST API JSON endpoint if no tag redirect is returned.
 pub(crate) fn latest_release() -> Result<String, String> {
-    use subomi_net::http::{HttpClient, Request, Url};
+    use subomi_net::http::{HttpClient, HttpClientConfig, Method, Request, Url};
+    let user_agent = format!("Subomi/{}", env!("CARGO_PKG_VERSION"));
+
+    if let Ok(releases_url) = Url::parse(SUBOMI_RELEASES_URL) {
+        let head_client = HttpClient::new(HttpClientConfig {
+            follow_redirects: false,
+            ..HttpClientConfig::default()
+        });
+        let head_req = Request::new(Method::Head, releases_url).header("User-Agent", &user_agent);
+        if let Ok(response) = head_client.send(&head_req) {
+            if matches!(response.status(), 301 | 302 | 303 | 307 | 308) {
+                if let Some(tag) = response
+                    .header("location")
+                    .and_then(parse_release_tag_from_location)
+                {
+                    return Ok(tag);
+                }
+            }
+        }
+    }
+
     let url = Url::parse("https://api.github.com/repos/eyalmazuz/Subomi/releases/latest")
         .map_err(|error| error.to_string())?;
     let request = Request::get(url)
-        .header(
-            "User-Agent",
-            format!("Subomi/{}", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", user_agent)
         .header("Accept", "application/vnd.github+json");
     let mut response = HttpClient::default()
         .send(&request)
@@ -315,5 +347,20 @@ mod tests {
         assert!(!update_opt_in_message(true).contains("Ctrl+,"));
         assert!(update_opt_in_message(false).contains("Ctrl+,"));
         assert!(!update_opt_in_message(false).contains("Cmd+,"));
+
+        assert_eq!(
+            parse_release_tag_from_location(
+                "https://github.com/eyalmazuz/Subomi/releases/tag/v2.1.0"
+            ),
+            Some("v2.1.0".to_owned())
+        );
+        assert_eq!(
+            parse_release_tag_from_location("/eyalmazuz/Subomi/releases/tag/v2.1.0/?ref=latest#top"),
+            Some("v2.1.0".to_owned())
+        );
+        assert_eq!(
+            parse_release_tag_from_location("https://github.com/eyalmazuz/Subomi/releases"),
+            None
+        );
     }
 }

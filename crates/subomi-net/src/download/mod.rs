@@ -256,7 +256,7 @@ impl Downloader
             }
         }
 
-        let request = Request::get(parsed);
+        let request = Request::get(parsed).header("Accept-Encoding", "identity");
         let mut response = self.http.send(&request)?;
         if !(200..300).contains(&response.status())
         {

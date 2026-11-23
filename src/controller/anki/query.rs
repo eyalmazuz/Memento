@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use subomi_net::anki::{AnkiAction, AnkiClient};
 
@@ -72,12 +73,112 @@ pub fn cached_model_field_names(
     Ok(fields)
 }
 
-/// Clears all cached `modelFieldNames` entries (e.g. when Anki profile settings change).
+/// Clears all cached `modelFieldNames` and entry Anki status caches (e.g. when Anki profile settings change).
 pub fn invalidate_model_field_names_cache() {
     let mut cache = model_field_names_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.clear();
+    invalidate_entry_status_cache();
+}
+
+const MAX_ENTRY_STATUS_CACHE_ENTRIES: usize = 512;
+const ENTRY_STATUS_CACHE_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EntryStatusCacheKey {
+    pub(crate) endpoint_url: String,
+    pub(crate) deck: String,
+    pub(crate) model: String,
+    pub(crate) duplicate_policy: i32,
+    pub(crate) key_field: String,
+    pub(crate) expression: String,
+    pub(crate) reading: String,
+    pub(crate) reading_as_expression: bool,
+}
+
+#[derive(Clone)]
+struct CachedEntryStatus {
+    inserted_at: Instant,
+    status: EntryAnkiStatus,
+    tags_loaded: bool,
+}
+
+static ENTRY_STATUS_CACHE: OnceLock<Mutex<HashMap<EntryStatusCacheKey, CachedEntryStatus>>> =
+    OnceLock::new();
+
+fn entry_status_cache() -> &'static Mutex<HashMap<EntryStatusCacheKey, CachedEntryStatus>> {
+    ENTRY_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clears all cached per-entry Anki duplicate/tag statuses across all endpoints.
+pub fn invalidate_entry_status_cache() {
+    let mut cache = entry_status_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clear();
+}
+
+/// Clears cached per-entry Anki statuses for a single endpoint (called after note writes).
+pub(crate) fn invalidate_entry_status_cache_for_endpoint(endpoint_url: &str) {
+    let mut cache = entry_status_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|key, _| key.endpoint_url != endpoint_url);
+}
+
+pub(crate) fn lookup_cached_entry_statuses(
+    keys: &[EntryStatusCacheKey],
+    show_tags: bool,
+) -> Vec<Option<EntryAnkiStatus>> {
+    let now = Instant::now();
+    let cache = entry_status_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    keys.iter()
+        .map(|key| {
+            let entry = cache.get(key)?;
+            if now.duration_since(entry.inserted_at) >= ENTRY_STATUS_CACHE_TTL {
+                return None;
+            }
+            if show_tags && !entry.tags_loaded {
+                return None;
+            }
+            let mut status = entry.status.clone();
+            if !show_tags {
+                status.tags.clear();
+            }
+            Some(status)
+        })
+        .collect()
+}
+
+pub(crate) fn store_cached_entry_statuses(
+    entries: Vec<(EntryStatusCacheKey, EntryAnkiStatus, bool)>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut cache = entry_status_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len().saturating_add(entries.len()) > MAX_ENTRY_STATUS_CACHE_ENTRIES {
+        cache.retain(|_, v| now.duration_since(v.inserted_at) < ENTRY_STATUS_CACHE_TTL);
+        if cache.len().saturating_add(entries.len()) > MAX_ENTRY_STATUS_CACHE_ENTRIES {
+            cache.clear();
+        }
+    }
+    for (key, status, tags_loaded) in entries {
+        cache.insert(
+            key,
+            CachedEntryStatus {
+                inserted_at: now,
+                status,
+                tags_loaded,
+            },
+        );
+    }
 }
 
 /// Resolves the exact first/sort field name of `profile.model` via cached
@@ -428,11 +529,18 @@ pub(crate) fn build_entry_probe_and_query_with_options(
         }
     };
 
+    // Strip empty non-key template fields and tags from `canAddNotes` probe payloads:
+    // AnkiConnect only inspects populated/sort fields for duplicate detection, so omitting
+    // empty fields avoids transferring redundant JSON bytes on every hover check.
+    fields.retain(|name, value| {
+        !value.trim().is_empty() || meta.key_field.as_deref() == Some(name.as_str())
+    });
+
     let payload = NotePayload {
         deck_name: profile.deck.clone(),
         model_name: profile.model.clone(),
         fields,
-        tags: profile.tags.clone(),
+        tags: Vec::new(),
         options: meta.policy.into(),
         audio: Vec::new(),
         picture: Vec::new(),

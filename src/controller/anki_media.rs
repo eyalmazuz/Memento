@@ -1,14 +1,13 @@
 //! Capture the media requested by configured Anki field markers.
 
 use std::io::{Read, Write};
-use std::ops::Deref;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::codecs::webp::WebPEncoder;
-use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgba};
+use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb};
 use subomi_anki::note::{
     audio_context_params, audio_media_params, compute_clip_range, screenshot_params, video_params,
     AudioMediaParams, ScreenshotParams, VideoParams,
@@ -241,7 +240,7 @@ fn pipe_command_io(mut cmd: Command, write_stdin: impl FnOnce(&mut dyn Write) ->
     Ok(encoded)
 }
 
-fn encode_webp_via_cwebp(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+fn encode_webp_via_cwebp(raw_rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("cwebp");
     cmd.args([
         "-quiet",
@@ -254,16 +253,14 @@ fn encode_webp_via_cwebp(raw: &[u8], width: u32, height: u32, quality: u8) -> Re
         "--",
         "-",
     ]);
-    let header = format!(
-        "P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n"
-    );
+    let header = format!("P6\n{width} {height}\n255\n");
     pipe_command_io(cmd, |stdin| {
         stdin.write_all(header.as_bytes())?;
-        stdin.write_all(raw)
+        stdin.write_all(raw_rgb)
     })
 }
 
-fn encode_webp_via_ffmpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+fn encode_webp_via_ffmpeg(raw_rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args([
         "-hide_banner",
@@ -272,7 +269,7 @@ fn encode_webp_via_ffmpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> R
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "rgba",
+        "rgb24",
         "-s",
         &format!("{width}x{height}"),
         "-i",
@@ -291,53 +288,124 @@ fn encode_webp_via_ffmpeg(raw: &[u8], width: u32, height: u32, quality: u8) -> R
         "image2pipe",
         "pipe:1",
     ]);
-    pipe_command_io(cmd, |stdin| stdin.write_all(raw))
+    pipe_command_io(cmd, |stdin| stdin.write_all(raw_rgb))
 }
 
-fn encode_webp_lossless(raw: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+fn encode_webp_lossless(raw_rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     WebPEncoder::new_lossless(&mut output)
-        .encode(raw, width, height, ExtendedColorType::Rgba8)
+        .encode(raw_rgb, width, height, ExtendedColorType::Rgb8)
         .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
     Ok(output)
 }
 
-fn encode_webp_rgba_with_backend(
-    raw: &[u8],
+fn encode_webp_rgb_with_backend(
+    raw_rgb: &[u8],
     width: u32,
     height: u32,
     backend: WebpLossyBackend,
 ) -> Result<Vec<u8>, String> {
     match backend {
-        WebpLossyBackend::Cwebp => encode_webp_via_cwebp(raw, width, height, LOSSY_WEBP_QUALITY)
-            .or_else(|_| encode_webp_lossless(raw, width, height)),
-        WebpLossyBackend::Ffmpeg => encode_webp_via_ffmpeg(raw, width, height, LOSSY_WEBP_QUALITY)
-            .or_else(|_| encode_webp_lossless(raw, width, height)),
-        WebpLossyBackend::LosslessFallback => encode_webp_lossless(raw, width, height),
+        WebpLossyBackend::Cwebp => encode_webp_via_cwebp(raw_rgb, width, height, LOSSY_WEBP_QUALITY)
+            .or_else(|_| encode_webp_lossless(raw_rgb, width, height)),
+        WebpLossyBackend::Ffmpeg => encode_webp_via_ffmpeg(raw_rgb, width, height, LOSSY_WEBP_QUALITY)
+            .or_else(|_| encode_webp_lossless(raw_rgb, width, height)),
+        WebpLossyBackend::LosslessFallback => encode_webp_lossless(raw_rgb, width, height),
     }
 }
 
-fn encode_rgba_buffer<C>(
-    image: &ImageBuffer<Rgba<u8>, C>,
+fn rgba_to_rgb(pixels: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity((pixels.len() / 4) * 3);
+    for px in pixels.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    rgb
+}
+
+/// Area-averaging RGB downscaler reading directly from opaque RGBA pixels so
+/// full-resolution RGB copies and 4th-channel alpha math are skipped completely.
+fn downscale_rgba_to_rgb(
+    pixels: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Vec<u8> {
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    let row_stride = sw * 4;
+
+    let x_ranges: Vec<(usize, usize)> = (0..dw)
+        .map(|dx| {
+            let x0 = (dx as u64 * sw as u64 / dw as u64) as usize;
+            let x1 = (((dx + 1) as u64 * sw as u64 / dw as u64) as usize)
+                .max(x0 + 1)
+                .min(sw);
+            (x0, x1)
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(dw * dh * 3);
+    let mut row_acc = vec![[0u64; 3]; dw];
+
+    for dy in 0..dh {
+        let y0 = (dy as u64 * sh as u64 / dh as u64) as usize;
+        let y1 = (((dy + 1) as u64 * sh as u64 / dh as u64) as usize)
+            .max(y0 + 1)
+            .min(sh);
+        let y_count = (y1 - y0) as u64;
+        row_acc.fill([0, 0, 0]);
+
+        for sy in y0..y1 {
+            let src_row = &pixels[sy * row_stride..(sy + 1) * row_stride];
+            for (acc, &(x0, x1)) in row_acc.iter_mut().zip(&x_ranges) {
+                let mut r = 0u64;
+                let mut g = 0u64;
+                let mut b = 0u64;
+                for px in src_row[x0 * 4..x1 * 4].chunks_exact(4) {
+                    r += u64::from(px[0]);
+                    g += u64::from(px[1]);
+                    b += u64::from(px[2]);
+                }
+                acc[0] += r;
+                acc[1] += g;
+                acc[2] += b;
+            }
+        }
+
+        for (acc, &(x0, x1)) in row_acc.iter().zip(&x_ranges) {
+            let count = y_count * (x1 - x0) as u64;
+            let half = count / 2;
+            out.push(((acc[0] + half) / count) as u8);
+            out.push(((acc[1] + half) / count) as u8);
+            out.push(((acc[2] + half) / count) as u8);
+        }
+    }
+
+    out
+}
+
+fn encode_rgb_buffer(
+    raw_rgb: &[u8],
+    width: u32,
+    height: u32,
     format: i32,
-) -> Result<(Vec<u8>, &'static str), String>
-where
-    C: Deref<Target = [u8]>,
-{
-    let raw: &[u8] = Deref::deref(image.as_raw());
+) -> Result<(Vec<u8>, &'static str), String> {
     match format {
         1 => {
             let mut output = Vec::new();
             PngEncoder::new_with_quality(&mut output, CompressionType::Fast, PngFilterType::Sub)
-                .write_image(raw, image.width(), image.height(), ExtendedColorType::Rgba8)
+                .write_image(raw_rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
             Ok((output, ".png"))
         }
         2 => {
-            let output = encode_webp_rgba_with_backend(
-                raw,
-                image.width(),
-                image.height(),
+            let output = encode_webp_rgb_with_backend(
+                raw_rgb,
+                width,
+                height,
                 detect_webp_lossy_backend(),
             )?;
             Ok((output, ".webp"))
@@ -345,7 +413,7 @@ where
         _ => {
             let mut output = Vec::new();
             JpegEncoder::new(&mut output)
-                .encode_image(image)
+                .encode(raw_rgb, width, height, ExtendedColorType::Rgb8)
                 .map_err(|error| format!("Could not encode Anki screenshot: {error}"))?;
             Ok((output, ".jpg"))
         }
@@ -368,8 +436,6 @@ fn encode_picture(
         .pixels
         .get(..expected_len)
         .ok_or("Video screenshot has invalid dimensions")?;
-    let view = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(frame.width, frame.height, pixels)
-        .ok_or("Video screenshot has invalid dimensions")?;
 
     let max_width = if params.max_width > 0 {
         params.max_width as u32
@@ -387,15 +453,25 @@ fn encode_picture(
         } else {
             (max_width, max_height)
         };
-        let resized = image::imageops::resize(
-            &view,
-            target_w,
-            target_h,
-            image::imageops::FilterType::CatmullRom,
-        );
-        encode_rgba_buffer(&resized, format)
+        if target_w <= frame.width && target_h <= frame.height {
+            let resized_rgb =
+                downscale_rgba_to_rgb(pixels, frame.width, frame.height, target_w, target_h);
+            encode_rgb_buffer(&resized_rgb, target_w, target_h, format)
+        } else {
+            let full_rgb = rgba_to_rgb(pixels);
+            let view = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(frame.width, frame.height, full_rgb)
+                .ok_or("Video screenshot has invalid dimensions")?;
+            let resized = image::imageops::resize(
+                &view,
+                target_w,
+                target_h,
+                image::imageops::FilterType::Triangle,
+            );
+            encode_rgb_buffer(resized.as_raw(), target_w, target_h, format)
+        }
     } else {
-        encode_rgba_buffer(&view, format)
+        let full_rgb = rgba_to_rgb(pixels);
+        encode_rgb_buffer(&full_rgb, frame.width, frame.height, format)
     }
 }
 
@@ -1496,7 +1572,8 @@ mod tests {
         let decoded = image::load_from_memory_with_format(&webp_bytes, ImageFormat::WebP).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (width, height));
 
-        let lossless_bytes = encode_webp_lossless(&frame.pixels, width, height).unwrap();
+        let frame_rgb = rgba_to_rgb(&frame.pixels);
+        let lossless_bytes = encode_webp_lossless(&frame_rgb, width, height).unwrap();
         assert!(is_valid_webp(&lossless_bytes));
         let decoded_lossless =
             image::load_from_memory_with_format(&lossless_bytes, ImageFormat::WebP).unwrap();
@@ -1523,8 +1600,8 @@ mod tests {
         }
 
         // Lossless fallback backend must also return valid WebP.
-        let fallback_bytes = encode_webp_rgba_with_backend(
-            &frame.pixels,
+        let fallback_bytes = encode_webp_rgb_with_backend(
+            &frame_rgb,
             width,
             height,
             WebpLossyBackend::LosslessFallback,
