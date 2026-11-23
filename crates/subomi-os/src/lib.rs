@@ -1024,10 +1024,8 @@ pub const fn requires_main_thread_file_dialog() -> bool {
 /// Blocking cross-platform file or folder chooser:
 /// - **Linux/Unix**: XDG Desktop Portal `org.freedesktop.portal.FileChooser.OpenFile`
 ///   first (with `directory: true` for folders), falling back to `zenity`/`kdialog`.
-/// - **Windows**: Native Win32 COM `IFileOpenDialog` (STA-safe, supports multi-file,
-///   folder picking via `FOS_PICKFOLDERS`, filters, and initial directory).
-/// - **macOS**: Native AppKit `NSOpenPanel` (guaranteed main-thread execution;
-///   synchronously hops to the main GCD queue if called from a worker thread).
+/// - **Windows & macOS**: Native `rfd` (`IFileOpenDialog` COM on Windows,
+///   AppKit `NSOpenPanel` on macOS).
 pub fn open_files_blocking(options: &FileDialogOptions) -> Vec<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -1036,13 +1034,9 @@ pub fn open_files_blocking(options: &FileDialogOptions) -> Vec<PathBuf> {
             Err(_) => open_files_cli_fallback(options),
         }
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        native_dialogs::open_files_windows(options)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        native_dialogs::open_files_macos_blocking(options)
+        native_dialogs::open_files_rfd(options)
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
@@ -1060,29 +1054,18 @@ pub fn open_folder_blocking(initial_dir: Option<PathBuf>) -> Option<PathBuf> {
 
 /// Spawn a non-blocking file or folder chooser dialog and invoke `callback`
 /// with the selected paths (if any).
-///
-/// - **Linux/Windows**: Runs on a dedicated `"subomi-file-dialog"` worker thread.
-/// - **macOS**: Dispatches onto the main GCD queue (`dispatch_async_f`) so
-///   AppKit `NSOpenPanel` NEVER runs on a worker thread.
 pub fn open_files_async(
     options: FileDialogOptions,
     callback: impl FnOnce(Vec<PathBuf>) + Send + 'static,
 ) {
-    #[cfg(target_os = "macos")]
-    {
-        native_dialogs::open_files_macos_async(options, callback);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = std::thread::Builder::new()
-            .name("subomi-file-dialog".to_owned())
-            .spawn(move || {
-                let paths = open_files_blocking(&options);
-                if !paths.is_empty() {
-                    callback(paths);
-                }
-            });
-    }
+    let _ = std::thread::Builder::new()
+        .name("subomi-file-dialog".to_owned())
+        .spawn(move || {
+            let paths = open_files_blocking(&options);
+            if !paths.is_empty() {
+                callback(paths);
+            }
+        });
 }
 
 /// Spawn a non-blocking folder picker dialog and invoke `callback` with the

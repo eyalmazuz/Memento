@@ -260,7 +260,7 @@ impl MpvInstance {
             if status < 0 {
                 Vec::new()
             } else {
-                extract_string_list_from_node(&node.0)
+                extract_string_list_from_node(Some(node.as_ref()))
             }
         };
 

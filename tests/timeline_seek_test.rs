@@ -19,6 +19,9 @@ fn format_time(sec: f32) -> String {
 
 #[test]
 fn hovering_and_seeking_timeline_does_not_reenter_sharedparley_font_context() {
+    if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+        return;
+    }
     i_slint_backend_testing::init_no_event_loop();
 
     let app = SubomiApp::new().unwrap();

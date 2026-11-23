@@ -1,12 +1,9 @@
 //! Single-pass extraction of structured `mpv_node` properties (`track-list`,
 //! `sub-lines`, `chapter-list`, `osd-dimensions`) directly into owned Rust types.
 
-use std::ffi::CStr;
-
 use crate::events::Track;
 
-use super::ffi;
-use super::node::{copy_mpv_string, iter_node_array, iter_node_map};
+use super::node::MpvNodeRef;
 use super::types::{AudioTrack, OsdDimensions, SubLine, SubtitleTrack, TrackType, VideoTrack};
 
 pub(super) struct ExtractedTracks {
@@ -16,8 +13,8 @@ pub(super) struct ExtractedTracks {
     pub(super) all: Vec<Track>,
 }
 
-pub(super) fn extract_all_tracks_from_node(node: *const ffi::mpv_node) -> ExtractedTracks {
-    let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
+pub(super) fn extract_all_tracks_from_node(node: Option<MpvNodeRef<'_>>) -> ExtractedTracks {
+    let Some(array_iter) = node.and_then(MpvNodeRef::as_array) else {
         return ExtractedTracks {
             audio: Vec::new(),
             video: Vec::new(),
@@ -32,52 +29,72 @@ pub(super) fn extract_all_tracks_from_node(node: *const ffi::mpv_node) -> Extrac
     let mut all = Vec::new();
 
     for entry in array_iter {
-        let Some(map_iter) = (unsafe { iter_node_map(entry) }) else {
+        let Some(map_iter) = entry.as_map() else {
             continue;
         };
 
         let mut track = Track::default();
         for (key, val) in map_iter {
             match key {
-                b"id" if val.format == ffi::MPV_FORMAT_INT64 => {
-                    track.id = unsafe { val.u.int64 };
+                b"id" => {
+                    if let Some(id) = val.as_i64() {
+                        track.id = id;
+                    }
                 }
-                b"type" if val.format == ffi::MPV_FORMAT_STRING => {
-                    let s = unsafe { val.u.string };
-                    if !s.is_null() {
-                        let type_bytes = unsafe { CStr::from_ptr(s) }.to_bytes();
+                b"type" => {
+                    if let Some(type_bytes) = val.as_str_bytes() {
                         track.track_type = TrackType::from_bytes(type_bytes);
                     }
                 }
-                b"src-id" if val.format == ffi::MPV_FORMAT_INT64 => {
-                    track.src_id = unsafe { val.u.int64 };
+                b"src-id" => {
+                    if let Some(id) = val.as_i64() {
+                        track.src_id = id;
+                    }
                 }
-                b"title" if val.format == ffi::MPV_FORMAT_STRING => {
-                    track.title = copy_mpv_string(unsafe { val.u.string });
+                b"title" => {
+                    if let Some(title) = val.as_string() {
+                        track.title = title;
+                    }
                 }
-                b"lang" if val.format == ffi::MPV_FORMAT_STRING => {
-                    track.language = copy_mpv_string(unsafe { val.u.string });
+                b"lang" => {
+                    if let Some(lang) = val.as_string() {
+                        track.language = lang;
+                    }
                 }
-                b"albumart" if val.format == ffi::MPV_FORMAT_FLAG => {
-                    track.album_art = unsafe { val.u.flag != 0 };
+                b"albumart" => {
+                    if let Some(flag) = val.as_bool() {
+                        track.album_art = flag;
+                    }
                 }
-                b"default" if val.format == ffi::MPV_FORMAT_FLAG => {
-                    track.default_track = unsafe { val.u.flag != 0 };
+                b"default" => {
+                    if let Some(flag) = val.as_bool() {
+                        track.default_track = flag;
+                    }
                 }
-                b"selected" if val.format == ffi::MPV_FORMAT_FLAG => {
-                    track.selected = unsafe { val.u.flag != 0 };
+                b"selected" => {
+                    if let Some(flag) = val.as_bool() {
+                        track.selected = flag;
+                    }
                 }
-                b"main-selection" if val.format == ffi::MPV_FORMAT_INT64 => {
-                    track.main_selection = unsafe { val.u.int64 };
+                b"main-selection" => {
+                    if let Some(sel) = val.as_i64() {
+                        track.main_selection = sel;
+                    }
                 }
-                b"external" if val.format == ffi::MPV_FORMAT_FLAG => {
-                    track.external = unsafe { val.u.flag != 0 };
+                b"external" => {
+                    if let Some(flag) = val.as_bool() {
+                        track.external = flag;
+                    }
                 }
-                b"external-filename" if val.format == ffi::MPV_FORMAT_STRING => {
-                    track.external_filename = copy_mpv_string(unsafe { val.u.string });
+                b"external-filename" => {
+                    if let Some(path) = val.as_string() {
+                        track.external_filename = path;
+                    }
                 }
-                b"codec" if val.format == ffi::MPV_FORMAT_STRING => {
-                    track.codec = copy_mpv_string(unsafe { val.u.string });
+                b"codec" => {
+                    if let Some(codec) = val.as_string() {
+                        track.codec = codec;
+                    }
                 }
                 _ => {}
             }
@@ -134,20 +151,19 @@ pub(super) fn extract_all_tracks_from_node(node: *const ffi::mpv_node) -> Extrac
 
 #[cfg(test)]
 pub(super) fn extract_tracks_from_node(
-    node: *const ffi::mpv_node,
+    node: Option<MpvNodeRef<'_>>,
 ) -> (Vec<AudioTrack>, Vec<SubtitleTrack>, Vec<Track>) {
     let extracted = extract_all_tracks_from_node(node);
     (extracted.audio, extracted.subtitle, extracted.all)
 }
 
-pub(super) fn extract_string_list_from_node(node: *const ffi::mpv_node) -> Vec<String> {
-    let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
+pub(super) fn extract_string_list_from_node(node: Option<MpvNodeRef<'_>>) -> Vec<String> {
+    let Some(array_iter) = node.and_then(MpvNodeRef::as_array) else {
         return Vec::new();
     };
     let mut items = Vec::new();
     for entry in array_iter {
-        if entry.format == ffi::MPV_FORMAT_STRING {
-            let value = copy_mpv_string(unsafe { entry.u.string });
+        if let Some(value) = entry.as_string() {
             if !value.is_empty() {
                 items.push(value);
             }
@@ -156,53 +172,52 @@ pub(super) fn extract_string_list_from_node(node: *const ffi::mpv_node) -> Vec<S
     items
 }
 
-pub(super) fn extract_sub_lines_from_node(node: *const ffi::mpv_node) -> Vec<SubLine> {
-    let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
+pub(super) fn extract_sub_lines_from_node(node: Option<MpvNodeRef<'_>>) -> Vec<SubLine> {
+    let Some(array_iter) = node.and_then(MpvNodeRef::as_array) else {
         return Vec::new();
     };
 
     let mut lines = Vec::new();
     for entry in array_iter {
-        let Some(map_iter) = (unsafe { iter_node_map(entry) }) else {
+        let Some(map_iter) = entry.as_map() else {
             continue;
         };
 
-        let mut has_id = false;
-        let mut text_ptr = std::ptr::null();
-        let mut has_start = false;
-        let mut has_end = false;
-        let mut id = 0i64;
-        let mut start = 0.0f64;
-        let mut end = 0.0f64;
+        let mut id: Option<i64> = None;
+        let mut text: Option<String> = None;
+        let mut start: Option<f64> = None;
+        let mut end: Option<f64> = None;
 
         for (key, val) in map_iter {
             match key {
-                b"id" if val.format == ffi::MPV_FORMAT_INT64 => {
-                    id = unsafe { val.u.int64 };
-                    has_id = true;
-                }
-                b"text" if val.format == ffi::MPV_FORMAT_STRING => {
-                    let s = unsafe { val.u.string };
-                    if !s.is_null() {
-                        text_ptr = s;
+                b"id" => {
+                    if let Some(v) = val.as_i64() {
+                        id = Some(v);
                     }
                 }
-                b"start" if val.format == ffi::MPV_FORMAT_DOUBLE => {
-                    start = unsafe { val.u.double_ };
-                    has_start = start.is_finite();
+                b"text" => {
+                    if let Some(v) = val.as_string() {
+                        text = Some(v);
+                    }
                 }
-                b"end" if val.format == ffi::MPV_FORMAT_DOUBLE => {
-                    end = unsafe { val.u.double_ };
-                    has_end = end.is_finite();
+                b"start" => {
+                    if let Some(v) = val.as_f64().filter(|v| v.is_finite()) {
+                        start = Some(v);
+                    }
+                }
+                b"end" => {
+                    if let Some(v) = val.as_f64().filter(|v| v.is_finite()) {
+                        end = Some(v);
+                    }
                 }
                 _ => {}
             }
         }
 
-        if has_id && !text_ptr.is_null() && has_start && has_end {
+        if let (Some(id), Some(text), Some(start), Some(end)) = (id, text, start, end) {
             lines.push(SubLine {
                 id,
-                text: copy_mpv_string(text_ptr),
+                text,
                 start,
                 end,
             });
@@ -212,52 +227,42 @@ pub(super) fn extract_sub_lines_from_node(node: *const ffi::mpv_node) -> Vec<Sub
     lines
 }
 
-pub(super) fn extract_chapters_from_node(node: *const ffi::mpv_node) -> Vec<f64> {
-    let Some(array_iter) = (unsafe { iter_node_array(node) }) else {
+pub(super) fn extract_chapters_from_node(node: Option<MpvNodeRef<'_>>) -> Vec<f64> {
+    let Some(array_iter) = node.and_then(MpvNodeRef::as_array) else {
         return Vec::new();
     };
 
     let mut chapters = Vec::new();
     for entry in array_iter {
-        let Some(map_iter) = (unsafe { iter_node_map(entry) }) else {
+        let Some(map_iter) = entry.as_map() else {
             continue;
         };
         for (key, val) in map_iter {
-            if key == b"time" && val.format == ffi::MPV_FORMAT_DOUBLE {
-                chapters.push(unsafe { val.u.double_ });
+            if key == b"time" {
+                if let Some(t) = val.as_f64() {
+                    chapters.push(t);
+                }
             }
         }
     }
     chapters
 }
 
-pub(super) fn extract_osd_dimensions_from_node(node: *const ffi::mpv_node) -> OsdDimensions {
+pub(super) fn extract_osd_dimensions_from_node(node: Option<MpvNodeRef<'_>>) -> OsdDimensions {
     let mut dims = OsdDimensions::default();
-    let Some(root) = (unsafe { node.as_ref() }) else {
-        return dims;
-    };
-    let Some(map_iter) = (unsafe { iter_node_map(root) }) else {
+    let Some(map_iter) = node.and_then(MpvNodeRef::as_map) else {
         return dims;
     };
 
     for (key, val) in map_iter {
-        let as_i64 = || -> Option<i64> {
-            match val.format {
-                ffi::MPV_FORMAT_INT64 => Some(unsafe { val.u.int64 }),
-                ffi::MPV_FORMAT_DOUBLE => {
-                    let d = unsafe { val.u.double_ };
-                    d.is_finite().then_some(d.round() as i64)
-                }
-                _ => None,
-            }
+        let as_i64 = || {
+            val.as_i64().or_else(|| {
+                val.as_f64()
+                    .filter(|d| d.is_finite())
+                    .map(|d| d.round() as i64)
+            })
         };
-        let as_f64 = || -> Option<f64> {
-            match val.format {
-                ffi::MPV_FORMAT_DOUBLE => Some(unsafe { val.u.double_ }),
-                ffi::MPV_FORMAT_INT64 => Some(unsafe { val.u.int64 } as f64),
-                _ => None,
-            }
-        };
+        let as_f64 = || val.as_f64().or_else(|| val.as_i64().map(|v| v as f64));
         match key {
             b"w" => {
                 if let Some(v) = as_i64() {

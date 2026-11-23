@@ -673,7 +673,10 @@ mod rich_popup_phase4_tests {
 
         let mut dict_ctrl = DictController::open(&fixture.db_path).unwrap();
         let hits = dict_ctrl.search("世界中").to_vec();
-        assert_eq!(hits.len(), 2);
+        // 2 term rows (`世界中`, `世界`) + 1 kanji footer row (`世`).
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits.iter().filter(|h| !h.is_kanji).count(), 2);
+        assert!(hits[2].is_kanji && hits[2].expression == "世");
         let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("世界中".into());
@@ -1172,7 +1175,10 @@ mod rich_popup_phase4_tests {
         let hits = dict_ctrl
             .search("寿限無寿限無五劫のすりきれ海砂利水魚の水行末")
             .to_vec();
-        assert_eq!(hits.len(), 1);
+        // 1 term row + 1 kanji footer row (`寿`).
+        assert_eq!(hits.len(), 2);
+        assert!(!hits[0].is_kanji);
+        assert!(hits[1].is_kanji && hits[1].expression == "寿");
         let rows = subomi_app::dictionary_result_rows(&hits, &[]);
         set_dictionary_rows(&app, rows);
         app.set_dict_query("寿限無寿限無五劫のすりきれ海砂利水魚の水行末".into());

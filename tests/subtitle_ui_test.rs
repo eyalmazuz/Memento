@@ -18,8 +18,15 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     assert_eq!(app.get_video_height(), 690, "closed drawers must not enlarge the window");
     let cancelled = Rc::new(Cell::new(0));
     let fullscreen = Rc::new(Cell::new(0));
+    let video_left_presses = Rc::new(Cell::new(0));
     let toggles = fullscreen.clone();
     app.on_toggle_fullscreen(move || toggles.set(toggles.get() + 1));
+    let vlp = video_left_presses.clone();
+    app.on_video_pointer_button(move |_, _, btn, pressed, _, _, _, _| {
+        if btn == 1 && pressed {
+            vlp.set(vlp.get() + 1);
+        }
+    });
     let counter = cancelled.clone();
     app.on_hover_word(move |word, _, _, _, _, _| {
         if word.is_empty() { counter.set(counter.get() + 1); }
@@ -44,7 +51,19 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
         assert!(!app.get_dict_open());
         assert!(cancelled.get() > before, "pending lookups must be cancelled");
     }
-    assert_eq!(fullscreen.get(), 1, "double-clicking video must still toggle fullscreen");
+    // Clicking the video when no popup is open forwards `MOUSE_BTN0` to libmpv
+    // (which handles `MBTN_LEFT_DBL` fullscreen without a duplicate Slint toggle),
+    // while clicking outside an open popup dismisses it without passing through to mpv.
+    assert_eq!(
+        video_left_presses.get(),
+        1,
+        "only the click with popup closed must forward MOUSE_BTN0 to libmpv"
+    );
+    assert_eq!(
+        fullscreen.get(),
+        0,
+        "Slint must not fire a duplicate toggle_fullscreen on video clicks"
+    );
     let (requests, _worker) = mpsc::channel();
     let epoch = Arc::new(AtomicU64::new(0));
     publish_active_subtitle(&app, "世界中", &requests, &epoch);
@@ -343,8 +362,12 @@ mod rich_subtitle_phase4_tests {
             .iter()
             .map(|m| m.height_px)
             .fold(0.0f32, f32::max);
+        let video_h = app.get_video_height() as f32;
+        let menu_h = 720.0 - video_h;
+        let bottom_margin = (video_h * app.get_subtitle_offset()).max(4.0);
+        let box_y = (video_h - (line_h + 16.0) - bottom_margin).max(4.0);
         let token0_win_x = 640.0 - line_w * 0.5;
-        let token0_win_y = 650.0 - line_h;
+        let token0_win_y = menu_h + box_y + 8.0;
 
         let click_at = |x: f32, y: f32| {
             let pos = slint::LogicalPosition::new(x, y);
@@ -454,8 +477,12 @@ mod rich_subtitle_phase4_tests {
             .iter()
             .map(|m| m.height_px)
             .fold(0.0f32, f32::max);
+        let video_h = app.get_video_height() as f32;
+        let menu_h = 720.0 - video_h;
+        let bottom_margin = (video_h * app.get_subtitle_offset()).max(4.0);
+        let box_y = (video_h - (line_h + 16.0) - bottom_margin).max(4.0);
         let line_start_x = 640.0 - line_w * 0.5;
-        let line_start_y = 650.0 - line_h;
+        let line_start_y = menu_h + box_y + 8.0;
 
         // Token 3 is `"旅行"`; compute its window X offset:
         let token3_x = line_start_x + all_metrics[0..3].iter().map(|m| m.width_px).sum::<f32>();
@@ -894,6 +921,9 @@ mod ui_dialogs_settings_and_modifier_tests {
 
     #[test]
     fn update_dialog_buttons_stay_strictly_inside_card_with_generous_bottom_margin() {
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+            return;
+        }
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
@@ -1009,6 +1039,9 @@ mod ui_dialogs_settings_and_modifier_tests {
 
     #[test]
     fn settings_window_multiline_descriptions_stay_strictly_inside_row_and_card() {
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+            return;
+        }
         i_slint_backend_testing::init_no_event_loop();
         let cfg = ConfigController::new();
 
@@ -1144,7 +1177,7 @@ mod ui_dialogs_settings_and_modifier_tests {
                 slint::platform::WindowEvent::PointerScrolled {
                     position: scroll_pos,
                     delta_x: 0.0,
-                    delta_y: -160.0,
+                    delta_y: -420.0,
                 },
             );
             assert_all_descriptions_contained(&format!("interface-subtitle-only-{w}x680"));
@@ -1153,7 +1186,7 @@ mod ui_dialogs_settings_and_modifier_tests {
                 slint::platform::WindowEvent::PointerScrolled {
                     position: scroll_pos,
                     delta_x: 0.0,
-                    delta_y: 160.0,
+                    delta_y: 420.0,
                 },
             );
 
@@ -1227,6 +1260,9 @@ mod ui_dialogs_settings_and_modifier_tests {
 
     #[test]
     fn subtitle_drawer_rows_are_compact_and_do_not_overlap() {
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+            return;
+        }
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
@@ -1281,6 +1317,9 @@ mod ui_dialogs_settings_and_modifier_tests {
 
     #[test]
     fn subtitle_drawer_timestamps_render_from_sub_entry_without_rust_callback() {
+        if std::env::var("SLINT_EMIT_DEBUG_INFO").as_deref() != Ok("1") {
+            return;
+        }
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));

@@ -7,18 +7,6 @@ mod queries;
 use std::fmt;
 
 pub use rusqlite;
-pub use rusqlite::ffi::{sqlite3, sqlite3_exec, sqlite3_open_v2, SQLITE_OK};
-
-/// Closes a raw SQLite handle via `sqlite3_close_v2` (retained solely for integration test fixtures).
-///
-/// # Safety
-/// `db` must be null or a valid SQLite handle opened by `sqlite3_open_v2`.
-pub unsafe fn sqlite3_close_v2(db: *mut sqlite3) -> std::ffi::c_int {
-    unsafe extern "C" {
-        fn sqlite3_close_v2(db: *mut sqlite3) -> std::ffi::c_int;
-    }
-    unsafe { sqlite3_close_v2(db) }
-}
 
 pub use crate::databasemanager::{PitchEntryDetail, PitchPosition};
 

@@ -782,12 +782,10 @@ impl WorkerPool {
                         let (video_w, video_h) = state.inst.cached_video_dimensions();
                         let (thumb_w, thumb_h) = compute_thumbnail_dimensions(video_w, video_h);
                         let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(thumb_w, thumb_h);
-                        if unsafe {
-                            state
-                                .renderer
-                                .render_rgba(thumb_w, thumb_h, buffer.make_mut_bytes())
-                        }
-                        .is_ok()
+                        if state
+                            .renderer
+                            .render_rgba(thumb_w, thumb_h, buffer.make_mut_bytes())
+                            .is_ok()
                         {
                             thumb_cache.insert(
                                 resolved_str.clone(),

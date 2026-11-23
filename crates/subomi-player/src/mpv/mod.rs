@@ -9,6 +9,7 @@ mod audio_instance;
 mod commands;
 mod event;
 mod extract;
+mod headless;
 mod hwdec;
 mod instance;
 mod node;
@@ -23,6 +24,7 @@ pub use asr_track::AsrSubtitleTrack;
 pub use audio_instance::AudioInstance;
 pub use event::MpvEvent;
 pub use ffi::mpv_handle;
+pub use headless::{mpv_error_message, HeadlessEvent, HeadlessMpv, WeakStringObserver};
 pub use hwdec::{
     compatible_opengl_hwdec, compatible_opengl_hwdec_for_session, compatible_software_hwdec,
 };
@@ -56,7 +58,7 @@ mod tests {
         extract_sub_lines_from_node, extract_tracks_from_node,
     };
     use super::node::{
-        command_name, copy_mpv_string, cue_valid, id_valid, supports_memory_subtitles,
+        command_name, copy_mpv_string, cue_valid, id_valid, supports_memory_subtitles, MpvNodeRef,
         MAX_TEXT_BYTES,
     };
     use super::playback_state::PLAYBACK_PROPERTIES;
@@ -221,9 +223,9 @@ mod tests {
 
     #[test]
     fn synthetic_track_chapter_and_sub_line_extraction() {
-        assert!(extract_tracks_from_node(ptr::null()).2.is_empty());
-        assert!(extract_chapters_from_node(ptr::null()).is_empty());
-        assert!(extract_sub_lines_from_node(ptr::null()).is_empty());
+        assert!(extract_tracks_from_node(None).2.is_empty());
+        assert!(extract_chapters_from_node(None).is_empty());
+        assert!(extract_sub_lines_from_node(None).is_empty());
 
         let mut keys = [
             c"id".as_ptr().cast_mut(),
@@ -280,7 +282,8 @@ mod tests {
                 list: &mut root_list,
             },
         };
-        let (audio, subtitle, all) = extract_tracks_from_node(&root);
+        let (audio, subtitle, all) =
+            extract_tracks_from_node(Some(unsafe { MpvNodeRef::from_ref(&root) }));
         assert_eq!(audio.len(), 1);
         assert!(subtitle.is_empty());
         assert_eq!(all.len(), 1);
@@ -876,7 +879,7 @@ mod tests {
             },
         };
         assert_eq!(
-            extract_string_list_from_node(&hdr_root),
+            extract_string_list_from_node(Some(unsafe { MpvNodeRef::from_ref(&hdr_root) })),
             vec!["Authorization: Bearer abc,def", "X-Custom: value"]
         );
 
@@ -1252,7 +1255,8 @@ mod tests {
             },
         };
 
-        let extracted = extract_all_tracks_from_node(&root);
+        let extracted =
+            extract_all_tracks_from_node(Some(unsafe { MpvNodeRef::from_ref(&root) }));
         assert_eq!(extracted.video.len(), 1);
         assert_eq!(
             extracted.video[0],

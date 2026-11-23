@@ -4,7 +4,7 @@ use std::ffi::{c_char, CString};
 use std::ptr;
 
 use super::ffi;
-use super::node::{iter_node_map, OwnedNode};
+use super::node::OwnedNode;
 
 /// Independent audio-only libmpv context used for pronunciation playback.
 ///
@@ -125,11 +125,8 @@ impl AudioInstance {
         if status < 0 {
             return Err(format!("mpv audio loadfile command failed with code {status}"));
         }
-        let entry_id = unsafe { iter_node_map(&result.0) }.and_then(|mut map| {
-            map.find_map(|(key, val)| {
-                (key == b"playlist_entry_id" && val.format == ffi::MPV_FORMAT_INT64)
-                    .then(|| unsafe { val.u.int64 })
-            })
+        let entry_id = result.as_ref().as_map().and_then(|mut map| {
+            map.find_map(|(key, val)| (key == b"playlist_entry_id").then(|| val.as_i64()).flatten())
         });
         Ok(entry_id)
     }

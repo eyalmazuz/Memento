@@ -131,10 +131,10 @@ impl RenderContext {
 }
 
 impl MpvSoftwareRenderer {
-    /// # Safety
-    /// The originating `MpvInstance` must remain alive until this call returns.
-    /// Join the render worker before dropping that instance.
-    pub unsafe fn render_rgba(
+    /// Render the current video frame into a caller-supplied tightly packed
+    /// RGBA8 pixel slice. Synchronized against [`super::MpvInstance`] teardown
+    /// by `render_lock`, so calling this after shutdown cleanly returns `Err`.
+    pub fn render_rgba(
         &self,
         width: u32,
         height: u32,

@@ -5,8 +5,6 @@
 //! applies cue deltas to the local ASR track in
 //! [`crate::controller::subtitles::SubtitleController`].
 
-#[cfg(feature = "asr-whisper")]
-use std::ffi::c_void;
 use std::path::PathBuf;
 
 use subomi_config::{config::Config, Value};
@@ -46,17 +44,7 @@ pub enum AsrBackend {
 /// Whisper counts both discrete and integrated GPUs for its device index.
 #[cfg(feature = "asr-whisper")]
 pub fn whisper_gpu_device_count() -> usize {
-    unsafe extern "C" {
-        fn ggml_backend_dev_count() -> usize;
-        fn ggml_backend_dev_get(index: usize) -> *mut c_void;
-        fn ggml_backend_dev_type(device: *mut c_void) -> i32;
-    }
-    (0..unsafe { ggml_backend_dev_count() })
-        .filter(|index| {
-            let device = unsafe { ggml_backend_dev_get(*index) };
-            !device.is_null() && matches!(unsafe { ggml_backend_dev_type(device) }, 1 | 2)
-        })
-        .count()
+    subomi_asr_whisper::engine::gpu_device_count()
 }
 
 #[cfg(not(feature = "asr-whisper"))]

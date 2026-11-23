@@ -12,7 +12,7 @@ accessibility = ["slint/accessibility"]
 asr = ["asr-whisper"]
 asr-whisper = ["dep:subomi-asr-whisper"]
 asr-onnx = ["dep:subomi-asr-onnx"]
-ocr = ["dep:libloading"]
+ocr = []
 whisper-cuda = ["asr-whisper", "subomi-asr-whisper/cuda"]
 whisper-vulkan = ["asr-whisper", "subomi-asr-whisper/vulkan"]
 
@@ -29,7 +29,6 @@ slint = { version = "=1.16.1", default-features = false, features = [
     "unstable-winit-030",
 ] }
 raw-window-handle = "=0.6.2"
-libloading = { version = "=0.8.9", optional = true }
 libc = "=0.2.190"
 tempfile = "=3.27.0"
 glow = "=0.17.0"

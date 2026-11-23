@@ -350,8 +350,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // H1.4: Augment macOS `.app` bundle `PATH` (Homebrew / MacPorts / local tools)
     // BEFORE OCR/Python probing or `MpvInstance` creation.
     subomi_os::augment_macos_bundle_path();
-    #[cfg(feature = "ocr")]
-    crate::controller::ocr::prepare_python_executable();
     let _ = log::set_logger(&APP_LOGGER);
     log::set_max_level(log::LevelFilter::Warn);
 

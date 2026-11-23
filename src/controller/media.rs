@@ -3,8 +3,8 @@
 #[cfg(any(feature = "asr-whisper", feature = "asr-onnx", test))]
 use subomi_asr::audio::wavreader::{read_pcm16_wav_bytes, SAMPLE_RATE_16K};
 use subomi_player::mpv::ffi as mpv;
-use subomi_player::EncodeContext;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use subomi_player::{mpv_error_message, EncodeContext, HeadlessMpv};
+use std::ffi::c_int;
 use std::fs;
 #[cfg(all(
     target_os = "linux",
@@ -12,7 +12,6 @@ use std::fs;
 ))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -128,26 +127,8 @@ fn create_temp_mp4_path() -> Result<TempMediaFile, String> {
     )
 }
 
-struct MpvHandle(*mut mpv::mpv_handle);
-
-impl Drop for MpvHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { mpv::mpv_terminate_destroy(self.0) };
-        }
-    }
-}
-
 fn mpv_error(status: c_int) -> String {
-    let message = unsafe { mpv::mpv_error_string(status) };
-    if message.is_null() {
-        format!("libmpv error {status}")
-    } else {
-        format!(
-            "libmpv error: {}",
-            unsafe { CStr::from_ptr(message) }.to_string_lossy()
-        )
-    }
+    mpv_error_message(status)
 }
 
 fn validate_audio_clip_args(media: &MediaContext, start: f64, end: f64) -> Result<(), String> {
@@ -492,7 +473,7 @@ fn check_abort_or_timeout(
 }
 
 fn set_string_list_option(
-    handle: *mut mpv::mpv_handle,
+    handle: &mut HeadlessMpv,
     name: &str,
     values: &[&str],
     context: &str,
@@ -500,45 +481,7 @@ fn set_string_list_option(
     if values.is_empty() {
         return Ok(());
     }
-    let name_c = CString::new(name)
-        .map_err(|_| format!("Invalid libmpv option name '{name}' for {context}"))?;
-    let mut c_values = Vec::with_capacity(values.len());
-    for value in values {
-        let c_val = CString::new(value.as_bytes()).map_err(|_| {
-            format!("libmpv option '{name}' contains an invalid NUL byte for {context}")
-        })?;
-        c_values.push(c_val);
-    }
-    let mut nodes: Vec<mpv::mpv_node> = c_values
-        .iter()
-        .map(|s| {
-            let mut node: mpv::mpv_node = unsafe { std::mem::zeroed() };
-            node.format = mpv::MPV_FORMAT_STRING;
-            node.u.string = s.as_ptr().cast_mut();
-            node
-        })
-        .collect();
-    let num = c_int::try_from(nodes.len())
-        .map_err(|_| format!("Too many entries for libmpv option '{name}' during {context}"))?;
-    let mut list = mpv::mpv_node_list {
-        num,
-        values: nodes.as_mut_ptr(),
-        keys: ptr::null_mut(),
-    };
-    let mut array_node: mpv::mpv_node = unsafe { std::mem::zeroed() };
-    array_node.format = mpv::MPV_FORMAT_NODE_ARRAY;
-    array_node.u.list = &mut list;
-
-    let status = unsafe {
-        mpv::mpv_set_option(
-            handle,
-            name_c.as_ptr(),
-            mpv::MPV_FORMAT_NODE,
-            (&mut array_node as *mut mpv::mpv_node).cast::<c_void>(),
-        )
-    };
-    if status < 0 {
-        let err = mpv_error(status);
+    if let Err(err) = handle.set_string_list_option(name, values) {
         log::warn!(
             "Could not configure libmpv {context} list option '{name}' ({} entries): {err}",
             values.len()
@@ -551,7 +494,7 @@ fn set_string_list_option(
 }
 
 fn apply_encode_handle_options(
-    handle: *mut mpv::mpv_handle,
+    handle: &mut HeadlessMpv,
     options: &[(&str, String)],
     http_header_fields: &[String],
     context: &str,
@@ -563,14 +506,7 @@ fn apply_encode_handle_options(
             set_string_list_option(handle, "audio-files", &[value.as_str()], context)?;
             continue;
         }
-        let name_c = CString::new(*name)
-            .map_err(|_| format!("Invalid libmpv option name '{name}' for {context}"))?;
-        let value_c = CString::new(value.as_bytes())
-            .map_err(|_| format!("libmpv option '{name}' contains an invalid NUL byte"))?;
-        let status =
-            unsafe { mpv::mpv_set_option_string(handle, name_c.as_ptr(), value_c.as_ptr()) };
-        if status < 0 {
-            let err = mpv_error(status);
+        if let Err(err) = handle.set_option_string(name, value) {
             log::warn!("Could not configure libmpv {context} option '{name}': {err}");
             return Err(format!(
                 "Could not configure libmpv {context} option {name}: {err}"
@@ -596,40 +532,20 @@ fn run_encode_job(
     let deadline = timeout.map(|limit| (limit, Instant::now().checked_add(limit)));
     check_abort_or_timeout(abort, deadline, context)?;
 
-    let input = CString::new(media_path.as_bytes())
-        .map_err(|_| "Media path contains an invalid NUL byte.".to_owned())?;
-    let load_options_c =
-        CString::new(load_options.as_bytes()).map_err(|_| format!("Invalid {context} options."))?;
-
-    let handle = unsafe { mpv::mpv_create() };
-    if handle.is_null() {
+    let Some(mut handle) = HeadlessMpv::create() else {
         log::warn!("Could not create a libmpv {context} instance for '{media_path}'.");
         return Err(format!("Could not create a libmpv {context} instance."));
-    }
-    let handle = MpvHandle(handle);
+    };
 
-    apply_encode_handle_options(handle.0, options, http_header_fields, context)?;
+    apply_encode_handle_options(&mut handle, options, http_header_fields, context)?;
 
-    let status = unsafe { mpv::mpv_initialize(handle.0) };
-    if status < 0 {
-        let err = mpv_error(status);
+    if let Err(err) = handle.initialize() {
         log::warn!("Could not initialize libmpv {context} for '{media_path}': {err}");
         return Err(format!("Could not initialize libmpv {context}: {err}"));
     }
     check_abort_or_timeout(abort, deadline, context)?;
 
-    let api_version = unsafe { mpv::mpv_client_api_version() };
-    // mpv_client_api_version() packs (major << 16) | minor; loadfile gained its
-    // <index> argument in client API 2.3.
-    let mut command: Vec<*const c_char> =
-        vec![c"loadfile".as_ptr(), input.as_ptr(), c"replace".as_ptr()];
-    if api_version >= ((2 << 16) | 3) {
-        command.push(c"0".as_ptr());
-    }
-    command.extend([load_options_c.as_ptr(), ptr::null()]);
-    let status = unsafe { mpv::mpv_command(handle.0, command.as_mut_ptr()) };
-    if status < 0 {
-        let err = mpv_error(status);
+    if let Err(err) = handle.loadfile_replace(media_path, load_options) {
         log::warn!("Could not start libmpv {context} for '{media_path}': {err}");
         return Err(format!("Could not start libmpv {context}: {err}"));
     }
@@ -637,22 +553,11 @@ fn run_encode_job(
     loop {
         let wait_secs = check_abort_or_timeout(abort, deadline, context)?
             .map_or(0.1, |remaining| remaining.as_secs_f64().min(0.1));
-        let event = unsafe { mpv::mpv_wait_event(handle.0, wait_secs) };
-        if event.is_null() {
+        let Some(event) = handle.wait_event(wait_secs) else {
             log::warn!("libmpv returned no event during {context} for '{media_path}'.");
             return Err(format!("libmpv returned no event during {context}."));
-        }
-        let event_id = unsafe { (*event).event_id };
-        let end_file = if event_id == mpv::MPV_EVENT_END_FILE {
-            let end_file_ptr = unsafe { (*event).data as *const mpv::mpv_event_end_file };
-            (!end_file_ptr.is_null()).then(|| {
-                let info = unsafe { &*end_file_ptr };
-                (info.reason, info.error)
-            })
-        } else {
-            None
         };
-        match classify_encode_event(event_id, end_file, media_path, context) {
+        match classify_encode_event(event.event_id, event.end_file, media_path, context) {
             EncodeEventAction::Continue => continue,
             EncodeEventAction::Finished => {
                 // Terminate and flush the encoder handle before inspecting the output.
@@ -1213,11 +1118,9 @@ mod tests {
         );
 
         // Verify libmpv accepts every configured streaming option & list option on a real handle.
-        let raw_handle = unsafe { mpv::mpv_create() };
-        assert!(!raw_handle.is_null());
-        let handle = MpvHandle(raw_handle);
+        let mut handle = HeadlessMpv::create().expect("libmpv must create handle");
         apply_encode_handle_options(
-            handle.0,
+            &mut handle,
             &audio_opts,
             &media.http_header_fields,
             "streaming unit test",

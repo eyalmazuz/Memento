@@ -1415,6 +1415,9 @@ pub(super) fn encode_note_id_i32(nid: i64) -> i32 {
 }
 
 pub(super) fn parse_def_rgba(value: &str, fallback: [u8; 4]) -> [u8; 4] {
+    if let Ok(c) = subomi_config::ArgbColor::parse(value) {
+        return [c.r, c.g, c.b, c.a];
+    }
     parse_css_color(value).unwrap_or(fallback)
 }
 

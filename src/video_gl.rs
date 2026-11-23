@@ -481,10 +481,12 @@ struct BlendGuard<'a> {
 }
 
 impl<'a> BlendGuard<'a> {
-    unsafe fn disable(gl: &'a glow::Context) -> Self {
-        let was_enabled = gl.is_enabled(glow::BLEND);
-        gl.disable(glow::BLEND);
-        Self { gl, was_enabled }
+    fn disable(gl: &'a glow::Context) -> Self {
+        unsafe {
+            let was_enabled = gl.is_enabled(glow::BLEND);
+            gl.disable(glow::BLEND);
+            Self { gl, was_enabled }
+        }
     }
 }
 
@@ -504,7 +506,7 @@ impl Drop for BlendGuard<'_> {
 /// even after an otherwise empty flush. Restore the caller's setting afterward.
 /// The caller must keep this GL context current throughout the operation.
 pub fn without_blending<T>(gl: &glow::Context, render: impl FnOnce() -> T) -> T {
-    let _guard = unsafe { BlendGuard::disable(gl) };
+    let _guard = BlendGuard::disable(gl);
     render()
 }
 
@@ -545,7 +547,8 @@ struct GlStateGuard<'a> {
 }
 
 impl<'a> GlStateGuard<'a> {
-    unsafe fn enter(gl: &'a glow::Context, caps: GlCapabilities) -> Self {
+    fn enter(gl: &'a glow::Context, caps: GlCapabilities) -> Self {
+        unsafe {
         let has_gl3 = caps.has_gl3;
         let has_srgb = caps.has_srgb;
         let has_samplers = caps.has_samplers;
@@ -747,6 +750,7 @@ impl<'a> GlStateGuard<'a> {
             old_unpack_skip_rows,
             old_viewport,
         }
+        }
     }
 }
 
@@ -907,7 +911,7 @@ pub fn with_saved_state_caps<T>(
     caps: GlCapabilities,
     action: impl FnOnce() -> T,
 ) -> T {
-    let _guard = unsafe { GlStateGuard::enter(gl, caps) };
+    let _guard = GlStateGuard::enter(gl, caps);
     action()
 }
 

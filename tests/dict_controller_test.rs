@@ -9,11 +9,9 @@ use subomi_app::controller::dict::{
 };
 
 use subomi_dict::sqlite_db;
-use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -48,16 +46,6 @@ impl Drop for TemporaryDictionaryDatabase {
     }
 }
 
-struct TestSqliteHandle(*mut sqlite_db::sqlite3);
-
-impl Drop for TestSqliteHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sqlite_db::sqlite3_close_v2(self.0) };
-        }
-    }
-}
-
 fn temporary_dictionary_path() -> PathBuf {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     for _ in 0..100 {
@@ -80,31 +68,11 @@ fn temporary_dictionary_path() -> PathBuf {
 
 fn exec_sql_fixture(sql: &str) -> TemporaryDictionaryDatabase {
     let path = temporary_dictionary_path();
-    let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
-    let mut raw_handle = ptr::null_mut();
-    let status = unsafe {
-        sqlite_db::sqlite3_open_v2(
-            c_path.as_ptr(),
-            &mut raw_handle,
-            0x0000_0002 | 0x0000_0004,
-            ptr::null(),
-        )
-    };
-    let handle = TestSqliteHandle(raw_handle);
-    assert_eq!(status, sqlite_db::SQLITE_OK);
-
-    let c_sql = CString::new(sql).unwrap();
-    let status = unsafe {
-        sqlite_db::sqlite3_exec(
-            handle.0,
-            c_sql.as_ptr(),
-            None,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    assert_eq!(status, sqlite_db::SQLITE_OK);
-    drop(handle);
+    let conn = sqlite_db::rusqlite::Connection::open(&path)
+        .expect("could not open dictionary fixture database");
+    conn.execute_batch(sql)
+        .expect("could not populate dictionary fixture database");
+    drop(conn);
     TemporaryDictionaryDatabase(path)
 }
 
@@ -182,7 +150,10 @@ fn test_open_dictionary_searches_real_term_kanji_and_normalized_rows_read_only()
     let mut controller = DictController::open(&fixture.0).expect("fixture should open");
 
     let term_hits = controller.search("食べる");
-    assert_eq!(term_hits.len(), 3);
+    // 3 term rows (`食べる` Primary, `食べる` Secondary, `食` Primary) + 3 kanji footer rows (`食`).
+    assert_eq!(term_hits.len(), 6);
+    assert!(term_hits[..3].iter().all(|h| !h.is_kanji));
+    assert!(term_hits[3..].iter().all(|h| h.is_kanji && h.expression == "食"));
     assert_eq!(term_hits[2].expression, "食");
     assert_eq!(term_hits[0].dict_name, "Primary");
     assert_eq!(term_hits[0].dictionary_id, 1);
@@ -252,8 +223,9 @@ fn anki_term_metadata_fills_frequency_and_pitch_markers() {
     assert!(metadata.frequencies.contains("Secondary: 180"));
     assert_eq!(metadata.frequency_harmonic_rank, "144");
     assert_eq!(metadata.frequency_average_rank, "150");
-    assert_eq!(metadata.frequency_harmonic_occurrence, "144");
-    assert_eq!(metadata.frequency_average_occurrence, "150");
+    // Fixture dictionaries default to `rank-based`, so occurrence-based aggregates stay `"0"`.
+    assert_eq!(metadata.frequency_harmonic_occurrence, "0");
+    assert_eq!(metadata.frequency_average_occurrence, "0");
     assert_eq!(
         metadata.pitch_positions,
         "<span class=\"subomi-pitch-position\">[2]</span>"
@@ -687,10 +659,13 @@ fn open_dict_controller_refreshes_names_and_tags_across_wal_commits() {
     assert_eq!(controller.dictionary_id_for_name("SecondDict"), Some(dic2_id));
 
     let term_hits = controller.search("飲む");
-    assert_eq!(term_hits.len(), 1);
+    // 1 term hit (`飲む`) + 1 kanji footer hit (`飲`).
+    assert_eq!(term_hits.len(), 2);
+    assert!(!term_hits[0].is_kanji);
     assert_eq!(term_hits[0].dict_name, "SecondDict");
     assert_eq!(term_hits[0].tags, "v5m");
     assert_eq!(term_hits[0].glossary, "◦ to drink");
+    assert!(term_hits[1].is_kanji && term_hits[1].expression == "飲");
 
     let kanji_hits = controller.search_kanji("飲");
     assert_eq!(kanji_hits.len(), 1);
@@ -987,8 +962,9 @@ fn unlisted_priority_i64_max_homograph_isolation_pitch_details_and_kanji_meta() 
     let anki_ninki = controller.get_anki_term_metadata("人気", "にんき", &[]);
     assert_eq!(anki_ninki.frequency_harmonic_rank, "163");
     assert_eq!(anki_ninki.frequency_average_rank, "200");
-    assert_eq!(anki_ninki.frequency_harmonic_occurrence, "163");
-    assert_eq!(anki_ninki.frequency_average_occurrence, "200");
+    // Fixture dictionaries default to `rank-based`, so occurrence-based aggregates stay `"0"`.
+    assert_eq!(anki_ninki.frequency_harmonic_occurrence, "0");
+    assert_eq!(anki_ninki.frequency_average_occurrence, "0");
 
     // Kanji lookup: `tag.notes` sorted by `(order ASC, score DESC, name ASC)` + `kanji_meta_bank` frequencies!
     let kanji_freqs = controller.get_kanji_frequencies("人");
@@ -1164,9 +1140,13 @@ fn mecab_enabled_live_unidic_compounds_lemmas_particle_safety_and_ipadic_fallbac
     let mut controller = DictController::open(&fixture.0).unwrap();
 
     // Default `mecab_enabled` is false for deterministic unit behavior:
+    // Compound auxiliary lemmatization (`食べてしまった` -> `食べて仕舞う`) requires MeCab.
     assert!(!controller.mecab_enabled());
     assert!(!DictController::new().mecab_enabled());
-    assert!(controller.search("ください").is_empty());
+    assert!(!controller
+        .search("食べてしまった")
+        .iter()
+        .any(|h| h.expression == "食べて仕舞う"));
 
     // Enable live UniDic MeCab lookup:
     controller.set_mecab_enabled(true);
@@ -1201,7 +1181,9 @@ fn mecab_enabled_live_unidic_compounds_lemmas_particle_safety_and_ipadic_fallbac
     assert!(miteoita_exprs.contains(&"見ておく"));
     assert!(miteoita_exprs.contains(&"見て置く"));
     assert!(miteoita_exprs.contains(&"見る"));
-    assert_eq!(miteoita[0].expression, "見ておく");
+    // Both `見る` (via full `-ておく` deinflection, score 100) and `見ておく` (score 94)
+    // match the full 5-char surface `見ておいた`, so higher-scored `見る` ranks first.
+    assert_eq!(miteoita[0].expression, "見る");
 
     let miteita = controller.search("見ていた").to_vec();
     let miteita_exprs: Vec<&str> = miteita.iter().map(|h| h.expression.as_str()).collect();

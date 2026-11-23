@@ -13,7 +13,7 @@ use crate::controller::player::compute_video_render_size;
 use crate::platform_renderer::{PlatformRendererConfig, PlatformRendererKind};
 use crate::ui::SubomiApp;
 use crate::video_gl::{self, GlCapabilities};
-use subomi_player::MpvInstance;
+use subomi_player::{MpvInstance, WeakStringObserver};
 
 /// Non-blocking observer of `video-params/{primaries,gamma,pixelformat,hw-pixelformat}`
 /// backed by a weak libmpv client created before OpenGL activation.
@@ -22,7 +22,7 @@ use subomi_player::MpvInstance;
 /// deadlocks with `MPV_RENDER_PARAM_ADVANCED_CONTROL`), and explicitly closed on
 /// shutdown before `MpvInstance::drop`.
 pub(crate) struct VideoParamsObserver {
-    handle: Option<*mut subomi_player::mpv::ffi::mpv_handle>,
+    observer: WeakStringObserver,
     primaries: Option<String>,
     gamma: Option<String>,
     pixelformat: Option<String>,
@@ -33,7 +33,7 @@ pub(crate) struct VideoParamsObserver {
 impl VideoParamsObserver {
     pub(crate) fn disabled() -> Self {
         Self {
-            handle: None,
+            observer: WeakStringObserver::disabled(),
             primaries: None,
             gamma: None,
             pixelformat: None,
@@ -44,30 +44,14 @@ impl VideoParamsObserver {
 
     /// Attach a weak client to `player` before OpenGL rendering starts.
     pub(crate) fn attach(player: &MpvInstance) -> Self {
-        use subomi_player::mpv::ffi;
-
-        let raw_parent = player.raw_handle();
-        if raw_parent.is_null() {
-            return Self::disabled();
-        }
-        let weak =
-            unsafe { ffi::mpv_create_weak_client(raw_parent, c"subomi-fbo-format".as_ptr()) };
-        if weak.is_null() {
-            return Self::disabled();
-        }
         const PROPS: &[(u64, &std::ffi::CStr)] = &[
             (1, c"video-params/primaries"),
             (2, c"video-params/gamma"),
             (3, c"video-params/pixelformat"),
             (4, c"video-params/hw-pixelformat"),
         ];
-        for &(id, name) in PROPS {
-            unsafe {
-                let _ = ffi::mpv_observe_property(weak, id, name.as_ptr(), ffi::MPV_FORMAT_STRING);
-            }
-        }
         Self {
-            handle: Some(weak),
+            observer: WeakStringObserver::attach(player, c"subomi-fbo-format", PROPS),
             primaries: None,
             gamma: None,
             pixelformat: None,
@@ -77,61 +61,29 @@ impl VideoParamsObserver {
     }
 
     pub(crate) fn is_active(&self) -> bool {
-        self.handle.is_some()
+        self.observer.is_active()
     }
 
     /// Drain any pending `video-params/*` property changes without blocking.
     pub(crate) fn poll(&mut self) {
-        use subomi_player::mpv::ffi;
-
-        let Some(handle) = self.handle else {
-            return;
-        };
-        loop {
-            let event = unsafe { ffi::mpv_wait_event(handle, 0.0) };
-            let Some(raw) = (unsafe { event.as_ref() }) else {
-                break;
+        let primaries = &mut self.primaries;
+        let gamma = &mut self.gamma;
+        let pixelformat = &mut self.pixelformat;
+        let hw_pixelformat = &mut self.hw_pixelformat;
+        let dirty = &mut self.dirty;
+        self.observer.poll(|id, value| {
+            let slot = match id {
+                1 => &mut *primaries,
+                2 => &mut *gamma,
+                3 => &mut *pixelformat,
+                4 => &mut *hw_pixelformat,
+                _ => return,
             };
-            match raw.event_id {
-                ffi::MPV_EVENT_NONE => break,
-                ffi::MPV_EVENT_SHUTDOWN => {
-                    self.close();
-                    break;
-                }
-                ffi::MPV_EVENT_PROPERTY_CHANGE => {
-                    let Some(prop) =
-                        (unsafe { raw.data.cast::<ffi::mpv_event_property>().as_ref() })
-                    else {
-                        continue;
-                    };
-                    let value = if prop.format == ffi::MPV_FORMAT_STRING && !prop.data.is_null() {
-                        let ptr = unsafe { *prop.data.cast::<*const std::ffi::c_char>() };
-                        if !ptr.is_null() {
-                            let text = unsafe { std::ffi::CStr::from_ptr(ptr) }
-                                .to_string_lossy()
-                                .into_owned();
-                            (!text.is_empty()).then_some(text)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let slot = match raw.reply_userdata {
-                        1 => &mut self.primaries,
-                        2 => &mut self.gamma,
-                        3 => &mut self.pixelformat,
-                        4 => &mut self.hw_pixelformat,
-                        _ => continue,
-                    };
-                    if *slot != value {
-                        *slot = value;
-                        self.dirty = true;
-                    }
-                }
-                _ => {}
+            if *slot != value {
+                *slot = value;
+                *dirty = true;
             }
-        }
+        });
     }
 
     pub(crate) fn take_dirty(&mut self) -> bool {
@@ -148,17 +100,7 @@ impl VideoParamsObserver {
     }
 
     pub(crate) fn close(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            unsafe {
-                subomi_player::mpv::ffi::mpv_destroy(handle);
-            }
-        }
-    }
-}
-
-impl Drop for VideoParamsObserver {
-    fn drop(&mut self) {
-        self.close();
+        self.observer.close();
     }
 }
 
@@ -861,10 +803,7 @@ pub(crate) fn install_video_pipeline(
                     Some(buf) if buf.width() == size.0 && buf.height() == size.1 => buf,
                     _ => SharedPixelBuffer::<Rgba8Pixel>::new(size.0, size.1),
                 };
-                // VideoRenderWorker joins before the mpv instance can be dropped.
-                if let Err(error) =
-                    unsafe { renderer.render_rgba(size.0, size.1, buffer.make_mut_bytes()) }
-                {
+                if let Err(error) = renderer.render_rgba(size.0, size.1, buffer.make_mut_bytes()) {
                     eprintln!("Cannot render video frame: {error}");
                     frame_pool[pool_idx] = Some(buffer);
                     continue;

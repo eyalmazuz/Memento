@@ -1,9 +1,5 @@
 //! Backend model resolution, loading, VAD state management, and inference.
 
-#[cfg(feature = "asr-whisper")]
-use std::ffi::CString;
-#[cfg(feature = "asr-whisper")]
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,7 +11,7 @@ use subomi_asr::whisper::whispercontroller;
 #[cfg(feature = "asr-onnx")]
 use subomi_asr_onnx::engine as onnx_engine;
 #[cfg(feature = "asr-whisper")]
-use subomi_asr_whisper::{engine as whisper_engine, whisper_sys};
+use subomi_asr_whisper::engine as whisper_engine;
 
 use super::cue_book::Window;
 #[cfg(feature = "asr-whisper")]
@@ -116,18 +112,6 @@ pub(super) fn resolve_model(settings: &AsrSettings) -> Result<ResolvedModel, Str
 }
 
 #[cfg(feature = "asr-whisper")]
-pub(super) struct WhisperModel(pub(super) *mut whisper_sys::whisper_context);
-
-#[cfg(feature = "asr-whisper")]
-impl Drop for WhisperModel {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { whisper_sys::whisper_free(self.0) };
-        }
-    }
-}
-
-#[cfg(feature = "asr-whisper")]
 pub(super) fn should_reset_vad(last_vad_end: Option<f64>, window_start: f64) -> bool {
     match last_vad_end {
         Some(prev_end) => (window_start - prev_end).abs() > SUBTITLE_TIME_DELTA,
@@ -137,22 +121,13 @@ pub(super) fn should_reset_vad(last_vad_end: Option<f64>, window_start: f64) -> 
 
 #[cfg(feature = "asr-whisper")]
 pub(super) struct WhisperVad {
-    ctx: *mut whisper_sys::whisper_vad_context,
+    ctx: whisper_engine::WhisperVadContext,
     last_end: Option<f64>,
 }
 
 #[cfg(feature = "asr-whisper")]
-impl Drop for WhisperVad {
-    fn drop(&mut self) {
-        if !self.ctx.is_null() {
-            unsafe { whisper_sys::whisper_vad_free(self.ctx) };
-        }
-    }
-}
-
-#[cfg(feature = "asr-whisper")]
 impl WhisperVad {
-    fn new(ctx: *mut whisper_sys::whisper_vad_context) -> Self {
+    fn new(ctx: whisper_engine::WhisperVadContext) -> Self {
         Self {
             ctx,
             last_end: None,
@@ -179,35 +154,18 @@ impl WhisperVad {
         // Clear `last_end` before native calls so any error forces a reset next time.
         self.last_end = None;
         if reset {
-            unsafe { whisper_sys::whisper_vad_reset_state(self.ctx) };
+            self.ctx.reset_state();
         }
-        let count = i32::try_from(samples.len())
-            .map_err(|_| "ASR VAD window contains too many audio samples".to_owned())?;
-        if !unsafe {
-            whisper_sys::whisper_vad_detect_speech_no_reset(self.ctx, samples.as_ptr(), count)
-        } {
-            return Err("Whisper VAD could not scan the audio window".into());
-        }
-        let segments = unsafe {
-            whisper_sys::whisper_vad_segments_from_probs(
-                self.ctx,
-                whisper_sys::whisper_vad_default_params(),
-            )
-        };
-        if segments.is_null() {
-            return Err("Whisper VAD could not identify speech segments".into());
-        }
-        let count = unsafe { whisper_sys::whisper_vad_segments_n_segments(segments) };
-        unsafe { whisper_sys::whisper_vad_free_segments(segments) };
+        let has_speech = self.ctx.detect_speech_no_reset(samples)?;
         self.last_end = Some(window_end);
-        Ok(count > 0)
+        Ok(has_speech)
     }
 }
 
 pub(super) enum RuntimeModel {
     #[cfg(feature = "asr-whisper")]
     Whisper(
-        WhisperModel,
+        whisper_engine::WhisperModel,
         whisper_engine::TranscribeOptions,
         Option<WhisperVad>,
     ),
@@ -233,33 +191,16 @@ pub(super) fn load_runtime_model(
     match (settings.backend, resolved) {
         #[cfg(feature = "asr-whisper")]
         (AsrBackend::Whisper, ResolvedModel::Whisper { path, vad_path }) => {
-            let path_c = path_to_cstring(path)?;
-            let mut params = unsafe { whisper_sys::whisper_context_default_params() };
-            params.use_gpu = settings.whisper.use_gpu;
-            params.gpu_device = settings.whisper.gpu_device.max(0);
-            params.flash_attn = settings.whisper.flash_attention;
-            let model =
-                unsafe { whisper_sys::whisper_init_from_file_with_params(path_c.as_ptr(), params) };
-            if model.is_null() {
-                return Err(format!(
-                    "Whisper could not load model '{}'. Check that the model file is complete and that enough memory is available.",
-                    path.display(),
-                ));
-            }
-            let model = WhisperModel(model);
+            let model = whisper_engine::WhisperModel::load(
+                path,
+                settings.whisper.use_gpu,
+                settings.whisper.gpu_device,
+                settings.whisper.flash_attention,
+            )?;
             let vad = if settings.whisper.vad_enabled {
-                let path_c = path_to_cstring(vad_path)?;
-                let params = unsafe { whisper_sys::whisper_vad_default_context_params() };
-                let context = unsafe {
-                    whisper_sys::whisper_vad_init_from_file_with_params(path_c.as_ptr(), params)
-                };
-                if context.is_null() {
-                    return Err(format!(
-                        "Whisper could not load VAD model '{}'",
-                        vad_path.display()
-                    ));
-                }
-                Some(WhisperVad::new(context))
+                Some(WhisperVad::new(whisper_engine::WhisperVadContext::load(
+                    vad_path,
+                )?))
             } else {
                 None
             };
@@ -311,26 +252,6 @@ pub(super) fn load_runtime_model(
     }
 }
 
-#[cfg(feature = "asr-whisper")]
-pub(super) fn path_to_cstring(path: &Path) -> Result<CString, String> {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes()
-    };
-    #[cfg(not(unix))]
-    let lossy = path.to_string_lossy();
-    #[cfg(not(unix))]
-    let bytes = lossy.as_bytes();
-
-    CString::new(bytes).map_err(|_| {
-        format!(
-            "Model path '{}' contains an invalid NUL byte.",
-            path.display()
-        )
-    })
-}
-
 pub(super) enum Transcription {
     Success,
     Canceled,
@@ -365,15 +286,7 @@ pub(super) fn transcribe_window(
                     whisper_engine::timestamp_to_seconds(end_cs),
                 );
             };
-            match unsafe {
-                whisper_engine::transcribe_samples_safe(
-                    model.0,
-                    samples,
-                    options,
-                    &should_abort,
-                    &mut on_segment,
-                )
-            } {
+            match model.transcribe_samples(samples, options, &should_abort, &mut on_segment) {
                 whisper_engine::EngineStatus::Success => Transcription::Success,
                 whisper_engine::EngineStatus::Canceled => Transcription::Canceled,
                 whisper_engine::EngineStatus::Failed { message, .. } => {
@@ -426,14 +339,15 @@ mod tests {
     fn path_to_cstring_preserves_non_utf8_unix_bytes_and_rejects_nul() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
 
         let raw = b"/tmp/whisper-\xff\xfe/model.bin";
         let path = Path::new(OsStr::from_bytes(raw));
-        let cstr = path_to_cstring(path).expect("valid non-UTF-8 Unix path");
+        let cstr = whisper_engine::path_to_cstring(path).expect("valid non-UTF-8 Unix path");
         assert_eq!(cstr.as_bytes(), raw);
 
         let with_nul = Path::new(OsStr::from_bytes(b"/tmp/bad\0model.bin"));
-        assert!(path_to_cstring(with_nul).is_err());
+        assert!(whisper_engine::path_to_cstring(with_nul).is_err());
     }
 
     #[cfg(feature = "asr-onnx")]

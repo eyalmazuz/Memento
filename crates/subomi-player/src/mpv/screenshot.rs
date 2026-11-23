@@ -1,14 +1,14 @@
 //! Asynchronous raw RGBA screenshot worker backed by a weak libmpv client.
 
 use std::cell::Cell;
-use std::ffi::{c_int, CStr};
+use std::ffi::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use super::ffi;
-use super::node::{copy_mpv_string, iter_node_map};
+use super::node::{copy_mpv_string, MpvNodeRef};
 use super::types::RawFrame;
 
 /// RAII guard that temporarily enables `sub-visibility` during a subtitle
@@ -303,40 +303,26 @@ pub(super) fn screenshot_error(status: i32) -> String {
 
 /// `result` and its nested pointers must remain valid for the whole copy.
 pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawFrame, String> {
-    let Some(fields) = (unsafe { iter_node_map(result) }) else {
+    let node = unsafe { MpvNodeRef::from_ref(result) };
+    let Some(fields) = node.as_map() else {
         return Err("mpv screenshot-raw returned no result map".into());
     };
     let mut width = None;
     let mut height = None;
     let mut stride = None;
     let mut is_rgba = false;
-    let mut data = None;
+    let mut data: Option<&[u8]> = None;
     for (key, value) in fields {
         match key {
-            b"w" if value.format == ffi::MPV_FORMAT_INT64 => {
-                width = Some(unsafe { value.u.int64 });
-            }
-            b"h" if value.format == ffi::MPV_FORMAT_INT64 => {
-                height = Some(unsafe { value.u.int64 });
-            }
-            b"stride" if value.format == ffi::MPV_FORMAT_INT64 => {
-                stride = Some(unsafe { value.u.int64 });
-            }
-            b"format" if value.format == ffi::MPV_FORMAT_STRING => {
-                let format = unsafe { value.u.string };
-                is_rgba = !format.is_null()
-                    && unsafe { CStr::from_ptr(format) }.to_bytes() == b"rgba";
-            }
-            b"data" if value.format == ffi::MPV_FORMAT_BYTE_ARRAY => {
-                if let Some(bytes) = unsafe { value.u.ba.as_ref() } {
-                    data = Some((bytes.data.cast::<u8>() as *const u8, bytes.size));
-                }
-            }
+            b"w" => width = value.as_i64(),
+            b"h" => height = value.as_i64(),
+            b"stride" => stride = value.as_i64(),
+            b"format" => is_rgba = value.as_str_bytes() == Some(b"rgba"),
+            b"data" => data = value.as_byte_array(),
             _ => {}
         }
     }
 
-    let has_data = data.is_some_and(|(pointer, _)| !pointer.is_null());
     let min_line_size = crate::controller::ScreenshotSpec::validate(
         width.is_some(),
         width.unwrap_or(0),
@@ -345,7 +331,7 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
         stride.is_some(),
         stride.unwrap_or(0),
         is_rgba.then_some("rgba"),
-        has_data,
+        data.is_some(),
     )
     .map_err(|error| format!("invalid mpv raw screenshot: {error:?}"))?;
     let width = usize::try_from(width.expect("validated width"))
@@ -364,8 +350,8 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
     let output_len = line_size
         .checked_mul(height)
         .ok_or("mpv screenshot output dimensions overflow")?;
-    let (source, source_size) = data.expect("validated screenshot data");
-    if source_size < source_len {
+    let source = data.expect("validated screenshot data");
+    if source.len() < source_len {
         return Err("mpv screenshot data is shorter than its dimensions and stride".into());
     }
 
@@ -373,7 +359,6 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
     pixels
         .try_reserve_exact(output_len)
         .map_err(|error| format!("could not allocate raw screenshot: {error}"))?;
-    unsafe { pixels.set_len(output_len) };
     for output_row in 0..height {
         let source_row = if stride < 0 {
             height - 1 - output_row
@@ -381,14 +366,7 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
             output_row
         };
         let source_offset = source_row * stride_abs;
-        let output_offset = output_row * line_size;
-        unsafe {
-            ptr::copy_nonoverlapping(
-                source.add(source_offset),
-                pixels.as_mut_ptr().add(output_offset),
-                line_size,
-            );
-        }
+        pixels.extend_from_slice(&source[source_offset..source_offset + line_size]);
     }
     Ok(RawFrame {
         width: width as u32,

@@ -894,29 +894,12 @@ mod imp {
         #[test]
         #[ignore = "requires SUBOMI_ASR_TEST_MODEL pointing to a local Whisper model"]
         fn shutdown_during_native_whisper_inference_releases_model() {
-            use std::ffi::c_void;
             use std::path::Path;
 
-            use subomi_asr_whisper::whisper_sys;
+            use subomi_asr_whisper::engine::{EngineStatus, TranscribeOptions, WhisperModel};
 
-            use super::super::super::engines::{path_to_cstring, WhisperModel};
-
-            struct AbortContext {
-                abort: Arc<AtomicBool>,
-                entered: mpsc::Sender<()>,
-                signaled: bool,
-            }
-            unsafe extern "C" fn signal_inference(data: *mut c_void) -> bool {
-                let context = &mut *data.cast::<AbortContext>();
-                if !context.signaled {
-                    context.signaled = true;
-                    let _ = context.entered.send(());
-                }
-                context.abort.load(Ordering::Acquire)
-            }
             let path =
                 std::env::var_os("SUBOMI_ASR_TEST_MODEL").expect("set SUBOMI_ASR_TEST_MODEL");
-            let path = path_to_cstring(Path::new(&path)).unwrap();
             let use_gpu = std::env::var_os("SUBOMI_ASR_TEST_GPU").is_some();
             let mut controller = AsrController::new();
             let abort = Arc::new(AtomicBool::new(false));
@@ -928,44 +911,42 @@ mod imp {
             let (entered, receiver) = mpsc::channel();
             let released = Arc::new(AtomicBool::new(false));
             let worker_released = released.clone();
-            controller.worker = Some(thread::spawn(move || unsafe {
-                let mut params = whisper_sys::whisper_context_default_params();
-                params.use_gpu = use_gpu;
-                let model = WhisperModel(whisper_sys::whisper_init_from_file_with_params(
-                    path.as_ptr(),
-                    params,
-                ));
-                assert!(!model.0.is_null(), "test model could not be loaded");
-                let mut context = AbortContext {
-                    abort,
-                    entered,
-                    signaled: false,
+            controller.worker = Some(thread::spawn(move || {
+                let mut model = WhisperModel::load(Path::new(&path), use_gpu, 0, false)
+                    .expect("test model could not be loaded");
+                let signaled = AtomicBool::new(false);
+                let should_abort = || {
+                    if !signaled.swap(true, Ordering::AcqRel) {
+                        let _ = entered.send(());
+                    }
+                    abort.load(Ordering::Acquire)
                 };
-                let mut params = whisper_sys::whisper_full_default_params(
-                    whisper_sys::whisper_sampling_strategy_WHISPER_SAMPLING_GREEDY,
-                );
-                params.language = c"ja".as_ptr();
-                params.n_threads =
-                    thread::available_parallelism().map_or(1, |count| count.get().min(4)) as i32;
-                params.print_progress = false;
-                params.print_realtime = false;
-                params.print_timestamps = false;
-                params.abort_callback = Some(signal_inference);
-                params.abort_callback_user_data = (&mut context as *mut AbortContext).cast();
                 let samples: Vec<f32> = (0..30 * 16000)
                     .map(|i| (i as f32 * 0.1).sin() * 0.1)
                     .collect();
-                let result = whisper_sys::whisper_full(
-                    model.0,
-                    params,
-                    samples.as_ptr(),
-                    samples.len() as i32,
+                let status = model.transcribe_samples(
+                    &samples,
+                    &TranscribeOptions {
+                        language: "ja".to_owned(),
+                        threads: 0,
+                        best_of: 1,
+                        beam_size: 1,
+                        use_vad: false,
+                        vad_model: String::new(),
+                        suppress_regex: String::new(),
+                    },
+                    &should_abort,
+                    &mut |_, _, _| {},
                 );
                 assert!(
-                    context.abort.load(Ordering::Acquire),
+                    abort.load(Ordering::Acquire),
                     "inference exited before cancellation"
                 );
-                assert_ne!(result, 0, "native inference should report cancellation");
+                assert_eq!(
+                    status,
+                    EngineStatus::Canceled,
+                    "native inference should report cancellation"
+                );
                 drop(model);
                 worker_released.store(true, Ordering::Release);
             }));
@@ -1013,10 +994,12 @@ mod imp {
             controller.receiver = receiver;
             let (in_window_tx, in_window_rx) = mpsc::channel();
             let (allow_abort_tx, allow_abort_rx) = mpsc::channel::<()>();
+            let (in_second_window_tx, in_second_window_rx) = mpsc::channel();
+            let (allow_second_abort_tx, allow_second_abort_rx) = mpsc::channel::<()>();
 
             controller.worker = Some(thread::spawn(move || {
                 let mut first_window_done = false;
-                let mut gated_30_once = false;
+                let mut gated_30_count = 0usize;
                 run_loop_with_fn(
                     shared,
                     sender,
@@ -1029,10 +1012,21 @@ mod imp {
                             seg_ctx.emit_segment("window-0", 1.0, 3.0);
                             return Ok(Transcription::Success);
                         }
-                        if (window.start - 30.0).abs() < 0.01 && !gated_30_once {
-                            gated_30_once = true;
+                        if (window.start - 30.0).abs() < 0.01 && gated_30_count == 0 {
+                            gated_30_count = 1;
                             let _ = in_window_tx.send(());
                             let _ = allow_abort_rx.recv_timeout(Duration::from_secs(5));
+                            while !abort.load(Ordering::Acquire) {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            return Ok(Transcription::Canceled);
+                        }
+                        if (window.start - 30.0).abs() < 0.01 && gated_30_count == 1 {
+                            // Hold second pass of [30, 60] active so transcription is still in
+                            // progress (not `done`) when the backward seek to 10.0 arrives.
+                            gated_30_count = 2;
+                            let _ = in_second_window_tx.send(());
+                            let _ = allow_second_abort_rx.recv_timeout(Duration::from_secs(5));
                             while !abort.load(Ordering::Acquire) {
                                 thread::sleep(Duration::from_millis(2));
                             }
@@ -1065,13 +1059,23 @@ mod imp {
             assert!(saw_95, "seek forward did not transcribe window at 95.0");
             assert_eq!(lock(&controller.shared.control).generation, 1);
 
-            // Seek backward to 10.0 via notify_seek: completed [0, 30] cue must still exist.
+            // Wait until worker moves back into uncovered [30, 60] (still in progress),
+            // then seek backward to 10.0 via notify_seek: active window must abort,
+            // generation must bump to 2, and completed [0, 30] / [95, 120] cues must remain.
+            in_second_window_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
             controller.notify_seek(10.0, 120.0);
+            let _ = allow_second_abort_tx.send(());
             assert_eq!(lock(&controller.shared.control).generation, 2);
             let cues = controller.current_cues();
             assert!(
                 cues.iter().any(|c| c.text == "window-0"),
                 "completed CueBook window should be preserved across seeks: {cues:?}"
+            );
+            assert!(
+                cues.iter().any(|c| c.text == "win-95"),
+                "forward-seek CueBook window should be preserved across backward seek: {cues:?}"
             );
             controller.shutdown();
         }

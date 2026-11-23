@@ -1,318 +1,249 @@
-//! Manga OCR runtime for normalized player selections.
+//! Pure-Rust Manga OCR controller backed by an isolated, persistent Python
+//! worker process (no `libmocr` C++ library, no `libloading`, zero `unsafe`).
 //!
-//! Runtime library loading, model loading, and inference happen lazily on a
-//! dedicated worker thread started on the first OCR trigger. A single-slot
-//! latest-wins queue drops stale frames so 4K RGBA captures never accumulate.
-//! Results are posted back to Slint's event loop so callers can update UI state
-//! directly.
+//! Spawning, model loading, and inference happen lazily on a dedicated worker
+//! thread started on the first OCR trigger. A single-slot latest-wins queue
+//! drops stale frames so 4K RGBA captures never accumulate. After an idle
+//! timeout (or on settings change / app exit), the Python child process exits
+//! cleanly so 100% of PyTorch RAM and GPU VRAM is reclaimed by the OS.
 
-use libloading::Library;
-use std::ffi::{c_char, c_int, c_void, CStr, CString, OsStr};
+use std::ffi::OsStr;
 use std::fmt;
-use std::mem::ManuallyDrop;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use subomi_util::ocrutils::{map_ocr_region, resolve_venv_python_str, OcrRegionStatus};
 
-const MOCR_MODE_RGBA: c_int = 4;
-const OCR_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 const DEFAULT_OCR_IDLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMON_SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+const MAX_STDERR_BYTES: usize = 8 * 1024;
 
-static OCR_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[repr(C)]
-struct MocrContextOpaque {
-    _private: [u8; 0],
+/// Embedded Python worker for `manga-ocr`.
+///
+/// Protocol:
+/// - Duplicates fd 1 for clean binary JSON-line responses and redirects fd 1 to
+///   fd 2 before importing PyTorch / `transformers` / `manga_ocr` so library
+///   logs, `tqdm` bars, or C `printf` output can never corrupt our protocol.
+/// - Emits a single handshake line on startup:
+///     `{"status":"ready","device":"gpu"|"cpu"}`
+///   or `{"status":"error","kind":"missing_pkg"|"model_init","error":"..."}`.
+/// - Reads requests from stdin:
+///     `{"op":"read","width":W,"height":H,"len":N}\n` followed by `N` RGBA bytes
+///   or `{"op":"quit"}\n`.
+/// - Responds with `{"ok":true,"text":"..."}\n` or `{"ok":false,"error":"..."}\n`.
+const MANGA_OCR_WORKER_SCRIPT: &str = r#"import json, os, sys
+
+_proto_fd = os.dup(1)
+os.dup2(2, 1)
+_proto_out = os.fdopen(_proto_fd, "wb", buffering=0)
+sys.stdout = sys.stderr
+
+def _send(obj):
+    _proto_out.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    _proto_out.flush()
+
+def _read_exact(stream, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+def _main():
+    model_name = sys.argv[1]
+    want_gpu = sys.argv[2] == "1"
+    try:
+        from PIL import Image
+        from manga_ocr import MangaOcr
+    except Exception as exc:
+        _send({"status": "error", "kind": "missing_pkg", "error": f"{type(exc).__name__}: {exc}"})
+        return 2
+
+    mocr = None
+    device = "cpu"
+    if want_gpu:
+        try:
+            mocr = MangaOcr(pretrained_model_name_or_path=model_name, force_cpu=False)
+            device = "gpu"
+        except Exception as gpu_exc:
+            sys.stderr.write(f"GPU initialization failed ({gpu_exc}); falling back to CPU.\n")
+            sys.stderr.flush()
+    if mocr is None:
+        try:
+            mocr = MangaOcr(pretrained_model_name_or_path=model_name, force_cpu=True)
+            device = "cpu"
+        except Exception as exc:
+            _send({"status": "error", "kind": "model_init", "error": f"{type(exc).__name__}: {exc}"})
+            return 3
+
+    _send({"status": "ready", "device": device})
+    stdin = sys.stdin.buffer
+    while True:
+        header = stdin.readline()
+        if not header:
+            break
+        try:
+            req = json.loads(header.decode("utf-8"))
+        except Exception as exc:
+            _send({"ok": False, "error": f"invalid request header: {exc}"})
+            continue
+        op = req.get("op")
+        if op == "quit":
+            break
+        if op != "read":
+            _send({"ok": False, "error": f"unknown op: {op}"})
+            continue
+        w = int(req.get("width", 0))
+        h = int(req.get("height", 0))
+        n = int(req.get("len", 0))
+        if w <= 0 or h <= 0 or n != w * h * 4:
+            _send({"ok": False, "error": "invalid RGBA dimensions"})
+            continue
+        raw = _read_exact(stdin, n)
+        if raw is None:
+            break
+        try:
+            img = Image.frombytes("RGBA", (w, h), raw).convert("RGB")
+            text = mocr(img)
+            _send({"ok": True, "text": "" if text is None else str(text)})
+        except Exception as exc:
+            _send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
+"#;
+
+/// A candidate Python invocation (`program` plus optional leading arguments,
+/// e.g. `py -3` on Windows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PythonCandidate {
+    pub program: PathBuf,
+    pub prefix_args: Vec<String>,
 }
 
-type MocrInit = unsafe extern "C" fn(*const c_char, c_int) -> *mut MocrContextOpaque;
-type MocrDestroy = unsafe extern "C" fn(*mut MocrContextOpaque) -> c_int;
-type MocrRead =
-    unsafe extern "C" fn(*mut MocrContextOpaque, *const c_void, usize, usize, c_int) -> *mut c_char;
-type MocrFree = unsafe extern "C" fn(*mut c_void) -> c_int;
-type MocrFinalize = unsafe extern "C" fn() -> c_int;
-
-#[cfg(target_os = "macos")]
-fn python_library_candidates() -> &'static [&'static str] {
-    &[
-        "libpython3.14.dylib",
-        "libpython3.13.dylib",
-        "libpython3.12.dylib",
-        "libpython3.11.dylib",
-        "libpython3.10.dylib",
-        "libpython3.dylib",
-    ]
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn python_library_candidates() -> &'static [&'static str] {
-    &[
-        "libpython3.14.so.1.0",
-        "libpython3.14.so",
-        "libpython3.13.so.1.0",
-        "libpython3.13.so",
-        "libpython3.12.so.1.0",
-        "libpython3.12.so",
-        "libpython3.11.so.1.0",
-        "libpython3.11.so",
-        "libpython3.10.so.1.0",
-        "libpython3.10.so",
-        "libpython3.so",
-    ]
-}
-
-const WINDOWS_MOCR_DLL_NAMES: &[&str] = &["libmocr.dll", "mocr.dll"];
-
-/// Build ordered Windows `libmocr.dll` discovery candidates (#135):
-/// 1. Executable directory (`<exe_dir>/libmocr.dll`, `<exe_dir>/mocr.dll`, `<exe_dir>/mocr/...`)
-/// 2. `%LOCALAPPDATA%\subomi` (and `%LOCALAPPDATA%\subomi\ocr`)
-/// 3. Existing `libmocr.dll` / `mocr.dll` matches on `PATH` (when present)
-/// 4. Bare DLL names so Windows `LoadLibraryW` default search order still runs.
-pub fn windows_mocr_library_candidates(
-    exe_dir: Option<&Path>,
-    local_app_data: Option<&Path>,
-    path_var: Option<&OsStr>,
-    path_exists: impl Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    let mut push_unique = |candidate: PathBuf| {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    };
-
-    if let Some(dir) = exe_dir.filter(|d| !d.as_os_str().is_empty()) {
-        for name in WINDOWS_MOCR_DLL_NAMES {
-            push_unique(dir.join(name));
-        }
-        let nested = dir.join("mocr");
-        for name in WINDOWS_MOCR_DLL_NAMES {
-            push_unique(nested.join(name));
-        }
-    }
-
-    if let Some(local) = local_app_data.filter(|d| !d.as_os_str().is_empty()) {
-        let subomi_dir = local.join("subomi");
-        for name in WINDOWS_MOCR_DLL_NAMES {
-            push_unique(subomi_dir.join(name));
-        }
-        let ocr_dir = subomi_dir.join("ocr");
-        for name in WINDOWS_MOCR_DLL_NAMES {
-            push_unique(ocr_dir.join(name));
-        }
-    }
-
-    if let Some(raw_path) = path_var.and_then(OsStr::to_str) {
-        for entry in raw_path.split(';') {
-            let trimmed = entry.trim().trim_matches('"');
-            if trimmed.is_empty() {
-                continue;
-            }
-            let dir = Path::new(trimmed);
-            for name in WINDOWS_MOCR_DLL_NAMES {
-                let candidate = dir.join(name);
-                if path_exists(&candidate) {
-                    push_unique(candidate);
-                }
-            }
-        }
-    }
-
-    for name in WINDOWS_MOCR_DLL_NAMES {
-        push_unique(PathBuf::from(name));
-    }
-
-    candidates
-}
-
-fn format_library_unavailable_message(
-    is_windows: bool,
-    found_on_disk: &[String],
-    errors: &[String],
-) -> String {
-    let detail = if errors.is_empty() {
-        "no library candidates configured".to_owned()
-    } else {
-        errors.join("; ")
-    };
-    if is_windows {
-        if !found_on_disk.is_empty() {
-            format!(
-                "libmocr.dll was found at {} but failed to load (verify Python 3 and MSVC/CUDA runtime DLLs are installed and match 64-bit architecture). Details: {detail}",
-                found_on_disk.join(", ")
-            )
-        } else {
-            format!(
-                "libmocr.dll was not found. Install libmocr (manga-ocr) and place libmocr.dll next to subomi.exe, in %LOCALAPPDATA%\\subomi, or on PATH. Details: {detail}"
-            )
-        }
-    } else {
-        format!(
-            "libmocr shared library was not found or could not be loaded. Install libmocr and ensure it is in your library search path. Details: {detail}"
-        )
-    }
-}
-
-struct MocrApi {
-    // Keep libmocr loaded until every context and returned text is released,
-    // and drop it before any explicitly retained libpython handle.
-    _library: Option<Library>,
-    #[cfg(unix)]
-    _python_library: Option<libloading::os::unix::Library>,
-    init: MocrInit,
-    destroy: MocrDestroy,
-    read: MocrRead,
-    free: MocrFree,
-    finalize: Option<MocrFinalize>,
-}
-
-impl MocrApi {
-    #[cfg(test)]
-    fn mock(init: MocrInit, destroy: MocrDestroy, read: MocrRead, free: MocrFree) -> Self {
-        Self::mock_with_finalize(init, destroy, read, free, None)
-    }
-
-    #[cfg(test)]
-    fn mock_with_finalize(
-        init: MocrInit,
-        destroy: MocrDestroy,
-        read: MocrRead,
-        free: MocrFree,
-        finalize: Option<MocrFinalize>,
-    ) -> Self {
+impl PythonCandidate {
+    fn new(program: impl Into<PathBuf>) -> Self {
         Self {
-            _library: None,
-            #[cfg(unix)]
-            _python_library: None,
-            init,
-            destroy,
-            read,
-            free,
-            finalize,
+            program: program.into(),
+            prefix_args: Vec::new(),
         }
     }
 
-    fn load() -> Result<Self, OcrError> {
-        #[cfg(target_os = "linux")]
-        let candidates: Vec<PathBuf> = [
-            "/usr/local/lib/libmocr.so",
-            "/usr/lib/libmocr.so",
-            "libmocr.so",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-        #[cfg(target_os = "macos")]
-        let candidates: Vec<PathBuf> = [
-            "/usr/local/lib/libmocr.dylib",
-            "/opt/homebrew/lib/libmocr.dylib",
-            "libmocr.dylib",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-        #[cfg(target_os = "windows")]
-        let candidates: Vec<PathBuf> = {
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(Path::to_path_buf));
-            let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-            let path_var = std::env::var_os("PATH");
-            windows_mocr_library_candidates(
-                exe_dir.as_deref(),
-                local_app_data.as_deref(),
-                path_var.as_deref(),
-                |candidate| candidate.is_file(),
-            )
-        };
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let candidates: Vec<PathBuf> = vec![PathBuf::from("libmocr.so")];
+    fn with_args(program: impl Into<PathBuf>, args: &[&str]) -> Self {
+        Self {
+            program: program.into(),
+            prefix_args: args.iter().map(|&arg| arg.to_owned()).collect(),
+        }
+    }
 
-        // On Unix, embedded Python C-extensions (e.g. `unicodedata.so`) often do
-        // not link directly against `libpython` and expect its C API symbols
-        // (such as `PyModule_Type`) to already be globally visible. Retain the
-        // first matching `libpython` handle in `MocrApi` with `RTLD_GLOBAL`,
-        // while keeping `libmocr` itself `RTLD_LOCAL`.
-        #[cfg(unix)]
-        let python_library = {
-            let mut loaded = None;
-            for py_name in python_library_candidates() {
-                if let Ok(lib) = unsafe {
-                    libloading::os::unix::Library::open(
-                        Some(py_name),
-                        libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL,
-                    )
-                } {
-                    loaded = Some(lib);
-                    break;
-                }
-            }
-            loaded
-        };
+    fn display(&self) -> String {
+        if self.prefix_args.is_empty() {
+            self.program.display().to_string()
+        } else {
+            format!("{} {}", self.program.display(), self.prefix_args.join(" "))
+        }
+    }
+}
 
-        let mut errors = Vec::new();
-        let mut found_on_disk = Vec::new();
-        for candidate in candidates {
-            let display = candidate.display().to_string();
-            let has_explicit_dir = candidate.parent().is_some_and(|p| !p.as_os_str().is_empty());
-            if has_explicit_dir {
-                if !candidate.is_file() {
-                    errors.push(format!("{display}: not found"));
-                    continue;
+/// Build an ordered, deduplicated list of Python interpreters to probe for
+/// `manga_ocr`:
+/// 1. `SUBOMI_OCR_PYTHON` / `PYTHONEXECUTABLE` explicit overrides (when present)
+/// 2. Active `VIRTUAL_ENV` and `CONDA_PREFIX` virtual environments
+/// 3. Subomi-local virtual environments (`<data_dir>/ocr-venv`, `<config_dir>/ocr-venv`)
+/// 4. System Python launchers on `PATH` (`python3`, `python`; on Windows `python`, `py -3`, `python3`).
+pub fn python_candidates_from_env(
+    subomi_ocr_python: Option<&OsStr>,
+    python_executable: Option<&OsStr>,
+    virtual_env: Option<&OsStr>,
+    conda_prefix: Option<&OsStr>,
+    venv_dirs: &[PathBuf],
+    is_windows: bool,
+    file_exists: impl Fn(&Path) -> bool,
+) -> Vec<PythonCandidate> {
+    let mut out = Vec::new();
+    let mut push_unique = |candidate: PythonCandidate| {
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    };
+
+    for explicit in [subomi_ocr_python, python_executable].into_iter().flatten() {
+        let path = PathBuf::from(explicit);
+        if !path.as_os_str().is_empty() && file_exists(&path) {
+            push_unique(PythonCandidate::new(path));
+        }
+    }
+
+    for env_venv in [virtual_env, conda_prefix].into_iter().flatten() {
+        if let Some(venv_str) = env_venv.to_str() {
+            if let Some(py) = resolve_venv_python_str(false, venv_str, is_windows) {
+                let path = PathBuf::from(py);
+                if file_exists(&path) {
+                    push_unique(PythonCandidate::new(path));
                 }
-                found_on_disk.push(display.clone());
-            }
-            // SAFETY: We load only known library names/absolute install paths
-            // with RTLD_LOCAL (default `Library::new`), then validate every
-            // required symbol before exposing the API.
-            let library = match unsafe { Library::new(candidate.as_os_str()) } {
-                Ok(library) => library,
-                Err(error) => {
-                    errors.push(format!("{display}: {error}"));
-                    continue;
-                }
-            };
-            // SAFETY: libmocr exports these symbols with the declared C ABI.
-            let symbols: Result<_, libloading::Error> = (|| unsafe {
-                let finalize = library
-                    .get::<MocrFinalize>(b"mocr_finalize\0")
-                    .ok()
-                    .map(|symbol| *symbol);
-                Ok((
-                    *library.get::<MocrInit>(b"mocr_init\0")?,
-                    *library.get::<MocrDestroy>(b"mocr_destroy\0")?,
-                    *library.get::<MocrRead>(b"mocr_read\0")?,
-                    *library.get::<MocrFree>(b"mocr_free\0")?,
-                    finalize,
-                ))
-            })();
-            match symbols {
-                Ok((init, destroy, read, free, finalize)) => {
-                    return Ok(Self {
-                        _library: Some(library),
-                        #[cfg(unix)]
-                        _python_library: python_library,
-                        init,
-                        destroy,
-                        read,
-                        free,
-                        finalize,
-                    });
-                }
-                Err(error) => errors.push(format!(
-                    "{display}: missing/incompatible libmocr symbol: {error}"
-                )),
             }
         }
-        Err(OcrError::LibraryUnavailable(
-            format_library_unavailable_message(cfg!(target_os = "windows"), &found_on_disk, &errors),
-        ))
     }
+
+    for dir in venv_dirs {
+        if let Some(venv_str) = dir.to_str() {
+            if let Some(py) = resolve_venv_python_str(false, venv_str, is_windows) {
+                let path = PathBuf::from(py);
+                if file_exists(&path) {
+                    push_unique(PythonCandidate::new(path));
+                }
+            }
+        }
+    }
+
+    if is_windows {
+        push_unique(PythonCandidate::new("python"));
+        push_unique(PythonCandidate::with_args("py", &["-3"]));
+        push_unique(PythonCandidate::new("python3"));
+    } else {
+        push_unique(PythonCandidate::new("python3"));
+        push_unique(PythonCandidate::new("python"));
+    }
+
+    out
+}
+
+fn default_subomi_venv_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(data_dir) = crate::app::paths::subomi_xdg_dir("XDG_DATA_HOME", ".local/share") {
+        dirs.push(data_dir.join("ocr-venv"));
+    }
+    if let Some(config_dir) = crate::app::paths::subomi_xdg_dir("XDG_CONFIG_HOME", ".config") {
+        dirs.push(config_dir.join("ocr-venv"));
+    }
+    dirs
+}
+
+fn discover_python_candidates() -> Vec<PythonCandidate> {
+    let subomi_ocr_python = std::env::var_os("SUBOMI_OCR_PYTHON");
+    let python_executable = std::env::var_os("PYTHONEXECUTABLE");
+    let virtual_env = std::env::var_os("VIRTUAL_ENV");
+    let conda_prefix = std::env::var_os("CONDA_PREFIX");
+    let venv_dirs = default_subomi_venv_dirs();
+    python_candidates_from_env(
+        subomi_ocr_python.as_deref(),
+        python_executable.as_deref(),
+        virtual_env.as_deref(),
+        conda_prefix.as_deref(),
+        &venv_dirs,
+        cfg!(windows),
+        |path| path.is_file(),
+    )
 }
 
 /// Settings needed for one OCR operation.
@@ -320,9 +251,9 @@ impl MocrApi {
 pub struct OcrSettings {
     /// Whether OCR is enabled in application settings.
     pub enabled: bool,
-    /// A local model path, Hugging Face repo, or URL supported by libmocr.
+    /// A local model path or Hugging Face repo supported by `manga-ocr`.
     pub model: String,
-    /// Whether libmocr may use CUDA when available.
+    /// Whether `manga-ocr` may use GPU acceleration (CUDA/MPS) when available.
     pub use_gpu: bool,
 }
 
@@ -359,8 +290,8 @@ pub struct OcrViewport {
 /// scaling or UI-composited overlays.
 ///
 /// `stride` is the byte count between row starts. Pixels may include row
-/// padding; the OCR crop is copied into a tightly packed buffer before calling
-/// libmocr.
+/// padding; the OCR crop is copied into a tightly packed buffer before sending
+/// to the Manga OCR worker.
 #[derive(Clone, Debug)]
 pub struct OcrFrame {
     width: u32,
@@ -416,7 +347,7 @@ impl OcrFrame {
     }
 }
 
-/// Failure reported by frame validation, region mapping, or libmocr.
+/// Failure reported by frame validation, region mapping, or the Manga OCR backend.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OcrError {
     Disabled,
@@ -429,14 +360,11 @@ pub enum OcrError {
     EmptyRegion,
     InvalidModelName,
     ModelInitializationFailed(String),
-    ModelDestructionFailed(i32),
-    InferenceFailed,
-    InvalidNativeText,
-    NativeTextFreeFailed(i32),
+    InferenceFailed(String),
     NoTextDetected,
     WorkerStartFailed(String),
     WorkerUnavailable,
-    LibraryUnavailable(String),
+    RuntimeUnavailable(String),
 }
 
 impl fmt::Display for OcrError {
@@ -461,30 +389,15 @@ impl fmt::Display for OcrError {
             Self::InvalidModelName => {
                 formatter.write_str("The configured OCR model name is invalid.")
             }
-            Self::ModelInitializationFailed(model) => {
-                write!(formatter, "Could not initialize OCR model `{model}`.")
+            Self::ModelInitializationFailed(detail) => {
+                write!(formatter, "Could not initialize OCR model: {detail}")
             }
-            Self::ModelDestructionFailed(status) => {
-                write!(
-                    formatter,
-                    "Could not release the previous OCR model (libmocr status {status})."
-                )
-            }
-            Self::InferenceFailed => {
-                formatter.write_str("libmocr could not read the selected image.")
-            }
-            Self::InvalidNativeText => {
-                formatter.write_str("libmocr returned text that was not valid UTF-8.")
-            }
-            Self::NativeTextFreeFailed(status) => {
-                write!(
-                    formatter,
-                    "Could not release OCR text (libmocr status {status})."
-                )
+            Self::InferenceFailed(detail) => {
+                write!(formatter, "OCR could not read the selected image: {detail}")
             }
             Self::NoTextDetected => formatter.write_str("No text was detected."),
-            Self::LibraryUnavailable(error) => {
-                write!(formatter, "Could not load libmocr: {error}")
+            Self::RuntimeUnavailable(error) => {
+                write!(formatter, "Manga OCR runtime unavailable: {error}")
             }
             Self::WorkerStartFailed(error) => {
                 write!(formatter, "Could not start OCR worker: {error}")
@@ -495,6 +408,364 @@ impl fmt::Display for OcrError {
 }
 
 impl std::error::Error for OcrError {}
+
+/// Safe abstraction for a loaded Manga OCR session (real Python daemon or mock
+/// backend in unit tests).
+trait OcrSession: Send {
+    fn read_rgba(&mut self, pixels: &[u8], width: usize, height: usize) -> Result<String, OcrError>;
+}
+
+/// Factory that spawns an [`OcrSession`] for a given `(model, use_gpu)` pair.
+trait OcrBackend: Send {
+    fn spawn_session(&mut self, model: &str, use_gpu: bool)
+        -> Result<Box<dyn OcrSession>, OcrError>;
+}
+
+/// Production backend backed by an isolated Python `manga-ocr` child process.
+struct PythonMangaOcrBackend {
+    script: &'static str,
+}
+
+impl Default for PythonMangaOcrBackend {
+    fn default() -> Self {
+        Self {
+            script: MANGA_OCR_WORKER_SCRIPT,
+        }
+    }
+}
+
+impl OcrBackend for PythonMangaOcrBackend {
+    fn spawn_session(
+        &mut self,
+        model: &str,
+        use_gpu: bool,
+    ) -> Result<Box<dyn OcrSession>, OcrError> {
+        let candidates = discover_python_candidates();
+        spawn_python_session_from_candidates(&candidates, self.script, model, use_gpu)
+            .map(|daemon| Box::new(daemon) as Box<dyn OcrSession>)
+    }
+}
+
+enum HandshakeOutcome {
+    Ready,
+    MissingPackage(String),
+    ModelInitFailed(String),
+    StartupFailed(String),
+}
+
+fn spawn_python_session_from_candidates(
+    candidates: &[PythonCandidate],
+    script: &str,
+    model: &str,
+    use_gpu: bool,
+) -> Result<PythonMangaOcrDaemon, OcrError> {
+    let mut spawn_errors = Vec::new();
+    let mut missing_pkg_errors = Vec::new();
+
+    for candidate in candidates {
+        match PythonMangaOcrDaemon::spawn(candidate, script, model, use_gpu) {
+            Ok((daemon, HandshakeOutcome::Ready)) => return Ok(daemon),
+            Ok((mut daemon, HandshakeOutcome::MissingPackage(detail))) => {
+                daemon.shutdown();
+                missing_pkg_errors.push(format!("{}: {detail}", candidate.display()));
+            }
+            Ok((mut daemon, HandshakeOutcome::ModelInitFailed(detail))) => {
+                daemon.shutdown();
+                return Err(OcrError::ModelInitializationFailed(format!(
+                    "`{model}` ({detail})"
+                )));
+            }
+            Ok((mut daemon, HandshakeOutcome::StartupFailed(detail))) => {
+                daemon.shutdown();
+                spawn_errors.push(format!("{}: {detail}", candidate.display()));
+            }
+            Err(error) => {
+                spawn_errors.push(format!("{}: {error}", candidate.display()));
+            }
+        }
+    }
+
+    if !missing_pkg_errors.is_empty() {
+        return Err(OcrError::RuntimeUnavailable(format!(
+            "Python was found, but `manga-ocr` (or `Pillow`) is not installed. Run `pip install manga-ocr` or set SUBOMI_OCR_PYTHON to your venv's python. Details: {}",
+            missing_pkg_errors.join("; ")
+        )));
+    }
+
+    Err(OcrError::RuntimeUnavailable(format!(
+        "Could not start a Python 3 runtime for manga-ocr. Install Python 3 + `pip install manga-ocr` or set SUBOMI_OCR_PYTHON. Details: {}",
+        if spawn_errors.is_empty() {
+            "no Python candidates configured".to_owned()
+        } else {
+            spawn_errors.join("; ")
+        }
+    )))
+}
+
+struct PythonMangaOcrDaemon {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    stderr_buf: Arc<Mutex<String>>,
+    stderr_thread: Option<JoinHandle<()>>,
+    exited: bool,
+}
+
+impl PythonMangaOcrDaemon {
+    fn spawn(
+        candidate: &PythonCandidate,
+        script: &str,
+        model: &str,
+        use_gpu: bool,
+    ) -> Result<(Self, HandshakeOutcome), String> {
+        let mut command = Command::new(&candidate.program);
+        for arg in &candidate.prefix_args {
+            command.arg(arg);
+        }
+        command
+            .arg("-u")
+            .arg("-c")
+            .arg(script)
+            .arg(model)
+            .arg(if use_gpu { "1" } else { "0" })
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("TOKENIZERS_PARALLELISM", "false")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = command.spawn().map_err(|err| err.to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "could not capture child stdin".to_owned())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "could not capture child stdout".to_owned())?;
+        let stderr = child.stderr.take();
+
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_thread = stderr.map(|mut pipe| {
+            let sink = Arc::clone(&stderr_buf);
+            thread::Builder::new()
+                .name("subomi-ocr-stderr".to_owned())
+                .spawn(move || {
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&chunk[..n]);
+                                let mut buf =
+                                    sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                buf.push_str(&text);
+                                if buf.len() > MAX_STDERR_BYTES {
+                                    let keep_from = buf.len() - MAX_STDERR_BYTES;
+                                    let boundary = buf
+                                        .char_indices()
+                                        .find(|(idx, _)| *idx >= keep_from)
+                                        .map(|(idx, _)| idx)
+                                        .unwrap_or(buf.len());
+                                    buf.drain(..boundary);
+                                }
+                            }
+                        }
+                    }
+                })
+                .ok()
+        });
+
+        let mut daemon = Self {
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+            stderr_buf,
+            stderr_thread: stderr_thread.flatten(),
+            exited: false,
+        };
+
+        let outcome = daemon.read_handshake();
+        Ok((daemon, outcome))
+    }
+
+    fn stderr_tail(&self) -> String {
+        let buf = self
+            .stderr_buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buf.trim().to_owned()
+    }
+
+    fn read_handshake(&mut self) -> HandshakeOutcome {
+        let mut line = String::new();
+        match self.stdout.read_line(&mut line) {
+            Ok(0) => {
+                self.reap_after_eof();
+                let stderr = self.stderr_tail();
+                HandshakeOutcome::StartupFailed(if stderr.is_empty() {
+                    "Python worker exited before signaling ready".to_owned()
+                } else {
+                    stderr
+                })
+            }
+            Err(err) => HandshakeOutcome::StartupFailed(format!("protocol read error: {err}")),
+            Ok(_) => {
+                let parsed: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return HandshakeOutcome::StartupFailed(format!(
+                            "malformed startup reply ({err}): {}",
+                            line.trim()
+                        ));
+                    }
+                };
+                match parsed.get("status").and_then(serde_json::Value::as_str) {
+                    Some("ready") => HandshakeOutcome::Ready,
+                    Some("error") => {
+                        let detail = parsed
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown error")
+                            .to_owned();
+                        match parsed.get("kind").and_then(serde_json::Value::as_str) {
+                            Some("missing_pkg") => HandshakeOutcome::MissingPackage(detail),
+                            Some("model_init") => HandshakeOutcome::ModelInitFailed(detail),
+                            _ => HandshakeOutcome::StartupFailed(detail),
+                        }
+                    }
+                    _ => HandshakeOutcome::StartupFailed(format!(
+                        "unexpected startup reply: {}",
+                        line.trim()
+                    )),
+                }
+            }
+        }
+    }
+
+    fn reap_after_eof(&mut self) {
+        if !self.exited {
+            let _ = self.child.wait();
+            self.exited = true;
+        }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut stdin) = self.stdin.take() {
+            let _ = stdin.write_all(b"{\"op\":\"quit\"}\n");
+            let _ = stdin.flush();
+            drop(stdin);
+        }
+        if !self.exited {
+            let deadline = Instant::now() + DAEMON_SHUTDOWN_GRACE;
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        self.exited = true;
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        self.exited = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl OcrSession for PythonMangaOcrDaemon {
+    fn read_rgba(&mut self, pixels: &[u8], width: usize, height: usize) -> Result<String, OcrError> {
+        let expected_bytes = width
+            .checked_mul(height)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or(OcrError::InvalidFrameDimensions)?;
+        if width == 0 || height == 0 || pixels.len() != expected_bytes {
+            return Err(OcrError::InvalidFrameBuffer);
+        }
+
+        let stdin = self.stdin.as_mut().ok_or(OcrError::WorkerUnavailable)?;
+        let header = format!(
+            "{{\"op\":\"read\",\"width\":{width},\"height\":{height},\"len\":{expected_bytes}}}\n"
+        );
+        if let Err(err) = stdin
+            .write_all(header.as_bytes())
+            .and_then(|()| stdin.write_all(pixels))
+            .and_then(|()| stdin.flush())
+        {
+            self.shutdown();
+            return Err(OcrError::WorkerUnavailableWithIo(err));
+        }
+
+        let mut line = String::new();
+        match self.stdout.read_line(&mut line) {
+            Ok(0) => {
+                self.reap_after_eof();
+                Err(OcrError::WorkerUnavailable)
+            }
+            Err(_) => {
+                self.shutdown();
+                Err(OcrError::WorkerUnavailable)
+            }
+            Ok(_) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(line.trim()).map_err(|err| {
+                        OcrError::InferenceFailed(format!("invalid worker reply ({err})"))
+                    })?;
+                if parsed
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let text = parsed
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    Ok(text)
+                } else {
+                    let detail = parsed
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown inference error")
+                        .to_owned();
+                    Err(OcrError::InferenceFailed(detail))
+                }
+            }
+        }
+    }
+}
+
+impl OcrError {
+    #[allow(non_snake_case)]
+    fn WorkerUnavailableWithIo(_err: std::io::Error) -> Self {
+        Self::WorkerUnavailable
+    }
+}
+
+impl Drop for PythonMangaOcrDaemon {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 type OcrCallback = Box<dyn FnOnce(Result<String, OcrError>) + Send + 'static>;
 
@@ -564,22 +835,21 @@ impl Drop for OcrControllerInner {
     }
 }
 
-/// Asynchronous OCR controller backed by one lazily initialized libmocr worker.
+/// Asynchronous OCR controller backed by one lazily initialized persistent
+/// Manga OCR worker process.
 ///
-/// Neither `libpython`/`libmocr` loading nor the 8 MiB worker thread happens in
-/// [`OcrController::new`]; both initialize lazily on the first OCR request.
-/// Native contexts are created, used, switched, and destroyed exclusively on
-/// the worker thread, which unloads the heavy model context after an idle
-/// timeout (keeping `libmocr`/`libpython` loaded) and shuts down and joins
-/// cleanly when the last controller handle drops.
+/// Nothing is spawned in [`OcrController::new`]; both the coordinator thread
+/// and the Python `manga-ocr` child process start lazily on the first OCR
+/// request. After an idle timeout, the child process exits cleanly so PyTorch
+/// RAM and GPU VRAM are returned directly to the OS.
 #[derive(Clone)]
 pub struct OcrController {
     inner: Arc<OcrControllerInner>,
 }
 
 impl OcrController {
-    /// Creates a lazy OCR controller. Native libraries and the worker thread
-    /// are initialized on the first [`Self::read_region_async`] call.
+    /// Creates a lazy OCR controller. The worker thread and Python daemon
+    /// initialize on the first [`Self::read_region_async`] call.
     pub fn new() -> Result<Self, OcrError> {
         Ok(Self::from_idle_unload_timeout(
             DEFAULT_OCR_IDLE_UNLOAD_TIMEOUT,
@@ -633,11 +903,8 @@ impl OcrController {
         }
         let queue = Arc::clone(&self.inner.queue);
         let idle_timeout = self.inner.idle_unload_timeout;
-        OCR_WORKER_STARTED.store(true, Ordering::Release);
         let handle = thread::Builder::new()
             .name("subomi-ocr".to_owned())
-            // libmocr's model initialization needs a larger stack on macOS.
-            .stack_size(OCR_WORKER_STACK_SIZE)
             .spawn(move || worker_loop(queue, idle_timeout))
             .map_err(|error| OcrError::WorkerStartFailed(error.to_string()))?;
         *worker = Some(handle);
@@ -683,11 +950,11 @@ impl OcrController {
 
 /// Waits for the next latest-wins OCR request or queue shutdown.
 ///
-/// When a native OCR model is currently loaded (`model_loaded == true`), waits
-/// up to `idle_timeout` before invoking `on_idle_unload` **without holding the
-/// queue mutex** so new requests or `Drop` shutdown never stall on model
-/// teardown. After unloading, re-locks and parks indefinitely until a request
-/// or shutdown arrives.
+/// When an OCR session is currently loaded (`model_loaded == true`), waits up
+/// to `idle_timeout` before invoking `on_idle_unload` **without holding the
+/// queue mutex** so new requests or `Drop` shutdown never stall on teardown.
+/// After unloading, re-locks and parks indefinitely until a request or shutdown
+/// arrives.
 fn pop_latest_request_with_idle_unload(
     queue: &(Mutex<RequestSlot>, Condvar),
     model_loaded: bool,
@@ -747,11 +1014,7 @@ fn worker_loop(queue: Arc<(Mutex<RequestSlot>, Condvar)>, idle_timeout: Duration
     worker_loop_with(
         queue,
         idle_timeout,
-        OcrWorker {
-            model: None,
-            api: None,
-            python_initialized: false,
-        },
+        OcrWorker::new(Box::new(PythonMangaOcrBackend::default())),
         deliver_to_slint,
     );
 }
@@ -779,7 +1042,7 @@ fn worker_loop_with(
         );
         deliver(request.callback, result);
     }
-    worker.finalize_runtime();
+    worker.unload_model();
 }
 
 fn normalize_model_name(raw: &str) -> Result<&str, OcrError> {
@@ -790,30 +1053,31 @@ fn normalize_model_name(raw: &str) -> Result<&str, OcrError> {
     Ok(trimmed)
 }
 
-struct OcrWorker {
-    // Field order is deliberate: the native context must be destroyed before
-    // `libmocr` is unloaded, and `libmocr` before `libpython`.
-    model: Option<LoadedModel>,
-    api: Option<MocrApi>,
-    python_initialized: bool,
-}
-
 struct LoadedModel {
     name: String,
     use_gpu: bool,
-    context: MocrContext,
+    session: Box<dyn OcrSession>,
+}
+
+struct OcrWorker {
+    model: Option<LoadedModel>,
+    backend: Box<dyn OcrBackend>,
 }
 
 impl OcrWorker {
+    fn new(backend: Box<dyn OcrBackend>) -> Self {
+        Self {
+            model: None,
+            backend,
+        }
+    }
+
     fn is_model_loaded(&self) -> bool {
         self.model.is_some()
     }
 
-    /// Drops the loaded Manga OCR model context (invoking `mocr_destroy` to
-    /// release the ~400-800 MiB PyTorch/model weights) while keeping `self.api`
-    /// (`libmocr` + `RTLD_GLOBAL` `libpython`) resident to avoid unsafe CPython
-    /// `dlclose` + re-initialization crashes. Trims the OS heap when a model
-    /// was actually unloaded.
+    /// Terminates the isolated OCR session so the OS reclaims PyTorch RAM and
+    /// GPU VRAM immediately.
     fn unload_model(&mut self) -> bool {
         if let Some(model) = self.model.take() {
             drop(model);
@@ -822,35 +1086,6 @@ impl OcrWorker {
         } else {
             false
         }
-    }
-
-    /// Destroy any active model context and finalize the embedded Python runtime
-    /// once when the dedicated OCR worker exits on application shutdown so
-    /// Python `atexit` handlers (e.g. `joblib`/`loky` semaphores and
-    /// `multiprocessing.resource_tracker`) clean up without leaked-resource warnings.
-    fn finalize_runtime(&mut self) {
-        self.unload_model();
-        if self.python_initialized {
-            if let Some(finalize) = self.api.as_ref().and_then(|api| api.finalize) {
-                // SAFETY: All `mocr_ctx` contexts were destroyed above, this runs
-                // once on the OCR worker thread at shutdown, and no further
-                // `mocr_init` calls will happen afterwards.
-                let status = unsafe { finalize() };
-                if status != 0 {
-                    eprintln!("Could not finalize OCR Python runtime (libmocr status {status}).");
-                }
-            }
-            self.python_initialized = false;
-        }
-    }
-
-    fn ensure_api(&mut self) -> Result<&MocrApi, OcrError> {
-        if self.api.is_none() {
-            self.api = Some(MocrApi::load()?);
-        }
-        self.api.as_ref().ok_or_else(|| {
-            OcrError::LibraryUnavailable("libmocr runtime is not initialized".to_owned())
-        })
     }
 
     fn read(
@@ -865,14 +1100,33 @@ impl OcrWorker {
         }
         let (pixels, width, height) = crop_frame(&frame, region, viewport)?;
         let model_name = normalize_model_name(&settings.model)?.to_owned();
-        let (read, free) = {
-            let api = self.ensure_api()?;
-            (api.read, api.free)
+
+        let was_reused = self
+            .model
+            .as_ref()
+            .is_some_and(|m| m.name == model_name && m.use_gpu == settings.use_gpu);
+        let first_attempt = {
+            let model = self.model_for(&model_name, settings.use_gpu)?;
+            model.session.read_rgba(&pixels, width, height)
         };
-        let model = self.model_for(&model_name, settings.use_gpu)?;
-        let text = model
-            .context
-            .read_rgba(read, free, &pixels, width, height)?;
+
+        let text = match first_attempt {
+            Ok(text) => text,
+            // If a previously warm daemon died between requests (e.g. OOM),
+            // restart it cleanly once and retry.
+            Err(OcrError::WorkerUnavailable) if was_reused => {
+                self.model = None;
+                let model = self.model_for(&model_name, settings.use_gpu)?;
+                model.session.read_rgba(&pixels, width, height)?
+            }
+            Err(err) => {
+                if matches!(err, OcrError::WorkerUnavailable) {
+                    self.model = None;
+                }
+                return Err(err);
+            }
+        };
+
         let text = text.trim();
         if text.is_empty() {
             return Err(OcrError::NoTextDetected);
@@ -887,141 +1141,17 @@ impl OcrWorker {
             .as_ref()
             .is_none_or(|model| model.name != model_name || model.use_gpu != use_gpu);
         if needs_recreate {
-            if let Some(previous) = self.model.take() {
-                previous.context.destroy()?;
-            }
-            self.ensure_api()?;
-            // Mark initialized before `mocr_init` so `mocr_finalize` still runs
-            // if Python initialized cleanly before a model load error.
-            self.python_initialized = true;
-            let api = self.api.as_ref().expect("api initialized above");
-            let context = MocrContext::new(api, model_name, use_gpu)?;
+            self.model = None;
+            let session = self.backend.spawn_session(model_name, use_gpu)?;
             self.model = Some(LoadedModel {
                 name: model_name.to_owned(),
                 use_gpu,
-                context,
+                session,
             });
         }
         self.model
             .as_mut()
             .ok_or_else(|| OcrError::ModelInitializationFailed(model_name.to_owned()))
-    }
-}
-
-struct MocrContext {
-    pointer: NonNull<MocrContextOpaque>,
-    destroy: MocrDestroy,
-}
-
-impl MocrContext {
-    fn new(api: &MocrApi, model: &str, use_gpu: bool) -> Result<Self, OcrError> {
-        let model_str = normalize_model_name(model)?;
-        let model_name = CString::new(model_str).map_err(|_| OcrError::InvalidModelName)?;
-        let mut pointer = unsafe { (api.init)(model_name.as_ptr(), if use_gpu { 0 } else { 1 }) };
-        if pointer.is_null() && use_gpu {
-            pointer = unsafe { (api.init)(model_name.as_ptr(), 1) };
-        }
-        let pointer = NonNull::new(pointer)
-            .ok_or_else(|| OcrError::ModelInitializationFailed(model_str.to_owned()))?;
-        Ok(Self {
-            pointer,
-            destroy: api.destroy,
-        })
-    }
-
-    fn read_rgba(
-        &mut self,
-        read: MocrRead,
-        free: MocrFree,
-        pixels: &[u8],
-        width: usize,
-        height: usize,
-    ) -> Result<String, OcrError> {
-        let expected_bytes = width
-            .checked_mul(height)
-            .and_then(|px| px.checked_mul(4))
-            .ok_or(OcrError::InvalidFrameDimensions)?;
-        if width == 0 || height == 0 || pixels.len() != expected_bytes {
-            return Err(OcrError::InvalidFrameBuffer);
-        }
-        // SAFETY: the context is live, `pixels` stays borrowed and alive for the
-        // entire synchronous `mocr_read` call and contains `width * height * 4`
-        // RGBA bytes (`MOCR_MODE_RGBA`). `mocr_read` takes a read-only image buffer.
-        let output = unsafe {
-            (read)(
-                self.pointer.as_ptr(),
-                pixels.as_ptr().cast(),
-                width,
-                height,
-                MOCR_MODE_RGBA,
-            )
-        };
-        let output = NonNull::new(output).ok_or(OcrError::InferenceFailed)?;
-        MocrText::new(output, free).into_string()
-    }
-
-    fn destroy(self) -> Result<(), OcrError> {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: `ManuallyDrop` suppresses `Drop`, so the owned context
-        // pointer is released exactly once with the matching destructor.
-        let status = unsafe { (this.destroy)(this.pointer.as_ptr()) };
-        if status == 0 {
-            Ok(())
-        } else {
-            Err(OcrError::ModelDestructionFailed(status))
-        }
-    }
-}
-
-impl Drop for MocrContext {
-    fn drop(&mut self) {
-        // SAFETY: this pointer is owned by `MocrContext` and `destroy`
-        // suppresses `Drop` via `ManuallyDrop`, so it is destroyed at most once.
-        let status = unsafe { (self.destroy)(self.pointer.as_ptr()) };
-        if status != 0 {
-            eprintln!("Could not release OCR model (libmocr status {status}).");
-        }
-    }
-}
-
-struct MocrText {
-    pointer: NonNull<c_char>,
-    free: MocrFree,
-}
-
-impl MocrText {
-    fn new(pointer: NonNull<c_char>, free: MocrFree) -> Self {
-        Self { pointer, free }
-    }
-
-    fn into_string(self) -> Result<String, OcrError> {
-        // Convert before disarming `Drop` so an unwind still frees the pointer.
-        // SAFETY: libmocr returns a NUL-terminated string allocated by
-        // `mocr_read`; it remains valid until freed below.
-        let text = unsafe { CStr::from_ptr(self.pointer.as_ptr()) }
-            .to_str()
-            .map(str::to_owned)
-            .map_err(|_| OcrError::InvalidNativeText);
-        let this = ManuallyDrop::new(self);
-        // SAFETY: `ManuallyDrop` suppresses `Drop`, so the pointer returned by
-        // `mocr_read` is released exactly once with `this.free`.
-        let status = unsafe { (this.free)(this.pointer.as_ptr().cast()) };
-        let text = text?;
-        if status != 0 {
-            return Err(OcrError::NativeTextFreeFailed(status));
-        }
-        Ok(text)
-    }
-}
-
-impl Drop for MocrText {
-    fn drop(&mut self) {
-        // SAFETY: this is the pointer returned by `mocr_read` and `into_string`
-        // suppresses `Drop` via `ManuallyDrop`, so it is freed at most once.
-        let status = unsafe { (self.free)(self.pointer.as_ptr().cast()) };
-        if status != 0 {
-            eprintln!("Could not release OCR text (libmocr status {status}).");
-        }
     }
 }
 
@@ -1107,66 +1237,85 @@ fn crop_frame(
     Ok((crop, width, height))
 }
 
-fn resolve_python_executable_from_env(
-    python_executable: Option<&OsStr>,
-    virtual_env: Option<&OsStr>,
-    is_windows: bool,
-    file_exists: impl Fn(&Path) -> bool,
-) -> Option<String> {
-    if python_executable.is_some() {
-        return None;
-    }
-    let virtual_env = virtual_env?.to_str()?;
-    let path = resolve_venv_python_str(false, virtual_env, is_windows)?;
-    file_exists(Path::new(&path)).then_some(path)
-}
-
-#[cfg(target_os = "linux")]
-fn process_is_single_threaded() -> bool {
-    !OCR_WORKER_STARTED.load(Ordering::Acquire)
-        && std::fs::read_dir("/proc/self/task")
-            .map(|entries| entries.take(2).count() <= 1)
-            .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_is_single_threaded() -> bool {
-    cfg!(windows) || !OCR_WORKER_STARTED.load(Ordering::Acquire)
-}
-
-/// Probes `VIRTUAL_ENV` and sets `PYTHONEXECUTABLE` once during single-threaded
-/// process startup if unset.
-///
-/// Must be called on the main thread before any worker threads (libmpv, GUI,
-/// ASR, or OCR) are spawned. If the process is already multi-threaded, this
-/// skips mutating process environment variables to avoid Unix `setenv` UB.
-pub fn prepare_python_executable() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        const PYTHON_EXECUTABLE: &str = "PYTHONEXECUTABLE";
-        const VIRTUAL_ENV: &str = "VIRTUAL_ENV";
-
-        if !process_is_single_threaded() {
-            return;
-        }
-        let python_executable = std::env::var_os(PYTHON_EXECUTABLE);
-        let virtual_env = std::env::var_os(VIRTUAL_ENV);
-        let Some(path) = resolve_python_executable_from_env(
-            python_executable.as_deref(),
-            virtual_env.as_deref(),
-            cfg!(windows),
-            |candidate| candidate.is_file(),
-        ) else {
-            return;
-        };
-        std::env::set_var(PYTHON_EXECUTABLE, path);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    struct MockSession {
+        drop_calls: Arc<AtomicUsize>,
+        drop_tx: Option<mpsc::Sender<usize>>,
+        fail_once: bool,
+    }
+
+    impl OcrSession for MockSession {
+        fn read_rgba(
+            &mut self,
+            pixels: &[u8],
+            _width: usize,
+            _height: usize,
+        ) -> Result<String, OcrError> {
+            if self.fail_once {
+                self.fail_once = false;
+                return Err(OcrError::WorkerUnavailable);
+            }
+            Ok(format!("frame-{}", pixels[0]))
+        }
+    }
+
+    impl Drop for MockSession {
+        fn drop(&mut self) {
+            let count = self.drop_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(tx) = &self.drop_tx {
+                let _ = tx.send(count);
+            }
+        }
+    }
+
+    struct MockBackend {
+        spawn_calls: Arc<AtomicUsize>,
+        drop_calls: Arc<AtomicUsize>,
+        drop_tx: Option<mpsc::Sender<usize>>,
+        fail_first_read_on_spawn: Option<usize>,
+    }
+
+    impl OcrBackend for MockBackend {
+        fn spawn_session(
+            &mut self,
+            _model: &str,
+            _use_gpu: bool,
+        ) -> Result<Box<dyn OcrSession>, OcrError> {
+            let n = self.spawn_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail_once = self.fail_first_read_on_spawn == Some(n);
+            Ok(Box::new(MockSession {
+                drop_calls: Arc::clone(&self.drop_calls),
+                drop_tx: self.drop_tx.clone(),
+                fail_once,
+            }))
+        }
+    }
+
+    fn test_ocr_request_args(tag: u8) -> (OcrFrame, OcrRegion, OcrViewport, OcrSettings) {
+        (
+            OcrFrame::from_rgba(1, 1, vec![tag, 0, 0, 255]).unwrap(),
+            OcrRegion {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            OcrViewport {
+                width: 1.0,
+                height: 1.0,
+            },
+            OcrSettings {
+                enabled: true,
+                model: "mock/manga-ocr".to_owned(),
+                use_gpu: false,
+            },
+        )
+    }
 
     #[test]
     fn crop_maps_normalized_region_and_honors_row_stride() {
@@ -1270,226 +1419,50 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn python_library_probes_cover_3_14_through_3_10() {
-        let candidates = python_library_candidates();
-        for minor in ["3.14", "3.13", "3.12", "3.11", "3.10"] {
-            assert!(
-                candidates.iter().any(|name| name.contains(minor)),
-                "missing libpython {minor} candidate in {candidates:?}"
-            );
-        }
-        assert!(candidates
-            .iter()
-            .any(|name| name.starts_with("libpython3.")));
-    }
-
-    #[test]
-    fn mocr_text_uses_owned_free_fn_and_frees_on_drop() {
-        static FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
-        unsafe extern "C" fn mock_free(ptr: *mut c_void) -> c_int {
-            FREE_CALLS.fetch_add(1, Ordering::SeqCst);
-            drop(CString::from_raw(ptr.cast::<c_char>()));
-            0
-        }
-
-        let before = FREE_CALLS.load(Ordering::SeqCst);
-        let raw_ok = NonNull::new(CString::new("日本語").unwrap().into_raw()).unwrap();
-        let text = MocrText::new(raw_ok, mock_free).into_string().unwrap();
-        assert_eq!(text, "日本語");
-        assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 1);
-
-        let raw_drop = NonNull::new(CString::new("dropped").unwrap().into_raw()).unwrap();
-        drop(MocrText::new(raw_drop, mock_free));
-        assert_eq!(FREE_CALLS.load(Ordering::SeqCst), before + 2);
-    }
-
-    #[test]
-    fn resolve_python_executable_from_env_checks_existing_venv_python() {
+    fn python_candidates_prioritize_overrides_venvs_local_venvs_and_system_python() {
+        let local_venv = PathBuf::from("/home/u/.local/share/subomi/ocr-venv");
+        let existing = [
+            PathBuf::from("/opt/custom/python"),
+            PathBuf::from("/tmp/venv/bin/python"),
+            local_venv.join("bin/python"),
+        ];
+        let candidates = python_candidates_from_env(
+            Some(OsStr::new("/opt/custom/python")),
+            Some(OsStr::new("/missing/python")),
+            Some(OsStr::new("/tmp/venv")),
+            None,
+            &[local_venv.clone()],
+            false,
+            |p| existing.iter().any(|e| e == p),
+        );
+        let names: Vec<String> = candidates.iter().map(PythonCandidate::display).collect();
         assert_eq!(
-            resolve_python_executable_from_env(
-                Some(OsStr::new("/already/set")),
-                Some(OsStr::new("/tmp/venv")),
-                false,
-                |_| true
-            ),
-            None
+            names,
+            vec![
+                "/opt/custom/python",
+                "/tmp/venv/bin/python",
+                "/home/u/.local/share/subomi/ocr-venv/bin/python",
+                "python3",
+                "python",
+            ]
         );
-        assert_eq!(
-            resolve_python_executable_from_env(None, Some(OsStr::new("/tmp/venv")), false, |_| {
-                false
-            }),
-            None
-        );
-        assert_eq!(
-            resolve_python_executable_from_env(None, Some(OsStr::new("/tmp/venv")), false, |p| {
-                p == Path::new("/tmp/venv/bin/python")
-            }),
-            Some("/tmp/venv/bin/python".to_owned())
-        );
-    }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn process_is_single_threaded_is_false_when_background_thread_exists() {
-        let ready = Arc::new((Mutex::new(false), Condvar::new()));
-        let done = Arc::new((Mutex::new(false), Condvar::new()));
-        let ready_bg = Arc::clone(&ready);
-        let done_bg = Arc::clone(&done);
-        let bg = thread::spawn(move || {
-            {
-                let (lock, cvar) = &*ready_bg;
-                *lock.lock().unwrap() = true;
-                cvar.notify_one();
-            }
-            let (lock, cvar) = &*done_bg;
-            let mut finished = lock.lock().unwrap();
-            while !*finished {
-                finished = cvar.wait(finished).unwrap();
-            }
-        });
-        {
-            let (lock, cvar) = &*ready;
-            let mut started = lock.lock().unwrap();
-            while !*started {
-                started = cvar.wait(started).unwrap();
-            }
-        }
-        assert!(
-            !process_is_single_threaded(),
-            "must refuse process env mutation while other threads are running"
-        );
-        {
-            let (lock, cvar) = &*done;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        }
-        bg.join().unwrap();
+        let win_candidates = python_candidates_from_env(None, None, None, None, &[], true, |_| false);
+        let win_names: Vec<String> = win_candidates.iter().map(PythonCandidate::display).collect();
+        assert_eq!(win_names, vec!["python", "py -3", "python3"]);
     }
 
     #[test]
-    fn windows_libmocr_discovery_checks_exe_dir_localappdata_path_and_explains_missing_dll() {
-        let exe_dir = Path::new("/win/ProgramFiles/Subomi");
-        let local_app_data = Path::new("/win/Users/Alice/AppData/Local");
-        let path_env = OsStr::new("/win/tools/ocr;/win/empty");
-        let candidates = windows_mocr_library_candidates(
-            Some(exe_dir),
-            Some(local_app_data),
-            Some(path_env),
-            |p| p == Path::new("/win/tools/ocr/libmocr.dll"),
-        );
-
-        assert_eq!(candidates[0], exe_dir.join("libmocr.dll"));
-        assert_eq!(candidates[1], exe_dir.join("mocr.dll"));
-        assert!(candidates.contains(&local_app_data.join("subomi").join("libmocr.dll")));
-        assert!(candidates.contains(&PathBuf::from("/win/tools/ocr/libmocr.dll")));
-        assert!(!candidates.contains(&PathBuf::from("/win/empty/libmocr.dll")));
-        assert_eq!(
-            candidates.last().map(PathBuf::as_path),
-            Some(Path::new("mocr.dll"))
-        );
-
-        // Priority order: exe dir -> %LOCALAPPDATA%\subomi -> PATH -> bare DLL fallback.
-        let idx_exe = candidates
-            .iter()
-            .position(|p| p == &exe_dir.join("libmocr.dll"))
-            .unwrap();
-        let idx_local = candidates
-            .iter()
-            .position(|p| p == &local_app_data.join("subomi").join("libmocr.dll"))
-            .unwrap();
-        let idx_path = candidates
-            .iter()
-            .position(|p| p == Path::new("/win/tools/ocr/libmocr.dll"))
-            .unwrap();
-        let idx_bare = candidates
-            .iter()
-            .position(|p| p == Path::new("libmocr.dll"))
-            .unwrap();
-        assert!(idx_exe < idx_local && idx_local < idx_path && idx_path < idx_bare);
-
-        let missing_msg = format_library_unavailable_message(
-            true,
-            &[],
-            &["libmocr.dll: not found".to_owned()],
-        );
-        assert!(missing_msg.contains("libmocr.dll"));
-        assert!(missing_msg.contains("%LOCALAPPDATA%\\subomi"));
-        assert!(missing_msg.contains("PATH"));
-
-        let broken_deps_msg = format_library_unavailable_message(
-            true,
-            &["C:\\Subomi\\libmocr.dll".to_owned()],
-            &["missing python312.dll".to_owned()],
-        );
-        assert!(broken_deps_msg.contains("found at C:\\Subomi\\libmocr.dll"));
-        assert!(broken_deps_msg.contains("Python 3"));
-    }
-
-    fn test_ocr_request_args(tag: u8) -> (OcrFrame, OcrRegion, OcrViewport, OcrSettings) {
-        (
-            OcrFrame::from_rgba(1, 1, vec![tag, 0, 0, 255]).unwrap(),
-            OcrRegion {
-                x: 0.0,
-                y: 0.0,
-                width: 1.0,
-                height: 1.0,
-            },
-            OcrViewport {
-                width: 1.0,
-                height: 1.0,
-            },
-            OcrSettings {
-                enabled: true,
-                model: "mock/manga-ocr".to_owned(),
-                use_gpu: false,
-            },
-        )
-    }
-
-    unsafe extern "C" fn test_mock_read(
-        _ctx: *mut MocrContextOpaque,
-        pixels: *const c_void,
-        _width: usize,
-        _height: usize,
-        _mode: c_int,
-    ) -> *mut c_char {
-        let tag = *(pixels as *const u8);
-        CString::new(format!("frame-{tag}")).unwrap().into_raw()
-    }
-
-    unsafe extern "C" fn test_mock_free(ptr: *mut c_void) -> c_int {
-        drop(CString::from_raw(ptr.cast::<c_char>()));
-        0
-    }
-
-    #[test]
-    fn ocr_worker_unload_model_drops_context_keeps_api_loaded_and_is_idempotent() {
-        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
-            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
-            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
-        }
-
-        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
-            DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
-            drop(Box::from_raw(ptr.cast::<u8>()));
-            0
-        }
-
-        let mut worker = OcrWorker {
-            model: None,
-            api: Some(MocrApi::mock(
-                mock_init,
-                mock_destroy,
-                test_mock_read,
-                test_mock_free,
-            )),
-            python_initialized: false,
-        };
+    fn ocr_worker_unload_model_is_idempotent_and_restarts_on_next_read() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut worker = OcrWorker::new(Box::new(MockBackend {
+            spawn_calls: Arc::clone(&spawns),
+            drop_calls: Arc::clone(&drops),
+            drop_tx: None,
+            fail_first_read_on_spawn: None,
+        }));
 
         assert!(!worker.is_model_loaded());
         assert!(!worker.unload_model());
@@ -1500,91 +1473,72 @@ mod tests {
             "frame-7"
         );
         assert!(worker.is_model_loaded());
-        assert!(worker.api.is_some());
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         assert!(worker.unload_model());
         assert!(!worker.is_model_loaded());
-        assert!(
-            worker.api.is_some(),
-            "libmocr/libpython API handle must remain loaded across idle model unloads"
-        );
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
-
-        // Second unload is a no-op.
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(!worker.unload_model());
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
 
-        // Reloading after idle unload reuses the resident API cleanly.
         let (frame2, region2, viewport2, settings2) = test_ocr_request_args(9);
         assert_eq!(
             worker.read(frame2, region2, viewport2, settings2).unwrap(),
             "frame-9"
         );
-        assert!(worker.is_model_loaded());
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
         drop(worker);
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn ocr_idle_unload_reclaims_model_after_timeout_and_reloads_on_next_request() {
-        use std::sync::mpsc;
+    fn ocr_worker_recovers_once_when_warm_session_dies_between_requests() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut worker = OcrWorker::new(Box::new(MockBackend {
+            spawn_calls: Arc::clone(&spawns),
+            drop_calls: Arc::clone(&drops),
+            drop_tx: None,
+            fail_first_read_on_spawn: None,
+        }));
 
-        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static FINALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static DESTROY_TX: Mutex<Option<mpsc::Sender<usize>>> = Mutex::new(None);
+        let (f1, r1, v1, s1) = test_ocr_request_args(1);
+        assert_eq!(worker.read(f1, r1, v1, s1.clone()).unwrap(), "frame-1");
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
 
-        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
-            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
-            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
-        }
+        // Simulate the warm session dying on its next read: replace with a failing session.
+        worker.model.as_mut().unwrap().session = Box::new(MockSession {
+            drop_calls: Arc::clone(&drops),
+            drop_tx: None,
+            fail_once: true,
+        });
 
-        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
-            drop(Box::from_raw(ptr.cast::<u8>()));
-            let count = DESTROY_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Some(tx) = DESTROY_TX
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_ref()
-            {
-                let _ = tx.send(count);
-            }
-            0
-        }
+        let (f2, r2, v2, s2) = test_ocr_request_args(2);
+        assert_eq!(worker.read(f2, r2, v2, s2).unwrap(), "frame-2");
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
+    }
 
-        unsafe extern "C" fn mock_finalize() -> c_int {
-            assert_eq!(
-                DESTROY_CALLS.load(Ordering::SeqCst),
-                INIT_CALLS.load(Ordering::SeqCst),
-                "all mocr contexts must be destroyed before mocr_finalize runs"
-            );
-            FINALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
-            0
-        }
-
-        let (destroy_tx, destroy_rx) = mpsc::channel();
-        *DESTROY_TX.lock().unwrap() = Some(destroy_tx);
+    #[test]
+    fn ocr_idle_unload_reclaims_session_after_timeout_and_reloads_on_next_request() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (drop_tx, drop_rx) = mpsc::channel();
 
         let controller = OcrController::with_idle_unload_timeout(Duration::from_millis(30));
+        let spawns_bg = Arc::clone(&spawns);
+        let drops_bg = Arc::clone(&drops);
         controller.start_test_worker(
-            || OcrWorker {
-                model: None,
-                api: Some(MocrApi::mock_with_finalize(
-                    mock_init,
-                    mock_destroy,
-                    test_mock_read,
-                    test_mock_free,
-                    Some(mock_finalize),
-                )),
-                python_initialized: false,
+            move || {
+                OcrWorker::new(Box::new(MockBackend {
+                    spawn_calls: spawns_bg,
+                    drop_calls: drops_bg,
+                    drop_tx: Some(drop_tx),
+                    fail_first_read_on_spawn: None,
+                }))
             },
             |callback, result| callback(result),
         );
 
-        // First request loads the model and returns OCR text.
         let (res1_tx, res1_rx) = mpsc::channel();
         let (frame1, region1, viewport1, settings1) = test_ocr_request_args(1);
         controller
@@ -1596,16 +1550,13 @@ mod tests {
             res1_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Ok("frame-1".to_owned())
         );
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
 
-        // After the 30 ms idle timeout, the model unloads automatically without finalizing Python.
-        let first_destroy = destroy_rx
+        let first_drop = drop_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("model should unload after idle timeout");
-        assert_eq!(first_destroy, 1);
-        assert_eq!(FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+            .expect("session should unload after idle timeout");
+        assert_eq!(first_drop, 1);
 
-        // A subsequent request after idle unload reloads MocrContext cleanly.
         let (res2_tx, res2_rx) = mpsc::channel();
         let (frame2, region2, viewport2, settings2) = test_ocr_request_args(2);
         controller
@@ -1617,44 +1568,28 @@ mod tests {
             res2_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Ok("frame-2".to_owned())
         );
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
 
-        // Dropping the controller shuts down the worker, destroys the reloaded model, and finalizes Python once.
         drop(controller);
-        *DESTROY_TX.lock().unwrap() = None;
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 2);
-        assert_eq!(FINALIZE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn ocr_drop_shutdown_wakes_timed_idle_wait_immediately_without_waiting_for_timeout() {
-        use std::sync::mpsc;
-
-        static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static DESTROY_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-        unsafe extern "C" fn mock_init(_model: *const c_char, _use_cpu: c_int) -> *mut MocrContextOpaque {
-            INIT_CALLS.fetch_add(1, Ordering::SeqCst);
-            Box::into_raw(Box::new(0u8)).cast::<MocrContextOpaque>()
-        }
-
-        unsafe extern "C" fn mock_destroy(ptr: *mut MocrContextOpaque) -> c_int {
-            drop(Box::from_raw(ptr.cast::<u8>()));
-            DESTROY_CALLS.fetch_add(1, Ordering::SeqCst);
-            0
-        }
+    fn ocr_drop_shutdown_wakes_timed_idle_wait_immediately() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
 
         let controller = OcrController::with_idle_unload_timeout(Duration::from_secs(60));
+        let spawns_bg = Arc::clone(&spawns);
+        let drops_bg = Arc::clone(&drops);
         controller.start_test_worker(
-            || OcrWorker {
-                model: None,
-                api: Some(MocrApi::mock(
-                    mock_init,
-                    mock_destroy,
-                    test_mock_read,
-                    test_mock_free,
-                )),
-                python_initialized: false,
+            move || {
+                OcrWorker::new(Box::new(MockBackend {
+                    spawn_calls: spawns_bg,
+                    drop_calls: drops_bg,
+                    drop_tx: None,
+                    fail_first_read_on_spawn: None,
+                }))
             },
             |callback, result| callback(result),
         );
@@ -1670,10 +1605,9 @@ mod tests {
             res_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Ok("frame-5".to_owned())
         );
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-        // Worker is now parked in the 60s timed idle wait; Drop must wake and join immediately.
         let started = Instant::now();
         drop(controller);
         assert!(
@@ -1681,13 +1615,11 @@ mod tests {
             "Drop shutdown must wake timed idle wait immediately, took {:?}",
             started.elapsed()
         );
-        assert_eq!(DESTROY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn pop_latest_request_with_idle_unload_releases_mutex_before_unload_callback() {
-        use std::sync::mpsc;
-
         let queue = Arc::new((Mutex::new(RequestSlot::new()), Condvar::new()));
         let queue_bg = Arc::clone(&queue);
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1701,7 +1633,6 @@ mod tests {
                 true,
                 Duration::from_millis(20),
                 || {
-                    // The queue mutex must NOT be held while unloading the model.
                     assert!(
                         queue_bg.0.try_lock().is_ok(),
                         "queue mutex must be dropped before calling idle unload callback"
@@ -1713,13 +1644,10 @@ mod tests {
             )
         });
 
-        // Wait until the idle-unload callback has started.
         entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("idle unload callback should fire after timeout");
 
-        // Enqueue a new request WHILE the unload callback is still running; this
-        // must not block on the unload callback because the mutex was released.
         let (frame, region, viewport, settings) = test_ocr_request_args(42);
         {
             let (lock, cvar) = &*queue;
@@ -1735,10 +1663,49 @@ mod tests {
             cvar.notify_one();
         }
 
-        // Let the unload callback finish; the worker should immediately pop the queued request.
         resume_tx.send(()).unwrap();
         let popped = worker.join().unwrap().expect("expected queued request");
         assert_eq!(popped.frame.pixels[0], 42);
         assert_eq!(unload_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn python_daemon_protocol_isolates_stdout_noise_and_round_trips_rgba_frames() {
+        let stub_script = r#"import json, os, sys
+_proto_fd = os.dup(1)
+os.dup2(2, 1)
+_proto_out = os.fdopen(_proto_fd, "wb", buffering=0)
+sys.stdout = sys.stderr
+print("noisy library stdout banner that must not break protocol")
+def _send(obj):
+    _proto_out.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    _proto_out.flush()
+_send({"status": "ready", "device": "cpu"})
+stdin = sys.stdin.buffer
+while True:
+    header = stdin.readline()
+    if not header:
+        break
+    req = json.loads(header.decode("utf-8"))
+    if req.get("op") == "quit":
+        break
+    n = int(req["len"])
+    raw = stdin.read(n)
+    print("noisy inference log")
+    _send({"ok": True, "text": f"日本語:{req['width']}x{req['height']}:{raw[0]}"})
+"#;
+        let candidates = python_candidates_from_env(None, None, None, None, &[], cfg!(windows), |_| false);
+        let mut daemon =
+            spawn_python_session_from_candidates(&candidates, stub_script, "stub", false)
+                .expect("python3 stub daemon should start");
+        let text1 = daemon
+            .read_rgba(&[77, 1, 2, 255, 88, 3, 4, 255], 2, 1)
+            .expect("first RGBA read");
+        assert_eq!(text1, "日本語:2x1:77");
+        let text2 = daemon
+            .read_rgba(&[99, 1, 2, 255], 1, 1)
+            .expect("second RGBA read on persistent daemon");
+        assert_eq!(text2, "日本語:1x1:99");
+        daemon.shutdown();
     }
 }

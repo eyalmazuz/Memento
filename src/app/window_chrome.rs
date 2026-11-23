@@ -293,45 +293,6 @@ pub(crate) fn native_window_display_pointers(
 }
 
 #[cfg(target_os = "linux")]
-fn query_x11_screen_size(window: &slint::Window) -> Option<(u32, u32)> {
-    let (Some(dpy), _) = native_window_display_pointers(window) else {
-        return None;
-    };
-    unsafe {
-        let handle = libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD);
-        if handle.is_null() {
-            return None;
-        }
-        let default_screen_sym = libc::dlsym(handle, c"XDefaultScreen".as_ptr());
-        let display_width_sym = libc::dlsym(handle, c"XDisplayWidth".as_ptr());
-        let display_height_sym = libc::dlsym(handle, c"XDisplayHeight".as_ptr());
-        let result = if !default_screen_sym.is_null()
-            && !display_width_sym.is_null()
-            && !display_height_sym.is_null()
-        {
-            let x_default_screen: unsafe extern "C" fn(*mut std::ffi::c_void) -> libc::c_int =
-                std::mem::transmute(default_screen_sym);
-            let x_display_width: unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                libc::c_int,
-            ) -> libc::c_int = std::mem::transmute(display_width_sym);
-            let x_display_height: unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                libc::c_int,
-            ) -> libc::c_int = std::mem::transmute(display_height_sym);
-            let screen = x_default_screen(dpy);
-            let w = x_display_width(dpy, screen);
-            let h = x_display_height(dpy, screen);
-            (w > 0 && h > 0).then_some((w as u32, h as u32))
-        } else {
-            None
-        };
-        libc::dlclose(handle);
-        result
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn parse_drm_mode_dimensions(modes_contents: &str) -> Option<(u32, u32)> {
     let first = modes_contents.lines().next()?.trim();
     let (w_str, h_str) = first.split_once('x')?;
@@ -373,29 +334,8 @@ fn query_drm_monitor_size() -> Option<(u32, u32)> {
     None
 }
 
-#[cfg(target_os = "macos")]
-fn query_macos_main_display_size() -> Option<(u32, u32)> {
-    unsafe {
-        let main_id_sym = libc::dlsym(libc::RTLD_DEFAULT, c"CGMainDisplayID".as_ptr());
-        let width_sym = libc::dlsym(libc::RTLD_DEFAULT, c"CGDisplayPixelsWide".as_ptr());
-        let height_sym = libc::dlsym(libc::RTLD_DEFAULT, c"CGDisplayPixelsHigh".as_ptr());
-        if main_id_sym.is_null() || width_sym.is_null() || height_sym.is_null() {
-            return None;
-        }
-        let cg_main_display_id: unsafe extern "C" fn() -> u32 = std::mem::transmute(main_id_sym);
-        let cg_display_pixels_wide: unsafe extern "C" fn(u32) -> usize =
-            std::mem::transmute(width_sym);
-        let cg_display_pixels_high: unsafe extern "C" fn(u32) -> usize =
-            std::mem::transmute(height_sym);
-        let id = cg_main_display_id();
-        let w = cg_display_pixels_wide(id);
-        let h = cg_display_pixels_high(id);
-        (w > 0 && h > 0).then_some((w as u32, h as u32))
-    }
-}
-
 /// Probe the current monitor's physical pixel bounds (`MonitorRect`), falling back
-/// cleanly to the current window bounds when running headless or on Wayland without DRM info.
+/// cleanly to DRM metadata (Linux) or current window bounds when running headless.
 pub(crate) fn query_window_monitor_physical(window: &slint::Window) -> subomi_os::MonitorRect {
     let pos = window.position();
     let size = window.size();
@@ -408,13 +348,25 @@ pub(crate) fn query_window_monitor_physical(window: &slint::Window) -> subomi_os
         return monitor;
     }
 
-    #[cfg(target_os = "linux")]
-    if let Some((w, h)) = query_x11_screen_size(window).or_else(query_drm_monitor_size) {
-        return subomi_os::MonitorRect::new(0, 0, w, h, scale);
+    if let Some(monitor) = window
+        .with_winit_window(|w| w.current_monitor().or_else(|| w.primary_monitor()))
+        .flatten()
+    {
+        let mpos = monitor.position();
+        let msize = monitor.size();
+        if msize.width > 0 && msize.height > 0 {
+            return subomi_os::MonitorRect::new(
+                mpos.x,
+                mpos.y,
+                msize.width,
+                msize.height,
+                monitor.scale_factor().max(0.5),
+            );
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    if let Some((w, h)) = query_macos_main_display_size() {
+    #[cfg(target_os = "linux")]
+    if let Some((w, h)) = query_drm_monitor_size() {
         return subomi_os::MonitorRect::new(0, 0, w, h, scale);
     }
 
@@ -425,17 +377,10 @@ pub(crate) fn query_window_monitor_physical(window: &slint::Window) -> subomi_os
 pub(crate) fn query_window_monitor_logical(window: &slint::Window) -> subomi_os::MonitorRect {
     let phys = query_window_monitor_physical(window);
     let scale = phys.sanitized_scale();
-    // On macOS, `CGDisplayPixelsWide`/`High` already report logical points; on Windows/Linux
-    // monitor bounds are physical pixels and must be divided by `scale`.
-    #[cfg(target_os = "macos")]
-    let (lw, lh, lx, ly) = (phys.width, phys.height, phys.x, phys.y);
-    #[cfg(not(target_os = "macos"))]
-    let (lw, lh, lx, ly) = (
-        ((phys.width as f64) / scale).round().max(1.0) as u32,
-        ((phys.height as f64) / scale).round().max(1.0) as u32,
-        ((phys.x as f64) / scale).round() as i32,
-        ((phys.y as f64) / scale).round() as i32,
-    );
+    let lw = ((phys.width as f64) / scale).round().max(1.0) as u32;
+    let lh = ((phys.height as f64) / scale).round().max(1.0) as u32;
+    let lx = ((phys.x as f64) / scale).round() as i32;
+    let ly = ((phys.y as f64) / scale).round() as i32;
     subomi_os::MonitorRect::new(lx, ly, lw, lh, scale)
 }
 

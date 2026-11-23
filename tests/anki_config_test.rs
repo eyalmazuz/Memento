@@ -656,6 +656,16 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced, frequency_mode) VALUES (9, 'OccDict1', 3, '1', 0, 'occurrence-based');",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO directory (dic_id, title, format, revision, sequenced, frequency_mode) VALUES (10, 'OccDict2', 3, '1', 0, 'occurrence-based');",
+        [],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO tag_bank (dic_id, name, category, ord, notes, score) VALUES (7, 'v1', 'partOfSpeech', 1, 'Ichidan verb', 50);",
         [],
     )
@@ -701,9 +711,12 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     )
     .unwrap();
 
-    // Two frequency dictionaries: 100 and 300 -> harmonic = floor(2 / (1/100 + 1/300)) = 150, average = 200
+    // Two rank-based frequency dictionaries: 100 and 300 -> harmonic = floor(2 / (1/100 + 1/300)) = 150, average = 200
+    // Two occurrence-based frequency dictionaries: 400 and 1200 -> harmonic = floor(2 / (1/400 + 1/1200)) = 600, average = 800
     let freq1 = r#"{"reading":"たべる","frequency":100}"#.as_bytes();
     let freq2 = r#"{"reading":"たべる","frequency":300}"#.as_bytes();
+    let occ1 = r#"{"reading":"たべる","frequency":400}"#.as_bytes();
+    let occ2 = r#"{"reading":"たべる","frequency":1200}"#.as_bytes();
     conn.execute(
         "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (7, '食べる', 'freq', 4, ?1);",
         [freq1],
@@ -712,6 +725,16 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     conn.execute(
         "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (8, '食べる', 'freq', 4, ?1);",
         [freq2],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (9, '食べる', 'freq', 4, ?1);",
+        [occ1],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO term_meta_bank (dic_id, expression, mode, type, data) VALUES (10, '食べる', 'freq', 4, ?1);",
+        [occ2],
     )
     .unwrap();
 
@@ -799,9 +822,9 @@ fn sqlite_enrichment_wires_glossary_scoped_css_media_upload_pitch_tags_and_frequ
     assert!(payload.fields["FreqAll"].contains("FreqDict2: 300"));
     assert_eq!(payload.fields["FreqMinVal"], "100");
     assert_eq!(payload.fields["HarmonicRank"], "150");
-    assert_eq!(payload.fields["HarmonicOcc"], "150");
+    assert_eq!(payload.fields["HarmonicOcc"], "600");
     assert_eq!(payload.fields["AverageRank"], "200");
-    assert_eq!(payload.fields["AverageOcc"], "200");
+    assert_eq!(payload.fields["AverageOcc"], "800");
 
     // Verify default rank=9999999 and occurrence=0 when absent
     let empty_freq_ctx = NoteFieldsContext::new("未知語", "みちご", "未知語。");
@@ -1510,7 +1533,7 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(10));
     };
 
-    // 1. Initial popup with 2 entries: `食べる` (duplicate) and `世界` (addable)
+    // 1. Initial popup with 2 term entries (`食べる` duplicate, `世界` addable) + kanji footer (`食` duplicate)
     let mut dict_ctrl = DictController::open(&db_path).unwrap();
     let mut combined_hits = dict_ctrl.search("食べる").to_vec();
     combined_hits.extend_from_slice(dict_ctrl.search("世界"));
@@ -1529,9 +1552,23 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    assert_eq!(dups, vec![true, false]);
-    assert_eq!(queries, vec!["nid:1669909161234".to_owned(), String::new()]);
-    assert_eq!(tags, vec!["mining leech".to_owned(), String::new()]);
+    assert_eq!(dups, vec![true, false, true]);
+    assert_eq!(
+        queries,
+        vec![
+            "nid:1669909161234".to_owned(),
+            String::new(),
+            "nid:1669909169000".to_owned(),
+        ]
+    );
+    assert_eq!(
+        tags,
+        vec![
+            "mining leech".to_owned(),
+            String::new(),
+            "kanji_known".to_owned(),
+        ]
+    );
     let split_pills: Vec<String> = pb
         .invoke_split_anki_tags(tags[0].clone().into())
         .iter()
@@ -1591,7 +1628,7 @@ fn popup_bridge_async_anki_badges_tags_history_navigation_and_epoch_guard() {
     mark_popup_term_anki_added(&app, 1, 1669909167777, &term_profile, true);
     assert_eq!(
         pb.get_row_anki_duplicates().iter().collect::<Vec<_>>(),
-        vec![true, true]
+        vec![true, true, true]
     );
     assert_eq!(
         pb.get_row_anki_browse_queries()

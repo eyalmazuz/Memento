@@ -174,7 +174,7 @@ fn ocr_feature_links_and_initializes_cleanly() {
 
     if let Err(err) = OcrController::new() {
         assert!(
-            matches!(err, OcrError::LibraryUnavailable(_)),
+            matches!(err, OcrError::RuntimeUnavailable(_)),
             "unexpected OCR initialization error: {err}"
         );
     }

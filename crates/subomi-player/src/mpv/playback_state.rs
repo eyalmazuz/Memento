@@ -8,7 +8,7 @@ use super::extract::{
     extract_string_list_from_node, extract_sub_lines_from_node,
 };
 use super::ffi;
-use super::node::copy_mpv_string;
+use super::node::{copy_mpv_string, MpvNodeRef};
 use super::types::{
     AudioTrack, CursorAutohide, MpvPropertyValue, OsdDimensions, SubLine, SubtitleTrack, TrackType,
     VideoTrack,
@@ -396,7 +396,7 @@ impl PlaybackState {
         match kind {
             ObservedProperty::ChapterList => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let chapters = extract_chapters_from_node(data.cast());
+                    let chapters = extract_chapters_from_node(unsafe { MpvNodeRef::from_ptr(data.cast()) });
                     self.chapters.clone_from(&chapters);
                     return MpvPropertyValue::Chapters(chapters);
                 }
@@ -405,7 +405,7 @@ impl PlaybackState {
             }
             ObservedProperty::TrackList => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let extracted = extract_all_tracks_from_node(data.cast());
+                    let extracted = extract_all_tracks_from_node(unsafe { MpvNodeRef::from_ptr(data.cast()) });
                     self.audio_tracks.clone_from(&extracted.audio);
                     self.video_tracks = extracted.video;
                     self.subtitle_tracks.clone_from(&extracted.subtitle);
@@ -446,7 +446,7 @@ impl PlaybackState {
             }
             ObservedProperty::HttpHeaderFields => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let headers = extract_string_list_from_node(data.cast());
+                    let headers = extract_string_list_from_node(unsafe { MpvNodeRef::from_ptr(data.cast()) });
                     self.http_header_fields.clone_from(&headers);
                     return MpvPropertyValue::StringList(headers);
                 }
@@ -465,7 +465,7 @@ impl PlaybackState {
             }
             ObservedProperty::SubLines => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let lines = extract_sub_lines_from_node(data.cast());
+                    let lines = extract_sub_lines_from_node(unsafe { MpvNodeRef::from_ptr(data.cast()) });
                     self.sub_lines.clone_from(&lines);
                     return MpvPropertyValue::SubLines(lines);
                 }
@@ -474,7 +474,7 @@ impl PlaybackState {
             }
             ObservedProperty::OsdDimensions => {
                 if property.format == ffi::MPV_FORMAT_NODE && !data.is_null() {
-                    let dims = extract_osd_dimensions_from_node(data.cast());
+                    let dims = extract_osd_dimensions_from_node(unsafe { MpvNodeRef::from_ptr(data.cast()) });
                     self.osd_dimensions = dims;
                     return MpvPropertyValue::OsdDimensions(dims);
                 }

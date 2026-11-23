@@ -46,31 +46,23 @@ fn env_from<'a>(pairs: &[(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String>
 // ── 1. Unified Platform Renderer Selection ──────────────────────────────────
 
 #[test]
-fn macos_prefers_metal_with_opengl_and_software_fallbacks() {
+fn macos_prefers_opengl_41_with_videotoolbox_copy_and_software_fallback() {
     let caps = VideoRendererCapabilities::for_macos(true, true);
     let cfg = PlatformRendererConfig::select(&caps, &RendererOverrides::default());
 
-    assert_eq!(cfg.primary, PlatformRendererKind::Metal);
+    assert_eq!(cfg.primary, PlatformRendererKind::OpenGl);
     assert_eq!(
         cfg.fallback_chain,
-        vec![
-            PlatformRendererKind::Metal,
-            PlatformRendererKind::OpenGl,
-            PlatformRendererKind::Software,
-        ]
+        vec![PlatformRendererKind::OpenGl, PlatformRendererKind::Software]
     );
+    assert_eq!(cfg.metal_mode, None);
     assert_eq!(
-        cfg.metal_mode,
-        Some(MetalPresentationMode::IoSurfaceOpenGlBridge)
+        cfg.preferred_fbo_formats,
+        vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Rgba8Unorm]
     );
-    assert_eq!(cfg.preferred_fbo_formats, vec![VideoColorFormat::Bgra8Unorm]);
-    assert_eq!(cfg.effective_hwdec, "videotoolbox,auto-safe");
+    assert_eq!(cfg.effective_hwdec, "videotoolbox-copy");
     assert!(!cfg.windows_borderless_fullscreen);
 
-    assert_eq!(
-        cfg.next_fallback(PlatformRendererKind::Metal),
-        Some(PlatformRendererKind::OpenGl)
-    );
     assert_eq!(
         cfg.next_fallback(PlatformRendererKind::OpenGl),
         Some(PlatformRendererKind::Software)
@@ -108,25 +100,36 @@ fn macos_falls_back_to_opengl_when_metal_unavailable_or_overridden() {
 }
 
 #[test]
-fn macos_moltenvk_and_edr_overrides_select_native_layer_and_16f_format() {
+fn macos_metal_and_vulkan_overrides_still_standardize_on_opengl_41() {
     let mut caps = VideoRendererCapabilities::for_macos(true, true);
     caps.edr_supported = true;
     let overrides = RendererOverrides {
+        explicit_renderer: Some(PlatformRendererKind::Metal),
         gpu_api: Some("vulkan".to_owned()),
         prefer_hdr: true,
         ..Default::default()
     };
     let cfg = PlatformRendererConfig::select(&caps, &overrides);
-    assert_eq!(cfg.primary, PlatformRendererKind::Metal);
+    assert_eq!(cfg.primary, PlatformRendererKind::OpenGl);
     assert_eq!(
-        cfg.metal_mode,
-        Some(MetalPresentationMode::NativeMetalLayer)
+        cfg.fallback_chain,
+        vec![PlatformRendererKind::OpenGl, PlatformRendererKind::Software]
     );
+    assert_eq!(cfg.metal_mode, None);
     assert_eq!(
         cfg.preferred_fbo_formats,
-        vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Bgra8Unorm]
+        vec![VideoColorFormat::Rgba16Float, VideoColorFormat::Rgba8Unorm]
     );
-    assert_eq!(cfg.effective_hwdec, "videotoolbox");
+    assert_eq!(cfg.effective_hwdec, "videotoolbox-copy");
+
+    let rgba8_no_hwdec = RendererOverrides {
+        cli_hwdec: Some("no".to_owned()),
+        force_rgba8: true,
+        ..Default::default()
+    };
+    let cfg_override = PlatformRendererConfig::select(&caps, &rgba8_no_hwdec);
+    assert_eq!(cfg_override.preferred_fbo_formats, vec![VideoColorFormat::Rgba8Unorm]);
+    assert_eq!(cfg_override.effective_hwdec, "no");
 }
 
 #[test]
