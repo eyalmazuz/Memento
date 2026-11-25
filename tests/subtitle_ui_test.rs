@@ -15,7 +15,7 @@ fn outside_click_clears_selection_even_before_a_lookup_opens() {
     app.set_duration(120.);
     app.show().unwrap();
     assert_eq!(app.get_video_width(), 1280, "closed drawers must not reserve video space");
-    assert_eq!(app.get_video_height(), 690, "closed drawers must not enlarge the window");
+    assert_eq!(app.get_video_height(), 720, "floating top menu bar must not reserve video height");
     let cancelled = Rc::new(Cell::new(0));
     let fullscreen = Rc::new(Cell::new(0));
     let video_left_presses = Rc::new(Cell::new(0));
@@ -800,7 +800,7 @@ mod rich_subtitle_phase4_tests {
 
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
-        app.window().set_size(slint::LogicalSize::new(1280.0, 750.0));
+        app.window().set_size(slint::LogicalSize::new(1280.0, 720.0));
         app.set_duration(120.0);
         app.set_osc_visible(false);
         app.set_osc_fade_ms(0);
@@ -842,7 +842,7 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,660)\\an2}鳥白島
         assert!(app.get_primary_subtitle_effective_visible());
 
         // Clicking empty center video (far from top y=80 and bottom y=660) MUST pass straight to video-motion!
-        let mid_pos = slint::LogicalPosition::new(640.0, 390.0); // 30px menu + 360px video center
+        let mid_pos = slint::LogicalPosition::new(640.0, 360.0); // video center (full 1280x720 viewport)
         app.window().dispatch_event(WindowEvent::PointerPressed {
             position: mid_pos,
             button: PointerEventButton::Left,
@@ -904,6 +904,222 @@ Dialogue: 0,0:00:10.00,0:00:15.00,Default,,0,0,0,,{\\pos(640,660)\\an2}鳥白島
         assert_eq!(sb.get_ass_highlight_patches().row_count(), 0);
         assert!(!sb.get_ass_anchor_active());
         assert!(ass.active_lookup().is_none());
+
+        app.hide().unwrap();
+    }
+
+    #[test]
+    fn rich_and_ass_keyboard_subtitle_scan_highlights_anchors_and_tracks_cursor() {
+        use subomi_app::controller::ass::AssOverlayController;
+        use subomi_app::{
+            active_ass_lookup_for_app, active_subtitle_scan_utf16_range,
+            bind_rich_bridge_ass_controller, start_keyboard_subtitle_scan,
+            step_keyboard_subtitle_scan,
+        };
+        use subomi_ass::MpvAssParams;
+
+        i_slint_backend_testing::init_no_event_loop();
+        let fixture = TempSubConfig::new();
+        let config = ConfigController::load(&fixture.dir, "subomi.conf").unwrap();
+        let db_path = fixture.dir.join("dictionaries.sqlite");
+
+        let app = SubomiApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        app.set_duration(120.);
+        app.set_subtitle_cursor_show_enabled(true);
+        install_popup_navigation(&app);
+        install_rich_ui_bridges(&app, &db_path, &fixture.dir, &config);
+        app.show().unwrap();
+
+        let text = "「世界中を旅行する。」";
+        let (requests, _worker) = mpsc::channel();
+        let epoch = Arc::new(AtomicU64::new(0));
+        publish_active_subtitle(&app, text, &requests, &epoch);
+
+        let looked_up: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let looked_up_cb = looked_up.clone();
+        let app_weak = app.as_weak();
+        app.on_lookup_word(move |q| {
+            looked_up_cb.borrow_mut().push(q.to_string());
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            if q.starts_with("界") {
+                // Simulate 0 hits on '界' to verify 1-char cursor highlight persistence.
+                set_dictionary_rows(&app, dictionary_result_rows(&[], &[]));
+                app.set_dict_open(false);
+                return;
+            }
+            let expr = if q.starts_with("世界中") {
+                "世界中".to_owned()
+            } else if q.starts_with("中") {
+                "中".to_owned()
+            } else if q.starts_with("旅行") {
+                "旅行".to_owned()
+            } else {
+                q.chars().next().map(|c| c.to_string()).unwrap_or_default()
+            };
+            let hit = SearchHit {
+                expression: expr.clone(),
+                reading: String::new(),
+                glossary: "test gloss".to_owned(),
+                tags: String::new(),
+                score: 10,
+                is_kanji: false,
+                notes: String::new(),
+                example_ja: String::new(),
+                example_en: String::new(),
+                dict_name: "TestDict".to_owned(),
+                rich_glossary: Vec::new(),
+                derivation: String::new(),
+                derivation_descriptions: Vec::new(),
+                dictionary_id: 1,
+                rules: String::new(),
+                raw_glossary: r#"["test gloss"]"#.to_owned(),
+                term_tags: String::new(),
+                def_tags: String::new(),
+            };
+            set_dictionary_rows(&app, dictionary_result_rows(&[hit], &[]));
+            app.set_dict_query(expr.into());
+            app.set_dict_open(true);
+        });
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+
+        // 1. Start keyboard scan: reveals cursor-show subtitle, skips '「', matches full "世界中" (UTF-16 1..4).
+        assert!(start_keyboard_subtitle_scan(&app));
+        assert!(sb.get_keyboard_scan_active());
+        assert!(
+            app.get_primary_cursor_reveal_active(),
+            "keyboard scan must reveal primary subtitles when subtitle-cursor-show is enabled"
+        );
+        assert_eq!(sb.get_keyboard_scan_char_index(), 1);
+        assert!(app.get_dict_open());
+        assert_eq!(active_subtitle_scan_utf16_range(&app), Some((1, 4)));
+        assert_eq!(looked_up.borrow().last().map(String::as_str), Some("世界中を旅行する。」"));
+        let offset_char1 = app.get_popup_offset_x();
+
+        // 2. Step right onto 0-hit char '界': popup closes, keyboard_scan_active stays true,
+        //    and a crisp 1-character UTF-16 range (2..3) highlights '界'.
+        assert!(step_keyboard_subtitle_scan(&app, 1));
+        assert!(!app.get_dict_open());
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_keyboard_scan_char_index(), 2);
+        assert_eq!(active_subtitle_scan_utf16_range(&app), Some((2, 3)));
+        let offset_char2 = app.get_popup_offset_x();
+        assert!(
+            offset_char2 > offset_char1,
+            "stepping rightward must move popup anchor rightward ({offset_char1} -> {offset_char2})"
+        );
+
+        // Verify token rendering draws selection slice for '界' even when dict_open == false.
+        let font_px = app.get_video_height() as f32 * app.get_subtitle_scale();
+        let words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
+        let sel_token_idx = app.get_selected_token_index() as usize;
+        let metrics = sb.invoke_render_token(
+            words[sel_token_idx].clone(),
+            font_px,
+            false,
+            true,
+            sb.get_style_revision(),
+            sb.get_highlight_revision(),
+        );
+        assert!(
+            metrics.has_selection,
+            "0-hit keyboard cursor must still paint a 1-char selection highlight"
+        );
+
+        // 3. Step right to '中' -> popup re-opens and highlights "中" (3..4).
+        assert!(step_keyboard_subtitle_scan(&app, 1));
+        assert!(app.get_dict_open());
+        assert_eq!(sb.get_keyboard_scan_char_index(), 3);
+        assert_eq!(active_subtitle_scan_utf16_range(&app), Some((3, 4)));
+
+        // 4. Async furigana update preserves selected token while keyboard scanning.
+        apply_subtitle_furigana(
+            &app,
+            text,
+            vec![
+                ("「".into(), "".into()),
+                ("世界".into(), "せかい".into()),
+                ("中".into(), "じゅう".into()),
+                ("を".into(), "".into()),
+                ("旅行".into(), "りょこう".into()),
+                ("する".into(), "".into()),
+                ("。".into(), "".into()),
+                ("」".into(), "".into()),
+            ],
+        );
+        assert!(app.get_selected_token_index() >= 0);
+
+        // 5. Mouse-to-keyboard handoff: simulate mouse click on "旅行" (token 4), then step right -> '行'.
+        let furi_words: Vec<SubtitleWord> = app.get_active_sub_words().iter().collect();
+        sb.invoke_token_left_clicked(furi_words[4].clone(), font_px, false, 4.0, font_px * 0.5);
+        assert!(!sb.get_keyboard_scan_active());
+        assert!(app.get_dict_open());
+        assert!(step_keyboard_subtitle_scan(&app, 1));
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(looked_up.borrow().last().map(String::as_str), Some("行する。」"));
+
+        // 6. Publishing a new subtitle cue resets keyboard scan state.
+        publish_active_subtitle(&app, "別の字幕", &requests, &epoch);
+        assert!(!sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_keyboard_scan_char_index(), -1);
+
+        // 7. Native ASS keyboard subtitle scanning: prioritizes dialogue over positioned signs.
+        let ass_ctrl = Rc::new(RefCell::new(AssOverlayController::new()));
+        bind_rich_bridge_ass_controller(&app, ass_ctrl.clone());
+        let extradata = "\
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans CJK JP,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+";
+        let ass_full = "\
+Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\pos(640,80)}看板
+Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,「世界中」
+";
+        ass_ctrl.borrow_mut().sync_from_playback(
+            &app,
+            true,
+            extradata,
+            ass_full,
+            &MpvAssParams::for_frame(1280, 720),
+            1000,
+            true,
+            0.4,
+        );
+        assert!(sb.get_ass_native_active());
+        assert!(start_keyboard_subtitle_scan(&app));
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(
+            looked_up.borrow().last().map(String::as_str),
+            Some("世界中」"),
+            "ASS keyboard scan must prioritize normal dialogue before positioned signs and skip leading '「'"
+        );
+        assert!(sb.get_ass_anchor_active());
+        assert!(sb.get_ass_highlight_patches().row_count() > 0);
+        let ass_lk = active_ass_lookup_for_app(&app).expect("active ASS lookup must be recorded");
+        assert_eq!(ass_lk.scanned_surface, "世界中");
+
+        // Stepping to 0-hit '界' on ASS keeps a 1-char highlight patch and stays active.
+        assert!(step_keyboard_subtitle_scan(&app, 1));
+        assert!(!app.get_dict_open());
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(looked_up.borrow().last().map(String::as_str), Some("界中」"));
+        assert!(sb.get_ass_highlight_patches().row_count() > 0);
+
+        // Dismiss clears ASS highlight and keyboard scan state.
+        app.invoke_dismiss_definition();
+        assert!(!sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_ass_highlight_patches().row_count(), 0);
 
         app.hide().unwrap();
     }

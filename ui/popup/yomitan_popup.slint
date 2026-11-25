@@ -763,8 +763,12 @@ export component YomitanPopup inherits Rectangle {
     in property <string> jpdb-rank: "";
     in property <[DictResult]> results;
     in property <int> focused-index: 0;
+    in property <int> focus-scroll-seq: 0;
+    in-out property <int> layout-sync-seq: 0;
     in-out property <length> target-scroll-y: 0px;
     out property <length> current-scroll-y: definition-list.viewport-y;
+    out property <length> list-viewport-height: definition-list.viewport-height;
+    out property <length> list-visible-height: definition-list.height;
     in property <bool> has-more-results: false;
     in property <[PopupAudioSource]> audio-sources;
     in property <[int]> audio-source-statuses: PopupBridge.audio-source-statuses;
@@ -786,6 +790,7 @@ export component YomitanPopup inherits Rectangle {
     in property <int> added-result-index: -1;
     in property <bool> render-nested-inline: false;
     private property <bool> programmatic-scroll: false;
+    private property <bool> suppress-target-scroll: false;
     callback close-requested();
     callback add-anki-note(int);
     callback add-to-anki-with-audio(int, int);
@@ -799,6 +804,7 @@ export component YomitanPopup inherits Rectangle {
     callback select-audio-source(int);
     callback open-rich-link(string);
     callback viewport-scrolled(length);
+    callback term-row-y-reported(int, length);
     callback reset-scroll();
     callback load-more-results(bool);
     out property <bool> needs-more: root.is-open && root.has-more-results
@@ -819,14 +825,27 @@ export component YomitanPopup inherits Rectangle {
     drop-shadow-blur: PopupBridge.css-popup-shadow-blur;
     drop-shadow-color: PopupBridge.css-popup-shadow-color;
 
-    changed target-scroll-y => {
+    public function scroll-to-offset(offset: length) {
+        root.scroll-viewport-to(offset);
+        root.suppress-target-scroll = true;
+        root.target-scroll-y = abs(offset);
+        root.suppress-target-scroll = false;
+    }
+
+    function scroll-viewport-to(offset: length) {
         let view-h = definition-list.height;
         let content-h = definition-list.viewport-height;
         let min-vy = content-h > view-h ? (view-h - content-h) : 0px;
-        let clamped = max(min-vy, min(0px, -abs(root.target-scroll-y)));
+        let clamped = max(min-vy, min(0px, -abs(offset)));
         root.programmatic-scroll = true;
         definition-list.viewport-y = clamped;
         root.programmatic-scroll = false;
+    }
+
+    changed target-scroll-y => {
+        if !root.suppress-target-scroll {
+            root.scroll-viewport-to(root.target-scroll-y);
+        }
     }
 
     changed watched-nested-depth => {
@@ -988,8 +1007,18 @@ export component YomitanPopup inherits Rectangle {
                     root.viewport-scrolled(-self.viewport-y);
                 }
             }
-            changed viewport-height => { self.fill-viewport(); }
-            changed height => { self.fill-viewport(); }
+            changed viewport-height => {
+                self.fill-viewport();
+                if root.is-open && self.viewport-height > 0px {
+                    root.layout-sync-seq += 1;
+                }
+            }
+            changed height => {
+                self.fill-viewport();
+                if root.is-open && self.viewport-height > 0px {
+                    root.layout-sync-seq += 1;
+                }
+            }
             definition-content := VerticalLayout {
                 x: 0px;
                 y: 0px;
@@ -1001,10 +1030,28 @@ export component YomitanPopup inherits Rectangle {
                 for res[idx] in root.results : row-wrapper := Rectangle {
                     property <bool> hidden-by-grid: root.use-two-columns && !res.term-start;
                     property <bool> row-hidden: self.hidden-by-grid || (res.collapsed && !res.term-start);
+                    property <bool> is-focused-term: res.term-start && idx == root.focused-index;
+                    property <int> observed-scroll-seq: root.focus-scroll-seq;
+                    property <int> observed-layout-seq: root.layout-sync-seq;
                     width: parent.width - 6px;
                     height: self.row-hidden ? 0px : term-segment.height + ((res.term-end || root.use-two-columns || (res.collapsed && res.term-start)) ? 10px : 0px);
                     visible: !self.row-hidden;
                     background: transparent;
+
+                    changed observed-layout-seq => {
+                        if res.term-start && !self.row-hidden && root.layout-sync-seq > 0 {
+                            root.term-row-y-reported(idx, self.y);
+                        }
+                    }
+                    changed observed-scroll-seq => {
+                        if self.is-focused-term && root.focus-scroll-seq > 0 && definition-list.viewport-height > 0px {
+                            root.term-row-y-reported(idx, self.y);
+                            root.scroll-viewport-to(self.y);
+                            root.suppress-target-scroll = true;
+                            root.target-scroll-y = self.y;
+                            root.suppress-target-scroll = false;
+                        }
+                    }
 
                     term-segment := Rectangle {
                         property <int> row-zero-idx: res.index - 1;
@@ -1086,19 +1133,39 @@ export component YomitanPopup inherits Rectangle {
                             height: self.preferred-height;
                             spacing: root.compact-glossaries ? 2px : 4px;
 
-                            if res.term-start : term-header := HorizontalLayout {
+                            if res.term-start : term-header-frame := Rectangle {
                                 width: parent.width;
-                                spacing: 6px;
-                                min-height: 34px;
-                                property <length> buttons-reserved-w:
-                                    (!res.is-kanji ? 34px : 0px)
-                                    + (root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 34px : 0px)
-                                    + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
-                                    + (term-segment.show-update-btn ? 34px : 0px)
-                                    + 34px;
-                                property <length> avail-title-w: max(96px, card-content.width - self.buttons-reserved-w);
+                                border-radius: 6px;
+                                background: row-wrapper.is-focused-term ? SubomiPalette.accent-subtle : transparent;
+                                border-width: row-wrapper.is-focused-term ? 1px : 0px;
+                                border-color: row-wrapper.is-focused-term ? SubomiPalette.accent-border-subtle : transparent;
 
-                                term-title := TermHeadwordBlock {
+                                // Left accent indicator bar marking the currently focused term for Ctrl+D
+                                if row-wrapper.is-focused-term : Rectangle {
+                                    x: 2px;
+                                    y: 4px;
+                                    width: 3px;
+                                    height: max(12px, parent.height - 8px);
+                                    border-radius: 1.5px;
+                                    background: SubomiPalette.cyan-accent;
+                                }
+
+                                term-header := HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 4px;
+                                    padding-top: 2px;
+                                    padding-bottom: 2px;
+                                    spacing: 6px;
+                                    min-height: 38px;
+                                    property <length> buttons-reserved-w:
+                                        (!res.is-kanji ? 34px : 0px)
+                                        + (root.anki-enabled && !res.is-kanji && res.reading != "" && res.reading != res.expression ? 34px : 0px)
+                                        + (term-segment.show-browse-btn || root.anki-enabled ? 34px : 0px)
+                                        + (term-segment.show-update-btn ? 34px : 0px)
+                                        + 34px;
+                                    property <length> avail-title-w: max(96px, card-content.width - 12px - self.buttons-reserved-w);
+
+                                    term-title := TermHeadwordBlock {
                                     res: res;
                                     nested: false;
                                     compact: root.compact-glossaries;
@@ -1153,7 +1220,7 @@ export component YomitanPopup inherits Rectangle {
                                                 root.audio-menu-anki-row-index = -1;
                                                 root.audio-menu-expression = res.expression;
                                                 root.audio-menu-reading = res.reading;
-                                                root.audio-menu-x = max(8px, min(root.width - 260px, PopupBridge.css-popup-padding + header-actions.x + leading-actions.x + offset-x - 190px));
+                                                root.audio-menu-x = max(8px, min(root.width - 260px, PopupBridge.css-popup-padding + term-header.x + header-actions.x + leading-actions.x + offset-x - 190px));
                                                 root.audio-menu-y = max(36px, min(root.height - 140px, 12px + definition-list.y + definition-list.viewport-y + row-wrapper.y + 38px));
                                                 root.audio-menu-open = true;
                                                 root.request-audio-sources(res.expression, res.reading);
@@ -1287,6 +1354,7 @@ export component YomitanPopup inherits Rectangle {
                                             }
                                         }
                                     }
+                                }
                                 }
                             }
 

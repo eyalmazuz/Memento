@@ -50,6 +50,7 @@ pub use anki::{
     mark_popup_term_anki_added, mark_popup_term_anki_updated, nested_popup_row_anki_note_id_i64,
     popup_row_anki_note_id_i64,
 };
+pub use subtitle::{start_keyboard_subtitle_scan, step_keyboard_subtitle_scan};
 pub use wire::install_rich_ui_bridges;
 
 enum PendingAssHighlightAction {
@@ -544,6 +545,9 @@ impl RichUiBridge {
         self.nested_anki_nav_epoch.fetch_add(1, Ordering::AcqRel);
         self.nested_anki_in_flight.store(0, Ordering::Release);
 
+        let keyboard_scan_active = app
+            .global::<SubtitleOverlayBridge>()
+            .get_keyboard_scan_active();
         let (
             can_back,
             can_fwd,
@@ -621,28 +625,71 @@ impl RichUiBridge {
                 let has_text_filters =
                     !st.settings.remove_regex.is_empty() || st.settings.replace_lines;
                 if let Some(utf16_start) = st.pending_scan_utf16_start.take() {
-                    let matched_u16 = compute_subtitle_lookup_match_u16(
-                        &mut st.dict_ctrl,
-                        candidate_hits.first(),
-                        pending_sub.as_deref(),
-                        has_text_filters,
-                    );
-                    st.active_scan_utf16_range = Some((utf16_start, utf16_start + matched_u16));
+                    if rows.is_empty() {
+                        if keyboard_scan_active {
+                            let cursor_u16 = pending_sub
+                                .as_deref()
+                                .and_then(|s| s.chars().next())
+                                .map_or(1, char::len_utf16);
+                            st.active_scan_utf16_range =
+                                Some((utf16_start, utf16_start + cursor_u16));
+                        } else {
+                            st.active_scan_utf16_range = None;
+                        }
+                    } else {
+                        let matched_u16 = compute_subtitle_lookup_match_u16(
+                            &mut st.dict_ctrl,
+                            candidate_hits.first(),
+                            pending_sub.as_deref(),
+                            has_text_filters,
+                        );
+                        st.active_scan_utf16_range =
+                            Some((utf16_start, utf16_start + matched_u16));
+                    }
                     st.pending_ass_scan = None;
                 } else if let Some(ass_target) = st.pending_ass_scan.take() {
-                    let matched_u16 = compute_subtitle_lookup_match_u16(
-                        &mut st.dict_ctrl,
-                        candidate_hits.first(),
-                        pending_sub.as_deref(),
-                        has_text_filters,
-                    );
-                    ass_action = Some(PendingAssHighlightAction::Apply(ass_target, matched_u16));
+                    if rows.is_empty() {
+                        if keyboard_scan_active {
+                            let cursor_u16 = ass_target.ch.len_utf16().max(1);
+                            ass_action =
+                                Some(PendingAssHighlightAction::Apply(ass_target, cursor_u16));
+                        } else {
+                            ass_action = Some(PendingAssHighlightAction::Clear);
+                        }
+                    } else {
+                        let matched_u16 = compute_subtitle_lookup_match_u16(
+                            &mut st.dict_ctrl,
+                            candidate_hits.first(),
+                            pending_sub.as_deref(),
+                            has_text_filters,
+                        );
+                        ass_action =
+                            Some(PendingAssHighlightAction::Apply(ass_target, matched_u16));
+                    }
+                } else if rows.is_empty() && !keyboard_scan_active {
+                    st.active_scan_utf16_range = None;
+                    ass_action = Some(PendingAssHighlightAction::Clear);
                 }
             } else {
                 st.current_hits.clear();
-                st.pending_scan_utf16_start = None;
-                st.pending_scan_sub_query = None;
-                if st.pending_ass_scan.take().is_some() || rows.is_empty() {
+                let pending_sub = st.pending_scan_sub_query.take();
+                let pending_utf16 = st.pending_scan_utf16_start.take();
+                let pending_ass = st.pending_ass_scan.take();
+                if rows.is_empty() && keyboard_scan_active {
+                    if let Some(utf16_start) = pending_utf16 {
+                        let cursor_u16 = pending_sub
+                            .as_deref()
+                            .and_then(|s| s.chars().next())
+                            .map_or(1, char::len_utf16);
+                        st.active_scan_utf16_range = Some((utf16_start, utf16_start + cursor_u16));
+                    } else if let Some(ass_target) = pending_ass {
+                        let cursor_u16 = ass_target.ch.len_utf16().max(1);
+                        ass_action = Some(PendingAssHighlightAction::Apply(ass_target, cursor_u16));
+                    }
+                } else if pending_ass.is_some() || rows.is_empty() {
+                    if rows.is_empty() {
+                        st.active_scan_utf16_range = None;
+                    }
                     ass_action = Some(PendingAssHighlightAction::Clear);
                 }
             }
@@ -1172,12 +1219,17 @@ pub fn bind_rich_bridge_ass_controller(
     }
 }
 
-/// Immediately clears any active ASS lookup highlight / anchor on the bound `AssOverlayController`.
+/// Immediately clears any active ASS/keyboard subtitle lookup highlight, cursor, and anchor.
 pub fn clear_rich_bridge_ass_lookup(app: &SubomiApp) {
     let bridge = active_rich_bridge_for_app(app);
     let ass_ctrl = bridge.as_ref().and_then(|bridge| {
         let mut st = bridge.state.borrow_mut();
+        st.scan_timer.stop();
+        st.keyboard_scan_cursor = None;
         st.pending_ass_scan = None;
+        st.active_scan_utf16_range = None;
+        st.pending_scan_utf16_start = None;
+        st.pending_scan_sub_query = None;
         st.ass_controller.clone()
     });
     if let Some(ass_ctrl) = ass_ctrl {
@@ -1185,6 +1237,14 @@ pub fn clear_rich_bridge_ass_lookup(app: &SubomiApp) {
             ctrl.clear_lookup_highlight(app);
         }
     }
+    let sb = app.global::<SubtitleOverlayBridge>();
+    if sb.get_keyboard_scan_active() {
+        sb.set_keyboard_scan_active(false);
+    }
+    if sb.get_keyboard_scan_char_index() != -1 {
+        sb.set_keyboard_scan_char_index(-1);
+    }
+    sb.set_highlight_revision(sb.get_highlight_revision().wrapping_add(1));
     if let Some(bridge) = bridge {
         bridge.schedule_idle_memory_shrink_if_closed(app);
     }

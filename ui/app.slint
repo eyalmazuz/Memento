@@ -116,6 +116,9 @@ export component SubomiApp inherits Window {
     in-out property <bool> search-replace-lines: false;
     in-out property <string> search-replace-with: "";
     out property <bool> menu-open: menu-bar.open-menu >= 0;
+    out property <bool> sidebar-hovered:
+        sidebar-bg-touch.has-hover || sub-drawer.is-hovered
+        || root.split-v-hovered || split-h-touch.has-hover;
     out property <bool> osc-hovered:
         osc.is-hovered || menu-bar.is-hovered || root.menu-open
         || subtitle-hover-area.has-hover || secondary-hover-area.has-hover
@@ -201,10 +204,15 @@ export component SubomiApp inherits Window {
     in-out property <[DictResult]> popup-results: [];
     in-out property <int> popup-loaded-count: 0;
     in-out property <int> popup-focused-index: 0;
+    in-out property <int> popup-focus-scroll-seq: 0;
+    in-out property <int> popup-layout-sync-seq: 0;
     in-out property <length> popup-target-scroll-y: 0px;
     in-out property <length> popup-configured-width: 480px;
     in-out property <length> popup-configured-height: 440px;
     out property <bool> popup-needs-more: yomi-card.needs-more;
+    out property <length> popup-list-viewport-height: yomi-card.list-viewport-height;
+    out property <length> popup-list-visible-height: yomi-card.list-visible-height;
+    out property <length> popup-current-scroll-y: yomi-card.current-scroll-y;
     out property <length> popup-x: yomi-card.x;
     out property <length> popup-y: yomi-card.y;
     out property <length> popup-width: yomi-card.width;
@@ -316,6 +324,8 @@ export component SubomiApp inherits Window {
     callback video-pointer-button(float, float, int, bool, bool, bool, bool, bool);
     callback video-wheel(float, float, float, float);
     callback osc-activity();
+    callback osc-rearm-hide();
+    callback cursor-hidden-changed(bool);
     callback select-row(int, bool);
     callback subtitle-row-clicked-mod(int, int, bool, bool);
     callback subtitle-row-lookup(int, int, int, length, length);
@@ -343,7 +353,9 @@ export component SubomiApp inherits Window {
     callback toggle-reading-as-expression(int);
     callback load-more-definition-results(bool);
     callback navigate-popup(int);
+    callback scroll-popup-to-y(length);
     callback popup-viewport-scrolled(length);
+    callback popup-term-row-y-reported(int, length);
     callback add-anki-note(int);
     callback add-to-anki-with-audio(int, int);
     callback browse-anki-note(string);
@@ -360,7 +372,10 @@ export component SubomiApp inherits Window {
         root.selected-token-index = -1;
         root.selected-token-count = 1;
         root.popup-focused-index = 0;
+        root.popup-focus-scroll-seq = 0;
         root.popup-offset-x = 0px;
+        SubtitleOverlayBridge.keyboard-scan-active = false;
+        SubtitleOverlayBridge.keyboard-scan-char-index = -1;
         SubtitleOverlayBridge.ass-highlight-patches = [];
         SubtitleOverlayBridge.ass-anchor-active = false;
         // Cancel delayed hover searches and invalidate results already in flight.
@@ -388,10 +403,49 @@ export component SubomiApp inherits Window {
         Palette.color-scheme = root.is-light-theme ? ColorScheme.light : ColorScheme.dark;
     }
 
+    changed cursor-hidden => {
+        root.cursor-hidden-changed(root.cursor-hidden);
+    }
+
+    changed duration => {
+        if root.duration > 0.0 {
+            root.osc-rearm-hide();
+        } else {
+            root.cursor-hidden = false;
+        }
+    }
+
+    changed osc-hovered => {
+        if root.osc-hovered {
+            root.cursor-hidden = false;
+        } else {
+            root.osc-rearm-hide();
+        }
+    }
+
+    changed sidebar-hovered => {
+        if root.sidebar-hovered {
+            root.cursor-hidden = false;
+        } else {
+            root.osc-rearm-hide();
+        }
+    }
+
+    changed menu-open => {
+        if root.menu-open {
+            root.cursor-hidden = false;
+        } else {
+            root.osc-rearm-hide();
+        }
+    }
+
     changed ocr-mode => {
         if root.ocr-mode {
+            root.cursor-hidden = false;
             menu-bar.open-menu = -1;
             root.dismiss-definition();
+        } else {
+            root.osc-rearm-hide();
         }
     }
 
@@ -409,8 +463,13 @@ export component SubomiApp inherits Window {
 
     reset-definition-scroll => {
         root.popup-focused-index = 0;
+        root.popup-focus-scroll-seq = 0;
         root.popup-target-scroll-y = 0px;
         yomi-card.reset-scroll();
+    }
+
+    scroll-popup-to-y(offset) => {
+        yomi-card.scroll-to-offset(offset);
     }
     pure callback format-timestamp(float) -> string;
 
@@ -435,7 +494,7 @@ export component SubomiApp inherits Window {
         !root.ocr-mode
         && SubtitleOverlayBridge.ass-native-active
         && root.subtitles-visible
-        && !(root.hide-subomi-while-playing && root.is-playing)
+        && !(root.hide-subomi-while-playing && root.is-playing && !SubtitleOverlayBridge.keyboard-scan-active)
         && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
     property <bool> primary-cursor-reveal:
         root.subtitle-cursor-show-enabled
@@ -443,6 +502,7 @@ export component SubomiApp inherits Window {
             || subtitle-hover-area.has-hover
             || root.token-hovered
             || SubtitleOverlayBridge.ass-hovered
+            || SubtitleOverlayBridge.keyboard-scan-active
             || hover-bridge.has-hover
             || osc.is-hovered
             || (root.dict-open && root.subtitle-hover-latched));
@@ -469,6 +529,7 @@ export component SubomiApp inherits Window {
     }
     property <bool> effective-subtitle-hover:
         root.direct-subtitle-hovered
+        || SubtitleOverlayBridge.keyboard-scan-active
         || (root.subtitle-hover-latched
             && root.dict-open
             && root.popup-results.length > 0
@@ -479,33 +540,47 @@ export component SubomiApp inherits Window {
 
     changed url-dialog-open => {
         if root.url-dialog-open {
+            root.cursor-hidden = false;
             url-modal.focus-input();
         } else {
             f-scope.focus();
+            root.osc-rearm-hide();
         }
     }
     changed about-open => {
-        if !root.about-open {
+        if root.about-open {
+            root.cursor-hidden = false;
+        } else {
             f-scope.focus();
+            root.osc-rearm-hide();
         }
     }
     changed update-dialog-open => {
-        if !root.update-dialog-open {
+        if root.update-dialog-open {
+            root.cursor-hidden = false;
+        } else {
             f-scope.focus();
+            root.osc-rearm-hide();
         }
     }
     changed no-dicts-dialog-open => {
-        if !root.no-dicts-dialog-open {
+        if root.no-dicts-dialog-open {
+            root.cursor-hidden = false;
+        } else {
             f-scope.focus();
+            root.osc-rearm-hide();
         }
     }
     changed sub-drawer-open => {
-        if !root.sub-drawer-open {
+        if root.sub-drawer-open {
+            root.cursor-hidden = false;
+        } else {
             f-scope.focus();
         }
     }
     changed dict-search-open => {
         if root.dict-search-open {
+            root.cursor-hidden = false;
             root.dict-query = "";
             root.dict-results = [];
             root.dismiss-definition();
@@ -514,11 +589,14 @@ export component SubomiApp inherits Window {
         }
     }
     changed dict-open => {
-        if !root.dict-open {
+        if root.dict-open {
+            root.cursor-hidden = false;
+        } else {
             root.subtitle-hover-latched = false;
             if !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
                 f-scope.focus();
             }
+            root.osc-rearm-hide();
         }
     }
     changed active-sub-lines => {
@@ -730,22 +808,12 @@ export component SubomiApp inherits Window {
             reject
         }
 
-        // Window Content Layout
+        // Window Content Layout (full viewport height; TopMenuBar floats above like bottom OSC)
         VerticalLayout {
             width: 100%;
             height: 100%;
             padding-bottom: root.window-bottom-margin;
             spacing: 0;
-
-            // Top Native Menu Bar (hidden whenever OCR mode is active)
-            menu-bar := TopMenuBar {
-                property <bool> target-visible: !root.ocr-mode && (root.osc-visible || self.open-menu >= 0);
-                opacity: self.target-visible ? 1.0 : 0.0;
-                animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
-                visible: !root.ocr-mode && (self.target-visible || self.opacity > 0.01);
-                activity => { root.osc-activity(); }
-                interacted => { root.dismiss-definition(); }
-            }
 
             // Center Area: Video Surface + Optional Resizable Sidebar (Search + Subtitle Drawer)
             HorizontalLayout {
@@ -773,20 +841,24 @@ export component SubomiApp inherits Window {
                     video-motion := TouchArea {
                         width: 100%;
                         height: 100%;
-                        // Windowed & fullscreen cursor auto-hide controlled uniformly by `root.cursor-hidden` (H3.4)
-                        mouse-cursor: root.cursor-hidden ? none : default;
+                        // Keep `mouse-cursor: default` so Slint does not race `winit_window.set_cursor_visible`
+                        // before `pointer-event` runs; OS cursor visibility is driven directly from
+                        // `root.cursor-hidden` via `window_chrome.rs`.
+                        mouse-cursor: default;
                         changed has-hover => {
                             if !self.has-hover {
                                 root.cursor-in-top-sub-zone = false;
                                 root.cursor-in-bottom-sub-zone = false;
                             }
-                            if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered {
+                            if self.has-hover && !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered && !SubtitleOverlayBridge.keyboard-scan-active {
                                 root.subtitle-hover-changed(false);
                             }
                         }
                         pointer-event(event) => {
                             if event.kind == PointerEventKind.move {
-                                root.cursor-hidden = false;
+                                if !root.osc-mpv-cursor && root.osc-min-move <= 0 {
+                                    root.cursor-hidden = false;
+                                }
                                 if video-area.height > 0px {
                                     let y-ratio = self.mouse-y / video-area.height;
                                     root.cursor-in-top-sub-zone = y-ratio >= 0.0 && y-ratio <= 0.25;
@@ -795,12 +867,14 @@ export component SubomiApp inherits Window {
                                     root.cursor-in-top-sub-zone = false;
                                     root.cursor-in-bottom-sub-zone = false;
                                 }
-                                if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered {
+                                if !subtitle-hover-area.has-hover && !secondary-hover-area.has-hover && !root.token-hovered && !SubtitleOverlayBridge.ass-hovered && !SubtitleOverlayBridge.keyboard-scan-active {
                                     root.subtitle-hover-changed(false);
                                 }
                                 root.pointer-moved(self.mouse-x / 1px, self.mouse-y / 1px);
                             } else if event.kind == PointerEventKind.down || event.kind == PointerEventKind.up {
-                                root.cursor-hidden = false;
+                                if !root.osc-mpv-cursor {
+                                    root.cursor-hidden = false;
+                                }
                                 f-scope.focus();
                                 let btn = event.button == PointerEventButton.left ? 1
                                     : event.button == PointerEventButton.right ? 2
@@ -1137,7 +1211,7 @@ export component SubomiApp inherits Window {
                             && !SubtitleOverlayBridge.ass-native-active
                             && root.active-sub-text != ""
                             && root.subtitles-visible
-                            && !(root.hide-subomi-while-playing && root.is-playing)
+                            && !(root.hide-subomi-while-playing && root.is-playing && !SubtitleOverlayBridge.keyboard-scan-active)
                             && (!root.subtitle-cursor-show-enabled || root.primary-cursor-reveal);
                         x: (parent.width - self.width) / 2;
                         // Allow subtitles all the way down to 4px bottom margin (removed 62px clamp — H3.7)
@@ -1294,6 +1368,8 @@ export component SubomiApp inherits Window {
                         jpdb-rank: root.dict-jpdb-rank;
                         results: root.dict-open ? root.popup-results : [];
                         focused-index: root.popup-focused-index;
+                        focus-scroll-seq: root.popup-focus-scroll-seq;
+                        layout-sync-seq <=> root.popup-layout-sync-seq;
                         target-scroll-y <=> root.popup-target-scroll-y;
                         has-more-results: root.popup-loaded-count < root.dict-results.length;
                         audio-sources: root.popup-audio-sources;
@@ -1314,6 +1390,7 @@ export component SubomiApp inherits Window {
                             PopupBridge.toggle-reading-as-expression(idx);
                         }
                         viewport-scrolled(sy) => { root.popup-viewport-scrolled(sy); }
+                        term-row-y-reported(idx, row-y) => { root.popup-term-row-y-reported(idx, row-y); }
                         load-more-results(force) => { root.load-more-definition-results(force); }
                         select-audio-source(idx) => { root.popup-selected-audio-source = idx; }
                         open-rich-link(link) => { root.open-glossary-link(link); }
@@ -1879,14 +1956,29 @@ export component SubomiApp inherits Window {
             }
         }
 
-        // Dismiss overlay when any menu is open (click outside menu bar to close)
+        // Dismiss overlay when any menu is open (click anywhere outside menu bar or dropdown to close)
         if menu-bar.open-menu >= 0 : TouchArea {
-            y: 30px;
+            x: 0px;
+            y: 0px;
             width: 100%;
-            height: parent.height - 30px;
+            height: 100%;
             clicked => {
                 menu-bar.open-menu = -1;
             }
+        }
+
+        // Top Native Menu Bar floating overlay (hidden whenever OCR mode is active; never reserves video height)
+        menu-bar := TopMenuBar {
+            x: 0px;
+            y: 0px;
+            width: video-area.width;
+            height: 30px;
+            property <bool> target-visible: !root.ocr-mode && (root.osc-visible || self.open-menu >= 0);
+            opacity: self.target-visible ? 1.0 : 0.0;
+            animate opacity { duration: max(0, root.osc-fade-ms) * 1ms; }
+            visible: !root.ocr-mode && (self.target-visible || self.opacity > 0.01);
+            activity => { root.osc-activity(); }
+            interacted => { root.dismiss-definition(); }
         }
 
         // Dropdown Menus Overlay (lazily instantiated only while a menu is open)

@@ -74,6 +74,8 @@ export global SubtitleOverlayBridge {
     in-out property <int> hovered-char-offset: -1;
     in-out property <int> hovered-global-char-index: -1;
     in-out property <string> hovered-query: "";
+    in-out property <bool> keyboard-scan-active: false;
+    in-out property <int> keyboard-scan-char-index: -1;
     in-out property <bool> middle-mouse-scan-enabled: false;
 
     // Native libmpv/libass interactive overlay state

@@ -10,10 +10,10 @@ These overrides are only for custom native installations:
 * `ORT_LIB_LOCATION`: an ONNX Runtime 1.22.0 installation or its library directory,
   instead of downloading the official CPU runtime with `--features asr-onnx`.
 * `SUBOMI_WHISPER_BUILD_DIR`: a prepared build containing
-  `_deps/whispercpp-build`, instead of Cargo building Whisper 1.9.4.
+  `_deps/whispercpp-build`, instead of Cargo building Whisper 1.9.6.
   Select matching `whisper-cuda`/`whisper-vulkan` features for GPU libraries.
 * `WHISPER_INCLUDE_DIR` and `GGML_INCLUDE_DIR`: matching headers when using a
-  custom Whisper build. Otherwise the checked-in 1.9.4 bindings are used.
+  custom Whisper build. Otherwise the checked-in 1.9.6 bindings are used.
 * `CUDA_HOME` / `CUDA_PATH`: CUDA toolkit location when it is outside the usual
   installation paths. `CMAKE_CUDA_ARCHITECTURES` optionally selects CUDA targets.
 

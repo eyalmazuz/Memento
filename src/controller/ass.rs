@@ -264,6 +264,12 @@ fn clear_slint_overlay_state(sb: &SubtitleOverlayBridge, clear_native_active: bo
     sb.set_ass_ruby_items(Rc::new(VecModel::from(Vec::<AssRubyItem>::new())).into());
     sb.set_ass_anchor_active(false);
     sb.set_ass_hovered(false);
+    if sb.get_keyboard_scan_active() {
+        sb.set_keyboard_scan_active(false);
+    }
+    if sb.get_keyboard_scan_char_index() != -1 {
+        sb.set_keyboard_scan_char_index(-1);
+    }
 }
 
 impl AssOverlayController {
@@ -458,6 +464,12 @@ impl AssOverlayController {
                                 Rc::new(VecModel::from(Vec::<AssHighlightPatch>::new())).into(),
                             );
                             sb.set_ass_anchor_active(false);
+                            if sb.get_keyboard_scan_active() {
+                                sb.set_keyboard_scan_active(false);
+                            }
+                            if sb.get_keyboard_scan_char_index() != -1 {
+                                sb.set_keyboard_scan_char_index(-1);
+                            }
                         }
                         self.push_hitboxes(app, &transform);
                         if !cue_text_changed {
@@ -648,6 +660,64 @@ impl AssOverlayController {
             line_rect: hit.line_rect,
             char_box: hit.char_box,
         })
+    }
+
+    /// Return all lookupable characters across currently active ASS events in deterministic
+    /// reading order (standard dialogue events first, positioned/sign events after, then
+    /// visual line and character order) for keyboard-driven subtitle scanning.
+    pub fn scannable_targets(&self) -> Vec<AssHoveredTarget> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        let mut ordered_events: Vec<&subomi_ass::AssActiveEvent> = layout
+            .events
+            .iter()
+            .filter(|ev| !ev.is_drawing_only && !ev.lines.is_empty())
+            .collect();
+        ordered_events.sort_by_key(|ev| (ev.is_rotated_or_sign, ev.has_explicit_pos, ev.event_index));
+
+        let mut targets = Vec::new();
+        for ev in ordered_events {
+            for line in &ev.lines {
+                let start = line.char_start.min(ev.chars.len());
+                let end = line.char_end.min(ev.chars.len());
+                for char_index in start..end {
+                    let c = &ev.chars[char_index];
+                    if c.is_whitespace || !subomi_ass::is_japanese_or_alnum_lookup_char(c.ch) {
+                        continue;
+                    }
+                    let scan_substring = ev
+                        .plain_text
+                        .get(c.byte_offset..)
+                        .unwrap_or("")
+                        .to_owned();
+                    if scan_substring.trim().is_empty() {
+                        continue;
+                    }
+                    let global_byte_offset = ev.global_byte_offset + c.byte_offset;
+                    let global_char_index = layout
+                        .combined_plain_text
+                        .get(..global_byte_offset)
+                        .map_or(char_index, |prefix| prefix.chars().count());
+                    targets.push(AssHoveredTarget {
+                        event_index: ev.event_index,
+                        line_index: line.line_index,
+                        char_index,
+                        ch: c.ch,
+                        event_byte_offset: c.byte_offset,
+                        event_utf16_offset: c.utf16_offset,
+                        global_char_index,
+                        scan_substring,
+                        event_plain_text: ev.plain_text.clone(),
+                        event_start_s: ev.dialogue.start_ms as f64 / 1000.0,
+                        event_end_s: ev.dialogue.end_ms as f64 / 1000.0,
+                        line_rect: line.ink_rect,
+                        char_box: c.clone(),
+                    });
+                }
+            }
+        }
+        targets
     }
 
     /// Render the solid `#38a6d6` highlight bar(s) + crisp `libass` glyph patch(es) for a

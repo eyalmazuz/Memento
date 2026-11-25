@@ -1796,7 +1796,10 @@ fn wire_subtitle_bridge(app: &SubomiApp, bridge: &Rc<RichUiBridge>) {
                 b_ptr_hover.state.borrow_mut().scan_timer.stop();
                 return;
             }
-            if app.get_dict_open() && app.get_selected_token_index() >= 0 && !mod_held {
+            if (app.get_dict_open() || sb.get_keyboard_scan_active())
+                && app.get_selected_token_index() >= 0
+                && !mod_held
+            {
                 return;
             }
             if prev_global == cluster.global_char_index as i32 && app.get_dict_open() {
@@ -1990,7 +1993,10 @@ fn wire_subtitle_bridge(app: &SubomiApp, bridge: &Rc<RichUiBridge>) {
             b_ass_hover.state.borrow_mut().scan_timer.stop();
             return;
         }
-        if app.get_dict_open() && app.get_selected_token_index() >= 0 && !mod_held {
+        if (app.get_dict_open() || sb.get_keyboard_scan_active())
+            && app.get_selected_token_index() >= 0
+            && !mod_held
+        {
             return;
         }
         if same_char && app.get_dict_open() {
@@ -2276,6 +2282,7 @@ pub fn install_rich_ui_bridges(
             pending_panel_anki_adds: VecDeque::new(),
             hovered_cluster: None,
             hovered_ass_target: None,
+            keyboard_scan_cursor: None,
             pending_ass_scan: None,
             ass_controller: None,
             active_scan_utf16_range: None,

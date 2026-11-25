@@ -242,11 +242,31 @@ fn is_overlay_interactive(app: &SubomiApp) -> bool {
     app.get_menu_open()
         || app.get_dict_open()
         || app.get_osc_hovered()
+        || app.get_sidebar_hovered()
         || app.get_ocr_mode()
         || app.get_about_open()
         || app.get_url_dialog_open()
         || app.get_update_dialog_open()
         || app.get_no_dicts_dialog_open()
+}
+
+/// Apply cursor visibility directly to the underlying winit window.
+///
+/// Slint only pushes `TouchArea::mouse-cursor` updates inside pointer input
+/// handling, so timer-driven cursor hiding must call `winit::window::Window::set_cursor_visible`
+/// directly for the OS cursor (Wayland, X11, Windows, macOS) to disappear
+/// immediately alongside the OSC.
+fn sync_os_cursor_visibility(window: &slint::Window, hidden: bool) {
+    let _ = window.with_winit_window(|winit_window| {
+        winit_window.set_cursor_visible(!hidden);
+    });
+}
+
+fn set_cursor_hidden_and_sync_os(app: &SubomiApp, hidden: bool) {
+    if app.get_cursor_hidden() != hidden {
+        app.set_cursor_hidden(hidden);
+    }
+    sync_os_cursor_visibility(app.window(), hidden);
 }
 
 fn current_mpv_cursor_policy(
@@ -504,9 +524,24 @@ pub(crate) fn install_window_chrome_handlers(
             WinitWindowEvent::ThemeChanged(_) => {
                 refresh_player_preferences(&app, &winit_config);
             }
+            WinitWindowEvent::CursorLeft { .. } | WinitWindowEvent::Focused(false) => {
+                set_cursor_hidden_and_sync_os(&app, false);
+            }
+            WinitWindowEvent::CursorEntered { .. } => {
+                if !app.get_cursor_hidden() {
+                    sync_os_cursor_visibility(slint_window, false);
+                }
+            }
             _ => {}
         }
         EventResult::Propagate
+    });
+
+    let cursor_sync_app = app.as_weak();
+    app.on_cursor_hidden_changed(move |hidden| {
+        if let Some(app) = cursor_sync_app.upgrade() {
+            sync_os_cursor_visibility(app.window(), hidden);
+        }
     });
 
     let arm_cursor_timer: Rc<dyn Fn(&SubomiApp)> = {
@@ -527,17 +562,13 @@ pub(crate) fn install_window_chrome_handlers(
                     overlay_interactive,
                 ) {
                     timer.stop();
-                    if !app.get_cursor_hidden() {
-                        app.set_cursor_hidden(true);
-                    }
+                    set_cursor_hidden_and_sync_os(app, true);
                     return;
                 }
                 let Some(delay_ms) = mpv_cursor_timer_delay_ms(autohide, fs_only, fullscreen)
                 else {
                     timer.stop();
-                    if app.get_cursor_hidden() {
-                        app.set_cursor_hidden(false);
-                    }
+                    set_cursor_hidden_and_sync_os(app, false);
                     return;
                 };
                 let timer_app = app.as_weak();
@@ -563,9 +594,7 @@ pub(crate) fn install_window_chrome_handlers(
                         elapsed_ms,
                         overlay_interactive,
                     );
-                    if app.get_cursor_hidden() != hide {
-                        app.set_cursor_hidden(hide);
-                    }
+                    set_cursor_hidden_and_sync_os(&app, hide);
                     // If an overlay is temporarily blocking hide or elapsed hasn't reached
                     // the configured timeout yet, keep re-checking cleanly until hidden.
                     if !hide {
@@ -579,37 +608,9 @@ pub(crate) fn install_window_chrome_handlers(
                     }
                 });
             } else {
-                let duration_ms = app.get_osc_duration_ms().max(50) as u64;
-                let timer_app = app.as_weak();
-                let timer_activity = activity.clone();
-                timer.start(
-                    slint::TimerMode::SingleShot,
-                    Duration::from_millis(duration_ms),
-                    move || {
-                        let Some(app) = timer_app.upgrade() else {
-                            return;
-                        };
-                        if app.get_osc_mpv_cursor() {
-                            return;
-                        }
-                        let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
-                        let overlay_interactive = is_overlay_interactive(&app);
-                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
-                        let hide = compute_cursor_should_hide(
-                            false,
-                            CursorAutohide::Never,
-                            false,
-                            fullscreen,
-                            app.get_duration() > 0.0,
-                            elapsed_ms,
-                            app.get_osc_duration_ms().max(50) as u64,
-                            overlay_interactive,
-                        );
-                        if hide && !app.get_cursor_hidden() {
-                            app.set_cursor_hidden(true);
-                        }
-                    },
-                );
+                // When following Subomi's OSC timer (`!osc_mpv_cursor`), `osc_timer` hides both
+                // the OSC and the cursor together in lockstep so they can never drift apart.
+                timer.stop();
             }
         })
     };
@@ -624,6 +625,7 @@ pub(crate) fn install_window_chrome_handlers(
             let timer_app = app.as_weak();
             let timer_coord = coord_rc.clone();
             let timer_activity = activity.clone();
+            let timer_self = timer.clone();
             timer.start(
                 slint::TimerMode::SingleShot,
                 Duration::from_millis(duration_ms),
@@ -631,6 +633,16 @@ pub(crate) fn install_window_chrome_handlers(
                     let Some(app) = timer_app.upgrade() else {
                         return;
                     };
+                    let duration_ms = app.get_osc_duration_ms().max(50) as u64;
+                    let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
+                    // Guard against early timer wake-ups / millisecond truncation (e.g. 699ms
+                    // elapsed for a 700ms timeout) so OSC and cursor always hide together.
+                    if elapsed_ms < duration_ms {
+                        let remaining = (duration_ms - elapsed_ms).max(1);
+                        timer_self.set_interval(Duration::from_millis(remaining));
+                        timer_self.restart();
+                        return;
+                    }
                     let win_fs = app.window().is_fullscreen();
                     let fullscreen = win_fs || app.get_is_fullscreen();
                     if win_fs && !app.get_is_fullscreen() {
@@ -650,7 +662,6 @@ pub(crate) fn install_window_chrome_handlers(
                     }
                     let overlay_interactive = is_overlay_interactive(&app);
                     if !app.get_osc_mpv_cursor() {
-                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
                         let hide = compute_cursor_should_hide(
                             false,
                             CursorAutohide::Never,
@@ -658,15 +669,14 @@ pub(crate) fn install_window_chrome_handlers(
                             fullscreen,
                             app.get_duration() > 0.0,
                             elapsed_ms,
-                            app.get_osc_duration_ms().max(50) as u64,
+                            duration_ms,
                             overlay_interactive,
                         );
-                        if hide && !app.get_cursor_hidden() {
-                            app.set_cursor_hidden(true);
+                        if hide {
+                            set_cursor_hidden_and_sync_os(&app, true);
                         }
                     } else {
                         let (autohide, fs_only) = current_mpv_cursor_policy(&timer_coord);
-                        let elapsed_ms = timer_activity.get().elapsed().as_millis() as u64;
                         let hide = mpv_cursor_should_hide(
                             autohide,
                             fs_only,
@@ -674,9 +684,7 @@ pub(crate) fn install_window_chrome_handlers(
                             elapsed_ms,
                             overlay_interactive,
                         );
-                        if app.get_cursor_hidden() != hide {
-                            app.set_cursor_hidden(hide);
-                        }
+                        set_cursor_hidden_and_sync_os(&app, hide);
                     }
                 },
             );
@@ -704,8 +712,6 @@ pub(crate) fn install_window_chrome_handlers(
         if app.get_cursor_in_bottom_sub_zone() != in_bottom {
             app.set_cursor_in_bottom_sub_zone(in_bottom);
         }
-        // Counteract Slint's unconditional `root.cursor-hidden = false` on move when
-        // `osc-mpv-cursor` is enabled and mpv's `cursor-autohide=always` is active (H3.4).
         let fullscreen = app.window().is_fullscreen() || app.get_is_fullscreen();
         let overlay_interactive = is_overlay_interactive(&app);
         let (autohide, fs_only) = current_mpv_cursor_policy(&pointer_coord);
@@ -717,7 +723,7 @@ pub(crate) fn install_window_chrome_handlers(
             overlay_interactive,
         );
         if keep_hidden {
-            app.set_cursor_hidden(true);
+            set_cursor_hidden_and_sync_os(&app, true);
         }
         if !app.get_dict_open()
             && !app.get_menu_open()
@@ -752,8 +758,8 @@ pub(crate) fn install_window_chrome_handlers(
             return;
         }
         pointer_activity.set(now);
-        if !keep_hidden && app.get_cursor_hidden() {
-            app.set_cursor_hidden(false);
+        if !keep_hidden {
+            set_cursor_hidden_and_sync_os(&app, false);
         }
         if app.get_osc_visibility_mode() != 2 {
             app.set_osc_visible(true);
@@ -765,10 +771,16 @@ pub(crate) fn install_window_chrome_handlers(
     let button_mpv = mpv.clone();
     let button_coord = coordinator.clone();
     let button_render_size = current_render_size.clone();
+    let button_arm_osc = arm_osc_timer.clone();
+    let button_activity = last_pointer_activity.clone();
     app.on_video_pointer_button(move |x, y, qt_button, pressed, control, shift, alt, meta| {
         let Some(app) = button_app.upgrade() else {
             return;
         };
+        if pressed {
+            button_activity.set(Instant::now());
+            button_arm_osc(&app);
+        }
         let (Ok(player_ref), Ok(mut coord_ref)) =
             (button_mpv.try_borrow(), button_coord.try_borrow_mut())
         else {
@@ -823,8 +835,8 @@ pub(crate) fn install_window_chrome_handlers(
     });
 
     let activity_app = app.as_weak();
-    let activity_arm_osc = arm_osc_timer;
-    let activity_pointer_ts = last_pointer_activity;
+    let activity_arm_osc = arm_osc_timer.clone();
+    let activity_pointer_ts = last_pointer_activity.clone();
     let activity_coord = coordinator.clone();
     app.on_osc_activity(move || {
         let Some(app) = activity_app.upgrade() else {
@@ -841,15 +853,22 @@ pub(crate) fn install_window_chrome_handlers(
             fullscreen,
             overlay_interactive,
         );
-        if keep_hidden {
-            app.set_cursor_hidden(true);
-        } else if app.get_cursor_hidden() {
-            app.set_cursor_hidden(false);
-        }
+        set_cursor_hidden_and_sync_os(&app, keep_hidden);
         if app.get_osc_visibility_mode() != 2 {
             app.set_osc_visible(true);
         }
         activity_arm_osc(&app);
+    });
+
+    let rearm_app = app.as_weak();
+    let rearm_arm_osc = arm_osc_timer;
+    let rearm_pointer_ts = last_pointer_activity;
+    app.on_osc_rearm_hide(move || {
+        let Some(app) = rearm_app.upgrade() else {
+            return;
+        };
+        rearm_pointer_ts.set(Instant::now());
+        rearm_arm_osc(&app);
     });
 
     let weak_fs = app.as_weak();
@@ -981,7 +1000,7 @@ pub(crate) fn install_window_chrome_handlers(
             }
         }
         app.set_is_fullscreen(next);
-        app.set_cursor_hidden(false);
+        set_cursor_hidden_and_sync_os(&app, false);
         if app.get_osc_visibility_mode() != 2 {
             app.set_osc_visible(true);
         }
@@ -1331,5 +1350,76 @@ mod tests {
             TargetOs::Linux,
             false
         ));
+    }
+
+    #[test]
+    fn floating_menu_bar_preserves_full_1080p_video_area_and_emits_cursor_sync_callbacks() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = SubomiApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1920., 1080.));
+        app.set_osc_fade_ms(0);
+
+        let cursor_events: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let ce = cursor_events.clone();
+        app.on_cursor_hidden_changed(move |hidden| ce.borrow_mut().push(hidden));
+
+        let rearm_count = Rc::new(Cell::new(0u32));
+        let rc = rearm_count.clone();
+        app.on_osc_rearm_hide(move || rc.set(rc.get() + 1));
+
+        app.show().unwrap();
+        app.set_osc_visible(true);
+        assert_eq!(app.get_video_width(), 1920);
+        assert_eq!(
+            app.get_video_height(),
+            1080,
+            "floating top menu bar must not shrink video-area height while visible"
+        );
+        app.set_osc_visible(false);
+        assert_eq!(app.get_video_width(), 1920);
+        assert_eq!(
+            app.get_video_height(),
+            1080,
+            "hiding floating top menu bar must not leave a 30px top border or resize video"
+        );
+
+        // Loading media (`duration > 0`) re-arms OSC/cursor auto-hide.
+        let before_rearm = rearm_count.get();
+        app.set_duration(1440.0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert!(
+            rearm_count.get() > before_rearm,
+            "setting duration > 0 must re-arm OSC/cursor auto-hide"
+        );
+
+        // Toggling `cursor_hidden` notifies `cursor_hidden_changed` so OS cursor visibility syncs.
+        cursor_events.borrow_mut().clear();
+        app.set_cursor_hidden(true);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert_eq!(*cursor_events.borrow(), vec![true]);
+
+        // Opening OCR or moving pointer over video restores `cursor_hidden = false` and notifies.
+        app.set_ocr_mode(true);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert!(!app.get_cursor_hidden());
+        assert_eq!(*cursor_events.borrow(), vec![true, false]);
+        let before_ocr_exit = rearm_count.get();
+        app.set_ocr_mode(false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        assert!(
+            rearm_count.get() > before_ocr_exit,
+            "exiting OCR mode must re-arm OSC/cursor auto-hide"
+        );
+
+        app.set_cursor_hidden(true);
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        app.window().dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(960., 540.),
+        });
+        assert!(
+            !app.get_cursor_hidden(),
+            "pointer motion over video must unhide cursor"
+        );
+        app.hide().unwrap();
     }
 }

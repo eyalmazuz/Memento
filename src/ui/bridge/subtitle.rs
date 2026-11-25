@@ -1,12 +1,109 @@
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model as _};
 
 use crate::controller::dict::{DictController, SearchHit};
-use crate::ui::subtitle_layout::is_japanese_lookup_char;
-use crate::ui::text_engine::{subtitle_cluster_at_point_with_style, with_shared_text_engine};
+use crate::ui::popup_model::active_rich_bridge_for_app;
+use crate::ui::subtitle_layout::{is_japanese_lookup_char, subtitle_token_width_with_engine};
+use crate::ui::text_engine::{
+    subtitle_cluster_at_point_with_style, with_shared_text_engine, SubtitleRenderStyle,
+};
 use crate::ui::{SubomiApp, SubtitleOverlayBridge, SubtitleTokenMetrics, SubtitleWord};
 
-use super::state::HoveredSubtitleCluster;
+use super::state::{HoveredSubtitleCluster, KeyboardScanCursor};
 use super::RichUiBridge;
+
+struct ScannableSubtitleChar {
+    cluster: HoveredSubtitleCluster,
+    byte_offset: usize,
+}
+
+fn collect_scannable_subtitle_chars(app: &SubomiApp) -> Vec<ScannableSubtitleChar> {
+    let words = app.get_active_sub_words();
+    let count = words.row_count();
+    let mut out = Vec::new();
+    let mut prefix_chars = 0usize;
+    let mut prefix_utf16 = 0usize;
+
+    for i in 0..count {
+        let Some(word) = words.row_data(i) else {
+            continue;
+        };
+        let text = word.text.as_str();
+        if !word.query.is_empty() {
+            let mut within_utf16 = 0usize;
+            for (char_offset, (byte_offset, ch)) in text.char_indices().enumerate() {
+                let ch_u16 = ch.len_utf16();
+                if ch.is_alphanumeric() || is_japanese_lookup_char(ch) {
+                    if let Some(sub_query) = word.query.as_str().get(byte_offset..) {
+                        if !sub_query.is_empty() {
+                            out.push(ScannableSubtitleChar {
+                                cluster: HoveredSubtitleCluster {
+                                    word: word.clone(),
+                                    char_offset,
+                                    global_char_index: prefix_chars + char_offset,
+                                    global_utf16_offset: prefix_utf16 + within_utf16,
+                                    sub_query: sub_query.to_owned(),
+                                },
+                                byte_offset,
+                            });
+                        }
+                    }
+                }
+                within_utf16 += ch_u16;
+            }
+        }
+        prefix_chars += text.chars().count();
+        prefix_utf16 += text.encode_utf16().count();
+    }
+    out
+}
+
+fn compute_subtitle_char_popup_offset_x(
+    app: &SubomiApp,
+    word: &SubtitleWord,
+    byte_offset: usize,
+    style: &SubtitleRenderStyle,
+) -> f32 {
+    let font_px = (app.get_video_height() as f32 * app.get_subtitle_scale()).max(8.0);
+    let show_furigana = app.get_furigana_visible();
+    let lines = app.get_active_sub_lines();
+    with_shared_text_engine(|engine| {
+        for li in 0..lines.row_count() {
+            let Some(line) = lines.row_data(li) else {
+                continue;
+            };
+            let mut found = false;
+            let mut total_w = 0.0f32;
+            let mut token_x = 0.0f32;
+            for wi in 0..line.words.row_count() {
+                let Some(w) = line.words.row_data(wi) else {
+                    continue;
+                };
+                let tw = subtitle_token_width_with_engine(engine, &w, font_px, show_furigana, style);
+                if w.index == word.index {
+                    token_x = total_w;
+                    found = true;
+                }
+                total_w += tw;
+            }
+            if found {
+                let shaped = engine.shape_and_render_subtitle_token(
+                    word,
+                    font_px,
+                    show_furigana,
+                    style,
+                );
+                let char_center_x = shaped
+                    .clusters
+                    .iter()
+                    .find(|&&(b0, b1, _, _)| byte_offset >= b0 && byte_offset < b1)
+                    .map(|&(_, _, cx, cadv)| shaped.glyph_x_px + cx + cadv * 0.5)
+                    .unwrap_or(shaped.width_px * 0.5);
+                return (token_x + char_center_x) - (total_w * 0.5);
+            }
+        }
+        0.0
+    })
+}
 
 impl RichUiBridge {
     pub(in crate::ui) fn clear_subtitle_scan_state(&self, app: &SubomiApp) {
@@ -15,6 +112,7 @@ impl RichUiBridge {
             st.scan_timer.stop();
             st.hovered_cluster = None;
             st.hovered_ass_target = None;
+            st.keyboard_scan_cursor = None;
             st.pending_ass_scan = None;
             st.active_scan_utf16_range = None;
             st.pending_scan_utf16_start = None;
@@ -32,6 +130,8 @@ impl RichUiBridge {
         bridge.set_hovered_char_offset(-1);
         bridge.set_hovered_global_char_index(-1);
         bridge.set_hovered_query("".into());
+        bridge.set_keyboard_scan_active(false);
+        bridge.set_keyboard_scan_char_index(-1);
         bridge.set_highlight_revision(bridge.get_highlight_revision().wrapping_add(1));
         self.schedule_idle_memory_shrink_if_closed(app);
     }
@@ -96,14 +196,18 @@ impl RichUiBridge {
         let app_snapshot = app_opt.as_ref().map(|app| {
             let lines = app.get_active_sub_lines();
             let dict_open = app.get_dict_open();
+            let keyboard_scan_active = app
+                .global::<SubtitleOverlayBridge>()
+                .get_keyboard_scan_active();
+            let scan_visible = dict_open || keyboard_scan_active;
             let selected_token_index = app.get_selected_token_index();
             let selected_token_count = app.get_selected_token_count();
-            let words = (dict_open && selected_token_index >= 0)
-                .then(|| app.get_active_sub_words());
+            let words =
+                (scan_visible && selected_token_index >= 0).then(|| app.get_active_sub_words());
             (
                 lines,
                 words,
-                dict_open,
+                scan_visible,
                 selected_token_index,
                 selected_token_count,
             )
@@ -234,13 +338,33 @@ impl RichUiBridge {
         app: &SubomiApp,
         cluster: HoveredSubtitleCluster,
     ) {
+        self.trigger_subtitle_scan_inner(app, cluster, false);
+    }
+
+    fn trigger_subtitle_scan_inner(
+        &self,
+        app: &SubomiApp,
+        cluster: HoveredSubtitleCluster,
+        from_keyboard: bool,
+    ) {
         {
             let mut st = self.state.borrow_mut();
             st.scan_timer.stop();
             st.pending_ass_scan = None;
             st.pending_scan_utf16_start = Some(cluster.global_utf16_offset);
             st.pending_scan_sub_query = Some(cluster.sub_query.clone());
+            st.keyboard_scan_cursor = from_keyboard.then_some(KeyboardScanCursor::Plain {
+                global_char_index: cluster.global_char_index,
+                global_utf16_offset: cluster.global_utf16_offset,
+            });
         }
+        let sb = app.global::<SubtitleOverlayBridge>();
+        sb.set_keyboard_scan_active(from_keyboard);
+        sb.set_keyboard_scan_char_index(if from_keyboard {
+            cluster.global_char_index as i32
+        } else {
+            -1
+        });
         app.set_popup_offset_x(app.get_pending_popup_offset_x());
         app.set_selected_token_index(cluster.word.index);
         app.invoke_lookup_word(cluster.sub_query.into());
@@ -251,20 +375,315 @@ impl RichUiBridge {
         app: &SubomiApp,
         target: crate::controller::ass::AssHoveredTarget,
     ) {
+        self.trigger_ass_scan_inner(app, target, false);
+    }
+
+    fn trigger_ass_scan_inner(
+        &self,
+        app: &SubomiApp,
+        target: crate::controller::ass::AssHoveredTarget,
+        from_keyboard: bool,
+    ) {
         let query = target.scan_substring.clone();
         if query.trim().is_empty() {
             return;
         }
+        let global_char_index = target.global_char_index;
+        let event_index = target.event_index;
+        let char_index = target.char_index;
         {
             let mut st = self.state.borrow_mut();
             st.scan_timer.stop();
             st.pending_scan_utf16_start = None;
             st.pending_ass_scan = Some(target);
             st.pending_scan_sub_query = Some(query.clone());
+            st.keyboard_scan_cursor = from_keyboard.then_some(KeyboardScanCursor::Ass {
+                event_index,
+                char_index,
+            });
         }
+        let sb = app.global::<SubtitleOverlayBridge>();
+        sb.set_keyboard_scan_active(from_keyboard);
+        sb.set_keyboard_scan_char_index(if from_keyboard {
+            global_char_index as i32
+        } else {
+            -1
+        });
         app.set_selected_token_index(0);
         app.invoke_lookup_word(query.into());
     }
+
+    fn scan_ass_with_keyboard(&self, app: &SubomiApp, delta: Option<i32>) -> bool {
+        let ass_ctrl = self.state.borrow().ass_controller.clone();
+        let Some(ass_ctrl) = ass_ctrl else {
+            return false;
+        };
+        let (targets, active_lookup) = {
+            let Ok(ctrl) = ass_ctrl.try_borrow() else {
+                return false;
+            };
+            (ctrl.scannable_targets(), ctrl.active_lookup().cloned())
+        };
+        if targets.is_empty() {
+            return false;
+        }
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        let already_kb = sb.get_keyboard_scan_active();
+        let target_idx = match delta {
+            None => 0,
+            Some(step) => {
+                let (cursor, hovered) = {
+                    let st = self.state.borrow();
+                    (
+                        already_kb.then(|| st.keyboard_scan_cursor.clone()).flatten(),
+                        st.hovered_ass_target.clone(),
+                    )
+                };
+                let cur_pos = match cursor {
+                    Some(KeyboardScanCursor::Ass {
+                        event_index,
+                        char_index,
+                    }) => targets
+                        .iter()
+                        .position(|t| t.event_index == event_index && t.char_index == char_index),
+                    _ => active_lookup
+                        .as_ref()
+                        .and_then(|lk| {
+                            targets
+                                .iter()
+                                .position(|t| {
+                                    t.event_index == lk.event_index
+                                        && t.event_utf16_offset == lk.utf16_offset_in_event
+                                })
+                                .or_else(|| {
+                                    targets.iter().position(|t| {
+                                        t.event_index == lk.event_index
+                                            && t.event_utf16_offset >= lk.utf16_offset_in_event
+                                    })
+                                })
+                        })
+                        .or_else(|| {
+                            hovered.as_ref().and_then(|h| {
+                                targets.iter().position(|t| {
+                                    t.event_index == h.event_index && t.char_index == h.char_index
+                                })
+                            })
+                        }),
+                };
+                match cur_pos {
+                    Some(cur) => {
+                        let next = if step > 0 {
+                            (cur + 1).min(targets.len() - 1)
+                        } else if step < 0 {
+                            cur.saturating_sub(1)
+                        } else {
+                            cur
+                        };
+                        if next == cur && already_kb {
+                            return true;
+                        }
+                        next
+                    }
+                    None => {
+                        if step >= 0 {
+                            0
+                        } else {
+                            targets.len() - 1
+                        }
+                    }
+                }
+            }
+        };
+
+        let target = targets[target_idx].clone();
+        self.trigger_ass_scan_inner(app, target, true);
+        true
+    }
+
+    fn scan_plain_with_keyboard(&self, app: &SubomiApp, delta: Option<i32>) -> bool {
+        let items = collect_scannable_subtitle_chars(app);
+        if items.is_empty() {
+            return false;
+        }
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        let already_kb = sb.get_keyboard_scan_active();
+        let target_idx = match delta {
+            None => 0,
+            Some(step) => {
+                let (cursor, active_range, hovered) = {
+                    let st = self.state.borrow();
+                    (
+                        already_kb.then(|| st.keyboard_scan_cursor.clone()).flatten(),
+                        st.active_scan_utf16_range,
+                        st.hovered_cluster.clone(),
+                    )
+                };
+                let cur_pos = match cursor {
+                    Some(KeyboardScanCursor::Plain {
+                        global_char_index,
+                        global_utf16_offset,
+                    }) => items
+                        .iter()
+                        .position(|item| item.cluster.global_char_index == global_char_index)
+                        .or_else(|| {
+                            items.iter().position(|item| {
+                                item.cluster.global_utf16_offset >= global_utf16_offset
+                            })
+                        }),
+                    _ => active_range
+                        .and_then(|(u16_start, _)| {
+                            items
+                                .iter()
+                                .position(|item| item.cluster.global_utf16_offset == u16_start)
+                                .or_else(|| {
+                                    items.iter().position(|item| {
+                                        item.cluster.global_utf16_offset >= u16_start
+                                    })
+                                })
+                        })
+                        .or_else(|| {
+                            hovered.as_ref().and_then(|h| {
+                                items.iter().position(|item| {
+                                    item.cluster.global_char_index == h.global_char_index
+                                })
+                            })
+                        })
+                        .or_else(|| {
+                            let sel = app.get_selected_token_index();
+                            (sel >= 0).then(|| {
+                                items
+                                    .iter()
+                                    .position(|item| item.cluster.word.index == sel)
+                            })?
+                        }),
+                };
+                match cur_pos {
+                    Some(cur) => {
+                        let next = if step > 0 {
+                            (cur + 1).min(items.len() - 1)
+                        } else if step < 0 {
+                            cur.saturating_sub(1)
+                        } else {
+                            cur
+                        };
+                        if next == cur && already_kb {
+                            return true;
+                        }
+                        next
+                    }
+                    None => {
+                        if step >= 0 {
+                            0
+                        } else {
+                            items.len() - 1
+                        }
+                    }
+                }
+            }
+        };
+
+        let item = &items[target_idx];
+        let style = self.state.borrow().settings.subtitle_style.clone();
+        let offset_x =
+            compute_subtitle_char_popup_offset_x(app, &item.cluster.word, item.byte_offset, &style);
+        app.set_pending_popup_offset_x(offset_x);
+        self.trigger_subtitle_scan_inner(app, item.cluster.clone(), true);
+        true
+    }
+}
+
+fn scan_plain_fallback_with_keyboard(app: &SubomiApp, delta: Option<i32>) -> bool {
+    let items = collect_scannable_subtitle_chars(app);
+    if items.is_empty() {
+        return false;
+    }
+
+    let sb = app.global::<SubtitleOverlayBridge>();
+    let already_kb = sb.get_keyboard_scan_active();
+    let target_idx = match delta {
+        None => 0,
+        Some(step) => {
+            let cur_pos = usize::try_from(sb.get_keyboard_scan_char_index())
+                .ok()
+                .and_then(|cur_char| {
+                    items
+                        .iter()
+                        .position(|item| item.cluster.global_char_index == cur_char)
+                })
+                .or_else(|| {
+                    let sel = app.get_selected_token_index();
+                    (sel >= 0).then(|| {
+                        items
+                            .iter()
+                            .position(|item| item.cluster.word.index == sel)
+                    })?
+                });
+            match cur_pos {
+                Some(cur) => {
+                    let next = if step > 0 {
+                        (cur + 1).min(items.len() - 1)
+                    } else if step < 0 {
+                        cur.saturating_sub(1)
+                    } else {
+                        cur
+                    };
+                    if next == cur && already_kb {
+                        return true;
+                    }
+                    next
+                }
+                None => {
+                    if step >= 0 {
+                        0
+                    } else {
+                        items.len() - 1
+                    }
+                }
+            }
+        }
+    };
+
+    let item = &items[target_idx];
+    sb.set_keyboard_scan_active(true);
+    sb.set_keyboard_scan_char_index(item.cluster.global_char_index as i32);
+    app.set_selected_token_index(item.cluster.word.index);
+    app.set_selected_token_count(1);
+    app.invoke_lookup_word(item.cluster.sub_query.clone().into());
+    true
+}
+
+/// Start keyboard-driven dictionary term search at the first lookupable character
+/// of the active subtitle (plain/rich or native ASS), matching the exact prefix
+/// lookup behavior of hovering that character.
+pub fn start_keyboard_subtitle_scan(app: &SubomiApp) -> bool {
+    if !app.get_subtitles_visible() {
+        return false;
+    }
+    if let Some(bridge) = active_rich_bridge_for_app(app) {
+        if app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
+            return bridge.scan_ass_with_keyboard(app, None);
+        }
+        return bridge.scan_plain_with_keyboard(app, None);
+    }
+    scan_plain_fallback_with_keyboard(app, None)
+}
+
+/// Step keyboard-driven subtitle dictionary search forward (`delta > 0`) or
+/// backward (`delta < 0`) by one lookupable character, preserving suffix lookup,
+/// highlight spans, and popup anchoring across both plain/rich and native ASS tracks.
+pub fn step_keyboard_subtitle_scan(app: &SubomiApp, delta: i32) -> bool {
+    if !app.get_subtitles_visible() {
+        return false;
+    }
+    if let Some(bridge) = active_rich_bridge_for_app(app) {
+        if app.global::<SubtitleOverlayBridge>().get_ass_native_active() {
+            return bridge.scan_ass_with_keyboard(app, Some(delta));
+        }
+        return bridge.scan_plain_with_keyboard(app, Some(delta));
+    }
+    scan_plain_fallback_with_keyboard(app, Some(delta))
 }
 
 fn matched_prefix_u16_by_norm(sub_q: &str, target: &str) -> Option<usize> {

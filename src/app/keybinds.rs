@@ -9,6 +9,7 @@ use slint::{ComponentHandle, Model as _};
 
 use crate::controller::config::{
     ConfigController, KEYBIND_CLEAR_AUDIO_CONTEXT, KEYBIND_MARK_AUDIO_CONTEXT,
+    KEYBIND_SUB_SCAN_NEXT, KEYBIND_SUB_SCAN_PREV, KEYBIND_SUB_SCAN_START,
     SETTINGS_SHORTCUT_DEFAULT, SETTINGS_SHORTCUT_MACOS,
 };
 use crate::ui::{DictResult, SubomiApp, PopupBridge, SubtitleOverlayBridge};
@@ -523,8 +524,14 @@ pub(crate) fn step_popup_term_group(
     Some((target, scroll_y))
 }
 
-/// Resolve the top visible term-group index for a given positive popup scroll offset.
-pub(crate) fn popup_top_term_group_at_scroll(rows: &[DictResult], scroll_y: f32) -> Option<usize> {
+/// Resolve the top visible term-group index for a given positive popup scroll offset,
+/// preferring live measured Slint `row-wrapper.y` coordinates when available and
+/// falling back to `estimate_popup_row_height` when unmeasured (e.g. headless tests).
+pub(crate) fn popup_top_term_group_at_scroll_with_layout(
+    rows: &[DictResult],
+    scroll_y: f32,
+    measured_term_y: &std::collections::BTreeMap<usize, f32>,
+) -> Option<usize> {
     if rows.is_empty() {
         return None;
     }
@@ -533,19 +540,128 @@ pub(crate) fn popup_top_term_group_at_scroll(rows: &[DictResult], scroll_y: f32)
     if clamped_scroll <= 1.0 {
         return starts.first().copied();
     }
-    let mut y = 0.0f32;
+    let mut est_y = 0.0f32;
     let mut best = *starts.first().unwrap();
     for (idx, row) in rows.iter().enumerate() {
         if starts.contains(&idx) {
-            if y <= clamped_scroll + 24.0 {
+            let row_y = if idx == 0 {
+                0.0
+            } else {
+                measured_term_y.get(&idx).copied().unwrap_or(est_y)
+            };
+            if row_y <= clamped_scroll + 24.0 {
                 best = idx;
             } else {
                 break;
             }
         }
-        y += estimate_popup_row_height(row);
+        est_y += estimate_popup_row_height(row);
     }
     Some(best)
+}
+
+/// Resolve the top visible term-group index for a given positive popup scroll offset.
+#[allow(dead_code)]
+pub(crate) fn popup_top_term_group_at_scroll(rows: &[DictResult], scroll_y: f32) -> Option<usize> {
+    popup_top_term_group_at_scroll_with_layout(rows, scroll_y, &std::collections::BTreeMap::new())
+}
+
+#[derive(Default)]
+struct PopupNavLayoutState {
+    revision: i32,
+    measured_viewport_height: f32,
+    term_row_y: std::collections::BTreeMap<usize, f32>,
+}
+
+impl PopupNavLayoutState {
+    fn sync_revision(&mut self, revision: i32) {
+        if self.revision != revision {
+            self.revision = revision;
+            self.measured_viewport_height = 0.0;
+            self.term_row_y.clear();
+        }
+    }
+
+    fn term_y_for(&self, revision: i32, idx: usize) -> Option<f32> {
+        if idx == 0 {
+            return Some(0.0);
+        }
+        if self.revision == revision {
+            self.term_row_y.get(&idx).copied()
+        } else {
+            None
+        }
+    }
+}
+
+fn bump_popup_focus_scroll_seq(app: &SubomiApp) {
+    let next = app.get_popup_focus_scroll_seq().wrapping_add(1);
+    app.set_popup_focus_scroll_seq(if next <= 0 { 1 } else { next });
+}
+
+fn sync_popup_term_layout_if_needed(
+    app: &SubomiApp,
+    layout: &Rc<RefCell<PopupNavLayoutState>>,
+    revision: i32,
+) {
+    let content_h = app.get_popup_list_viewport_height().max(0.0);
+    let view_h = app.get_popup_list_visible_height().max(0.0);
+    if content_h <= 1.0 || view_h <= 1.0 {
+        return;
+    }
+    let needs_probe = {
+        let mut st = layout.borrow_mut();
+        st.sync_revision(revision);
+        if (st.measured_viewport_height - content_h).abs() > 0.5 || st.term_row_y.is_empty() {
+            st.term_row_y.clear();
+            st.measured_viewport_height = content_h;
+            true
+        } else {
+            false
+        }
+    };
+    if needs_probe {
+        let next = app.get_popup_layout_sync_seq().wrapping_add(1);
+        app.set_popup_layout_sync_seq(if next <= 0 { 1 } else { next });
+    }
+}
+
+fn apply_popup_target_scroll(app: &SubomiApp, scroll_y: f32, last_scroll: &Cell<f32>) {
+    let clamped = scroll_y.max(0.0);
+    app.invoke_scroll_popup_to_y(clamped);
+    last_scroll.set(clamped);
+}
+
+fn resolve_popup_term_scroll_y(
+    rows: &[DictResult],
+    target_idx: usize,
+    layout: &PopupNavLayoutState,
+    revision: i32,
+) -> (f32, bool) {
+    if let Some(exact_y) = layout.term_y_for(revision, target_idx) {
+        return (exact_y, true);
+    }
+    let estimated: f32 = rows[..target_idx.min(rows.len())]
+        .iter()
+        .map(estimate_popup_row_height)
+        .sum();
+    (estimated, false)
+}
+
+/// Map `popup_focused_index` (an index into `popup_results`, which omits collapsed
+/// non-`term_start` rows) to the 0-based `dict_results` row index expected by `add-anki-note`.
+pub(crate) fn focused_popup_dict_row_index(app: &SubomiApp) -> i32 {
+    let focused = app.get_popup_focused_index().max(0) as usize;
+    app.get_popup_results()
+        .row_data(focused)
+        .map(|row| {
+            if row.index > 0 {
+                row.index - 1
+            } else {
+                focused as i32
+            }
+        })
+        .unwrap_or(focused as i32)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,15 +673,37 @@ pub(crate) fn install_keybind_handlers(
     hover_cursor: Rc<RefCell<Option<(String, i32)>>>,
     audio_context_marks: Rc<RefCell<AudioContextMarkState>>,
 ) {
-    // H4.1: Override popup navigation to step strictly by term group (`term_start == true`)
-    // and keep `popup-target-scroll-y` and `popup-viewport-scrolled` synchronized.
+    // H4.1: Override popup navigation to step cleanly by term group (`term_start == true`)
+    // using live Slint row coordinates (1-col, 2-col grid, rich glossaries, collapsed terms),
+    // synchronously loading additional term batches as needed, and scrolling through any
+    // remaining overflow on the last term so Ctrl+Down never stalls partway down the popup.
     let last_popup_scroll_y = Rc::new(Cell::new(0.0f32));
+    let popup_nav_layout = Rc::new(RefCell::new(PopupNavLayoutState::default()));
+
+    let layout_app = app.as_weak();
+    let layout_state = popup_nav_layout.clone();
+    app.on_popup_term_row_y_reported(move |idx, row_y| {
+        let Some(app) = layout_app.upgrade() else {
+            return;
+        };
+        if idx < 0 || !row_y.is_finite() {
+            return;
+        }
+        let rev = app.global::<PopupBridge>().get_popup_revision();
+        let mut st = layout_state.borrow_mut();
+        st.sync_revision(rev);
+        st.term_row_y.insert(idx as usize, row_y.max(0.0));
+    });
+
     let nav_app = app.as_weak();
     let nav_last_scroll = last_popup_scroll_y.clone();
+    let nav_layout = popup_nav_layout.clone();
     app.on_navigate_popup(move |direction| {
         let Some(app) = nav_app.upgrade() else {
             return;
         };
+        let rev = app.global::<PopupBridge>().get_popup_revision();
+        nav_layout.borrow_mut().sync_revision(rev);
         let collect_rows = |app: &SubomiApp| -> Vec<DictResult> {
             let model = app.get_popup_results();
             (0..model.row_count())
@@ -573,54 +711,154 @@ pub(crate) fn install_keybind_handlers(
                 .collect()
         };
         let mut rows = collect_rows(&app);
+        if rows.is_empty() {
+            return;
+        }
+
+        let content_h = app.get_popup_list_viewport_height().max(0.0);
+        let view_h = app.get_popup_list_visible_height().max(0.0);
+        let has_live_layout = content_h > 1.0 && view_h > 1.0;
+        let max_scroll = (content_h - view_h).max(0.0);
+        let current_scroll = (-app.get_popup_current_scroll_y()).max(0.0);
+        let page_step = (view_h * 0.7).clamp(120.0, 360.0);
+
         if direction > 0 {
-            let starts = popup_term_start_indices(&rows);
+            let mut starts = popup_term_start_indices(&rows);
             let cur = app.get_popup_focused_index().max(0) as usize;
             let at_last_loaded_group = starts.last().is_none_or(|&last| cur >= last);
+            let mut loaded_new_rows = false;
             if at_last_loaded_group
                 && (app.get_popup_loaded_count() as usize) < app.get_dict_results().row_count()
             {
-                app.invoke_load_more_definition_results(true);
-                rows = collect_rows(&app);
+                if crate::ui::load_next_popup_term_batch_now(&app) > 0 {
+                    loaded_new_rows = true;
+                    rows = collect_rows(&app);
+                    starts = popup_term_start_indices(&rows);
+                }
             }
-        }
-        if let Some((target_idx, scroll_y)) =
-            step_popup_term_group(&rows, app.get_popup_focused_index(), direction)
-        {
-            app.set_popup_focused_index(target_idx as i32);
-            // Force Slint's `changed target-scroll-y` to fire if manual scrolling drifted
-            // away while `target-scroll-y` still held the previous numeric value.
-            if (app.get_popup_target_scroll_y() - scroll_y).abs() < 0.01
-                && (nav_last_scroll.get() - scroll_y).abs() > 0.5
-            {
-                app.set_popup_target_scroll_y(scroll_y + 0.5);
+
+            if let Some(target_idx) = starts.iter().copied().find(|&idx| idx > cur) {
+                app.set_popup_focused_index(target_idx as i32);
+                let (scroll_y, is_exact) =
+                    resolve_popup_term_scroll_y(&rows, target_idx, &nav_layout.borrow(), rev);
+                apply_popup_target_scroll(&app, scroll_y, &nav_last_scroll);
+                if has_live_layout && (!is_exact || loaded_new_rows) {
+                    // Ask Slint to align to the exact live `row-wrapper.y` on the next flush
+                    // (and re-trigger once more if rows were just pushed into the repeater).
+                    bump_popup_focus_scroll_seq(&app);
+                    if loaded_new_rows {
+                        let retry_app = app.as_weak();
+                        let target_i32 = target_idx as i32;
+                        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                            let Some(app) = retry_app.upgrade() else {
+                                return;
+                            };
+                            if app.get_dict_open()
+                                && app.get_popup_focused_index() == target_i32
+                                && app.global::<PopupBridge>().get_popup_revision() == rev
+                            {
+                                bump_popup_focus_scroll_seq(&app);
+                            }
+                        });
+                    }
+                }
+                if starts.last() == Some(&target_idx)
+                    && (app.get_popup_loaded_count() as usize) < app.get_dict_results().row_count()
+                {
+                    let _ = crate::ui::load_next_popup_term_batch_now(&app);
+                }
+                return;
             }
-            app.set_popup_target_scroll_y(scroll_y);
-            nav_last_scroll.set(scroll_y);
+
+            // Already on the last term group (and all batches are loaded): keep scrolling down
+            // through any remaining definition overflow until the bottom of the popup is reached.
+            if has_live_layout && current_scroll + 1.0 < max_scroll {
+                let next_scroll = (current_scroll + page_step).min(max_scroll);
+                apply_popup_target_scroll(&app, next_scroll, &nav_last_scroll);
+            } else if !has_live_layout {
+                if let Some((target_idx, scroll_y)) =
+                    step_popup_term_group(&rows, app.get_popup_focused_index(), direction)
+                {
+                    app.set_popup_focused_index(target_idx as i32);
+                    apply_popup_target_scroll(&app, scroll_y, &nav_last_scroll);
+                }
+            }
+            return;
         }
-        if direction > 0
-            && (app.get_popup_loaded_count() as usize) < app.get_dict_results().row_count()
-        {
+
+        if direction < 0 {
             let starts = popup_term_start_indices(&rows);
             let cur = app.get_popup_focused_index().max(0) as usize;
-            if starts.last().is_some_and(|&last| cur >= last) {
-                app.invoke_load_more_definition_results(true);
+            let cur_start = starts
+                .iter()
+                .rev()
+                .copied()
+                .find(|&idx| idx <= cur)
+                .unwrap_or(*starts.first().unwrap());
+
+            // If the user scrolled down past the header of the focused term (e.g., reading a tall
+            // final term), step back up toward its header before jumping to the previous term.
+            if has_live_layout {
+                sync_popup_term_layout_if_needed(&app, &nav_layout, rev);
+                let (cur_y, _) =
+                    resolve_popup_term_scroll_y(&rows, cur_start, &nav_layout.borrow(), rev);
+                if current_scroll > cur_y + 24.0 {
+                    let next_scroll = (current_scroll - page_step).max(cur_y);
+                    app.set_popup_focused_index(cur_start as i32);
+                    apply_popup_target_scroll(&app, next_scroll, &nav_last_scroll);
+                    return;
+                }
+            }
+
+            let prev_idx = starts
+                .iter()
+                .rev()
+                .copied()
+                .find(|&idx| idx < cur)
+                .unwrap_or(*starts.first().unwrap());
+            app.set_popup_focused_index(prev_idx as i32);
+            let (scroll_y, is_exact) =
+                resolve_popup_term_scroll_y(&rows, prev_idx, &nav_layout.borrow(), rev);
+            apply_popup_target_scroll(&app, scroll_y, &nav_last_scroll);
+            if has_live_layout && !is_exact {
+                bump_popup_focus_scroll_seq(&app);
+            }
+            return;
+        }
+
+        if let Some((target_idx, _)) =
+            step_popup_term_group(&rows, app.get_popup_focused_index(), 0)
+        {
+            app.set_popup_focused_index(target_idx as i32);
+            let (scroll_y, is_exact) =
+                resolve_popup_term_scroll_y(&rows, target_idx, &nav_layout.borrow(), rev);
+            apply_popup_target_scroll(&app, scroll_y, &nav_last_scroll);
+            if has_live_layout && !is_exact {
+                bump_popup_focus_scroll_seq(&app);
             }
         }
     });
 
     let scroll_app = app.as_weak();
     let scroll_last = last_popup_scroll_y;
+    let scroll_layout = popup_nav_layout;
     app.on_popup_viewport_scrolled(move |scroll_y| {
         scroll_last.set(scroll_y);
         let Some(app) = scroll_app.upgrade() else {
             return;
         };
+        let rev = app.global::<PopupBridge>().get_popup_revision();
+        sync_popup_term_layout_if_needed(&app, &scroll_layout, rev);
         let model = app.get_popup_results();
         let rows: Vec<DictResult> = (0..model.row_count())
             .filter_map(|i| model.row_data(i))
             .collect();
-        if let Some(top_idx) = popup_top_term_group_at_scroll(&rows, scroll_y) {
+        let top_idx = {
+            let mut st = scroll_layout.borrow_mut();
+            st.sync_revision(rev);
+            popup_top_term_group_at_scroll_with_layout(&rows, scroll_y, &st.term_row_y)
+        };
+        if let Some(top_idx) = top_idx {
             if app.get_popup_focused_index() != top_idx as i32 {
                 app.set_popup_focused_index(top_idx as i32);
             }
@@ -674,32 +912,78 @@ pub(crate) fn install_keybind_handlers(
         };
         let assigned = |binding: &slint::SharedString| assigned_str(binding.as_str());
 
-        // Popup navigation, Anki card-add (routing to active nested popup when open),
-        // and Escape on nested popups operate on the open YomitanPopup without dismissing it.
-        if app.get_dict_open() {
-            if assigned(&app.get_key_card_next()) {
-                app.invoke_navigate_popup(1);
+        let default_sub_scan_start = if is_macos { "Cmd+K" } else { "Ctrl+K" };
+        let default_sub_scan_next = if is_macos { "Cmd+Right" } else { "Ctrl+Right" };
+        let default_sub_scan_prev = if is_macos { "Cmd+Left" } else { "Ctrl+Left" };
+        let sub_scan_start_shortcut = active_profile_keybind(
+            &key_config,
+            KEYBIND_SUB_SCAN_START,
+            default_sub_scan_start,
+        );
+        let sub_scan_next_shortcut = active_profile_keybind(
+            &key_config,
+            KEYBIND_SUB_SCAN_NEXT,
+            default_sub_scan_next,
+        );
+        let sub_scan_prev_shortcut = active_profile_keybind(
+            &key_config,
+            KEYBIND_SUB_SCAN_PREV,
+            default_sub_scan_prev,
+        );
+        let modal_blocking_scan = app.get_ocr_mode()
+            || app.get_about_open()
+            || app.get_url_dialog_open()
+            || app.get_no_dicts_dialog_open()
+            || app.get_update_dialog_open()
+            || app.get_menu_open();
+        let keyboard_scan_active = app
+            .global::<SubtitleOverlayBridge>()
+            .get_keyboard_scan_active();
+
+        if !modal_blocking_scan && assigned_str(&sub_scan_start_shortcut) {
+            if !crate::ui::start_keyboard_subtitle_scan(&app) && !app.get_dict_open() {
+                app.invoke_dismiss_definition();
+            }
+            return true;
+        }
+
+        // Popup navigation, keyboard subtitle character scanning, Anki card-add
+        // (routing to active nested popup when open), and Escape on nested popups
+        // operate on the active lookup/scan session without dismissing it.
+        if app.get_dict_open() || keyboard_scan_active {
+            if !modal_blocking_scan && assigned_str(&sub_scan_next_shortcut) {
+                let _ = crate::ui::step_keyboard_subtitle_scan(&app, 1);
                 return true;
             }
-            if assigned(&app.get_key_card_prev()) {
-                app.invoke_navigate_popup(-1);
+            if !modal_blocking_scan && assigned_str(&sub_scan_prev_shortcut) {
+                let _ = crate::ui::step_keyboard_subtitle_scan(&app, -1);
                 return true;
             }
-            if assigned(&app.get_key_card_add()) && app.get_anki_enabled() {
-                let bridge = app.global::<PopupBridge>();
-                if bridge.get_rich_enabled() && bridge.get_nested_depth() > 0 {
-                    bridge.invoke_nested_add_anki_note(0);
-                } else {
-                    let idx = app.get_popup_focused_index().max(0);
-                    app.invoke_add_anki_note(idx);
-                }
-                return true;
-            }
-            if text == "\u{001b}" || text == "Escape" {
-                let bridge = app.global::<PopupBridge>();
-                if bridge.get_rich_enabled() && bridge.get_nested_depth() > 0 {
-                    bridge.invoke_pop_nested_popup();
+            if app.get_dict_open() {
+                if assigned(&app.get_key_card_next()) {
+                    app.invoke_navigate_popup(1);
                     return true;
+                }
+                if assigned(&app.get_key_card_prev()) {
+                    app.invoke_navigate_popup(-1);
+                    return true;
+                }
+                if assigned(&app.get_key_card_add()) && app.get_anki_enabled() {
+                    let bridge = app.global::<PopupBridge>();
+                    if bridge.get_rich_enabled() && bridge.get_nested_depth() > 0 {
+                        bridge.invoke_nested_add_anki_note(0);
+                    } else {
+                        let idx = focused_popup_dict_row_index(&app);
+                        app.invoke_add_anki_note(idx);
+                    }
+                    return true;
+                }
+                if text == "\u{001b}" || text == "Escape" {
+                    let bridge = app.global::<PopupBridge>();
+                    if bridge.get_rich_enabled() && bridge.get_nested_depth() > 0 {
+                        bridge.invoke_pop_nested_popup();
+                        return true;
+                    }
                 }
             }
         }
@@ -730,9 +1014,9 @@ pub(crate) fn install_keybind_handlers(
             return true;
         }
 
-        // Any other keyboard input dismisses a definition, even when the key is
-        // handled by the player or a child widget.
-        let had_dict_open = app.get_dict_open();
+        // Any other keyboard input dismisses a definition (or active keyboard scan),
+        // even when the key is handled by the player or a child widget.
+        let had_dict_open = app.get_dict_open() || keyboard_scan_active;
         app.invoke_dismiss_definition();
         let settings_shortcut = if is_macos {
             SETTINGS_SHORTCUT_MACOS
@@ -769,14 +1053,17 @@ pub(crate) fn install_keybind_handlers(
             match next_mode {
                 0 => {
                     app.set_osc_visible(true);
+                    app.invoke_osc_rearm_hide();
                     app.set_status_message("OSC Visibility: Auto".into());
                 }
                 1 => {
                     app.set_osc_visible(true);
+                    app.invoke_osc_rearm_hide();
                     app.set_status_message("OSC Visibility: Visible".into());
                 }
                 _ => {
                     app.set_osc_visible(false);
+                    app.invoke_osc_rearm_hide();
                     app.set_status_message("OSC Visibility: Hidden".into());
                 }
             }
@@ -1469,6 +1756,342 @@ mod tests {
         assert_eq!(
             app.get_copied_subtitle_text().as_str(),
             "Second middle line"
+        );
+    }
+
+    #[test]
+    fn keyboard_subtitle_scan_starts_steps_handles_zero_hits_and_supports_custom_vim_keys() {
+        use std::sync::{atomic::AtomicU64, mpsc, Arc};
+
+        i_slint_backend_testing::init_no_event_loop();
+        let app = SubomiApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        let cfg = Rc::new(ConfigController::new());
+        let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
+        let closing = Rc::new(Cell::new(false));
+        let hover = Rc::new(RefCell::new(None));
+        let audio_marks = Rc::new(RefCell::new(AudioContextMarkState::default()));
+        install_keybind_handlers(
+            &app,
+            cfg.clone(),
+            mpv,
+            closing,
+            hover,
+            audio_marks,
+        );
+
+        let (furi_tx, _furi_rx) = mpsc::channel();
+        let furi_epoch = Arc::new(AtomicU64::new(0));
+        crate::ui::publish_active_subtitle(&app, "「世界中」", &furi_tx, &furi_epoch);
+
+        let queries: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let queries_cb = queries.clone();
+        let lookup_app = app.as_weak();
+        app.on_lookup_word(move |q| {
+            queries_cb.borrow_mut().push(q.to_string());
+            if let Some(app) = lookup_app.upgrade() {
+                // Simulate a dictionary hit for '世' and '中', and a 0-hit miss for '界'.
+                if q.starts_with('界') {
+                    set_dictionary_rows(&app, Vec::new());
+                    app.set_dict_open(false);
+                } else {
+                    let expr = if q.starts_with("世界中") { "世界中" } else { "中" };
+                    set_dictionary_rows(
+                        &app,
+                        vec![DictResult {
+                            index: 1,
+                            expression: expr.into(),
+                            reading: "せかいじゅう".into(),
+                            glossary: "around the world".into(),
+                            dict_name: "JMdict".into(),
+                            term_start: true,
+                            term_end: true,
+                            selected: true,
+                            ..Default::default()
+                        }],
+                    );
+                    app.set_dict_query(expr.into());
+                    app.set_dict_open(true);
+                }
+            }
+        });
+
+        let sb = app.global::<SubtitleOverlayBridge>();
+        let is_macos = cfg!(target_os = "macos");
+
+        // When NOT scanning, Ctrl+Right / Ctrl+Left are NOT intercepted (fall through to mpv).
+        assert!(!app.invoke_key_pressed(
+            "\u{F703}".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert!(!sb.get_keyboard_scan_active());
+        assert!(queries.borrow().is_empty());
+
+        // Start scan with default Ctrl+K / Cmd+K: skips leading '「' and queries full suffix from '世'.
+        assert!(app.invoke_key_pressed(
+            "k".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_keyboard_scan_char_index(), 1);
+        assert!(app.get_dict_open());
+        assert_eq!(queries.borrow().as_slice(), &["世界中」"]);
+
+        // Step next (Ctrl+Right) -> '界' (0 hits): popup closes, but keyboard scan stays active!
+        assert!(app.invoke_key_pressed(
+            "\u{F703}".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert!(!app.get_dict_open());
+        assert!(
+            sb.get_keyboard_scan_active(),
+            "stepping onto a character with no hits must keep keyboard scan active"
+        );
+        assert_eq!(sb.get_keyboard_scan_char_index(), 2);
+        assert_eq!(queries.borrow().last().map(String::as_str), Some("界中」"));
+
+        // Step next again -> '中': popup re-opens with full suffix from '中'!
+        assert!(app.invoke_key_pressed(
+            "\u{F703}".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert!(app.get_dict_open());
+        assert_eq!(sb.get_keyboard_scan_char_index(), 3);
+        assert_eq!(queries.borrow().last().map(String::as_str), Some("中」"));
+
+        // Stepping past last lookupable char ('中', skipping trailing '」') clamps without extra lookup.
+        let count_before_clamp = queries.borrow().len();
+        assert!(app.invoke_key_pressed(
+            "\u{F703}".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert_eq!(queries.borrow().len(), count_before_clamp);
+        assert_eq!(sb.get_keyboard_scan_char_index(), 3);
+
+        // Step previous (Ctrl+Left) -> back to '界' (0 hits), then Escape exits scan cleanly without toggling fullscreen.
+        let fs_toggles = Rc::new(Cell::new(0usize));
+        let fs_sink = fs_toggles.clone();
+        app.on_toggle_fullscreen(move || fs_sink.set(fs_sink.get() + 1));
+        app.set_is_fullscreen(true);
+        assert!(app.invoke_key_pressed(
+            "\u{F702}".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert!(!app.get_dict_open());
+        assert!(sb.get_keyboard_scan_active());
+        assert!(app.invoke_key_pressed(
+            "\u{001b}".into(),
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_keyboard_scan_char_index(), -1);
+        assert_eq!(
+            fs_toggles.get(),
+            0,
+            "Escape during keyboard scan on a 0-hit char must exit scan, not exit fullscreen"
+        );
+
+        // Custom Vim-style rebinding: Alt+S to start, H/L to step prev/next.
+        let profile = cfg.current_keybind_profile();
+        cfg.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_START}"), "Alt+S")
+            .unwrap();
+        cfg.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_NEXT}"), "L")
+            .unwrap();
+        cfg.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_PREV}"), "H")
+            .unwrap();
+
+        // While scan is inactive, bare 'h'/'l' are NOT intercepted (pass through to mpv).
+        assert!(!app.invoke_key_pressed("l".into(), false, false, false, false));
+        assert!(!app.invoke_key_pressed("h".into(), false, false, false, false));
+
+        // Alt+S activates scan at '世'; 'l' moves to '界'; 'h' moves back to '世'.
+        assert!(app.invoke_key_pressed("s".into(), false, false, true, false));
+        assert!(sb.get_keyboard_scan_active());
+        assert_eq!(sb.get_keyboard_scan_char_index(), 1);
+        assert!(app.invoke_key_pressed("l".into(), false, false, false, false));
+        assert_eq!(sb.get_keyboard_scan_char_index(), 2);
+        assert!(app.invoke_key_pressed("h".into(), false, false, false, false));
+        assert_eq!(sb.get_keyboard_scan_char_index(), 1);
+        assert!(app.get_dict_open());
+
+        // Hidden subtitles do not start keyboard scanning.
+        app.invoke_dismiss_definition();
+        app.set_subtitles_visible(false);
+        assert!(app.invoke_key_pressed("s".into(), false, false, true, false));
+        assert!(!sb.get_keyboard_scan_active());
+    }
+
+    #[test]
+    fn popup_ctrl_down_loads_all_batches_scrolls_to_bottom_and_ctrl_d_targets_focused_dict_row() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = SubomiApp::new().unwrap();
+        app.window().set_size(slint::LogicalSize::new(1280., 720.));
+        let cfg = Rc::new(ConfigController::new());
+        let mpv = Rc::new(RefCell::new(None));
+        let closing = Rc::new(Cell::new(false));
+        let hover_cursor = Rc::new(RefCell::new(None));
+        let audio_marks = Rc::new(RefCell::new(AudioContextMarkState::default()));
+        install_keybind_handlers(&app, cfg, mpv, closing, hover_cursor, audio_marks);
+        crate::ui::install_popup_navigation(&app);
+
+        // 10 term groups × 3 dictionaries = 30 rows (> INITIAL_POPUP_BATCH_MAX_ROWS = 24),
+        // with a tall final term so its definitions overflow past the popup viewport.
+        let mut rows = Vec::new();
+        let mut idx_1based = 1i32;
+        for term in 0..10usize {
+            for dict in 0..3usize {
+                let glossary = if term == 9 {
+                    "Very detailed final term definition line that wraps generously across the popup. "
+                        .repeat(12)
+                } else {
+                    format!("Term {term} dictionary {dict} gloss line 1\nSecond line of explanation")
+                };
+                rows.push(DictResult {
+                    index: idx_1based,
+                    expression: format!("語{term}").into(),
+                    reading: format!("ご{term}").into(),
+                    dict_name: format!("Dict{dict}").into(),
+                    glossary: glossary.into(),
+                    selected: true,
+                    term_start: dict == 0,
+                    term_end: dict == 2,
+                    ..Default::default()
+                });
+                idx_1based += 1;
+            }
+        }
+        set_dictionary_rows(&app, rows);
+        assert!(
+            (app.get_popup_loaded_count() as usize) < 30,
+            "fixture must exercise lazy batch loading beyond initial batch"
+        );
+        app.set_popup_configured_height(360.0);
+        app.set_anki_enabled(true);
+        app.set_dict_open(true);
+        app.show().unwrap();
+
+        let is_macos = cfg!(target_os = "macos");
+        // Step Ctrl+Down across all 10 term groups (crossing the 24-row batch boundary synchronously).
+        let mut visited_terms = vec![0i32];
+        for _ in 0..9 {
+            assert!(app.invoke_key_pressed(
+                "\u{F701}".into(),
+                !is_macos,
+                false,
+                false,
+                is_macos,
+            ));
+            visited_terms.push(app.get_popup_focused_index());
+        }
+        assert_eq!(
+            app.get_popup_loaded_count(),
+            30,
+            "Ctrl+Down must synchronously load remaining term batches"
+        );
+        assert_eq!(
+            visited_terms,
+            vec![0, 3, 6, 9, 12, 15, 18, 21, 24, 27],
+            "Ctrl+Down must step cleanly through every term group without stopping at batch 1"
+        );
+
+        // Pressing Ctrl+D now must add the currently focused last term (dict_results index 27).
+        let added = Rc::new(Cell::new(-1i32));
+        let added_sink = added.clone();
+        app.on_add_anki_note(move |idx| added_sink.set(idx));
+        assert!(app.invoke_key_pressed(
+            "d".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert_eq!(
+            added.get(),
+            27,
+            "Ctrl+D must add the currently focused term rather than always adding index 0"
+        );
+
+        // Continuing Ctrl+Down on the tall last term must scroll all the way to the bottom.
+        let scroll_at_last_term = (-app.get_popup_current_scroll_y()).max(0.0);
+        for _ in 0..8 {
+            assert!(app.invoke_key_pressed(
+                "\u{F701}".into(),
+                !is_macos,
+                false,
+                false,
+                is_macos,
+            ));
+        }
+        let max_scroll =
+            (app.get_popup_list_viewport_height() - app.get_popup_list_visible_height()).max(0.0);
+        let scroll_at_bottom = (-app.get_popup_current_scroll_y()).max(0.0);
+        assert!(
+            max_scroll > scroll_at_last_term + 10.0,
+            "last term must overflow viewport (scroll_at_last_term={scroll_at_last_term}, max_scroll={max_scroll})"
+        );
+        assert!(
+            (scroll_at_bottom - max_scroll).abs() <= 2.0,
+            "Ctrl+Down on final term must reach bottom (scroll={scroll_at_bottom}, max_scroll={max_scroll})"
+        );
+        assert_eq!(app.get_popup_focused_index(), 27);
+
+        // Ctrl+Up steps smoothly back up through the last term overflow, then to the previous term.
+        let mut reached_prev_term = false;
+        for _ in 0..10 {
+            assert!(app.invoke_key_pressed(
+                "\u{F700}".into(),
+                !is_macos,
+                false,
+                false,
+                is_macos,
+            ));
+            if app.get_popup_focused_index() == 24 {
+                reached_prev_term = true;
+                break;
+            }
+        }
+        assert!(
+            reached_prev_term,
+            "Ctrl+Up must return from bottom overflow back to the previous term group"
+        );
+
+        // Collapse Term 0 (3 rows -> 1 visible row in popup_results): Term 1 is now at
+        // popup_results[1], while its dict_results 0-based index is 3 (`res.index - 1`).
+        app.invoke_toggle_term_collapse(0);
+        app.set_popup_focused_index(1);
+        added.set(-1);
+        assert!(app.invoke_key_pressed(
+            "d".into(),
+            !is_macos,
+            false,
+            false,
+            is_macos,
+        ));
+        assert_eq!(
+            added.get(),
+            3,
+            "Ctrl+D must map popup_results focus index to dict_results index when earlier terms are collapsed"
         );
     }
 }

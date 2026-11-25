@@ -6,8 +6,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-const VERSION: &str = "1.9.4";
-const SHA256: &str = "57e280cee375ab02425b806ad5146b99f6eb9357e3c2b31357c8a6af2e2e44ae";
+const VERSION: &str = "1.9.6";
+const SHA256: &str = "7ab15dc88022d2425ad94dcffd8abbf1b6d7018089b4e48d6b40780738e0b445";
 
 fn env_flag(name: &str) -> Option<bool> {
     let raw = std::env::var(name).ok()?;

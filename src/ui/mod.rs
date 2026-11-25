@@ -17,7 +17,7 @@ pub use bridge::{
     bind_rich_bridge_ass_controller, bind_rich_bridge_lookup_epoch,
     clear_rich_bridge_ass_lookup, install_rich_ui_bridges, mark_popup_term_anki_added,
     mark_popup_term_anki_updated, nested_popup_row_anki_note_id_i64, popup_row_anki_note_id_i64,
-    refresh_rich_ui_bridges,
+    refresh_rich_ui_bridges, start_keyboard_subtitle_scan, step_keyboard_subtitle_scan,
 };
 pub use dict_assets::{
     collect_dictionary_resource_dirs, load_dictionary_image_pixmap,
@@ -37,7 +37,8 @@ pub use popup_css::{
     ResolvedDictStyle, CUSTOM_POPUP_CSS_FILENAME, CUSTOM_POPUP_OUTER_CSS_FILENAME,
 };
 pub use popup_model::{
-    dictionary_result_rows, install_popup_navigation, is_kanji_char, next_popup_batch_end,
+    dictionary_result_rows, install_popup_navigation, is_kanji_char, load_more_popup_rows_now,
+    load_next_popup_term_batch_now, next_popup_batch_end, next_popup_term_batch_end,
     popup_pitch_graphs, prepare_text_fonts, rich_pitch_graphs_from_details, set_dictionary_rows,
     spawn_prepare_text_fonts, split_anki_tags_str,
 };

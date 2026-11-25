@@ -97,6 +97,18 @@ pub(super) struct HoveredSubtitleCluster {
     pub(super) sub_query: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum KeyboardScanCursor {
+    Plain {
+        global_char_index: usize,
+        global_utf16_offset: usize,
+    },
+    Ass {
+        event_index: usize,
+        char_index: usize,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct GlossaryScanHighlight {
     pub(super) row_index: i32,
@@ -1210,6 +1222,7 @@ pub(super) struct RichUiMutable {
 
     pub(super) hovered_cluster: Option<HoveredSubtitleCluster>,
     pub(super) hovered_ass_target: Option<crate::controller::ass::AssHoveredTarget>,
+    pub(super) keyboard_scan_cursor: Option<KeyboardScanCursor>,
     pub(super) pending_ass_scan: Option<crate::controller::ass::AssHoveredTarget>,
     pub(super) ass_controller: Option<Rc<RefCell<crate::controller::ass::AssOverlayController>>>,
     pub(super) active_scan_utf16_range: Option<(usize, usize)>,

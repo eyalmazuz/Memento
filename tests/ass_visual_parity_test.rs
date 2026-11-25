@@ -283,7 +283,7 @@ end)
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.finish();
-            // Window is 1920x1110 (top 30px = menu bar, bottom 1080px = video-area).
+            // Window is 1920x1080 (floating menu bar does not reserve vertical space).
             // OpenGL origin is bottom-left, so y=0..1080 is the exact 1920x1080 video-area!
             gl.read_pixels(
                 0,
@@ -402,7 +402,7 @@ end)
         std::fs::create_dir_all(COMPARISON_OUT_DIR).expect("create ass-comparison dir");
         let out_dir = PathBuf::from(COMPARISON_OUT_DIR);
 
-        // Initialize 1920x1110 EGL surfaceless OpenGL 3.3 context (30px menu bar + 1920x1080 video-area).
+        // Initialize 1920x1080 EGL surfaceless OpenGL 3.3 context (floating menu bar + full 1920x1080 video-area).
         let (display, surface, context, make_current, get_proc, destroy_ctx, destroy_surf, terminate) = unsafe {
             let display_fn = egl
                 .get::<unsafe extern "C" fn(u32, *mut c_void, *const isize) -> *mut c_void>(
@@ -493,7 +493,7 @@ end)
             let surface = create_surface(
                 display,
                 config,
-                [0x3057, 1920, 0x3056, 1110, 0x3038].as_ptr(),
+                [0x3057, 1920, 0x3056, 1080, 0x3038].as_ptr(),
             );
             assert!(!surface.is_null());
             assert_ne!(make_current(display, surface, surface, context), 0);
@@ -522,7 +522,7 @@ end)
             make_current,
             get_proc,
         });
-        app.window().set_size(slint::PhysicalSize::new(1920, 1110));
+        app.window().set_size(slint::PhysicalSize::new(1920, 1080));
         app.set_osc_fade_ms(0);
         app.set_osc_visible(false);
         app.set_duration(1440.0);

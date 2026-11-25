@@ -82,6 +82,64 @@ pub fn next_popup_batch_end(rows: &slint::ModelRc<DictResult>, start: usize) -> 
     rows.row_count()
 }
 
+/// Advance `start` through at least the end of the next complete `term_start..=term_end`
+/// group so keyboard popup navigation (`Ctrl+Down`) synchronously exposes the next term
+/// without dumping an entire 300-row lookup in one frame.
+pub fn next_popup_term_batch_end(rows: &slint::ModelRc<DictResult>, start: usize) -> usize {
+    let total = rows.row_count();
+    if start >= total {
+        return total;
+    }
+    let mut loaded_new_term_start = false;
+    for index in start..total {
+        if let Some(row) = rows.row_data(index) {
+            if row.term_start {
+                loaded_new_term_start = true;
+            }
+            if loaded_new_term_start && row.term_end {
+                return index + 1;
+            }
+        }
+    }
+    total
+}
+
+/// Synchronously append additional rows from `dict_results` into `popup_results`.
+/// When `load_all` is `true`, appends every remaining row; otherwise appends one
+/// complete term-group batch via [`next_popup_term_batch_end`].
+pub fn load_more_popup_rows_now(app: &SubomiApp, load_all: bool) -> usize {
+    let full = app.get_dict_results();
+    let start = app.get_popup_loaded_count().max(0) as usize;
+    if start >= full.row_count() {
+        return 0;
+    }
+    let end = if load_all {
+        full.row_count()
+    } else {
+        next_popup_term_batch_end(&full, start)
+    };
+    let popup = app.get_popup_results();
+    let mut pushed = 0usize;
+    if let Some(model) = popup.as_any().downcast_ref::<VecModel<DictResult>>() {
+        for index in start..end {
+            if let Some(row) = full
+                .row_data(index)
+                .filter(|row| !row.collapsed || row.term_start)
+            {
+                model.push(row);
+                pushed += 1;
+            }
+        }
+        app.set_popup_loaded_count(end as i32);
+    }
+    pushed
+}
+
+/// Synchronously append the next complete term group from `dict_results` into `popup_results`.
+pub fn load_next_popup_term_batch_now(app: &SubomiApp) -> usize {
+    load_more_popup_rows_now(app, false)
+}
+
 pub(super) static NEXT_BRIDGE_INSTANCE_ID: AtomicI32 = AtomicI32::new(1);
 
 thread_local! {
@@ -408,6 +466,8 @@ pub fn set_dictionary_rows(app: &SubomiApp, rows: Vec<DictResult>) {
     app.set_dict_results(full.into());
     let full = app.get_dict_results();
     let initial_loaded = initial_popup_batch_end(&full);
+    app.set_popup_focused_index(0);
+    app.set_popup_focus_scroll_seq(0);
     app.set_popup_loaded_count(initial_loaded as i32);
     app.set_popup_results(
         Rc::new(VecModel::from(popup_rows_through(&full, initial_loaded))).into(),
@@ -1247,13 +1307,16 @@ pub fn install_popup_navigation(app: &SubomiApp) {
     let more_app = app.as_weak();
     let more_pending = Rc::new(Cell::new(false));
     app.on_load_more_definition_results(move |force| {
+        let Some(app) = more_app.upgrade() else {
+            return;
+        };
+        if force {
+            let _ = load_more_popup_rows_now(&app, true);
+            return;
+        }
         if more_pending.replace(true) {
             return;
         }
-        let Some(app) = more_app.upgrade() else {
-            more_pending.set(false);
-            return;
-        };
         let expected_rows = app.get_dict_results();
         let weak = app.as_weak();
         let pending = more_pending.clone();
@@ -1263,7 +1326,7 @@ pub fn install_popup_navigation(app: &SubomiApp) {
             if app.get_dict_results() != expected_rows {
                 return;
             }
-            if !force && !app.get_popup_needs_more() {
+            if !app.get_popup_needs_more() {
                 return;
             }
             let full = app.get_dict_results();
@@ -1271,11 +1334,7 @@ pub fn install_popup_navigation(app: &SubomiApp) {
             if start >= full.row_count() {
                 return;
             }
-            let end = if force {
-                full.row_count()
-            } else {
-                next_popup_batch_end(&full, start)
-            };
+            let end = next_popup_batch_end(&full, start);
             let popup = app.get_popup_results();
             if let Some(model) = popup.as_any().downcast_ref::<VecModel<DictResult>>() {
                 for index in start..end {

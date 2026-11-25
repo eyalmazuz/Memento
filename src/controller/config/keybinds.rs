@@ -18,6 +18,18 @@ pub const KEYBIND_MARK_AUDIO_CONTEXT: &str = "mark-audio-context";
 /// audio context timestamps (Subomi `#136`).
 pub const KEYBIND_CLEAR_AUDIO_CONTEXT: &str = "clear-audio-context";
 
+/// Config key inside `[keybind/profiles/<name>]` for starting keyboard-driven
+/// dictionary lookup at the first lookupable character of the active subtitle.
+pub const KEYBIND_SUB_SCAN_START: &str = "sub-scan-start";
+
+/// Config key inside `[keybind/profiles/<name>]` for moving keyboard-driven
+/// subtitle dictionary lookup to the next lookupable character.
+pub const KEYBIND_SUB_SCAN_NEXT: &str = "sub-scan-next";
+
+/// Config key inside `[keybind/profiles/<name>]` for moving keyboard-driven
+/// subtitle dictionary lookup to the previous lookupable character.
+pub const KEYBIND_SUB_SCAN_PREV: &str = "sub-scan-prev";
+
 /// Reserved platform Settings shortcut strings.
 pub const SETTINGS_SHORTCUT_MACOS: &str = "Cmd+,";
 pub const SETTINGS_SHORTCUT_DEFAULT: &str = "Ctrl+,";
@@ -52,6 +64,9 @@ pub(crate) const KEYBIND_FIELDS: &[(&str, &str)] = &[
         raw::keybind::profile::CARD_PREVIOUS,
         "Scroll to previous search result",
     ),
+    (KEYBIND_SUB_SCAN_START, "Scan subtitle from start"),
+    (KEYBIND_SUB_SCAN_NEXT, "Scan next character in subtitle"),
+    (KEYBIND_SUB_SCAN_PREV, "Scan previous character in subtitle"),
     (KEYBIND_MARK_AUDIO_CONTEXT, "Mark/toggle A-B audio context"),
     (KEYBIND_CLEAR_AUDIO_CONTEXT, "Clear A-B audio context"),
     (raw::keybind::profile::OPEN_FILE, "Open file"),
@@ -129,6 +144,9 @@ pub(crate) fn keybind_default_for_os(key: &str, is_macos: bool) -> &'static str 
             raw::keybind::profile::CARD_ADD => "Cmd+D",
             raw::keybind::profile::CARD_NEXT => "Cmd+Down",
             raw::keybind::profile::CARD_PREVIOUS => "Cmd+Up",
+            KEYBIND_SUB_SCAN_START => "Cmd+K",
+            KEYBIND_SUB_SCAN_NEXT => "Cmd+Right",
+            KEYBIND_SUB_SCAN_PREV => "Cmd+Left",
             KEYBIND_MARK_AUDIO_CONTEXT => "Cmd+B",
             KEYBIND_CLEAR_AUDIO_CONTEXT => "Cmd+Shift+B",
             raw::keybind::profile::OPEN_FILE => "Cmd+O",
@@ -155,6 +173,9 @@ pub(crate) fn keybind_default_for_os(key: &str, is_macos: bool) -> &'static str 
             raw::keybind::profile::CARD_ADD => "Ctrl+D",
             raw::keybind::profile::CARD_NEXT => "Ctrl+Down",
             raw::keybind::profile::CARD_PREVIOUS => "Ctrl+Up",
+            KEYBIND_SUB_SCAN_START => "Ctrl+K",
+            KEYBIND_SUB_SCAN_NEXT => "Ctrl+Right",
+            KEYBIND_SUB_SCAN_PREV => "Ctrl+Left",
             KEYBIND_MARK_AUDIO_CONTEXT => "Ctrl+B",
             KEYBIND_CLEAR_AUDIO_CONTEXT => "Ctrl+Shift+B",
             raw::keybind::profile::OPEN_FILE => "Ctrl+O",

@@ -104,8 +104,8 @@ fn compiled_whisper_library_exposes_the_required_api() {
     unsafe {
         let version = subomi_asr_whisper::whisper_sys::whisper_version();
         assert!(!version.is_null());
-        // The upstream v1.9.4 tag reports "1.9.4-dev" in whisper_version().
-        assert_eq!(std::ffi::CStr::from_ptr(version).to_str().unwrap().split('-').next(), Some("1.9.4"));
+        // The upstream v1.9.6 tag reports "1.9.6-dev" in whisper_version().
+        assert_eq!(std::ffi::CStr::from_ptr(version).to_str().unwrap().split('-').next(), Some("1.9.6"));
         let _ = subomi_asr_whisper::whisper_sys::whisper_vad_default_context_params();
     }
 }

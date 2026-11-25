@@ -33,7 +33,8 @@ pub use anki_profiles::{
 pub use audio_sources::AudioSourceEntry;
 pub use keybinds::{
     reserved_shortcut_reason, AudioContextKeybindAction, KEYBIND_CLEAR_AUDIO_CONTEXT,
-    KEYBIND_MARK_AUDIO_CONTEXT, QUIT_SHORTCUT_MACOS, SETTINGS_SHORTCUT_DEFAULT,
+    KEYBIND_MARK_AUDIO_CONTEXT, KEYBIND_SUB_SCAN_NEXT, KEYBIND_SUB_SCAN_PREV,
+    KEYBIND_SUB_SCAN_START, QUIT_SHORTCUT_MACOS, SETTINGS_SHORTCUT_DEFAULT,
     SETTINGS_SHORTCUT_MACOS,
 };
 pub use migration::is_volatile_cache_key;
@@ -1815,14 +1816,36 @@ mod tests {
         assert_eq!(keybind_default_for_os(KEYBIND_CLEAR_AUDIO_CONTEXT, true), "Cmd+Shift+B");
         assert_eq!(keybind_default_for_os(KEYBIND_MARK_AUDIO_CONTEXT, false), "Ctrl+B");
         assert_eq!(keybind_default_for_os(KEYBIND_CLEAR_AUDIO_CONTEXT, false), "Ctrl+Shift+B");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_START, true), "Cmd+K");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_NEXT, true), "Cmd+Right");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_PREV, true), "Cmd+Left");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_START, false), "Ctrl+K");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_NEXT, false), "Ctrl+Right");
+        assert_eq!(keybind_default_for_os(KEYBIND_SUB_SCAN_PREV, false), "Ctrl+Left");
 
         let without_ocr = visible_keybind_fields_for(false);
         assert!(!without_ocr.iter().any(|(k, _)| *k == raw::keybind::profile::START_OCR));
         assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_MARK_AUDIO_CONTEXT));
         assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_CLEAR_AUDIO_CONTEXT));
+        assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_SUB_SCAN_START));
+        assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_SUB_SCAN_NEXT));
+        assert!(without_ocr.iter().any(|(k, _)| *k == KEYBIND_SUB_SCAN_PREV));
 
         let with_ocr = visible_keybind_fields_for(true);
         assert!(with_ocr.iter().any(|(k, _)| *k == raw::keybind::profile::START_OCR));
+        assert!(with_ocr.iter().any(|(k, _)| *k == KEYBIND_SUB_SCAN_START));
+
+        // Default profile must have zero conflicts and allow rebinding to vim-style keys (H/L).
+        let ctrl = ConfigController::new();
+        assert_eq!(ctrl.keybind_conflict_count(), 0);
+        let profile = ctrl.current_keybind_profile();
+        ctrl.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_START}"), "Alt+S")
+            .unwrap();
+        ctrl.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_NEXT}"), "L")
+            .unwrap();
+        ctrl.edit_setting(&format!("keybind/profiles/{profile}/{KEYBIND_SUB_SCAN_PREV}"), "H")
+            .unwrap();
+        assert_eq!(ctrl.keybind_conflict_count(), 0);
     }
 
     #[test]

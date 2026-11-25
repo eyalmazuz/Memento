@@ -111,7 +111,7 @@ fn subtitle_style_for_app(app: &SubomiApp) -> SubtitleRenderStyle {
     active_subtitle_render_style()
 }
 
-fn subtitle_token_width_with_engine(
+pub(in crate::ui) fn subtitle_token_width_with_engine(
     engine: &mut super::text_engine::TextEngine,
     word: &SubtitleWord,
     font_px: f32,
@@ -263,6 +263,22 @@ pub fn apply_subtitle_furigana(app: &SubomiApp, text: &str, parts: Vec<(String, 
         .as_ref()
         .and_then(|query| words.iter().position(|word| word.query == *query))
         .map(|index| index as i32)
+        .or_else(|| {
+            let sb = app.global::<SubtitleOverlayBridge>();
+            if !sb.get_keyboard_scan_active() {
+                return None;
+            }
+            let target_char = usize::try_from(sb.get_keyboard_scan_char_index()).ok()?;
+            let mut acc_chars = 0usize;
+            for word in &words {
+                let len = word.text.chars().count();
+                if target_char >= acc_chars && target_char < acc_chars + len {
+                    return Some(word.index);
+                }
+                acc_chars += len;
+            }
+            None
+        })
         .unwrap_or(-1);
     let selected_count = if selected_index >= 0 && app.get_dict_open() {
         let target = app.get_dict_query().encode_utf16().count();
