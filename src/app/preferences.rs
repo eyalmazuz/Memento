@@ -1676,6 +1676,7 @@ mod tests {
         let hit = SearchHit::new("食べる", "たべる", "to eat", "v1", 10, false);
         dict.add_entries([hit]);
 
+        cfg.edit_setting("search/ipadic-matcher", "false").unwrap();
         cfg.edit_setting(
             "search/text-replacements",
             r#"[{"pattern":"喰","replacement":"食","ignore_case":false,"enabled":true}]"#,

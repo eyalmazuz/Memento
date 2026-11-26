@@ -1950,9 +1950,19 @@ mod tests {
         let browse = setting_browse_metadata("behavior/file-open-custom").unwrap();
         assert_eq!(browse.kind, BrowseKind::Folder);
         assert!(browse.store_as_file_uri);
+        #[cfg(windows)]
+        let (sample_dir, expected_uri) = (
+            Path::new(r"C:\tmp\My Anime"),
+            "file:///C:/tmp/My%20Anime",
+        );
+        #[cfg(not(windows))]
+        let (sample_dir, expected_uri) = (
+            Path::new("/tmp/My Anime"),
+            "file:///tmp/My%20Anime",
+        );
         assert_eq!(
-            format_browse_selection("behavior/file-open-custom", Path::new("/tmp/My Anime")),
-            "file:///tmp/My%20Anime"
+            format_browse_selection("behavior/file-open-custom", sample_dir),
+            expected_uri
         );
 
         // Old config containing hidden dead switches still loads without error.

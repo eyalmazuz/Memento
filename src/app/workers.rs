@@ -1511,10 +1511,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("sample clip.mkv");
         std::fs::write(&file, b"demo").expect("write temp file");
-        let uri = format!(
-            "file://{}",
-            file.to_string_lossy().replace(' ', "%20")
-        );
+        let uri = url::Url::from_file_path(&file).unwrap().to_string();
         assert_eq!(resolve_thumbnail_media_path(&uri), Some(file.clone()));
         assert_eq!(
             resolve_thumbnail_media_path(&file.to_string_lossy()),

@@ -600,7 +600,7 @@ mod tests {
             ),
             Some(custom.clone())
         );
-        let file_uri = format!("file://{}", custom.to_str().unwrap().replace(' ', "%20"));
+        let file_uri = url::Url::from_file_path(&custom).unwrap().to_string();
         assert_eq!(
             resolve_file_open_dir(
                 4,
