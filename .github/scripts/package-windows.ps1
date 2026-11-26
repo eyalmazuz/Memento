@@ -38,12 +38,23 @@ Write-Host "Staged Windows portable directory contents:"
 Get-ChildItem -Path $stageDir | Format-Table Name, Length -AutoSize
 
 # Smoke-test launching the packaged binary directly (without inheriting build PATH).
+# subomi.exe uses `windows_subsystem = "windows"`, so PowerShell's `&` operator
+# returns asynchronously without populating $LASTEXITCODE; use Start-Process -Wait.
 $savedPath = $env:PATH
 try {
     $env:PATH = "$stageDir;C:\Windows\System32;C:\Windows"
-    & (Join-Path $stageDir "subomi.exe") --version
-    if ($LASTEXITCODE -ne 0) {
-        throw "Packaged subomi.exe --version exited with code $LASTEXITCODE"
+    $verOut = Join-Path $env:RUNNER_TEMP "subomi-version.txt"
+    $proc = Start-Process -FilePath (Join-Path $stageDir "subomi.exe") `
+        -ArgumentList "--version" `
+        -Wait -PassThru `
+        -RedirectStandardOutput $verOut
+    if ($proc.ExitCode -ne 0) {
+        throw "Packaged subomi.exe --version exited with code $($proc.ExitCode)"
+    }
+    $verText = (Get-Content -Path $verOut -Raw).Trim()
+    Write-Host "Smoke test output: $verText"
+    if (-not $verText.StartsWith("subomi ")) {
+        throw "Unexpected --version output: '$verText'"
     }
 } finally {
     $env:PATH = $savedPath
