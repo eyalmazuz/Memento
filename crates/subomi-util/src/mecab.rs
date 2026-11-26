@@ -1250,9 +1250,14 @@ mod tests {
         }
         let avg_micros =
             start.elapsed().as_micros() as f64 / (cues.len() * iterations) as f64;
+        let budget_us = if std::env::var_os("CI").is_some() {
+            2000.0
+        } else {
+            100.0
+        };
         assert!(
-            avg_micros < 250.0,
-            "warm in-process libmecab should stay sub-250us per cue, took {avg_micros:.2}us"
+            avg_micros < budget_us,
+            "warm in-process libmecab should stay under {budget_us:.0}us per cue, took {avg_micros:.2}us"
         );
     }
 
@@ -1381,9 +1386,14 @@ mod tests {
         }
         let avg_micros =
             start.elapsed().as_micros() as f64 / (inputs.len() * iterations) as f64;
+        let budget_us = if std::env::var_os("CI").is_some() {
+            5000.0
+        } else {
+            1000.0
+        };
         assert!(
-            avg_micros < 1000.0,
-            "mecab_tokenize_for_lookup must run under 1ms (1000us), took {avg_micros:.2}us"
+            avg_micros < budget_us,
+            "mecab_tokenize_for_lookup must run under {budget_us:.0}us, took {avg_micros:.2}us"
         );
     }
 

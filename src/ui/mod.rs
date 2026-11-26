@@ -51,7 +51,7 @@ pub use subtitle_layout::{
 pub use tags::{extract_inline_structured_tags, suppress_redundant_tags, tag_category_hex_color};
 pub(crate) use text_engine::cancel_subtitle_token_prewarm;
 #[cfg(test)]
-pub(crate) use text_engine::subtitle_token_prewarm_epoch_for_test;
+pub(crate) use text_engine::{lock_subtitle_prewarm_for_test, subtitle_token_prewarm_epoch_for_test};
 pub use text_engine::{
     prewarm_subtitle_tokens, subtitle_cluster_at_point, subtitle_cluster_at_point_with_style,
     ShapedSubtitleToken, SubtitleRenderStyle,

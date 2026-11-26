@@ -49,7 +49,8 @@ pub fn whisper_model_url(model: &str) -> String {
 /// filenames outside the Silero VAD whitelist; the exact Hugging Face URL
 /// otherwise.
 pub fn vad_model_url(model_path: &str) -> String {
-    if Path::new(model_path).is_absolute() {
+    let p = Path::new(model_path);
+    if p.is_absolute() || p.has_root() {
         return String::new();
     }
     let filename = file_name(model_path);
@@ -122,7 +123,8 @@ pub fn resolve_model_path(
     if path.is_empty() {
         return String::new();
     }
-    if Path::new(path).is_absolute() {
+    let p = Path::new(path);
+    if p.is_absolute() || p.has_root() {
         return path.to_string();
     }
 
@@ -160,7 +162,8 @@ fn is_bare_filename(path: &str) -> bool {
 }
 
 fn join_dir(dir: &str, name: &str) -> String {
-    if Path::new(name).is_absolute() {
+    let p = Path::new(name);
+    if p.is_absolute() || p.has_root() {
         return name.to_string();
     }
     let base = if dir.is_empty() { "." } else { dir };

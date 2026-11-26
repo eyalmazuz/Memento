@@ -80,7 +80,7 @@ jobs:
           key: ci-linux-${{ matrix.arch }}
 
       - name: Run workspace tests (base)
-        run: cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+        run: cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx --no-fail-fast
 
   macos:
     name: macOS (${{ matrix.arch }})
@@ -111,7 +111,7 @@ jobs:
           export MPV_SDK="$(brew --prefix mpv)"
           export ASS_SDK="$(brew --prefix libass)"
           export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix libarchive)/lib/pkgconfig"
-          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx --no-fail-fast
 
   windows:
     name: Windows (x86_64 MSVC)
@@ -156,7 +156,7 @@ jobs:
           $ErrorActionPreference = "Continue"
           $PSNativeCommandUseErrorActionPreference = $false
           $buildLog = "windows-ci-build.log"
-          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx 2>&1 | Tee-Object -FilePath $buildLog
+          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx --no-fail-fast 2>&1 | Tee-Object -FilePath $buildLog
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) {
             if (Select-String -Path $buildLog -Pattern 'LNK\d{4}|unresolved external symbol|cannot open input file' -Quiet) {
@@ -164,7 +164,7 @@ jobs:
               $ErrorActionPreference = "Stop"
               ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
               $ErrorActionPreference = "Continue"
-              cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+              cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx --no-fail-fast
               exit $LASTEXITCODE
             }
             exit $exitCode

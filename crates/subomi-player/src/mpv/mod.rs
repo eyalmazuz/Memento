@@ -1135,7 +1135,19 @@ mod tests {
     #[test]
     fn double_left_click_mouse_btn0_cycles_mpv_fullscreen_once() {
         let player = MpvInstance::new_software(None).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        let init_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw_initial_last = false;
+        while !saw_initial_last && std::time::Instant::now() < init_deadline {
+            for ev in player.drain_events() {
+                if matches!(ev, MpvEvent::PropertyChange { name, .. } if name == "cursor-autohide-fs-only")
+                {
+                    saw_initial_last = true;
+                }
+            }
+            if !saw_initial_last {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         let _ = player.drain_events();
         assert!(!player.is_fullscreen());
 
@@ -1160,7 +1172,7 @@ mod tests {
                     }
                 }
             }
-            if !transitions.is_empty() {
+            if transitions.last() == Some(&true) && player.is_fullscreen() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

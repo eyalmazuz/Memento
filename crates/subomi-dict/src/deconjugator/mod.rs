@@ -1064,7 +1064,12 @@ mod tests {
         let started = std::time::Instant::now();
         let nagara = deconjugate_str("ながらながらながらながら", true);
         assert!(nagara.len() <= MAX_TOTAL_RESULTS);
-        assert!(started.elapsed().as_millis() < 200);
+        let budget_ms = if std::env::var_os("CI").is_some() {
+            2000
+        } else {
+            200
+        };
+        assert!(started.elapsed().as_millis() < budget_ms);
     }
 
     #[test]

@@ -357,7 +357,14 @@ pub(crate) fn declared_setting_default(config: &Config, group: &str, key: &str) 
         } else {
             config.context().home_dir.clone()
         };
-        return Some(Value::Text(format!("file://{home}")));
+        let uri = if home.is_empty() {
+            "file://".to_owned()
+        } else {
+            url::Url::from_file_path(std::path::Path::new(&home))
+                .map(String::from)
+                .unwrap_or_else(|()| format!("file://{home}"))
+        };
+        return Some(Value::Text(uri));
     }
     if group == raw::application::GROUP && key == raw::application::UPDATE_CHANNEL {
         return Some(Value::Text(

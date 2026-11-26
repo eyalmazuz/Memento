@@ -100,6 +100,59 @@ fn ulp_distance(a: f32, b: f32) -> u64 {
     (f32_sort_key(a.to_bits()) - f32_sort_key(b.to_bits())).unsigned_abs()
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[track_caller]
+fn assert_f32_features_match(case_name: &str, label: &str, expected: &[f32], got: &[f32]) {
+    assert_f32_bits_equal(case_name, label, expected, got);
+}
+
+/// On non-`x86_64-linux` targets (`macOS` `libSystem`, `Windows` `UCRT`, and
+/// `aarch64` `libm`), transcendental `cos`/`sin`/`ln`/`exp` implementations
+/// differ from GNU `glibc` `x86_64` by up to ~1 ULP (~3e-7 after z-score
+/// normalization). Enforce strict `1e-5` absolute agreement plus NaN/Inf parity.
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[track_caller]
+fn assert_f32_features_match(case_name: &str, label: &str, expected: &[f32], got: &[f32]) {
+    let _ = ulp_distance;
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "[{case_name} / {label}] length mismatch: got {} expected {}",
+        got.len(),
+        expected.len(),
+    );
+    const MAX_ABS_TOL: f32 = 1e-5;
+    let mut max_abs: f32 = 0.0;
+    let mut max_idx: usize = 0;
+    for (i, (&e, &g)) in expected.iter().zip(got.iter()).enumerate() {
+        assert_eq!(
+            g.is_nan(),
+            e.is_nan(),
+            "[{case_name} / {label}] NaN mismatch at index {i}: expected {e:?}, got {g:?}"
+        );
+        assert_eq!(
+            g.is_infinite(),
+            e.is_infinite(),
+            "[{case_name} / {label}] Inf mismatch at index {i}: expected {e:?}, got {g:?}"
+        );
+        if e.is_finite() {
+            let diff = (g - e).abs();
+            if diff > max_abs {
+                max_abs = diff;
+                max_idx = i;
+            }
+        }
+    }
+    assert!(
+        max_abs <= MAX_ABS_TOL,
+        "GOLDEN MISMATCH [{case_name} / {label}]: max abs diff {max_abs:e} > {MAX_ABS_TOL:e} at index {max_idx} \
+         (expected {:?}, got {:?})",
+        expected[max_idx],
+        got[max_idx],
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[track_caller]
 fn assert_f32_bits_equal(case_name: &str, label: &str, expected: &[f32], got: &[f32]) {
     assert_eq!(
@@ -257,8 +310,8 @@ fn golden_mel_bit_identical_against_cxx() {
         );
         assert_eq!(got.n_mels, case.output.n_mels, "[{}] n_mels mismatch", case.name,);
 
-        // Bit-exact features (row-major [num_frames, n_mels]).
-        assert_f32_bits_equal(&case.name, "features", &case.output.features, &got.features);
+        // Bit-exact features on x86_64 Linux (reference libm), <=1e-5 on other OS/arch libm.
+        assert_f32_features_match(&case.name, "features", &case.output.features, &got.features);
 
         // Exact attention masks.
         assert_i64_exact(

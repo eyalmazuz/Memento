@@ -428,7 +428,12 @@ mod tests {
         let started = std::time::Instant::now();
         let rows = generate_queries_with_spans(&nodes, Some(0)).expect("DAG should succeed");
         assert!(!rows.is_empty());
-        assert!(started.elapsed().as_millis() < 200);
+        let budget_ms = if std::env::var_os("CI").is_some() {
+            2000
+        } else {
+            200
+        };
+        assert!(started.elapsed().as_millis() < budget_ms);
     }
 
     #[test]

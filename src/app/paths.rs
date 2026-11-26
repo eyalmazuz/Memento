@@ -632,7 +632,15 @@ mod tests {
 
     #[test]
     fn spawn_and_reap_leaves_zero_defunct_zombies_and_browse_targets_normalize() {
-        let pid = spawn_and_reap(Command::new("true")).expect("should spawn /usr/bin/true");
+        #[cfg(windows)]
+        let cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit", "0"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let cmd = Command::new("true");
+        let pid = spawn_and_reap(cmd).expect("should spawn trivial child process");
         #[cfg(target_os = "linux")]
         {
             let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));

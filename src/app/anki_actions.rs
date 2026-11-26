@@ -1292,7 +1292,7 @@ pub(crate) fn install_anki_and_audio_handlers(
     lookup_epoch: Arc<AtomicU64>,
 ) {
     let audio_player: Rc<RefCell<Option<audio::AudioController>>> = Rc::new(RefCell::new(None));
-    audio::set_download_timeout_ms(config_ctrl.audio_download_timeout_ms());
+    let _ = crate::app::preferences::sync_audio_preferences(&config_ctrl);
     register_audio_invalidation_target(
         app.as_weak(),
         popup_audio_cache.clone(),
@@ -1467,6 +1467,10 @@ pub(crate) fn install_anki_and_audio_handlers(
         if player.is_none() {
             match audio::AudioController::new() {
                 Ok(controller) => {
+                    #[cfg(test)]
+                    let _audio_gate = crate::app::preferences::AUDIO_SYNC_TEST_GATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     controller.set_download_timeout_ms(audio_config.audio_download_timeout_ms());
                     *player = Some(controller);
                 }
@@ -2153,6 +2157,9 @@ mod tests {
 
     #[test]
     fn audio_cache_invalidation_clears_popup_state_and_updates_timeout() {
+        let _audio_gate = crate::app::preferences::AUDIO_SYNC_TEST_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         let cache = Arc::new(Mutex::new(PopupAudioState::default()));
@@ -2182,6 +2189,7 @@ mod tests {
 
         invalidate_audio_caches_for_config_change(7_500);
         assert_eq!(audio::download_timeout_ms(), 7_500);
+        audio::set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
         assert_eq!(app.get_popup_audio_sources().row_count(), 0);
         assert_eq!(app.get_popup_audio_source_statuses().row_count(), 0);
         let st = cache.lock().unwrap();

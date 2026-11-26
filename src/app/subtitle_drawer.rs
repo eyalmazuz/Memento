@@ -1284,7 +1284,9 @@ mod tests {
         app.set_subtitle_entries(rows.clone().into());
         refresh_subtitle_list(&app, &rows, &subtitles.borrow());
         install_subtitle_selection(&app, subtitles.clone(), rows.clone());
+        app.set_sub_list_primary_font_family("FixedTestFont".into());
         app.show().unwrap();
+        let (y0, y1, y2) = (58.0f32, 82.0f32, 106.0f32);
         let click = |x, y| {
             let position = slint::LogicalPosition::new(x, y);
             app.window().dispatch_event(WindowEvent::PointerPressed {
@@ -1296,12 +1298,12 @@ mod tests {
                 button: PointerEventButton::Left,
             });
         };
-        click(950., 58.);
+        click(950., y0);
         assert_eq!(subtitles.borrow().selected_indices(), &[0]);
         app.window().dispatch_event(WindowEvent::KeyPressed {
             text: Key::Shift.into(),
         });
-        click(950., 106.);
+        click(950., y2);
         app.window().dispatch_event(WindowEvent::KeyReleased {
             text: Key::Shift.into(),
         });
@@ -1310,7 +1312,7 @@ mod tests {
         app.window().dispatch_event(WindowEvent::KeyPressed {
             text: Key::Control.into(),
         });
-        click(1100., 82.);
+        click(1100., y1);
         app.window().dispatch_event(WindowEvent::KeyReleased {
             text: Key::Control.into(),
         });
@@ -1331,21 +1333,21 @@ mod tests {
         let seek = Rc::new(Cell::new(0.));
         let result = seek.clone();
         app.on_seek_to(move |position| result.set(position));
-        click(1100., 106.);
-        click(1100., 106.);
+        click(1100., y2);
+        click(1100., y2);
         assert_eq!(seek.get(), 5.);
         assert!(subtitles.borrow().is_selected(2));
         subtitles.borrow_mut().clear_selection();
         refresh_subtitle_marks(&rows, &subtitles.borrow());
         assert!(rows.iter().all(|row| !row.selected));
         app.invoke_mark_subtitle_row(2);
-        let position = slint::LogicalPosition::new(1100., 58.);
+        let position = slint::LogicalPosition::new(1100., y0);
         app.window().dispatch_event(WindowEvent::PointerPressed {
             position,
             button: PointerEventButton::Left,
         });
         app.window().dispatch_event(WindowEvent::PointerMoved {
-            position: slint::LogicalPosition::new(1100., 106.),
+            position: slint::LogicalPosition::new(1100., y2),
         });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
         app.window()
@@ -1362,12 +1364,12 @@ mod tests {
         );
         subtitles.borrow_mut().clear_selection();
         refresh_subtitle_marks(&rows, &subtitles.borrow());
-        let position = slint::LogicalPosition::new(1100., 106.);
+        let position = slint::LogicalPosition::new(1100., y2);
         app.window().dispatch_event(WindowEvent::PointerPressed {
             position,
             button: PointerEventButton::Left,
         });
-        let position = slint::LogicalPosition::new(1100., 58.);
+        let position = slint::LogicalPosition::new(1100., y0);
         app.window()
             .dispatch_event(WindowEvent::PointerMoved { position });
         assert_eq!(
@@ -1381,14 +1383,14 @@ mod tests {
         });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
         app.window().dispatch_event(WindowEvent::PointerMoved {
-            position: slint::LogicalPosition::new(1100., 82.),
+            position: slint::LogicalPosition::new(1100., y1),
         });
         assert_eq!(subtitles.borrow().selected_indices(), &[0, 1, 2]);
         // M1: Ctrl+Click toggles an individual row out of the selection without clearing others.
         app.window().dispatch_event(WindowEvent::KeyPressed {
             text: Key::Control.into(),
         });
-        click(1100., 82.);
+        click(1100., y1);
         app.window().dispatch_event(WindowEvent::KeyReleased {
             text: Key::Control.into(),
         });
@@ -1405,7 +1407,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         refresh_subtitle_list(&app, &rows, &subtitles.borrow());
-        let position = slint::LogicalPosition::new(1100., 58.);
+        let position = slint::LogicalPosition::new(1100., y0);
         app.window().dispatch_event(WindowEvent::PointerScrolled {
             position,
             delta_x: 0.,
@@ -1417,7 +1419,7 @@ mod tests {
             button: PointerEventButton::Left,
         });
         i_slint_backend_testing::mock_elapsed_time(std::time::Duration::from_millis(600));
-        let position = slint::LogicalPosition::new(1100., 106.);
+        let position = slint::LogicalPosition::new(1100., y2);
         app.window()
             .dispatch_event(WindowEvent::PointerMoved { position });
         app.window().dispatch_event(WindowEvent::PointerReleased {

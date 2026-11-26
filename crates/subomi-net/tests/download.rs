@@ -17,9 +17,11 @@ use subomi_net::download::{
 
 fn workdir() -> PathBuf
 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = std::env::temp_dir();
     let dir = base.join(format!(
-        "subomi-net-dl-{}-{}",
+        "subomi-net-dl-{}-{}-{seq}",
         std::process::id(),
         nanos()
     ));

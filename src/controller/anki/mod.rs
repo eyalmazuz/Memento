@@ -1638,29 +1638,29 @@ mod tests {
 
     #[test]
     fn scoped_dictionary_css_caches_per_dict_id_and_raw_css_hash() {
+        let test_dict_id = -42_001;
         clear_scoped_css_cache();
         let css1 = ".gloss { color: red; }";
         let css2 = ".gloss { color: blue; }";
-        let scoped1 = scope_dictionary_css_cached(42, css1, "Jitendex");
+        let scoped1 = scope_dictionary_css_cached(test_dict_id, css1, "Jitendex");
         assert_eq!(
             scoped1,
             "[data-dictionary=\"Jitendex\"] .gloss { color: red; }"
         );
-        let len_after_first = css_glossary::scoped_css_cache_len();
-        assert!(len_after_first >= 1);
+        assert_eq!(css_glossary::scoped_css_cache_count_for_dict(test_dict_id), 1);
 
         // Cache hit on same `(dict_id, raw_css_hash)`.
-        let scoped1_again = scope_dictionary_css_cached(42, css1, "Jitendex");
+        let scoped1_again = scope_dictionary_css_cached(test_dict_id, css1, "Jitendex");
         assert_eq!(scoped1_again, scoped1);
-        assert_eq!(css_glossary::scoped_css_cache_len(), len_after_first);
+        assert_eq!(css_glossary::scoped_css_cache_count_for_dict(test_dict_id), 1);
 
         // Different raw CSS hash caches a distinct entry.
-        let scoped2 = scope_dictionary_css_cached(42, css2, "Jitendex");
+        let scoped2 = scope_dictionary_css_cached(test_dict_id, css2, "Jitendex");
         assert_eq!(
             scoped2,
             "[data-dictionary=\"Jitendex\"] .gloss { color: blue; }"
         );
-        assert_eq!(css_glossary::scoped_css_cache_len(), len_after_first + 1);
+        assert_eq!(css_glossary::scoped_css_cache_count_for_dict(test_dict_id), 2);
     }
 
     #[test]

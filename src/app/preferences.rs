@@ -372,7 +372,7 @@ pub(crate) fn audio_config_generation() -> u64 {
 /// Synchronizes `audio/download-timeout-ms` and `audio/sources` changes from `ConfigController`,
 /// updating the active download timeout and invalidating audio worker & popup caches on change.
 #[cfg(test)]
-static AUDIO_SYNC_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static AUDIO_SYNC_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn sync_audio_preferences_inner(config: &ConfigController) -> bool {
     let timeout_ms = config.audio_download_timeout_ms();
@@ -520,6 +520,10 @@ pub(crate) fn maybe_release_mecab_resources(
     if furigana_visible || mecab_matcher_enabled(config) {
         return false;
     }
+    #[cfg(test)]
+    let _furigana_gate = crate::controller::subtitles::furigana::lock_furigana_for_test();
+    #[cfg(test)]
+    let _prewarm_gate = crate::ui::lock_subtitle_prewarm_for_test();
     let cleared_cache = crate::controller::subtitles::clear_furigana_cache_and_cancel_prewarm();
     crate::ui::cancel_subtitle_token_prewarm();
     let unloaded_mecab = subomi_util::mecab::unload_mecab();
@@ -1739,6 +1743,11 @@ mod tests {
         // Unchanged config does not re-invalidate.
         sync_audio_preferences_inner(&cfg);
         assert_eq!(audio_config_generation(), gen1);
+
+        // Restore default 8000 ms before releasing gate.
+        cfg.edit_setting("audio/download-timeout-ms", "8000")
+            .unwrap();
+        sync_audio_preferences_inner(&cfg);
     }
 
     #[test]
@@ -1931,13 +1940,12 @@ mod tests {
     #[test]
     fn mecab_unload_and_prewarm_cancel_only_when_both_furigana_and_matcher_disabled() {
         use crate::controller::subtitles::furigana::{
-            cached_subtitle_furigana_parts, insert_cached_furigana_for_test, prewarm_epoch_for_test,
-            FURIGANA_GLOBAL_TEST_LOCK,
+            cached_subtitle_furigana_parts, insert_cached_furigana_for_test, lock_furigana_for_test,
+            prewarm_epoch_for_test,
         };
 
-        let _global_guard = FURIGANA_GLOBAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _global_guard = lock_furigana_for_test();
+        let _token_prewarm_guard = crate::ui::lock_subtitle_prewarm_for_test();
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();

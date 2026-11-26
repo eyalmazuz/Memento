@@ -29,6 +29,8 @@ pub(super) fn set_active_subtitle_render_style(style: SubtitleRenderStyle) {
         }
     });
     if changed {
+        #[cfg(test)]
+        let _prewarm_gate = super::text_engine::lock_subtitle_prewarm_for_test();
         cancel_subtitle_token_prewarm();
     }
 }

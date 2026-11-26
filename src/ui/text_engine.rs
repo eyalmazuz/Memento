@@ -1847,6 +1847,43 @@ pub(crate) fn cancel_subtitle_token_prewarm() {
 }
 
 #[cfg(test)]
+pub(crate) static SUBTITLE_PREWARM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static HOLDING_SUBTITLE_PREWARM_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct SubtitlePrewarmTestGuard {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for SubtitlePrewarmTestGuard {
+    fn drop(&mut self) {
+        if self._guard.is_some() {
+            HOLDING_SUBTITLE_PREWARM_LOCK.with(|h| h.set(false));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_subtitle_prewarm_for_test() -> SubtitlePrewarmTestGuard {
+    let already_held = HOLDING_SUBTITLE_PREWARM_LOCK.with(|h| h.replace(true));
+    if already_held {
+        SubtitlePrewarmTestGuard { _guard: None }
+    } else {
+        let guard = SUBTITLE_PREWARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        SubtitlePrewarmTestGuard {
+            _guard: Some(guard),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn subtitle_token_prewarm_epoch_for_test() -> u64 {
     SUBTITLE_PREWARM_EPOCH.load(Ordering::Acquire)
 }

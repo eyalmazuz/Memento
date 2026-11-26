@@ -379,11 +379,13 @@ pub fn clear_scoped_css_cache() {
 }
 
 #[cfg(test)]
-pub(crate) fn scoped_css_cache_len() -> usize {
+pub(crate) fn scoped_css_cache_count_for_dict(dict_id: i64) -> usize {
     scoped_css_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .len()
+        .keys()
+        .filter(|&&(id, _)| id == dict_id)
+        .count()
 }
 
 fn definition_html(definition: &GlossaryDefinition) -> String {

@@ -86,17 +86,21 @@ impl TestServer
         format!("http://{}:{}{}", self.addr.ip(), self.addr.port(), path)
     }
 
-    /// Spawns the accept loop. `handler` is called once per connection with
-    /// the connection index (0-based) and the captured request.
+    /// Spawns the accept loop. `handler` is called once per HTTP request with
+    /// the request index (0-based across the server) and the captured request,
+    /// honoring HTTP/1.1 keep-alive when a complete `Content-Length` response
+    /// without `Connection: close` is returned so pooled clients never race a
+    /// server-initiated close on redirect/follow-up hops.
     pub fn spawn<F>(&self, handler: F) -> &Self
     where
         F: Fn(usize, CapturedRequest) -> Action + Send + Sync + 'static,
     {
         let listener = self.listener.try_clone().expect("listener clone");
         let handler = Arc::new(handler);
+        let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = self.workers.lock().unwrap();
         workers.push(std::thread::spawn(move || {
-            for (index, conn) in listener.incoming().enumerate()
+            for conn in listener.incoming()
             {
                 match conn
                 {
@@ -106,35 +110,49 @@ impl TestServer
                         let _ =
                             stream.set_write_timeout(Some(Duration::from_secs(5)));
                         let handler = Arc::clone(&handler);
-                        std::thread::spawn(move || {
+                        let next_index = Arc::clone(&next_index);
+                        std::thread::spawn(move || loop {
                             let Ok(Some(request)) = read_request(&mut stream)
                             else
                             {
-                                // includes read timeouts — client gave up first
+                                // includes read timeouts or clean keep-alive pool close
                                 return;
                             };
+                            let index =
+                                next_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let req_method = request.method.clone();
                             match handler(index, request)
                             {
                                 Action::Respond(bytes) => {
-                                    let _ = stream.write_all(&bytes);
-                                    let _ = stream.flush();
+                                    if stream.write_all(&bytes).is_err()
+                                        || stream.flush().is_err()
+                                    {
+                                        return;
+                                    }
+                                    if response_is_complete_keep_alive(&bytes, &req_method)
+                                    {
+                                        continue;
+                                    }
                                     let _ =
                                         stream.shutdown(std::net::Shutdown::Write);
                                     // drain for a graceful close
                                     let mut sink = [0u8; 512];
                                     let _ = stream.read(&mut sink);
+                                    return;
                                 }
                                 Action::StallThen(delay, bytes) => {
                                     std::thread::sleep(delay);
                                     let _ = stream.write_all(&bytes);
+                                    return;
                                 }
                                 Action::Stall => {
                                     // hold the socket open longer than any
                                     // test timeout so the client sees a
                                     // read timeout, not a close
                                     std::thread::sleep(Duration::from_secs(2));
+                                    return;
                                 }
-                                Action::Drop => { /* close immediately */ }
+                                Action::Drop => return,
                             }
                         });
                     }
@@ -144,6 +162,49 @@ impl TestServer
         }));
         self
     }
+}
+
+fn response_is_complete_keep_alive(bytes: &[u8], request_method: &str) -> bool
+{
+    let Some(head_end) = find_head_end(bytes)
+    else
+    {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&bytes[..head_end]);
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    if !status_line.starts_with("HTTP/1.1 ")
+    {
+        return false;
+    }
+    let mut content_length: Option<usize> = None;
+    for line in lines
+    {
+        if let Some((name, value)) = line.split_once(':')
+        {
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+            {
+                return false;
+            }
+            if name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.parse().ok();
+            }
+        }
+    }
+    let Some(expected_body) = content_length
+    else
+    {
+        return false;
+    };
+    let actual_body = bytes.len() - (head_end + 4);
+    actual_body == expected_body || request_method.eq_ignore_ascii_case("HEAD")
 }
 
 /// Reads one request (head + Content-Length body). Returns `Ok(None)` when

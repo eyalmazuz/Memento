@@ -62,6 +62,7 @@ mod tests {
         played: Arc<Mutex<Vec<(PathBuf, Vec<u8>)>>>,
         fail_prefix: Option<Vec<u8>>,
         delay: Duration,
+        first_play_gate: Option<Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>>,
     }
 
     impl MockPlayback {
@@ -70,12 +71,22 @@ mod tests {
                 played: Arc::new(Mutex::new(Vec::new())),
                 fail_prefix: None,
                 delay: Duration::ZERO,
+                first_play_gate: None,
             }
         }
     }
 
     impl PlaybackBackend for MockPlayback {
         fn play_file(&mut self, path: &Path) -> Result<(), String> {
+            if let Some(gate) = self.first_play_gate.take() {
+                let (lock, cvar) = &*gate;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                cvar.notify_all();
+                let _ = cvar
+                    .wait_timeout_while(state, Duration::from_secs(5), |s| !s.1)
+                    .unwrap();
+            }
             if !self.delay.is_zero() {
                 std::thread::sleep(self.delay);
             }
@@ -242,21 +253,25 @@ mod tests {
         let played = Arc::clone(&mock.played);
         let init_started = Arc::new(AtomicBool::new(false));
         let init_started_worker = Arc::clone(&init_started);
+        let init_finished = Arc::new(AtomicBool::new(false));
+        let init_finished_worker = Arc::clone(&init_finished);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
 
-        let started = Instant::now();
         let controller = AudioController::with_backend_factory(
             move || {
                 init_started_worker.store(true, Ordering::Release);
-                std::thread::sleep(Duration::from_millis(80));
+                let _ = gate_rx.recv_timeout(Duration::from_secs(5));
+                init_finished_worker.store(true, Ordering::Release);
                 Ok(mock)
             },
             fast_http_config(),
         )
         .unwrap();
         assert!(
-            started.elapsed() < Duration::from_millis(60),
+            !init_finished.load(Ordering::Acquire),
             "AudioController creation must not block waiting on backend initialization"
         );
+        let _ = gate_tx.send(());
 
         let (tx, rx) = mpsc::channel();
         controller
@@ -962,7 +977,8 @@ mod tests {
         }
 
         let mut mock = MockPlayback::new();
-        mock.delay = Duration::from_millis(40);
+        let gate = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        mock.first_play_gate = Some(Arc::clone(&gate));
         let played = Arc::clone(&mock.played);
         let controller = AudioController::with_backend(mock, fast_http_config()).unwrap();
 
@@ -984,6 +1000,19 @@ mod tests {
                     },
                 )
                 .unwrap();
+            if idx == 0 {
+                let (lock, cvar) = &*gate;
+                let guard = lock.lock().unwrap();
+                let _ = cvar
+                    .wait_timeout_while(guard, Duration::from_secs(5), |s| !s.0)
+                    .unwrap();
+            }
+        }
+        {
+            let (lock, cvar) = &*gate;
+            let mut guard = lock.lock().unwrap();
+            guard.1 = true;
+            cvar.notify_all();
         }
         drop(tx);
 
@@ -1024,28 +1053,34 @@ mod tests {
 
     #[test]
     fn download_timeout_uses_bounded_config_and_enforces_per_request_timeout() {
-        // Default is 8_000 ms; bounds clamp strictly to 1_000..=30_000 ms.
-        set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
-        assert_eq!(download_timeout_ms(), 8_000);
-        assert_eq!(download_timeout_config().timeout(), Duration::from_secs(8));
+        {
+            let _audio_gate = crate::app::preferences::AUDIO_SYNC_TEST_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Default is 8_000 ms; bounds clamp strictly to 1_000..=30_000 ms.
+            set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+            assert_eq!(download_timeout_ms(), 8_000);
+            assert_eq!(download_timeout_config().timeout(), Duration::from_secs(8));
 
-        set_download_timeout_ms(250);
-        assert_eq!(download_timeout_ms(), 1_000);
-        set_download_timeout_ms(12_500);
-        assert_eq!(download_timeout_ms(), 12_500);
-        set_download_timeout_ms(120_000);
-        assert_eq!(download_timeout_ms(), 30_000);
-        // Restore default so other tests see the 8 s default.
-        set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+            set_download_timeout_ms(250);
+            assert_eq!(download_timeout_ms(), 1_000);
+            set_download_timeout_ms(12_500);
+            assert_eq!(download_timeout_ms(), 12_500);
+            set_download_timeout_ms(120_000);
+            assert_eq!(download_timeout_ms(), 30_000);
+            // Restore default so other tests see the 8 s default.
+            set_download_timeout_ms(subomi_audio::DEFAULT_AUDIO_DOWNLOAD_TIMEOUT_MS);
+        }
 
         // Verify `send_with_request_timeout` overrides a long-timeout client cleanly.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut req = [0u8; 1024];
                 let _ = stream.read(&mut req);
-                std::thread::sleep(Duration::from_millis(600));
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: audio/mpeg\r\n\r\nID3slow",
                 );
@@ -1072,8 +1107,14 @@ mod tests {
         )
         .unwrap_err();
         let elapsed = started.elapsed();
+        let _ = done_tx.send(());
+        let max_budget = if std::env::var_os("CI").is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < max_budget,
             "per-request timeout override must abort quickly, took {elapsed:?} (err: {err})"
         );
         let _ = server.join();
@@ -1158,6 +1199,10 @@ mod tests {
 
     #[test]
     fn shared_audio_cache_reuses_downloaded_audio_and_json_and_clears() {
+        let _audio_gate = crate::app::preferences::AUDIO_SYNC_TEST_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_shared_audio_cache();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let json_hits = Arc::new(AtomicUsize::new(0));

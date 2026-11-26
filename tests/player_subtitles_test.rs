@@ -857,7 +857,8 @@ mod phase2c_live_wire_tests {
                 &hover_owned,
                 Duration::from_secs(6),
                 |coord, _, _| {
-                    coord.playback_state().paused && coord.playback_state().position >= 1.75
+                    coord.playback_state().paused
+                        && (1.75..=2.15).contains(&coord.playback_state().position)
                 },
             ),
             "AutoPauseState did not pause at end of ASR cue 1 (pos={}, paused={})",
@@ -1059,7 +1060,10 @@ mod phase2c_live_wire_tests {
                 false,
                 &[
                     "aid=1".to_owned(),
-                    format!("audio-files-append={}", wav2.display()),
+                    format!(
+                        "audio-files-append={}",
+                        wav2.to_string_lossy().replace('\\', "/")
+                    ),
                 ],
             )
             .unwrap();
