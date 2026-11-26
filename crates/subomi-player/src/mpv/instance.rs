@@ -529,7 +529,7 @@ impl MpvInstance {
                         (EndFileReason::Unknown(-1), 0),
                         |info| {
                             #[allow(clippy::unnecessary_cast)]
-                            let reason = match info.reason as u32 {
+                            let reason = match info.reason as ffi::mpv_end_file_reason {
                                 ffi::MPV_END_FILE_REASON_EOF => EndFileReason::Eof,
                                 ffi::MPV_END_FILE_REASON_STOP => EndFileReason::Stop,
                                 ffi::MPV_END_FILE_REASON_QUIT => EndFileReason::Quit,
@@ -725,9 +725,10 @@ impl MpvInstance {
         let Some(context) = guard.pointer else {
             return false;
         };
+        #[allow(clippy::unnecessary_cast)]
         unsafe {
             ffi::mpv_render_context_update(context.as_ptr())
-                & u64::from(ffi::MPV_RENDER_UPDATE_FRAME)
+                & (ffi::MPV_RENDER_UPDATE_FRAME as u64)
                 != 0
         }
     }

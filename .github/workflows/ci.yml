@@ -63,7 +63,14 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libfontconfig1-dev \
-            libegl1-mesa-dev
+            libegl1-mesa-dev \
+            fontconfig \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji \
+            mecab \
+            libmecab2 \
+            mecab-ipadic-utf8
+          fc-cache -f
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -111,8 +118,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache vcpkg installed libraries
-        uses: actions/cache@v4
+      - name: Restore vcpkg installed libraries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1
@@ -122,6 +130,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./.github/scripts/setup-windows-deps.ps1
+
+      - name: Save vcpkg installed libraries
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libass-win-x64-v1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -136,9 +151,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Build/test with static libass failed; retrying with dynamic libass fallback..."
-            ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
-            cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $buildLog = "windows-ci-build.log"
+          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx 2>&1 | Tee-Object -FilePath $buildLog
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Select-String -Path $buildLog -Pattern 'LNK\d{4}|unresolved external symbol|cannot open input file' -Quiet) {
+              Write-Warning "Build/test with static libass failed at link; retrying with dynamic libass fallback..."
+              $ErrorActionPreference = "Stop"
+              ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
+              $ErrorActionPreference = "Continue"
+              cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+              exit $LASTEXITCODE
+            }
+            exit $exitCode
           }

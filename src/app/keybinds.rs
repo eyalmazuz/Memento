@@ -1383,6 +1383,8 @@ mod tests {
 
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
+        #[cfg(target_os = "macos")]
+        app.set_key_quit(crate::controller::config::QUIT_SHORTCUT_MACOS.into());
         let cfg = Rc::new(ConfigController::new());
         let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
         let closing = Rc::new(Cell::new(false));
@@ -1951,6 +1953,7 @@ mod tests {
         let app = SubomiApp::new().unwrap();
         app.window().set_size(slint::LogicalSize::new(1280., 720.));
         let cfg = Rc::new(ConfigController::new());
+        crate::app::preferences::refresh_player_preferences(&app, &cfg);
         let mpv = Rc::new(RefCell::new(None));
         let closing = Rc::new(Cell::new(false));
         let hover_cursor = Rc::new(RefCell::new(None));

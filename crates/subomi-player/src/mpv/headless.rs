@@ -256,11 +256,12 @@ impl HeadlessMpv {
         unsafe {
             let event = ffi::mpv_wait_event(self.handle.as_ptr(), timeout_secs);
             let raw = event.as_ref()?;
+            #[allow(clippy::unnecessary_cast)]
             let end_file = if raw.event_id == ffi::MPV_EVENT_END_FILE {
                 raw.data
                     .cast::<ffi::mpv_event_end_file>()
                     .as_ref()
-                    .map(|info| (info.reason as u32, info.error))
+                    .map(|info| (info.reason as ffi::mpv_end_file_reason, info.error))
             } else {
                 None
             };

@@ -34,7 +34,7 @@ const SUBTITLE_PREWARM_MAX_TOKENS: usize = 96;
 const SUBTITLE_PREWARM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub(super) const RICH_EMOJI_FALLBACK_STACK: &str =
-    "Noto Sans CJK JP, Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, sans-serif";
+    "Noto Sans CJK JP, Hiragino Sans, Hiragino Kaku Gothic ProN, Yu Gothic UI, Yu Gothic, Meiryo, MS Gothic, Noto Color Emoji, Apple Color Emoji, Segoe UI Emoji, sans-serif";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubtitleRenderStyle {

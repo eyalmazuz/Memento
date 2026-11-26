@@ -1917,8 +1917,12 @@ mod tests {
     fn mecab_unload_and_prewarm_cancel_only_when_both_furigana_and_matcher_disabled() {
         use crate::controller::subtitles::furigana::{
             cached_subtitle_furigana_parts, insert_cached_furigana_for_test, prewarm_epoch_for_test,
+            FURIGANA_GLOBAL_TEST_LOCK,
         };
 
+        let _global_guard = FURIGANA_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         i_slint_backend_testing::init_no_event_loop();
         let app = SubomiApp::new().unwrap();
         let cfg = ConfigController::new();

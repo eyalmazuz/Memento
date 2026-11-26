@@ -190,7 +190,11 @@ impl Default for CursorAutohide {
 }
 
 impl CursorAutohide {
-    pub fn decode(format: u32, int64_val: i64, str_val: *const c_char) -> Option<Self> {
+    pub fn decode(
+        format: ffi::mpv_format,
+        int64_val: i64,
+        str_val: *const c_char,
+    ) -> Option<Self> {
         if format == ffi::MPV_FORMAT_INT64 {
             Some(Self::Number(int64_val))
         } else if format == ffi::MPV_FORMAT_STRING && !str_val.is_null() {

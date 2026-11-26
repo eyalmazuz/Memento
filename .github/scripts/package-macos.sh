@@ -126,6 +126,27 @@ if [[ "$leaked" -ne 0 ]]; then
   exit 1
 fi
 
+# macOS 15 dyld aborts on duplicate LC_RPATH entries (which dylibbundler can emit).
+# Deduplicate LC_RPATHs and drop any residual Homebrew rpaths before signing.
+for bin in "${APP_BUNDLE}/Contents/MacOS/subomi" "${APP_BUNDLE}/Contents/Frameworks/"*.dylib; do
+  [[ -f "$bin" ]] || continue
+  chmod u+w "$bin"
+  rpaths="$(otool -l "$bin" | awk '/cmd LC_RPATH/{f=1;next} f && /path /{print $2; f=0}')"
+  if [[ -n "$rpaths" ]]; then
+    while IFS= read -r rp; do
+      [[ -z "$rp" ]] && continue
+      while install_name_tool -delete_rpath "$rp" "$bin" 2>/dev/null; do :; done
+    done < <(printf '%s\n' "$rpaths" | sort -u)
+    while IFS= read -r rp; do
+      [[ -z "$rp" ]] && continue
+      case "$rp" in
+        /opt/homebrew/*|/usr/local/*) continue ;;
+      esac
+      install_name_tool -add_rpath "$rp" "$bin"
+    done < <(printf '%s\n' "$rpaths" | sed -E 's|/+$||' | sort -u)
+  fi
+done
+
 # Ad-hoc code sign all dylibs first, then the app bundle (required on Apple Silicon).
 find "${APP_BUNDLE}/Contents/Frameworks" -type f -name '*.dylib' -exec \
   codesign --force --sign - {} +

@@ -261,8 +261,9 @@ jobs:
           name: ${{ inputs.changelog_artifact }}
           path: .
 
-      - name: Cache vcpkg installed libraries
-        uses: actions/cache@v4
+      - name: Restore vcpkg installed libraries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1
@@ -272,6 +273,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./.github/scripts/setup-windows-deps.ps1
+
+      - name: Save vcpkg installed libraries
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libass-win-x64-v1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -288,14 +296,21 @@ jobs:
           SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          cargo build --profile "${{ inputs.profile }}" --bin subomi
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Static libass link failed; falling back to dynamic libass DLLs..."
-            ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
-            cargo build --profile "${{ inputs.profile }}" --bin subomi
-            if ($LASTEXITCODE -ne 0) {
-              throw "cargo build failed even with dynamic libass fallback"
+          $ErrorActionPreference = "Continue"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $buildLog = "windows-dist-build.log"
+          cargo build --profile "${{ inputs.profile }}" --bin subomi 2>&1 | Tee-Object -FilePath $buildLog
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            if (Select-String -Path $buildLog -Pattern 'LNK\d{4}|unresolved external symbol|cannot open input file' -Quiet) {
+              Write-Warning "Static libass link failed; falling back to dynamic libass DLLs..."
+              $ErrorActionPreference = "Stop"
+              ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
+              $ErrorActionPreference = "Continue"
+              cargo build --profile "${{ inputs.profile }}" --bin subomi
+              exit $LASTEXITCODE
             }
+            exit $exitCode
           }
 
       - name: Package portable Windows .zip
