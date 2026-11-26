@@ -1,6 +1,6 @@
 [package]
 name = "subomi-config"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 rust-version = "1.77"
 description = "Settings persistence and legacy configuration loader"

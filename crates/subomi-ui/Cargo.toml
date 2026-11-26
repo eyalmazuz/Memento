@@ -1,6 +1,6 @@
 [package]
 name = "subomi-ui"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 publish = false
 license = "GPL-2.0-only"

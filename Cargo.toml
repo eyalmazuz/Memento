@@ -1,6 +1,6 @@
 [package]
 name = "subomi"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 publish = false
 default-run = "subomi"
@@ -79,6 +79,9 @@ members = [
     ".",
     "crates/*",
 ]
+
+[workspace.package]
+version = "2.0.2"
 
 [profile.release]
 opt-level = "z"

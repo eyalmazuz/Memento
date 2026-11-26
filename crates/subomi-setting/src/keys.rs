@@ -150,6 +150,14 @@ pub mod application {
     pub const AUTO_UPDATE_CHECK: &str = "auto-update-check";
     /// keys.h:151
     pub const AUTO_UPDATE_CHECK_DEFAULT: bool = false;
+
+    /// Pure-Rust extension: release channel checked for updates (`"stable"` or `"nightly"`).
+    pub const UPDATE_CHANNEL: &str = "update-channel";
+    pub const UPDATE_CHANNEL_STABLE: &str = "stable";
+    pub const UPDATE_CHANNEL_NIGHTLY: &str = "nightly";
+    /// Fallback default update channel (`"stable"`). Official nightly binaries
+    /// default to `"nightly"` at runtime unless explicitly overridden by the user.
+    pub const UPDATE_CHANNEL_DEFAULT: &str = UPDATE_CHANNEL_STABLE;
 }
 
 pub mod behavior {

@@ -315,6 +315,7 @@ export component MenuDropdown inherits Rectangle {
     callback open-config();
     callback check-updates();
     callback show-about();
+    callback show-whats-new();
     callback select-anki-profile(string);
     callback close-menu();
 
@@ -353,6 +354,7 @@ export component MenuDropdown inherits Rectangle {
         else if action-id == 32 { root.open-config(); root.close-menu(); }
         else if action-id == 33 { root.check-updates(); root.close-menu(); }
         else if action-id == 34 { root.show-about(); root.close-menu(); }
+        else if action-id == 35 { root.show-whats-new(); root.close-menu(); }
         else if action-id == 40 { root.adjust-subtitle-scale(0.005); root.close-menu(); }
         else if action-id == 41 { root.adjust-subtitle-scale(-0.005); root.close-menu(); }
         else if action-id == 42 { root.adjust-subtitle-offset(0.005); root.close-menu(); }
@@ -391,6 +393,7 @@ export component MenuDropdown inherits Rectangle {
         { id: 33, text: "Check for Updates", shown: true },
         { id: 0, is-separator: true, shown: true },
         { id: 34, text: "About Subomi", shown: true },
+        { id: 35, text: "What's New", shown: true },
     ];
     property <[MenuActionRow]> active-menu-rows:
         root.menu-index == 0 ? root.media-menu-rows :

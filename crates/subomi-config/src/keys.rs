@@ -198,12 +198,14 @@ field_enum! {
 pub enum ApplicationField {
     Language,
     AutoUpdateCheck,
+    UpdateChannel,
 }
 
 field_enum! {
     ApplicationField,
     Language(raw = raw::application::LANGUAGE, default = DefaultFallback::Int(raw::application::LANGUAGE_DEFAULT as i32)),
     AutoUpdateCheck(raw = raw::application::AUTO_UPDATE_CHECK, default = DefaultFallback::Bool(raw::application::AUTO_UPDATE_CHECK_DEFAULT)),
+    UpdateChannel(raw = raw::application::UPDATE_CHANNEL, default = DefaultFallback::Str(raw::application::UPDATE_CHANNEL_DEFAULT)),
 }
 
 /// Field of the `[behavior]` group (keys.h `Keys::Behavior`).

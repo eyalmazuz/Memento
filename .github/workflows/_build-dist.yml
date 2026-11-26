@@ -1,0 +1,307 @@
+name: Build Distribution Artifacts
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: Cargo profile (`release` for nightly, `release-dist` for stable)
+        required: true
+        type: string
+      build_channel:
+        description: Compile-time SUBOMI_BUILD_CHANNEL (`nightly` or `stable`)
+        required: true
+        type: string
+      include_linux_full:
+        description: Also build the Linux x86_64 OCR + Whisper Vulkan variant
+        required: false
+        default: false
+        type: boolean
+      changelog_artifact:
+        description: Optional artifact name containing `nightly-changelog.md` to bake into What's New
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: Git ref or SHA to check out (defaults to triggering commit)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Download nightly changelog (if provided)
+        if: inputs.changelog_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.changelog_artifact }}
+          path: .
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libclang-dev \
+            pkg-config \
+            libmpv-dev \
+            libass-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libfontconfig1-dev \
+            libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ inputs.profile }}-linux-${{ matrix.arch }}
+
+      - name: Build Subomi (base)
+        env:
+          SUBOMI_BUILD_CHANNEL: ${{ inputs.build_channel }}
+          SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
+        run: cargo build --profile "${{ inputs.profile }}" --bin subomi
+
+      - name: Package .tar.gz and .AppImage
+        env:
+          BINARY_PATH: target/${{ inputs.profile }}/subomi
+          ARCH: ${{ matrix.arch }}
+          OUT_DIR: dist
+        run: bash .github/scripts/package-linux.sh
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux-full:
+    name: Build Linux (x86_64 OCR + Whisper Vulkan)
+    if: inputs.include_linux_full
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Download nightly changelog (if provided)
+        if: inputs.changelog_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.changelog_artifact }}
+          path: .
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            curl \
+            file \
+            xz-utils \
+            libclang-dev \
+            pkg-config \
+            libmpv-dev \
+            libass-dev \
+            libvulkan-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libfontconfig1-dev \
+            libegl1-mesa-dev
+
+      - name: Cache LunarG Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/vulkan-sdk
+          key: lunarg-vulkan-sdk-linux-x86_64-v1
+
+      - name: Install LunarG Vulkan SDK (modern glslc & headers for ggml-vulkan)
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/vulkan-sdk"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz" -o /tmp/vulkan-sdk.tar.xz
+          tar -xf /tmp/vulkan-sdk.tar.xz -C "$HOME/vulkan-sdk"
+          rm -f /tmp/vulkan-sdk.tar.xz
+
+      - name: Configure Vulkan SDK environment
+        run: |
+          SDK_DIR="$(find "$HOME/vulkan-sdk" -mindepth 2 -maxdepth 2 -type d -name x86_64 | head -n 1)"
+          if [[ -z "$SDK_DIR" || ! -x "${SDK_DIR}/bin/glslc" ]]; then
+            echo "::error::Could not locate x86_64/bin/glslc inside $HOME/vulkan-sdk"
+            exit 1
+          fi
+          echo "VULKAN_SDK=${SDK_DIR}" >> "$GITHUB_ENV"
+          echo "${SDK_DIR}/bin" >> "$GITHUB_PATH"
+          echo "CMAKE_PREFIX_PATH=${SDK_DIR}" >> "$GITHUB_ENV"
+          "${SDK_DIR}/bin/glslc" --version
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ inputs.profile }}-linux-x86_64-ocr-asr-vulkan
+
+      - name: Build Subomi (OCR + Whisper Vulkan)
+        env:
+          SUBOMI_BUILD_CHANNEL: ${{ inputs.build_channel }}
+          SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
+          SUBOMI_WHISPER_PORTABLE: "1"
+        run: cargo build --profile "${{ inputs.profile }}" --bin subomi --features ocr,asr,whisper-vulkan
+
+      - name: Package .tar.gz and .AppImage
+        env:
+          BINARY_PATH: target/${{ inputs.profile }}/subomi
+          ARCH: x86_64
+          VARIANT_SUFFIX: -ocr-asr-vulkan
+          OUT_DIR: dist
+        run: bash .github/scripts/package-linux.sh
+
+      - name: Upload Linux OCR + ASR Vulkan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-x86_64-ocr-asr-vulkan
+          path: dist/*
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Download nightly changelog (if provided)
+        if: inputs.changelog_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.changelog_artifact }}
+          path: .
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install pkgconf mpv libass dylibbundler
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ inputs.profile }}-macos-${{ matrix.arch }}
+
+      - name: Build Subomi (base)
+        env:
+          SUBOMI_BUILD_CHANNEL: ${{ inputs.build_channel }}
+          SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig
+        run: cargo build --profile "${{ inputs.profile }}" --bin subomi
+
+      - name: Package Subomi.app zip
+        env:
+          BINARY_PATH: target/${{ inputs.profile }}/subomi
+          ARCH: ${{ matrix.arch }}
+          OUT_DIR: dist
+        run: bash .github/scripts/package-macos.sh
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (x86_64 MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Download nightly changelog (if provided)
+        if: inputs.changelog_artifact != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.changelog_artifact }}
+          path: .
+
+      - name: Cache vcpkg installed libraries
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libass-win-x64-v1
+
+      - name: Setup Windows native dependencies (static libass)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/setup-windows-deps.ps1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ inputs.profile }}-windows-x86_64
+
+      - name: Build Subomi (base, static libass with dynamic fallback)
+        shell: pwsh
+        env:
+          SUBOMI_BUILD_CHANNEL: ${{ inputs.build_channel }}
+          SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo build --profile "${{ inputs.profile }}" --bin subomi
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Static libass link failed; falling back to dynamic libass DLLs..."
+            ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
+            cargo build --profile "${{ inputs.profile }}" --bin subomi
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo build failed even with dynamic libass fallback"
+            }
+          }
+
+      - name: Package portable Windows .zip
+        shell: pwsh
+        run: ./.github/scripts/package-windows.ps1 -BinaryPath "target\${{ inputs.profile }}\subomi.exe" -OutDir "dist"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-x86_64
+          path: dist/*
+          if-no-files-found: error

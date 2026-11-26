@@ -573,7 +573,7 @@ export component SettingsWindow inherits Window {
                                 text: parent.is-empty-search
                                     ? ("No settings match \"" + root.settings-search-query + "\".")
                                     : (root.active-category == 7
-                                        ? "⚠ OCR runtime unavailable (libmocr / manga-ocr); preferences remain editable."
+                                        ? "⚠ manga-ocr not found — install into ~/.local/share/subomi/ocr-venv or set SUBOMI_OCR_PYTHON."
                                         : "⚠ ASR runtime unavailable; preferences remain editable.");
                                 color: parent.is-empty-search ? SubomiPalette.text-muted : SubomiPalette.warning-text;
                                 font-size: parent.is-empty-search ? 13px : 12px;

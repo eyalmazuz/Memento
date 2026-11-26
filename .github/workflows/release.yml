@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-22.04
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/_build-dist.yml
+    with:
+      profile: release-dist
+      build_channel: stable
+      include_linux_full: true
+      checkout_ref: ${{ github.sha }}
+
+  publish:
+    name: Upload assets & publish release
+    needs:
+      - release-please
+      - build
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify expected assets and generate checksums
+        run: |
+          set -euo pipefail
+          expected=(
+            subomi-linux-x86_64.tar.gz
+            Subomi-linux-x86_64.AppImage
+            subomi-linux-x86_64-ocr-asr-vulkan.tar.gz
+            Subomi-linux-x86_64-ocr-asr-vulkan.AppImage
+            subomi-linux-arm64.tar.gz
+            Subomi-linux-arm64.AppImage
+            Subomi-macos-arm64.zip
+            Subomi-macos-x86_64.zip
+            Subomi-windows-x86_64.zip
+          )
+          for asset in "${expected[@]}"; do
+            test -s "release-assets/${asset}"
+          done
+          (cd release-assets && sha256sum "${expected[@]}" > SHA256SUMS.txt)
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Upload assets and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          # Preserve release-please's generated changelog body and append concise download notes.
+          gh release view "$RELEASE_TAG" --json body -q .body > release-notes.md
+          cat >> release-notes.md << 'EOF'
+
+          ---
+
+          ### Downloads & Setup Notes
+
+          * **Windows (`Subomi-windows-x86_64.zip`):** Portable base build — unzip and double-click `subomi.exe`.
+          * **macOS (`Subomi-macos-arm64.zip` / `Subomi-macos-x86_64.zip`):** Standalone `Subomi.app` base build. Because builds are ad-hoc signed (not notarized), run `xattr -cr Subomi.app` once if Gatekeeper blocks first launch.
+          * **Linux Base (`.AppImage` / `.tar.gz`, `x86_64` & `arm64`):**
+            * `.AppImage` is self-contained (`chmod +x Subomi-*.AppImage && ./Subomi-*.AppImage`).
+            * `.tar.gz` is the raw ELF binary (requires system `mpv` and `libass`).
+          * **Linux Full — OCR + Whisper Vulkan (`*-ocr-asr-vulkan.*`, `x86_64`):**
+            * Requires your distro's Vulkan loader (`libvulkan1` / `vulkan-loader`) for GPU acceleration (falls back to CPU if no Vulkan GPU is available).
+            * Download Whisper models inside **Settings → Options → ASR**.
+            * For Manga OCR, install `manga-ocr` into Subomi's auto-detected venv:
+              ```bash
+              uv venv ~/.local/share/subomi/ocr-venv && uv pip install --python ~/.local/share/subomi/ocr-venv manga-ocr
+              # or: python3 -m venv ~/.local/share/subomi/ocr-venv && ~/.local/share/subomi/ocr-venv/bin/pip install manga-ocr
+              ```
+          * **Optional runtime extras (all platforms):** Install `mecab` + IPADic/UniDic for automatic furigana, and `yt-dlp` on `PATH` for streaming URLs.
+          EOF
+
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" \
+            --notes-file release-notes.md \
+            --target "$GITHUB_SHA" \
+            --draft=false \
+            --latest

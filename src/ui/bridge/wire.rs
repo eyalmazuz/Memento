@@ -1752,6 +1752,7 @@ fn wire_subtitle_bridge(app: &SubomiApp, bridge: &Rc<RichUiBridge>) {
             && !app.get_menu_open()
             && !app.get_ocr_mode()
             && !app.get_about_open()
+            && !app.get_whats_new_open()
             && !app.get_url_dialog_open()
             && !has_glossary_selection
     });

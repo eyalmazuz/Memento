@@ -8,7 +8,7 @@ fn main() {
         .file("src/msg_cb_shim.c")
         .compile("subomi_ass_msg_cb_shim");
 
-    for var in ["ASS_SDK", "ASS_LIB_DIR"] {
+    for var in ["ASS_SDK", "ASS_LIB_DIR", "ASS_EXTRA_LIBS"] {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
@@ -16,6 +16,7 @@ fn main() {
         let dir = PathBuf::from(lib_dir);
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=ass");
+        emit_extra_libs();
         return;
     }
 
@@ -24,6 +25,7 @@ fn main() {
         if let Some(dir) = find_lib_dir(&prefix) {
             println!("cargo:rustc-link-search=native={}", dir.display());
             println!("cargo:rustc-link-lib=ass");
+            emit_extra_libs();
             return;
         }
     }
@@ -36,6 +38,17 @@ fn main() {
             "libass development package was not found via pkg-config ({err}). \
              Install libass (e.g. libass-dev / libass) or set ASS_LIB_DIR."
         );
+    }
+}
+
+fn emit_extra_libs() {
+    if let Ok(extra) = std::env::var("ASS_EXTRA_LIBS") {
+        for raw in extra.split([',', ';']) {
+            let lib = raw.trim();
+            if !lib.is_empty() {
+                println!("cargo:rustc-link-lib={lib}");
+            }
+        }
     }
 }
 

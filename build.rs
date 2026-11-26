@@ -51,6 +51,39 @@ fn emit_git_hash(manifest_dir: &Path) {
     println!("cargo:rustc-env=SUBOMI_GIT_HASH={hash}");
 }
 
+fn emit_build_channel() {
+    println!("cargo:rerun-if-env-changed=SUBOMI_BUILD_CHANNEL");
+    let raw = std::env::var("SUBOMI_BUILD_CHANNEL").unwrap_or_default();
+    let channel = match raw.trim().to_ascii_lowercase().as_str() {
+        "stable" => "stable",
+        "nightly" => "nightly",
+        _ => "dev",
+    };
+    println!("cargo:rustc-env=SUBOMI_BUILD_CHANNEL={channel}");
+}
+
+fn emit_embedded_changelog(manifest_dir: &Path, out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=SUBOMI_CHANGELOG_FILE");
+    let default_path = manifest_dir.join("CHANGELOG.md");
+    let source_path = std::env::var_os("SUBOMI_CHANGELOG_FILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                manifest_dir.join(path)
+            }
+        })
+        .unwrap_or(default_path);
+    println!("cargo:rerun-if-changed={}", source_path.display());
+
+    let contents = std::fs::read_to_string(&source_path).unwrap_or_default();
+    let dest = out_dir.join("embedded_changelog.md");
+    std::fs::write(&dest, contents)
+        .expect("failed to write embedded changelog into OUT_DIR/embedded_changelog.md");
+}
+
 fn try_compile_windows_icon(manifest_dir: &Path, out_dir: &Path) {
     let res_dir = manifest_dir.join("res");
     let ico_path = res_dir.join("subomi.ico");
@@ -153,6 +186,8 @@ fn main() {
         std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS must be set by Cargo");
 
     emit_git_hash(&manifest_dir);
+    emit_build_channel();
+    emit_embedded_changelog(&manifest_dir, &out_dir);
 
     if target == "windows" {
         try_compile_windows_icon(&manifest_dir, &out_dir);

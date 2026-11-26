@@ -951,6 +951,10 @@ impl ConfigController {
         self.effective_setting(group, key)
     }
 
+    pub fn explicit_setting(&self, group: &str, key: &str) -> Option<Value> {
+        self.store.borrow().get_at(group, key)
+    }
+
     pub fn settings_groups(&self) -> Vec<SettingsGroup> {
         let config = self.store.borrow();
         let mut groups = Vec::new();
@@ -1342,6 +1346,11 @@ impl ConfigController {
                     &mut store,
                     raw::application::GROUP,
                     raw::application::AUTO_UPDATE_CHECK,
+                );
+                write_default_value(
+                    &mut store,
+                    raw::application::GROUP,
+                    raw::application::UPDATE_CHANNEL,
                 );
             }
             SettingsCategory::Audio => {

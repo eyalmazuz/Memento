@@ -138,6 +138,48 @@ impl TryFrom<&str> for ThemeMode {
     }
 }
 
+/// Update release channel preference (`application/update-channel`).
+///
+/// Stored on disk as lowercase strings (`"stable"`, `"nightly"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Nightly,
+}
+
+impl UpdateChannel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    pub fn from_str_lossy(value: &str) -> Self {
+        Self::try_from(value).unwrap_or(Self::Stable)
+    }
+
+    pub fn from_str_with_default(value: &str, default: Self) -> Self {
+        Self::try_from(value).unwrap_or(default)
+    }
+}
+
+impl TryFrom<&str> for UpdateChannel {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("stable") {
+            Ok(Self::Stable)
+        } else if trimmed.eq_ignore_ascii_case("nightly") {
+            Ok(Self::Nightly)
+        } else {
+            Err(())
+        }
+    }
+}
+
 /// `Q_ENUM_NS` numeric round trip: swallows the invalid values that a plain
 /// `as` cast would happily preserve. `Q_ENUM_NS` itself only does the
 /// name/registration side, which stays in C++.

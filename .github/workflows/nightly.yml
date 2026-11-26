@@ -1,0 +1,144 @@
+name: Nightly Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'example.png'
+      - 'docs/**'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare nightly changelog
+    if: "${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore(main): release') }}"
+    runs-on: ubuntu-22.04
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      date_utc: ${{ steps.meta.outputs.date_utc }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate nightly changelog
+        id: meta
+        run: |
+          bash .github/scripts/generate-nightly-changelog.sh nightly-changelog.md
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date_utc=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload nightly changelog artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-changelog
+          path: nightly-changelog.md
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/_build-dist.yml
+    with:
+      profile: release
+      build_channel: nightly
+      include_linux_full: false
+      changelog_artifact: nightly-changelog
+      checkout_ref: ${{ github.sha }}
+
+  publish:
+    name: Publish rolling nightly prerelease
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify expected assets and generate checksums
+        run: |
+          set -euo pipefail
+          mv release-assets/nightly-changelog.md ./nightly-changelog.md
+          expected=(
+            subomi-linux-x86_64.tar.gz
+            Subomi-linux-x86_64.AppImage
+            subomi-linux-arm64.tar.gz
+            Subomi-linux-arm64.AppImage
+            Subomi-macos-arm64.zip
+            Subomi-macos-x86_64.zip
+            Subomi-windows-x86_64.zip
+          )
+          for asset in "${expected[@]}"; do
+            test -s "release-assets/${asset}"
+          done
+          (cd release-assets && sha256sum "${expected[@]}" > SHA256SUMS.txt)
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Compose nightly release notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          > **Rolling Nightly Prerelease** — built automatically from `main` (base build: no ASR / OCR).
+          > Subscribe to nightly checks in **Settings → Options → Application → Update channel → Nightly**.
+
+          EOF
+          cat nightly-changelog.md >> release-notes.md
+          cat >> release-notes.md << 'EOF'
+
+          ---
+
+          ### Platform Notes
+          * **Windows (`Subomi-windows-x86_64.zip`):** Unzip and run `subomi.exe` (no installation needed).
+          * **macOS (`Subomi-macos-*.zip`):** Unzip `Subomi.app`. Because builds are ad-hoc signed (not notarized), run `xattr -cr Subomi.app` once if Gatekeeper blocks first launch.
+          * **Linux (`.AppImage`):** Self-contained single file (`chmod +x Subomi-*.AppImage && ./Subomi-*.AppImage`).
+          * **Linux (`.tar.gz`):** Raw ELF binary — requires system `mpv` and `libass` packages (`apt install libmpv2 libass9` / `pacman -S mpv libass`).
+          * **Optional extras:** Install `mecab` + IPADic/UniDic for furigana and `yt-dlp` on `PATH` for streaming URLs.
+          EOF
+
+      - name: Update rolling nightly tag and prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: Nightly (${{ needs.prepare.outputs.date_utc }} · ${{ needs.prepare.outputs.short_sha }})
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly
+
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly \
+              --title "$TITLE" \
+              --notes-file release-notes.md \
+              --prerelease \
+              --target "$GITHUB_SHA"
+            gh release upload nightly release-assets/* --clobber
+          else
+            gh release create nightly release-assets/* \
+              --title "$TITLE" \
+              --notes-file release-notes.md \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi

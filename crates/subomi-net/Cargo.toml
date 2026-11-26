@@ -1,6 +1,6 @@
 [package]
 name = "subomi-net"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 rust-version = "1.85"
 description = "HTTP client, AnkiConnect transport, and model downloader"

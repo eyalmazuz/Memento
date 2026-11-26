@@ -1,6 +1,7 @@
 //! Main application orchestration module for pure-Rust Subomi.
 
 pub mod anki_actions;
+pub mod changelog;
 pub mod clipboard;
 pub mod keybinds;
 pub mod paths;
@@ -85,10 +86,34 @@ fn terminate_process_bypassing_atexit(code: i32) -> ! {
 }
 
 /// Format the About-modal / menu version string from `CARGO_PKG_VERSION` + optional `SUBOMI_GIT_HASH` (H1.6).
+#[cfg(test)]
 pub(crate) fn format_app_version_display(pkg_version: &str, git_hash: Option<&str>) -> String {
     match git_hash.map(str::trim).filter(|hash| !hash.is_empty()) {
         Some(hash) => format!("{pkg_version}-{hash}"),
         None => pkg_version.to_owned(),
+    }
+}
+
+/// Format the About-modal version string taking build channel (`stable`, `nightly`, `dev`) into account.
+pub(crate) fn format_app_version_display_for_channel(
+    pkg_version: &str,
+    git_hash: Option<&str>,
+    channel: updater::BuildChannel,
+) -> String {
+    let hash = git_hash.map(str::trim).filter(|h| !h.is_empty());
+    match channel {
+        updater::BuildChannel::Stable => match hash {
+            Some(h) => format!("Version {pkg_version} ({h})"),
+            None => format!("Version {pkg_version}"),
+        },
+        updater::BuildChannel::Nightly => match hash {
+            Some(h) => format!("Nightly · {pkg_version} ({h})"),
+            None => format!("Nightly · {pkg_version}"),
+        },
+        updater::BuildChannel::Dev => match hash {
+            Some(h) => format!("Version {pkg_version} ({h} · dev)"),
+            None => format!("Version {pkg_version} (dev)"),
+        },
     }
 }
 
@@ -500,9 +525,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     app.set_duration_time("00:00".into());
     app.set_app_version(env!("CARGO_PKG_VERSION").into());
     app.set_app_version_display(
-        format_app_version_display(env!("CARGO_PKG_VERSION"), option_env!("SUBOMI_GIT_HASH"))
-            .into(),
+        format_app_version_display_for_channel(
+            env!("CARGO_PKG_VERSION"),
+            option_env!("SUBOMI_GIT_HASH"),
+            updater::BuildChannel::current(),
+        )
+        .into(),
     );
+    changelog::populate_whats_new(&app);
     #[cfg(target_os = "macos")]
     app.set_key_quit(crate::controller::config::QUIT_SHORTCUT_MACOS.into());
     app.on_format_timestamp(|sec| format_time(sec as f64).into());
@@ -774,7 +804,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match determine_startup_update_action(&config_ctrl) {
         StartupUpdateAction::ShowOptInPrompt => open_update_opt_in_dialog(&app),
-        StartupUpdateAction::RunSilentCheck => spawn_update_check(app.as_weak(), true),
+        StartupUpdateAction::RunSilentCheck => {
+            spawn_update_check(app.as_weak(), &config_ctrl, true)
+        }
         StartupUpdateAction::Nothing => {}
     }
 

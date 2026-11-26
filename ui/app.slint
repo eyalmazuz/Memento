@@ -21,18 +21,18 @@ import {
     SubtitleTokenSelectionSlice, SubtitleTokenStrokeSlice,
     AssLineHitbox, AssHighlightPatch, AssRubyItem,
 } from "subtitle_overlay.slint";
-import { SubEntry, PlayerTrack, ChapterMark } from "player/types.slint";
+import { SubEntry, PlayerTrack, ChapterMark, ChangelogSection } from "player/types.slint";
 import { PlayerOscBar } from "player/osc_bar.slint";
 import { TopMenuBar, MenuDropdown } from "player/menu_bar.slint";
 import { SubtitleDrawerPanel } from "player/subtitle_drawer.slint";
-import { AboutModal, NoDictionariesModal, OpenUrlModal } from "player/modals.slint";
+import { AboutModal, NoDictionariesModal, OpenUrlModal, WhatsNewModal } from "player/modals.slint";
 
 export {
     SubomiPalette, SettingsWindow, AnkiHelpWindow,
     HelpArgument, HelpMarker, HelpSection,
     AnkiExcludedDictRow, AnkiAutocompleteItem, TextReplacementRow,
 }
-export { SubEntry, PlayerTrack, ChapterMark }
+export { SubEntry, PlayerTrack, ChapterMark, ChangelogSection }
 export {
     PitchMora, PitchGraph, RichPitchEntry, PopupFrequency, PopupFrequencyLine,
     CompactFrequencyItem, CompactFrequencyLine,
@@ -231,6 +231,11 @@ export component SubomiApp inherits Window {
     in-out property <string> anki-added-note-id: "";
     in-out property <int> anki-added-result-index: -1;
     in-out property <bool> about-open: false;
+    in-out property <bool> whats-new-open: false;
+    in-out property <string> whats-new-title: "What's New";
+    in-out property <string> whats-new-subtitle: "";
+    in-out property <[ChangelogSection]> whats-new-sections: [];
+    in-out property <string> whats-new-release-url: "https://github.com/eyalmazuz/Subomi/releases";
     in-out property <bool> url-dialog-open: false;
     in-out property <string> url-dialog-text: "";
     in-out property <bool> no-dicts-dialog-open: false;
@@ -486,6 +491,7 @@ export component SubomiApp inherits Window {
         || sidebar-bg-touch.has-hover
         || root.menu-open
         || root.about-open
+        || root.whats-new-open
         || root.url-dialog-open
         || root.no-dicts-dialog-open
         || root.update-dialog-open
@@ -555,6 +561,14 @@ export component SubomiApp inherits Window {
             root.osc-rearm-hide();
         }
     }
+    changed whats-new-open => {
+        if root.whats-new-open {
+            root.cursor-hidden = false;
+        } else {
+            f-scope.focus();
+            root.osc-rearm-hide();
+        }
+    }
     changed update-dialog-open => {
         if root.update-dialog-open {
             root.cursor-hidden = false;
@@ -593,24 +607,24 @@ export component SubomiApp inherits Window {
             root.cursor-hidden = false;
         } else {
             root.subtitle-hover-latched = false;
-            if !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+            if !root.url-dialog-open && !root.about-open && !root.whats-new-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
                 f-scope.focus();
             }
             root.osc-rearm-hide();
         }
     }
     changed active-sub-lines => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.whats-new-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
     changed active-sub-text => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.whats-new-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
     changed token-hovered => {
-        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+        if !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.whats-new-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
             f-scope.focus();
         }
     }
@@ -782,6 +796,7 @@ export component SubomiApp inherits Window {
                     return accept;
                 }
                 if (root.url-dialog-open) { root.url-dialog-open = false; return accept; }
+                if (root.whats-new-open) { root.whats-new-open = false; return accept; }
                 if (root.about-open) { root.about-open = false; return accept; }
                 if (had-dict) { return accept; }
                 if (root.dict-search-open) { root.dict-search-open = false; return accept; }
@@ -887,7 +902,7 @@ export component SubomiApp inherits Window {
                                     if had-popup {
                                         // Suppress matching pointer-up so dismissing popup never emits an orphan keyup MOUSE_BTN0 to mpv (H3.2)
                                         root.suppress-next-mouse-up = true;
-                                    } else if !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
+                                    } else if !root.menu-open && !root.ocr-mode && !root.about-open && !root.whats-new-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
                                         root.suppress-next-mouse-up = false;
                                         root.video-pointer-button(
                                             self.mouse-x / 1px,
@@ -903,7 +918,7 @@ export component SubomiApp inherits Window {
                                 } else {
                                     if root.suppress-next-mouse-up {
                                         root.suppress-next-mouse-up = false;
-                                    } else if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
+                                    } else if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.whats-new-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open && btn > 0 {
                                         root.video-pointer-button(
                                             self.mouse-x / 1px,
                                             self.mouse-y / 1px,
@@ -922,7 +937,7 @@ export component SubomiApp inherits Window {
                             }
                         }
                         scroll-event(event) => {
-                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open {
+                            if !root.dict-open && !root.menu-open && !root.ocr-mode && !root.about-open && !root.whats-new-open && !root.url-dialog-open && !root.no-dicts-dialog-open && !root.update-dialog-open {
                                 root.video-wheel(
                                     self.mouse-x / 1px,
                                     self.mouse-y / 1px,
@@ -1142,7 +1157,7 @@ export component SubomiApp inherits Window {
                                     }
                                 } else {
                                     SubtitleOverlayBridge.ass-pointer-left();
-                                    if !SubtitleOverlayBridge.ass-hovered && !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
+                                    if !SubtitleOverlayBridge.ass-hovered && !root.token-hovered && !root.dict-open && !root.url-dialog-open && !root.about-open && !root.whats-new-open && !root.update-dialog-open && !root.dict-search-open && !root.sub-drawer-open {
                                         f-scope.focus();
                                     }
                                 }
@@ -2052,6 +2067,7 @@ export component SubomiApp inherits Window {
             open-config => { root.open-config(); }
             check-updates => { root.check-updates(); }
             show-about => { root.about-open = true; }
+            show-whats-new => { root.whats-new-open = true; }
             close-menu => { menu-bar.open-menu = -1; root.osc-activity(); }
         }
 
@@ -2077,6 +2093,23 @@ export component SubomiApp inherits Window {
             app-version-display: root.app-version-display;
             dismissed => {
                 root.about-open = false;
+                f-scope.focus();
+            }
+            open-link(url) => { root.open-external-link(url); }
+            open-whats-new => {
+                root.about-open = false;
+                root.whats-new-open = true;
+            }
+        }
+
+        // What's New Changelog Modal
+        if root.whats-new-open : WhatsNewModal {
+            release-title: root.whats-new-title;
+            release-subtitle: root.whats-new-subtitle;
+            sections: root.whats-new-sections;
+            release-url: root.whats-new-release-url;
+            dismissed => {
+                root.whats-new-open = false;
                 f-scope.focus();
             }
             open-link(url) => { root.open-external-link(url); }

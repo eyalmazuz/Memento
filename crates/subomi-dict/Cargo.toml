@@ -1,13 +1,13 @@
 [package]
 name = "subomi-dict"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 rust-version = "1.89"
 description = "Yomitan dictionary importer, SQLite query engine, and Japanese deconjugator"
 license = "GPL-2.0-only"
 
 [dependencies]
-rusqlite = { version = "0.43", default-features = false, features = ["cache"] }
+rusqlite = { version = "0.43", default-features = false, features = ["cache", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"

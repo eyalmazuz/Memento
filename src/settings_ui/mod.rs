@@ -1563,6 +1563,7 @@ pub(crate) fn create_settings_session(
                         key.as_str(),
                         "anki/profile"
                             | "anki/profile/ex-glos"
+                            | "application/update-channel"
                             | "interface/theme"
                             | "keybind/current"
                             | "behavior/file-open-dir"

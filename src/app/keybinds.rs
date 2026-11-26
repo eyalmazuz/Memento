@@ -932,6 +932,7 @@ pub(crate) fn install_keybind_handlers(
         );
         let modal_blocking_scan = app.get_ocr_mode()
             || app.get_about_open()
+            || app.get_whats_new_open()
             || app.get_url_dialog_open()
             || app.get_no_dicts_dialog_open()
             || app.get_update_dialog_open()
@@ -1097,6 +1098,8 @@ pub(crate) fn install_keybind_handlers(
                 app.set_no_dicts_dialog_open(false);
             } else if app.get_url_dialog_open() {
                 app.set_url_dialog_open(false);
+            } else if app.get_whats_new_open() {
+                app.set_whats_new_open(false);
             } else if app.get_about_open() {
                 app.set_about_open(false);
             } else if app.get_ocr_mode() {

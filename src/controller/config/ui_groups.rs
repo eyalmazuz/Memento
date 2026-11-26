@@ -20,9 +20,9 @@ use super::keybinds::{
 use super::schema::{
     asr_thread_limit, audio_source_type_label, directory_label, effective_bool, effective_i64,
     effective_text, effective_value, glossary_style_label, language_label, modifier_label,
-    search_method_label, theme_label, value_text, SettingsCategory, AUDIO_SOURCE_TYPE_CHOICES,
-    DIRECTORY_CHOICES, GLOSSARY_STYLE_CHOICES, LANGUAGE_CHOICES, MODIFIER_CHOICES,
-    SEARCH_METHOD_CHOICES, THEME_CHOICES,
+    search_method_label, theme_label, update_channel_label, value_text, SettingsCategory,
+    AUDIO_SOURCE_TYPE_CHOICES, DIRECTORY_CHOICES, GLOSSARY_STYLE_CHOICES, LANGUAGE_CHOICES,
+    MODIFIER_CHOICES, SEARCH_METHOD_CHOICES, THEME_CHOICES, UPDATE_CHANNEL_CHOICES,
 };
 
 fn strings_model(values: &[String]) -> ModelRc<SharedString> {
@@ -205,15 +205,31 @@ pub(crate) fn application_settings_groups(config: &Config) -> Vec<SettingsGroup>
             SettingsCategory::Application,
             "Update",
             "",
-            vec![switch_field(
-                "application/auto-update-check",
-                "Check for updates on launch",
-                effective_bool(
-                    config,
-                    raw::application::GROUP,
-                    raw::application::AUTO_UPDATE_CHECK,
+            vec![
+                switch_field(
+                    "application/auto-update-check",
+                    "Check for updates on launch",
+                    effective_bool(
+                        config,
+                        raw::application::GROUP,
+                        raw::application::AUTO_UPDATE_CHECK,
+                    ),
                 ),
-            )],
+                with_description(
+                    choice_field(
+                        "application/update-channel",
+                        "Update channel",
+                        update_channel_label(&value_text(&effective_value(
+                            config,
+                            raw::application::GROUP,
+                            raw::application::UPDATE_CHANNEL,
+                        )))
+                        .to_owned(),
+                        &choice_labels(UPDATE_CHANNEL_CHOICES),
+                    ),
+                    "Stable checks versioned GitHub releases; Nightly tracks rolling prerelease builds from main.",
+                ),
+            ],
         ),
     ]
 }

@@ -11,6 +11,7 @@ use subomi_config::{ArgbColor, FontSpec, KeyPath, Value, ValueType};
 use subomi_dict::searchcontroller::{TextReplacementOptions, TextReplacementRule};
 use subomi_setting::enums::{
     AudioSourceType, Directory, GlossaryStyle, Language, Modifier, SearchMethod, ThemeMode,
+    UpdateChannel,
 };
 use subomi_setting::keys as raw;
 
@@ -107,6 +108,30 @@ pub(crate) const THEME_CHOICES: &[(ThemeMode, &str)] = &[
     (ThemeMode::Dark, "Dark"),
     (ThemeMode::Light, "Light"),
 ];
+
+pub(crate) const UPDATE_CHANNEL_CHOICES: &[(UpdateChannel, &str)] = &[
+    (UpdateChannel::Stable, "Stable"),
+    (UpdateChannel::Nightly, "Nightly"),
+];
+
+pub(crate) fn default_update_channel_for_build() -> UpdateChannel {
+    match option_env!("SUBOMI_BUILD_CHANNEL")
+        .map(str::trim)
+        .unwrap_or("")
+    {
+        "nightly" => UpdateChannel::Nightly,
+        _ => UpdateChannel::Stable,
+    }
+}
+
+pub(crate) fn update_channel_label(raw_value: &str) -> &'static str {
+    let channel =
+        UpdateChannel::from_str_with_default(raw_value, default_update_channel_for_build());
+    UPDATE_CHANNEL_CHOICES
+        .iter()
+        .find(|(item, _)| *item == channel)
+        .map_or("Stable", |(_, label)| *label)
+}
 
 /// Browse dialog kind for filesystem path settings (C1.1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -334,6 +359,11 @@ pub(crate) fn declared_setting_default(config: &Config, group: &str, key: &str) 
         };
         return Some(Value::Text(format!("file://{home}")));
     }
+    if group == raw::application::GROUP && key == raw::application::UPDATE_CHANNEL {
+        return Some(Value::Text(
+            default_update_channel_for_build().as_str().to_owned(),
+        ));
+    }
     if group == raw::interface::GROUP {
         if let Some(value) = qt_font_default(key) {
             return Some(value);
@@ -506,6 +536,7 @@ pub(crate) fn category_paths(category: SettingsCategory) -> Vec<(&'static str, &
         SettingsCategory::Application => vec![
             (raw::application::GROUP, raw::application::LANGUAGE),
             (raw::application::GROUP, raw::application::AUTO_UPDATE_CHECK),
+            (raw::application::GROUP, raw::application::UPDATE_CHANNEL),
         ],
         SettingsCategory::Behavior => behavior_paths(),
         SettingsCategory::Dictionary => vec![(raw::dictionary::GROUP, raw::dictionary::ORDER)],
@@ -811,6 +842,12 @@ pub(crate) fn parse_config_value(
     value: &str,
     current: Value,
 ) -> Result<Value, String> {
+    if group == raw::application::GROUP && key == raw::application::UPDATE_CHANNEL {
+        let channel = UpdateChannel::try_from(value).map_err(|()| {
+            format!("application/update-channel must be Stable or Nightly (received {value:?})")
+        })?;
+        return Ok(Value::Text(channel.as_str().to_owned()));
+    }
     if group == raw::interface::GROUP && key == raw::interface::THEME {
         let mode = ThemeMode::try_from(value).map_err(|()| {
             format!("interface/theme must be System, Dark, or Light (received {value:?})")

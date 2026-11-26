@@ -1,6 +1,6 @@
 [package]
 name = "subomi-audio"
-version = "2.0.2"
+version.workspace = true
 edition = "2021"
 rust-version = "1.77"
 description = "Pronunciation audio source expansion, payload validation, and LRU cache"

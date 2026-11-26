@@ -1,6 +1,7 @@
-import { LineEdit } from "std-widgets.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
 import { SubomiPalette } from "../palette.slint";
 import { ModalDialog } from "../components/modal.slint";
+import { ChangelogSection } from "types.slint";
 
 export component OpenUrlModal inherits ModalDialog {
     in-out property <string> url-text: "";
@@ -34,6 +35,7 @@ export component AboutModal inherits ModalDialog {
     in property <string> app-version: "";
     in property <string> app-version-display: "";
     callback open-link(string);
+    callback open-whats-new();
 
     title: "";
     dialog-width: 420px;
@@ -129,6 +131,134 @@ export component AboutModal inherits ModalDialog {
                 gh-touch := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.open-link("https://github.com/eyalmazuz/Subomi"); }
+                }
+            }
+
+            Rectangle {
+                width: wn-lbl.preferred-width + 18px;
+                height: 28px;
+                border-radius: 6px;
+                background: wn-touch.has-hover ? SubomiPalette.hover-bg : transparent;
+                animate background { duration: 100ms; }
+                wn-lbl := Text {
+                    text: "What's New";
+                    color: SubomiPalette.cyan-accent;
+                    font-size: 13px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                wn-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.open-whats-new(); }
+                }
+            }
+        }
+    }
+}
+
+export component WhatsNewModal inherits ModalDialog {
+    in property <string> release-title: "What's New";
+    in property <string> release-subtitle: "";
+    in property <[ChangelogSection]> sections: [];
+    in property <string> release-url: "https://github.com/eyalmazuz/Subomi/releases";
+    callback open-link(string);
+
+    title: root.release-title;
+    dialog-width: 520px;
+    primary-text: "Close";
+    primary-clicked => { root.dismissed(); }
+
+    VerticalLayout {
+        spacing: 10px;
+
+        if root.release-subtitle != "" : Text {
+            text: root.release-subtitle;
+            color: SubomiPalette.text-muted;
+            font-size: 12px;
+        }
+
+        Rectangle {
+            height: 1px;
+            background: SubomiPalette.border;
+        }
+
+        ScrollView {
+            height: min(max(120px, wn-content.preferred-height), 340px);
+            viewport-width: self.width;
+
+            wn-content := VerticalLayout {
+                width: parent.width - 12px;
+                padding-top: 2px;
+                padding-bottom: 4px;
+                padding-right: 4px;
+                spacing: 12px;
+
+                if root.sections.length == 0 : Text {
+                    text: "No release notes are bundled in this build. Check GitHub Releases for the full changelog.";
+                    color: SubomiPalette.text-secondary;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+
+                for section in root.sections : VerticalLayout {
+                    spacing: 5px;
+
+                    Text {
+                        text: section.heading;
+                        color: SubomiPalette.cyan-accent;
+                        font-size: 12.5px;
+                        font-weight: 700;
+                    }
+
+                    for item in section.items : HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+
+                        Text {
+                            text: "•";
+                            color: SubomiPalette.text-muted;
+                            font-size: 13px;
+                            vertical-alignment: top;
+                        }
+
+                        Text {
+                            text: item;
+                            color: SubomiPalette.text;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: SubomiPalette.border;
+        }
+
+        HorizontalLayout {
+            alignment: start;
+
+            Rectangle {
+                width: notes-link-lbl.preferred-width + 14px;
+                height: 26px;
+                border-radius: 6px;
+                background: notes-link-touch.has-hover ? SubomiPalette.hover-bg : transparent;
+                animate background { duration: 100ms; }
+                notes-link-lbl := Text {
+                    text: "View full release notes on GitHub ↗";
+                    color: SubomiPalette.cyan-accent;
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                notes-link-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.open-link(root.release-url); }
                 }
             }
         }

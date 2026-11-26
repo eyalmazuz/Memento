@@ -1505,8 +1505,8 @@ mod tests {
         });
         app.show().unwrap();
         // Drawer right edge = 1280; right pad = 10, Close button = 28, spacing = 6,
-        // Time pill = 58px -> x in [1178, 1236], menu bar 30 + top pad 10 + 14 = y 54.
-        let pos = slint::LogicalPosition::new(1207.0, 54.0);
+        // Time pill = 58px -> x in [1178, 1236]; floating menu bar leaves drawer at y = 0 -> top pad 10 + 14 = y 24.
+        let pos = slint::LogicalPosition::new(1207.0, 24.0);
         app.window().dispatch_event(WindowEvent::PointerPressed {
             position: pos,
             button: PointerEventButton::Left,

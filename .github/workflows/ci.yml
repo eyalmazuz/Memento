@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'example.png'
+      - 'docs/**'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'example.png'
+      - 'docs/**'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libclang-dev \
+            pkg-config \
+            libmpv-dev \
+            libass-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libfontconfig1-dev \
+            libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux-${{ matrix.arch }}
+
+      - name: Run workspace tests (base)
+        run: cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install pkgconf mpv libass
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-macos-${{ matrix.arch }}
+
+      - name: Run workspace tests (base)
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig
+        run: cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+
+  windows:
+    name: Windows (x86_64 MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache vcpkg installed libraries
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-libass-win-x64-v1
+
+      - name: Setup Windows native dependencies
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/setup-windows-deps.ps1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-x86_64
+
+      - name: Build and test workspace (base)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Build/test with static libass failed; retrying with dynamic libass fallback..."
+            ./.github/scripts/setup-windows-deps.ps1 -DynamicLibAss
+            cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+          }
