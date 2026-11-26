@@ -181,8 +181,8 @@ fn install_macos_open_urls_hook() {
     static HOOK_ONCE: Once = Once::new();
     HOOK_ONCE.call_once(|| {
         type Id = *mut c_void;
-        type Sel = *mut c_void;
-        type Class = *mut c_void;
+        type Sel = *const c_void;
+        type Class = *const c_void;
 
         #[link(name = "objc")]
         extern "C" {

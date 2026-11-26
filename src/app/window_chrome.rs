@@ -22,12 +22,14 @@ use crate::ui::{ChapterMark, SubomiApp};
 use subomi_player::mpv::CursorAutohide;
 use subomi_player::MpvInstance;
 
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 const WINDOW_ICON_ICO: &[u8] = include_bytes!("../../res/subomi.ico");
 const OSC_MOVE_ANCHOR_RESET: Duration = Duration::from_millis(100);
 const DROP_COALESCE_DELAY: Duration = Duration::from_millis(50);
 
 /// Decode an embedded Windows `.ico` file (PNG-compressed or 32-bit BGRA BMP DIB
 /// entry) into tightly packed RGBA8 pixels and `(width, height)`.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub(crate) fn decode_ico_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     if bytes.len() < 6 {
         return None;

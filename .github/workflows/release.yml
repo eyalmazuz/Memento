@@ -77,6 +77,7 @@ jobs:
       - name: Upload assets and publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
