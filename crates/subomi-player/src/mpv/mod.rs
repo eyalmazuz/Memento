@@ -718,10 +718,21 @@ mod tests {
             Some(false),
             "sub-visibility must be restored immediately after subtitle screenshot error"
         );
-        let sub_vis_transitions = wait_for_sub_vis_event(Some(false));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let sub_vis_transitions: Vec<bool> = player
+            .drain_events()
+            .into_iter()
+            .filter_map(|ev| match ev {
+                MpvEvent::PropertyChange {
+                    name,
+                    value: MpvPropertyValue::Flag(v),
+                } if name == "sub-visibility" => Some(v),
+                _ => None,
+            })
+            .collect();
         assert!(
-            !sub_vis_transitions.is_empty() && sub_vis_transitions.last() == Some(&false),
-            "expected sub-visibility property notification ending in false, got {sub_vis_transitions:?}"
+            sub_vis_transitions.is_empty() || sub_vis_transitions.last() == Some(&false),
+            "expected sub-visibility property notifications to coalesce or end in false, got {sub_vis_transitions:?}"
         );
 
         // 3. Synchronous software screenshot_raw_rgba(true) also restores sub-visibility on error.

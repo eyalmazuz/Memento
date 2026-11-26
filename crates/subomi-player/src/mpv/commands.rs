@@ -108,19 +108,21 @@ impl MpvInstance {
                 let _ = set_sub_visibility(self.handle, original);
             },
         );
-        let mut pointers = [
-            c"screenshot-raw".as_ptr(),
-            if subtitles {
-                c"subtitles".as_ptr()
-            } else {
-                c"video".as_ptr()
-            },
-            c"rgba".as_ptr(),
-            ptr::null(),
-        ];
+        let mode = if subtitles {
+            c"subtitles".as_ptr()
+        } else {
+            c"video".as_ptr()
+        };
+        let mut pointers = [c"screenshot-raw".as_ptr(), mode, c"rgba".as_ptr(), ptr::null()];
         let mut result = OwnedNode::new();
-        let status =
+        let mut status =
             unsafe { ffi::mpv_command_ret(self.handle, pointers.as_mut_ptr(), &mut result.0) };
+        if status == ffi::MPV_ERROR_INVALID_PARAMETER {
+            let mut legacy_pointers = [c"screenshot-raw".as_ptr(), mode, ptr::null()];
+            status = unsafe {
+                ffi::mpv_command_ret(self.handle, legacy_pointers.as_mut_ptr(), &mut result.0)
+            };
+        }
         if status < 0 {
             return Err(screenshot_error(status));
         }

@@ -48,7 +48,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         env:
@@ -95,7 +95,7 @@ jobs:
             runner: macos-15-intel
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Homebrew dependencies
         run: |
@@ -118,11 +118,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Restore vcpkg installed libraries
         id: vcpkg-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1
@@ -135,7 +135,7 @@ jobs:
 
       - name: Save vcpkg installed libraries
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1

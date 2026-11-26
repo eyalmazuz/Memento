@@ -44,13 +44,13 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: Download nightly changelog (if provided)
         if: inputs.changelog_artifact != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.changelog_artifact }}
           path: .
@@ -93,7 +93,7 @@ jobs:
         run: bash .github/scripts/package-linux.sh
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist-linux-${{ matrix.arch }}
           path: dist/*
@@ -105,13 +105,13 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: Download nightly changelog (if provided)
         if: inputs.changelog_artifact != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.changelog_artifact }}
           path: .
@@ -140,7 +140,7 @@ jobs:
 
       - name: Cache LunarG Vulkan SDK
         id: vulkan-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/vulkan-sdk
           key: lunarg-vulkan-sdk-linux-x86_64-v1
@@ -186,7 +186,7 @@ jobs:
         run: bash .github/scripts/package-linux.sh
 
       - name: Upload Linux OCR + ASR Vulkan artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist-linux-x86_64-ocr-asr-vulkan
           path: dist/*
@@ -205,13 +205,13 @@ jobs:
             runner: macos-15-intel
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: Download nightly changelog (if provided)
         if: inputs.changelog_artifact != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.changelog_artifact }}
           path: .
@@ -243,7 +243,7 @@ jobs:
         run: bash .github/scripts/package-macos.sh
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist-macos-${{ matrix.arch }}
           path: dist/*
@@ -254,20 +254,20 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
 
       - name: Download nightly changelog (if provided)
         if: inputs.changelog_artifact != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: ${{ inputs.changelog_artifact }}
           path: .
 
       - name: Restore vcpkg installed libraries
         id: vcpkg-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1
@@ -280,7 +280,7 @@ jobs:
 
       - name: Save vcpkg installed libraries
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: C:\vcpkg\installed
           key: vcpkg-libass-win-x64-v1
@@ -322,7 +322,7 @@ jobs:
         run: ./.github/scripts/package-windows.ps1 -BinaryPath "target\${{ inputs.profile }}\subomi.exe" -OutDir "dist"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dist-windows-x86_64
           path: dist/*

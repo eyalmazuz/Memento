@@ -181,17 +181,18 @@ impl ScreenshotClient {
                 }
             },
         );
-        let mut args = [
-            c"screenshot-raw".as_ptr(),
-            if subtitles {
-                c"subtitles".as_ptr()
-            } else {
-                c"video".as_ptr()
-            },
-            c"rgba".as_ptr(),
-            ptr::null(),
-        ];
-        let status = unsafe { ffi::mpv_command_async(self.handle, id, args.as_mut_ptr()) };
+        let mode = if subtitles {
+            c"subtitles".as_ptr()
+        } else {
+            c"video".as_ptr()
+        };
+        let mut args = [c"screenshot-raw".as_ptr(), mode, c"rgba".as_ptr(), ptr::null()];
+        let mut status = unsafe { ffi::mpv_command_async(self.handle, id, args.as_mut_ptr()) };
+        if status == ffi::MPV_ERROR_INVALID_PARAMETER {
+            // mpv <= 0.37 (e.g. Ubuntu 24.04) accepts only 1 argument (`flags`) and returns `bgr0`.
+            let mut legacy_args = [c"screenshot-raw".as_ptr(), mode, ptr::null()];
+            status = unsafe { ffi::mpv_command_async(self.handle, id, legacy_args.as_mut_ptr()) };
+        }
         if status < 0 {
             return Err(screenshot_error(status));
         }
@@ -311,13 +312,18 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
     let mut height = None;
     let mut stride = None;
     let mut is_rgba = false;
+    let mut is_bgr0 = false;
     let mut data: Option<&[u8]> = None;
     for (key, value) in fields {
         match key {
             b"w" => width = value.as_i64(),
             b"h" => height = value.as_i64(),
             b"stride" => stride = value.as_i64(),
-            b"format" => is_rgba = value.as_str_bytes() == Some(b"rgba"),
+            b"format" => match value.as_str_bytes() {
+                Some(b"rgba") => is_rgba = true,
+                Some(b"bgr0") => is_bgr0 = true,
+                _ => {}
+            },
             b"data" => data = value.as_byte_array(),
             _ => {}
         }
@@ -330,7 +336,7 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
         height.unwrap_or(0),
         stride.is_some(),
         stride.unwrap_or(0),
-        is_rgba.then_some("rgba"),
+        (is_rgba || is_bgr0).then_some("rgba"),
         data.is_some(),
     )
     .map_err(|error| format!("invalid mpv raw screenshot: {error:?}"))?;
@@ -366,7 +372,14 @@ pub(super) unsafe fn copy_screenshot_node(result: &ffi::mpv_node) -> Result<RawF
             output_row
         };
         let source_offset = source_row * stride_abs;
-        pixels.extend_from_slice(&source[source_offset..source_offset + line_size]);
+        let row = &source[source_offset..source_offset + line_size];
+        if is_bgr0 {
+            for px in row.chunks_exact(4) {
+                pixels.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
+            }
+        } else {
+            pixels.extend_from_slice(row);
+        }
     }
     Ok(RawFrame {
         width: width as u32,

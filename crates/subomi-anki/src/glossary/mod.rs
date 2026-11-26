@@ -237,9 +237,14 @@ mod tests {
             "imageRendering": "pixelated"
         });
 
+        let expected_path = if cfg!(windows) {
+            "/base\\folder\\pic.png"
+        } else {
+            "/base/folder/pic.png"
+        };
         let hex_hash = "0123456789abcdef0123456789abcdef";
         let (glossaries, files) = build_glossary(&[img], "/base", |path| {
-            (path == "/base/folder/pic.png").then(|| hex_hash.to_owned())
+            (path == expected_path).then(|| hex_hash.to_owned())
         });
         assert_eq!(glossaries.len(), 1);
         let html = &glossaries[0];
@@ -251,7 +256,7 @@ mod tests {
         assert_eq!(
             files,
             vec![(
-                "/base/folder/pic.png".to_owned(),
+                expected_path.to_owned(),
                 "0123456789abcdef0123456789abcdef.png".to_owned()
             )]
         );

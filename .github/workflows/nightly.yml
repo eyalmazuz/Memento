@@ -26,13 +26,13 @@ jobs:
   prepare:
     name: Prepare nightly changelog
     if: "${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message, 'chore(main): release') }}"
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
       date_utc: ${{ steps.meta.outputs.date_utc }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -44,7 +44,7 @@ jobs:
           echo "date_utc=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: Upload nightly changelog artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-changelog
           path: nightly-changelog.md
@@ -65,15 +65,15 @@ jobs:
     needs:
       - prepare
       - build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
           merge-multiple: true

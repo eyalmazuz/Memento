@@ -1348,13 +1348,18 @@ mod tests {
             assert_eq!(tabete[2].alt_lemma.as_deref(), Some("仕舞う"));
         }
 
-        // Single-kana particles never emit verb/noun lemmas:
+        // Single-kana particles never emit verb/noun lemmas (UniDic tags standalone
+        // "は" as "助詞"; IPADic tags standalone "は" as "フィラー"):
         for particle in ["は", "の", "と"] {
             let p_toks = mecab_tokenize_for_lookup(particle).expect("particle parse");
             assert_eq!(p_toks.len(), 1);
             assert_eq!(p_toks[0].lemma, particle);
             assert_eq!(p_toks[0].alt_lemma, None);
-            assert_eq!(p_toks[0].pos, "助詞");
+            assert!(
+                matches!(p_toks[0].pos.as_str(), "助詞" | "フィラー"),
+                "unexpected POS for {particle}: {}",
+                p_toks[0].pos
+            );
         }
 
         // N-best paths:
