@@ -23,7 +23,8 @@ $stageDir = Join-Path $stageRoot "Subomi-windows-x86_64"
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 
 Copy-Item -Path $BinaryPath -Destination (Join-Path $stageDir "subomi.exe")
-Copy-Item -Path $env:MPV_DLL_PATH -Destination (Join-Path $stageDir "libmpv-2.dll")
+$mpvDllName = Split-Path -Path $env:MPV_DLL_PATH -Leaf
+Copy-Item -Path $env:MPV_DLL_PATH -Destination (Join-Path $stageDir $mpvDllName)
 Copy-Item -Path "LICENSE" -Destination (Join-Path $stageDir "LICENSE")
 
 # If dynamic libass fallback was used, copy its runtime DLLs alongside subomi.exe.

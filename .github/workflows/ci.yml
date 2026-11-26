@@ -43,9 +43,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v4
@@ -98,9 +98,11 @@ jobs:
           key: ci-macos-${{ matrix.arch }}
 
       - name: Run workspace tests (base)
-        env:
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig
-        run: cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
+        run: |
+          export MPV_SDK="$(brew --prefix mpv)"
+          export ASS_SDK="$(brew --prefix libass)"
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix libarchive)/lib/pkgconfig"
+          cargo test --workspace --exclude subomi-asr-whisper --exclude subomi-asr-onnx
 
   windows:
     name: Windows (x86_64 MSVC)

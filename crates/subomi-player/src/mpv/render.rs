@@ -219,10 +219,11 @@ pub fn create_opengl_context_with_options(
     let resolver_ptr = non_null_resolver.as_ptr();
     let _clear_guard = is_scoped.then_some(ScopedResolverClear(resolver_ptr));
 
-    let mut init = ffi::mpv_opengl_init_params {
-        get_proc_address: Some(resolve_gl_proc),
-        get_proc_address_ctx: resolver_ptr.cast(),
-    };
+    // Zero-initialize so older libmpv (<0.35) headers with the deprecated
+    // `extra_exts` pointer field also compile cleanly with `extra_exts = null`.
+    let mut init: ffi::mpv_opengl_init_params = unsafe { std::mem::zeroed() };
+    init.get_proc_address = Some(resolve_gl_proc);
+    init.get_proc_address_ctx = resolver_ptr.cast();
     let mut context = ptr::null_mut();
     let mut advanced_control: c_int = c_int::from(advanced_control_enabled);
     let mut params = Vec::with_capacity(5);

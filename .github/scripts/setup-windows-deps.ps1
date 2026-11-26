@@ -15,7 +15,12 @@ New-Item -ItemType Directory -Force -Path $depsRoot | Out-Null
 
 # ── 1. libmpv SDK (shinchiro non-v3 x86_64) ──────────────────────────────────
 $mpvDir = Join-Path $depsRoot "mpv-sdk"
-if (-not (Test-Path (Join-Path $mpvDir "mpv.lib")) -or -not (Test-Path (Join-Path $mpvDir "libmpv-2.dll"))) {
+$existingMpvDll = if (Test-Path $mpvDir) {
+    Get-ChildItem -Path $mpvDir -Filter "*mpv-2.dll" -Recurse | Select-Object -First 1
+} else {
+    $null
+}
+if (-not (Test-Path (Join-Path $mpvDir "mpv.lib")) -or -not $existingMpvDll) {
     New-Item -ItemType Directory -Force -Path $mpvDir | Out-Null
 
     $headers = @{ "User-Agent" = "Subomi-CI" }
@@ -38,12 +43,14 @@ if (-not (Test-Path (Join-Path $mpvDir "mpv.lib")) -or -not (Test-Path (Join-Pat
     & 7z x $archivePath "-o$mpvDir" -y | Out-Null
     Remove-Item -Force $archivePath
 
-    $defFile = Get-ChildItem -Path $mpvDir -Filter "mpv.def" -Recurse | Select-Object -First 1
-    if (-not $defFile) {
-        throw "mpv.def not found after extracting $($asset.name)"
+    $mpvDll = Get-ChildItem -Path $mpvDir -Filter "*mpv-2.dll" -Recurse | Select-Object -First 1
+    if (-not $mpvDll) {
+        Write-Host "Extracted archive contents:"
+        Get-ChildItem -Path $mpvDir -Recurse | Select-Object -ExpandProperty FullName
+        throw "libmpv-2.dll / mpv-2.dll not found after extracting $($asset.name)"
     }
 
-    # Locate MSVC lib.exe via vswhere
+    # Locate MSVC lib.exe and dumpbin.exe via vswhere
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $vsInstall) {
@@ -56,7 +63,28 @@ if (-not (Test-Path (Join-Path $mpvDir "mpv.lib")) -or -not (Test-Path (Join-Pat
         throw "Could not locate x64 MSVC lib.exe under $vsInstall"
     }
 
-    & $libExe.FullName "/def:$($defFile.FullName)" "/out:$(Join-Path $mpvDir 'mpv.lib')" "/machine:x64"
+    $defFile = Get-ChildItem -Path $mpvDir -Filter "*mpv*.def" -Recurse | Select-Object -First 1
+    if ($defFile) {
+        $defPath = $defFile.FullName
+    } else {
+        $dumpbinExe = Join-Path $libExe.DirectoryName "dumpbin.exe"
+        if (-not (Test-Path $dumpbinExe)) {
+            throw "Could not locate dumpbin.exe beside $($libExe.FullName)"
+        }
+        Write-Host "Generating mpv.def from $($mpvDll.Name) via dumpbin..."
+        $defPath = Join-Path $mpvDir "mpv.def"
+        $exports = & $dumpbinExe /exports $mpvDll.FullName |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } |
+            Select-Object -Unique
+        if (-not $exports) {
+            throw "dumpbin /exports found no exported symbols in $($mpvDll.FullName)"
+        }
+        @("LIBRARY $($mpvDll.Name)", "EXPORTS") + ($exports | ForEach-Object { "  $_" }) |
+            Set-Content -Path $defPath -Encoding ascii
+    }
+
+    & $libExe.FullName "/def:$defPath" "/name:$($mpvDll.Name)" "/out:$(Join-Path $mpvDir 'mpv.lib')" "/machine:x64"
     if ($LASTEXITCODE -ne 0) {
         throw "lib.exe failed to generate mpv.lib"
     }
@@ -70,9 +98,9 @@ $mpvInclude = if (Test-Path (Join-Path $mpvDir "include\mpv\client.h")) {
     throw "Could not locate mpv/client.h inside $mpvDir"
 }
 
-$mpvDll = Get-ChildItem -Path $mpvDir -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
+$mpvDll = Get-ChildItem -Path $mpvDir -Filter "*mpv-2.dll" -Recurse | Select-Object -First 1
 if (-not $mpvDll) {
-    throw "libmpv-2.dll not found inside $mpvDir"
+    throw "libmpv-2.dll / mpv-2.dll not found inside $mpvDir"
 }
 
 # ── 2. libass via vcpkg ──────────────────────────────────────────────────────

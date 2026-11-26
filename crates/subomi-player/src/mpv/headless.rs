@@ -260,7 +260,7 @@ impl HeadlessMpv {
                 raw.data
                     .cast::<ffi::mpv_event_end_file>()
                     .as_ref()
-                    .map(|info| (info.reason, info.error))
+                    .map(|info| (info.reason as u32, info.error))
             } else {
                 None
             };

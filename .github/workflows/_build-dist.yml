@@ -39,9 +39,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v4
@@ -100,7 +100,7 @@ jobs:
   build-linux-full:
     name: Build Linux (x86_64 OCR + Whisper Vulkan)
     if: inputs.include_linux_full
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
@@ -225,8 +225,11 @@ jobs:
         env:
           SUBOMI_BUILD_CHANNEL: ${{ inputs.build_channel }}
           SUBOMI_CHANGELOG_FILE: ${{ inputs.changelog_artifact != '' && 'nightly-changelog.md' || '' }}
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig
-        run: cargo build --profile "${{ inputs.profile }}" --bin subomi
+        run: |
+          export MPV_SDK="$(brew --prefix mpv)"
+          export ASS_SDK="$(brew --prefix libass)"
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix libarchive)/lib/pkgconfig"
+          cargo build --profile "${{ inputs.profile }}" --bin subomi
 
       - name: Package Subomi.app zip
         env:

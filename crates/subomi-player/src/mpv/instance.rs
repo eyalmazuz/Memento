@@ -528,7 +528,8 @@ impl MpvInstance {
                     unsafe { raw.data.cast::<ffi::mpv_event_end_file>().as_ref() }.map_or(
                         (EndFileReason::Unknown(-1), 0),
                         |info| {
-                            let reason = match info.reason {
+                            #[allow(clippy::unnecessary_cast)]
+                            let reason = match info.reason as u32 {
                                 ffi::MPV_END_FILE_REASON_EOF => EndFileReason::Eof,
                                 ffi::MPV_END_FILE_REASON_STOP => EndFileReason::Stop,
                                 ffi::MPV_END_FILE_REASON_QUIT => EndFileReason::Quit,
