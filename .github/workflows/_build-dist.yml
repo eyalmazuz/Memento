@@ -56,9 +56,11 @@ jobs:
           path: .
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo -E apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo -E apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
             build-essential \
             curl \
             file \
@@ -115,9 +117,11 @@ jobs:
           path: .
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo -E apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo -E apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
             build-essential \
             cmake \
             curl \
