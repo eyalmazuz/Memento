@@ -1386,6 +1386,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         app.set_key_quit(crate::controller::config::QUIT_SHORTCUT_MACOS.into());
         let cfg = Rc::new(ConfigController::new());
+        crate::app::preferences::refresh_player_preferences(&app, &cfg);
         let mpv: Rc<RefCell<Option<MpvInstance>>> = Rc::new(RefCell::new(None));
         let closing = Rc::new(Cell::new(false));
         let hover = Rc::new(RefCell::new(None));
@@ -1436,13 +1437,25 @@ mod tests {
         );
         assert_eq!(quit_count.get(), 1);
 
-        // `key_card_add` (`Ctrl+D`) must NOT toggle search panel when popup is closed;
-        // only `key_show_search` (`Ctrl+R`) toggles it.
+        // `key_card_add` (`Ctrl+D` / `Cmd+D`) must NOT toggle search panel when popup is closed;
+        // only `key_show_search` (`Ctrl+R` / `Cmd+R`) toggles it.
         assert!(!app.get_dict_open());
         assert!(!app.get_dict_search_open());
-        app.invoke_key_pressed("d".into(), true, false, false, false);
+        app.invoke_key_pressed(
+            "d".into(),
+            !cfg!(target_os = "macos"),
+            false,
+            false,
+            cfg!(target_os = "macos"),
+        );
         assert!(!app.get_dict_search_open());
-        app.invoke_key_pressed("r".into(), true, false, false, false);
+        app.invoke_key_pressed(
+            "r".into(),
+            !cfg!(target_os = "macos"),
+            false,
+            false,
+            cfg!(target_os = "macos"),
+        );
         assert!(app.get_dict_search_open());
 
         // H5.2: MarkAudioContext / ClearAudioContext keybinds update HUD text cleanly.

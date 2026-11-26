@@ -144,6 +144,10 @@ struct PrewarmJob {
 struct PrewarmWorker {
     slot: Mutex<Option<PrewarmJob>>,
     condvar: Condvar,
+    /// Held around each individual prewarmed line so
+    /// `clear_furigana_cache_and_cancel_prewarm` can synchronize with any
+    /// in-flight `parse_mecab` call before `unload_mecab()` runs.
+    in_flight: Mutex<()>,
 }
 
 static PREWARM_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +158,7 @@ fn prewarm_worker() -> &'static Arc<PrewarmWorker> {
         let worker = Arc::new(PrewarmWorker {
             slot: Mutex::new(None),
             condvar: Condvar::new(),
+            in_flight: Mutex::new(()),
         });
         let bg = Arc::clone(&worker);
         let _ = std::thread::Builder::new()
@@ -205,6 +210,10 @@ fn prewarm_worker_loop(worker: Arc<PrewarmWorker>) {
         };
 
         for line in job.lines {
+            let _in_flight = worker
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if PREWARM_EPOCH.load(Ordering::Acquire) != job.epoch {
                 break;
             }
@@ -322,6 +331,12 @@ pub fn clear_furigana_cache_and_cancel_prewarm() -> bool {
                 *guard = None;
             }
         }
+        // Wait for any single in-flight line on the background thread to finish
+        // observing the bumped epoch so it cannot reload MeCab after unload.
+        let _fence = worker
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
     let Some(cache) = FURIGANA_CACHE.get() else {
         return false;
