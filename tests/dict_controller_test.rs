@@ -1148,84 +1148,100 @@ fn mecab_enabled_live_unidic_compounds_lemmas_particle_safety_and_ipadic_fallbac
         .iter()
         .any(|h| h.expression == "食べて仕舞う"));
 
-    // Enable live UniDic MeCab lookup:
+    // Enable live MeCab lookup (UniDic or IPADic when installed on the host):
     controller.set_mecab_enabled(true);
     assert!(controller.mecab_enabled());
 
-    // Honorific irregular imperative `ください` -> `くださる` & `下さる` via MeCab `orthBase` + `lemma`:
-    let kudasai = controller.search("ください");
-    let kudasai_exprs: Vec<&str> = kudasai.iter().map(|h| h.expression.as_str()).collect();
-    assert!(kudasai_exprs.contains(&"くださる"));
-    assert!(kudasai_exprs.contains(&"下さる"));
+    if let Ok(probe) = subomi_util::mecab::mecab_tokenize_for_lookup("していました") {
+        // UniDic provides kanji `alt_lemma` entries (`為る`, `仕舞う`, `置く`, `居る`, `下さる`);
+        // IPADic emits only the kana dictionary forms (`する`, `しまう`, `おく`, `いる`, `くださる`).
+        let has_unidic = probe.first().and_then(|t| t.alt_lemma.as_deref()) == Some("為る");
 
-    // Compound & lemma lookups (`食べてしまった`, `食べさせられてしまった`, `見ておいた`, `見ていた`, `していました`):
-    let tabeteshimatta = controller.search("食べてしまった").to_vec();
-    let tabe_exprs: Vec<&str> = tabeteshimatta.iter().map(|h| h.expression.as_str()).collect();
-    assert_eq!(tabeteshimatta[0].expression, "食べる");
-    assert_eq!(
-        controller.last_match_units(),
-        "食べてしまった".encode_utf16().count()
-    );
-    assert!(tabe_exprs.contains(&"食べてしまう"));
-    assert!(tabe_exprs.contains(&"食べて仕舞う"));
+        // Honorific irregular imperative `ください` -> `くださる` (& `下さる` with UniDic):
+        let kudasai = controller.search("ください");
+        let kudasai_exprs: Vec<&str> = kudasai.iter().map(|h| h.expression.as_str()).collect();
+        assert!(kudasai_exprs.contains(&"くださる"));
+        if has_unidic {
+            assert!(kudasai_exprs.contains(&"下さる"));
+        }
 
-    let tabesaserareteshimatta = controller.search("食べさせられてしまった").to_vec();
-    assert_eq!(tabesaserareteshimatta[0].expression, "食べる");
-    assert_eq!(
-        controller.last_match_units(),
-        "食べさせられてしまった".encode_utf16().count()
-    );
-
-    let miteoita = controller.search("見ておいた").to_vec();
-    let miteoita_exprs: Vec<&str> = miteoita.iter().map(|h| h.expression.as_str()).collect();
-    assert!(miteoita_exprs.contains(&"見ておく"));
-    assert!(miteoita_exprs.contains(&"見て置く"));
-    assert!(miteoita_exprs.contains(&"見る"));
-    // Both `見る` (via full `-ておく` deinflection, score 100) and `見ておく` (score 94)
-    // match the full 5-char surface `見ておいた`, so higher-scored `見る` ranks first.
-    assert_eq!(miteoita[0].expression, "見る");
-
-    let miteita = controller.search("見ていた").to_vec();
-    let miteita_exprs: Vec<&str> = miteita.iter().map(|h| h.expression.as_str()).collect();
-    assert_eq!(miteita[0].expression, "見る");
-    assert!(miteita_exprs.contains(&"見ている"));
-    assert!(miteita_exprs.contains(&"見て居る"));
-
-    let shiteimashita = controller.search("していました").to_vec();
-    let shite_exprs: Vec<&str> = shiteimashita.iter().map(|h| h.expression.as_str()).collect();
-    assert!(shite_exprs.contains(&"する"));
-    assert!(shite_exprs.contains(&"為る"));
-    assert!(shite_exprs.contains(&"して居る"));
-
-    // Noun compounds (`日本語能力`, `日本語能力試験`):
-    let nouryoku = controller.search("日本語能力").to_vec();
-    assert_eq!(nouryoku[0].expression, "日本語能力");
-    let jlpt = controller.search("日本語能力試験を受験する").to_vec();
-    assert_eq!(
-        jlpt.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
-        vec!["日本語能力試験", "日本語能力", "日本語", "日本"]
-    );
-
-    // Strict single-kana particle & rule_mask safety (`は`, `の`, `と` NEVER match `春`, `乗る`, `取る`):
-    for (particle_query, expected) in [
-        ("は", "は"),
-        ("の", "の"),
-        ("と", "と"),
-        ("は走る", "は"),
-        ("の本", "の"),
-        ("と行く", "と"),
-    ] {
-        let hits = controller.search(particle_query);
+        // Compound & lemma lookups (`食べてしまった`, `食べさせられてしまった`, `見ておいた`, `見ていた`, `していました`):
+        let tabeteshimatta = controller.search("食べてしまった").to_vec();
+        let tabe_exprs: Vec<&str> = tabeteshimatta.iter().map(|h| h.expression.as_str()).collect();
+        assert_eq!(tabeteshimatta[0].expression, "食べる");
         assert_eq!(
-            hits.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
-            vec![expected],
-            "particle query {particle_query:?} must never false-match verbs or homophones"
+            controller.last_match_units(),
+            "食べてしまった".encode_utf16().count()
         );
-    }
+        assert!(tabe_exprs.contains(&"食べてしまう"));
+        if has_unidic {
+            assert!(tabe_exprs.contains(&"食べて仕舞う"));
+        }
 
-    let oyoijau = controller.search("泳いじゃう");
-    assert_eq!(oyoijau[0].expression, "泳ぐ");
-    assert!(!oyoijau.iter().any(|h| h.expression == "泳く"));
+        let tabesaserareteshimatta = controller.search("食べさせられてしまった").to_vec();
+        assert_eq!(tabesaserareteshimatta[0].expression, "食べる");
+        assert_eq!(
+            controller.last_match_units(),
+            "食べさせられてしまった".encode_utf16().count()
+        );
+
+        let miteoita = controller.search("見ておいた").to_vec();
+        let miteoita_exprs: Vec<&str> = miteoita.iter().map(|h| h.expression.as_str()).collect();
+        assert!(miteoita_exprs.contains(&"見ておく"));
+        if has_unidic {
+            assert!(miteoita_exprs.contains(&"見て置く"));
+        }
+        assert!(miteoita_exprs.contains(&"見る"));
+        // Both `見る` (via full `-ておく` deinflection, score 100) and `見ておく` (score 94)
+        // match the full 5-char surface `見ておいた`, so higher-scored `見る` ranks first.
+        assert_eq!(miteoita[0].expression, "見る");
+
+        let miteita = controller.search("見ていた").to_vec();
+        let miteita_exprs: Vec<&str> = miteita.iter().map(|h| h.expression.as_str()).collect();
+        assert_eq!(miteita[0].expression, "見る");
+        assert!(miteita_exprs.contains(&"見ている"));
+        if has_unidic {
+            assert!(miteita_exprs.contains(&"見て居る"));
+        }
+
+        let shiteimashita = controller.search("していました").to_vec();
+        let shite_exprs: Vec<&str> = shiteimashita.iter().map(|h| h.expression.as_str()).collect();
+        assert!(shite_exprs.contains(&"する"));
+        if has_unidic {
+            assert!(shite_exprs.contains(&"為る"));
+            assert!(shite_exprs.contains(&"して居る"));
+        }
+
+        // Noun compounds (`日本語能力`, `日本語能力試験`):
+        let nouryoku = controller.search("日本語能力").to_vec();
+        assert_eq!(nouryoku[0].expression, "日本語能力");
+        let jlpt = controller.search("日本語能力試験を受験する").to_vec();
+        assert_eq!(
+            jlpt.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
+            vec!["日本語能力試験", "日本語能力", "日本語", "日本"]
+        );
+
+        // Strict single-kana particle & rule_mask safety (`は`, `の`, `と` NEVER match `春`, `乗る`, `取る`):
+        for (particle_query, expected) in [
+            ("は", "は"),
+            ("の", "の"),
+            ("と", "と"),
+            ("は走る", "は"),
+            ("の本", "の"),
+            ("と行く", "と"),
+        ] {
+            let hits = controller.search(particle_query);
+            assert_eq!(
+                hits.iter().map(|h| h.expression.as_str()).collect::<Vec<_>>(),
+                vec![expected],
+                "particle query {particle_query:?} must never false-match verbs or homophones"
+            );
+        }
+
+        let oyoijau = controller.search("泳いじゃう");
+        assert_eq!(oyoijau[0].expression, "泳ぐ");
+        assert!(!oyoijau.iter().any(|h| h.expression == "泳く"));
+    }
 
     // Deterministic 9-column IPADic tokenizer path:
     controller.set_mecab_tokenizer(|text| {

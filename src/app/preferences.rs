@@ -371,7 +371,10 @@ pub(crate) fn audio_config_generation() -> u64 {
 
 /// Synchronizes `audio/download-timeout-ms` and `audio/sources` changes from `ConfigController`,
 /// updating the active download timeout and invalidating audio worker & popup caches on change.
-pub(crate) fn sync_audio_preferences(config: &ConfigController) -> bool {
+#[cfg(test)]
+static AUDIO_SYNC_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn sync_audio_preferences_inner(config: &ConfigController) -> bool {
     let timeout_ms = config.audio_download_timeout_ms();
     let hash = compute_audio_config_hash(config);
     crate::controller::audio::set_download_timeout_ms(timeout_ms);
@@ -384,6 +387,14 @@ pub(crate) fn sync_audio_preferences(config: &ConfigController) -> bool {
     } else {
         false
     }
+}
+
+pub(crate) fn sync_audio_preferences(config: &ConfigController) -> bool {
+    #[cfg(test)]
+    let _gate = AUDIO_SYNC_TEST_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sync_audio_preferences_inner(config)
 }
 
 pub(crate) fn sync_subtitle_overlay_style_from_config(
@@ -1711,19 +1722,22 @@ mod tests {
 
     #[test]
     fn sync_audio_preferences_tracks_timeout_and_source_changes() {
+        let _gate = AUDIO_SYNC_TEST_GATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cfg = ConfigController::new();
-        sync_audio_preferences(&cfg);
+        sync_audio_preferences_inner(&cfg);
         let gen0 = audio_config_generation();
 
         cfg.edit_setting("audio/download-timeout-ms", "8500")
             .unwrap();
-        sync_audio_preferences(&cfg);
+        sync_audio_preferences_inner(&cfg);
         let gen1 = audio_config_generation();
         assert!(gen1 > gen0);
         assert_eq!(crate::controller::audio::download_timeout_ms(), 8_500);
 
         // Unchanged config does not re-invalidate.
-        sync_audio_preferences(&cfg);
+        sync_audio_preferences_inner(&cfg);
         assert_eq!(audio_config_generation(), gen1);
     }
 

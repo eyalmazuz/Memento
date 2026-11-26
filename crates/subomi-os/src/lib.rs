@@ -1271,38 +1271,67 @@ mod tests {
             percent_decode("/home/user/%E6%97%A5%E6%9C%AC%E8%AA%9E%2001.mkv"),
             "/home/user/日本語 01.mkv"
         );
-        assert_eq!(
-            decode_file_uri("file:///home/user/Anime%20Episode%2001.mkv"),
-            Some(PathBuf::from("/home/user/Anime Episode 01.mkv"))
-        );
-        assert_eq!(
-            decode_file_uri("file://localhost/tmp/sub.srt"),
-            Some(PathBuf::from("/tmp/sub.srt"))
-        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(
+                decode_file_uri("file:///home/user/Anime%20Episode%2001.mkv"),
+                Some(PathBuf::from("/home/user/Anime Episode 01.mkv"))
+            );
+            assert_eq!(
+                decode_file_uri("file://localhost/tmp/sub.srt"),
+                Some(PathBuf::from("/tmp/sub.srt"))
+            );
+            let list = "# comment\r\nfile:///tmp/ep%201.mkv\r\nfile:///tmp/ep%201.ja.srt\r\n\r\n";
+            assert_eq!(
+                parse_uri_list(list),
+                vec![
+                    PathBuf::from("/tmp/ep 1.mkv"),
+                    PathBuf::from("/tmp/ep 1.ja.srt"),
+                ]
+            );
+            // Case-insensitive scheme and localhost authority
+            assert_eq!(
+                decode_file_uri("FILE:///home/user/ep%2002.mkv"),
+                Some(PathBuf::from("/home/user/ep 02.mkv"))
+            );
+            assert_eq!(
+                decode_file_uri("File://LOCALHOST/tmp/sub.srt"),
+                Some(PathBuf::from("/tmp/sub.srt"))
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                decode_file_uri("file:///C:/Users/Anime%20Episode%2001.mkv"),
+                Some(PathBuf::from("C:/Users/Anime Episode 01.mkv"))
+            );
+            assert_eq!(
+                decode_file_uri("file://localhost/C:/tmp/sub.srt"),
+                Some(PathBuf::from("C:/tmp/sub.srt"))
+            );
+            let list =
+                "# comment\r\nfile:///C:/tmp/ep%201.mkv\r\nfile:///C:/tmp/ep%201.ja.srt\r\n\r\n";
+            assert_eq!(
+                parse_uri_list(list),
+                vec![
+                    PathBuf::from("C:/tmp/ep 1.mkv"),
+                    PathBuf::from("C:/tmp/ep 1.ja.srt"),
+                ]
+            );
+            assert_eq!(
+                decode_file_uri("FILE:///C:/Users/ep%2002.mkv"),
+                Some(PathBuf::from("C:/Users/ep 02.mkv"))
+            );
+            assert_eq!(
+                decode_file_uri("File://LOCALHOST/C:/tmp/sub.srt"),
+                Some(PathBuf::from("C:/tmp/sub.srt"))
+            );
+        }
         assert_eq!(
             decode_file_uri("/var/media/movie.mp4"),
             Some(PathBuf::from("/var/media/movie.mp4"))
         );
         assert_eq!(decode_file_uri("   "), None);
-
-        let list = "# comment\r\nfile:///tmp/ep%201.mkv\r\nfile:///tmp/ep%201.ja.srt\r\n\r\n";
-        assert_eq!(
-            parse_uri_list(list),
-            vec![
-                PathBuf::from("/tmp/ep 1.mkv"),
-                PathBuf::from("/tmp/ep 1.ja.srt"),
-            ]
-        );
-
-        // Case-insensitive scheme and localhost authority
-        assert_eq!(
-            decode_file_uri("FILE:///home/user/ep%2002.mkv"),
-            Some(PathBuf::from("/home/user/ep 02.mkv"))
-        );
-        assert_eq!(
-            decode_file_uri("File://LOCALHOST/tmp/sub.srt"),
-            Some(PathBuf::from("/tmp/sub.srt"))
-        );
         assert_eq!(decode_file_uri("file://"), None);
         assert_eq!(decode_file_uri("file://localhost"), None);
 

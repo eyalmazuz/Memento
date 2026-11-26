@@ -156,12 +156,20 @@ mod tests {
 
     #[test]
     fn directories_and_empty_checks() {
-        assert_eq!(models_directory("/tmp/subomi"), "/tmp/subomi/models");
         assert_eq!(
-            model_directory(PRESET_KITSUNE_T06B_JA, "/tmp/subomi"),
-            format!("/tmp/subomi/models/{PRESET_KITSUNE_T06B_JA}")
+            Path::new(&models_directory("/tmp/subomi")),
+            Path::new("/tmp/subomi").join("models")
         );
-        assert_eq!(model_directory("", "/tmp/subomi"), "/tmp/subomi/models");
+        assert_eq!(
+            Path::new(&model_directory(PRESET_KITSUNE_T06B_JA, "/tmp/subomi")),
+            Path::new("/tmp/subomi")
+                .join("models")
+                .join(PRESET_KITSUNE_T06B_JA)
+        );
+        assert_eq!(
+            Path::new(&model_directory("", "/tmp/subomi")),
+            Path::new("/tmp/subomi").join("models")
+        );
         assert!(!model_available("", "/tmp/nonexistent-subomi-dir"));
         assert!(!has_any_model("", "/tmp/nonexistent-subomi-dir"));
     }

@@ -1758,14 +1758,32 @@ fn test_secondary_subtitle_entries_and_active_tracking() {
 
 #[test]
 fn test_drag_and_drop_uri_list_partitioning_for_playlists_and_subtitles() {
-    let uri_list = "\
+    #[cfg(windows)]
+    let (uri_list, expected_0, expected_1) = (
+        "\
+# Dropped playlist and external subtitles\r\n\
+file:///C:/Users/user/Videos/Episode%2001.mkv\r\n\
+file:///C:/Users/user/Videos/Episode%2002.mp4\r\n\
+file:///C:/Users/user/Videos/Episode%2001.ja.srt\r\n\
+file:///C:/Users/user/Videos/Episode%2001.en.ass\r\n\
+file:///C:/Users/user/Videos/Episode%2001.vtt\r\n\
+file:///C:/Users/user/Videos/Episode%2001.sub\r\n",
+        "C:/Users/user/Videos/Episode 01.mkv",
+        "C:/Users/user/Videos/Episode 02.mp4",
+    );
+    #[cfg(not(windows))]
+    let (uri_list, expected_0, expected_1) = (
+        "\
 # Dropped playlist and external subtitles\r\n\
 file:///home/user/Videos/Episode%2001.mkv\r\n\
 file:///home/user/Videos/Episode%2002.mp4\r\n\
 file:///home/user/Videos/Episode%2001.ja.srt\r\n\
 file:///home/user/Videos/Episode%2001.en.ass\r\n\
 file:///home/user/Videos/Episode%2001.vtt\r\n\
-file:///home/user/Videos/Episode%2001.sub\r\n";
+file:///home/user/Videos/Episode%2001.sub\r\n",
+        "/home/user/Videos/Episode 01.mkv",
+        "/home/user/Videos/Episode 02.mp4",
+    );
 
     let paths = subomi_os::parse_uri_list(uri_list);
     assert_eq!(paths.len(), 6);
@@ -1774,8 +1792,8 @@ file:///home/user/Videos/Episode%2001.sub\r\n";
         .partition(|path| is_subtitle_file(path.as_path()));
     assert_eq!(media.len(), 2);
     assert_eq!(subtitles.len(), 4);
-    assert_eq!(media[0].to_string_lossy(), "/home/user/Videos/Episode 01.mkv");
-    assert_eq!(media[1].to_string_lossy(), "/home/user/Videos/Episode 02.mp4");
+    assert_eq!(media[0].to_string_lossy(), expected_0);
+    assert_eq!(media[1].to_string_lossy(), expected_1);
 }
 
 #[test]
